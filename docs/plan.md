@@ -142,7 +142,7 @@ Milestone F; here the structures just hold constraint metadata.
 **Notes:** Wiring to the storage engine (stamping versions on commit) is refined
 in Milestone G; here the manager is a standalone bookkeeping unit.
 
-### Task 8 — Snapshot & visibility function
+### Task 8 — Snapshot & visibility function [COMPLETE]
 **Goal:** The single visibility function that all reads use (§5.3).
 
 **DoD:**

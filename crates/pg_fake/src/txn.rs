@@ -1,4 +1,6 @@
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
+
+use crate::storage::{Version, VersionChain};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct Xid(pub u64);
@@ -11,6 +13,13 @@ pub enum TransactionStatus {
     InFlight,
     Committed(CommitSeq),
     Aborted,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Snapshot {
+    pub commit_seq: CommitSeq,
+    pub in_flight: BTreeSet<Xid>,
+    statuses: BTreeMap<Xid, TransactionStatus>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -72,6 +81,57 @@ impl TransactionManager {
     }
 }
 
+impl Snapshot {
+    pub fn new(manager: &TransactionManager) -> Self {
+        Snapshot {
+            commit_seq: manager.commit_seq,
+            in_flight: manager
+                .statuses
+                .iter()
+                .filter_map(|(xid, status)| {
+                    if matches!(status, TransactionStatus::InFlight) {
+                        Some(*xid)
+                    } else {
+                        None
+                    }
+                })
+                .collect(),
+            statuses: manager.statuses.clone(),
+        }
+    }
+}
+
+pub fn is_visible(version: &Version, snapshot: &Snapshot, current_xid: Xid) -> bool {
+    let xmin_visible = version.xmin == current_xid
+        || matches!(
+            snapshot.statuses.get(&version.xmin),
+            Some(TransactionStatus::Committed(commit_seq))
+                if *commit_seq <= snapshot.commit_seq && !snapshot.in_flight.contains(&version.xmin)
+        );
+    let xmax_invisible = matches!(
+        version.xmax,
+        Some(xmax) if xmax == current_xid
+            || matches!(
+                snapshot.statuses.get(&xmax),
+                Some(TransactionStatus::Committed(commit_seq))
+                    if *commit_seq <= snapshot.commit_seq && !snapshot.in_flight.contains(&xmax)
+            )
+    );
+
+    xmin_visible && !xmax_invisible
+}
+
+pub fn visible_version<'a>(
+    chain: &'a VersionChain,
+    snapshot: &Snapshot,
+    current_xid: Xid,
+) -> Option<&'a Version> {
+    chain
+        .versions
+        .iter()
+        .find(|version| is_visible(version, snapshot, current_xid))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -106,5 +166,98 @@ mod tests {
         assert_eq!(manager.commit(second), CommitSeq(1));
         assert_eq!(manager.commit(first), CommitSeq(2));
         assert_eq!(manager.commit_seq(), CommitSeq(2));
+    }
+
+    fn version(xmin: Xid, xmax: Option<Xid>) -> Version {
+        Version {
+            xmin,
+            xmax,
+            row: vec![],
+        }
+    }
+
+    #[test]
+    fn own_uncommitted_insert_is_visible_only_to_its_transaction() {
+        let mut manager = TransactionManager::new();
+        let writer = manager.begin();
+        let reader = manager.begin();
+        let snapshot = Snapshot::new(&manager);
+        let inserted = version(writer, None);
+
+        assert!(is_visible(&inserted, &snapshot, writer));
+        assert!(!is_visible(&inserted, &snapshot, reader));
+    }
+
+    #[test]
+    fn committed_before_snapshot_is_visible() {
+        let mut manager = TransactionManager::new();
+        let writer = manager.begin();
+        manager.commit(writer);
+        let reader = manager.begin();
+        let snapshot = Snapshot::new(&manager);
+
+        assert!(is_visible(&version(writer, None), &snapshot, reader));
+    }
+
+    #[test]
+    fn committed_after_snapshot_is_invisible() {
+        let mut manager = TransactionManager::new();
+        let writer = manager.begin();
+        let reader = manager.begin();
+        let snapshot = Snapshot::new(&manager);
+        manager.commit(writer);
+
+        assert!(!is_visible(&version(writer, None), &snapshot, reader));
+    }
+
+    #[test]
+    fn delete_committed_before_snapshot_hides_the_version() {
+        let mut manager = TransactionManager::new();
+        let writer = manager.begin();
+        manager.commit(writer);
+        let deleter = manager.begin();
+        manager.commit(deleter);
+        let reader = manager.begin();
+        let snapshot = Snapshot::new(&manager);
+
+        assert!(!is_visible(
+            &version(writer, Some(deleter)),
+            &snapshot,
+            reader
+        ));
+    }
+
+    #[test]
+    fn in_flight_delete_leaves_the_version_visible() {
+        let mut manager = TransactionManager::new();
+        let writer = manager.begin();
+        manager.commit(writer);
+        let deleter = manager.begin();
+        let reader = manager.begin();
+        let snapshot = Snapshot::new(&manager);
+
+        assert!(is_visible(
+            &version(writer, Some(deleter)),
+            &snapshot,
+            reader
+        ));
+    }
+
+    #[test]
+    fn visible_version_selects_one_version_from_a_chain() {
+        let mut manager = TransactionManager::new();
+        let writer = manager.begin();
+        manager.commit(writer);
+        let updater = manager.begin();
+        let reader = manager.begin();
+        let snapshot = Snapshot::new(&manager);
+        let chain = VersionChain {
+            versions: vec![version(writer, Some(updater)), version(updater, None)],
+        };
+
+        assert_eq!(
+            visible_version(&chain, &snapshot, reader),
+            Some(&chain.versions[0])
+        );
     }
 }
