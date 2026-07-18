@@ -94,7 +94,7 @@ later; for now unknown statements return a clear "not implemented" error.
 
 ## Milestone B — Storage & MVCC core
 
-### Task 5 — Catalog structures
+### Task 5 — Catalog structures [COMPLETE]
 **Goal:** In-memory catalog data structures for schemas, tables, and columns
 (§4).
 
