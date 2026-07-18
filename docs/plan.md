@@ -236,7 +236,7 @@ one big lock is introduced here as a plain `Mutex`; task 29 upgrades usage to th
 **Notes:** This completes the first end-to-end path: `CREATE` → `INSERT` →
 `SELECT`. Expressions, `WHERE`, ordering, and limits arrive in Milestone D.
 
-### Task 13 — Differential test harness (vs real Postgres 18)
+### Task 13 — Differential test harness (vs real Postgres 18) [COMPLETE]
 **Goal:** The primary correctness oracle: run SQL scripts against real Postgres
 18 and `pg_fake` and compare (§12).
 

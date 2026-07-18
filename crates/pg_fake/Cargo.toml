@@ -8,3 +8,8 @@ license.workspace = true
 bigdecimal = "0.4"
 sqlparser = "0.53"
 thiserror = "2"
+
+[dev-dependencies]
+postgres = "0.19"
+testcontainers = { version = "0.27", features = ["blocking"] }
+testcontainers-modules = { version = "0.15", features = ["blocking", "postgres"] }

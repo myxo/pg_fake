@@ -10,3 +10,4 @@ After finishing task of plan, wait for user approval and only then mark task as 
 
 General rules:
 - do not change code if I asked the question without asking for action
+- do not run git commands unless I specifically told you to
