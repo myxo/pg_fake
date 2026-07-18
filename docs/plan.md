@@ -128,7 +128,7 @@ Milestone F; here the structures just hold constraint metadata.
 **Notes:** No transaction/visibility logic yet — this task is the raw store.
 `Xid` values used here are provided by the caller (task 7 supplies real ones).
 
-### Task 7 — Transaction manager (`Xid`, `CommitSeq`, commit log)
+### Task 7 — Transaction manager (`Xid`, `CommitSeq`, commit log) [COMPLETE]
 **Goal:** Transaction identity, commit ordering, and status tracking (§5.2).
 
 **DoD:**
