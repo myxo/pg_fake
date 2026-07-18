@@ -111,7 +111,7 @@ later; for now unknown statements return a clear "not implemented" error.
 DDL (MVCC-versioned catalog) is Phase 3 (§4). Constraint enforcement is added in
 Milestone F; here the structures just hold constraint metadata.
 
-### Task 6 — MVCC table storage (`RowId`, version chains)
+### Task 6 — MVCC table storage (`RowId`, version chains) [COMPLETE]
 **Goal:** The per-table row store with version chains (§3.2, §3.3, §5.1).
 
 **DoD:**

@@ -1,2 +1,2 @@
-//! Transaction manager — Xid, CommitSeq, commit log, snapshots (§5).
-//! Implemented starting in task 7.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct Xid(pub u64);
