@@ -164,7 +164,7 @@ hand-built chains and snapshots before it is used by the executor.
 
 ## Milestone C — Walking skeleton & measurement
 
-### Task 9 — `Db` / `Session` API skeleton (autocommit)
+### Task 9 — `Db` / `Session` API skeleton (autocommit) [COMPLETE]
 **Goal:** The public entry points wired end-to-end, running each statement in an
 implicit autocommit transaction (§8).
 
@@ -185,7 +185,7 @@ implicit autocommit transaction (§8).
 one big lock is introduced here as a plain `Mutex`; task 29 upgrades usage to the
 `Mutex`+`Condvar` monitor (§6).
 
-### Task 10 — `CREATE TABLE` / `DROP TABLE`
+### Task 10 — `CREATE TABLE` / `DROP TABLE` [COMPLETE]
 **Goal:** Execute basic DDL against the catalog.
 
 **DoD:**
@@ -202,7 +202,7 @@ one big lock is introduced here as a plain `Mutex`; task 29 upgrades usage to th
 
 **Notes:** Only the default `public` schema. `IF NOT EXISTS` handling included.
 
-### Task 11 — `INSERT` (literal rows, exact types)
+### Task 11 — `INSERT` (literal rows, exact types) [COMPLETE]
 **Goal:** Insert literal rows into a table.
 
 **DoD:**

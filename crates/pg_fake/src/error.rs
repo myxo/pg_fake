@@ -31,12 +31,13 @@ pub enum SqlState {
     DeadlockDetected,     // 40P01
 
     // 42 — Syntax Error / Access Rule
-    UndefinedTable,  // 42P01
-    DuplicateTable,  // 42P07
-    SyntaxError,     // 42601
-    UndefinedColumn, // 42703
-    UndefinedObject, // 42704
-    CannotCoerce,    // 42846
+    UndefinedTable,   // 42P01
+    DuplicateTable,   // 42P07
+    SyntaxError,      // 42601
+    UndefinedColumn,  // 42703
+    UndefinedObject,  // 42704
+    CannotCoerce,     // 42846
+    DatatypeMismatch, // 42804
 
     // 55 — Object Not In Prerequisite State
     LockNotAvailable, // 55P03
@@ -67,6 +68,7 @@ impl SqlState {
             SqlState::UndefinedColumn => "42703",
             SqlState::UndefinedObject => "42704",
             SqlState::CannotCoerce => "42846",
+            SqlState::DatatypeMismatch => "42804",
             SqlState::LockNotAvailable => "55P03",
             SqlState::InternalError => "XX000",
         }

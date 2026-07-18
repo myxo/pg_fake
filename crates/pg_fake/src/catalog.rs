@@ -21,7 +21,11 @@ pub struct ColumnDef {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub enum Constraint {}
+pub enum Constraint {
+    PrimaryKey(Vec<String>),
+    Unique(Vec<String>),
+    Check(Box<Expr>),
+}
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct TableSchema {
