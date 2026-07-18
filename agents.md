@@ -7,3 +7,6 @@ If user ask to continue with a plan, read docs/plan.md and choose first task tha
 If there is anything uncomplete in task description, you must ask user question until evry uncertanty is resolve.
 
 After finishing task of plan, wait for user approval and only then mark task as complete.
+
+General rules:
+- do not change code if I asked the question without asking for action

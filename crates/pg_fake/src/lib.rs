@@ -8,10 +8,4 @@ pub mod storage;
 pub mod txn;
 pub mod value;
 
-#[cfg(test)]
-mod tests {
-    #[test]
-    fn placeholder() {
-        assert_eq!(2 + 2, 4);
-    }
-}
+pub use error::Result;

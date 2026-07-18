@@ -38,7 +38,7 @@ have a place to live.
 **Notes:** No behavior yet. Keep module boundaries aligned with the spec so
 future tasks slot in cleanly.
 
-### Task 2 — Error model: `SqlState` + `PgError`
+### Task 2 — Error model: `SqlState` + `PgError` [COMPLETE]
 **Goal:** A single error type carrying a Postgres `SQLSTATE` code (§11).
 
 **DoD:**
@@ -54,7 +54,7 @@ future tasks slot in cleanly.
 **Notes:** `sqlstate` is Tier A; message text is Tier B and not asserted on in
 differential tests. Codes are added incrementally as later tasks need them.
 
-### Task 3 — `Value` type & Phase-1 type system
+### Task 3 — `Value` type & Phase-1 type system [COMPLETE]
 **Goal:** The `Value` enum for Phase-1 types and a companion type descriptor
 (§3.1).
 

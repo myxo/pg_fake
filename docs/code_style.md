@@ -5,3 +5,5 @@
 - prefer good naming against comments. Add comments only then we should document some non trivial postgres internals
 - do not afraid breaking change. Prefer to change current function over making wrappers or new function that slightly
   different from existing
+- prefer property tests against small local unit tests
+- do not make links from code to specification
