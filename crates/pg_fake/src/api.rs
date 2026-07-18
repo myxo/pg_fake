@@ -46,6 +46,10 @@ impl Session {
     pub fn execute(&mut self, sql: &str) -> Result<u64> {
         match self.run(sql)? {
             ExecutionResult::Affected(rows) => Ok(rows),
+            ExecutionResult::Query(_) => Err(PgError::new(
+                SqlState::FeatureNotSupported,
+                "use query for SELECT statements",
+            )),
         }
     }
     pub fn query(&mut self, sql: &str, params: &[Value]) -> Result<QueryResult> {
@@ -55,11 +59,13 @@ impl Session {
                 "parameters are not implemented",
             ));
         }
-        let _ = self.run(sql)?;
-        Err(PgError::new(
-            SqlState::FeatureNotSupported,
-            "queries are not implemented",
-        ))
+        match self.run(sql)? {
+            ExecutionResult::Query(result) => Ok(result),
+            ExecutionResult::Affected(_) => Err(PgError::new(
+                SqlState::FeatureNotSupported,
+                "query requires a SELECT statement",
+            )),
+        }
     }
     fn run(&mut self, sql: &str) -> Result<ExecutionResult> {
         let mut statements = parser::parse(sql)?;
@@ -107,6 +113,100 @@ mod tests {
         assert_eq!(table.columns[2].data_type.typmod, (8 << 16) + 2 + 4);
         drop(state);
         assert_eq!(session.execute("DROP TABLE items").unwrap(), 1);
+    }
+
+    #[test]
+    fn selects_projections_with_metadata_in_row_id_order() {
+        let db = Db::new();
+        let mut session = db.session();
+        session
+            .execute("CREATE TABLE items (id INTEGER, name TEXT)")
+            .unwrap();
+        session
+            .execute("INSERT INTO items VALUES (2, 'second'), (1, 'first')")
+            .unwrap();
+
+        let result = session.query("SELECT name, id FROM items", &[]).unwrap();
+
+        assert_eq!(
+            result.columns,
+            vec![
+                ColumnMeta {
+                    name: "name".into(),
+                    type_oid: BaseType::Text.oid(),
+                    typmod: -1,
+                },
+                ColumnMeta {
+                    name: "id".into(),
+                    type_oid: BaseType::Int4.oid(),
+                    typmod: -1,
+                },
+            ]
+        );
+        assert_eq!(
+            result.rows,
+            vec![
+                vec![Value::Text("second".into()), Value::Int4(2)],
+                vec![Value::Text("first".into()), Value::Int4(1)],
+            ]
+        );
+        let all_columns = session.query("SELECT * FROM items", &[]).unwrap();
+        assert_eq!(
+            all_columns.rows,
+            vec![
+                vec![Value::Int4(2), Value::Text("second".into())],
+                vec![Value::Int4(1), Value::Text("first".into())],
+            ]
+        );
+    }
+
+    #[test]
+    fn select_excludes_uncommitted_rows_from_another_transaction() {
+        let db = Db::new();
+        let mut session = db.session();
+        session.execute("CREATE TABLE items (id INTEGER)").unwrap();
+        let mut state = db.state.lock().unwrap();
+        let writer = state.transactions.begin();
+        let table_id = state.catalog.table("items").unwrap().id;
+        state
+            .tables
+            .get_mut(&table_id)
+            .unwrap()
+            .insert(writer, vec![Value::Int4(1)]);
+        drop(state);
+
+        assert!(
+            session
+                .query("SELECT * FROM items", &[])
+                .unwrap()
+                .rows
+                .is_empty()
+        );
+
+        let mut state = db.state.lock().unwrap();
+        state.transactions.abort(writer);
+    }
+
+    #[test]
+    fn select_reports_unknown_tables_and_columns() {
+        let db = Db::new();
+        let mut session = db.session();
+
+        assert_eq!(
+            session
+                .query("SELECT * FROM missing", &[])
+                .unwrap_err()
+                .sqlstate,
+            SqlState::UndefinedTable
+        );
+        session.execute("CREATE TABLE items (id INTEGER)").unwrap();
+        assert_eq!(
+            session
+                .query("SELECT missing FROM items", &[])
+                .unwrap_err()
+                .sqlstate,
+            SqlState::UndefinedColumn
+        );
     }
 
     #[test]

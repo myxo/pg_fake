@@ -1,12 +1,14 @@
 use crate::{
+    api::{ColumnMeta, QueryResult},
     catalog::{Catalog, ColumnDef, TableId},
     error::{PgError, Result, SqlState},
     storage::Table,
-    txn::{Snapshot, TransactionManager, Xid},
+    txn::{Snapshot, TransactionManager, Xid, visible_version},
     value::{BaseType, PgType, Value},
 };
 use sqlparser::ast::{
-    ColumnOption, Expr, ObjectType, SetExpr, Statement, TableConstraint, Value as AstValue,
+    ColumnOption, Expr, GroupByExpr, Ident, ObjectType, SelectItem, SetExpr, Statement,
+    TableConstraint, TableFactor, Value as AstValue,
 };
 use std::collections::BTreeMap;
 
@@ -17,6 +19,7 @@ pub(crate) struct DatabaseState {
 }
 pub(crate) enum ExecutionResult {
     Affected(u64),
+    Query(QueryResult),
 }
 impl DatabaseState {
     pub fn new() -> Self {
@@ -32,7 +35,7 @@ pub(crate) fn dispatch(
     state: &mut DatabaseState,
     statement: &Statement,
     xid: Xid,
-    _: &Snapshot,
+    snapshot: &Snapshot,
 ) -> Result<ExecutionResult> {
     match statement {
         Statement::CreateTable(create) => {
@@ -110,7 +113,7 @@ pub(crate) fn dispatch(
                     }
                 }
                 columns.push(ColumnDef {
-                    name: column.name.value.clone(),
+                    name: identifier_name(&column.name),
                     data_type,
                     nullable,
                     default,
@@ -170,6 +173,7 @@ pub(crate) fn dispatch(
             Ok(ExecutionResult::Affected(affected))
         }
         Statement::Insert(insert) => insert_rows(state, insert, xid),
+        Statement::Query(query) => select_rows(state, query, xid, snapshot),
         _ => Err(PgError::new(
             SqlState::FeatureNotSupported,
             "statement is not implemented",
@@ -183,12 +187,14 @@ fn name(name: &sqlparser::ast::ObjectName) -> Result<String> {
             "schemas are not implemented",
         ));
     }
-    let ident = &name.0[0];
-    Ok(if ident.quote_style.is_some() {
-        ident.value.clone()
+    Ok(identifier_name(&name.0[0]))
+}
+fn identifier_name(identifier: &Ident) -> String {
+    if identifier.quote_style.is_some() {
+        identifier.value.clone()
     } else {
-        ident.value.to_ascii_lowercase()
-    })
+        identifier.value.to_ascii_lowercase()
+    }
 }
 fn insert_rows(
     state: &mut DatabaseState,
@@ -225,7 +231,7 @@ fn insert_rows(
                 schema
                     .columns
                     .iter()
-                    .position(|column| column.name == name.value)
+                    .position(|column| column.name == identifier_name(name))
                     .ok_or_else(|| {
                         PgError::new(
                             SqlState::UndefinedColumn,
@@ -259,6 +265,128 @@ fn insert_rows(
         table.insert(xid, row);
     }
     Ok(ExecutionResult::Affected(values.rows.len() as u64))
+}
+fn select_rows(
+    state: &DatabaseState,
+    query: &sqlparser::ast::Query,
+    xid: Xid,
+    snapshot: &Snapshot,
+) -> Result<ExecutionResult> {
+    if query.with.is_some()
+        || query.order_by.is_some()
+        || query.limit.is_some()
+        || !query.limit_by.is_empty()
+        || query.offset.is_some()
+        || query.fetch.is_some()
+        || !query.locks.is_empty()
+    {
+        return Err(PgError::new(
+            SqlState::FeatureNotSupported,
+            "query clause is not implemented",
+        ));
+    }
+    let SetExpr::Select(select) = query.body.as_ref() else {
+        return Err(PgError::new(
+            SqlState::FeatureNotSupported,
+            "query source is not implemented",
+        ));
+    };
+    let GroupByExpr::Expressions(group_by, modifiers) = &select.group_by else {
+        return Err(PgError::new(
+            SqlState::FeatureNotSupported,
+            "GROUP BY is not implemented",
+        ));
+    };
+    if select.distinct.is_some()
+        || select.into.is_some()
+        || select.selection.is_some()
+        || !group_by.is_empty()
+        || !modifiers.is_empty()
+        || select.having.is_some()
+        || select.from.len() != 1
+    {
+        return Err(PgError::new(
+            SqlState::FeatureNotSupported,
+            "SELECT feature is not implemented",
+        ));
+    }
+    let from = &select.from[0];
+    if !from.joins.is_empty() {
+        return Err(PgError::new(
+            SqlState::FeatureNotSupported,
+            "joins are not implemented",
+        ));
+    }
+    let TableFactor::Table {
+        name: table_name,
+        args,
+        ..
+    } = &from.relation
+    else {
+        return Err(PgError::new(
+            SqlState::FeatureNotSupported,
+            "FROM source is not implemented",
+        ));
+    };
+    if args.is_some() {
+        return Err(PgError::new(
+            SqlState::FeatureNotSupported,
+            "table functions are not implemented",
+        ));
+    }
+    let schema = state.catalog.table(&name(table_name)?)?;
+    let mut indexes = Vec::new();
+    for item in &select.projection {
+        match item {
+            SelectItem::Wildcard(_) => indexes.extend(0..schema.columns.len()),
+            SelectItem::UnnamedExpr(Expr::Identifier(column)) => {
+                indexes.push(
+                    schema
+                        .columns
+                        .iter()
+                        .position(|definition| definition.name == identifier_name(column))
+                        .ok_or_else(|| {
+                            PgError::new(
+                                SqlState::UndefinedColumn,
+                                format!("column {:?} does not exist", column.value),
+                            )
+                        })?,
+                );
+            }
+            _ => {
+                return Err(PgError::new(
+                    SqlState::FeatureNotSupported,
+                    "SELECT projection is not implemented",
+                ));
+            }
+        }
+    }
+    let columns = indexes
+        .iter()
+        .map(|index| {
+            let column = &schema.columns[*index];
+            ColumnMeta {
+                name: column.name.clone(),
+                type_oid: column.data_type.oid(),
+                typmod: column.data_type.typmod,
+            }
+        })
+        .collect();
+    let table = state
+        .tables
+        .get(&schema.id)
+        .expect("catalog table must have storage");
+    let rows = table
+        .rows()
+        .filter_map(|(_, chain)| visible_version(chain, snapshot, xid))
+        .map(|version| {
+            indexes
+                .iter()
+                .map(|index| version.row[*index].clone())
+                .collect()
+        })
+        .collect();
+    Ok(ExecutionResult::Query(QueryResult { columns, rows }))
 }
 fn value(expr: &Expr, base: BaseType) -> Result<Value> {
     let value = match expr {

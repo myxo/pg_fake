@@ -219,7 +219,7 @@ one big lock is introduced here as a plain `Mutex`; task 29 upgrades usage to th
 **Notes:** Coercion is exact-only for now (task 21 relaxes). No `RETURNING`
 (Phase 2). No constraint enforcement yet.
 
-### Task 12 — `SELECT *` full scan + projection
+### Task 12 — `SELECT *` full scan + projection [COMPLETE]
 **Goal:** Read rows back with column projection.
 
 **DoD:**
