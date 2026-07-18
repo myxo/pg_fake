@@ -73,7 +73,7 @@ differential tests. Codes are added incrementally as later tasks need them.
 `Value`. Coercion between types is deferred to task 21. Temporal/uuid/json are
 out of Phase 1.
 
-### Task 4 — `sqlparser` wrapper & statement dispatch
+### Task 4 — `sqlparser` wrapper & statement dispatch [COMPLETE]
 **Goal:** A thin parsing layer that produces owned ASTs and a dispatch skeleton
 routing statements to (stub) handlers.
 
