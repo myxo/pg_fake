@@ -21,7 +21,7 @@ Conventions:
 
 ## Milestone A — Foundations
 
-### Task 1 — Workspace & crate scaffolding
+### Task 1 — Workspace & crate scaffolding [COMPLETE]
 **Goal:** Establish the Cargo workspace and core crate skeleton so later tasks
 have a place to live.
 

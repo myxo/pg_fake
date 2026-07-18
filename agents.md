@@ -1,0 +1,9 @@
+Before doing any tasks, read
+
+docs/spec.md - full specification of project
+docs/code_style.md
+
+If user ask to continue with a plan, read docs/plan.md and choose first task that not marked as complete.
+If there is anything uncomplete in task description, you must ask user question until evry uncertanty is resolve.
+
+After finishing task of plan, wait for user approval and only then mark task as complete.
