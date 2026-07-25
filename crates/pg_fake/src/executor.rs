@@ -189,6 +189,7 @@ fn name(name: &sqlparser::ast::ObjectName) -> Result<String> {
     }
     Ok(identifier_name(&name.0[0]))
 }
+
 fn identifier_name(identifier: &Ident) -> String {
     if identifier.quote_style.is_some() {
         identifier.value.clone()
@@ -196,6 +197,7 @@ fn identifier_name(identifier: &Ident) -> String {
         identifier.value.to_ascii_lowercase()
     }
 }
+
 fn insert_rows(
     state: &mut DatabaseState,
     insert: &sqlparser::ast::Insert,
@@ -266,6 +268,7 @@ fn insert_rows(
     }
     Ok(ExecutionResult::Affected(values.rows.len() as u64))
 }
+
 fn select_rows(
     state: &DatabaseState,
     query: &sqlparser::ast::Query,
@@ -388,6 +391,7 @@ fn select_rows(
         .collect();
     Ok(ExecutionResult::Query(QueryResult { columns, rows }))
 }
+
 fn value(expr: &Expr, base: BaseType) -> Result<Value> {
     let value = match expr {
         Expr::Value(AstValue::Null) => Value::Null,

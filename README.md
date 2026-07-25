@@ -3,6 +3,13 @@
 An in-memory, embeddable fake of PostgreSQL for use as a test double in
 automated tests.
 
+## Benchmarks
+
+The Criterion suite compares `pg_fake` with PostgreSQL 18 for create/drop,
+insert, and select workloads. See
+[`crates/pg_fake/benches/README.md`](crates/pg_fake/benches/README.md) for
+Docker/database configuration, commands, reports, and speedup interpretation.
+
 ## Differential tests
 
 The differential suite compares `pg_fake` with PostgreSQL 18 and starts it

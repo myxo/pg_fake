@@ -10,6 +10,14 @@ build:
 test:
     cargo test
 
+# Run PostgreSQL 18 comparison benchmarks
+bench:
+    cargo bench --bench workloads
+
+# Record one pg_fake benchmark and open its flame graph
+profile-bench filter duration='10':
+    scripts/profile-bench.py {{filter}} {{duration}}
+
 # Run clippy on all workspace crates
 lint:
     cargo clippy --all-targets -- -D warnings
