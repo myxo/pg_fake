@@ -150,6 +150,54 @@ fn insert_benchmark(criterion: &mut Criterion, postgres: &mut Client) {
         .unwrap();
 }
 
+fn update_benchmark(criterion: &mut Criterion, postgres: &mut Client) {
+    let fake_table = unique_table_name("update_fake");
+    let postgres_table = unique_table_name("update_postgres");
+    let db = Db::new();
+    let mut fake = db.session();
+    assert_eq!(
+        fake.execute(&format!(
+            "CREATE TABLE {fake_table} (id INTEGER, amount INTEGER)"
+        ))
+        .unwrap(),
+        0
+    );
+    assert_eq!(
+        postgres
+            .execute(
+                &format!("CREATE TABLE {postgres_table} (id INTEGER, amount INTEGER)"),
+                &[],
+            )
+            .unwrap(),
+        0
+    );
+    assert_eq!(
+        fake.execute(&format!("INSERT INTO {fake_table} VALUES (1, 0)"))
+            .unwrap(),
+        1
+    );
+    assert_eq!(
+        postgres
+            .execute(&format!("INSERT INTO {postgres_table} VALUES (1, 0)"), &[])
+            .unwrap(),
+        1
+    );
+    let fake_update = format!("UPDATE {fake_table} SET amount = amount + 1 WHERE id = 1");
+    let postgres_update = format!("UPDATE {postgres_table} SET amount = amount + 1 WHERE id = 1");
+    let mut group = criterion.benchmark_group("update_row");
+
+    group.bench_function("pg_fake", |benchmark| {
+        benchmark.iter(|| assert_eq!(fake.execute(&fake_update).unwrap(), 1));
+    });
+    group.bench_function("postgres_18", |benchmark| {
+        benchmark.iter(|| assert_eq!(postgres.execute(&postgres_update, &[]).unwrap(), 1));
+    });
+    group.finish();
+    postgres
+        .execute(&format!("DROP TABLE {postgres_table}"), &[])
+        .unwrap();
+}
+
 fn select_benchmark(criterion: &mut Criterion, postgres: &mut Client) {
     let fake_table = unique_table_name("select_fake");
     let postgres_table = unique_table_name("select_postgres");
@@ -224,6 +272,7 @@ fn benchmarks(criterion: &mut Criterion) {
 
     create_table_benchmark(criterion, &mut postgres.client);
     insert_benchmark(criterion, &mut postgres.client);
+    update_benchmark(criterion, &mut postgres.client);
     select_benchmark(criterion, &mut postgres.client);
 }
 

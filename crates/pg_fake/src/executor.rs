@@ -7,10 +7,14 @@ use crate::{
     value::{BaseType, PgType, Value},
 };
 use sqlparser::ast::{
-    BinaryOperator, ColumnOption, Expr, GroupByExpr, Ident, ObjectType, SelectItem, SetExpr,
-    Statement, TableConstraint, TableFactor, UnaryOperator, Value as AstValue,
+    AssignmentTarget, BinaryOperator, ColumnOption, Expr, GroupByExpr, Ident, ObjectType,
+    SelectItem, SetExpr, Statement, TableConstraint, TableFactor, TableWithJoins, UnaryOperator,
+    Value as AstValue,
 };
-use std::{cmp::Ordering, collections::BTreeMap};
+use std::{
+    cmp::Ordering,
+    collections::{BTreeMap, BTreeSet},
+};
 
 pub(crate) struct DatabaseState {
     pub catalog: Catalog,
@@ -177,6 +181,22 @@ pub(crate) fn dispatch(
             Ok(ExecutionResult::Affected(affected))
         }
         Statement::Insert(insert) => insert_rows(state, insert, xid),
+        Statement::Update {
+            table,
+            assignments,
+            from,
+            selection,
+            returning,
+            or,
+        } => {
+            if from.is_some() || returning.is_some() || or.is_some() {
+                return Err(PgError::new(
+                    SqlState::FeatureNotSupported,
+                    "UPDATE feature is not implemented",
+                ));
+            }
+            update_rows(state, table, assignments, selection.as_ref(), xid, snapshot)
+        }
         Statement::Query(query) => select_rows(state, query, xid, snapshot),
         _ => Err(PgError::new(
             SqlState::FeatureNotSupported,
@@ -271,6 +291,128 @@ fn insert_rows(
         table.insert(xid, row);
     }
     Ok(ExecutionResult::Affected(values.rows.len() as u64))
+}
+
+fn update_rows(
+    state: &mut DatabaseState,
+    update_table: &TableWithJoins,
+    assignments: &[sqlparser::ast::Assignment],
+    selection: Option<&Expr>,
+    xid: Xid,
+    snapshot: &Snapshot,
+) -> Result<ExecutionResult> {
+    if !update_table.joins.is_empty() {
+        return Err(PgError::new(
+            SqlState::FeatureNotSupported,
+            "UPDATE joins are not implemented",
+        ));
+    }
+    let TableFactor::Table {
+        name: table_name,
+        args,
+        ..
+    } = &update_table.relation
+    else {
+        return Err(PgError::new(
+            SqlState::FeatureNotSupported,
+            "UPDATE target is not implemented",
+        ));
+    };
+    if args.is_some() {
+        return Err(PgError::new(
+            SqlState::FeatureNotSupported,
+            "UPDATE table functions are not implemented",
+        ));
+    }
+    let schema = state.catalog.table(&name(table_name)?)?.clone();
+    if let Some(selection) = selection {
+        let base = expression_type(selection, &schema)?;
+        if base != BaseType::Bool && !null_expression(selection) {
+            return Err(PgError::new(
+                SqlState::DatatypeMismatch,
+                "WHERE requires a boolean expression",
+            ));
+        }
+    }
+    let mut assigned = BTreeSet::new();
+    let assignments = assignments
+        .iter()
+        .map(|assignment| {
+            let AssignmentTarget::ColumnName(column) = &assignment.target else {
+                return Err(PgError::new(
+                    SqlState::FeatureNotSupported,
+                    "UPDATE tuple assignment is not implemented",
+                ));
+            };
+            let column_name = name(column)?;
+            let index = schema
+                .columns
+                .iter()
+                .position(|definition| definition.name == column_name)
+                .ok_or_else(|| {
+                    PgError::new(
+                        SqlState::UndefinedColumn,
+                        format!("column {column_name:?} does not exist"),
+                    )
+                })?;
+            if !assigned.insert(index) {
+                return Err(PgError::new(
+                    SqlState::SyntaxError,
+                    "multiple assignments to the same column",
+                ));
+            }
+            let expression_base = expression_type(&assignment.value, &schema)?;
+            let column_base = schema.columns[index].data_type.base;
+            if !null_expression(&assignment.value)
+                && expression_base != column_base
+                && !matches!(
+                    (expression_base, column_base),
+                    (BaseType::Text, BaseType::Varchar | BaseType::Bpchar)
+                )
+            {
+                return Err(PgError::new(
+                    SqlState::DatatypeMismatch,
+                    "column has incompatible type",
+                ));
+            }
+            Ok((index, &assignment.value))
+        })
+        .collect::<Result<Vec<_>>>()?;
+    let targets = state
+        .tables
+        .get(&schema.id)
+        .expect("catalog table must have storage")
+        .rows()
+        .try_fold(Vec::new(), |mut targets, (row_id, chain)| {
+            let Some(version) = visible_version(chain, snapshot, xid) else {
+                return Ok(targets);
+            };
+            if let Some(selection) = selection {
+                match evaluate(selection, &schema, &version.row)? {
+                    Value::Bool(true) => {}
+                    Value::Bool(false) | Value::Null => return Ok(targets),
+                    _ => unreachable!("WHERE expression was type-checked"),
+                }
+            }
+            targets.push((row_id, version.xmin, version.row.clone()));
+            Ok(targets)
+        })?;
+    let affected = targets.len() as u64;
+    let table = state
+        .tables
+        .get_mut(&schema.id)
+        .expect("catalog table must have storage");
+    for (row_id, version_xmin, row) in targets {
+        let mut updated = row.clone();
+        for (index, expression) in &assignments {
+            updated[*index] = assignment_value(
+                evaluate(expression, &schema, &row)?,
+                schema.columns[*index].data_type.base,
+            )?;
+        }
+        table.update(row_id, version_xmin, xid, updated);
+    }
+    Ok(ExecutionResult::Affected(affected))
 }
 
 fn select_rows(
@@ -421,7 +563,10 @@ fn select_rows(
 }
 
 fn value(expr: &Expr, base: BaseType) -> Result<Value> {
-    let value = literal_value(expr)?;
+    assignment_value(literal_value(expr)?, base)
+}
+
+fn assignment_value(value: Value, base: BaseType) -> Result<Value> {
     if value.is_null()
         || value.base_type() == Some(base)
         || matches!(

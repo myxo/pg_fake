@@ -193,6 +193,19 @@ fn evaluates_arithmetic_and_comparison_projections() {
 }
 
 #[test]
+fn updates_rows_with_expressions_and_where() {
+    assert_differential(
+        "CREATE TABLE __TABLE__ (id INTEGER, amount INTEGER); \
+         INSERT INTO __TABLE__ VALUES (1, 2), (3, 4), (5, 1); \
+         UPDATE __TABLE__ SET id = id + amount, amount = id WHERE amount > 2; \
+         SELECT * FROM __TABLE__; \
+         UPDATE __TABLE__ SET amount = amount * 2; \
+         SELECT * FROM __TABLE__",
+        RowOrder::Unordered,
+    );
+}
+
+#[test]
 fn filters_with_boolean_expressions() {
     assert_differential(
         "CREATE TABLE __TABLE__ (id INTEGER, score INTEGER, active BOOLEAN, optional INTEGER); \

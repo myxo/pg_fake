@@ -316,7 +316,7 @@ set.
 **Notes:** No joins/subqueries (Phase 2). Prepares the ground for
 `UPDATE`/`DELETE` targeting.
 
-### Task 18 — `UPDATE`
+### Task 18 — `UPDATE` [COMPLETE]
 **Goal:** Modify existing rows (§5.1).
 
 **DoD:**
