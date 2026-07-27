@@ -475,6 +475,10 @@ fn expression_type(expr: &Expr, schema: &TableSchema) -> Result<BaseType> {
             let base = expression_type(expr, schema)?;
             if matches!(op, UnaryOperator::Plus | UnaryOperator::Minus) && numeric(base) {
                 Ok(base)
+            } else if matches!(op, UnaryOperator::Not)
+                && (base == BaseType::Bool || null_expression(expr))
+            {
+                Ok(BaseType::Bool)
             } else {
                 Err(PgError::new(
                     SqlState::DatatypeMismatch,
@@ -491,9 +495,15 @@ fn expression_type(expr: &Expr, schema: &TableSchema) -> Result<BaseType> {
                 | BinaryOperator::Multiply
                 | BinaryOperator::Divide
                 | BinaryOperator::Modulo
-                    if numeric(left_base) && left_base == right_base =>
+                    if (numeric(left_base) && left_base == right_base)
+                        || (null_expression(left) && numeric(right_base))
+                        || (numeric(left_base) && null_expression(right)) =>
                 {
-                    Ok(left_base)
+                    if null_expression(left) {
+                        Ok(right_base)
+                    } else {
+                        Ok(left_base)
+                    }
                 }
                 BinaryOperator::Eq
                 | BinaryOperator::NotEq
@@ -501,7 +511,15 @@ fn expression_type(expr: &Expr, schema: &TableSchema) -> Result<BaseType> {
                 | BinaryOperator::Lt
                 | BinaryOperator::GtEq
                 | BinaryOperator::LtEq
-                    if comparable(left_base, right_base) =>
+                    if comparable(left_base, right_base)
+                        || null_expression(left)
+                        || null_expression(right) =>
+                {
+                    Ok(BaseType::Bool)
+                }
+                BinaryOperator::And | BinaryOperator::Or
+                    if (left_base == BaseType::Bool || null_expression(left))
+                        && (right_base == BaseType::Bool || null_expression(right)) =>
                 {
                     Ok(BaseType::Bool)
                 }
@@ -511,10 +529,43 @@ fn expression_type(expr: &Expr, schema: &TableSchema) -> Result<BaseType> {
                 )),
             }
         }
+        Expr::IsNull(_) | Expr::IsNotNull(_) => Ok(BaseType::Bool),
+        Expr::IsTrue(expr) | Expr::IsFalse(expr) | Expr::IsUnknown(expr) => {
+            let base = expression_type(expr, schema)?;
+            if base == BaseType::Bool || null_expression(expr) {
+                Ok(BaseType::Bool)
+            } else {
+                Err(PgError::new(
+                    SqlState::DatatypeMismatch,
+                    "operator has incompatible type",
+                ))
+            }
+        }
+        Expr::IsDistinctFrom(left, right) | Expr::IsNotDistinctFrom(left, right) => {
+            let left_base = expression_type(left, schema)?;
+            let right_base = expression_type(right, schema)?;
+            if comparable(left_base, right_base) || null_expression(left) || null_expression(right)
+            {
+                Ok(BaseType::Bool)
+            } else {
+                Err(PgError::new(
+                    SqlState::DatatypeMismatch,
+                    "operator has incompatible types",
+                ))
+            }
+        }
         _ => Err(PgError::new(
             SqlState::FeatureNotSupported,
             "expression is not implemented",
         )),
+    }
+}
+
+fn null_expression(expr: &Expr) -> bool {
+    match expr {
+        Expr::Value(AstValue::Null) => true,
+        Expr::Nested(expr) => null_expression(expr),
+        _ => false,
     }
 }
 
@@ -563,19 +614,53 @@ fn evaluate(expr: &Expr, schema: &TableSchema, row: &[Value]) -> Result<Value> {
                 | BinaryOperator::Minus
                 | BinaryOperator::Multiply
                 | BinaryOperator::Divide
-                | BinaryOperator::Modulo => arithmetic(op, left, right),
+                | BinaryOperator::Modulo => {
+                    if left.is_null() || right.is_null() {
+                        Ok(Value::Null)
+                    } else {
+                        arithmetic(op, left, right)
+                    }
+                }
                 BinaryOperator::Eq
                 | BinaryOperator::NotEq
                 | BinaryOperator::Gt
                 | BinaryOperator::Lt
                 | BinaryOperator::GtEq
-                | BinaryOperator::LtEq => comparison(op, &left, &right),
+                | BinaryOperator::LtEq => {
+                    if left.is_null() || right.is_null() {
+                        Ok(Value::Null)
+                    } else {
+                        comparison(op, &left, &right)
+                    }
+                }
+                BinaryOperator::And | BinaryOperator::Or => boolean_binary(op, left, right),
                 _ => Err(PgError::new(
                     SqlState::FeatureNotSupported,
                     "operator is not implemented",
                 )),
             }
         }
+        Expr::IsNull(expr) => Ok(Value::Bool(evaluate(expr, schema, row)?.is_null())),
+        Expr::IsNotNull(expr) => Ok(Value::Bool(!evaluate(expr, schema, row)?.is_null())),
+        Expr::IsTrue(expr) => Ok(Value::Bool(matches!(
+            evaluate(expr, schema, row)?,
+            Value::Bool(true)
+        ))),
+        Expr::IsFalse(expr) => Ok(Value::Bool(matches!(
+            evaluate(expr, schema, row)?,
+            Value::Bool(false)
+        ))),
+        Expr::IsUnknown(expr) => Ok(Value::Bool(evaluate(expr, schema, row)?.is_null())),
+        Expr::IsDistinctFrom(left, right) => distinct(
+            evaluate(left, schema, row)?,
+            evaluate(right, schema, row)?,
+            false,
+        ),
+        Expr::IsNotDistinctFrom(left, right) => distinct(
+            evaluate(left, schema, row)?,
+            evaluate(right, schema, row)?,
+            true,
+        ),
         _ => Err(PgError::new(
             SqlState::FeatureNotSupported,
             "expression is not implemented",
@@ -584,6 +669,9 @@ fn evaluate(expr: &Expr, schema: &TableSchema, row: &[Value]) -> Result<Value> {
 }
 
 fn unary(operator: UnaryOperator, value: Value) -> Result<Value> {
+    if value.is_null() {
+        return Ok(Value::Null);
+    }
     match (operator, value) {
         (UnaryOperator::Plus, value @ (Value::Int2(_) | Value::Int4(_) | Value::Int8(_))) => {
             Ok(value)
@@ -607,10 +695,42 @@ fn unary(operator: UnaryOperator, value: Value) -> Result<Value> {
         (UnaryOperator::Minus, Value::Float4(value)) => Ok(Value::Float4(-value)),
         (UnaryOperator::Minus, Value::Float8(value)) => Ok(Value::Float8(-value)),
         (UnaryOperator::Minus, Value::Numeric(value)) => Ok(Value::Numeric(-value)),
+        (UnaryOperator::Not, Value::Bool(value)) => Ok(Value::Bool(!value)),
         _ => Err(PgError::new(
             SqlState::DatatypeMismatch,
             "operator has incompatible type",
         )),
+    }
+}
+
+fn boolean_binary(operator: &BinaryOperator, left: Value, right: Value) -> Result<Value> {
+    match (operator, left, right) {
+        (BinaryOperator::And, Value::Bool(false), _)
+        | (BinaryOperator::And, _, Value::Bool(false)) => Ok(Value::Bool(false)),
+        (BinaryOperator::And, Value::Bool(true), value)
+        | (BinaryOperator::And, value, Value::Bool(true)) => Ok(value),
+        (BinaryOperator::And, Value::Null, Value::Null) => Ok(Value::Null),
+        (BinaryOperator::Or, Value::Bool(true), _) | (BinaryOperator::Or, _, Value::Bool(true)) => {
+            Ok(Value::Bool(true))
+        }
+        (BinaryOperator::Or, Value::Bool(false), value)
+        | (BinaryOperator::Or, value, Value::Bool(false)) => Ok(value),
+        (BinaryOperator::Or, Value::Null, Value::Null) => Ok(Value::Null),
+        _ => Err(PgError::new(
+            SqlState::DatatypeMismatch,
+            "operator has incompatible types",
+        )),
+    }
+}
+
+fn distinct(left: Value, right: Value, equal: bool) -> Result<Value> {
+    match (&left, &right) {
+        (Value::Null, Value::Null) => Ok(Value::Bool(equal)),
+        (Value::Null, _) | (_, Value::Null) => Ok(Value::Bool(!equal)),
+        _ => match comparison(&BinaryOperator::Eq, &left, &right)? {
+            Value::Bool(value) => Ok(Value::Bool(value == equal)),
+            _ => unreachable!("comparison always returns a boolean"),
+        },
     }
 }
 

@@ -292,7 +292,7 @@ task 27).
 coercion module (task 21). Boolean logic and NULL propagation are refined in
 task 16.
 
-### Task 16 — Three-valued logic & NULL semantics
+### Task 16 — Three-valued logic & NULL semantics [COMPLETE]
 **Goal:** Correct SQL NULL behavior across operators (§1.3, §3.1).
 
 **DoD:**

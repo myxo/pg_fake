@@ -193,6 +193,25 @@ fn evaluates_arithmetic_and_comparison_projections() {
 }
 
 #[test]
+fn evaluates_null_and_three_valued_logic() {
+    assert_differential(
+        "CREATE TABLE __TABLE__ (id INTEGER, a BOOLEAN, b BOOLEAN); \
+         INSERT INTO __TABLE__ VALUES \
+             (1, TRUE, TRUE), (2, TRUE, FALSE), (3, TRUE, NULL), \
+             (4, FALSE, TRUE), (5, FALSE, FALSE), (6, FALSE, NULL), \
+             (7, NULL, TRUE), (8, NULL, FALSE), (9, NULL, NULL); \
+         SELECT \
+             a AND b, a OR b, NOT a, \
+             a IS TRUE, a IS FALSE, a IS UNKNOWN, a IS NULL, a IS NOT NULL, \
+             a IS DISTINCT FROM b, a IS NOT DISTINCT FROM b, \
+             id + NULL, id = NULL, \
+             id IS DISTINCT FROM NULL, id IS NOT DISTINCT FROM NULL \
+         FROM __TABLE__",
+        RowOrder::Ordered,
+    );
+}
+
+#[test]
 fn reports_arithmetic_errors() {
     assert_differential(
         "CREATE TABLE __TABLE__ (id INTEGER);\
