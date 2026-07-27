@@ -183,6 +183,27 @@ fn compares_rows_in_order_when_requested() {
 }
 
 #[test]
+fn evaluates_arithmetic_and_comparison_projections() {
+    assert_differential(
+        "CREATE TABLE __TABLE__ (id INTEGER, amount INTEGER, name TEXT, price NUMERIC);\
+         INSERT INTO __TABLE__ VALUES (7, 3, 'seven', 2.5);\
+         SELECT id + amount, id - amount, id * amount, id / amount, id % amount, id > amount, name = 'seven', price * 2.0 FROM __TABLE__",
+        RowOrder::Unordered,
+    );
+}
+
+#[test]
+fn reports_arithmetic_errors() {
+    assert_differential(
+        "CREATE TABLE __TABLE__ (id INTEGER);\
+         INSERT INTO __TABLE__ VALUES (2147483647);\
+         SELECT id / 0 FROM __TABLE__;\
+         SELECT id + 1 FROM __TABLE__",
+        RowOrder::Unordered,
+    );
+}
+
+#[test]
 fn compares_sqlstate_errors() {
     assert_differential(
         "CREATE TABLE __TABLE__ (id INTEGER);\

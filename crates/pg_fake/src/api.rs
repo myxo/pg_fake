@@ -210,6 +210,81 @@ mod tests {
     }
 
     #[test]
+    fn evaluates_arithmetic_and_comparison_projections() {
+        let db = Db::new();
+        let mut session = db.session();
+        session
+            .execute("CREATE TABLE items (id INTEGER, amount INTEGER, name TEXT, price NUMERIC)")
+            .unwrap();
+        session
+            .execute("INSERT INTO items VALUES (7, 3, 'seven', 2.5)")
+            .unwrap();
+
+        let result = session
+            .query(
+                "SELECT id + amount, id - amount, id * amount, id / amount, id % amount, id > amount, name = 'seven', price * 2.0 FROM items",
+                &[],
+            )
+            .unwrap();
+
+        assert_eq!(
+            result.rows,
+            vec![vec![
+                Value::Int4(10),
+                Value::Int4(4),
+                Value::Int4(21),
+                Value::Int4(2),
+                Value::Int4(1),
+                Value::Bool(true),
+                Value::Bool(true),
+                Value::Numeric("5.00".parse().unwrap()),
+            ]]
+        );
+        assert_eq!(
+            result
+                .columns
+                .iter()
+                .map(|column| column.name.as_str())
+                .collect::<Vec<_>>(),
+            vec!["?column?"; 8]
+        );
+        assert_eq!(
+            result
+                .columns
+                .iter()
+                .map(|column| (column.type_oid, column.typmod))
+                .collect::<Vec<_>>(),
+            vec![
+                (BaseType::Int4.oid(), -1),
+                (BaseType::Int4.oid(), -1),
+                (BaseType::Int4.oid(), -1),
+                (BaseType::Int4.oid(), -1),
+                (BaseType::Int4.oid(), -1),
+                (BaseType::Bool.oid(), -1),
+                (BaseType::Bool.oid(), -1),
+                (BaseType::Numeric.oid(), -1),
+            ]
+        );
+        assert_eq!(
+            session
+                .query("SELECT id / 0 FROM items", &[])
+                .unwrap_err()
+                .sqlstate,
+            SqlState::DivisionByZero
+        );
+        session
+            .execute("INSERT INTO items VALUES (2147483647, 1, 'max', 1.0)")
+            .unwrap();
+        assert_eq!(
+            session
+                .query("SELECT id + 1 FROM items", &[])
+                .unwrap_err()
+                .sqlstate,
+            SqlState::NumericValueOutOfRange
+        );
+    }
+
+    #[test]
     fn insert_uses_exact_literal_types_and_commits() {
         let db = Db::new();
         let mut session = db.session();

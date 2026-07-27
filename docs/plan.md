@@ -255,7 +255,7 @@ one big lock is introduced here as a plain `Mutex`; task 29 upgrades usage to th
 
 **Notes:** From here on, every feature task adds differential cases to its DoD.
 
-### Task 14 — Benchmark harness (vs real Postgres 18)
+### Task 14 — Benchmark harness (vs real Postgres 18) [COMPLETE]
 **Goal:** Validate the core premise — `pg_fake` is dramatically faster than real
 Postgres for the same workload — and keep it measurable over time.
 
@@ -270,14 +270,14 @@ Postgres for the same workload — and keep it measurable over time.
   least an order of magnitude faster on these workloads.
 
 **Notes:** The harness is infrastructure; later feature tasks extend it with new
-workloads (notably mutations after tasks 18–19 and transactions after Milestone
-G).
+workloads (notably mutations after tasks 18–19 and explicit transactions after
+task 27).
 
 ---
 
-## Milestone D — Expressions, filtering & CRUD
+## Milestone D — Expressions, filtering, mutations & basic transactions
 
-### Task 15 — Expression evaluator: literals, column refs, arithmetic, comparisons
+### Task 15 — Expression evaluator: literals, column refs, arithmetic, comparisons [COMPLETE]
 **Goal:** Evaluate scalar expressions over a row (§3.1).
 
 **DoD:**
@@ -329,7 +329,43 @@ set.
   benchmark workload added to task 14's suite.
 
 **Notes:** Exact types only until task 21. No `FROM`/join in `UPDATE` (Phase 2).
-Constraint checks arrive in Milestone F.
+Constraint checks arrive in Milestone F. Task 27 validates updates inside
+explicit transactions.
+
+### Task 27 — Explicit transactions + aborted-state machine
+**Goal:** User-driven transaction boundaries for the available `INSERT`,
+`SELECT`, and `UPDATE` operations, with API-level correctness coverage (§5.7).
+
+**DoD:**
+- `BEGIN` / `START TRANSACTION`, `COMMIT`, and `ROLLBACK` via SQL, plus
+  `Session::begin()` returning a `Transaction` RAII guard (drop = rollback);
+  both drive one shared session state machine (§8).
+- A statement issued while the session has an active explicit transaction reuses
+  its `Xid`; it does not enter the implicit-autocommit path. `BEGIN` itself also
+  bypasses that path.
+- An active transaction reads its own inserted and updated versions. A separate
+  session cannot read them before commit, and can read them after commit.
+- `ROLLBACK` marks the transaction aborted so its inserted and updated versions
+  are invisible; physical cleanup remains deferred to garbage collection.
+- An execution error inside a transaction poisons it: subsequent ordinary
+  statements raise `25P02`; `ROLLBACK` restores the session, and `COMMIT` of a
+  poisoned transaction aborts it.
+- DDL inside an explicit transaction is rejected as unsupported until
+  transactional catalog changes are implemented in Phase 3; it must not leak an
+  unrollbackable catalog change.
+- Public-API integration tests use only `Db`, `Session`, `Transaction`,
+  `execute`, and `query` to verify own-write visibility, cross-session
+  invisibility before commit, commit visibility, rollback invisibility,
+  multi-statement transactions, unchanged autocommit behavior, poisoned state,
+  and RAII rollback on drop.
+- The differential harness supports ordered operations on named sessions. A
+  two-session Postgres-18 case covers an uncommitted insert and update,
+  visibility after commit, and invisibility after rollback.
+- A transaction benchmark workload is added to task 14's suite.
+
+**Notes:** This task uses the existing default snapshot policy only. Isolation
+level selection, READ COMMITTED versus REPEATABLE READ behavior, row locking,
+and deadlock detection remain tasks 28–30.
 
 ### Task 19 — `DELETE`
 **Goal:** Remove rows (§5.1).
@@ -452,23 +488,6 @@ concurrency edge cases are further validated in Milestone G.
 ---
 
 ## Milestone G — Transactions & concurrency
-
-### Task 27 — Explicit transactions + aborted-state machine
-**Goal:** User-driven transaction boundaries and error poisoning (§5.7).
-
-**DoD:**
-- `BEGIN` / `START TRANSACTION`, `COMMIT`, `ROLLBACK` via SQL, plus
-  `Session::begin()` returning a `Transaction` RAII guard (drop = rollback);
-  both drive one shared state machine (§8).
-- An error inside a transaction poisons it: subsequent statements (except
-  `ROLLBACK`/`COMMIT`) raise `25P02`; `COMMIT` of a poisoned transaction rolls
-  back.
-- Rollback discards the transaction's versions (marked aborted; invisible).
-- Differential cases: multi-statement transactions, rollback semantics, and the
-  aborted-state behavior.
-
-**Notes:** Isolation-level behavior is task 28; this task establishes boundaries
-and the state machine under a single default snapshot policy.
 
 ### Task 28 — Isolation levels (READ COMMITTED + REPEATABLE READ)
 **Goal:** Per-statement vs per-transaction snapshots and level selection (§5.4).

@@ -1,16 +1,16 @@
 use crate::{
     api::{ColumnMeta, QueryResult},
-    catalog::{Catalog, ColumnDef, TableId},
+    catalog::{Catalog, ColumnDef, TableId, TableSchema},
     error::{PgError, Result, SqlState},
     storage::Table,
     txn::{Snapshot, TransactionManager, Xid, visible_version},
     value::{BaseType, PgType, Value},
 };
 use sqlparser::ast::{
-    ColumnOption, Expr, GroupByExpr, Ident, ObjectType, SelectItem, SetExpr, Statement,
-    TableConstraint, TableFactor, Value as AstValue,
+    BinaryOperator, ColumnOption, Expr, GroupByExpr, Ident, ObjectType, SelectItem, SetExpr,
+    Statement, TableConstraint, TableFactor, UnaryOperator, Value as AstValue,
 };
-use std::collections::BTreeMap;
+use std::{cmp::Ordering, collections::BTreeMap};
 
 pub(crate) struct DatabaseState {
     pub catalog: Catalog,
@@ -20,6 +20,10 @@ pub(crate) struct DatabaseState {
 pub(crate) enum ExecutionResult {
     Affected(u64),
     Query(QueryResult),
+}
+enum Projection<'a> {
+    Column(usize),
+    Expression(&'a Expr),
 }
 impl DatabaseState {
     pub fn new() -> Self {
@@ -338,23 +342,38 @@ fn select_rows(
         ));
     }
     let schema = state.catalog.table(&name(table_name)?)?;
-    let mut indexes = Vec::new();
+    let mut projections = Vec::new();
+    let mut columns = Vec::new();
     for item in &select.projection {
         match item {
-            SelectItem::Wildcard(_) => indexes.extend(0..schema.columns.len()),
+            SelectItem::Wildcard(_) => {
+                for (index, column) in schema.columns.iter().enumerate() {
+                    projections.push(Projection::Column(index));
+                    columns.push(ColumnMeta {
+                        name: column.name.clone(),
+                        type_oid: column.data_type.oid(),
+                        typmod: column.data_type.typmod,
+                    });
+                }
+            }
             SelectItem::UnnamedExpr(Expr::Identifier(column)) => {
-                indexes.push(
-                    schema
-                        .columns
-                        .iter()
-                        .position(|definition| definition.name == identifier_name(column))
-                        .ok_or_else(|| {
-                            PgError::new(
-                                SqlState::UndefinedColumn,
-                                format!("column {:?} does not exist", column.value),
-                            )
-                        })?,
-                );
+                let index = column_index(schema, column)?;
+                let column = &schema.columns[index];
+                projections.push(Projection::Column(index));
+                columns.push(ColumnMeta {
+                    name: column.name.clone(),
+                    type_oid: column.data_type.oid(),
+                    typmod: column.data_type.typmod,
+                });
+            }
+            SelectItem::UnnamedExpr(expr) => {
+                let data_type = expression_type(expr, schema)?;
+                projections.push(Projection::Expression(expr));
+                columns.push(ColumnMeta {
+                    name: "?column?".into(),
+                    type_oid: data_type.oid(),
+                    typmod: PgType::NO_TYPEMOD,
+                });
             }
             _ => {
                 return Err(PgError::new(
@@ -364,17 +383,6 @@ fn select_rows(
             }
         }
     }
-    let columns = indexes
-        .iter()
-        .map(|index| {
-            let column = &schema.columns[*index];
-            ColumnMeta {
-                name: column.name.clone(),
-                type_oid: column.data_type.oid(),
-                typmod: column.data_type.typmod,
-            }
-        })
-        .collect();
     let table = state
         .tables
         .get(&schema.id)
@@ -383,37 +391,20 @@ fn select_rows(
         .rows()
         .filter_map(|(_, chain)| visible_version(chain, snapshot, xid))
         .map(|version| {
-            indexes
+            projections
                 .iter()
-                .map(|index| version.row[*index].clone())
-                .collect()
+                .map(|projection| match projection {
+                    Projection::Column(index) => Ok(version.row[*index].clone()),
+                    Projection::Expression(expr) => evaluate(expr, schema, &version.row),
+                })
+                .collect::<Result<Vec<_>>>()
         })
-        .collect();
+        .collect::<Result<Vec<_>>>()?;
     Ok(ExecutionResult::Query(QueryResult { columns, rows }))
 }
 
 fn value(expr: &Expr, base: BaseType) -> Result<Value> {
-    let value = match expr {
-        Expr::Value(AstValue::Null) => Value::Null,
-        Expr::Value(AstValue::Boolean(value)) => Value::Bool(*value),
-        Expr::Value(AstValue::SingleQuotedString(value)) => Value::Text(value.clone()),
-        Expr::Value(AstValue::Number(value, _)) if value.contains(['.', 'e', 'E']) => {
-            Value::parse(BaseType::Numeric, value)?
-        }
-        Expr::Value(AstValue::Number(value, _)) => Value::parse(BaseType::Int4, value)?,
-        Expr::Value(_) => {
-            return Err(PgError::new(
-                SqlState::CannotCoerce,
-                "literal has incompatible type",
-            ));
-        }
-        _ => {
-            return Err(PgError::new(
-                SqlState::FeatureNotSupported,
-                "INSERT expressions are not implemented",
-            ));
-        }
-    };
+    let value = literal_value(expr)?;
     if value.is_null()
         || value.base_type() == Some(base)
         || matches!(
@@ -427,5 +418,338 @@ fn value(expr: &Expr, base: BaseType) -> Result<Value> {
             SqlState::DatatypeMismatch,
             "column has incompatible type",
         ))
+    }
+}
+
+fn literal_value(expr: &Expr) -> Result<Value> {
+    match expr {
+        Expr::Value(AstValue::Null) => Ok(Value::Null),
+        Expr::Value(AstValue::Boolean(value)) => Ok(Value::Bool(*value)),
+        Expr::Value(AstValue::SingleQuotedString(value)) => Ok(Value::Text(value.clone())),
+        Expr::Value(AstValue::Number(value, _)) if value.contains(['.', 'e', 'E']) => {
+            Value::parse(BaseType::Numeric, value)
+        }
+        Expr::Value(AstValue::Number(value, _)) => Value::parse(BaseType::Int4, value),
+        Expr::Value(_) => Err(PgError::new(
+            SqlState::CannotCoerce,
+            "literal has incompatible type",
+        )),
+        _ => Err(PgError::new(
+            SqlState::FeatureNotSupported,
+            "expression is not implemented",
+        )),
+    }
+}
+
+fn column_index(schema: &TableSchema, column: &Ident) -> Result<usize> {
+    schema
+        .columns
+        .iter()
+        .position(|definition| definition.name == identifier_name(column))
+        .ok_or_else(|| {
+            PgError::new(
+                SqlState::UndefinedColumn,
+                format!("column {:?} does not exist", column.value),
+            )
+        })
+}
+
+fn expression_type(expr: &Expr, schema: &TableSchema) -> Result<BaseType> {
+    match expr {
+        Expr::Identifier(column) => {
+            Ok(schema.columns[column_index(schema, column)?].data_type.base)
+        }
+        Expr::Value(AstValue::Null) => Ok(BaseType::Text),
+        Expr::Value(AstValue::Boolean(_)) => Ok(BaseType::Bool),
+        Expr::Value(AstValue::SingleQuotedString(_)) => Ok(BaseType::Text),
+        Expr::Value(AstValue::Number(value, _)) if value.contains(['.', 'e', 'E']) => {
+            Ok(BaseType::Numeric)
+        }
+        Expr::Value(AstValue::Number(_, _)) => Ok(BaseType::Int4),
+        Expr::Value(_) => Err(PgError::new(
+            SqlState::FeatureNotSupported,
+            "literal is not implemented",
+        )),
+        Expr::Nested(expr) => expression_type(expr, schema),
+        Expr::UnaryOp { op, expr } => {
+            let base = expression_type(expr, schema)?;
+            if matches!(op, UnaryOperator::Plus | UnaryOperator::Minus) && numeric(base) {
+                Ok(base)
+            } else {
+                Err(PgError::new(
+                    SqlState::DatatypeMismatch,
+                    "operator has incompatible type",
+                ))
+            }
+        }
+        Expr::BinaryOp { left, op, right } => {
+            let left_base = expression_type(left, schema)?;
+            let right_base = expression_type(right, schema)?;
+            match op {
+                BinaryOperator::Plus
+                | BinaryOperator::Minus
+                | BinaryOperator::Multiply
+                | BinaryOperator::Divide
+                | BinaryOperator::Modulo
+                    if numeric(left_base) && left_base == right_base =>
+                {
+                    Ok(left_base)
+                }
+                BinaryOperator::Eq
+                | BinaryOperator::NotEq
+                | BinaryOperator::Gt
+                | BinaryOperator::Lt
+                | BinaryOperator::GtEq
+                | BinaryOperator::LtEq
+                    if comparable(left_base, right_base) =>
+                {
+                    Ok(BaseType::Bool)
+                }
+                _ => Err(PgError::new(
+                    SqlState::DatatypeMismatch,
+                    "operator has incompatible types",
+                )),
+            }
+        }
+        _ => Err(PgError::new(
+            SqlState::FeatureNotSupported,
+            "expression is not implemented",
+        )),
+    }
+}
+
+fn numeric(base: BaseType) -> bool {
+    matches!(
+        base,
+        BaseType::Int2
+            | BaseType::Int4
+            | BaseType::Int8
+            | BaseType::Float4
+            | BaseType::Float8
+            | BaseType::Numeric
+    )
+}
+
+fn comparable(left: BaseType, right: BaseType) -> bool {
+    left == right
+        || matches!(
+            (left, right),
+            (
+                BaseType::Text | BaseType::Varchar | BaseType::Bpchar,
+                BaseType::Text | BaseType::Varchar | BaseType::Bpchar
+            )
+        )
+}
+
+fn evaluate(expr: &Expr, schema: &TableSchema, row: &[Value]) -> Result<Value> {
+    match expr {
+        Expr::Identifier(column) => Ok(row[column_index(schema, column)?].clone()),
+        Expr::Value(_) => literal_value(expr),
+        Expr::Nested(expr) => evaluate(expr, schema, row),
+        Expr::UnaryOp { op, expr } => {
+            if matches!(op, UnaryOperator::Minus)
+                && let Expr::Value(AstValue::Number(value, _)) = expr.as_ref()
+                && !value.contains(['.', 'e', 'E'])
+            {
+                return Value::parse(BaseType::Int4, &format!("-{value}"));
+            }
+            unary(*op, evaluate(expr, schema, row)?)
+        }
+        Expr::BinaryOp { left, op, right } => {
+            let left = evaluate(left, schema, row)?;
+            let right = evaluate(right, schema, row)?;
+            match op {
+                BinaryOperator::Plus
+                | BinaryOperator::Minus
+                | BinaryOperator::Multiply
+                | BinaryOperator::Divide
+                | BinaryOperator::Modulo => arithmetic(op, left, right),
+                BinaryOperator::Eq
+                | BinaryOperator::NotEq
+                | BinaryOperator::Gt
+                | BinaryOperator::Lt
+                | BinaryOperator::GtEq
+                | BinaryOperator::LtEq => comparison(op, &left, &right),
+                _ => Err(PgError::new(
+                    SqlState::FeatureNotSupported,
+                    "operator is not implemented",
+                )),
+            }
+        }
+        _ => Err(PgError::new(
+            SqlState::FeatureNotSupported,
+            "expression is not implemented",
+        )),
+    }
+}
+
+fn unary(operator: UnaryOperator, value: Value) -> Result<Value> {
+    match (operator, value) {
+        (UnaryOperator::Plus, value @ (Value::Int2(_) | Value::Int4(_) | Value::Int8(_))) => {
+            Ok(value)
+        }
+        (
+            UnaryOperator::Plus,
+            value @ (Value::Float4(_) | Value::Float8(_) | Value::Numeric(_)),
+        ) => Ok(value),
+        (UnaryOperator::Minus, Value::Int2(value)) => value
+            .checked_neg()
+            .map(Value::Int2)
+            .ok_or_else(|| PgError::new(SqlState::NumericValueOutOfRange, "smallint out of range")),
+        (UnaryOperator::Minus, Value::Int4(value)) => value
+            .checked_neg()
+            .map(Value::Int4)
+            .ok_or_else(|| PgError::new(SqlState::NumericValueOutOfRange, "integer out of range")),
+        (UnaryOperator::Minus, Value::Int8(value)) => value
+            .checked_neg()
+            .map(Value::Int8)
+            .ok_or_else(|| PgError::new(SqlState::NumericValueOutOfRange, "bigint out of range")),
+        (UnaryOperator::Minus, Value::Float4(value)) => Ok(Value::Float4(-value)),
+        (UnaryOperator::Minus, Value::Float8(value)) => Ok(Value::Float8(-value)),
+        (UnaryOperator::Minus, Value::Numeric(value)) => Ok(Value::Numeric(-value)),
+        _ => Err(PgError::new(
+            SqlState::DatatypeMismatch,
+            "operator has incompatible type",
+        )),
+    }
+}
+
+fn arithmetic(operator: &BinaryOperator, left: Value, right: Value) -> Result<Value> {
+    macro_rules! integer {
+        ($left:expr, $right:expr, $variant:ident, $name:literal) => {{
+            if matches!(operator, BinaryOperator::Divide | BinaryOperator::Modulo) && $right == 0 {
+                return Err(PgError::new(SqlState::DivisionByZero, "division by zero"));
+            }
+            let value = match operator {
+                BinaryOperator::Plus => $left.checked_add($right),
+                BinaryOperator::Minus => $left.checked_sub($right),
+                BinaryOperator::Multiply => $left.checked_mul($right),
+                BinaryOperator::Divide => $left.checked_div($right),
+                BinaryOperator::Modulo => $left.checked_rem($right),
+                _ => unreachable!("arithmetic operator was checked by caller"),
+            };
+            value.map(Value::$variant).ok_or_else(|| {
+                PgError::new(
+                    SqlState::NumericValueOutOfRange,
+                    concat!($name, " out of range"),
+                )
+            })
+        }};
+    }
+
+    match (left, right) {
+        (Value::Int2(left), Value::Int2(right)) => integer!(left, right, Int2, "smallint"),
+        (Value::Int4(left), Value::Int4(right)) => integer!(left, right, Int4, "integer"),
+        (Value::Int8(left), Value::Int8(right)) => integer!(left, right, Int8, "bigint"),
+        (Value::Float4(left), Value::Float4(right)) => {
+            if matches!(operator, BinaryOperator::Divide | BinaryOperator::Modulo) && right == 0.0 {
+                return Err(PgError::new(SqlState::DivisionByZero, "division by zero"));
+            }
+            let value = match operator {
+                BinaryOperator::Plus => left + right,
+                BinaryOperator::Minus => left - right,
+                BinaryOperator::Multiply => left * right,
+                BinaryOperator::Divide => left / right,
+                BinaryOperator::Modulo => left % right,
+                _ => unreachable!("arithmetic operator was checked by caller"),
+            };
+            if value.is_infinite() && left.is_finite() && right.is_finite() {
+                Err(PgError::new(
+                    SqlState::NumericValueOutOfRange,
+                    "real out of range",
+                ))
+            } else {
+                Ok(Value::Float4(value))
+            }
+        }
+        (Value::Float8(left), Value::Float8(right)) => {
+            if matches!(operator, BinaryOperator::Divide | BinaryOperator::Modulo) && right == 0.0 {
+                return Err(PgError::new(SqlState::DivisionByZero, "division by zero"));
+            }
+            let value = match operator {
+                BinaryOperator::Plus => left + right,
+                BinaryOperator::Minus => left - right,
+                BinaryOperator::Multiply => left * right,
+                BinaryOperator::Divide => left / right,
+                BinaryOperator::Modulo => left % right,
+                _ => unreachable!("arithmetic operator was checked by caller"),
+            };
+            if value.is_infinite() && left.is_finite() && right.is_finite() {
+                Err(PgError::new(
+                    SqlState::NumericValueOutOfRange,
+                    "double precision out of range",
+                ))
+            } else {
+                Ok(Value::Float8(value))
+            }
+        }
+        (Value::Numeric(left), Value::Numeric(right)) => {
+            if matches!(operator, BinaryOperator::Divide | BinaryOperator::Modulo) && right == 0 {
+                return Err(PgError::new(SqlState::DivisionByZero, "division by zero"));
+            }
+            Ok(Value::Numeric(match operator {
+                BinaryOperator::Plus => left + right,
+                BinaryOperator::Minus => left - right,
+                BinaryOperator::Multiply => left * right,
+                BinaryOperator::Divide => left / right,
+                BinaryOperator::Modulo => left % right,
+                _ => unreachable!("arithmetic operator was checked by caller"),
+            }))
+        }
+        _ => Err(PgError::new(
+            SqlState::DatatypeMismatch,
+            "operator has incompatible types",
+        )),
+    }
+}
+
+fn comparison(operator: &BinaryOperator, left: &Value, right: &Value) -> Result<Value> {
+    let ordering = match (left, right) {
+        (Value::Bool(left), Value::Bool(right)) => left.cmp(right),
+        (Value::Int2(left), Value::Int2(right)) => left.cmp(right),
+        (Value::Int4(left), Value::Int4(right)) => left.cmp(right),
+        (Value::Int8(left), Value::Int8(right)) => left.cmp(right),
+        (Value::Float4(left), Value::Float4(right)) => float4_ordering(*left, *right),
+        (Value::Float8(left), Value::Float8(right)) => float8_ordering(*left, *right),
+        (Value::Numeric(left), Value::Numeric(right)) => left.cmp(right),
+        (Value::Text(left), Value::Text(right)) => left.cmp(right),
+        (Value::Bytea(left), Value::Bytea(right)) => left.cmp(right),
+        _ => {
+            return Err(PgError::new(
+                SqlState::DatatypeMismatch,
+                "operator has incompatible types",
+            ));
+        }
+    };
+    Ok(Value::Bool(match operator {
+        BinaryOperator::Eq => ordering == Ordering::Equal,
+        BinaryOperator::NotEq => ordering != Ordering::Equal,
+        BinaryOperator::Gt => ordering == Ordering::Greater,
+        BinaryOperator::Lt => ordering == Ordering::Less,
+        BinaryOperator::GtEq => ordering != Ordering::Less,
+        BinaryOperator::LtEq => ordering != Ordering::Greater,
+        _ => unreachable!("comparison operator was checked by caller"),
+    }))
+}
+
+fn float4_ordering(left: f32, right: f32) -> Ordering {
+    match (left.is_nan(), right.is_nan()) {
+        (true, true) => Ordering::Equal,
+        (true, false) => Ordering::Greater,
+        (false, true) => Ordering::Less,
+        (false, false) => left
+            .partial_cmp(&right)
+            .expect("finite floats are comparable"),
+    }
+}
+
+fn float8_ordering(left: f64, right: f64) -> Ordering {
+    match (left.is_nan(), right.is_nan()) {
+        (true, true) => Ordering::Equal,
+        (true, false) => Ordering::Greater,
+        (false, true) => Ordering::Less,
+        (false, false) => left
+            .partial_cmp(&right)
+            .expect("finite floats are comparable"),
     }
 }
