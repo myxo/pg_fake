@@ -193,6 +193,19 @@ fn evaluates_arithmetic_and_comparison_projections() {
 }
 
 #[test]
+fn filters_with_boolean_expressions() {
+    assert_differential(
+        "CREATE TABLE __TABLE__ (id INTEGER, score INTEGER, active BOOLEAN, optional INTEGER); \
+         INSERT INTO __TABLE__ VALUES \
+             (1, 3, TRUE, NULL), (2, 10, TRUE, 5), \
+             (3, 8, FALSE, 4), (4, NULL, TRUE, 1); \
+         SELECT id, score FROM __TABLE__ \
+         WHERE (score + id > 10 AND active) OR optional IS NULL",
+        RowOrder::Ordered,
+    );
+}
+
+#[test]
 fn evaluates_null_and_three_valued_logic() {
     assert_differential(
         "CREATE TABLE __TABLE__ (id INTEGER, a BOOLEAN, b BOOLEAN); \

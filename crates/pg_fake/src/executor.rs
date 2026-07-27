@@ -306,7 +306,6 @@ fn select_rows(
     };
     if select.distinct.is_some()
         || select.into.is_some()
-        || select.selection.is_some()
         || !group_by.is_empty()
         || !modifiers.is_empty()
         || select.having.is_some()
@@ -342,6 +341,15 @@ fn select_rows(
         ));
     }
     let schema = state.catalog.table(&name(table_name)?)?;
+    if let Some(selection) = &select.selection {
+        let base = expression_type(selection, schema)?;
+        if base != BaseType::Bool && !null_expression(selection) {
+            return Err(PgError::new(
+                SqlState::DatatypeMismatch,
+                "WHERE requires a boolean expression",
+            ));
+        }
+    }
     let mut projections = Vec::new();
     let mut columns = Vec::new();
     for item in &select.projection {
@@ -390,16 +398,25 @@ fn select_rows(
     let rows = table
         .rows()
         .filter_map(|(_, chain)| visible_version(chain, snapshot, xid))
-        .map(|version| {
-            projections
-                .iter()
-                .map(|projection| match projection {
-                    Projection::Column(index) => Ok(version.row[*index].clone()),
-                    Projection::Expression(expr) => evaluate(expr, schema, &version.row),
-                })
-                .collect::<Result<Vec<_>>>()
-        })
-        .collect::<Result<Vec<_>>>()?;
+        .try_fold(Vec::new(), |mut rows, version| -> Result<Vec<Vec<Value>>> {
+            if let Some(selection) = &select.selection {
+                match evaluate(selection, schema, &version.row)? {
+                    Value::Bool(true) => {}
+                    Value::Bool(false) | Value::Null => return Ok(rows),
+                    _ => unreachable!("WHERE expression was type-checked"),
+                }
+            }
+            rows.push(
+                projections
+                    .iter()
+                    .map(|projection| match projection {
+                        Projection::Column(index) => Ok(version.row[*index].clone()),
+                        Projection::Expression(expr) => evaluate(expr, schema, &version.row),
+                    })
+                    .collect::<Result<Vec<_>>>()?,
+            );
+            Ok(rows)
+        })?;
     Ok(ExecutionResult::Query(QueryResult { columns, rows }))
 }
 

@@ -304,7 +304,7 @@ task 16.
 **Notes:** This is Tier A behavior; be exhaustive. Depends on task 15's operator
 set.
 
-### Task 17 — `WHERE` filtering
+### Task 17 — `WHERE` filtering [COMPLETE]
 **Goal:** Filter rows in `SELECT` by a boolean predicate.
 
 **DoD:**
