@@ -198,6 +198,60 @@ fn update_benchmark(criterion: &mut Criterion, postgres: &mut Client) {
         .unwrap();
 }
 
+fn transaction_benchmark(criterion: &mut Criterion, postgres: &mut Client) {
+    let fake_table = unique_table_name("transaction_fake");
+    let postgres_table = unique_table_name("transaction_postgres");
+    let db = Db::new();
+    let mut fake = db.session();
+    assert_eq!(
+        fake.execute(&format!("CREATE TABLE {fake_table} (id INTEGER)"))
+            .unwrap(),
+        0
+    );
+    assert_eq!(
+        postgres
+            .execute(&format!("CREATE TABLE {postgres_table} (id INTEGER)"), &[])
+            .unwrap(),
+        0
+    );
+    let mut fake_id = 0;
+    let mut postgres_id = 0;
+    let mut group = criterion.benchmark_group("transaction_insert");
+
+    group.bench_function("pg_fake", |benchmark| {
+        benchmark.iter(|| {
+            fake_id += 1;
+            assert_eq!(fake.execute("BEGIN").unwrap(), 0);
+            assert_eq!(
+                fake.execute(&format!("INSERT INTO {fake_table} VALUES ({fake_id})"))
+                    .unwrap(),
+                1
+            );
+            assert_eq!(fake.execute("COMMIT").unwrap(), 0);
+        });
+    });
+    group.bench_function("postgres_18", |benchmark| {
+        benchmark.iter(|| {
+            postgres_id += 1;
+            assert_eq!(postgres.execute("BEGIN", &[]).unwrap(), 0);
+            assert_eq!(
+                postgres
+                    .execute(
+                        &format!("INSERT INTO {postgres_table} VALUES ({postgres_id})"),
+                        &[],
+                    )
+                    .unwrap(),
+                1
+            );
+            assert_eq!(postgres.execute("COMMIT", &[]).unwrap(), 0);
+        });
+    });
+    group.finish();
+    postgres
+        .execute(&format!("DROP TABLE {postgres_table}"), &[])
+        .unwrap();
+}
+
 fn select_benchmark(criterion: &mut Criterion, postgres: &mut Client) {
     let fake_table = unique_table_name("select_fake");
     let postgres_table = unique_table_name("select_postgres");
@@ -273,6 +327,7 @@ fn benchmarks(criterion: &mut Criterion) {
     create_table_benchmark(criterion, &mut postgres.client);
     insert_benchmark(criterion, &mut postgres.client);
     update_benchmark(criterion, &mut postgres.client);
+    transaction_benchmark(criterion, &mut postgres.client);
     select_benchmark(criterion, &mut postgres.client);
 }
 

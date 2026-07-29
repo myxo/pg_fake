@@ -332,7 +332,7 @@ set.
 Constraint checks arrive in Milestone F. Task 27 validates updates inside
 explicit transactions.
 
-### Task 27 — Explicit transactions + aborted-state machine
+### Task 27 — Explicit transactions + aborted-state machine [COMPLETE]
 **Goal:** User-driven transaction boundaries for the available `INSERT`,
 `SELECT`, and `UPDATE` operations, with API-level correctness coverage (§5.7).
 

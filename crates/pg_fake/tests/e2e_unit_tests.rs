@@ -29,10 +29,16 @@ enum RowOrder {
     Ordered,
 }
 
-fn assert_differential(script: &str, row_order: RowOrder) {
-    static TABLE_NUMBER: AtomicU64 = AtomicU64::new(1);
-    static TEST_LOCK: Mutex<()> = Mutex::new(());
+#[derive(Clone, Copy)]
+enum SessionName {
+    First,
+    Second,
+}
 
+static TABLE_NUMBER: AtomicU64 = AtomicU64::new(1);
+static TEST_LOCK: Mutex<()> = Mutex::new(());
+
+fn assert_differential(script: &str, row_order: RowOrder) {
     let _test_lock = TEST_LOCK.lock().expect("test mutex must not be poisoned");
     let configured_url = env::var("PG_FAKE_TEST_DATABASE_URL").ok();
     if configured_url.is_none() && env::var_os("DOCKER_HOST").is_none() {
@@ -76,6 +82,75 @@ fn assert_differential(script: &str, row_order: RowOrder) {
         let sql = statement.to_string();
         let expected = postgres_outcome(&mut postgres, &statement, &sql);
         let actual = fake_outcome(&mut fake, &statement, &sql);
+        match (expected, actual) {
+            (Outcome::Rows(mut expected), Outcome::Rows(mut actual)) => {
+                if matches!(row_order, RowOrder::Unordered) {
+                    expected.sort();
+                    actual.sort();
+                }
+                assert_eq!(actual, expected, "{sql}");
+            }
+            (expected, actual) => assert_eq!(actual, expected, "{sql}"),
+        }
+    }
+}
+
+fn assert_session_differential(operations: &[(SessionName, &str)], row_order: RowOrder) {
+    let _test_lock = TEST_LOCK.lock().expect("test mutex must not be poisoned");
+    let configured_url = env::var("PG_FAKE_TEST_DATABASE_URL").ok();
+    if configured_url.is_none() && env::var_os("DOCKER_HOST").is_none() {
+        let socket = PathBuf::from(env::var_os("HOME").expect("HOME must be set"))
+            .join(".colima/default/docker.sock");
+        if socket.exists() {
+            unsafe { env::set_var("DOCKER_HOST", format!("unix://{}", socket.display())) };
+        }
+    }
+
+    let table_name = format!(
+        "pg_fake_differential_{}_{}",
+        std::process::id(),
+        TABLE_NUMBER.fetch_add(1, Ordering::Relaxed)
+    );
+    let operations = operations
+        .iter()
+        .map(|(session, sql)| {
+            let sql = sql.replace("__TABLE__", &table_name);
+            let mut statements = parser::parse(&sql).unwrap();
+            assert_eq!(statements.len(), 1, "operation must contain one statement");
+            (*session, statements.pop().unwrap(), sql)
+        })
+        .collect::<Vec<_>>();
+    let container = configured_url.is_none().then(|| {
+        Postgres::default()
+            .with_tag("18")
+            .start()
+            .expect("must start PostgreSQL 18 container")
+    });
+    let url = configured_url.unwrap_or_else(|| {
+        let container = container.as_ref().expect("container must be started");
+        format!(
+            "postgresql://postgres:postgres@{}:{}/postgres",
+            container
+                .get_host()
+                .expect("container host must be available"),
+            container
+                .get_host_port_ipv4(5432)
+                .expect("PostgreSQL port must be available")
+        )
+    });
+    let mut postgres_first = Client::connect(&url, NoTls).expect("must connect to PostgreSQL");
+    let mut postgres_second = Client::connect(&url, NoTls).expect("must connect to PostgreSQL");
+    let db = Db::new();
+    let mut fake_first = db.session();
+    let mut fake_second = db.session();
+
+    for (session, statement, sql) in operations {
+        let (postgres, fake) = match session {
+            SessionName::First => (&mut postgres_first, &mut fake_first),
+            SessionName::Second => (&mut postgres_second, &mut fake_second),
+        };
+        let expected = postgres_outcome(postgres, &statement, &sql);
+        let actual = fake_outcome(fake, &statement, &sql);
         match (expected, actual) {
             (Outcome::Rows(mut expected), Outcome::Rows(mut actual)) => {
                 if matches!(row_order, RowOrder::Unordered) {
@@ -150,6 +225,38 @@ fn fake_outcome(session: &mut pg_fake::api::Session, statement: &Statement, sql:
             Err(error) => Outcome::Error(error.sqlstate.code().into()),
         },
     }
+}
+
+#[test]
+fn explicit_transactions_match_postgres_across_sessions() {
+    assert_session_differential(
+        &[
+            (
+                SessionName::First,
+                "CREATE TABLE __TABLE__ (id INTEGER, amount INTEGER)",
+            ),
+            (SessionName::First, "INSERT INTO __TABLE__ VALUES (1, 1)"),
+            (SessionName::First, "BEGIN"),
+            (
+                SessionName::First,
+                "UPDATE __TABLE__ SET amount = amount + 1 WHERE id = 1",
+            ),
+            (SessionName::First, "SELECT * FROM __TABLE__"),
+            (SessionName::Second, "SELECT * FROM __TABLE__"),
+            (SessionName::First, "COMMIT"),
+            (SessionName::Second, "SELECT * FROM __TABLE__"),
+            (SessionName::First, "BEGIN"),
+            (SessionName::First, "INSERT INTO __TABLE__ VALUES (2, 2)"),
+            (SessionName::First, "ROLLBACK"),
+            (SessionName::Second, "SELECT * FROM __TABLE__"),
+            (SessionName::First, "BEGIN"),
+            (SessionName::First, "INSERT INTO missing VALUES (1)"),
+            (SessionName::First, "SELECT * FROM __TABLE__"),
+            (SessionName::First, "ROLLBACK"),
+            (SessionName::First, "SELECT * FROM __TABLE__"),
+        ],
+        RowOrder::Unordered,
+    );
 }
 
 #[test]

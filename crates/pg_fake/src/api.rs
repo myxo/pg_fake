@@ -4,7 +4,7 @@ use crate::{
     error::{PgError, Result, SqlState},
     executor::{self, DatabaseState, ExecutionResult},
     parser,
-    txn::Snapshot,
+    txn::{Snapshot, Xid},
     value::{Oid, Value},
 };
 
@@ -25,6 +25,16 @@ pub struct Db {
 }
 pub struct Session {
     db: Db,
+    transaction: Option<SessionTransaction>,
+}
+#[derive(Clone, Copy)]
+enum SessionTransaction {
+    Active(Xid),
+    Aborted(Xid),
+}
+pub struct Transaction<'session> {
+    session: &'session mut Session,
+    finished: bool,
 }
 
 impl Db {
@@ -34,7 +44,10 @@ impl Db {
         }
     }
     pub fn session(&self) -> Session {
-        Session { db: self.clone() }
+        Session {
+            db: self.clone(),
+            transaction: None,
+        }
     }
 }
 impl Default for Db {
@@ -67,15 +80,126 @@ impl Session {
             )),
         }
     }
-    fn run(&mut self, sql: &str) -> Result<ExecutionResult> {
-        let mut statements = parser::parse(sql)?;
-        if statements.len() != 1 {
+    pub fn begin(&mut self) -> Result<Transaction<'_>> {
+        if self.transaction.is_some() {
             return Err(PgError::new(
+                SqlState::ActiveSqlTransaction,
+                "transaction already in progress",
+            ));
+        }
+        self.start_transaction();
+        Ok(Transaction {
+            session: self,
+            finished: false,
+        })
+    }
+    fn start_transaction(&mut self) {
+        let mut state = self.db.state.lock().expect("database mutex is poisoned");
+        self.transaction = Some(SessionTransaction::Active(state.transactions.begin()));
+    }
+    fn finish_transaction(&mut self, commit: bool) {
+        let Some(transaction) = self.transaction.take() else {
+            return;
+        };
+        let xid = match transaction {
+            SessionTransaction::Active(xid) if commit => {
+                let mut state = self.db.state.lock().expect("database mutex is poisoned");
+                state.transactions.commit(xid);
+                return;
+            }
+            SessionTransaction::Active(xid) | SessionTransaction::Aborted(xid) => xid,
+        };
+        let mut state = self.db.state.lock().expect("database mutex is poisoned");
+        state.transactions.abort(xid);
+    }
+    fn abort_transaction(&mut self) {
+        if let Some(SessionTransaction::Active(xid)) = self.transaction {
+            self.transaction = Some(SessionTransaction::Aborted(xid));
+        }
+    }
+    fn failed<T>(&mut self, error: PgError) -> Result<T> {
+        self.abort_transaction();
+        Err(error)
+    }
+    fn run(&mut self, sql: &str) -> Result<ExecutionResult> {
+        let mut statements = match parser::parse(sql) {
+            Ok(statements) => statements,
+            Err(error) => return self.failed(error),
+        };
+        if statements.len() != 1 {
+            return self.failed(PgError::new(
                 SqlState::SyntaxError,
                 "exactly one statement is required",
             ));
         }
         let statement = statements.pop().expect("statement count was checked");
+        match &statement {
+            parser::Statement::StartTransaction { modes, .. } => {
+                if !modes.is_empty() {
+                    return self.failed(PgError::new(
+                        SqlState::FeatureNotSupported,
+                        "transaction modes are not implemented",
+                    ));
+                }
+                return match self.transaction {
+                    None => {
+                        self.start_transaction();
+                        Ok(ExecutionResult::Affected(0))
+                    }
+                    Some(SessionTransaction::Active(_)) => Ok(ExecutionResult::Affected(0)),
+                    Some(SessionTransaction::Aborted(_)) => Err(PgError::new(
+                        SqlState::InFailedSqlTransaction,
+                        "current transaction is aborted",
+                    )),
+                };
+            }
+            parser::Statement::Commit { chain } => {
+                if *chain {
+                    return self.failed(PgError::new(
+                        SqlState::FeatureNotSupported,
+                        "COMMIT AND CHAIN is not implemented",
+                    ));
+                }
+                self.finish_transaction(true);
+                return Ok(ExecutionResult::Affected(0));
+            }
+            parser::Statement::Rollback { chain, savepoint } => {
+                if *chain || savepoint.is_some() {
+                    return self.failed(PgError::new(
+                        SqlState::FeatureNotSupported,
+                        "ROLLBACK variant is not implemented",
+                    ));
+                }
+                self.finish_transaction(false);
+                return Ok(ExecutionResult::Affected(0));
+            }
+            _ => {}
+        }
+        if matches!(self.transaction, Some(SessionTransaction::Aborted(_))) {
+            return Err(PgError::new(
+                SqlState::InFailedSqlTransaction,
+                "current transaction is aborted",
+            ));
+        }
+        if self.transaction.is_some()
+            && matches!(parser::classify(&statement), parser::StatementKind::Ddl)
+        {
+            return self.failed(PgError::new(
+                SqlState::FeatureNotSupported,
+                "DDL in an explicit transaction is not implemented",
+            ));
+        }
+        if let Some(SessionTransaction::Active(xid)) = self.transaction {
+            let mut state = self.db.state.lock().expect("database mutex is poisoned");
+            let snapshot = Snapshot::new(&state.transactions);
+            return match executor::dispatch(&mut state, &statement, xid, &snapshot) {
+                Ok(result) => Ok(result),
+                Err(error) => {
+                    drop(state);
+                    self.failed(error)
+                }
+            };
+        }
         let mut state = self.db.state.lock().expect("database mutex is poisoned");
         let xid = state.transactions.begin();
         let snapshot = Snapshot::new(&state.transactions);
@@ -88,6 +212,33 @@ impl Session {
                 state.transactions.abort(xid);
                 Err(error)
             }
+        }
+    }
+}
+
+impl Transaction<'_> {
+    pub fn execute(&mut self, sql: &str) -> Result<u64> {
+        self.session.execute(sql)
+    }
+    pub fn query(&mut self, sql: &str, params: &[Value]) -> Result<QueryResult> {
+        self.session.query(sql, params)
+    }
+    pub fn commit(mut self) -> Result<()> {
+        self.session.finish_transaction(true);
+        self.finished = true;
+        Ok(())
+    }
+    pub fn rollback(mut self) -> Result<()> {
+        self.session.finish_transaction(false);
+        self.finished = true;
+        Ok(())
+    }
+}
+
+impl Drop for Transaction<'_> {
+    fn drop(&mut self) {
+        if !self.finished {
+            self.session.finish_transaction(false);
         }
     }
 }
@@ -281,6 +432,127 @@ mod tests {
                 .unwrap_err()
                 .sqlstate,
             SqlState::NumericValueOutOfRange
+        );
+    }
+
+    #[test]
+    fn explicit_transactions_control_insert_and_update_visibility() {
+        let db = Db::new();
+        let mut first = db.session();
+        let mut second = db.session();
+        first
+            .execute("CREATE TABLE items (id INTEGER, amount INTEGER)")
+            .unwrap();
+        first.execute("INSERT INTO items VALUES (1, 1)").unwrap();
+
+        first.execute("BEGIN").unwrap();
+        first
+            .execute("UPDATE items SET amount = amount + 1 WHERE id = 1")
+            .unwrap();
+        first.execute("INSERT INTO items VALUES (2, 2)").unwrap();
+        assert_eq!(
+            first.query("SELECT * FROM items", &[]).unwrap().rows,
+            vec![
+                vec![Value::Int4(1), Value::Int4(2)],
+                vec![Value::Int4(2), Value::Int4(2)]
+            ]
+        );
+        assert_eq!(
+            second.query("SELECT * FROM items", &[]).unwrap().rows,
+            vec![vec![Value::Int4(1), Value::Int4(1)]]
+        );
+        first.execute("COMMIT").unwrap();
+        assert_eq!(
+            second.query("SELECT * FROM items", &[]).unwrap().rows,
+            vec![
+                vec![Value::Int4(1), Value::Int4(2)],
+                vec![Value::Int4(2), Value::Int4(2)]
+            ]
+        );
+
+        first.execute("BEGIN").unwrap();
+        first.execute("INSERT INTO items VALUES (3, 3)").unwrap();
+        first.execute("ROLLBACK").unwrap();
+        assert_eq!(
+            second.query("SELECT * FROM items", &[]).unwrap().rows,
+            vec![
+                vec![Value::Int4(1), Value::Int4(2)],
+                vec![Value::Int4(2), Value::Int4(2)]
+            ]
+        );
+        first.execute("INSERT INTO items VALUES (4, 4)").unwrap();
+        assert_eq!(
+            second.query("SELECT * FROM items", &[]).unwrap().rows,
+            vec![
+                vec![Value::Int4(1), Value::Int4(2)],
+                vec![Value::Int4(2), Value::Int4(2)],
+                vec![Value::Int4(4), Value::Int4(4)],
+            ]
+        );
+    }
+
+    #[test]
+    fn explicit_transactions_abort_after_errors_and_raii_rolls_back() {
+        let db = Db::new();
+        let mut session = db.session();
+        let mut reader = db.session();
+        session.execute("CREATE TABLE items (id INTEGER)").unwrap();
+
+        session.execute("BEGIN").unwrap();
+        assert_eq!(
+            session
+                .execute("INSERT INTO missing VALUES (1)")
+                .unwrap_err()
+                .sqlstate,
+            SqlState::UndefinedTable
+        );
+        assert_eq!(
+            session
+                .query("SELECT * FROM items", &[])
+                .unwrap_err()
+                .sqlstate,
+            SqlState::InFailedSqlTransaction
+        );
+        session.execute("ROLLBACK").unwrap();
+        session.execute("INSERT INTO items VALUES (1)").unwrap();
+
+        {
+            let mut transaction = session.begin().unwrap();
+            transaction.execute("INSERT INTO items VALUES (2)").unwrap();
+        }
+        assert_eq!(
+            reader.query("SELECT * FROM items", &[]).unwrap().rows,
+            vec![vec![Value::Int4(1)]]
+        );
+        let mut transaction = session.begin().unwrap();
+        transaction.execute("INSERT INTO items VALUES (3)").unwrap();
+        transaction.commit().unwrap();
+        assert_eq!(
+            reader.query("SELECT * FROM items", &[]).unwrap().rows,
+            vec![vec![Value::Int4(1)], vec![Value::Int4(3)]]
+        );
+    }
+
+    #[test]
+    fn rejects_ddl_inside_explicit_transactions() {
+        let db = Db::new();
+        let mut session = db.session();
+
+        session.execute("BEGIN").unwrap();
+        assert_eq!(
+            session
+                .execute("CREATE TABLE items (id INTEGER)")
+                .unwrap_err()
+                .sqlstate,
+            SqlState::FeatureNotSupported
+        );
+        session.execute("ROLLBACK").unwrap();
+        assert_eq!(
+            session
+                .query("SELECT * FROM items", &[])
+                .unwrap_err()
+                .sqlstate,
+            SqlState::UndefinedTable
         );
     }
 
