@@ -7,9 +7,9 @@ use crate::{
     value::{BaseType, PgType, Value},
 };
 use sqlparser::ast::{
-    AssignmentTarget, BinaryOperator, ColumnOption, Delete, Expr, FromTable, GroupByExpr, Ident,
-    ObjectType, SelectItem, SetExpr, Statement, TableConstraint, TableFactor, TableWithJoins,
-    UnaryOperator, Value as AstValue,
+    AssignmentTarget, BinaryOperator, ColumnOption, Delete, Expr, FromTable, Function, FunctionArg,
+    FunctionArgExpr, FunctionArguments, GroupByExpr, Ident, ObjectType, SelectItem, SetExpr,
+    Statement, TableConstraint, TableFactor, TableWithJoins, UnaryOperator, Value as AstValue,
 };
 use std::{
     cmp::Ordering,
@@ -803,6 +803,48 @@ fn expression_type(expr: &Expr, schema: &TableSchema) -> Result<BaseType> {
                 ))
             }
         }
+        Expr::Case {
+            operand,
+            conditions,
+            results,
+            else_result,
+        } => {
+            assert_eq!(conditions.len(), results.len());
+            if let Some(operand) = operand {
+                let operand_base = expression_type(operand, schema)?;
+                for condition in conditions {
+                    let condition_base = expression_type(condition, schema)?;
+                    if !null_expression(operand)
+                        && !null_expression(condition)
+                        && !comparable(operand_base, condition_base)
+                    {
+                        return Err(PgError::new(
+                            SqlState::DatatypeMismatch,
+                            "CASE types are incompatible",
+                        ));
+                    }
+                }
+            } else {
+                for condition in conditions {
+                    let base = expression_type(condition, schema)?;
+                    if base != BaseType::Bool && !null_expression(condition) {
+                        return Err(PgError::new(
+                            SqlState::DatatypeMismatch,
+                            "CASE condition must be boolean",
+                        ));
+                    }
+                }
+            }
+            common_expression_type(
+                results
+                    .iter()
+                    .chain(else_result.as_deref())
+                    .collect::<Vec<_>>()
+                    .as_slice(),
+                schema,
+            )
+        }
+        Expr::Function(function) => function_type(function, schema),
         _ => Err(PgError::new(
             SqlState::FeatureNotSupported,
             "expression is not implemented",
@@ -839,6 +881,110 @@ fn comparable(left: BaseType, right: BaseType) -> bool {
                 BaseType::Text | BaseType::Varchar | BaseType::Bpchar
             )
         )
+}
+
+fn common_expression_type(expressions: &[&Expr], schema: &TableSchema) -> Result<BaseType> {
+    let mut result = None;
+    for expression in expressions {
+        if null_expression(expression) {
+            continue;
+        }
+        let base = expression_type(expression, schema)?;
+        result = Some(match result {
+            None => base,
+            Some(current) if current == base => current,
+            Some(current) if comparable(current, base) => BaseType::Text,
+            Some(_) => {
+                return Err(PgError::new(
+                    SqlState::DatatypeMismatch,
+                    "expressions have incompatible types",
+                ));
+            }
+        });
+    }
+    Ok(result.unwrap_or(BaseType::Text))
+}
+
+fn function_arguments(function: &Function) -> Result<Vec<&Expr>> {
+    if function.uses_odbc_syntax
+        || !matches!(function.parameters, FunctionArguments::None)
+        || function.filter.is_some()
+        || function.null_treatment.is_some()
+        || function.over.is_some()
+        || !function.within_group.is_empty()
+    {
+        return Err(PgError::new(
+            SqlState::FeatureNotSupported,
+            "function feature is not implemented",
+        ));
+    }
+    let FunctionArguments::List(arguments) = &function.args else {
+        return Err(PgError::new(
+            SqlState::UndefinedFunction,
+            "function signature does not exist",
+        ));
+    };
+    if arguments.duplicate_treatment.is_some() || !arguments.clauses.is_empty() {
+        return Err(PgError::new(
+            SqlState::FeatureNotSupported,
+            "function argument feature is not implemented",
+        ));
+    }
+    arguments
+        .args
+        .iter()
+        .map(|argument| match argument {
+            FunctionArg::Unnamed(FunctionArgExpr::Expr(expression)) => Ok(expression),
+            _ => Err(PgError::new(
+                SqlState::FeatureNotSupported,
+                "function argument is not implemented",
+            )),
+        })
+        .collect()
+}
+
+fn function_type(function: &Function, schema: &TableSchema) -> Result<BaseType> {
+    let function_name = name(&function.name)?;
+    let arguments = function_arguments(function)?;
+    let signature_error = || {
+        PgError::new(
+            SqlState::UndefinedFunction,
+            format!("function {function_name} does not exist"),
+        )
+    };
+    match function_name.as_str() {
+        "coalesce" | "greatest" | "least" if !arguments.is_empty() => {
+            common_expression_type(&arguments, schema)
+        }
+        "nullif" if arguments.len() == 2 => common_expression_type(&arguments, schema),
+        "length" | "lower" | "upper" if arguments.len() == 1 => {
+            let base = expression_type(arguments[0], schema)?;
+            if !null_expression(arguments[0])
+                && !matches!(base, BaseType::Text | BaseType::Varchar | BaseType::Bpchar)
+            {
+                return Err(signature_error());
+            }
+            Ok(if function_name == "length" {
+                BaseType::Int4
+            } else {
+                BaseType::Text
+            })
+        }
+        "abs" if arguments.len() == 1 => {
+            let base = expression_type(arguments[0], schema)?;
+            if !null_expression(arguments[0]) && !numeric(base) {
+                return Err(signature_error());
+            }
+            Ok(base)
+        }
+        "coalesce" | "nullif" | "greatest" | "least" | "length" | "lower" | "upper" | "abs" => {
+            Err(signature_error())
+        }
+        _ => Err(PgError::new(
+            SqlState::UndefinedFunction,
+            format!("function {function_name} does not exist"),
+        )),
+    }
 }
 
 fn evaluate(expr: &Expr, schema: &TableSchema, row: &[Value]) -> Result<Value> {
@@ -910,10 +1056,137 @@ fn evaluate(expr: &Expr, schema: &TableSchema, row: &[Value]) -> Result<Value> {
             evaluate(right, schema, row)?,
             true,
         ),
+        Expr::Case {
+            operand,
+            conditions,
+            results,
+            else_result,
+        } => {
+            let operand = operand
+                .as_deref()
+                .map(|operand| evaluate(operand, schema, row))
+                .transpose()?;
+            for (condition, result) in conditions.iter().zip(results) {
+                let matches = if let Some(operand) = &operand {
+                    let condition = evaluate(condition, schema, row)?;
+                    if operand.is_null() || condition.is_null() {
+                        false
+                    } else {
+                        matches!(
+                            comparison(&BinaryOperator::Eq, operand, &condition)?,
+                            Value::Bool(true)
+                        )
+                    }
+                } else {
+                    matches!(evaluate(condition, schema, row)?, Value::Bool(true))
+                };
+                if matches {
+                    return evaluate(result, schema, row);
+                }
+            }
+            else_result
+                .as_deref()
+                .map(|result| evaluate(result, schema, row))
+                .unwrap_or(Ok(Value::Null))
+        }
+        Expr::Function(function) => evaluate_function(function, schema, row),
         _ => Err(PgError::new(
             SqlState::FeatureNotSupported,
             "expression is not implemented",
         )),
+    }
+}
+
+fn evaluate_function(function: &Function, schema: &TableSchema, row: &[Value]) -> Result<Value> {
+    function_type(function, schema)?;
+    let function_name = name(&function.name)?;
+    let arguments = function_arguments(function)?;
+    match function_name.as_str() {
+        "coalesce" => {
+            for argument in arguments {
+                let value = evaluate(argument, schema, row)?;
+                if !value.is_null() {
+                    return Ok(value);
+                }
+            }
+            Ok(Value::Null)
+        }
+        "nullif" => {
+            let left = evaluate(arguments[0], schema, row)?;
+            if left.is_null() {
+                return Ok(Value::Null);
+            }
+            let right = evaluate(arguments[1], schema, row)?;
+            if !right.is_null()
+                && matches!(
+                    comparison(&BinaryOperator::Eq, &left, &right)?,
+                    Value::Bool(true)
+                )
+            {
+                Ok(Value::Null)
+            } else {
+                Ok(left)
+            }
+        }
+        "greatest" | "least" => {
+            let mut selected = None;
+            for argument in arguments {
+                let value = evaluate(argument, schema, row)?;
+                if value.is_null() {
+                    continue;
+                }
+                selected = Some(match selected {
+                    None => value,
+                    Some(current) => {
+                        let operator = if function_name == "greatest" {
+                            BinaryOperator::Gt
+                        } else {
+                            BinaryOperator::Lt
+                        };
+                        if matches!(comparison(&operator, &value, &current)?, Value::Bool(true)) {
+                            value
+                        } else {
+                            current
+                        }
+                    }
+                });
+            }
+            Ok(selected.unwrap_or(Value::Null))
+        }
+        "length" => match evaluate(arguments[0], schema, row)? {
+            Value::Null => Ok(Value::Null),
+            Value::Text(value) => Ok(Value::Int4(
+                i32::try_from(value.chars().count()).expect("text length must fit in int4"),
+            )),
+            _ => unreachable!("length argument was type-checked"),
+        },
+        "lower" => match evaluate(arguments[0], schema, row)? {
+            Value::Null => Ok(Value::Null),
+            Value::Text(value) => Ok(Value::Text(value.to_lowercase())),
+            _ => unreachable!("lower argument was type-checked"),
+        },
+        "upper" => match evaluate(arguments[0], schema, row)? {
+            Value::Null => Ok(Value::Null),
+            Value::Text(value) => Ok(Value::Text(value.to_uppercase())),
+            _ => unreachable!("upper argument was type-checked"),
+        },
+        "abs" => match evaluate(arguments[0], schema, row)? {
+            Value::Null => Ok(Value::Null),
+            Value::Int2(value) => value.checked_abs().map(Value::Int2).ok_or_else(|| {
+                PgError::new(SqlState::NumericValueOutOfRange, "smallint out of range")
+            }),
+            Value::Int4(value) => value.checked_abs().map(Value::Int4).ok_or_else(|| {
+                PgError::new(SqlState::NumericValueOutOfRange, "integer out of range")
+            }),
+            Value::Int8(value) => value.checked_abs().map(Value::Int8).ok_or_else(|| {
+                PgError::new(SqlState::NumericValueOutOfRange, "bigint out of range")
+            }),
+            Value::Float4(value) => Ok(Value::Float4(value.abs())),
+            Value::Float8(value) => Ok(Value::Float8(value.abs())),
+            Value::Numeric(value) => Ok(Value::Numeric(value.abs())),
+            _ => unreachable!("abs argument was type-checked"),
+        },
+        _ => unreachable!("function name was type-checked"),
     }
 }
 

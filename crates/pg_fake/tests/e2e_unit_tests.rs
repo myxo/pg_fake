@@ -300,6 +300,62 @@ fn evaluates_arithmetic_and_comparison_projections() {
 }
 
 #[test]
+fn evaluates_case_and_common_scalar_functions() {
+    assert_differential(
+        "CREATE TABLE __TABLE__ (
+             id INTEGER,
+             score INTEGER,
+             label TEXT,
+             delta INTEGER,
+             amount NUMERIC
+         ); \
+         INSERT INTO __TABLE__ VALUES
+             (1, 7, 'MiXeD', 3, 2.5),
+             (2, 0, NULL, NULL, NULL),
+             (3, NULL, 'third', 4, 1.5); \
+         SELECT
+             CASE
+                 WHEN score > 5 THEN 'high'
+                 WHEN score IS NULL THEN 'missing'
+                 ELSE 'low'
+             END,
+             CASE id
+                 WHEN 1 THEN 'one'
+                 WHEN 2 THEN NULL
+                 ELSE 'other'
+             END,
+             CASE WHEN score > 100 THEN score END,
+             COALESCE(label, 'fallback'),
+             NULLIF(score, 0),
+             GREATEST(score, 5),
+             LEAST(score, 5),
+             length(label),
+             lower(label),
+             upper(label),
+             abs(-delta),
+             abs(-amount)
+         FROM __TABLE__; \
+         SELECT
+             CASE WHEN id = 1 THEN 10 ELSE 1 / (id - 1) END,
+             COALESCE(score, 1 / (score - 7))
+         FROM __TABLE__
+         WHERE id = 1",
+        RowOrder::Ordered,
+    );
+}
+
+#[test]
+fn case_and_functions_match_postgres_errors() {
+    assert_differential(
+        "CREATE TABLE __TABLE__ (id INTEGER); \
+         INSERT INTO __TABLE__ VALUES (1); \
+         SELECT CASE WHEN id = 1 THEN id ELSE TRUE END FROM __TABLE__; \
+         SELECT unknown_function(id) FROM __TABLE__",
+        RowOrder::Unordered,
+    );
+}
+
+#[test]
 fn updates_rows_with_expressions_and_where() {
     assert_differential(
         "CREATE TABLE __TABLE__ (id INTEGER, amount INTEGER); \

@@ -384,14 +384,13 @@ and deadlock detection remain tasks 28–30.
 
 ## Milestone E — Query features
 
-### Task 20 — `CASE` + common scalar functions
+### Task 20 — `CASE` + common scalar functions [COMPLETE]
 **Goal:** Conditional expressions and a starter set of scalar functions.
 
 **DoD:**
 - Searched and simple `CASE` expressions with correct type/NULL handling.
-- `COALESCE`, `NULLIF`, `GREATEST`, `LEAST`, and a small set of common string/
-  math functions (e.g. `length`, `lower`, `upper`, `abs`); the exact list is
-  documented and driven by differential needs.
+- `COALESCE`, `NULLIF`, `GREATEST`, `LEAST`, `length(text)`, `lower(text)`,
+  `upper(text)`, and `abs(int2/int4/int8/float4/float8/numeric)`.
 - Differential cases for each function/`CASE` including NULL inputs.
 
 **Notes:** The function set grows over phases; Phase 1 covers the common ones.

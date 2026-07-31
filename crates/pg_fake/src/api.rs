@@ -436,6 +436,201 @@ mod tests {
     }
 
     #[test]
+    fn evaluates_case_and_common_scalar_functions() {
+        let db = Db::new();
+        let mut session = db.session();
+        session
+            .execute(
+                "CREATE TABLE items (
+                    id INTEGER,
+                    score INTEGER,
+                    label TEXT,
+                    delta INTEGER
+                )",
+            )
+            .unwrap();
+        session
+            .execute(
+                "INSERT INTO items VALUES
+                    (1, 7, 'MiXeD', 3),
+                    (2, 0, NULL, NULL),
+                    (3, NULL, 'third', 4)",
+            )
+            .unwrap();
+
+        let result = session
+            .query(
+                "SELECT
+                    CASE
+                        WHEN score > 5 THEN 'high'
+                        WHEN score IS NULL THEN 'missing'
+                        ELSE 'low'
+                    END,
+                    CASE id
+                        WHEN 1 THEN 'one'
+                        WHEN 2 THEN NULL
+                        ELSE 'other'
+                    END,
+                    CASE WHEN score > 100 THEN score END,
+                    COALESCE(label, 'fallback'),
+                    NULLIF(score, 0),
+                    GREATEST(score, 5),
+                    LEAST(score, 5),
+                    length(label),
+                    lower(label),
+                    upper(label),
+                    abs(-delta)
+                 FROM items",
+                &[],
+            )
+            .unwrap();
+
+        assert_eq!(
+            result.rows,
+            vec![
+                vec![
+                    Value::Text("high".into()),
+                    Value::Text("one".into()),
+                    Value::Null,
+                    Value::Text("MiXeD".into()),
+                    Value::Int4(7),
+                    Value::Int4(7),
+                    Value::Int4(5),
+                    Value::Int4(5),
+                    Value::Text("mixed".into()),
+                    Value::Text("MIXED".into()),
+                    Value::Int4(3),
+                ],
+                vec![
+                    Value::Text("low".into()),
+                    Value::Null,
+                    Value::Null,
+                    Value::Text("fallback".into()),
+                    Value::Null,
+                    Value::Int4(5),
+                    Value::Int4(0),
+                    Value::Null,
+                    Value::Null,
+                    Value::Null,
+                    Value::Null,
+                ],
+                vec![
+                    Value::Text("missing".into()),
+                    Value::Text("other".into()),
+                    Value::Null,
+                    Value::Text("third".into()),
+                    Value::Null,
+                    Value::Int4(5),
+                    Value::Int4(5),
+                    Value::Int4(5),
+                    Value::Text("third".into()),
+                    Value::Text("THIRD".into()),
+                    Value::Int4(4),
+                ],
+            ]
+        );
+        assert_eq!(
+            session
+                .query(
+                    "SELECT
+                        CASE WHEN id = 1 THEN 10 ELSE 1 / (id - 1) END,
+                        COALESCE(score, 1 / (score - 7))
+                     FROM items
+                     WHERE id = 1",
+                    &[],
+                )
+                .unwrap()
+                .rows,
+            vec![vec![Value::Int4(10), Value::Int4(7)]]
+        );
+    }
+
+    #[test]
+    fn abs_supports_all_phase_one_numeric_types() {
+        let db = Db::new();
+        let mut session = db.session();
+        session
+            .execute(
+                "CREATE TABLE numbers (
+                    int2_value SMALLINT,
+                    int4_value INTEGER,
+                    int8_value BIGINT,
+                    float4_value REAL,
+                    float8_value DOUBLE PRECISION,
+                    numeric_value NUMERIC
+                )",
+            )
+            .unwrap();
+        let mut state = db.state.lock().unwrap();
+        let xid = state.transactions.begin();
+        let table_id = state.catalog.table("numbers").unwrap().id;
+        state.tables.get_mut(&table_id).unwrap().insert(
+            xid,
+            vec![
+                Value::Int2(-2),
+                Value::Int4(-4),
+                Value::Int8(-8),
+                Value::Float4(-4.5),
+                Value::Float8(-8.5),
+                Value::Numeric("-12.25".parse().unwrap()),
+            ],
+        );
+        state.transactions.commit(xid);
+        drop(state);
+
+        assert_eq!(
+            session
+                .query(
+                    "SELECT
+                        abs(int2_value),
+                        abs(int4_value),
+                        abs(int8_value),
+                        abs(float4_value),
+                        abs(float8_value),
+                        abs(numeric_value)
+                     FROM numbers",
+                    &[],
+                )
+                .unwrap()
+                .rows,
+            vec![vec![
+                Value::Int2(2),
+                Value::Int4(4),
+                Value::Int8(8),
+                Value::Float4(4.5),
+                Value::Float8(8.5),
+                Value::Numeric("12.25".parse().unwrap()),
+            ]]
+        );
+    }
+
+    #[test]
+    fn case_and_functions_report_type_and_name_errors() {
+        let db = Db::new();
+        let mut session = db.session();
+        session.execute("CREATE TABLE items (id INTEGER)").unwrap();
+        session.execute("INSERT INTO items VALUES (1)").unwrap();
+
+        assert_eq!(
+            session
+                .query(
+                    "SELECT CASE WHEN id = 1 THEN id ELSE TRUE END FROM items",
+                    &[]
+                )
+                .unwrap_err()
+                .sqlstate,
+            SqlState::DatatypeMismatch
+        );
+        assert_eq!(
+            session
+                .query("SELECT unknown_function(id) FROM items", &[])
+                .unwrap_err()
+                .sqlstate,
+            SqlState::UndefinedFunction
+        );
+    }
+
+    #[test]
     fn explicit_transactions_control_insert_and_update_visibility() {
         let db = Db::new();
         let mut first = db.session();
