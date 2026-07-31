@@ -6,7 +6,7 @@ automated tests.
 ## Benchmarks
 
 The Criterion suite compares `pg_fake` with PostgreSQL 18 for create/drop,
-insert, and select workloads. See
+insert, update, delete, transaction, and select workloads. See
 [`crates/pg_fake/benches/README.md`](crates/pg_fake/benches/README.md) for
 Docker/database configuration, commands, reports, and speedup interpretation.
 
@@ -32,5 +32,4 @@ PG_FAKE_TEST_DATABASE_URL=postgresql://postgres:password@localhost:5432/postgres
 
 The tests create uniquely named tables and leave them in the configured target
 database. A database dedicated to differential testing is recommended.
-
 

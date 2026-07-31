@@ -367,7 +367,7 @@ explicit transactions.
 level selection, READ COMMITTED versus REPEATABLE READ behavior, row locking,
 and deadlock detection remain tasks 28–30.
 
-### Task 19 — `DELETE`
+### Task 19 — `DELETE` [COMPLETE]
 **Goal:** Remove rows (§5.1).
 
 **DoD:**

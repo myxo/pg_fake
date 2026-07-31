@@ -7,9 +7,9 @@ use crate::{
     value::{BaseType, PgType, Value},
 };
 use sqlparser::ast::{
-    AssignmentTarget, BinaryOperator, ColumnOption, Expr, GroupByExpr, Ident, ObjectType,
-    SelectItem, SetExpr, Statement, TableConstraint, TableFactor, TableWithJoins, UnaryOperator,
-    Value as AstValue,
+    AssignmentTarget, BinaryOperator, ColumnOption, Delete, Expr, FromTable, GroupByExpr, Ident,
+    ObjectType, SelectItem, SetExpr, Statement, TableConstraint, TableFactor, TableWithJoins,
+    UnaryOperator, Value as AstValue,
 };
 use std::{
     cmp::Ordering,
@@ -197,6 +197,7 @@ pub(crate) fn dispatch(
             }
             update_rows(state, table, assignments, selection.as_ref(), xid, snapshot)
         }
+        Statement::Delete(delete) => delete_rows(state, delete, xid, snapshot),
         Statement::Query(query) => select_rows(state, query, xid, snapshot),
         _ => Err(PgError::new(
             SqlState::FeatureNotSupported,
@@ -411,6 +412,92 @@ fn update_rows(
             )?;
         }
         table.update(row_id, version_xmin, xid, updated);
+    }
+    Ok(ExecutionResult::Affected(affected))
+}
+
+fn delete_rows(
+    state: &mut DatabaseState,
+    delete: &Delete,
+    xid: Xid,
+    snapshot: &Snapshot,
+) -> Result<ExecutionResult> {
+    if !delete.tables.is_empty()
+        || delete.using.is_some()
+        || delete.returning.is_some()
+        || !delete.order_by.is_empty()
+        || delete.limit.is_some()
+    {
+        return Err(PgError::new(
+            SqlState::FeatureNotSupported,
+            "DELETE feature is not implemented",
+        ));
+    }
+    let FromTable::WithFromKeyword(from) = &delete.from else {
+        return Err(PgError::new(
+            SqlState::FeatureNotSupported,
+            "DELETE without FROM is not implemented",
+        ));
+    };
+    if from.len() != 1 || !from[0].joins.is_empty() {
+        return Err(PgError::new(
+            SqlState::FeatureNotSupported,
+            "DELETE joins are not implemented",
+        ));
+    }
+    let TableFactor::Table {
+        name: table_name,
+        args,
+        ..
+    } = &from[0].relation
+    else {
+        return Err(PgError::new(
+            SqlState::FeatureNotSupported,
+            "DELETE target is not implemented",
+        ));
+    };
+    if args.is_some() {
+        return Err(PgError::new(
+            SqlState::FeatureNotSupported,
+            "DELETE table functions are not implemented",
+        ));
+    }
+    let schema = state.catalog.table(&name(table_name)?)?.clone();
+    if let Some(selection) = &delete.selection {
+        let base = expression_type(selection, &schema)?;
+        if base != BaseType::Bool && !null_expression(selection) {
+            return Err(PgError::new(
+                SqlState::DatatypeMismatch,
+                "WHERE requires a boolean expression",
+            ));
+        }
+    }
+    let targets = state
+        .tables
+        .get(&schema.id)
+        .expect("catalog table must have storage")
+        .rows()
+        .try_fold(Vec::new(), |mut targets, (row_id, chain)| {
+            let Some(version) = visible_version(chain, snapshot, xid, &state.transactions) else {
+                return Ok(targets);
+            };
+            if let Some(selection) = &delete.selection {
+                match evaluate(selection, &schema, &version.row)? {
+                    Value::Bool(true) => {}
+                    Value::Bool(false) | Value::Null => return Ok(targets),
+                    _ => unreachable!("WHERE expression was type-checked"),
+                }
+            }
+            targets.push((row_id, version.xmin));
+            Ok(targets)
+        })?;
+    let affected = targets.len() as u64;
+    let table = state
+        .tables
+        .get_mut(&schema.id)
+        .expect("catalog table must have storage");
+    for (row_id, version_xmin) in targets {
+        table.tombstone(row_id, version_xmin, xid);
     }
     Ok(ExecutionResult::Affected(affected))
 }

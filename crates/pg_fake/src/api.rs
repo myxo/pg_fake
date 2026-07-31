@@ -492,6 +492,104 @@ mod tests {
     }
 
     #[test]
+    fn deletes_matching_rows_and_all_rows() {
+        let db = Db::new();
+        let mut session = db.session();
+        session
+            .execute("CREATE TABLE items (id INTEGER, amount INTEGER)")
+            .unwrap();
+        session
+            .execute("INSERT INTO items VALUES (1, 2), (2, NULL), (3, 4)")
+            .unwrap();
+
+        assert_eq!(
+            session
+                .execute("DELETE FROM items WHERE amount > 2")
+                .unwrap(),
+            1
+        );
+        assert_eq!(
+            session.query("SELECT * FROM items", &[]).unwrap().rows,
+            vec![
+                vec![Value::Int4(1), Value::Int4(2)],
+                vec![Value::Int4(2), Value::Null],
+            ]
+        );
+        assert_eq!(session.execute("DELETE FROM items").unwrap(), 2);
+        assert!(
+            session
+                .query("SELECT * FROM items", &[])
+                .unwrap()
+                .rows
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn explicit_delete_visibility_matches_transaction_outcome() {
+        let db = Db::new();
+        let mut writer = db.session();
+        let mut reader = db.session();
+        writer.execute("CREATE TABLE items (id INTEGER)").unwrap();
+        writer
+            .execute("INSERT INTO items VALUES (1), (2), (3)")
+            .unwrap();
+
+        writer.execute("BEGIN").unwrap();
+        assert_eq!(writer.execute("DELETE FROM items WHERE id = 1").unwrap(), 1);
+        assert_eq!(
+            writer.query("SELECT * FROM items", &[]).unwrap().rows,
+            vec![vec![Value::Int4(2)], vec![Value::Int4(3)]]
+        );
+        assert_eq!(
+            reader.query("SELECT * FROM items", &[]).unwrap().rows,
+            vec![
+                vec![Value::Int4(1)],
+                vec![Value::Int4(2)],
+                vec![Value::Int4(3)]
+            ]
+        );
+        writer.execute("ROLLBACK").unwrap();
+        assert_eq!(
+            reader.query("SELECT * FROM items", &[]).unwrap().rows,
+            vec![
+                vec![Value::Int4(1)],
+                vec![Value::Int4(2)],
+                vec![Value::Int4(3)]
+            ]
+        );
+
+        writer.execute("BEGIN").unwrap();
+        writer.execute("DELETE FROM items WHERE id = 2").unwrap();
+        writer.execute("COMMIT").unwrap();
+        assert_eq!(
+            reader.query("SELECT * FROM items", &[]).unwrap().rows,
+            vec![vec![Value::Int4(1)], vec![Value::Int4(3)]]
+        );
+    }
+
+    #[test]
+    fn delete_requires_a_boolean_where_expression() {
+        let db = Db::new();
+        let mut session = db.session();
+        session.execute("CREATE TABLE items (id INTEGER)").unwrap();
+        session.execute("INSERT INTO items VALUES (1)").unwrap();
+
+        assert_eq!(
+            session
+                .execute("DELETE FROM items WHERE id")
+                .unwrap_err()
+                .sqlstate,
+            SqlState::DatatypeMismatch
+        );
+        session.execute("ROLLBACK").unwrap();
+        assert_eq!(
+            session.query("SELECT * FROM items", &[]).unwrap().rows,
+            vec![vec![Value::Int4(1)]]
+        );
+    }
+
+    #[test]
     fn explicit_transactions_abort_after_errors_and_raii_rolls_back() {
         let db = Db::new();
         let mut session = db.session();

@@ -313,6 +313,36 @@ fn updates_rows_with_expressions_and_where() {
 }
 
 #[test]
+fn deletes_rows_with_and_without_where() {
+    assert_differential(
+        "CREATE TABLE __TABLE__ (id INTEGER, amount INTEGER); \
+         INSERT INTO __TABLE__ VALUES (1, 2), (2, NULL), (3, 4); \
+         DELETE FROM __TABLE__ WHERE amount > 2; \
+         SELECT * FROM __TABLE__; \
+         DELETE FROM __TABLE__; \
+         SELECT * FROM __TABLE__",
+        RowOrder::Unordered,
+    );
+}
+
+#[test]
+fn delete_visibility_matches_postgres_across_sessions() {
+    assert_session_differential(
+        &[
+            (SessionName::First, "CREATE TABLE __TABLE__ (id INTEGER)"),
+            (SessionName::First, "INSERT INTO __TABLE__ VALUES (1), (2)"),
+            (SessionName::First, "BEGIN"),
+            (SessionName::First, "DELETE FROM __TABLE__ WHERE id = 1"),
+            (SessionName::First, "SELECT * FROM __TABLE__"),
+            (SessionName::Second, "SELECT * FROM __TABLE__"),
+            (SessionName::First, "COMMIT"),
+            (SessionName::Second, "SELECT * FROM __TABLE__"),
+        ],
+        RowOrder::Unordered,
+    );
+}
+
+#[test]
 fn filters_with_boolean_expressions() {
     assert_differential(
         "CREATE TABLE __TABLE__ (id INTEGER, score INTEGER, active BOOLEAN, optional INTEGER); \

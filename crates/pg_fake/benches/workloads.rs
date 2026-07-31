@@ -5,6 +5,7 @@ use std::{
         Mutex,
         atomic::{AtomicU64, Ordering},
     },
+    time::{Duration, Instant},
 };
 
 use criterion::{Criterion, black_box, criterion_group, criterion_main};
@@ -198,6 +199,53 @@ fn update_benchmark(criterion: &mut Criterion, postgres: &mut Client) {
         .unwrap();
 }
 
+fn delete_benchmark(criterion: &mut Criterion, postgres: &mut Client) {
+    let fake_table = unique_table_name("delete_fake");
+    let postgres_table = unique_table_name("delete_postgres");
+    postgres
+        .execute(&format!("CREATE TABLE {postgres_table} (id INTEGER)"), &[])
+        .unwrap();
+    let mut group = criterion.benchmark_group("delete_row");
+
+    group.bench_function("pg_fake", |benchmark| {
+        benchmark.iter_custom(|iterations| {
+            let mut elapsed = Duration::ZERO;
+            for id in 0..iterations {
+                let db = Db::new();
+                let mut fake = db.session();
+                fake.execute(&format!("CREATE TABLE {fake_table} (id INTEGER)"))
+                    .unwrap();
+                fake.execute(&format!("INSERT INTO {fake_table} VALUES ({id})"))
+                    .unwrap();
+                let delete = format!("DELETE FROM {fake_table} WHERE id = {id}");
+                let started = Instant::now();
+                assert_eq!(fake.execute(&delete).unwrap(), 1);
+                elapsed += started.elapsed();
+            }
+            elapsed
+        });
+    });
+    group.bench_function("postgres_18", |benchmark| {
+        benchmark.iter_custom(|iterations| {
+            let mut elapsed = Duration::ZERO;
+            for id in 0..iterations {
+                postgres
+                    .execute(&format!("INSERT INTO {postgres_table} VALUES ({id})"), &[])
+                    .unwrap();
+                let delete = format!("DELETE FROM {postgres_table} WHERE id = {id}");
+                let started = Instant::now();
+                assert_eq!(postgres.execute(&delete, &[]).unwrap(), 1);
+                elapsed += started.elapsed();
+            }
+            elapsed
+        });
+    });
+    group.finish();
+    postgres
+        .execute(&format!("DROP TABLE {postgres_table}"), &[])
+        .unwrap();
+}
+
 fn transaction_benchmark(criterion: &mut Criterion, postgres: &mut Client) {
     let fake_table = unique_table_name("transaction_fake");
     let postgres_table = unique_table_name("transaction_postgres");
@@ -327,6 +375,7 @@ fn benchmarks(criterion: &mut Criterion) {
     create_table_benchmark(criterion, &mut postgres.client);
     insert_benchmark(criterion, &mut postgres.client);
     update_benchmark(criterion, &mut postgres.client);
+    delete_benchmark(criterion, &mut postgres.client);
     transaction_benchmark(criterion, &mut postgres.client);
     select_benchmark(criterion, &mut postgres.client);
 }
