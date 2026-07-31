@@ -2,7 +2,13 @@
 import json
 from pathlib import Path
 
-workloads = ("create_table", "insert_row", "select_100_rows")
+workloads = (
+    "create_table",
+    "insert_row",
+    "update_row",
+    "transaction_insert",
+    "select_100_rows",
+)
 root = Path("target/criterion")
 
 for workload in workloads:

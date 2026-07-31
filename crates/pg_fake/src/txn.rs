@@ -1,4 +1,4 @@
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::BTreeMap;
 
 use crate::storage::{Version, VersionChain};
 
@@ -15,11 +15,9 @@ pub enum TransactionStatus {
     Aborted,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Snapshot {
     pub commit_seq: CommitSeq,
-    pub in_flight: BTreeSet<Xid>,
-    statuses: BTreeMap<Xid, TransactionStatus>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -85,36 +83,29 @@ impl Snapshot {
     pub fn new(manager: &TransactionManager) -> Self {
         Snapshot {
             commit_seq: manager.commit_seq,
-            in_flight: manager
-                .statuses
-                .iter()
-                .filter_map(|(xid, status)| {
-                    if matches!(status, TransactionStatus::InFlight) {
-                        Some(*xid)
-                    } else {
-                        None
-                    }
-                })
-                .collect(),
-            statuses: manager.statuses.clone(),
         }
     }
 }
 
-pub fn is_visible(version: &Version, snapshot: &Snapshot, current_xid: Xid) -> bool {
+pub fn is_visible(
+    version: &Version,
+    snapshot: &Snapshot,
+    current_xid: Xid,
+    manager: &TransactionManager,
+) -> bool {
     let xmin_visible = version.xmin == current_xid
         || matches!(
-            snapshot.statuses.get(&version.xmin),
+            manager.status(version.xmin),
             Some(TransactionStatus::Committed(commit_seq))
-                if *commit_seq <= snapshot.commit_seq && !snapshot.in_flight.contains(&version.xmin)
+                if commit_seq <= snapshot.commit_seq
         );
     let xmax_invisible = matches!(
         version.xmax,
         Some(xmax) if xmax == current_xid
             || matches!(
-                snapshot.statuses.get(&xmax),
+                manager.status(xmax),
                 Some(TransactionStatus::Committed(commit_seq))
-                    if *commit_seq <= snapshot.commit_seq && !snapshot.in_flight.contains(&xmax)
+                    if commit_seq <= snapshot.commit_seq
             )
     );
 
@@ -125,11 +116,13 @@ pub fn visible_version<'a>(
     chain: &'a VersionChain,
     snapshot: &Snapshot,
     current_xid: Xid,
+    manager: &TransactionManager,
 ) -> Option<&'a Version> {
     chain
         .versions
         .iter()
-        .find(|version| is_visible(version, snapshot, current_xid))
+        .rev()
+        .find(|version| is_visible(version, snapshot, current_xid, manager))
 }
 
 #[cfg(test)]
@@ -184,8 +177,8 @@ mod tests {
         let snapshot = Snapshot::new(&manager);
         let inserted = version(writer, None);
 
-        assert!(is_visible(&inserted, &snapshot, writer));
-        assert!(!is_visible(&inserted, &snapshot, reader));
+        assert!(is_visible(&inserted, &snapshot, writer, &manager));
+        assert!(!is_visible(&inserted, &snapshot, reader, &manager));
     }
 
     #[test]
@@ -196,7 +189,12 @@ mod tests {
         let reader = manager.begin();
         let snapshot = Snapshot::new(&manager);
 
-        assert!(is_visible(&version(writer, None), &snapshot, reader));
+        assert!(is_visible(
+            &version(writer, None),
+            &snapshot,
+            reader,
+            &manager
+        ));
     }
 
     #[test]
@@ -207,7 +205,12 @@ mod tests {
         let snapshot = Snapshot::new(&manager);
         manager.commit(writer);
 
-        assert!(!is_visible(&version(writer, None), &snapshot, reader));
+        assert!(!is_visible(
+            &version(writer, None),
+            &snapshot,
+            reader,
+            &manager
+        ));
     }
 
     #[test]
@@ -223,7 +226,8 @@ mod tests {
         assert!(!is_visible(
             &version(writer, Some(deleter)),
             &snapshot,
-            reader
+            reader,
+            &manager
         ));
     }
 
@@ -239,7 +243,8 @@ mod tests {
         assert!(is_visible(
             &version(writer, Some(deleter)),
             &snapshot,
-            reader
+            reader,
+            &manager
         ));
     }
 
@@ -256,7 +261,7 @@ mod tests {
         };
 
         assert_eq!(
-            visible_version(&chain, &snapshot, reader),
+            visible_version(&chain, &snapshot, reader, &manager),
             Some(&chain.versions[0])
         );
     }

@@ -577,7 +577,7 @@ mod tests {
         let rows = table
             .rows()
             .map(|(_, chain)| {
-                visible_version(chain, &snapshot, reader)
+                visible_version(chain, &snapshot, reader, &state.transactions)
                     .unwrap()
                     .row
                     .clone()

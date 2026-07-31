@@ -384,7 +384,7 @@ fn update_rows(
         .expect("catalog table must have storage")
         .rows()
         .try_fold(Vec::new(), |mut targets, (row_id, chain)| {
-            let Some(version) = visible_version(chain, snapshot, xid) else {
+            let Some(version) = visible_version(chain, snapshot, xid, &state.transactions) else {
                 return Ok(targets);
             };
             if let Some(selection) = selection {
@@ -539,7 +539,7 @@ fn select_rows(
         .expect("catalog table must have storage");
     let rows = table
         .rows()
-        .filter_map(|(_, chain)| visible_version(chain, snapshot, xid))
+        .filter_map(|(_, chain)| visible_version(chain, snapshot, xid, &state.transactions))
         .try_fold(Vec::new(), |mut rows, version| -> Result<Vec<Vec<Value>>> {
             if let Some(selection) = &select.selection {
                 match evaluate(selection, schema, &version.row)? {
