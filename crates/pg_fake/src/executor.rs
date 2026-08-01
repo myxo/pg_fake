@@ -35,6 +35,10 @@ enum OrderKey<'a> {
     Output(usize),
     Expression(&'a Expr),
 }
+enum RowCountClause {
+    Limit,
+    Offset,
+}
 struct OrderSpec<'a> {
     key: OrderKey<'a>,
     ascending: bool,
@@ -491,9 +495,7 @@ fn select_rows(
     snapshot: &Snapshot,
 ) -> Result<ExecutionResult> {
     if query.with.is_some()
-        || query.limit.is_some()
         || !query.limit_by.is_empty()
-        || query.offset.is_some()
         || query.fetch.is_some()
         || !query.locks.is_empty()
     {
@@ -551,6 +553,19 @@ fn select_rows(
         ));
     }
     let schema = state.catalog.table(&name(table_name)?)?;
+    let limit = query
+        .limit
+        .as_ref()
+        .map(|limit| row_count(limit, RowCountClause::Limit))
+        .transpose()?
+        .flatten();
+    let offset = query
+        .offset
+        .as_ref()
+        .map(|offset| row_count(&offset.value, RowCountClause::Offset))
+        .transpose()?
+        .flatten()
+        .unwrap_or(0);
     if let Some(selection) = &select.selection {
         let base = expression_type(selection, schema)?;
         if base != BaseType::Bool && !null_expression(selection) {
@@ -719,8 +734,57 @@ fn select_rows(
             })
             .unwrap_or(Ordering::Equal)
     });
-    let rows = rows.into_iter().map(|row| row.values).collect();
+    let rows = rows
+        .into_iter()
+        .skip(offset)
+        .take(limit.unwrap_or(usize::MAX))
+        .map(|row| row.values)
+        .collect();
     Ok(ExecutionResult::Query(QueryResult { columns, rows }))
+}
+
+fn row_count(expr: &Expr, clause: RowCountClause) -> Result<Option<usize>> {
+    if matches!(clause, RowCountClause::Limit)
+        && matches!(expr, Expr::Identifier(identifier) if identifier.quote_style.is_none() && identifier.value.eq_ignore_ascii_case("all"))
+    {
+        return Ok(None);
+    }
+    let schema = TableSchema {
+        id: TableId(0),
+        name: String::new(),
+        columns: Vec::new(),
+        constraints: Vec::new(),
+    };
+    let value = evaluate_as(expr, BaseType::Int8, CastContext::Implicit, &schema, &[]).map_err(
+        |error| {
+            if error.sqlstate == SqlState::CannotCoerce {
+                PgError::new(
+                    SqlState::DatatypeMismatch,
+                    match clause {
+                        RowCountClause::Limit => "argument of LIMIT must be type bigint",
+                        RowCountClause::Offset => "argument of OFFSET must be type bigint",
+                    },
+                )
+            } else {
+                error
+            }
+        },
+    )?;
+    match value {
+        Value::Null => Ok(None),
+        Value::Int8(value) if value >= 0 => Ok(Some(usize::try_from(value).unwrap_or(usize::MAX))),
+        Value::Int8(_) => Err(PgError::new(
+            match clause {
+                RowCountClause::Limit => SqlState::InvalidRowCountInLimitClause,
+                RowCountClause::Offset => SqlState::InvalidRowCountInResultOffsetClause,
+            },
+            match clause {
+                RowCountClause::Limit => "LIMIT must not be negative",
+                RowCountClause::Offset => "OFFSET must not be negative",
+            },
+        )),
+        _ => unreachable!("row count was coerced to bigint"),
+    }
 }
 
 fn value(expr: &Expr, target: PgType) -> Result<Value> {

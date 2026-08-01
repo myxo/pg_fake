@@ -477,6 +477,21 @@ fn select_expression(src: &mut Source) -> String {
     )
 }
 
+fn row_count(src: &mut Source, ordered: bool, offset: bool) -> String {
+    let choices: &[&str] = match (ordered, offset) {
+        (true, _) => &["null", "zero", "small", "beyond"],
+        (false, true) => &["null", "zero"],
+        (false, false) => &["null", "beyond"],
+    };
+    src.select("value", choices, |src, value, _| match value {
+        "null" => "NULL".into(),
+        "zero" => "0".into(),
+        "small" => src.any_of("count", int_in_range(1..=8)).to_string(),
+        "beyond" => "1000".into(),
+        _ => unreachable!(),
+    })
+}
+
 fn select_sql(src: &mut Source, table: &str) -> (String, RowOrder) {
     let mut projections = vec!["row_key".into()];
     src.repeat_n("projections", 1..=4, |src| {
@@ -506,12 +521,23 @@ fn select_sql(src: &mut Source, table: &str) -> (String, RowOrder) {
         };
         format!(" ORDER BY {key} {direction} {nulls}, row_key + 0")
     });
-    if let Some(order) = ordered {
+    let row_order = if let Some(order) = ordered {
         sql.push_str(&order);
-        (sql, RowOrder::Ordered)
+        RowOrder::Ordered
     } else {
-        (sql, RowOrder::Unordered)
+        RowOrder::Unordered
+    };
+    if let Some(limit) = src.maybe("limit", |src| {
+        row_count(src, matches!(row_order, RowOrder::Ordered), false)
+    }) {
+        sql.push_str(&format!(" LIMIT {limit}"));
     }
+    if let Some(offset) = src.maybe("offset", |src| {
+        row_count(src, matches!(row_order, RowOrder::Ordered), true)
+    }) {
+        sql.push_str(&format!(" OFFSET {offset}"));
+    }
+    (sql, row_order)
 }
 
 fn update_sql(src: &mut Source, table: &str) -> String {

@@ -364,6 +364,34 @@ fn select_benchmark(criterion: &mut Criterion, postgres: &mut Client) {
         });
     });
     group.finish();
+
+    let fake_select =
+        format!("SELECT id, name FROM {fake_table} ORDER BY id DESC LIMIT 10 OFFSET 40");
+    let postgres_select =
+        format!("SELECT id, name FROM {postgres_table} ORDER BY id DESC LIMIT 10 OFFSET 40");
+    let mut group = criterion.benchmark_group("limit_offset_ordered_100_rows");
+
+    group.bench_function("pg_fake", |benchmark| {
+        benchmark.iter(|| {
+            let result = fake.query(&fake_select, &[]).unwrap();
+            assert_eq!(result.rows.len(), 10);
+            black_box(result);
+        });
+    });
+    group.bench_function("postgres_18", |benchmark| {
+        benchmark.iter(|| {
+            let result = postgres.simple_query(&postgres_select).unwrap();
+            assert_eq!(
+                result
+                    .iter()
+                    .filter(|message| matches!(message, SimpleQueryMessage::Row(_)))
+                    .count(),
+                10
+            );
+            black_box(result);
+        });
+    });
+    group.finish();
     postgres
         .execute(&format!("DROP TABLE {postgres_table}"), &[])
         .unwrap();

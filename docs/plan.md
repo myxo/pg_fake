@@ -16,6 +16,16 @@ Conventions:
 - Spec references like (§5.3) point into `docs/spec.md`.
 - Unless stated otherwise, everything before Milestone G runs single-threaded in
   autocommit mode.
+- Every SQL feature task must extend the property-based differential generator
+  to cover the feature and its interactions with existing features. If property
+  testing is not applicable, the completion handoff must explain why and provide
+  equivalent focused differential coverage.
+- Every feature task must add or update a representative benchmark workload when
+  applicable. If benchmarking is not applicable, the completion handoff must
+  explain why.
+- Before a task can be marked complete, the property test suite must pass at
+  least 10,000 `chaos_theory` iterations, run with
+  `CHAOS_THEORY_CHECK_ITERS=10000 cargo test -p pg_fake --test property_tests`.
 
 ---
 
@@ -428,7 +438,7 @@ intentional so earlier tasks stay small.
 **Notes:** Collation is default/byte-ish for Phase 1; locale-aware collation is
 out of scope.
 
-### Task 23 — `LIMIT` / `OFFSET`
+### Task 23 — `LIMIT` / `OFFSET` [COMPLETE]
 **Goal:** Row-count limiting and skipping.
 
 **DoD:**

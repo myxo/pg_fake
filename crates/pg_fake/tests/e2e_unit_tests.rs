@@ -300,6 +300,40 @@ fn order_by_position_errors_match_postgres() {
 }
 
 #[test]
+fn limit_and_offset_match_postgres() {
+    assert_differential(
+        "CREATE TABLE __TABLE__ (id INTEGER); \
+         INSERT INTO __TABLE__ VALUES (4), (1), (5), (2), (3); \
+         SELECT id FROM __TABLE__ ORDER BY id LIMIT 2; \
+         SELECT id FROM __TABLE__ ORDER BY id OFFSET 2; \
+         SELECT id FROM __TABLE__ ORDER BY id LIMIT 2 OFFSET 1; \
+         SELECT id FROM __TABLE__ ORDER BY id LIMIT NULL OFFSET NULL",
+        RowOrder::Ordered,
+    );
+}
+
+#[test]
+fn limit_and_offset_without_order_by_match_postgres() {
+    assert_differential(
+        "CREATE TABLE __TABLE__ (id INTEGER); \
+         INSERT INTO __TABLE__ VALUES (4), (1), (5), (2), (3); \
+         SELECT id FROM __TABLE__ LIMIT 3; \
+         SELECT id FROM __TABLE__ OFFSET 3",
+        RowOrder::Unordered,
+    );
+}
+
+#[test]
+fn negative_limit_and_offset_errors_match_postgres() {
+    assert_differential(
+        "CREATE TABLE __TABLE__ (id INTEGER); \
+         SELECT id FROM __TABLE__ LIMIT -1; \
+         SELECT id FROM __TABLE__ OFFSET -1",
+        RowOrder::Ordered,
+    );
+}
+
+#[test]
 fn delete_visibility_matches_postgres_across_sessions() {
     assert_session_differential(
         &[

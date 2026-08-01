@@ -13,10 +13,12 @@ pub enum SqlState {
     FeatureNotSupported, // 0A000
 
     // 22 — Data Exception
-    NumericValueOutOfRange,    // 22003
-    DivisionByZero,            // 22012
-    InvalidTextRepresentation, // 22P02
-    StringDataRightTruncation, // 22001
+    NumericValueOutOfRange,              // 22003
+    DivisionByZero,                      // 22012
+    InvalidRowCountInLimitClause,        // 2201W
+    InvalidRowCountInResultOffsetClause, // 2201X
+    InvalidTextRepresentation,           // 22P02
+    StringDataRightTruncation,           // 22001
 
     // 23 — Integrity Constraint Violation
     NotNullViolation, // 23502
@@ -57,6 +59,8 @@ impl SqlState {
             SqlState::FeatureNotSupported => "0A000",
             SqlState::NumericValueOutOfRange => "22003",
             SqlState::DivisionByZero => "22012",
+            SqlState::InvalidRowCountInLimitClause => "2201W",
+            SqlState::InvalidRowCountInResultOffsetClause => "2201X",
             SqlState::InvalidTextRepresentation => "22P02",
             SqlState::StringDataRightTruncation => "22001",
             SqlState::NotNullViolation => "23502",

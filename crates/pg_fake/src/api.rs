@@ -953,6 +953,84 @@ mod tests {
     }
 
     #[test]
+    fn limits_and_offsets_rows_after_ordering() {
+        let db = Db::new();
+        let mut session = db.session();
+        session.execute("CREATE TABLE items (id INTEGER)").unwrap();
+        session
+            .execute("INSERT INTO items VALUES (4), (1), (5), (2), (3)")
+            .unwrap();
+
+        assert_eq!(
+            session
+                .query("SELECT id FROM items ORDER BY id LIMIT 2 OFFSET 1", &[])
+                .unwrap()
+                .rows,
+            vec![vec![Value::Int4(2)], vec![Value::Int4(3)]]
+        );
+        assert_eq!(
+            session
+                .query("SELECT id FROM items LIMIT 2", &[])
+                .unwrap()
+                .rows,
+            vec![vec![Value::Int4(4)], vec![Value::Int4(1)]]
+        );
+        assert_eq!(
+            session
+                .query("SELECT id FROM items OFFSET 3", &[])
+                .unwrap()
+                .rows,
+            vec![vec![Value::Int4(2)], vec![Value::Int4(3)]]
+        );
+        assert_eq!(
+            session
+                .query("SELECT id FROM items ORDER BY id LIMIT 0 OFFSET 2", &[])
+                .unwrap()
+                .rows,
+            Vec::<Vec<Value>>::new()
+        );
+        assert_eq!(
+            session
+                .query(
+                    "SELECT id FROM items ORDER BY id LIMIT NULL OFFSET NULL",
+                    &[],
+                )
+                .unwrap()
+                .rows,
+            vec![
+                vec![Value::Int4(1)],
+                vec![Value::Int4(2)],
+                vec![Value::Int4(3)],
+                vec![Value::Int4(4)],
+                vec![Value::Int4(5)],
+            ]
+        );
+    }
+
+    #[test]
+    fn rejects_negative_limit_and_offset() {
+        let db = Db::new();
+        let mut session = db.session();
+        session.execute("CREATE TABLE items (id INTEGER)").unwrap();
+
+        assert_eq!(
+            session
+                .query("SELECT id FROM items LIMIT -1", &[])
+                .unwrap_err()
+                .sqlstate,
+            SqlState::InvalidRowCountInLimitClause
+        );
+        session.execute("ROLLBACK").unwrap();
+        assert_eq!(
+            session
+                .query("SELECT id FROM items OFFSET -1", &[])
+                .unwrap_err()
+                .sqlstate,
+            SqlState::InvalidRowCountInResultOffsetClause
+        );
+    }
+
+    #[test]
     fn explicit_transactions_control_insert_and_update_visibility() {
         let db = Db::new();
         let mut first = db.session();
