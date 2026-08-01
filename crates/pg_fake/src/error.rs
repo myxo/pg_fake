@@ -16,6 +16,7 @@ pub enum SqlState {
     NumericValueOutOfRange,    // 22003
     DivisionByZero,            // 22012
     InvalidTextRepresentation, // 22P02
+    StringDataRightTruncation, // 22001
 
     // 23 — Integrity Constraint Violation
     NotNullViolation, // 23502
@@ -56,6 +57,7 @@ impl SqlState {
             SqlState::NumericValueOutOfRange => "22003",
             SqlState::DivisionByZero => "22012",
             SqlState::InvalidTextRepresentation => "22P02",
+            SqlState::StringDataRightTruncation => "22001",
             SqlState::NotNullViolation => "23502",
             SqlState::UniqueViolation => "23505",
             SqlState::CheckViolation => "23514",

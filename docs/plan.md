@@ -396,7 +396,7 @@ and deadlock detection remain tasks 28–30.
 **Notes:** The function set grows over phases; Phase 1 covers the common ones.
 Unknown functions error via the unsupported-feature policy (§10).
 
-### Task 21 — Type coercion module (implicit / assignment / explicit)
+### Task 21 — Type coercion module (implicit / assignment / explicit) [COMPLETE]
 **Goal:** Central coercion mirroring Postgres cast rules (§11).
 
 **DoD:**

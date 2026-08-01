@@ -631,6 +631,154 @@ mod tests {
     }
 
     #[test]
+    fn coerces_phase_one_types_in_all_cast_contexts() {
+        let db = Db::new();
+        let mut session = db.session();
+        session
+            .execute(
+                "CREATE TABLE types (
+                    small_value SMALLINT,
+                    int_value INTEGER,
+                    big_value BIGINT,
+                    numeric_value NUMERIC,
+                    real_value REAL,
+                    double_value DOUBLE PRECISION,
+                    short_label VARCHAR(4)
+                )",
+            )
+            .unwrap();
+        session
+            .execute("INSERT INTO types VALUES (1, 2, 3, 4, 5, 6, 'abcd')")
+            .unwrap();
+
+        assert_eq!(
+            session
+                .query(
+                    "SELECT
+                        small_value + int_value,
+                        int_value + big_value,
+                        big_value + numeric_value,
+                        numeric_value + real_value,
+                        real_value + double_value,
+                        int_value = '2',
+                        CASE WHEN TRUE THEN int_value ELSE numeric_value END,
+                        COALESCE(NULL, int_value, numeric_value)
+                     FROM types",
+                    &[],
+                )
+                .unwrap()
+                .rows,
+            vec![vec![
+                Value::Int4(3),
+                Value::Int8(5),
+                Value::Numeric("7".parse().unwrap()),
+                Value::Float4(9.0),
+                Value::Float8(11.0),
+                Value::Bool(true),
+                Value::Numeric("2".parse().unwrap()),
+                Value::Numeric("2".parse().unwrap()),
+            ]]
+        );
+        assert_eq!(
+            session
+                .query(
+                    "SELECT
+                        CAST('42' AS INTEGER),
+                        '3.5'::NUMERIC,
+                        CAST(2.6 AS INTEGER),
+                        CAST(1 AS TEXT),
+                        CAST(TRUE AS TEXT),
+                        1::BOOLEAN,
+                        TRUE::INTEGER,
+                        258::BYTEA,
+                        '\\x00000102'::BYTEA::INTEGER,
+                        CAST('abcdef' AS VARCHAR(3)),
+                        CAST(12.36 AS NUMERIC(4, 1))
+                     FROM types",
+                    &[],
+                )
+                .unwrap()
+                .rows,
+            vec![vec![
+                Value::Int4(42),
+                Value::Numeric("3.5".parse().unwrap()),
+                Value::Int4(3),
+                Value::Text("1".into()),
+                Value::Text("true".into()),
+                Value::Bool(true),
+                Value::Int4(1),
+                Value::Bytea(vec![0, 0, 1, 2]),
+                Value::Int4(258),
+                Value::Text("abc".into()),
+                Value::Numeric("12.4".parse().unwrap()),
+            ]]
+        );
+
+        session
+            .execute("UPDATE types SET small_value = int_value, int_value = 2.6")
+            .unwrap();
+        session.execute("UPDATE types SET int_value = '7'").unwrap();
+        assert_eq!(
+            session
+                .query("SELECT small_value, int_value FROM types", &[])
+                .unwrap()
+                .rows,
+            vec![vec![Value::Int2(2), Value::Int4(7)]]
+        );
+    }
+
+    #[test]
+    fn coercion_reports_postgres_error_categories() {
+        let db = Db::new();
+        let mut session = db.session();
+        session
+            .execute(
+                "CREATE TABLE assignments (
+                    small_value SMALLINT,
+                    short_label VARCHAR(3),
+                    fixed_numeric NUMERIC(4, 1)
+                )",
+            )
+            .unwrap();
+
+        assert_eq!(
+            session
+                .execute("INSERT INTO assignments VALUES ('bad', 'abc', 1)")
+                .unwrap_err()
+                .sqlstate,
+            SqlState::InvalidTextRepresentation
+        );
+        assert_eq!(
+            session
+                .execute("INSERT INTO assignments VALUES (40000, 'abc', 1)")
+                .unwrap_err()
+                .sqlstate,
+            SqlState::NumericValueOutOfRange
+        );
+        assert_eq!(
+            session
+                .execute("INSERT INTO assignments VALUES (1, 'toolong', 1)")
+                .unwrap_err()
+                .sqlstate,
+            SqlState::StringDataRightTruncation
+        );
+        assert_eq!(
+            session
+                .execute("INSERT INTO assignments VALUES (1, 'abc', 1234.5)")
+                .unwrap_err()
+                .sqlstate,
+            SqlState::NumericValueOutOfRange
+        );
+        assert_eq!(
+            session
+                .query("SELECT TRUE::BYTEA FROM assignments", &[])
+                .unwrap_err()
+                .sqlstate,
+            SqlState::CannotCoerce
+        );
+    }
+
+    #[test]
     fn explicit_transactions_control_insert_and_update_visibility() {
         let db = Db::new();
         let mut first = db.session();
@@ -888,6 +1036,6 @@ mod tests {
         let error = session
             .execute("INSERT INTO items VALUES ('wrong', 'type')")
             .unwrap_err();
-        assert_eq!(error.sqlstate, SqlState::DatatypeMismatch);
+        assert_eq!(error.sqlstate, SqlState::InvalidTextRepresentation);
     }
 }

@@ -1,15 +1,17 @@
 use crate::{
     api::{ColumnMeta, QueryResult},
     catalog::{Catalog, ColumnDef, TableId, TableSchema},
+    coercion::{self, CastContext},
     error::{PgError, Result, SqlState},
     storage::Table,
     txn::{Snapshot, TransactionManager, Xid, visible_version},
     value::{BaseType, PgType, Value},
 };
 use sqlparser::ast::{
-    AssignmentTarget, BinaryOperator, ColumnOption, Delete, Expr, FromTable, Function, FunctionArg,
-    FunctionArgExpr, FunctionArguments, GroupByExpr, Ident, ObjectType, SelectItem, SetExpr,
-    Statement, TableConstraint, TableFactor, TableWithJoins, UnaryOperator, Value as AstValue,
+    AssignmentTarget, BinaryOperator, CastKind, ColumnOption, Delete, Expr, FromTable, Function,
+    FunctionArg, FunctionArgExpr, FunctionArguments, GroupByExpr, Ident, ObjectType, SelectItem,
+    SetExpr, Statement, TableConstraint, TableFactor, TableWithJoins, UnaryOperator,
+    Value as AstValue,
 };
 use std::{
     cmp::Ordering,
@@ -54,47 +56,7 @@ pub(crate) fn dispatch(
             let mut columns = Vec::new();
             let mut constraints = Vec::new();
             for column in &create.columns {
-                let text = column.data_type.to_string();
-                let base = BaseType::from_name(text.split('(').next().unwrap().trim()).ok_or_else(
-                    || {
-                        PgError::new(
-                            SqlState::UndefinedObject,
-                            format!("type {text} does not exist"),
-                        )
-                    },
-                )?;
-                let params = text
-                    .split_once('(')
-                    .map(|(_, params)| {
-                        params
-                            .trim_end_matches(')')
-                            .split(',')
-                            .map(str::trim)
-                            .map(str::parse::<i32>)
-                            .collect::<std::result::Result<Vec<_>, _>>()
-                    })
-                    .transpose()
-                    .map_err(|_| {
-                        PgError::new(
-                            SqlState::UndefinedObject,
-                            format!("type {text} does not exist"),
-                        )
-                    })?;
-                let data_type = match (base, params.as_deref()) {
-                    (BaseType::Varchar | BaseType::Bpchar, Some([length])) => {
-                        PgType::with_typmod(base, length + 4)
-                    }
-                    (BaseType::Numeric, Some([precision, scale])) => {
-                        PgType::with_typmod(base, (precision << 16) + scale + 4)
-                    }
-                    (_, None) => PgType::new(base),
-                    _ => {
-                        return Err(PgError::new(
-                            SqlState::UndefinedObject,
-                            format!("type {text} does not exist"),
-                        ));
-                    }
-                };
+                let data_type = coercion::type_from_ast(&column.data_type)?;
                 let mut nullable = true;
                 let mut default = None;
                 for option in &column.options {
@@ -287,7 +249,7 @@ fn insert_rows(
         }
         let mut row = vec![Value::Null; schema.columns.len()];
         for (expr, index) in expressions.iter().zip(&column_indexes) {
-            row[*index] = value(expr, schema.columns[*index].data_type.base)?;
+            row[*index] = value(expr, schema.columns[*index].data_type)?;
         }
         table.insert(xid, row);
     }
@@ -363,12 +325,12 @@ fn update_rows(
                 ));
             }
             let expression_base = expression_type(&assignment.value, &schema)?;
-            let column_base = schema.columns[index].data_type.base;
             if !null_expression(&assignment.value)
-                && expression_base != column_base
-                && !matches!(
-                    (expression_base, column_base),
-                    (BaseType::Text, BaseType::Varchar | BaseType::Bpchar)
+                && unknown_string(&assignment.value).is_none()
+                && !coercion::can_cast(
+                    expression_base,
+                    schema.columns[index].data_type.base,
+                    CastContext::Assignment,
                 )
             {
                 return Err(PgError::new(
@@ -406,10 +368,17 @@ fn update_rows(
     for (row_id, version_xmin, row) in targets {
         let mut updated = row.clone();
         for (index, expression) in &assignments {
-            updated[*index] = assignment_value(
-                evaluate(expression, &schema, &row)?,
-                schema.columns[*index].data_type.base,
-            )?;
+            let target = schema.columns[*index].data_type;
+            updated[*index] = if let Some(text) = unknown_string(expression) {
+                coercion::coerce_unknown(text, target, CastContext::Assignment)?
+            } else {
+                coercion::coerce(
+                    evaluate(expression, &schema, &row)?,
+                    expression_type(expression, &schema)?,
+                    target,
+                    CastContext::Assignment,
+                )?
+            };
         }
         table.update(row_id, version_xmin, xid, updated);
     }
@@ -649,25 +618,41 @@ fn select_rows(
     Ok(ExecutionResult::Query(QueryResult { columns, rows }))
 }
 
-fn value(expr: &Expr, base: BaseType) -> Result<Value> {
-    assignment_value(literal_value(expr)?, base)
+fn value(expr: &Expr, target: PgType) -> Result<Value> {
+    if let Some(text) = unknown_string(expr) {
+        coercion::coerce_unknown(text, target, CastContext::Assignment)
+    } else {
+        let (value, source) = constant_value(expr, target.base)?;
+        coercion::coerce(value, source, target, CastContext::Assignment)
+    }
 }
 
-fn assignment_value(value: Value, base: BaseType) -> Result<Value> {
-    if value.is_null()
-        || value.base_type() == Some(base)
-        || matches!(
-            (value.base_type(), base),
-            (Some(BaseType::Text), BaseType::Varchar | BaseType::Bpchar)
-        )
+fn constant_value(expr: &Expr, null_type: BaseType) -> Result<(Value, BaseType)> {
+    if let Expr::Cast {
+        kind,
+        expr,
+        data_type,
+        format,
+    } = expr
     {
-        Ok(value)
-    } else {
-        Err(PgError::new(
-            SqlState::DatatypeMismatch,
-            "column has incompatible type",
-        ))
+        if !matches!(kind, CastKind::Cast | CastKind::DoubleColon) || format.is_some() {
+            return Err(PgError::new(
+                SqlState::FeatureNotSupported,
+                "cast variant is not implemented",
+            ));
+        }
+        let target = coercion::type_from_ast(data_type)?;
+        let value = if let Some(text) = unknown_string(expr) {
+            coercion::coerce_unknown(text, target, CastContext::Explicit)?
+        } else {
+            let (value, source) = constant_value(expr, target.base)?;
+            coercion::coerce(value, source, target, CastContext::Explicit)?
+        };
+        return Ok((value, target.base));
     }
+    let value = literal_value(expr)?;
+    let source = value.base_type().unwrap_or(null_type);
+    Ok((value, source))
 }
 
 fn literal_value(expr: &Expr) -> Result<Value> {
@@ -678,7 +663,28 @@ fn literal_value(expr: &Expr) -> Result<Value> {
         Expr::Value(AstValue::Number(value, _)) if value.contains(['.', 'e', 'E']) => {
             Value::parse(BaseType::Numeric, value)
         }
-        Expr::Value(AstValue::Number(value, _)) => Value::parse(BaseType::Int4, value),
+        Expr::Value(AstValue::Number(value, _)) => integer_literal(value),
+        Expr::UnaryOp {
+            op: UnaryOperator::Plus,
+            expr,
+        } => literal_value(expr),
+        Expr::UnaryOp {
+            op: UnaryOperator::Minus,
+            expr,
+        } if matches!(expr.as_ref(), Expr::Value(AstValue::Number(value, _)) if !value.contains(['.', 'e', 'E'])) =>
+        {
+            let Expr::Value(AstValue::Number(value, _)) = expr.as_ref() else {
+                unreachable!("integer literal pattern was checked")
+            };
+            integer_literal(&format!("-{value}"))
+        }
+        Expr::UnaryOp {
+            op: UnaryOperator::Minus,
+            expr,
+        } if matches!(expr.as_ref(), Expr::Value(AstValue::Number(_, _))) => {
+            unary(UnaryOperator::Minus, literal_value(expr)?)
+        }
+        Expr::Nested(expr) => literal_value(expr),
         Expr::Value(_) => Err(PgError::new(
             SqlState::CannotCoerce,
             "literal has incompatible type",
@@ -687,6 +693,24 @@ fn literal_value(expr: &Expr) -> Result<Value> {
             SqlState::FeatureNotSupported,
             "expression is not implemented",
         )),
+    }
+}
+
+fn integer_literal(value: &str) -> Result<Value> {
+    if let Ok(value) = value.parse::<i32>() {
+        return Ok(Value::Int4(value));
+    }
+    if let Ok(value) = value.parse::<i64>() {
+        return Ok(Value::Int8(value));
+    }
+    Value::parse(BaseType::Numeric, value)
+}
+
+fn unknown_string(expr: &Expr) -> Option<&str> {
+    match expr {
+        Expr::Value(AstValue::SingleQuotedString(value)) => Some(value),
+        Expr::Nested(expr) => unknown_string(expr),
+        _ => None,
     }
 }
 
@@ -714,7 +738,9 @@ fn expression_type(expr: &Expr, schema: &TableSchema) -> Result<BaseType> {
         Expr::Value(AstValue::Number(value, _)) if value.contains(['.', 'e', 'E']) => {
             Ok(BaseType::Numeric)
         }
-        Expr::Value(AstValue::Number(_, _)) => Ok(BaseType::Int4),
+        Expr::Value(AstValue::Number(value, _)) => Ok(integer_literal(value)?
+            .base_type()
+            .expect("numeric literal is not null")),
         Expr::Value(_) => Err(PgError::new(
             SqlState::FeatureNotSupported,
             "literal is not implemented",
@@ -735,53 +761,58 @@ fn expression_type(expr: &Expr, schema: &TableSchema) -> Result<BaseType> {
                 ))
             }
         }
-        Expr::BinaryOp { left, op, right } => {
-            let left_base = expression_type(left, schema)?;
-            let right_base = expression_type(right, schema)?;
-            match op {
-                BinaryOperator::Plus
-                | BinaryOperator::Minus
-                | BinaryOperator::Multiply
-                | BinaryOperator::Divide
-                | BinaryOperator::Modulo
-                    if (numeric(left_base) && left_base == right_base)
-                        || (null_expression(left) && numeric(right_base))
-                        || (numeric(left_base) && null_expression(right)) =>
-                {
-                    if null_expression(left) {
-                        Ok(right_base)
-                    } else {
-                        Ok(left_base)
-                    }
+        Expr::BinaryOp { left, op, right } => match op {
+            BinaryOperator::Plus
+            | BinaryOperator::Minus
+            | BinaryOperator::Multiply
+            | BinaryOperator::Divide
+            | BinaryOperator::Modulo => {
+                let base = expression_common_type(left, right, schema)?;
+                if numeric(base) {
+                    Ok(base)
+                } else {
+                    Err(PgError::new(
+                        SqlState::DatatypeMismatch,
+                        "operator has incompatible types",
+                    ))
                 }
-                BinaryOperator::Eq
-                | BinaryOperator::NotEq
-                | BinaryOperator::Gt
-                | BinaryOperator::Lt
-                | BinaryOperator::GtEq
-                | BinaryOperator::LtEq
-                    if comparable(left_base, right_base)
-                        || null_expression(left)
-                        || null_expression(right) =>
-                {
-                    Ok(BaseType::Bool)
-                }
-                BinaryOperator::And | BinaryOperator::Or
-                    if (left_base == BaseType::Bool || null_expression(left))
-                        && (right_base == BaseType::Bool || null_expression(right)) =>
-                {
-                    Ok(BaseType::Bool)
-                }
-                _ => Err(PgError::new(
-                    SqlState::DatatypeMismatch,
-                    "operator has incompatible types",
-                )),
             }
-        }
+            BinaryOperator::Eq
+            | BinaryOperator::NotEq
+            | BinaryOperator::Gt
+            | BinaryOperator::Lt
+            | BinaryOperator::GtEq
+            | BinaryOperator::LtEq => {
+                expression_common_type(left, right, schema)?;
+                Ok(BaseType::Bool)
+            }
+            BinaryOperator::And | BinaryOperator::Or => {
+                let left_base = expression_type(left, schema)?;
+                let right_base = expression_type(right, schema)?;
+                if (left_base == BaseType::Bool
+                    || null_expression(left)
+                    || unknown_string(left).is_some())
+                    && (right_base == BaseType::Bool
+                        || null_expression(right)
+                        || unknown_string(right).is_some())
+                {
+                    Ok(BaseType::Bool)
+                } else {
+                    Err(PgError::new(
+                        SqlState::DatatypeMismatch,
+                        "operator has incompatible types",
+                    ))
+                }
+            }
+            _ => Err(PgError::new(
+                SqlState::DatatypeMismatch,
+                "operator has incompatible types",
+            )),
+        },
         Expr::IsNull(_) | Expr::IsNotNull(_) => Ok(BaseType::Bool),
         Expr::IsTrue(expr) | Expr::IsFalse(expr) | Expr::IsUnknown(expr) => {
             let base = expression_type(expr, schema)?;
-            if base == BaseType::Bool || null_expression(expr) {
+            if base == BaseType::Bool || null_expression(expr) || unknown_string(expr).is_some() {
                 Ok(BaseType::Bool)
             } else {
                 Err(PgError::new(
@@ -811,18 +842,10 @@ fn expression_type(expr: &Expr, schema: &TableSchema) -> Result<BaseType> {
         } => {
             assert_eq!(conditions.len(), results.len());
             if let Some(operand) = operand {
-                let operand_base = expression_type(operand, schema)?;
                 for condition in conditions {
-                    let condition_base = expression_type(condition, schema)?;
-                    if !null_expression(operand)
-                        && !null_expression(condition)
-                        && !comparable(operand_base, condition_base)
-                    {
-                        return Err(PgError::new(
-                            SqlState::DatatypeMismatch,
-                            "CASE types are incompatible",
-                        ));
-                    }
+                    expression_common_type(operand, condition, schema).map_err(|_| {
+                        PgError::new(SqlState::DatatypeMismatch, "CASE types are incompatible")
+                    })?;
                 }
             } else {
                 for condition in conditions {
@@ -845,6 +868,31 @@ fn expression_type(expr: &Expr, schema: &TableSchema) -> Result<BaseType> {
             )
         }
         Expr::Function(function) => function_type(function, schema),
+        Expr::Cast {
+            kind,
+            expr,
+            data_type,
+            format,
+        } => {
+            if !matches!(kind, CastKind::Cast | CastKind::DoubleColon) || format.is_some() {
+                return Err(PgError::new(
+                    SqlState::FeatureNotSupported,
+                    "cast variant is not implemented",
+                ));
+            }
+            let target = coercion::type_from_ast(data_type)?;
+            if unknown_string(expr).is_none()
+                && !null_expression(expr)
+                && !coercion::can_cast(
+                    expression_type(expr, schema)?,
+                    target.base,
+                    CastContext::Explicit,
+                )
+            {
+                return Err(PgError::new(SqlState::CannotCoerce, "types cannot be cast"));
+            }
+            Ok(target.base)
+        }
         _ => Err(PgError::new(
             SqlState::FeatureNotSupported,
             "expression is not implemented",
@@ -873,27 +921,46 @@ fn numeric(base: BaseType) -> bool {
 }
 
 fn comparable(left: BaseType, right: BaseType) -> bool {
-    left == right
-        || matches!(
-            (left, right),
-            (
-                BaseType::Text | BaseType::Varchar | BaseType::Bpchar,
-                BaseType::Text | BaseType::Varchar | BaseType::Bpchar
-            )
+    coercion::common_type(left, right).is_some()
+}
+
+fn expression_common_type(left: &Expr, right: &Expr, schema: &TableSchema) -> Result<BaseType> {
+    if null_expression(left) && null_expression(right)
+        || unknown_string(left).is_some() && unknown_string(right).is_some()
+    {
+        return Ok(BaseType::Text);
+    }
+    if null_expression(left) || unknown_string(left).is_some() {
+        return expression_type(right, schema);
+    }
+    if null_expression(right) || unknown_string(right).is_some() {
+        return expression_type(left, schema);
+    }
+    coercion::common_type(
+        expression_type(left, schema)?,
+        expression_type(right, schema)?,
+    )
+    .ok_or_else(|| {
+        PgError::new(
+            SqlState::DatatypeMismatch,
+            "expressions have incompatible types",
         )
+    })
 }
 
 fn common_expression_type(expressions: &[&Expr], schema: &TableSchema) -> Result<BaseType> {
     let mut result = None;
     for expression in expressions {
-        if null_expression(expression) {
+        if null_expression(expression) || unknown_string(expression).is_some() {
             continue;
         }
         let base = expression_type(expression, schema)?;
         result = Some(match result {
             None => base,
             Some(current) if current == base => current,
-            Some(current) if comparable(current, base) => BaseType::Text,
+            Some(current) if coercion::common_type(current, base).is_some() => {
+                coercion::common_type(current, base).expect("common type was checked")
+            }
             Some(_) => {
                 return Err(PgError::new(
                     SqlState::DatatypeMismatch,
@@ -971,6 +1038,9 @@ fn function_type(function: &Function, schema: &TableSchema) -> Result<BaseType> 
             })
         }
         "abs" if arguments.len() == 1 => {
+            if unknown_string(arguments[0]).is_some() {
+                return Ok(BaseType::Float8);
+            }
             let base = expression_type(arguments[0], schema)?;
             if !null_expression(arguments[0]) && !numeric(base) {
                 return Err(signature_error());
@@ -997,13 +1067,18 @@ fn evaluate(expr: &Expr, schema: &TableSchema, row: &[Value]) -> Result<Value> {
                 && let Expr::Value(AstValue::Number(value, _)) = expr.as_ref()
                 && !value.contains(['.', 'e', 'E'])
             {
-                return Value::parse(BaseType::Int4, &format!("-{value}"));
+                return integer_literal(&format!("-{value}"));
             }
             unary(*op, evaluate(expr, schema, row)?)
         }
         Expr::BinaryOp { left, op, right } => {
-            let left = evaluate(left, schema, row)?;
-            let right = evaluate(right, schema, row)?;
+            let target = if matches!(op, BinaryOperator::And | BinaryOperator::Or) {
+                BaseType::Bool
+            } else {
+                expression_common_type(left, right, schema)?
+            };
+            let left = evaluate_as(left, target, CastContext::Implicit, schema, row)?;
+            let right = evaluate_as(right, target, CastContext::Implicit, schema, row)?;
             match op {
                 BinaryOperator::Plus
                 | BinaryOperator::Minus
@@ -1038,42 +1113,50 @@ fn evaluate(expr: &Expr, schema: &TableSchema, row: &[Value]) -> Result<Value> {
         Expr::IsNull(expr) => Ok(Value::Bool(evaluate(expr, schema, row)?.is_null())),
         Expr::IsNotNull(expr) => Ok(Value::Bool(!evaluate(expr, schema, row)?.is_null())),
         Expr::IsTrue(expr) => Ok(Value::Bool(matches!(
-            evaluate(expr, schema, row)?,
+            evaluate_as(expr, BaseType::Bool, CastContext::Implicit, schema, row)?,
             Value::Bool(true)
         ))),
         Expr::IsFalse(expr) => Ok(Value::Bool(matches!(
-            evaluate(expr, schema, row)?,
+            evaluate_as(expr, BaseType::Bool, CastContext::Implicit, schema, row)?,
             Value::Bool(false)
         ))),
-        Expr::IsUnknown(expr) => Ok(Value::Bool(evaluate(expr, schema, row)?.is_null())),
-        Expr::IsDistinctFrom(left, right) => distinct(
-            evaluate(left, schema, row)?,
-            evaluate(right, schema, row)?,
-            false,
-        ),
-        Expr::IsNotDistinctFrom(left, right) => distinct(
-            evaluate(left, schema, row)?,
-            evaluate(right, schema, row)?,
-            true,
-        ),
+        Expr::IsUnknown(expr) => Ok(Value::Bool(
+            evaluate_as(expr, BaseType::Bool, CastContext::Implicit, schema, row)?.is_null(),
+        )),
+        Expr::IsDistinctFrom(left, right) | Expr::IsNotDistinctFrom(left, right) => {
+            let target = expression_common_type(left, right, schema)?;
+            distinct(
+                evaluate_as(left, target, CastContext::Implicit, schema, row)?,
+                evaluate_as(right, target, CastContext::Implicit, schema, row)?,
+                matches!(expr, Expr::IsNotDistinctFrom(_, _)),
+            )
+        }
         Expr::Case {
             operand,
             conditions,
             results,
             else_result,
         } => {
-            let operand = operand
-                .as_deref()
-                .map(|operand| evaluate(operand, schema, row))
-                .transpose()?;
+            let result_type = common_expression_type(
+                results
+                    .iter()
+                    .chain(else_result.as_deref())
+                    .collect::<Vec<_>>()
+                    .as_slice(),
+                schema,
+            )?;
+            let operand = operand.as_deref();
             for (condition, result) in conditions.iter().zip(results) {
                 let matches = if let Some(operand) = &operand {
-                    let condition = evaluate(condition, schema, row)?;
+                    let target = expression_common_type(operand, condition, schema)?;
+                    let operand = evaluate_as(operand, target, CastContext::Implicit, schema, row)?;
+                    let condition =
+                        evaluate_as(condition, target, CastContext::Implicit, schema, row)?;
                     if operand.is_null() || condition.is_null() {
                         false
                     } else {
                         matches!(
-                            comparison(&BinaryOperator::Eq, operand, &condition)?,
+                            comparison(&BinaryOperator::Eq, &operand, &condition)?,
                             Value::Bool(true)
                         )
                     }
@@ -1081,15 +1164,41 @@ fn evaluate(expr: &Expr, schema: &TableSchema, row: &[Value]) -> Result<Value> {
                     matches!(evaluate(condition, schema, row)?, Value::Bool(true))
                 };
                 if matches {
-                    return evaluate(result, schema, row);
+                    return evaluate_as(result, result_type, CastContext::Implicit, schema, row);
                 }
             }
-            else_result
-                .as_deref()
-                .map(|result| evaluate(result, schema, row))
-                .unwrap_or(Ok(Value::Null))
+            match else_result {
+                Some(result) => {
+                    evaluate_as(result, result_type, CastContext::Implicit, schema, row)
+                }
+                None => Ok(Value::Null),
+            }
         }
         Expr::Function(function) => evaluate_function(function, schema, row),
+        Expr::Cast {
+            kind,
+            expr,
+            data_type,
+            format,
+        } => {
+            if !matches!(kind, CastKind::Cast | CastKind::DoubleColon) || format.is_some() {
+                return Err(PgError::new(
+                    SqlState::FeatureNotSupported,
+                    "cast variant is not implemented",
+                ));
+            }
+            let target = coercion::type_from_ast(data_type)?;
+            if let Some(text) = unknown_string(expr) {
+                coercion::coerce_unknown(text, target, CastContext::Explicit)
+            } else {
+                coercion::coerce(
+                    evaluate(expr, schema, row)?,
+                    expression_type(expr, schema)?,
+                    target,
+                    CastContext::Explicit,
+                )
+            }
+        }
         _ => Err(PgError::new(
             SqlState::FeatureNotSupported,
             "expression is not implemented",
@@ -1097,14 +1206,35 @@ fn evaluate(expr: &Expr, schema: &TableSchema, row: &[Value]) -> Result<Value> {
     }
 }
 
+fn evaluate_as(
+    expression: &Expr,
+    target: BaseType,
+    context: CastContext,
+    schema: &TableSchema,
+    row: &[Value],
+) -> Result<Value> {
+    if let Some(text) = unknown_string(expression) {
+        coercion::coerce_unknown(text, PgType::new(target), context)
+    } else {
+        let source = expression_type(expression, schema)?;
+        coercion::coerce(
+            evaluate(expression, schema, row)?,
+            source,
+            PgType::new(target),
+            context,
+        )
+    }
+}
+
 fn evaluate_function(function: &Function, schema: &TableSchema, row: &[Value]) -> Result<Value> {
     function_type(function, schema)?;
     let function_name = name(&function.name)?;
     let arguments = function_arguments(function)?;
+    let result_type = function_type(function, schema)?;
     match function_name.as_str() {
         "coalesce" => {
             for argument in arguments {
-                let value = evaluate(argument, schema, row)?;
+                let value = evaluate_as(argument, result_type, CastContext::Implicit, schema, row)?;
                 if !value.is_null() {
                     return Ok(value);
                 }
@@ -1112,11 +1242,23 @@ fn evaluate_function(function: &Function, schema: &TableSchema, row: &[Value]) -
             Ok(Value::Null)
         }
         "nullif" => {
-            let left = evaluate(arguments[0], schema, row)?;
+            let left = evaluate_as(
+                arguments[0],
+                result_type,
+                CastContext::Implicit,
+                schema,
+                row,
+            )?;
             if left.is_null() {
                 return Ok(Value::Null);
             }
-            let right = evaluate(arguments[1], schema, row)?;
+            let right = evaluate_as(
+                arguments[1],
+                result_type,
+                CastContext::Implicit,
+                schema,
+                row,
+            )?;
             if !right.is_null()
                 && matches!(
                     comparison(&BinaryOperator::Eq, &left, &right)?,
@@ -1131,7 +1273,7 @@ fn evaluate_function(function: &Function, schema: &TableSchema, row: &[Value]) -
         "greatest" | "least" => {
             let mut selected = None;
             for argument in arguments {
-                let value = evaluate(argument, schema, row)?;
+                let value = evaluate_as(argument, result_type, CastContext::Implicit, schema, row)?;
                 if value.is_null() {
                     continue;
                 }

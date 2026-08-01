@@ -356,6 +356,67 @@ fn case_and_functions_match_postgres_errors() {
 }
 
 #[test]
+fn coerces_phase_one_types_in_all_cast_contexts() {
+    assert_differential(
+        "CREATE TABLE __TABLE__ (
+             small_value SMALLINT,
+             int_value INTEGER,
+             big_value BIGINT,
+             numeric_value NUMERIC,
+             real_value REAL,
+             double_value DOUBLE PRECISION,
+             short_label VARCHAR(4)
+         ); \
+         INSERT INTO __TABLE__ VALUES (1, 2, 3, 4, 5, 6, 'abcd'); \
+         SELECT
+             small_value + int_value,
+             int_value + big_value,
+             big_value + numeric_value,
+             numeric_value + real_value,
+             real_value + double_value,
+             int_value = '2',
+             CASE WHEN TRUE THEN int_value ELSE numeric_value END,
+             COALESCE(NULL, int_value, numeric_value)
+         FROM __TABLE__; \
+         SELECT
+             CAST('42' AS INTEGER),
+             '3.5'::NUMERIC,
+             CAST(2.6 AS INTEGER),
+             CAST(1 AS TEXT),
+             CAST(TRUE AS TEXT),
+             1::BOOLEAN,
+             TRUE::INTEGER,
+             258::BYTEA,
+             '\\x00000102'::BYTEA::INTEGER,
+             CAST('abcdef' AS VARCHAR(3)),
+             CAST(12.36 AS NUMERIC(4, 1))
+         FROM __TABLE__; \
+         UPDATE __TABLE__
+         SET small_value = int_value, int_value = 2.6; \
+         UPDATE __TABLE__ SET int_value = '7'; \
+         SELECT small_value, int_value FROM __TABLE__",
+        RowOrder::Ordered,
+    );
+}
+
+#[test]
+fn coercion_errors_match_postgres() {
+    assert_differential(
+        "CREATE TABLE __TABLE__ (
+             small_value SMALLINT,
+             short_label VARCHAR(3),
+             fixed_numeric NUMERIC(4, 1)
+         ); \
+         INSERT INTO __TABLE__ VALUES ('bad', 'abc', 1); \
+         INSERT INTO __TABLE__ VALUES (40000, 'abc', 1); \
+         INSERT INTO __TABLE__ VALUES (1, 'toolong', 1); \
+         INSERT INTO __TABLE__ VALUES (1, 'abc', 1234.5); \
+         SELECT TRUE::BYTEA FROM __TABLE__",
+        RowOrder::Unordered,
+    );
+}
+
+#[test]
 fn updates_rows_with_expressions_and_where() {
     assert_differential(
         "CREATE TABLE __TABLE__ (id INTEGER, amount INTEGER); \
