@@ -16,7 +16,7 @@ The differential suite compares `pg_fake` with PostgreSQL 18 and starts it
 through Testcontainers by default:
 
 ```sh
-cargo test --test e2e_unit_tests
+cargo test --tests
 ```
 
 The default Colima socket (`~/.colima/default/docker.sock`) is detected
@@ -27,9 +27,12 @@ instead:
 
 ```sh
 PG_FAKE_TEST_DATABASE_URL=postgresql://postgres:password@localhost:5432/postgres \
-  cargo test --test e2e_unit_tests
+  cargo test --tests
 ```
 
-The tests create uniquely named tables and leave them in the configured target
-database. A database dedicated to differential testing is recommended.
-
+The property test generates stateful sequences of valid SQL and compares every
+statement with PostgreSQL. `chaos_theory` prints `CHAOS_THEORY_REPLAY` when it
+finds a failing sequence. Generated tables are dropped during success and
+failure cleanup. The intentional-error examples leave uniquely named tables in
+the configured target database, so a database dedicated to differential testing
+is recommended.

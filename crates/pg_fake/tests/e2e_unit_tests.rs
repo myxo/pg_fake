@@ -260,91 +260,6 @@ fn explicit_transactions_match_postgres_across_sessions() {
 }
 
 #[test]
-fn create_insert_and_select_star() {
-    assert_differential(
-        "CREATE TABLE __TABLE__ (id INTEGER, name TEXT);\
-         INSERT INTO __TABLE__ VALUES (2, 'second'), (1, 'first');\
-         SELECT * FROM __TABLE__",
-        RowOrder::Unordered,
-    );
-}
-
-#[test]
-fn projects_columns_and_nulls() {
-    assert_differential(
-        "CREATE TABLE __TABLE__ (id INTEGER, name TEXT);\
-         INSERT INTO __TABLE__ VALUES (1, NULL), (2, 'two');\
-         SELECT name, id FROM __TABLE__",
-        RowOrder::Unordered,
-    );
-}
-
-#[test]
-fn compares_rows_in_order_when_requested() {
-    assert_differential(
-        "CREATE TABLE __TABLE__ (id INTEGER, name TEXT);\
-         INSERT INTO __TABLE__ VALUES (1, 'first'), (2, 'second');\
-         SELECT * FROM __TABLE__",
-        RowOrder::Ordered,
-    );
-}
-
-#[test]
-fn evaluates_arithmetic_and_comparison_projections() {
-    assert_differential(
-        "CREATE TABLE __TABLE__ (id INTEGER, amount INTEGER, name TEXT, price NUMERIC);\
-         INSERT INTO __TABLE__ VALUES (7, 3, 'seven', 2.5);\
-         SELECT id + amount, id - amount, id * amount, id / amount, id % amount, id > amount, name = 'seven', price * 2.0 FROM __TABLE__",
-        RowOrder::Unordered,
-    );
-}
-
-#[test]
-fn evaluates_case_and_common_scalar_functions() {
-    assert_differential(
-        "CREATE TABLE __TABLE__ (
-             id INTEGER,
-             score INTEGER,
-             label TEXT,
-             delta INTEGER,
-             amount NUMERIC
-         ); \
-         INSERT INTO __TABLE__ VALUES
-             (1, 7, 'MiXeD', 3, 2.5),
-             (2, 0, NULL, NULL, NULL),
-             (3, NULL, 'third', 4, 1.5); \
-         SELECT
-             CASE
-                 WHEN score > 5 THEN 'high'
-                 WHEN score IS NULL THEN 'missing'
-                 ELSE 'low'
-             END,
-             CASE id
-                 WHEN 1 THEN 'one'
-                 WHEN 2 THEN NULL
-                 ELSE 'other'
-             END,
-             CASE WHEN score > 100 THEN score END,
-             COALESCE(label, 'fallback'),
-             NULLIF(score, 0),
-             GREATEST(score, 5),
-             LEAST(score, 5),
-             length(label),
-             lower(label),
-             upper(label),
-             abs(-delta),
-             abs(-amount)
-         FROM __TABLE__; \
-         SELECT
-             CASE WHEN id = 1 THEN 10 ELSE 1 / (id - 1) END,
-             COALESCE(score, 1 / (score - 7))
-         FROM __TABLE__
-         WHERE id = 1",
-        RowOrder::Ordered,
-    );
-}
-
-#[test]
 fn case_and_functions_match_postgres_errors() {
     assert_differential(
         "CREATE TABLE __TABLE__ (id INTEGER); \
@@ -352,50 +267,6 @@ fn case_and_functions_match_postgres_errors() {
          SELECT CASE WHEN id = 1 THEN id ELSE TRUE END FROM __TABLE__; \
          SELECT unknown_function(id) FROM __TABLE__",
         RowOrder::Unordered,
-    );
-}
-
-#[test]
-fn coerces_phase_one_types_in_all_cast_contexts() {
-    assert_differential(
-        "CREATE TABLE __TABLE__ (
-             small_value SMALLINT,
-             int_value INTEGER,
-             big_value BIGINT,
-             numeric_value NUMERIC,
-             real_value REAL,
-             double_value DOUBLE PRECISION,
-             short_label VARCHAR(4)
-         ); \
-         INSERT INTO __TABLE__ VALUES (1, 2, 3, 4, 5, 6, 'abcd'); \
-         SELECT
-             small_value + int_value,
-             int_value + big_value,
-             big_value + numeric_value,
-             numeric_value + real_value,
-             real_value + double_value,
-             int_value = '2',
-             CASE WHEN TRUE THEN int_value ELSE numeric_value END,
-             COALESCE(NULL, int_value, numeric_value)
-         FROM __TABLE__; \
-         SELECT
-             CAST('42' AS INTEGER),
-             '3.5'::NUMERIC,
-             CAST(2.6 AS INTEGER),
-             CAST(1 AS TEXT),
-             CAST(TRUE AS TEXT),
-             1::BOOLEAN,
-             TRUE::INTEGER,
-             258::BYTEA,
-             '\\x00000102'::BYTEA::INTEGER,
-             CAST('abcdef' AS VARCHAR(3)),
-             CAST(12.36 AS NUMERIC(4, 1))
-         FROM __TABLE__; \
-         UPDATE __TABLE__
-         SET small_value = int_value, int_value = 2.6; \
-         UPDATE __TABLE__ SET int_value = '7'; \
-         SELECT small_value, int_value FROM __TABLE__",
-        RowOrder::Ordered,
     );
 }
 
@@ -417,34 +288,6 @@ fn coercion_errors_match_postgres() {
 }
 
 #[test]
-fn orders_by_columns_expressions_and_output_positions() {
-    assert_differential(
-        "CREATE TABLE __TABLE__ (
-             id INTEGER,
-             name TEXT,
-             score INTEGER,
-             optional INTEGER
-         ); \
-         INSERT INTO __TABLE__ VALUES
-             (1, 'b', 2, NULL),
-             (2, 'a', 2, 5),
-             (3, 'c', 1, 3),
-             (4, NULL, 1, NULL),
-             (5, 'a', 2, 1); \
-         SELECT id, name FROM __TABLE__
-         ORDER BY name ASC NULLS LAST, id DESC; \
-         SELECT id FROM __TABLE__ ORDER BY score ASC, id DESC; \
-         SELECT name, id FROM __TABLE__
-         ORDER BY 1 DESC NULLS FIRST, 2 ASC; \
-         SELECT id FROM __TABLE__
-         ORDER BY score + id DESC, id ASC; \
-         SELECT id FROM __TABLE__ ORDER BY optional ASC; \
-         SELECT id FROM __TABLE__ ORDER BY optional DESC",
-        RowOrder::Ordered,
-    );
-}
-
-#[test]
 fn order_by_position_errors_match_postgres() {
     assert_differential(
         "CREATE TABLE __TABLE__ (id INTEGER); \
@@ -452,32 +295,6 @@ fn order_by_position_errors_match_postgres() {
          SELECT id FROM __TABLE__ ORDER BY 0; \
          SELECT id FROM __TABLE__ ORDER BY 2",
         RowOrder::Ordered,
-    );
-}
-
-#[test]
-fn updates_rows_with_expressions_and_where() {
-    assert_differential(
-        "CREATE TABLE __TABLE__ (id INTEGER, amount INTEGER); \
-         INSERT INTO __TABLE__ VALUES (1, 2), (3, 4), (5, 1); \
-         UPDATE __TABLE__ SET id = id + amount, amount = id WHERE amount > 2; \
-         SELECT * FROM __TABLE__; \
-         UPDATE __TABLE__ SET amount = amount * 2; \
-         SELECT * FROM __TABLE__",
-        RowOrder::Unordered,
-    );
-}
-
-#[test]
-fn deletes_rows_with_and_without_where() {
-    assert_differential(
-        "CREATE TABLE __TABLE__ (id INTEGER, amount INTEGER); \
-         INSERT INTO __TABLE__ VALUES (1, 2), (2, NULL), (3, 4); \
-         DELETE FROM __TABLE__ WHERE amount > 2; \
-         SELECT * FROM __TABLE__; \
-         DELETE FROM __TABLE__; \
-         SELECT * FROM __TABLE__",
-        RowOrder::Unordered,
     );
 }
 
@@ -495,38 +312,6 @@ fn delete_visibility_matches_postgres_across_sessions() {
             (SessionName::Second, "SELECT * FROM __TABLE__"),
         ],
         RowOrder::Unordered,
-    );
-}
-
-#[test]
-fn filters_with_boolean_expressions() {
-    assert_differential(
-        "CREATE TABLE __TABLE__ (id INTEGER, score INTEGER, active BOOLEAN, optional INTEGER); \
-         INSERT INTO __TABLE__ VALUES \
-             (1, 3, TRUE, NULL), (2, 10, TRUE, 5), \
-             (3, 8, FALSE, 4), (4, NULL, TRUE, 1); \
-         SELECT id, score FROM __TABLE__ \
-         WHERE (score + id > 10 AND active) OR optional IS NULL",
-        RowOrder::Ordered,
-    );
-}
-
-#[test]
-fn evaluates_null_and_three_valued_logic() {
-    assert_differential(
-        "CREATE TABLE __TABLE__ (id INTEGER, a BOOLEAN, b BOOLEAN); \
-         INSERT INTO __TABLE__ VALUES \
-             (1, TRUE, TRUE), (2, TRUE, FALSE), (3, TRUE, NULL), \
-             (4, FALSE, TRUE), (5, FALSE, FALSE), (6, FALSE, NULL), \
-             (7, NULL, TRUE), (8, NULL, FALSE), (9, NULL, NULL); \
-         SELECT \
-             a AND b, a OR b, NOT a, \
-             a IS TRUE, a IS FALSE, a IS UNKNOWN, a IS NULL, a IS NOT NULL, \
-             a IS DISTINCT FROM b, a IS NOT DISTINCT FROM b, \
-             id + NULL, id = NULL, \
-             id IS DISTINCT FROM NULL, id IS NOT DISTINCT FROM NULL \
-         FROM __TABLE__",
-        RowOrder::Ordered,
     );
 }
 

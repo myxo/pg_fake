@@ -1,0 +1,643 @@
+use std::{
+    cell::RefCell,
+    env,
+    path::PathBuf,
+    str::FromStr,
+    sync::{
+        Mutex,
+        atomic::{AtomicU64, Ordering},
+    },
+};
+
+use bigdecimal::BigDecimal;
+use chaos_theory::{Effect, Source, check, make::int_in_range};
+use pg_fake::{
+    api::{Db, Session},
+    parser::{self, Statement},
+    value::Value,
+};
+use postgres::{Client, NoTls, SimpleQueryMessage};
+use testcontainers::{Container, ImageExt, runners::SyncRunner};
+use testcontainers_modules::postgres::Postgres;
+
+#[derive(Debug, PartialEq, Eq)]
+enum Outcome {
+    Affected(u64),
+    Rows {
+        values: Vec<Vec<Option<String>>>,
+        type_oids: Option<Vec<u32>>,
+    },
+}
+
+#[derive(Clone, Copy)]
+enum RowOrder {
+    Unordered,
+    Ordered,
+}
+
+static TEST_LOCK: Mutex<()> = Mutex::new(());
+static TABLE_NUMBER: AtomicU64 = AtomicU64::new(1);
+
+struct PostgresServer {
+    url: String,
+    _container: Option<Container<Postgres>>,
+}
+
+struct PostgresCase<'client> {
+    client: &'client mut Client,
+    table: String,
+}
+
+impl PostgresCase<'_> {
+    fn client(&mut self) -> &mut Client {
+        self.client
+    }
+}
+
+impl Drop for PostgresCase<'_> {
+    fn drop(&mut self) {
+        let _ = self.client.batch_execute("ROLLBACK");
+        let _ = self
+            .client
+            .batch_execute(&format!("DROP TABLE IF EXISTS {}", self.table));
+    }
+}
+
+fn postgres_server() -> PostgresServer {
+    if let Ok(url) = env::var("PG_FAKE_TEST_DATABASE_URL") {
+        return PostgresServer {
+            url,
+            _container: None,
+        };
+    }
+    if env::var_os("DOCKER_HOST").is_none() {
+        let socket = PathBuf::from(env::var_os("HOME").expect("HOME must be set"))
+            .join(".colima/default/docker.sock");
+        if socket.exists() {
+            unsafe { env::set_var("DOCKER_HOST", format!("unix://{}", socket.display())) };
+        }
+    }
+    let container = Postgres::default()
+        .with_tag("18")
+        .start()
+        .expect("must start PostgreSQL 18 container");
+    let url = format!(
+        "postgresql://postgres:postgres@{}:{}/postgres",
+        container
+            .get_host()
+            .expect("container host must be available"),
+        container
+            .get_host_port_ipv4(5432)
+            .expect("PostgreSQL port must be available")
+    );
+    PostgresServer {
+        url,
+        _container: Some(container),
+    }
+}
+
+fn postgres_outcome(client: &mut Client, statement: &Statement, sql: &str) -> Outcome {
+    let messages = client.simple_query(sql).unwrap_or_else(|error| {
+        panic!(
+            "generated SQL must be valid for PostgreSQL: {sql}\nSQLSTATE: {:?}\n{error}",
+            error.code().map(|code| code.code())
+        )
+    });
+    match statement {
+        Statement::Query(_) => Outcome::Rows {
+            values: messages
+                .iter()
+                .filter_map(|message| match message {
+                    SimpleQueryMessage::Row(row) => Some(
+                        (0..row.len())
+                            .map(|index| row.get(index).map(str::to_owned))
+                            .collect(),
+                    ),
+                    _ => None,
+                })
+                .collect(),
+            type_oids: None,
+        },
+        _ => Outcome::Affected(
+            messages
+                .iter()
+                .filter_map(|message| match message {
+                    SimpleQueryMessage::CommandComplete(rows) => Some(*rows),
+                    _ => None,
+                })
+                .last()
+                .expect("non-query statements must complete"),
+        ),
+    }
+}
+
+fn fake_outcome(session: &mut Session, statement: &Statement, sql: &str) -> Outcome {
+    match statement {
+        Statement::Query(_) => {
+            let result = session.query(sql, &[]).unwrap_or_else(|error| {
+                panic!(
+                    "generated SQL must be supported by pg_fake: {sql}\nSQLSTATE: {}\n{error}",
+                    error.sqlstate.code()
+                )
+            });
+            Outcome::Rows {
+                values: result
+                    .rows
+                    .iter()
+                    .map(|row| {
+                        row.iter()
+                            .map(|value| match value {
+                                Value::Null => None,
+                                value => Some(value.to_text()),
+                            })
+                            .collect()
+                    })
+                    .collect(),
+                type_oids: Some(
+                    result
+                        .columns
+                        .iter()
+                        .map(|column| column.type_oid)
+                        .collect(),
+                ),
+            }
+        }
+        _ => Outcome::Affected(session.execute(sql).unwrap_or_else(|error| {
+            panic!(
+                "generated SQL must be supported by pg_fake: {sql}\nSQLSTATE: {}\n{error}",
+                error.sqlstate.code()
+            )
+        })),
+    }
+}
+
+fn assert_statement(postgres: &mut Client, fake: &mut Session, sql: &str, row_order: RowOrder) {
+    let mut statements = parser::parse(sql)
+        .unwrap_or_else(|error| panic!("generated SQL must parse: {sql}\n{error}"));
+    assert_eq!(
+        statements.len(),
+        1,
+        "generated operation must be one statement"
+    );
+    let statement = statements.pop().expect("statement count was checked");
+    let expected = postgres_outcome(postgres, &statement, sql);
+    let actual = fake_outcome(fake, &statement, sql);
+    match (expected, actual) {
+        (
+            Outcome::Rows {
+                values: mut expected,
+                type_oids: None,
+            },
+            Outcome::Rows {
+                values: mut actual,
+                type_oids: Some(type_oids),
+            },
+        ) => {
+            normalize_rows(&mut expected, &type_oids);
+            normalize_rows(&mut actual, &type_oids);
+            if matches!(row_order, RowOrder::Unordered) {
+                expected.sort();
+                actual.sort();
+            }
+            assert_eq!(actual, expected, "generated SQL: {sql}");
+        }
+        (expected, actual) => assert_eq!(actual, expected, "generated SQL: {sql}"),
+    }
+}
+
+fn normalize_rows(rows: &mut [Vec<Option<String>>], type_oids: &[u32]) {
+    for row in rows {
+        assert_eq!(row.len(), type_oids.len());
+        for (value, type_oid) in row.iter_mut().zip(type_oids) {
+            let Some(value) = value else {
+                continue;
+            };
+            *value = match type_oid {
+                700 => format!("{:08x}", value.parse::<f32>().unwrap().to_bits()),
+                701 => format!("{:016x}", value.parse::<f64>().unwrap().to_bits()),
+                1700 => BigDecimal::from_str(value)
+                    .unwrap()
+                    .normalized()
+                    .to_plain_string(),
+                _ => continue,
+            };
+        }
+    }
+}
+
+fn integer(src: &mut Source, label: &str) -> i32 {
+    src.any_of(label, int_in_range(-20..=20))
+}
+
+fn decimal_literal(value: i32) -> String {
+    let sign = if value < 0 { "-" } else { "" };
+    let absolute = value.abs();
+    format!("{sign}{}.{:02}", absolute / 100, absolute % 100)
+}
+
+fn text_literal(src: &mut Source, label: &str) -> String {
+    let values = ["", "a", "MiXeD", "two words", "quote's", "東京"];
+    let (value, _) = src
+        .choose(label, &values)
+        .expect("text choices must not be empty");
+    format!("'{}'", value.replace('\'', "''"))
+}
+
+fn maybe_null(src: &mut Source, label: &str, value: impl FnOnce(&mut Source) -> String) -> String {
+    src.maybe(label, value).unwrap_or_else(|| "NULL".into())
+}
+
+fn row(src: &mut Source, row_key: i64) -> String {
+    let small_value = maybe_null(src, "small", |src| integer(src, "value").to_string());
+    let int_value = maybe_null(src, "int", |src| integer(src, "value").to_string());
+    let big_value = maybe_null(src, "big", |src| integer(src, "value").to_string());
+    let numeric_value = maybe_null(src, "numeric", |src| {
+        decimal_literal(src.any_of("value", int_in_range(-2000..=2000)))
+    });
+    let real_value = maybe_null(src, "real", |src| {
+        decimal_literal(src.any_of("value", int_in_range(-2000..=2000)))
+    });
+    let double_value = maybe_null(src, "double", |src| {
+        decimal_literal(src.any_of("value", int_in_range(-2000..=2000)))
+    });
+    let flag = maybe_null(src, "flag", |src| {
+        if src.any("value") { "TRUE" } else { "FALSE" }.into()
+    });
+    let text_value = maybe_null(src, "text", |src| text_literal(src, "value"));
+    let varchar_value = maybe_null(src, "varchar", |src| text_literal(src, "value"));
+    let char_value = maybe_null(src, "char", |src| {
+        let values = ["", "x", "fixed", "eight888"];
+        let (value, _) = src
+            .choose("value", &values)
+            .expect("char choices must not be empty");
+        format!("'{value}'")
+    });
+    let bytes = maybe_null(src, "bytes", |src| {
+        let bytes = [
+            src.any_of("a", int_in_range(0_u8..=255)),
+            src.any_of("b", int_in_range(0_u8..=255)),
+            src.any_of("c", int_in_range(0_u8..=255)),
+            src.any_of("d", int_in_range(0_u8..=255)),
+        ];
+        format!(
+            r"'\x{:02x}{:02x}{:02x}{:02x}'",
+            bytes[0], bytes[1], bytes[2], bytes[3]
+        )
+    });
+    format!(
+        "({row_key}, {small_value}, {int_value}, {big_value}, {numeric_value}, \
+         {real_value}, {double_value}, {flag}, {text_value}, {varchar_value}, \
+         {char_value}, {bytes})"
+    )
+}
+
+fn insert_sql(src: &mut Source, table: &str, next_row_key: &mut i64) -> String {
+    let mut rows = Vec::new();
+    src.repeat_n("rows", 1..=4, |src| {
+        rows.push(row(src, *next_row_key));
+        *next_row_key += 1;
+        Effect::Success
+    });
+    format!("INSERT INTO {table} VALUES {}", rows.join(", "))
+}
+
+fn where_clause(src: &mut Source) -> String {
+    src.maybe("where", |src| {
+        src.select(
+            "predicate",
+            &["comparison", "boolean", "null", "distinct", "combined"],
+            |src, predicate, _| match predicate {
+                "comparison" => format!("int_value >= {}", integer(src, "value")),
+                "boolean" => {
+                    let values = ["flag", "NOT flag", "flag IS TRUE", "flag IS FALSE"];
+                    let (value, _) = src
+                        .choose("value", &values)
+                        .expect("boolean predicate choices must not be empty");
+                    (*value).into()
+                }
+                "null" => {
+                    let columns = ["small_value", "text_value", "bytes"];
+                    let (column, _) = src
+                        .choose("column", &columns)
+                        .expect("nullable columns must not be empty");
+                    let operator = if src.any("not") {
+                        "IS NOT NULL"
+                    } else {
+                        "IS NULL"
+                    };
+                    format!("{column} {operator}")
+                }
+                "distinct" => format!(
+                    "int_value IS {}DISTINCT FROM {}",
+                    if src.any("not") { "NOT " } else { "" },
+                    integer(src, "value")
+                ),
+                "combined" => format!(
+                    "(int_value < {} OR flag IS TRUE) AND text_value IS NOT NULL",
+                    integer(src, "value")
+                ),
+                _ => unreachable!(),
+            },
+        )
+    })
+    .map(|predicate| format!(" WHERE {predicate}"))
+    .unwrap_or_default()
+}
+
+fn select_expression(src: &mut Source) -> String {
+    src.select(
+        "expression",
+        &[
+            "wildcard",
+            "column",
+            "arithmetic",
+            "comparison",
+            "boolean",
+            "null",
+            "case",
+            "function",
+            "cast",
+        ],
+        |src, expression, _| match expression {
+            "wildcard" => "*".into(),
+            "column" => {
+                let columns = [
+                    "row_key",
+                    "small_value",
+                    "int_value",
+                    "big_value",
+                    "numeric_value",
+                    "real_value",
+                    "double_value",
+                    "flag",
+                    "text_value",
+                    "varchar_value",
+                    "char_value",
+                    "bytes",
+                ];
+                let (column, _) = src
+                    .choose("column", &columns)
+                    .expect("column choices must not be empty");
+                (*column).into()
+            }
+            "arithmetic" => {
+                let operators = ["+", "-", "*", "/", "%"];
+                let (operator, _) = src
+                    .choose("operator", &operators)
+                    .expect("arithmetic operators must not be empty");
+                let right = if *operator == "/" || *operator == "%" {
+                    src.any_of("right", int_in_range(1..=5))
+                } else {
+                    integer(src, "right")
+                };
+                format!("int_value {operator} {right}")
+            }
+            "comparison" => {
+                let operators = ["=", "<>", ">", "<", ">=", "<="];
+                let (operator, _) = src
+                    .choose("operator", &operators)
+                    .expect("comparison operators must not be empty");
+                format!("numeric_value {operator} {}", integer(src, "right"))
+            }
+            "boolean" => {
+                let values = [
+                    "flag AND TRUE",
+                    "flag OR FALSE",
+                    "NOT flag",
+                    "flag IS TRUE",
+                    "flag IS FALSE",
+                    "flag IS UNKNOWN",
+                ];
+                let (value, _) = src
+                    .choose("value", &values)
+                    .expect("boolean expressions must not be empty");
+                (*value).into()
+            }
+            "null" => {
+                let values = [
+                    "text_value IS NULL",
+                    "text_value IS NOT NULL",
+                    "int_value IS DISTINCT FROM small_value",
+                    "int_value IS NOT DISTINCT FROM small_value",
+                    "int_value + NULL",
+                    "int_value = NULL",
+                ];
+                let (value, _) = src
+                    .choose("value", &values)
+                    .expect("null expressions must not be empty");
+                (*value).into()
+            }
+            "case" => {
+                if src.any("simple") {
+                    format!(
+                        "CASE int_value WHEN {} THEN 'match' ELSE text_value END",
+                        integer(src, "value")
+                    )
+                } else {
+                    format!(
+                        "CASE WHEN int_value > {} THEN big_value WHEN flag IS TRUE THEN 0 ELSE small_value END",
+                        integer(src, "value")
+                    )
+                }
+            }
+            "function" => {
+                let values = [
+                    "COALESCE(text_value, varchar_value, 'fallback')",
+                    "NULLIF(int_value, small_value)",
+                    "GREATEST(int_value, small_value, 0)",
+                    "LEAST(big_value, int_value, 0)",
+                    "length(text_value)",
+                    "lower(varchar_value)",
+                    "upper(text_value)",
+                    "abs(numeric_value)",
+                ];
+                let (value, _) = src
+                    .choose("value", &values)
+                    .expect("function expressions must not be empty");
+                (*value).into()
+            }
+            "cast" => {
+                let values = [
+                    "small_value::BIGINT",
+                    "CAST(int_value AS TEXT)",
+                    "CAST(flag AS INTEGER)",
+                    "CAST(int_value AS BOOLEAN)",
+                    "int_value::BYTEA::INTEGER",
+                    "CAST(text_value AS VARCHAR(6))",
+                    "CAST(numeric_value AS INTEGER)",
+                    "CAST(real_value AS DOUBLE PRECISION)",
+                ];
+                let (value, _) = src
+                    .choose("value", &values)
+                    .expect("cast expressions must not be empty");
+                (*value).into()
+            }
+            _ => unreachable!(),
+        },
+    )
+}
+
+fn select_sql(src: &mut Source, table: &str) -> (String, RowOrder) {
+    let mut projections = Vec::new();
+    src.repeat_n("projections", 1..=4, |src| {
+        projections.push(select_expression(src));
+        Effect::Success
+    });
+    let mut sql = format!(
+        "SELECT {} FROM {table}{}",
+        projections.join(", "),
+        where_clause(src)
+    );
+    let ordered = src.maybe("order", |src| {
+        let keys = [
+            "1",
+            "numeric_value + int_value",
+            "lower(text_value)",
+            "flag IS TRUE",
+        ];
+        let (key, _) = src
+            .choose("key", &keys)
+            .expect("order keys must not be empty");
+        let direction = if src.any("descending") { "DESC" } else { "ASC" };
+        let nulls = if src.any("nulls_first") {
+            "NULLS FIRST"
+        } else {
+            "NULLS LAST"
+        };
+        format!(" ORDER BY {key} {direction} {nulls}, row_key + 0")
+    });
+    if let Some(order) = ordered {
+        sql.push_str(&order);
+        (sql, RowOrder::Ordered)
+    } else {
+        (sql, RowOrder::Unordered)
+    }
+}
+
+fn update_sql(src: &mut Source, table: &str) -> String {
+    let assignment = src.select(
+        "assignment",
+        &[
+            "multiple", "small", "int", "big", "numeric", "real", "double", "flag", "text",
+            "varchar", "char", "bytes",
+        ],
+        |src, assignment, _| match assignment {
+            "multiple" => "int_value = small_value, small_value = int_value".into(),
+            "small" => format!("small_value = {}", integer(src, "value")),
+            "int" => format!("int_value = int_value + {}", integer(src, "value")),
+            "big" => format!(
+                "big_value = COALESCE(big_value, 0) - {}",
+                integer(src, "value")
+            ),
+            "numeric" => format!(
+                "numeric_value = {}",
+                decimal_literal(src.any_of("value", int_in_range(-2000..=2000)))
+            ),
+            "real" => format!("real_value = {}", integer(src, "value")),
+            "double" => format!("double_value = {}", integer(src, "value")),
+            "flag" => "flag = NOT flag".into(),
+            "text" => "text_value = upper(COALESCE(text_value, 'fallback'))".into(),
+            "varchar" => "varchar_value = CAST(COALESCE(text_value, '') AS VARCHAR(12))".into(),
+            "char" => "char_value = CAST(COALESCE(varchar_value, '') AS CHAR(8))".into(),
+            "bytes" => "bytes = int_value::BYTEA".into(),
+            _ => unreachable!(),
+        },
+    );
+    format!("UPDATE {table} SET {assignment}{}", where_clause(src))
+}
+
+fn create_table_sql(table: &str) -> String {
+    format!(
+        "CREATE TABLE {table} (\
+             row_key BIGINT PRIMARY KEY, \
+             small_value SMALLINT CHECK (small_value IS NULL OR small_value >= -100), \
+             int_value INTEGER DEFAULT 0, \
+             big_value BIGINT, \
+             numeric_value NUMERIC(8, 2), \
+             real_value REAL, \
+             double_value DOUBLE PRECISION, \
+             flag BOOLEAN, \
+             text_value TEXT, \
+             varchar_value VARCHAR(12), \
+             char_value CHAR(8), \
+             bytes BYTEA\
+         )"
+    )
+}
+
+#[test]
+fn generated_sql_matches_postgres() {
+    let _test_lock = TEST_LOCK.lock().expect("test mutex must not be poisoned");
+    let server = postgres_server();
+    let postgres = RefCell::new(
+        Client::connect(&server.url, NoTls).expect("must connect to PostgreSQL 18 once"),
+    );
+    check(|src| {
+        let table = format!(
+            "pg_fake_property_{}_{}",
+            std::process::id(),
+            TABLE_NUMBER.fetch_add(1, Ordering::Relaxed)
+        );
+        let mut postgres = postgres.borrow_mut();
+        let mut postgres = PostgresCase {
+            client: &mut postgres,
+            table: table.clone(),
+        };
+        let db = Db::new();
+        let mut fake = db.session();
+        let mut next_row_key = 1;
+        let mut in_transaction = false;
+
+        let create = create_table_sql(&table);
+        assert_statement(postgres.client(), &mut fake, &create, RowOrder::Unordered);
+        let insert = insert_sql(src, &table, &mut next_row_key);
+        assert_statement(postgres.client(), &mut fake, &insert, RowOrder::Unordered);
+
+        src.repeat_n("statements", 3..=14, |src| {
+            let actions: &[&'static str] = if in_transaction {
+                &["insert", "select", "update", "delete", "commit", "rollback"]
+            } else {
+                &["insert", "select", "update", "delete", "begin"]
+            };
+            src.select("action", actions, |src, action, _| {
+                let (sql, order) = match action {
+                    "insert" => (
+                        insert_sql(src, &table, &mut next_row_key),
+                        RowOrder::Unordered,
+                    ),
+                    "select" => select_sql(src, &table),
+                    "update" => (update_sql(src, &table), RowOrder::Unordered),
+                    "delete" => (
+                        format!("DELETE FROM {table}{}", where_clause(src)),
+                        RowOrder::Unordered,
+                    ),
+                    "begin" => {
+                        in_transaction = true;
+                        ("BEGIN".into(), RowOrder::Unordered)
+                    }
+                    "commit" => {
+                        in_transaction = false;
+                        ("COMMIT".into(), RowOrder::Unordered)
+                    }
+                    "rollback" => {
+                        in_transaction = false;
+                        ("ROLLBACK".into(), RowOrder::Unordered)
+                    }
+                    _ => unreachable!(),
+                };
+                src.log_value("sql", &sql);
+                assert_statement(postgres.client(), &mut fake, &sql, order);
+                Effect::Success
+            })
+        });
+
+        if in_transaction {
+            assert_statement(
+                postgres.client(),
+                &mut fake,
+                "ROLLBACK",
+                RowOrder::Unordered,
+            );
+        }
+    });
+}
