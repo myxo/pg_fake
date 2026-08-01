@@ -31,6 +31,19 @@ enum Projection<'a> {
     Column(usize),
     Expression(&'a Expr),
 }
+enum OrderKey<'a> {
+    Output(usize),
+    Expression(&'a Expr),
+}
+struct OrderSpec<'a> {
+    key: OrderKey<'a>,
+    ascending: bool,
+    nulls_first: bool,
+}
+struct OrderedRow {
+    values: Vec<Value>,
+    keys: Vec<Value>,
+}
 impl DatabaseState {
     pub fn new() -> Self {
         DatabaseState {
@@ -478,7 +491,6 @@ fn select_rows(
     snapshot: &Snapshot,
 ) -> Result<ExecutionResult> {
     if query.with.is_some()
-        || query.order_by.is_some()
         || query.limit.is_some()
         || !query.limit_by.is_empty()
         || query.offset.is_some()
@@ -589,14 +601,65 @@ fn select_rows(
             }
         }
     }
+    let order_specs = query
+        .order_by
+        .as_ref()
+        .map(|order_by| {
+            if order_by.interpolate.is_some() {
+                return Err(PgError::new(
+                    SqlState::FeatureNotSupported,
+                    "ORDER BY INTERPOLATE is not implemented",
+                ));
+            }
+            order_by
+                .exprs
+                .iter()
+                .map(|order| {
+                    if order.with_fill.is_some() {
+                        return Err(PgError::new(
+                            SqlState::FeatureNotSupported,
+                            "ORDER BY WITH FILL is not implemented",
+                        ));
+                    }
+                    let key = if let Expr::Value(AstValue::Number(position, _)) = &order.expr
+                        && !position.contains(['.', 'e', 'E'])
+                    {
+                        let position = position.parse::<usize>().map_err(|_| {
+                            PgError::new(
+                                SqlState::InvalidColumnReference,
+                                "ORDER BY position is not in select list",
+                            )
+                        })?;
+                        if position == 0 || position > projections.len() {
+                            return Err(PgError::new(
+                                SqlState::InvalidColumnReference,
+                                "ORDER BY position is not in select list",
+                            ));
+                        }
+                        OrderKey::Output(position - 1)
+                    } else {
+                        expression_type(&order.expr, schema)?;
+                        OrderKey::Expression(&order.expr)
+                    };
+                    let ascending = order.asc.unwrap_or(true);
+                    Ok(OrderSpec {
+                        key,
+                        ascending,
+                        nulls_first: order.nulls_first.unwrap_or(!ascending),
+                    })
+                })
+                .collect::<Result<Vec<_>>>()
+        })
+        .transpose()?
+        .unwrap_or_default();
     let table = state
         .tables
         .get(&schema.id)
         .expect("catalog table must have storage");
-    let rows = table
+    let mut rows = table
         .rows()
         .filter_map(|(_, chain)| visible_version(chain, snapshot, xid, &state.transactions))
-        .try_fold(Vec::new(), |mut rows, version| -> Result<Vec<Vec<Value>>> {
+        .try_fold(Vec::new(), |mut rows, version| -> Result<Vec<OrderedRow>> {
             if let Some(selection) = &select.selection {
                 match evaluate(selection, schema, &version.row)? {
                     Value::Bool(true) => {}
@@ -604,17 +667,59 @@ fn select_rows(
                     _ => unreachable!("WHERE expression was type-checked"),
                 }
             }
-            rows.push(
-                projections
-                    .iter()
-                    .map(|projection| match projection {
-                        Projection::Column(index) => Ok(version.row[*index].clone()),
-                        Projection::Expression(expr) => evaluate(expr, schema, &version.row),
-                    })
-                    .collect::<Result<Vec<_>>>()?,
-            );
+            let values = projections
+                .iter()
+                .map(|projection| match projection {
+                    Projection::Column(index) => Ok(version.row[*index].clone()),
+                    Projection::Expression(expr) => evaluate(expr, schema, &version.row),
+                })
+                .collect::<Result<Vec<_>>>()?;
+            let keys = order_specs
+                .iter()
+                .map(|order| match order.key {
+                    OrderKey::Output(index) => Ok(values[index].clone()),
+                    OrderKey::Expression(expression) => evaluate(expression, schema, &version.row),
+                })
+                .collect::<Result<Vec<_>>>()?;
+            rows.push(OrderedRow { values, keys });
             Ok(rows)
         })?;
+    rows.sort_by(|left, right| {
+        order_specs
+            .iter()
+            .zip(left.keys.iter().zip(&right.keys))
+            .find_map(|(spec, (left, right))| {
+                let ordering = match (left, right) {
+                    (Value::Null, Value::Null) => Ordering::Equal,
+                    (Value::Null, _) => {
+                        if spec.nulls_first {
+                            Ordering::Less
+                        } else {
+                            Ordering::Greater
+                        }
+                    }
+                    (_, Value::Null) => {
+                        if spec.nulls_first {
+                            Ordering::Greater
+                        } else {
+                            Ordering::Less
+                        }
+                    }
+                    _ => {
+                        let ordering = value_ordering(left, right)
+                            .expect("ORDER BY expression type was checked");
+                        if spec.ascending {
+                            ordering
+                        } else {
+                            ordering.reverse()
+                        }
+                    }
+                };
+                (ordering != Ordering::Equal).then_some(ordering)
+            })
+            .unwrap_or(Ordering::Equal)
+    });
+    let rows = rows.into_iter().map(|row| row.values).collect();
     Ok(ExecutionResult::Query(QueryResult { columns, rows }))
 }
 
@@ -1488,7 +1593,20 @@ fn arithmetic(operator: &BinaryOperator, left: Value, right: Value) -> Result<Va
 }
 
 fn comparison(operator: &BinaryOperator, left: &Value, right: &Value) -> Result<Value> {
-    let ordering = match (left, right) {
+    let ordering = value_ordering(left, right)?;
+    Ok(Value::Bool(match operator {
+        BinaryOperator::Eq => ordering == Ordering::Equal,
+        BinaryOperator::NotEq => ordering != Ordering::Equal,
+        BinaryOperator::Gt => ordering == Ordering::Greater,
+        BinaryOperator::Lt => ordering == Ordering::Less,
+        BinaryOperator::GtEq => ordering != Ordering::Less,
+        BinaryOperator::LtEq => ordering != Ordering::Greater,
+        _ => unreachable!("comparison operator was checked by caller"),
+    }))
+}
+
+fn value_ordering(left: &Value, right: &Value) -> Result<Ordering> {
+    Ok(match (left, right) {
         (Value::Bool(left), Value::Bool(right)) => left.cmp(right),
         (Value::Int2(left), Value::Int2(right)) => left.cmp(right),
         (Value::Int4(left), Value::Int4(right)) => left.cmp(right),
@@ -1504,16 +1622,7 @@ fn comparison(operator: &BinaryOperator, left: &Value, right: &Value) -> Result<
                 "operator has incompatible types",
             ));
         }
-    };
-    Ok(Value::Bool(match operator {
-        BinaryOperator::Eq => ordering == Ordering::Equal,
-        BinaryOperator::NotEq => ordering != Ordering::Equal,
-        BinaryOperator::Gt => ordering == Ordering::Greater,
-        BinaryOperator::Lt => ordering == Ordering::Less,
-        BinaryOperator::GtEq => ordering != Ordering::Less,
-        BinaryOperator::LtEq => ordering != Ordering::Greater,
-        _ => unreachable!("comparison operator was checked by caller"),
-    }))
+    })
 }
 
 fn float4_ordering(left: f32, right: f32) -> Ordering {
@@ -1535,5 +1644,42 @@ fn float8_ordering(left: f64, right: f64) -> Ordering {
         (false, false) => left
             .partial_cmp(&right)
             .expect("finite floats are comparable"),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn value_ordering_covers_all_phase_one_types() {
+        let pairs = [
+            (Value::Bool(false), Value::Bool(true)),
+            (Value::Int2(1), Value::Int2(2)),
+            (Value::Int4(1), Value::Int4(2)),
+            (Value::Int8(1), Value::Int8(2)),
+            (Value::Float4(1.0), Value::Float4(2.0)),
+            (Value::Float8(1.0), Value::Float8(2.0)),
+            (
+                Value::Numeric("1".parse().unwrap()),
+                Value::Numeric("2".parse().unwrap()),
+            ),
+            (Value::Text("a".into()), Value::Text("b".into())),
+            (Value::Bytea(vec![1]), Value::Bytea(vec![2])),
+        ];
+
+        for (lower, higher) in pairs {
+            assert_eq!(value_ordering(&lower, &higher).unwrap(), Ordering::Less);
+            assert_eq!(value_ordering(&higher, &lower).unwrap(), Ordering::Greater);
+        }
+
+        assert_eq!(
+            value_ordering(&Value::Float4(f32::NAN), &Value::Float4(1.0)).unwrap(),
+            Ordering::Greater
+        );
+        assert_eq!(
+            value_ordering(&Value::Float8(f64::NAN), &Value::Float8(1.0)).unwrap(),
+            Ordering::Greater
+        );
     }
 }

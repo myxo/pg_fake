@@ -369,6 +369,80 @@ fn select_benchmark(criterion: &mut Criterion, postgres: &mut Client) {
         .unwrap();
 }
 
+fn order_by_benchmark(criterion: &mut Criterion, postgres: &mut Client) {
+    let fake_table = unique_table_name("order_by_fake");
+    let postgres_table = unique_table_name("order_by_postgres");
+    let db = Db::new();
+    let mut fake = db.session();
+    assert_eq!(
+        fake.execute(&format!(
+            "CREATE TABLE {fake_table} (id INTEGER, bucket INTEGER)"
+        ))
+        .unwrap(),
+        0
+    );
+    assert_eq!(
+        postgres
+            .execute(
+                &format!("CREATE TABLE {postgres_table} (id INTEGER, bucket INTEGER)"),
+                &[],
+            )
+            .unwrap(),
+        0
+    );
+    for id in 1..=100 {
+        let bucket = if id % 10 == 0 {
+            "NULL".to_owned()
+        } else {
+            (id % 10).to_string()
+        };
+        assert_eq!(
+            fake.execute(&format!("INSERT INTO {fake_table} VALUES ({id}, {bucket})"))
+                .unwrap(),
+            1
+        );
+        assert_eq!(
+            postgres
+                .execute(
+                    &format!("INSERT INTO {postgres_table} VALUES ({id}, {bucket})"),
+                    &[],
+                )
+                .unwrap(),
+            1
+        );
+    }
+    let fake_select =
+        format!("SELECT id, bucket FROM {fake_table} ORDER BY bucket DESC NULLS LAST, id ASC");
+    let postgres_select =
+        format!("SELECT id, bucket FROM {postgres_table} ORDER BY bucket DESC NULLS LAST, id ASC");
+    let mut group = criterion.benchmark_group("order_by_100_rows");
+
+    group.bench_function("pg_fake", |benchmark| {
+        benchmark.iter(|| {
+            let result = fake.query(&fake_select, &[]).unwrap();
+            assert_eq!(result.rows.len(), 100);
+            black_box(result);
+        });
+    });
+    group.bench_function("postgres_18", |benchmark| {
+        benchmark.iter(|| {
+            let result = postgres.simple_query(&postgres_select).unwrap();
+            assert_eq!(
+                result
+                    .iter()
+                    .filter(|message| matches!(message, SimpleQueryMessage::Row(_)))
+                    .count(),
+                100
+            );
+            black_box(result);
+        });
+    });
+    group.finish();
+    postgres
+        .execute(&format!("DROP TABLE {postgres_table}"), &[])
+        .unwrap();
+}
+
 fn benchmarks(criterion: &mut Criterion) {
     let mut postgres = postgres_benchmark();
 
@@ -378,6 +452,7 @@ fn benchmarks(criterion: &mut Criterion) {
     delete_benchmark(criterion, &mut postgres.client);
     transaction_benchmark(criterion, &mut postgres.client);
     select_benchmark(criterion, &mut postgres.client);
+    order_by_benchmark(criterion, &mut postgres.client);
 }
 
 criterion_group!(workloads, benchmarks);

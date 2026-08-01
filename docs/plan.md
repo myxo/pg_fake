@@ -414,7 +414,7 @@ Unknown functions error via the unsupported-feature policy (§10).
 **Notes:** Rules are mirrored from Postgres, not invented. Retrofitting here is
 intentional so earlier tasks stay small.
 
-### Task 22 — `ORDER BY`
+### Task 22 — `ORDER BY` [COMPLETE]
 **Goal:** Deterministic result ordering on request.
 
 **DoD:**

@@ -8,6 +8,7 @@ workloads = (
     "update_row",
     "transaction_insert",
     "select_100_rows",
+    "order_by_100_rows",
 )
 root = Path("target/criterion")
 

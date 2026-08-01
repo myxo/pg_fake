@@ -779,6 +779,154 @@ mod tests {
     }
 
     #[test]
+    fn orders_rows_by_columns_expressions_and_output_positions() {
+        let db = Db::new();
+        let mut session = db.session();
+        session
+            .execute(
+                "CREATE TABLE items (
+                    id INTEGER,
+                    name TEXT,
+                    score INTEGER,
+                    optional INTEGER
+                )",
+            )
+            .unwrap();
+        session
+            .execute(
+                "INSERT INTO items VALUES
+                    (1, 'b', 2, NULL),
+                    (2, 'a', 2, 5),
+                    (3, 'c', 1, 3),
+                    (4, NULL, 1, NULL),
+                    (5, 'a', 2, 1)",
+            )
+            .unwrap();
+
+        assert_eq!(
+            session
+                .query(
+                    "SELECT id, name FROM items
+                     ORDER BY name ASC NULLS LAST, id DESC",
+                    &[],
+                )
+                .unwrap()
+                .rows,
+            vec![
+                vec![Value::Int4(5), Value::Text("a".into())],
+                vec![Value::Int4(2), Value::Text("a".into())],
+                vec![Value::Int4(1), Value::Text("b".into())],
+                vec![Value::Int4(3), Value::Text("c".into())],
+                vec![Value::Int4(4), Value::Null],
+            ]
+        );
+        assert_eq!(
+            session
+                .query("SELECT id FROM items ORDER BY score ASC, id DESC", &[],)
+                .unwrap()
+                .rows,
+            vec![
+                vec![Value::Int4(4)],
+                vec![Value::Int4(3)],
+                vec![Value::Int4(5)],
+                vec![Value::Int4(2)],
+                vec![Value::Int4(1)],
+            ]
+        );
+        assert_eq!(
+            session
+                .query(
+                    "SELECT name, id FROM items
+                     ORDER BY 1 DESC NULLS FIRST, 2 ASC",
+                    &[],
+                )
+                .unwrap()
+                .rows,
+            vec![
+                vec![Value::Null, Value::Int4(4)],
+                vec![Value::Text("c".into()), Value::Int4(3)],
+                vec![Value::Text("b".into()), Value::Int4(1)],
+                vec![Value::Text("a".into()), Value::Int4(2)],
+                vec![Value::Text("a".into()), Value::Int4(5)],
+            ]
+        );
+        assert_eq!(
+            session
+                .query(
+                    "SELECT id FROM items
+                     ORDER BY score + id DESC, id ASC",
+                    &[],
+                )
+                .unwrap()
+                .rows,
+            vec![
+                vec![Value::Int4(5)],
+                vec![Value::Int4(4)],
+                vec![Value::Int4(2)],
+                vec![Value::Int4(3)],
+                vec![Value::Int4(1)],
+            ]
+        );
+    }
+
+    #[test]
+    fn order_by_uses_postgres_null_defaults_and_validates_positions() {
+        let db = Db::new();
+        let mut session = db.session();
+        session
+            .execute("CREATE TABLE items (id INTEGER, optional INTEGER)")
+            .unwrap();
+        session
+            .execute(
+                "INSERT INTO items VALUES
+                    (1, NULL), (2, 5), (3, 3), (4, NULL), (5, 1)",
+            )
+            .unwrap();
+
+        assert_eq!(
+            session
+                .query("SELECT id FROM items ORDER BY optional ASC", &[])
+                .unwrap()
+                .rows,
+            vec![
+                vec![Value::Int4(5)],
+                vec![Value::Int4(3)],
+                vec![Value::Int4(2)],
+                vec![Value::Int4(1)],
+                vec![Value::Int4(4)],
+            ]
+        );
+        assert_eq!(
+            session
+                .query("SELECT id FROM items ORDER BY optional DESC", &[])
+                .unwrap()
+                .rows,
+            vec![
+                vec![Value::Int4(1)],
+                vec![Value::Int4(4)],
+                vec![Value::Int4(2)],
+                vec![Value::Int4(3)],
+                vec![Value::Int4(5)],
+            ]
+        );
+        assert_eq!(
+            session
+                .query("SELECT id FROM items ORDER BY 0", &[])
+                .unwrap_err()
+                .sqlstate,
+            SqlState::InvalidColumnReference
+        );
+        session.execute("ROLLBACK").unwrap();
+        assert_eq!(
+            session
+                .query("SELECT id FROM items ORDER BY 2", &[])
+                .unwrap_err()
+                .sqlstate,
+            SqlState::InvalidColumnReference
+        );
+    }
+
+    #[test]
     fn explicit_transactions_control_insert_and_update_visibility() {
         let db = Db::new();
         let mut first = db.session();

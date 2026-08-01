@@ -417,6 +417,45 @@ fn coercion_errors_match_postgres() {
 }
 
 #[test]
+fn orders_by_columns_expressions_and_output_positions() {
+    assert_differential(
+        "CREATE TABLE __TABLE__ (
+             id INTEGER,
+             name TEXT,
+             score INTEGER,
+             optional INTEGER
+         ); \
+         INSERT INTO __TABLE__ VALUES
+             (1, 'b', 2, NULL),
+             (2, 'a', 2, 5),
+             (3, 'c', 1, 3),
+             (4, NULL, 1, NULL),
+             (5, 'a', 2, 1); \
+         SELECT id, name FROM __TABLE__
+         ORDER BY name ASC NULLS LAST, id DESC; \
+         SELECT id FROM __TABLE__ ORDER BY score ASC, id DESC; \
+         SELECT name, id FROM __TABLE__
+         ORDER BY 1 DESC NULLS FIRST, 2 ASC; \
+         SELECT id FROM __TABLE__
+         ORDER BY score + id DESC, id ASC; \
+         SELECT id FROM __TABLE__ ORDER BY optional ASC; \
+         SELECT id FROM __TABLE__ ORDER BY optional DESC",
+        RowOrder::Ordered,
+    );
+}
+
+#[test]
+fn order_by_position_errors_match_postgres() {
+    assert_differential(
+        "CREATE TABLE __TABLE__ (id INTEGER); \
+         INSERT INTO __TABLE__ VALUES (1); \
+         SELECT id FROM __TABLE__ ORDER BY 0; \
+         SELECT id FROM __TABLE__ ORDER BY 2",
+        RowOrder::Ordered,
+    );
+}
+
+#[test]
 fn updates_rows_with_expressions_and_where() {
     assert_differential(
         "CREATE TABLE __TABLE__ (id INTEGER, amount INTEGER); \
