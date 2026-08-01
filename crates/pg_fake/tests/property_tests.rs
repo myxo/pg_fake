@@ -292,13 +292,34 @@ fn row(src: &mut Source, row_key: i64) -> String {
 }
 
 fn insert_sql(src: &mut Source, table: &str, next_row_key: &mut i64) -> String {
-    let mut rows = Vec::new();
-    src.repeat_n("rows", 1..=4, |src| {
-        rows.push(row(src, *next_row_key));
-        *next_row_key += 1;
-        Effect::Success
-    });
-    format!("INSERT INTO {table} VALUES {}", rows.join(", "))
+    src.select(
+        "shape",
+        &["full", "omitted", "defaults"],
+        |src, shape, _| {
+            let mut rows = Vec::new();
+            src.repeat_n("rows", 1..=4, |src| {
+                rows.push(match shape {
+                    "full" => row(src, *next_row_key),
+                    "omitted" => format!("({})", *next_row_key),
+                    "defaults" => format!("({}, DEFAULT, DEFAULT)", *next_row_key),
+                    _ => unreachable!(),
+                });
+                *next_row_key += 1;
+                Effect::Success
+            });
+            match shape {
+                "full" => format!("INSERT INTO {table} VALUES {}", rows.join(", ")),
+                "omitted" => {
+                    format!("INSERT INTO {table} (row_key) VALUES {}", rows.join(", "))
+                }
+                "defaults" => format!(
+                    "INSERT INTO {table} (row_key, int_value, text_value) VALUES {}",
+                    rows.join(", ")
+                ),
+                _ => unreachable!(),
+            }
+        },
+    )
 }
 
 fn where_clause(src: &mut Source) -> String {
@@ -544,11 +565,14 @@ fn update_sql(src: &mut Source, table: &str) -> String {
     let assignment = src.select(
         "assignment",
         &[
-            "multiple", "small", "int", "big", "numeric", "real", "double", "flag", "text",
-            "varchar", "char", "bytes",
+            "multiple", "default", "small", "int", "big", "numeric", "real", "double", "flag",
+            "text", "varchar", "char", "bytes",
         ],
         |src, assignment, _| match assignment {
             "multiple" => "int_value = small_value, small_value = int_value".into(),
+            "default" => {
+                "int_value = DEFAULT, numeric_value = DEFAULT, text_value = DEFAULT".into()
+            }
             "small" => format!("small_value = {}", integer(src, "value")),
             "int" => format!("int_value = int_value + {}", integer(src, "value")),
             "big" => format!(
@@ -575,15 +599,15 @@ fn update_sql(src: &mut Source, table: &str) -> String {
 fn create_table_sql(table: &str) -> String {
     format!(
         "CREATE TABLE {table} (\
-             row_key BIGINT PRIMARY KEY, \
+             row_key BIGINT NOT NULL PRIMARY KEY, \
              small_value SMALLINT CHECK (small_value IS NULL OR small_value >= -100), \
              int_value INTEGER DEFAULT 0, \
              big_value BIGINT, \
-             numeric_value NUMERIC(8, 2), \
+             numeric_value NUMERIC(8, 2) DEFAULT 1 + 2, \
              real_value REAL, \
              double_value DOUBLE PRECISION, \
              flag BOOLEAN, \
-             text_value TEXT, \
+             text_value TEXT DEFAULT upper('default'), \
              varchar_value VARCHAR(12), \
              char_value CHAR(8), \
              bytes BYTEA\

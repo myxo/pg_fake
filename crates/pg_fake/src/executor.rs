@@ -99,12 +99,16 @@ pub(crate) fn dispatch(
                         }
                     }
                 }
-                columns.push(ColumnDef {
+                let column = ColumnDef {
                     name: identifier_name(&column.name),
                     data_type,
                     nullable,
                     default,
-                });
+                };
+                if column.default.is_some() {
+                    column_default(&column)?;
+                }
+                columns.push(column);
             }
             for constraint in &create.constraints {
                 match constraint {
@@ -215,18 +219,6 @@ fn insert_rows(
             "INSERT RETURNING is not implemented",
         ));
     }
-    let Some(source) = &insert.source else {
-        return Err(PgError::new(
-            SqlState::FeatureNotSupported,
-            "DEFAULT VALUES is not implemented",
-        ));
-    };
-    let SetExpr::Values(values) = source.body.as_ref() else {
-        return Err(PgError::new(
-            SqlState::FeatureNotSupported,
-            "INSERT source is not implemented",
-        ));
-    };
     let column_indexes = if insert.columns.is_empty() {
         (0..schema.columns.len()).collect::<Vec<_>>()
     } else {
@@ -247,17 +239,8 @@ fn insert_rows(
             })
             .collect::<Result<Vec<_>>>()?
     };
-    if column_indexes.len() != schema.columns.len() {
-        return Err(PgError::new(
-            SqlState::FeatureNotSupported,
-            "omitted INSERT columns are not implemented",
-        ));
-    }
-    let table = state
-        .tables
-        .get_mut(&schema.id)
-        .expect("catalog table must have storage");
-    for expressions in &values.rows {
+    let provided = column_indexes.iter().copied().collect::<BTreeSet<_>>();
+    let build_row = |expressions: &[Expr]| -> Result<Vec<Value>> {
         if expressions.len() != column_indexes.len() {
             return Err(PgError::new(
                 SqlState::SyntaxError,
@@ -265,12 +248,55 @@ fn insert_rows(
             ));
         }
         let mut row = vec![Value::Null; schema.columns.len()];
-        for (expr, index) in expressions.iter().zip(&column_indexes) {
-            row[*index] = value(expr, schema.columns[*index].data_type)?;
+        for (index, column) in schema.columns.iter().enumerate() {
+            if !provided.contains(&index) {
+                row[index] = column_default(column)?;
+            }
         }
+        let constants = constant_schema();
+        for (expr, index) in expressions.iter().zip(&column_indexes) {
+            row[*index] = if default_expression(expr) {
+                column_default(&schema.columns[*index])?
+            } else {
+                expression_value(expr, schema.columns[*index].data_type, &constants, &[])?
+            };
+        }
+        validate_not_null(&schema, &row)?;
+        Ok(row)
+    };
+    let rows = if let Some(source) = &insert.source {
+        let SetExpr::Values(values) = source.body.as_ref() else {
+            return Err(PgError::new(
+                SqlState::FeatureNotSupported,
+                "INSERT source is not implemented",
+            ));
+        };
+        values
+            .rows
+            .iter()
+            .map(|expressions| build_row(expressions))
+            .collect::<Result<Vec<_>>>()?
+    } else {
+        assert!(insert.columns.is_empty());
+        schema
+            .columns
+            .iter()
+            .map(column_default)
+            .collect::<Result<Vec<_>>>()
+            .and_then(|row| {
+                validate_not_null(&schema, &row)?;
+                Ok(vec![row])
+            })?
+    };
+    let table = state
+        .tables
+        .get_mut(&schema.id)
+        .expect("catalog table must have storage");
+    let affected = rows.len() as u64;
+    for row in rows {
         table.insert(xid, row);
     }
-    Ok(ExecutionResult::Affected(values.rows.len() as u64))
+    Ok(ExecutionResult::Affected(affected))
 }
 
 fn update_rows(
@@ -341,11 +367,11 @@ fn update_rows(
                     "multiple assignments to the same column",
                 ));
             }
-            let expression_base = expression_type(&assignment.value, &schema)?;
-            if !null_expression(&assignment.value)
+            if !default_expression(&assignment.value)
+                && !null_expression(&assignment.value)
                 && unknown_string(&assignment.value).is_none()
                 && !coercion::can_cast(
-                    expression_base,
+                    expression_type(&assignment.value, &schema)?,
                     schema.columns[index].data_type.base,
                     CastContext::Assignment,
                 )
@@ -386,17 +412,13 @@ fn update_rows(
         let mut updated = row.clone();
         for (index, expression) in &assignments {
             let target = schema.columns[*index].data_type;
-            updated[*index] = if let Some(text) = unknown_string(expression) {
-                coercion::coerce_unknown(text, target, CastContext::Assignment)?
+            updated[*index] = if default_expression(expression) {
+                column_default(&schema.columns[*index])?
             } else {
-                coercion::coerce(
-                    evaluate(expression, &schema, &row)?,
-                    expression_type(expression, &schema)?,
-                    target,
-                    CastContext::Assignment,
-                )?
+                expression_value(expression, target, &schema, &row)?
             };
         }
+        validate_not_null(&schema, &updated)?;
         table.update(row_id, version_xmin, xid, updated);
     }
     Ok(ExecutionResult::Affected(affected))
@@ -749,12 +771,7 @@ fn row_count(expr: &Expr, clause: RowCountClause) -> Result<Option<usize>> {
     {
         return Ok(None);
     }
-    let schema = TableSchema {
-        id: TableId(0),
-        name: String::new(),
-        columns: Vec::new(),
-        constraints: Vec::new(),
-    };
+    let schema = constant_schema();
     let value = evaluate_as(expr, BaseType::Int8, CastContext::Implicit, &schema, &[]).map_err(
         |error| {
             if error.sqlstate == SqlState::CannotCoerce {
@@ -787,41 +804,69 @@ fn row_count(expr: &Expr, clause: RowCountClause) -> Result<Option<usize>> {
     }
 }
 
-fn value(expr: &Expr, target: PgType) -> Result<Value> {
+fn expression_value(
+    expr: &Expr,
+    target: PgType,
+    schema: &TableSchema,
+    row: &[Value],
+) -> Result<Value> {
     if let Some(text) = unknown_string(expr) {
         coercion::coerce_unknown(text, target, CastContext::Assignment)
     } else {
-        let (value, source) = constant_value(expr, target.base)?;
-        coercion::coerce(value, source, target, CastContext::Assignment)
+        coercion::coerce(
+            evaluate(expr, schema, row)?,
+            expression_type(expr, schema)?,
+            target,
+            CastContext::Assignment,
+        )
     }
 }
 
-fn constant_value(expr: &Expr, null_type: BaseType) -> Result<(Value, BaseType)> {
-    if let Expr::Cast {
-        kind,
-        expr,
-        data_type,
-        format,
-    } = expr
-    {
-        if !matches!(kind, CastKind::Cast | CastKind::DoubleColon) || format.is_some() {
-            return Err(PgError::new(
+fn column_default(column: &ColumnDef) -> Result<Value> {
+    let Some(expr) = &column.default else {
+        return Ok(Value::Null);
+    };
+    expression_value(expr, column.data_type, &constant_schema(), &[]).map_err(|error| {
+        if error.sqlstate == SqlState::UndefinedColumn {
+            PgError::new(
                 SqlState::FeatureNotSupported,
-                "cast variant is not implemented",
-            ));
-        }
-        let target = coercion::type_from_ast(data_type)?;
-        let value = if let Some(text) = unknown_string(expr) {
-            coercion::coerce_unknown(text, target, CastContext::Explicit)?
+                "cannot use column reference in DEFAULT expression",
+            )
         } else {
-            let (value, source) = constant_value(expr, target.base)?;
-            coercion::coerce(value, source, target, CastContext::Explicit)?
-        };
-        return Ok((value, target.base));
+            error
+        }
+    })
+}
+
+fn validate_not_null(schema: &TableSchema, row: &[Value]) -> Result<()> {
+    if let Some(column) = schema
+        .columns
+        .iter()
+        .zip(row)
+        .find_map(|(column, value)| (!column.nullable && value.is_null()).then_some(column))
+    {
+        return Err(PgError::new(
+            SqlState::NotNullViolation,
+            format!(
+                "null value in column {:?} of relation {:?} violates not-null constraint",
+                column.name, schema.name
+            ),
+        ));
     }
-    let value = literal_value(expr)?;
-    let source = value.base_type().unwrap_or(null_type);
-    Ok((value, source))
+    Ok(())
+}
+
+fn default_expression(expr: &Expr) -> bool {
+    matches!(expr, Expr::Identifier(identifier) if identifier.quote_style.is_none() && identifier.value.eq_ignore_ascii_case("default"))
+}
+
+fn constant_schema() -> TableSchema {
+    TableSchema {
+        id: TableId(0),
+        name: String::new(),
+        columns: Vec::new(),
+        constraints: Vec::new(),
+    }
 }
 
 fn literal_value(expr: &Expr) -> Result<Value> {

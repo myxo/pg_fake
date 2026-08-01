@@ -1031,6 +1031,103 @@ mod tests {
     }
 
     #[test]
+    fn applies_defaults_to_inserted_and_updated_rows() {
+        let db = Db::new();
+        let mut session = db.session();
+        session
+            .execute(
+                "CREATE TABLE items (
+                    id INTEGER NOT NULL DEFAULT 10,
+                    amount INTEGER NOT NULL DEFAULT 2 + 3,
+                    label TEXT DEFAULT upper('mixed'),
+                    optional INTEGER
+                )",
+            )
+            .unwrap();
+
+        session.execute("INSERT INTO items DEFAULT VALUES").unwrap();
+        session
+            .execute("INSERT INTO items (id, label) VALUES (1, DEFAULT), (2, NULL)")
+            .unwrap();
+        session
+            .execute("INSERT INTO items (id, amount) VALUES (3, DEFAULT)")
+            .unwrap();
+        session
+            .execute("UPDATE items SET amount = DEFAULT, label = DEFAULT WHERE id = 2")
+            .unwrap();
+
+        assert_eq!(
+            session
+                .query(
+                    "SELECT id, amount, label, optional FROM items ORDER BY id",
+                    &[],
+                )
+                .unwrap()
+                .rows,
+            vec![
+                vec![
+                    Value::Int4(1),
+                    Value::Int4(5),
+                    Value::Text("MIXED".into()),
+                    Value::Null,
+                ],
+                vec![
+                    Value::Int4(2),
+                    Value::Int4(5),
+                    Value::Text("MIXED".into()),
+                    Value::Null,
+                ],
+                vec![
+                    Value::Int4(3),
+                    Value::Int4(5),
+                    Value::Text("MIXED".into()),
+                    Value::Null,
+                ],
+                vec![
+                    Value::Int4(10),
+                    Value::Int4(5),
+                    Value::Text("MIXED".into()),
+                    Value::Null,
+                ],
+            ]
+        );
+    }
+
+    #[test]
+    fn enforces_not_null_after_defaults_and_assignments() {
+        let db = Db::new();
+        let mut session = db.session();
+        session
+            .execute("CREATE TABLE items (id INTEGER NOT NULL, optional INTEGER)")
+            .unwrap();
+
+        assert_eq!(
+            session
+                .execute("INSERT INTO items (optional) VALUES (1)")
+                .unwrap_err()
+                .sqlstate,
+            SqlState::NotNullViolation
+        );
+        session
+            .execute("INSERT INTO items VALUES (1, NULL)")
+            .unwrap();
+        assert_eq!(
+            session
+                .execute("UPDATE items SET id = DEFAULT")
+                .unwrap_err()
+                .sqlstate,
+            SqlState::NotNullViolation
+        );
+        assert_eq!(
+            session
+                .execute("CREATE TABLE invalid_default (a INTEGER, b INTEGER DEFAULT a)")
+                .unwrap_err()
+                .sqlstate,
+            SqlState::FeatureNotSupported
+        );
+    }
+
+    #[test]
     fn explicit_transactions_control_insert_and_update_visibility() {
         let db = Db::new();
         let mut first = db.session();

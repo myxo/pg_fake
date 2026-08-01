@@ -99,7 +99,7 @@ fn insert_benchmark(criterion: &mut Criterion, postgres: &mut Client) {
     let mut fake = db.session();
     assert_eq!(
         fake.execute(&format!(
-            "CREATE TABLE {fake_table} (id INTEGER, name TEXT)"
+            "CREATE TABLE {fake_table} (id INTEGER NOT NULL, name TEXT NOT NULL DEFAULT upper('benchmark'))"
         ))
         .unwrap(),
         0
@@ -107,7 +107,9 @@ fn insert_benchmark(criterion: &mut Criterion, postgres: &mut Client) {
     assert_eq!(
         postgres
             .execute(
-                &format!("CREATE TABLE {postgres_table} (id INTEGER, name TEXT)"),
+                &format!(
+                    "CREATE TABLE {postgres_table} (id INTEGER NOT NULL, name TEXT NOT NULL DEFAULT upper('benchmark'))"
+                ),
                 &[],
             )
             .unwrap(),
@@ -138,6 +140,34 @@ fn insert_benchmark(criterion: &mut Criterion, postgres: &mut Client) {
                         &format!(
                             "INSERT INTO {postgres_table} VALUES ({postgres_id}, 'benchmark')"
                         ),
+                        &[],
+                    )
+                    .unwrap(),
+                1
+            );
+        });
+    });
+    group.finish();
+
+    let mut group = criterion.benchmark_group("insert_row_with_defaults");
+
+    group.bench_function("pg_fake", |benchmark| {
+        benchmark.iter(|| {
+            fake_id += 1;
+            assert_eq!(
+                fake.execute(&format!("INSERT INTO {fake_table} (id) VALUES ({fake_id})"))
+                    .unwrap(),
+                1
+            );
+        });
+    });
+    group.bench_function("postgres_18", |benchmark| {
+        benchmark.iter(|| {
+            postgres_id += 1;
+            assert_eq!(
+                postgres
+                    .execute(
+                        &format!("INSERT INTO {postgres_table} (id) VALUES ({postgres_id})"),
                         &[],
                     )
                     .unwrap(),

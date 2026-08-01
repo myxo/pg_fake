@@ -334,6 +334,36 @@ fn negative_limit_and_offset_errors_match_postgres() {
 }
 
 #[test]
+fn not_null_and_defaults_match_postgres() {
+    assert_differential(
+        "CREATE TABLE __TABLE__ (
+             id INTEGER NOT NULL DEFAULT 10,
+             amount INTEGER NOT NULL DEFAULT 2 + 3,
+             label TEXT DEFAULT upper('mixed'),
+             optional INTEGER
+         ); \
+         INSERT INTO __TABLE__ DEFAULT VALUES; \
+         INSERT INTO __TABLE__ (id, label) VALUES (1, DEFAULT), (2, NULL); \
+         INSERT INTO __TABLE__ (id, amount) VALUES (3, DEFAULT); \
+         UPDATE __TABLE__ SET amount = DEFAULT, label = DEFAULT WHERE id = 2; \
+         SELECT id, amount, label, optional FROM __TABLE__ ORDER BY id",
+        RowOrder::Ordered,
+    );
+}
+
+#[test]
+fn not_null_and_default_errors_match_postgres() {
+    assert_differential(
+        "CREATE TABLE __TABLE__ (id INTEGER NOT NULL, optional INTEGER); \
+         INSERT INTO __TABLE__ (optional) VALUES (1); \
+         INSERT INTO __TABLE__ VALUES (1, NULL); \
+         UPDATE __TABLE__ SET id = DEFAULT; \
+         CREATE TABLE invalid_default (a INTEGER, b INTEGER DEFAULT a)",
+        RowOrder::Unordered,
+    );
+}
+
+#[test]
 fn delete_visibility_matches_postgres_across_sessions() {
     assert_session_differential(
         &[

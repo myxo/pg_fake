@@ -454,7 +454,7 @@ target.
 
 ## Milestone F — Constraints
 
-### Task 24 — `NOT NULL` + column `DEFAULT`
+### Task 24 — `NOT NULL` + column `DEFAULT` [COMPLETE]
 **Goal:** Enforce not-null and apply defaults (§4).
 
 **DoD:**
