@@ -1,7 +1,6 @@
 use std::{
     cell::RefCell,
     env,
-    num::NonZeroI32,
     path::PathBuf,
     str::FromStr,
     sync::{
@@ -11,7 +10,7 @@ use std::{
 };
 
 use bigdecimal::BigDecimal;
-use chaos_theory::{Effect, Source, check};
+use chaos_theory::{Effect, Source, check, make::int_in_range};
 use pg_fake::{
     api::{Db, Session},
     parser::{self, Statement},
@@ -62,422 +61,6 @@ impl Drop for PostgresCase<'_> {
             .client
             .batch_execute(&format!("DROP TABLE IF EXISTS {}", self.table));
     }
-}
-
-#[derive(Debug, Clone, Copy, chaos_theory::Arbitrary)]
-enum TextValue {
-    Empty,
-    Lower,
-    Mixed,
-    Words,
-    Quote,
-    Unicode,
-}
-
-impl TextValue {
-    fn sql(self) -> String {
-        let value = match self {
-            TextValue::Empty => "",
-            TextValue::Lower => "a",
-            TextValue::Mixed => "MiXeD",
-            TextValue::Words => "two words",
-            TextValue::Quote => "quote's",
-            TextValue::Unicode => "東京",
-        };
-        format!("'{}'", value.replace('\'', "''"))
-    }
-}
-
-#[derive(Debug, Clone, Copy, chaos_theory::Arbitrary)]
-enum CharValue {
-    Empty,
-    One,
-    Word,
-    Eight,
-}
-
-impl CharValue {
-    fn sql(self) -> &'static str {
-        match self {
-            CharValue::Empty => "''",
-            CharValue::One => "'x'",
-            CharValue::Word => "'fixed'",
-            CharValue::Eight => "'eight888'",
-        }
-    }
-}
-
-#[derive(Debug, chaos_theory::Arbitrary)]
-struct GeneratedRow {
-    small_value: Option<i16>,
-    int_value: Option<i32>,
-    big_value: Option<i64>,
-    numeric_hundredths: Option<i16>,
-    real_hundredths: Option<i16>,
-    double_hundredths: Option<i16>,
-    flag: Option<bool>,
-    text_value: Option<TextValue>,
-    varchar_value: Option<TextValue>,
-    char_value: Option<CharValue>,
-    bytes: Option<[u8; 4]>,
-}
-
-#[derive(Debug, chaos_theory::Arbitrary)]
-enum Column {
-    RowKey,
-    Small,
-    Int,
-    Big,
-    Numeric,
-    Real,
-    Double,
-    Flag,
-    Text,
-    Varchar,
-    Char,
-    Bytes,
-}
-
-impl Column {
-    fn sql(&self) -> &'static str {
-        match self {
-            Column::RowKey => "row_key",
-            Column::Small => "small_value",
-            Column::Int => "int_value",
-            Column::Big => "big_value",
-            Column::Numeric => "numeric_value",
-            Column::Real => "real_value",
-            Column::Double => "double_value",
-            Column::Flag => "flag",
-            Column::Text => "text_value",
-            Column::Varchar => "varchar_value",
-            Column::Char => "char_value",
-            Column::Bytes => "bytes",
-        }
-    }
-}
-
-#[derive(Debug, chaos_theory::Arbitrary)]
-enum ArithmeticExpression {
-    Add(i32),
-    Subtract(i32),
-    Multiply(i32),
-    Divide(NonZeroI32),
-    Modulo(NonZeroI32),
-}
-
-impl ArithmeticExpression {
-    fn sql(&self) -> String {
-        match self {
-            ArithmeticExpression::Add(value) => format!("int_value::BIGINT + {value}"),
-            ArithmeticExpression::Subtract(value) => format!("int_value::BIGINT - {value}"),
-            ArithmeticExpression::Multiply(value) => format!("int_value::BIGINT * {value}"),
-            ArithmeticExpression::Divide(value) => format!("int_value::BIGINT / {value}"),
-            ArithmeticExpression::Modulo(value) => format!("int_value::BIGINT % {value}"),
-        }
-    }
-}
-
-#[derive(Debug, chaos_theory::Arbitrary)]
-enum ComparisonOperator {
-    Equal,
-    NotEqual,
-    Greater,
-    Less,
-    GreaterOrEqual,
-    LessOrEqual,
-}
-
-impl ComparisonOperator {
-    fn sql(&self) -> &'static str {
-        match self {
-            ComparisonOperator::Equal => "=",
-            ComparisonOperator::NotEqual => "<>",
-            ComparisonOperator::Greater => ">",
-            ComparisonOperator::Less => "<",
-            ComparisonOperator::GreaterOrEqual => ">=",
-            ComparisonOperator::LessOrEqual => "<=",
-        }
-    }
-}
-
-#[derive(Debug, chaos_theory::Arbitrary)]
-enum BooleanExpression {
-    AndTrue,
-    OrFalse,
-    Not,
-    IsTrue,
-    IsFalse,
-    IsUnknown,
-}
-
-impl BooleanExpression {
-    fn sql(&self) -> &'static str {
-        match self {
-            BooleanExpression::AndTrue => "flag AND TRUE",
-            BooleanExpression::OrFalse => "flag OR FALSE",
-            BooleanExpression::Not => "NOT flag",
-            BooleanExpression::IsTrue => "flag IS TRUE",
-            BooleanExpression::IsFalse => "flag IS FALSE",
-            BooleanExpression::IsUnknown => "flag IS UNKNOWN",
-        }
-    }
-}
-
-#[derive(Debug, chaos_theory::Arbitrary)]
-enum NullExpression {
-    IsNull,
-    IsNotNull,
-    IsDistinct,
-    IsNotDistinct,
-    AddNull,
-    EqualNull,
-}
-
-impl NullExpression {
-    fn sql(&self) -> &'static str {
-        match self {
-            NullExpression::IsNull => "text_value IS NULL",
-            NullExpression::IsNotNull => "text_value IS NOT NULL",
-            NullExpression::IsDistinct => "int_value IS DISTINCT FROM small_value",
-            NullExpression::IsNotDistinct => "int_value IS NOT DISTINCT FROM small_value",
-            NullExpression::AddNull => "int_value + NULL",
-            NullExpression::EqualNull => "int_value = NULL",
-        }
-    }
-}
-
-#[derive(Debug, chaos_theory::Arbitrary)]
-enum FunctionExpression {
-    Coalesce,
-    NullIf,
-    Greatest,
-    Least,
-    Length,
-    Lower,
-    Upper,
-    Abs,
-}
-
-impl FunctionExpression {
-    fn sql(&self) -> &'static str {
-        match self {
-            FunctionExpression::Coalesce => "COALESCE(text_value, varchar_value, 'fallback')",
-            FunctionExpression::NullIf => "NULLIF(int_value, small_value)",
-            FunctionExpression::Greatest => "GREATEST(int_value, small_value, 0)",
-            FunctionExpression::Least => "LEAST(big_value, int_value, 0)",
-            FunctionExpression::Length => "length(text_value)",
-            FunctionExpression::Lower => "lower(varchar_value)",
-            FunctionExpression::Upper => "upper(text_value)",
-            FunctionExpression::Abs => "abs(numeric_value)",
-        }
-    }
-}
-
-#[derive(Debug, chaos_theory::Arbitrary)]
-enum CastExpression {
-    SmallToBig,
-    IntToText,
-    BoolToInt,
-    IntToBool,
-    IntToByteaRoundtrip,
-    TextToVarchar,
-    NumericToInt,
-    RealToDouble,
-}
-
-impl CastExpression {
-    fn sql(&self) -> &'static str {
-        match self {
-            CastExpression::SmallToBig => "small_value::BIGINT",
-            CastExpression::IntToText => "CAST(int_value AS TEXT)",
-            CastExpression::BoolToInt => "CAST(flag AS INTEGER)",
-            CastExpression::IntToBool => "CAST(int_value AS BOOLEAN)",
-            CastExpression::IntToByteaRoundtrip => "int_value::BYTEA::INTEGER",
-            CastExpression::TextToVarchar => "CAST(text_value AS VARCHAR(6))",
-            CastExpression::NumericToInt => "CAST(numeric_value AS INTEGER)",
-            CastExpression::RealToDouble => "CAST(real_value AS DOUBLE PRECISION)",
-        }
-    }
-}
-
-#[derive(Debug, chaos_theory::Arbitrary)]
-enum SelectExpression {
-    Wildcard,
-    Column(Column),
-    Arithmetic(ArithmeticExpression),
-    Comparison {
-        operator: ComparisonOperator,
-        right: i32,
-    },
-    Boolean(BooleanExpression),
-    Null(NullExpression),
-    SimpleCase(i32),
-    SearchedCase(i32),
-    Function(FunctionExpression),
-    Cast(CastExpression),
-}
-
-impl SelectExpression {
-    fn sql(&self) -> String {
-        match self {
-            SelectExpression::Wildcard => "*".into(),
-            SelectExpression::Column(column) => column.sql().into(),
-            SelectExpression::Arithmetic(expression) => expression.sql(),
-            SelectExpression::Comparison { operator, right } => {
-                format!("numeric_value {} {right}", operator.sql())
-            }
-            SelectExpression::Boolean(expression) => expression.sql().into(),
-            SelectExpression::Null(expression) => expression.sql().into(),
-            SelectExpression::SimpleCase(value) => {
-                format!("CASE int_value WHEN {value} THEN 'match' ELSE text_value END")
-            }
-            SelectExpression::SearchedCase(value) => format!(
-                "CASE WHEN int_value > {value} THEN big_value WHEN flag IS TRUE THEN 0 ELSE small_value END"
-            ),
-            SelectExpression::Function(expression) => expression.sql().into(),
-            SelectExpression::Cast(expression) => expression.sql().into(),
-        }
-    }
-}
-
-#[derive(Debug, chaos_theory::Arbitrary)]
-enum NullableColumn {
-    Small,
-    Text,
-    Bytes,
-}
-
-impl NullableColumn {
-    fn sql(&self) -> &'static str {
-        match self {
-            NullableColumn::Small => "small_value",
-            NullableColumn::Text => "text_value",
-            NullableColumn::Bytes => "bytes",
-        }
-    }
-}
-
-#[derive(Debug, chaos_theory::Arbitrary)]
-enum Predicate {
-    Comparison(i32),
-    Flag,
-    NotFlag,
-    FlagIsTrue,
-    FlagIsFalse,
-    Null { column: NullableColumn, not: bool },
-    Distinct { not: bool, value: i32 },
-    Combined(i32),
-}
-
-impl Predicate {
-    fn sql(&self) -> String {
-        match self {
-            Predicate::Comparison(value) => format!("int_value >= {value}"),
-            Predicate::Flag => "flag".into(),
-            Predicate::NotFlag => "NOT flag".into(),
-            Predicate::FlagIsTrue => "flag IS TRUE".into(),
-            Predicate::FlagIsFalse => "flag IS FALSE".into(),
-            Predicate::Null { column, not } => {
-                format!("{} IS {}NULL", column.sql(), if *not { "NOT " } else { "" })
-            }
-            Predicate::Distinct { not, value } => format!(
-                "int_value IS {}DISTINCT FROM {value}",
-                if *not { "NOT " } else { "" }
-            ),
-            Predicate::Combined(value) => {
-                format!("(int_value < {value} OR flag IS TRUE) AND text_value IS NOT NULL")
-            }
-        }
-    }
-}
-
-#[derive(Debug, chaos_theory::Arbitrary)]
-enum OrderKey {
-    FirstProjection,
-    NumericExpression,
-    LowerText,
-    FlagIsTrue,
-}
-
-impl OrderKey {
-    fn sql(&self) -> &'static str {
-        match self {
-            OrderKey::FirstProjection => "1",
-            OrderKey::NumericExpression => "numeric_value + int_value",
-            OrderKey::LowerText => "lower(text_value)",
-            OrderKey::FlagIsTrue => "flag IS TRUE",
-        }
-    }
-}
-
-#[derive(Debug, chaos_theory::Arbitrary)]
-struct OrderSpec {
-    key: OrderKey,
-    descending: bool,
-    nulls_first: bool,
-}
-
-#[derive(Debug, chaos_theory::Arbitrary)]
-enum Assignment {
-    Multiple,
-    Small(i16),
-    Int(i32),
-    Big(i64),
-    Numeric(i16),
-    Real(i16),
-    Double(i16),
-    Flag,
-    Text,
-    Varchar,
-    Char,
-    Bytes,
-}
-
-impl Assignment {
-    fn sql(&self) -> String {
-        match self {
-            Assignment::Multiple => "big_value = int_value, int_value = small_value".into(),
-            Assignment::Small(value) => format!("small_value = {value}"),
-            Assignment::Int(value) => format!("int_value = {value}"),
-            Assignment::Big(value) => format!("big_value = {value}"),
-            Assignment::Numeric(value) => {
-                format!("numeric_value = {}", decimal_literal(i32::from(*value)))
-            }
-            Assignment::Real(value) => {
-                format!("real_value = {}", decimal_literal(i32::from(*value)))
-            }
-            Assignment::Double(value) => {
-                format!("double_value = {}", decimal_literal(i32::from(*value)))
-            }
-            Assignment::Flag => "flag = NOT flag".into(),
-            Assignment::Text => "text_value = upper(COALESCE(text_value, 'fallback'))".into(),
-            Assignment::Varchar => {
-                "varchar_value = CAST(COALESCE(text_value, '') AS VARCHAR(12))".into()
-            }
-            Assignment::Char => "char_value = CAST(COALESCE(varchar_value, '') AS CHAR(8))".into(),
-            Assignment::Bytes => "bytes = int_value::BYTEA".into(),
-        }
-    }
-}
-
-#[derive(Debug, chaos_theory::Arbitrary)]
-enum AutocommitAction {
-    Insert,
-    Select,
-    Update,
-    Delete,
-    Begin,
-}
-
-#[derive(Debug, chaos_theory::Arbitrary)]
-enum TransactionAction {
-    Insert,
-    Select,
-    Update,
-    Delete,
-    Commit,
-    Rollback,
 }
 
 fn postgres_server() -> PostgresServer {
@@ -642,36 +225,60 @@ fn normalize_rows(rows: &mut [Vec<Option<String>>], type_oids: &[u32]) {
     }
 }
 
+fn integer(src: &mut Source, label: &str) -> i32 {
+    src.any_of(label, int_in_range(-20..=20))
+}
+
 fn decimal_literal(value: i32) -> String {
     let sign = if value < 0 { "-" } else { "" };
     let absolute = value.abs();
     format!("{sign}{}.{:02}", absolute / 100, absolute % 100)
 }
 
-fn nullable<T>(value: Option<T>, render: impl FnOnce(T) -> String) -> String {
-    value.map(render).unwrap_or_else(|| "NULL".into())
+fn text_literal(src: &mut Source, label: &str) -> String {
+    let values = ["", "a", "MiXeD", "two words", "quote's", "東京"];
+    let (value, _) = src
+        .choose(label, &values)
+        .expect("text choices must not be empty");
+    format!("'{}'", value.replace('\'', "''"))
 }
 
-fn row(row: GeneratedRow, row_key: i64) -> String {
-    let small_value = nullable(row.small_value, |value| value.to_string());
-    let int_value = nullable(row.int_value, |value| value.to_string());
-    let big_value = nullable(row.big_value, |value| value.to_string());
-    let numeric_value = nullable(row.numeric_hundredths, |value| {
-        decimal_literal(i32::from(value))
+fn maybe_null(src: &mut Source, label: &str, value: impl FnOnce(&mut Source) -> String) -> String {
+    src.maybe(label, value).unwrap_or_else(|| "NULL".into())
+}
+
+fn row(src: &mut Source, row_key: i64) -> String {
+    let small_value = maybe_null(src, "small", |src| integer(src, "value").to_string());
+    let int_value = maybe_null(src, "int", |src| integer(src, "value").to_string());
+    let big_value = maybe_null(src, "big", |src| integer(src, "value").to_string());
+    let numeric_value = maybe_null(src, "numeric", |src| {
+        decimal_literal(src.any_of("value", int_in_range(-2000..=2000)))
     });
-    let real_value = nullable(row.real_hundredths, |value| {
-        decimal_literal(i32::from(value))
+    let real_value = maybe_null(src, "real", |src| {
+        decimal_literal(src.any_of("value", int_in_range(-2000..=2000)))
     });
-    let double_value = nullable(row.double_hundredths, |value| {
-        decimal_literal(i32::from(value))
+    let double_value = maybe_null(src, "double", |src| {
+        decimal_literal(src.any_of("value", int_in_range(-2000..=2000)))
     });
-    let flag = nullable(row.flag, |value| {
-        if value { "TRUE" } else { "FALSE" }.into()
+    let flag = maybe_null(src, "flag", |src| {
+        if src.any("value") { "TRUE" } else { "FALSE" }.into()
     });
-    let text_value = nullable(row.text_value, TextValue::sql);
-    let varchar_value = nullable(row.varchar_value, TextValue::sql);
-    let char_value = nullable(row.char_value, |value| value.sql().into());
-    let bytes = nullable(row.bytes, |bytes| {
+    let text_value = maybe_null(src, "text", |src| text_literal(src, "value"));
+    let varchar_value = maybe_null(src, "varchar", |src| text_literal(src, "value"));
+    let char_value = maybe_null(src, "char", |src| {
+        let values = ["", "x", "fixed", "eight888"];
+        let (value, _) = src
+            .choose("value", &values)
+            .expect("char choices must not be empty");
+        format!("'{value}'")
+    });
+    let bytes = maybe_null(src, "bytes", |src| {
+        let bytes = [
+            src.any_of("a", int_in_range(0_u8..=255)),
+            src.any_of("b", int_in_range(0_u8..=255)),
+            src.any_of("c", int_in_range(0_u8..=255)),
+            src.any_of("d", int_in_range(0_u8..=255)),
+        ];
         format!(
             r"'\x{:02x}{:02x}{:02x}{:02x}'",
             bytes[0], bytes[1], bytes[2], bytes[3]
@@ -687,7 +294,7 @@ fn row(row: GeneratedRow, row_key: i64) -> String {
 fn insert_sql(src: &mut Source, table: &str, next_row_key: &mut i64) -> String {
     let mut rows = Vec::new();
     src.repeat_n("rows", 1..=4, |src| {
-        rows.push(row(src.any("row"), *next_row_key));
+        rows.push(row(src, *next_row_key));
         *next_row_key += 1;
         Effect::Success
     });
@@ -695,14 +302,179 @@ fn insert_sql(src: &mut Source, table: &str, next_row_key: &mut i64) -> String {
 }
 
 fn where_clause(src: &mut Source) -> String {
-    let predicate: Option<Predicate> = src.any("where");
-    predicate
-        .map(|predicate| format!(" WHERE {}", predicate.sql()))
-        .unwrap_or_default()
+    src.maybe("where", |src| {
+        src.select(
+            "predicate",
+            &["comparison", "boolean", "null", "distinct", "combined"],
+            |src, predicate, _| match predicate {
+                "comparison" => format!("int_value >= {}", integer(src, "value")),
+                "boolean" => {
+                    let values = ["flag", "NOT flag", "flag IS TRUE", "flag IS FALSE"];
+                    let (value, _) = src
+                        .choose("value", &values)
+                        .expect("boolean predicate choices must not be empty");
+                    (*value).into()
+                }
+                "null" => {
+                    let columns = ["small_value", "text_value", "bytes"];
+                    let (column, _) = src
+                        .choose("column", &columns)
+                        .expect("nullable columns must not be empty");
+                    let operator = if src.any("not") {
+                        "IS NOT NULL"
+                    } else {
+                        "IS NULL"
+                    };
+                    format!("{column} {operator}")
+                }
+                "distinct" => format!(
+                    "int_value IS {}DISTINCT FROM {}",
+                    if src.any("not") { "NOT " } else { "" },
+                    integer(src, "value")
+                ),
+                "combined" => format!(
+                    "(int_value < {} OR flag IS TRUE) AND text_value IS NOT NULL",
+                    integer(src, "value")
+                ),
+                _ => unreachable!(),
+            },
+        )
+    })
+    .map(|predicate| format!(" WHERE {predicate}"))
+    .unwrap_or_default()
 }
 
 fn select_expression(src: &mut Source) -> String {
-    src.any::<SelectExpression>("expression").sql()
+    src.select(
+        "expression",
+        &[
+            "wildcard",
+            "column",
+            "arithmetic",
+            "comparison",
+            "boolean",
+            "null",
+            "case",
+            "function",
+            "cast",
+        ],
+        |src, expression, _| match expression {
+            "wildcard" => "*".into(),
+            "column" => {
+                let columns = [
+                    "row_key",
+                    "small_value",
+                    "int_value",
+                    "big_value",
+                    "numeric_value",
+                    "real_value",
+                    "double_value",
+                    "flag",
+                    "text_value",
+                    "varchar_value",
+                    "char_value",
+                    "bytes",
+                ];
+                let (column, _) = src
+                    .choose("column", &columns)
+                    .expect("column choices must not be empty");
+                (*column).into()
+            }
+            "arithmetic" => {
+                let operators = ["+", "-", "*", "/", "%"];
+                let (operator, _) = src
+                    .choose("operator", &operators)
+                    .expect("arithmetic operators must not be empty");
+                let right = if *operator == "/" || *operator == "%" {
+                    src.any_of("right", int_in_range(1..=5))
+                } else {
+                    integer(src, "right")
+                };
+                format!("int_value {operator} {right}")
+            }
+            "comparison" => {
+                let operators = ["=", "<>", ">", "<", ">=", "<="];
+                let (operator, _) = src
+                    .choose("operator", &operators)
+                    .expect("comparison operators must not be empty");
+                format!("numeric_value {operator} {}", integer(src, "right"))
+            }
+            "boolean" => {
+                let values = [
+                    "flag AND TRUE",
+                    "flag OR FALSE",
+                    "NOT flag",
+                    "flag IS TRUE",
+                    "flag IS FALSE",
+                    "flag IS UNKNOWN",
+                ];
+                let (value, _) = src
+                    .choose("value", &values)
+                    .expect("boolean expressions must not be empty");
+                (*value).into()
+            }
+            "null" => {
+                let values = [
+                    "text_value IS NULL",
+                    "text_value IS NOT NULL",
+                    "int_value IS DISTINCT FROM small_value",
+                    "int_value IS NOT DISTINCT FROM small_value",
+                    "int_value + NULL",
+                    "int_value = NULL",
+                ];
+                let (value, _) = src
+                    .choose("value", &values)
+                    .expect("null expressions must not be empty");
+                (*value).into()
+            }
+            "case" => {
+                if src.any("simple") {
+                    format!(
+                        "CASE int_value WHEN {} THEN 'match' ELSE text_value END",
+                        integer(src, "value")
+                    )
+                } else {
+                    format!(
+                        "CASE WHEN int_value > {} THEN big_value WHEN flag IS TRUE THEN 0 ELSE small_value END",
+                        integer(src, "value")
+                    )
+                }
+            }
+            "function" => {
+                let values = [
+                    "COALESCE(text_value, varchar_value, 'fallback')",
+                    "NULLIF(int_value, small_value)",
+                    "GREATEST(int_value, small_value, 0)",
+                    "LEAST(big_value, int_value, 0)",
+                    "length(text_value)",
+                    "lower(varchar_value)",
+                    "upper(text_value)",
+                    "abs(numeric_value)",
+                ];
+                let (value, _) = src
+                    .choose("value", &values)
+                    .expect("function expressions must not be empty");
+                (*value).into()
+            }
+            "cast" => {
+                let values = [
+                    "small_value::BIGINT",
+                    "CAST(int_value AS TEXT)",
+                    "CAST(flag AS INTEGER)",
+                    "CAST(int_value AS BOOLEAN)",
+                    "int_value::BYTEA::INTEGER",
+                    "CAST(text_value AS VARCHAR(6))",
+                    "CAST(numeric_value AS INTEGER)",
+                    "CAST(real_value AS DOUBLE PRECISION)",
+                ];
+                let (value, _) = src
+                    .choose("value", &values)
+                    .expect("cast expressions must not be empty");
+                (*value).into()
+            }
+            _ => unreachable!(),
+        },
+    )
 }
 
 fn select_sql(src: &mut Source, table: &str) -> (String, RowOrder) {
@@ -716,18 +488,26 @@ fn select_sql(src: &mut Source, table: &str) -> (String, RowOrder) {
         projections.join(", "),
         where_clause(src)
     );
-    let ordered: Option<OrderSpec> = src.any("order");
-    if let Some(order) = ordered {
-        let direction = if order.descending { "DESC" } else { "ASC" };
-        let nulls = if order.nulls_first {
+    let ordered = src.maybe("order", |src| {
+        let keys = [
+            "1",
+            "numeric_value + int_value",
+            "lower(text_value)",
+            "flag IS TRUE",
+        ];
+        let (key, _) = src
+            .choose("key", &keys)
+            .expect("order keys must not be empty");
+        let direction = if src.any("descending") { "DESC" } else { "ASC" };
+        let nulls = if src.any("nulls_first") {
             "NULLS FIRST"
         } else {
             "NULLS LAST"
         };
-        sql.push_str(&format!(
-            " ORDER BY {} {direction} {nulls}, row_key + 0",
-            order.key.sql()
-        ));
+        format!(" ORDER BY {key} {direction} {nulls}, row_key + 0")
+    });
+    if let Some(order) = ordered {
+        sql.push_str(&order);
         (sql, RowOrder::Ordered)
     } else {
         (sql, RowOrder::Unordered)
@@ -735,19 +515,42 @@ fn select_sql(src: &mut Source, table: &str) -> (String, RowOrder) {
 }
 
 fn update_sql(src: &mut Source, table: &str) -> String {
-    let assignment: Assignment = src.any("assignment");
-    format!(
-        "UPDATE {table} SET {}{}",
-        assignment.sql(),
-        where_clause(src)
-    )
+    let assignment = src.select(
+        "assignment",
+        &[
+            "multiple", "small", "int", "big", "numeric", "real", "double", "flag", "text",
+            "varchar", "char", "bytes",
+        ],
+        |src, assignment, _| match assignment {
+            "multiple" => "int_value = small_value, small_value = int_value".into(),
+            "small" => format!("small_value = {}", integer(src, "value")),
+            "int" => format!("int_value = int_value + {}", integer(src, "value")),
+            "big" => format!(
+                "big_value = COALESCE(big_value, 0) - {}",
+                integer(src, "value")
+            ),
+            "numeric" => format!(
+                "numeric_value = {}",
+                decimal_literal(src.any_of("value", int_in_range(-2000..=2000)))
+            ),
+            "real" => format!("real_value = {}", integer(src, "value")),
+            "double" => format!("double_value = {}", integer(src, "value")),
+            "flag" => "flag = NOT flag".into(),
+            "text" => "text_value = upper(COALESCE(text_value, 'fallback'))".into(),
+            "varchar" => "varchar_value = CAST(COALESCE(text_value, '') AS VARCHAR(12))".into(),
+            "char" => "char_value = CAST(COALESCE(varchar_value, '') AS CHAR(8))".into(),
+            "bytes" => "bytes = int_value::BYTEA".into(),
+            _ => unreachable!(),
+        },
+    );
+    format!("UPDATE {table} SET {assignment}{}", where_clause(src))
 }
 
 fn create_table_sql(table: &str) -> String {
     format!(
         "CREATE TABLE {table} (\
              row_key BIGINT PRIMARY KEY, \
-             small_value SMALLINT CHECK (small_value IS NULL OR small_value >= -32768), \
+             small_value SMALLINT CHECK (small_value IS NULL OR small_value >= -100), \
              int_value INTEGER DEFAULT 0, \
              big_value BIGINT, \
              numeric_value NUMERIC(8, 2), \
@@ -791,48 +594,41 @@ fn generated_sql_matches_postgres() {
         assert_statement(postgres.client(), &mut fake, &insert, RowOrder::Unordered);
 
         src.repeat_n("statements", 3..=14, |src| {
-            let (sql, order) = if in_transaction {
-                match src.any::<TransactionAction>("action") {
-                    TransactionAction::Insert => (
-                        insert_sql(src, &table, &mut next_row_key),
-                        RowOrder::Unordered,
-                    ),
-                    TransactionAction::Select => select_sql(src, &table),
-                    TransactionAction::Update => (update_sql(src, &table), RowOrder::Unordered),
-                    TransactionAction::Delete => (
-                        format!("DELETE FROM {table}{}", where_clause(src)),
-                        RowOrder::Unordered,
-                    ),
-                    TransactionAction::Commit => {
-                        in_transaction = false;
-                        ("COMMIT".into(), RowOrder::Unordered)
-                    }
-                    TransactionAction::Rollback => {
-                        in_transaction = false;
-                        ("ROLLBACK".into(), RowOrder::Unordered)
-                    }
-                }
+            let actions: &[&'static str] = if in_transaction {
+                &["insert", "select", "update", "delete", "commit", "rollback"]
             } else {
-                match src.any::<AutocommitAction>("action") {
-                    AutocommitAction::Insert => (
+                &["insert", "select", "update", "delete", "begin"]
+            };
+            src.select("action", actions, |src, action, _| {
+                let (sql, order) = match action {
+                    "insert" => (
                         insert_sql(src, &table, &mut next_row_key),
                         RowOrder::Unordered,
                     ),
-                    AutocommitAction::Select => select_sql(src, &table),
-                    AutocommitAction::Update => (update_sql(src, &table), RowOrder::Unordered),
-                    AutocommitAction::Delete => (
+                    "select" => select_sql(src, &table),
+                    "update" => (update_sql(src, &table), RowOrder::Unordered),
+                    "delete" => (
                         format!("DELETE FROM {table}{}", where_clause(src)),
                         RowOrder::Unordered,
                     ),
-                    AutocommitAction::Begin => {
+                    "begin" => {
                         in_transaction = true;
                         ("BEGIN".into(), RowOrder::Unordered)
                     }
-                }
-            };
-            src.log_value("sql", &sql);
-            assert_statement(postgres.client(), &mut fake, &sql, order);
-            Effect::Success
+                    "commit" => {
+                        in_transaction = false;
+                        ("COMMIT".into(), RowOrder::Unordered)
+                    }
+                    "rollback" => {
+                        in_transaction = false;
+                        ("ROLLBACK".into(), RowOrder::Unordered)
+                    }
+                    _ => unreachable!(),
+                };
+                src.log_value("sql", &sql);
+                assert_statement(postgres.client(), &mut fake, &sql, order);
+                Effect::Success
+            })
         });
 
         if in_transaction {

@@ -316,21 +316,9 @@ version = "0.3.5"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "46dba8e790d3a38b9ce8cf14f70f7d81b5c2d431409503a1545eb8ca482b95b3"
 dependencies = [
- "chaos_theory_derive",
  "indexmap 2.14.0",
  "ordermap",
  "regex",
-]
-
-[[package]]
-name = "chaos_theory_derive"
-version = "0.3.5"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "b69583284ba72588cc585d9738945a771fe5ed9a6f13cb4f2590ea4e4858bb21"
-dependencies = [
- "proc-macro2",
- "quote",
- "syn",
 ]
 
 [[package]]
