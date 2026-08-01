@@ -478,7 +478,7 @@ fn select_expression(src: &mut Source) -> String {
 }
 
 fn select_sql(src: &mut Source, table: &str) -> (String, RowOrder) {
-    let mut projections = Vec::new();
+    let mut projections = vec!["row_key".into()];
     src.repeat_n("projections", 1..=4, |src| {
         projections.push(select_expression(src));
         Effect::Success
@@ -492,7 +492,7 @@ fn select_sql(src: &mut Source, table: &str) -> (String, RowOrder) {
         let keys = [
             "1",
             "numeric_value + int_value",
-            "lower(text_value)",
+            "length(text_value)",
             "flag IS TRUE",
         ];
         let (key, _) = src

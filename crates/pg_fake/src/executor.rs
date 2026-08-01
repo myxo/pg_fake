@@ -851,6 +851,18 @@ fn expression_type(expr: &Expr, schema: &TableSchema) -> Result<BaseType> {
             "literal is not implemented",
         )),
         Expr::Nested(expr) => expression_type(expr, schema),
+        Expr::UnaryOp {
+            op: UnaryOperator::Minus,
+            expr,
+        } if matches!(expr.as_ref(), Expr::Value(AstValue::Number(value, _)) if !value.contains(['.', 'e', 'E'])) =>
+        {
+            let Expr::Value(AstValue::Number(value, _)) = expr.as_ref() else {
+                unreachable!("integer literal pattern was checked")
+            };
+            Ok(integer_literal(&format!("-{value}"))?
+                .base_type()
+                .expect("integer literal is not null"))
+        }
         Expr::UnaryOp { op, expr } => {
             let base = expression_type(expr, schema)?;
             if matches!(op, UnaryOperator::Plus | UnaryOperator::Minus) && numeric(base) {

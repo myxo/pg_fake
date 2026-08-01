@@ -86,6 +86,18 @@ impl Table {
         row_id
     }
 
+    pub fn abort(&mut self, xid: Xid) {
+        self.rows.chains.retain(|_, chain| {
+            chain.versions.retain(|version| version.xmin != xid);
+            for version in &mut chain.versions {
+                if version.xmax == Some(xid) {
+                    version.xmax = None;
+                }
+            }
+            !chain.versions.is_empty()
+        });
+    }
+
     pub fn versions(&self, row_id: RowId) -> Option<&VersionChain> {
         self.rows.chains.get(&row_id)
     }
@@ -165,6 +177,26 @@ mod tests {
                 },
             ]
         );
+    }
+
+    #[test]
+    fn abort_removes_created_versions_and_restores_retired_versions() {
+        let mut table = table();
+        let existing = table.insert(Xid(10), vec![Value::Int4(1)]);
+        let inserted = table.insert(Xid(11), vec![Value::Int4(2)]);
+        table.update(existing, Xid(10), Xid(11), vec![Value::Int4(3)]);
+
+        table.abort(Xid(11));
+
+        assert_eq!(
+            table.versions(existing).unwrap().versions,
+            vec![Version {
+                xmin: Xid(10),
+                xmax: None,
+                row: vec![Value::Int4(1)],
+            }]
+        );
+        assert!(table.versions(inserted).is_none());
     }
 
     #[test]

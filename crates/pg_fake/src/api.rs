@@ -37,6 +37,13 @@ pub struct Transaction<'session> {
     finished: bool,
 }
 
+fn abort(state: &mut DatabaseState, xid: Xid) {
+    state.transactions.abort(xid);
+    for table in state.tables.values_mut() {
+        table.abort(xid);
+    }
+}
+
 impl Db {
     pub fn new() -> Self {
         Db {
@@ -110,7 +117,7 @@ impl Session {
             SessionTransaction::Active(xid) | SessionTransaction::Aborted(xid) => xid,
         };
         let mut state = self.db.state.lock().expect("database mutex is poisoned");
-        state.transactions.abort(xid);
+        abort(&mut state, xid);
     }
     fn abort_transaction(&mut self) {
         if let Some(SessionTransaction::Active(xid)) = self.transaction {
@@ -209,7 +216,7 @@ impl Session {
                 Ok(result)
             }
             Err(error) => {
-                state.transactions.abort(xid);
+                abort(&mut state, xid);
                 Err(error)
             }
         }
@@ -542,6 +549,25 @@ mod tests {
                 .unwrap()
                 .rows,
             vec![vec![Value::Int4(10), Value::Int4(7)]]
+        );
+    }
+
+    #[test]
+    fn simple_case_accepts_minimum_int4_literal() {
+        let db = Db::new();
+        let mut session = db.session();
+        session.execute("CREATE TABLE items (id INTEGER)").unwrap();
+        session.execute("INSERT INTO items VALUES (0)").unwrap();
+
+        assert_eq!(
+            session
+                .query(
+                    "SELECT CASE id WHEN -2147483648 THEN 'minimum' ELSE 'other' END FROM items",
+                    &[]
+                )
+                .unwrap()
+                .rows,
+            vec![vec![Value::Text("other".into())]]
         );
     }
 
@@ -980,6 +1006,26 @@ mod tests {
                 vec![Value::Int4(4), Value::Int4(4)],
             ]
         );
+    }
+
+    #[test]
+    fn rolled_back_update_restores_row_for_later_delete() {
+        let db = Db::new();
+        let mut session = db.session();
+        session
+            .execute("CREATE TABLE items (id INTEGER, amount INTEGER)")
+            .unwrap();
+        session.execute("INSERT INTO items VALUES (1, 1)").unwrap();
+
+        session.execute("BEGIN").unwrap();
+        session.execute("UPDATE items SET amount = 2").unwrap();
+        session.execute("ROLLBACK").unwrap();
+
+        assert_eq!(
+            session.query("SELECT * FROM items", &[]).unwrap().rows,
+            vec![vec![Value::Int4(1), Value::Int4(1)]]
+        );
+        assert_eq!(session.execute("DELETE FROM items").unwrap(), 1);
     }
 
     #[test]

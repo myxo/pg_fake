@@ -260,10 +260,11 @@ fn explicit_transactions_match_postgres_across_sessions() {
 }
 
 #[test]
-fn case_and_functions_match_postgres_errors() {
+fn case_boundaries_and_function_errors_match_postgres() {
     assert_differential(
         "CREATE TABLE __TABLE__ (id INTEGER); \
          INSERT INTO __TABLE__ VALUES (1); \
+         SELECT CASE id WHEN -2147483648 THEN 'minimum' ELSE 'other' END FROM __TABLE__; \
          SELECT CASE WHEN id = 1 THEN id ELSE TRUE END FROM __TABLE__; \
          SELECT unknown_function(id) FROM __TABLE__",
         RowOrder::Unordered,
