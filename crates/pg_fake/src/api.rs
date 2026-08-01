@@ -1128,6 +1128,89 @@ mod tests {
     }
 
     #[test]
+    fn enforces_primary_and_multi_column_unique_constraints() {
+        let db = Db::new();
+        let mut session = db.session();
+        session
+            .execute(
+                "CREATE TABLE accounts (
+                    id INTEGER PRIMARY KEY,
+                    tenant INTEGER,
+                    email TEXT,
+                    UNIQUE (tenant, email)
+                )",
+            )
+            .unwrap();
+        session
+            .execute("INSERT INTO accounts VALUES (1, 1, 'a'), (2, 1, 'b')")
+            .unwrap();
+
+        assert_eq!(
+            session
+                .execute("INSERT INTO accounts VALUES (1, 2, 'c')")
+                .unwrap_err()
+                .sqlstate,
+            SqlState::UniqueViolation
+        );
+        assert_eq!(
+            session
+                .execute("INSERT INTO accounts VALUES (3, 1, 'a')")
+                .unwrap_err()
+                .sqlstate,
+            SqlState::UniqueViolation
+        );
+        assert_eq!(
+            session
+                .execute("UPDATE accounts SET id = 1 WHERE id = 2")
+                .unwrap_err()
+                .sqlstate,
+            SqlState::UniqueViolation
+        );
+        assert_eq!(
+            session
+                .execute("INSERT INTO accounts VALUES (NULL, 2, 'd')")
+                .unwrap_err()
+                .sqlstate,
+            SqlState::NotNullViolation
+        );
+
+        session
+            .execute("INSERT INTO accounts VALUES (3, NULL, 'a'), (4, NULL, 'a')")
+            .unwrap();
+        session
+            .execute("UPDATE accounts SET id = 5, email = 'c' WHERE id = 2")
+            .unwrap();
+        session
+            .execute("DELETE FROM accounts WHERE id = 1")
+            .unwrap();
+        session
+            .execute("INSERT INTO accounts VALUES (1, 1, 'a')")
+            .unwrap();
+    }
+
+    #[test]
+    fn rebuilds_unique_indexes_after_rollback() {
+        let db = Db::new();
+        let mut session = db.session();
+        session
+            .execute("CREATE TABLE items (id INTEGER PRIMARY KEY)")
+            .unwrap();
+        session.execute("INSERT INTO items VALUES (1)").unwrap();
+        session.execute("BEGIN").unwrap();
+        session.execute("UPDATE items SET id = 2").unwrap();
+        session.execute("ROLLBACK").unwrap();
+
+        session.execute("INSERT INTO items VALUES (2)").unwrap();
+        assert_eq!(
+            session
+                .execute("INSERT INTO items VALUES (1)")
+                .unwrap_err()
+                .sqlstate,
+            SqlState::UniqueViolation
+        );
+    }
+
+    #[test]
     fn explicit_transactions_control_insert_and_update_visibility() {
         let db = Db::new();
         let mut first = db.session();

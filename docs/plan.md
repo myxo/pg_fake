@@ -467,7 +467,7 @@ target.
 
 **Notes:** Sequence-backed defaults (`SERIAL`) are Phase 2.
 
-### Task 25 — `PRIMARY KEY` / `UNIQUE` (+ index structures)
+### Task 25 — `PRIMARY KEY` / `UNIQUE` (+ index structures) [COMPLETE]
 **Goal:** Enforce uniqueness via index structures (§3.2).
 
 **DoD:**

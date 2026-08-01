@@ -99,7 +99,7 @@ fn insert_benchmark(criterion: &mut Criterion, postgres: &mut Client) {
     let mut fake = db.session();
     assert_eq!(
         fake.execute(&format!(
-            "CREATE TABLE {fake_table} (id INTEGER NOT NULL, name TEXT NOT NULL DEFAULT upper('benchmark'))"
+            "CREATE TABLE {fake_table} (id INTEGER PRIMARY KEY, name TEXT NOT NULL DEFAULT upper('benchmark'))"
         ))
         .unwrap(),
         0
@@ -108,7 +108,7 @@ fn insert_benchmark(criterion: &mut Criterion, postgres: &mut Client) {
         postgres
             .execute(
                 &format!(
-                    "CREATE TABLE {postgres_table} (id INTEGER NOT NULL, name TEXT NOT NULL DEFAULT upper('benchmark'))"
+                    "CREATE TABLE {postgres_table} (id INTEGER PRIMARY KEY, name TEXT NOT NULL DEFAULT upper('benchmark'))"
                 ),
                 &[],
             )

@@ -565,11 +565,12 @@ fn update_sql(src: &mut Source, table: &str) -> String {
     let assignment = src.select(
         "assignment",
         &[
-            "multiple", "default", "small", "int", "big", "numeric", "real", "double", "flag",
-            "text", "varchar", "char", "bytes",
+            "multiple", "key", "default", "small", "int", "big", "numeric", "real", "double",
+            "flag", "text", "varchar", "char", "bytes",
         ],
         |src, assignment, _| match assignment {
             "multiple" => "int_value = small_value, small_value = int_value".into(),
+            "key" => "row_key = row_key + 1000000".into(),
             "default" => {
                 "int_value = DEFAULT, numeric_value = DEFAULT, text_value = DEFAULT".into()
             }
@@ -610,7 +611,8 @@ fn create_table_sql(table: &str) -> String {
              text_value TEXT DEFAULT upper('default'), \
              varchar_value VARCHAR(12), \
              char_value CHAR(8), \
-             bytes BYTEA\
+             bytes BYTEA, \
+             UNIQUE (row_key, int_value)\
          )"
     )
 }

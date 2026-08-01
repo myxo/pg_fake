@@ -364,6 +364,47 @@ fn not_null_and_default_errors_match_postgres() {
 }
 
 #[test]
+fn primary_and_unique_constraints_match_postgres() {
+    assert_differential(
+        "CREATE TABLE __TABLE__ (
+             id INTEGER PRIMARY KEY,
+             tenant INTEGER,
+             email TEXT,
+             UNIQUE (tenant, email)
+         ); \
+         INSERT INTO __TABLE__ VALUES (1, 1, 'a'), (2, 1, 'b'); \
+         INSERT INTO __TABLE__ VALUES (1, 2, 'c'); \
+         INSERT INTO __TABLE__ VALUES (3, 1, 'a'); \
+         UPDATE __TABLE__ SET id = 1 WHERE id = 2; \
+         UPDATE __TABLE__ SET id = 3, email = 'c' WHERE id = 2; \
+         INSERT INTO __TABLE__ VALUES (NULL, 2, 'd'); \
+         INSERT INTO __TABLE__ VALUES (4, NULL, 'a'), (5, NULL, 'a'); \
+         DELETE FROM __TABLE__ WHERE id = 1; \
+         INSERT INTO __TABLE__ VALUES (1, 1, 'a'); \
+         SELECT * FROM __TABLE__ ORDER BY id",
+        RowOrder::Ordered,
+    );
+}
+
+#[test]
+fn unique_value_semantics_match_postgres() {
+    assert_differential(
+        "CREATE TABLE __TABLE__ (
+             float_value DOUBLE PRECISION UNIQUE,
+             numeric_value NUMERIC UNIQUE,
+             char_value CHAR(3) UNIQUE
+         ); \
+         INSERT INTO __TABLE__ VALUES ('NaN', 1.0, 'x'); \
+         INSERT INTO __TABLE__ (float_value) VALUES ('NaN'); \
+         INSERT INTO __TABLE__ (numeric_value) VALUES (1.00); \
+         INSERT INTO __TABLE__ (char_value) VALUES ('x  '); \
+         INSERT INTO __TABLE__ VALUES (NULL, NULL, NULL); \
+         INSERT INTO __TABLE__ VALUES (NULL, NULL, NULL)",
+        RowOrder::Unordered,
+    );
+}
+
+#[test]
 fn delete_visibility_matches_postgres_across_sessions() {
     assert_session_differential(
         &[

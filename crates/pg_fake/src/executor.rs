@@ -82,7 +82,7 @@ pub(crate) fn dispatch(
                         ColumnOption::NotNull => nullable = false,
                         ColumnOption::Default(expr) => default = Some(expr.clone()),
                         ColumnOption::Unique { is_primary, .. } => {
-                            let columns = vec![column.name.value.clone()];
+                            let columns = vec![identifier_name(&column.name)];
                             constraints.push(if *is_primary {
                                 crate::catalog::Constraint::PrimaryKey(columns)
                             } else {
@@ -114,12 +114,12 @@ pub(crate) fn dispatch(
                 match constraint {
                     TableConstraint::PrimaryKey { columns, .. } => {
                         constraints.push(crate::catalog::Constraint::PrimaryKey(
-                            columns.iter().map(|column| column.value.clone()).collect(),
+                            columns.iter().map(identifier_name).collect(),
                         ))
                     }
                     TableConstraint::Unique { columns, .. } => {
                         constraints.push(crate::catalog::Constraint::Unique(
-                            columns.iter().map(|column| column.value.clone()).collect(),
+                            columns.iter().map(identifier_name).collect(),
                         ))
                     }
                     TableConstraint::Check { expr, .. } => {
@@ -130,6 +130,27 @@ pub(crate) fn dispatch(
                             SqlState::FeatureNotSupported,
                             format!("table constraint is not implemented: {constraint}"),
                         ));
+                    }
+                }
+            }
+            for constraint in &constraints {
+                let (constraint_columns, primary_key) = match constraint {
+                    crate::catalog::Constraint::PrimaryKey(columns) => (columns, true),
+                    crate::catalog::Constraint::Unique(columns) => (columns, false),
+                    crate::catalog::Constraint::Check(_) => continue,
+                };
+                for name in constraint_columns {
+                    let column = columns
+                        .iter_mut()
+                        .find(|column| column.name == *name)
+                        .ok_or_else(|| {
+                            PgError::new(
+                                SqlState::UndefinedColumn,
+                                format!("column {name:?} does not exist"),
+                            )
+                        })?;
+                    if primary_key {
+                        column.nullable = false;
                     }
                 }
             }
@@ -163,7 +184,7 @@ pub(crate) fn dispatch(
             }
             Ok(ExecutionResult::Affected(affected))
         }
-        Statement::Insert(insert) => insert_rows(state, insert, xid),
+        Statement::Insert(insert) => insert_rows(state, insert, xid, snapshot),
         Statement::Update {
             table,
             assignments,
@@ -210,6 +231,7 @@ fn insert_rows(
     state: &mut DatabaseState,
     insert: &sqlparser::ast::Insert,
     xid: Xid,
+    snapshot: &Snapshot,
 ) -> Result<ExecutionResult> {
     let table_name = name(&insert.table_name)?;
     let schema = state.catalog.table(&table_name)?.clone();
@@ -294,6 +316,15 @@ fn insert_rows(
         .expect("catalog table must have storage");
     let affected = rows.len() as u64;
     for row in rows {
+        if table.unique_conflict(&row, snapshot, xid, &state.transactions, None) {
+            return Err(PgError::new(
+                SqlState::UniqueViolation,
+                format!(
+                    "duplicate key value violates unique constraint on {:?}",
+                    schema.name
+                ),
+            ));
+        }
         table.insert(xid, row);
     }
     Ok(ExecutionResult::Affected(affected))
@@ -419,6 +450,15 @@ fn update_rows(
             };
         }
         validate_not_null(&schema, &updated)?;
+        if table.unique_conflict(&updated, snapshot, xid, &state.transactions, Some(row_id)) {
+            return Err(PgError::new(
+                SqlState::UniqueViolation,
+                format!(
+                    "duplicate key value violates unique constraint on {:?}",
+                    schema.name
+                ),
+            ));
+        }
         table.update(row_id, version_xmin, xid, updated);
     }
     Ok(ExecutionResult::Affected(affected))
