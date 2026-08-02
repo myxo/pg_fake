@@ -18,6 +18,7 @@ pub enum SqlState {
     InvalidRowCountInLimitClause,        // 2201W
     InvalidRowCountInResultOffsetClause, // 2201X
     InvalidTextRepresentation,           // 22P02
+    InvalidParameterValue,               // 22023
     StringDataRightTruncation,           // 22001
 
     // 23 — Integrity Constraint Violation
@@ -62,6 +63,7 @@ impl SqlState {
             SqlState::InvalidRowCountInLimitClause => "2201W",
             SqlState::InvalidRowCountInResultOffsetClause => "2201X",
             SqlState::InvalidTextRepresentation => "22P02",
+            SqlState::InvalidParameterValue => "22023",
             SqlState::StringDataRightTruncation => "22001",
             SqlState::NotNullViolation => "23502",
             SqlState::UniqueViolation => "23505",

@@ -558,6 +558,15 @@ fn select_sql(src: &mut Source, table: &str) -> (String, RowOrder) {
     }) {
         sql.push_str(&format!(" OFFSET {offset}"));
     }
+    if let Some(lock) = src.maybe("row_lock", |src| {
+        let locks = ["FOR UPDATE", "FOR SHARE"];
+        let (lock, _) = src
+            .choose("mode", &locks)
+            .expect("row locks must not be empty");
+        *lock
+    }) {
+        sql.push_str(&format!(" {lock}"));
+    }
     (sql, row_order)
 }
 
@@ -626,6 +635,29 @@ fn isolation_level(src: &mut Source) -> &'static str {
     level
 }
 
+fn lock_timeout_sql(src: &mut Source) -> String {
+    src.select(
+        "value",
+        &["zero", "integer", "milliseconds", "seconds"],
+        |src, value, _| match value {
+            "zero" => "SET lock_timeout = 0".into(),
+            "integer" => format!(
+                "SET lock_timeout = {}",
+                src.any_of("milliseconds", int_in_range(1..=1000))
+            ),
+            "milliseconds" => format!(
+                "SET lock_timeout = '{}ms'",
+                src.any_of("milliseconds", int_in_range(1..=1000))
+            ),
+            "seconds" => format!(
+                "SET lock_timeout = '{}s'",
+                src.any_of("seconds", int_in_range(1..=3))
+            ),
+            _ => unreachable!(),
+        },
+    )
+}
+
 #[test]
 fn generated_sql_matches_postgres() {
     let _test_lock = TEST_LOCK.lock().expect("test mutex must not be poisoned");
@@ -655,6 +687,12 @@ fn generated_sql_matches_postgres() {
             "SET SESSION CHARACTERISTICS AS TRANSACTION ISOLATION LEVEL READ COMMITTED",
             RowOrder::Unordered,
         );
+        assert_statement(
+            postgres.client(),
+            &mut fake,
+            "SET lock_timeout = 1000",
+            RowOrder::Unordered,
+        );
         let create = create_table_sql(&table);
         assert_statement(postgres.client(), &mut fake, &create, RowOrder::Unordered);
         let insert = insert_sql(src, &table, &mut next_row_key);
@@ -668,6 +706,7 @@ fn generated_sql_matches_postgres() {
                     "update",
                     "delete",
                     "set_transaction",
+                    "set_lock_timeout",
                     "commit",
                     "rollback",
                 ]
@@ -678,6 +717,7 @@ fn generated_sql_matches_postgres() {
                     "update",
                     "delete",
                     "set_session",
+                    "set_lock_timeout",
                     "begin",
                 ]
             };
@@ -713,6 +753,7 @@ fn generated_sql_matches_postgres() {
                         ),
                         RowOrder::Unordered,
                     ),
+                    "set_lock_timeout" => (lock_timeout_sql(src), RowOrder::Unordered),
                     "commit" => {
                         in_transaction = false;
                         ("COMMIT".into(), RowOrder::Unordered)

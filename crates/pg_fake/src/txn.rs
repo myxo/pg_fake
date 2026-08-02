@@ -1,6 +1,9 @@
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, VecDeque};
 
-use crate::storage::{Version, VersionChain};
+use crate::{
+    catalog::TableId,
+    storage::{RowId, Version, VersionChain},
+};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct Xid(pub u64);
@@ -20,6 +23,34 @@ pub struct Snapshot {
     pub commit_seq: CommitSeq,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct RowLockKey {
+    pub table_id: TableId,
+    pub row_id: RowId,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RowLockMode {
+    Share,
+    Update,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct RowLock {
+    holders: BTreeMap<Xid, RowLockMode>,
+    waiters: VecDeque<Xid>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RowLockManager {
+    locks: BTreeMap<RowLockKey, RowLock>,
+}
+
+pub enum LockAttempt {
+    Acquired,
+    Blocked(Vec<Xid>),
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct TransactionManager {
     next_xid: u64,
@@ -30,6 +61,74 @@ pub struct TransactionManager {
 impl Default for TransactionManager {
     fn default() -> Self {
         Self::new()
+    }
+}
+
+impl Default for RowLockManager {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl RowLockManager {
+    pub fn new() -> Self {
+        RowLockManager {
+            locks: BTreeMap::new(),
+        }
+    }
+
+    pub fn acquire(&mut self, key: RowLockKey, xid: Xid, mode: RowLockMode) -> LockAttempt {
+        let lock = self.locks.entry(key).or_insert_with(|| RowLock {
+            holders: BTreeMap::new(),
+            waiters: VecDeque::new(),
+        });
+        if let Some(held) = lock.holders.get(&xid)
+            && (*held == RowLockMode::Update || mode == RowLockMode::Share)
+        {
+            return LockAttempt::Acquired;
+        }
+        let holder_conflicts = lock
+            .holders
+            .iter()
+            .filter_map(|(holder, held)| {
+                (*holder != xid && (*held == RowLockMode::Update || mode == RowLockMode::Update))
+                    .then_some(*holder)
+            })
+            .collect::<Vec<_>>();
+        let first_waiter = lock.waiters.front().copied();
+        if holder_conflicts.is_empty() && first_waiter.is_none_or(|waiter| waiter == xid) {
+            if first_waiter == Some(xid) {
+                lock.waiters.pop_front();
+            }
+            lock.holders.insert(xid, mode);
+            return LockAttempt::Acquired;
+        }
+        if !lock.waiters.contains(&xid) {
+            lock.waiters.push_back(xid);
+        }
+        LockAttempt::Blocked(holder_conflicts)
+    }
+
+    pub fn cancel_wait(&mut self, key: RowLockKey, xid: Xid) {
+        let Some(lock) = self.locks.get_mut(&key) else {
+            return;
+        };
+        lock.waiters.retain(|waiter| *waiter != xid);
+        if lock.holders.is_empty() && lock.waiters.is_empty() {
+            self.locks.remove(&key);
+        }
+    }
+
+    pub fn release(&mut self, xid: Xid) {
+        self.locks.retain(|_, lock| {
+            lock.holders.remove(&xid);
+            lock.waiters.retain(|waiter| *waiter != xid);
+            !lock.holders.is_empty() || !lock.waiters.is_empty()
+        });
+    }
+
+    pub fn has_waiters(&self) -> bool {
+        self.locks.values().any(|lock| !lock.waiters.is_empty())
     }
 }
 

@@ -4,13 +4,16 @@ use crate::{
     coercion::{self, CastContext},
     error::{PgError, Result, SqlState},
     storage::Table,
-    txn::{Snapshot, TransactionManager, Xid, visible_version},
+    txn::{
+        RowLockKey, RowLockManager, RowLockMode, Snapshot, TransactionManager, TransactionStatus,
+        Xid, visible_version,
+    },
     value::{BaseType, PgType, Value},
 };
 use sqlparser::ast::{
     AssignmentTarget, BinaryOperator, CastKind, ColumnOption, Delete, Expr, FromTable, Function,
-    FunctionArg, FunctionArgExpr, FunctionArguments, GroupByExpr, Ident, ObjectType, SelectItem,
-    SetExpr, Statement, TableConstraint, TableFactor, TableWithJoins, UnaryOperator,
+    FunctionArg, FunctionArgExpr, FunctionArguments, GroupByExpr, Ident, LockType, ObjectType,
+    SelectItem, SetExpr, Statement, TableConstraint, TableFactor, TableWithJoins, UnaryOperator,
     Value as AstValue,
 };
 use std::{
@@ -22,10 +25,15 @@ pub(crate) struct DatabaseState {
     pub catalog: Catalog,
     pub tables: BTreeMap<TableId, Table>,
     pub transactions: TransactionManager,
+    pub row_locks: RowLockManager,
 }
 pub(crate) enum ExecutionResult {
     Affected(u64),
     Query(QueryResult),
+}
+pub(crate) struct RequiredRowLock {
+    pub key: RowLockKey,
+    pub mode: RowLockMode,
 }
 enum Projection<'a> {
     Column(usize),
@@ -54,8 +62,129 @@ impl DatabaseState {
             catalog: Catalog::new(),
             tables: BTreeMap::new(),
             transactions: TransactionManager::new(),
+            row_locks: RowLockManager::new(),
         }
     }
+}
+
+pub(crate) fn required_row_locks(
+    state: &DatabaseState,
+    statement: &Statement,
+    xid: Xid,
+    snapshot: &Snapshot,
+) -> Result<Vec<RequiredRowLock>> {
+    let (schema, selection, mode) = match statement {
+        Statement::Update {
+            table, selection, ..
+        } => {
+            if !table.joins.is_empty() {
+                return Ok(Vec::new());
+            }
+            let TableFactor::Table {
+                name: table_name,
+                args: None,
+                ..
+            } = &table.relation
+            else {
+                return Ok(Vec::new());
+            };
+            (
+                state.catalog.table(&name(table_name)?)?,
+                selection.as_ref(),
+                RowLockMode::Update,
+            )
+        }
+        Statement::Delete(delete) => {
+            let FromTable::WithFromKeyword(from) = &delete.from else {
+                return Ok(Vec::new());
+            };
+            if from.len() != 1 || !from[0].joins.is_empty() {
+                return Ok(Vec::new());
+            }
+            let TableFactor::Table {
+                name: table_name,
+                args: None,
+                ..
+            } = &from[0].relation
+            else {
+                return Ok(Vec::new());
+            };
+            (
+                state.catalog.table(&name(table_name)?)?,
+                delete.selection.as_ref(),
+                RowLockMode::Update,
+            )
+        }
+        Statement::Query(query) => {
+            let Some(mode) = select_lock_mode(query)? else {
+                return Ok(Vec::new());
+            };
+            let SetExpr::Select(select) = query.body.as_ref() else {
+                return Ok(Vec::new());
+            };
+            if select.from.len() != 1 || !select.from[0].joins.is_empty() {
+                return Ok(Vec::new());
+            }
+            let TableFactor::Table {
+                name: table_name,
+                args: None,
+                ..
+            } = &select.from[0].relation
+            else {
+                return Ok(Vec::new());
+            };
+            (
+                state.catalog.table(&name(table_name)?)?,
+                select.selection.as_ref(),
+                mode,
+            )
+        }
+        _ => return Ok(Vec::new()),
+    };
+    if let Some(selection) = selection {
+        let base = expression_type(selection, schema)?;
+        if base != BaseType::Bool && !null_expression(selection) {
+            return Ok(Vec::new());
+        }
+    }
+    state
+        .tables
+        .get(&schema.id)
+        .expect("catalog table must have storage")
+        .rows()
+        .try_fold(Vec::new(), |mut locks, (row_id, chain)| {
+            let Some(version) = visible_version(chain, snapshot, xid, &state.transactions) else {
+                return Ok(locks);
+            };
+            if let Some(selection) = selection {
+                match evaluate(selection, schema, &version.row)? {
+                    Value::Bool(true) => {}
+                    Value::Bool(false) | Value::Null => return Ok(locks),
+                    _ => return Ok(locks),
+                }
+            }
+            if version.xmax.is_some_and(|xmax| {
+                xmax != xid
+                    && matches!(
+                        state.transactions.status(xmax),
+                        Some(TransactionStatus::Committed(commit_seq))
+                            if commit_seq > snapshot.commit_seq
+                    )
+            }) {
+                return Err(PgError::new(
+                    SqlState::SerializationFailure,
+                    "could not serialize access due to concurrent update",
+                ));
+            }
+            locks.push(RequiredRowLock {
+                key: RowLockKey {
+                    table_id: schema.id,
+                    row_id,
+                },
+                mode,
+            });
+            Ok(locks)
+        })
 }
 
 pub(crate) fn dispatch(
@@ -559,22 +688,41 @@ fn delete_rows(
     Ok(ExecutionResult::Affected(affected))
 }
 
+fn select_lock_mode(query: &sqlparser::ast::Query) -> Result<Option<RowLockMode>> {
+    if query.locks.len() > 1 {
+        return Err(PgError::new(
+            SqlState::FeatureNotSupported,
+            "multiple row-lock clauses are not implemented",
+        ));
+    }
+    let Some(lock) = query.locks.first() else {
+        return Ok(None);
+    };
+    if lock.of.is_some() || lock.nonblock.is_some() {
+        return Err(PgError::new(
+            SqlState::FeatureNotSupported,
+            "row-lock clause variant is not implemented",
+        ));
+    }
+    Ok(Some(match lock.lock_type {
+        LockType::Share => RowLockMode::Share,
+        LockType::Update => RowLockMode::Update,
+    }))
+}
+
 fn select_rows(
     state: &DatabaseState,
     query: &sqlparser::ast::Query,
     xid: Xid,
     snapshot: &Snapshot,
 ) -> Result<ExecutionResult> {
-    if query.with.is_some()
-        || !query.limit_by.is_empty()
-        || query.fetch.is_some()
-        || !query.locks.is_empty()
-    {
+    if query.with.is_some() || !query.limit_by.is_empty() || query.fetch.is_some() {
         return Err(PgError::new(
             SqlState::FeatureNotSupported,
             "query clause is not implemented",
         ));
     }
+    select_lock_mode(query)?;
     let SetExpr::Select(select) = query.body.as_ref() else {
         return Err(PgError::new(
             SqlState::FeatureNotSupported,

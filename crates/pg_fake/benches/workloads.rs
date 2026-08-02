@@ -347,9 +347,9 @@ fn repeatable_read_benchmark(criterion: &mut Criterion, postgres: &mut Client) {
     postgres
         .execute(&format!("INSERT INTO {postgres_table} VALUES (1)"), &[])
         .unwrap();
-    let fake_select = format!("SELECT * FROM {fake_table}");
-    let postgres_select = format!("SELECT * FROM {postgres_table}");
-    let mut group = criterion.benchmark_group("transaction_repeatable_read_select");
+    let fake_select = format!("SELECT * FROM {fake_table} FOR UPDATE");
+    let postgres_select = format!("SELECT * FROM {postgres_table} FOR UPDATE");
+    let mut group = criterion.benchmark_group("transaction_repeatable_read_select_for_update");
 
     group.bench_function("pg_fake", |benchmark| {
         benchmark.iter(|| {

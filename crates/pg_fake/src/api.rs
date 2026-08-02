@@ -1,12 +1,18 @@
-use std::sync::{Arc, Mutex};
+use std::{
+    sync::{Arc, Condvar, Mutex, MutexGuard},
+    time::{Duration, Instant},
+};
 
-use sqlparser::ast::{TransactionIsolationLevel as AstIsolationLevel, TransactionMode};
+use sqlparser::ast::{
+    Expr, OneOrManyWithParens, TransactionIsolationLevel as AstIsolationLevel, TransactionMode,
+    Value as AstValue,
+};
 
 use crate::{
     error::{PgError, Result, SqlState},
     executor::{self, DatabaseState, ExecutionResult},
     parser,
-    txn::{Snapshot, Xid},
+    txn::{LockAttempt, Snapshot, TransactionStatus, Xid},
     value::{Oid, Value},
 };
 
@@ -29,11 +35,17 @@ pub enum IsolationLevel {
 #[derive(Clone)]
 pub struct Db {
     state: Arc<Mutex<DatabaseState>>,
+    condvar: Arc<Condvar>,
+    default_lock_timeout: Duration,
+}
+pub struct DbBuilder {
+    lock_timeout: Duration,
 }
 pub struct Session {
     db: Db,
     transaction: Option<SessionTransaction>,
     default_isolation: IsolationLevel,
+    lock_timeout: Duration,
 }
 #[derive(Clone, Copy)]
 enum SessionTransaction {
@@ -57,6 +69,49 @@ fn abort(state: &mut DatabaseState, xid: Xid) {
     for table in state.tables.values_mut() {
         table.abort(xid);
     }
+    state.row_locks.release(xid);
+}
+
+fn invalid_lock_timeout() -> PgError {
+    PgError::new(
+        SqlState::InvalidParameterValue,
+        "invalid value for parameter lock_timeout",
+    )
+}
+
+fn parse_lock_timeout(expression: &Expr) -> Result<Duration> {
+    let text = match expression {
+        Expr::Value(AstValue::Number(value, _)) => value.as_str(),
+        Expr::Value(AstValue::SingleQuotedString(value)) => value.trim(),
+        _ => return Err(invalid_lock_timeout()),
+    };
+    let lower = text.to_ascii_lowercase();
+    if let Some(milliseconds) = lower.strip_suffix("ms") {
+        return milliseconds
+            .trim()
+            .parse::<u64>()
+            .map(Duration::from_millis)
+            .map_err(|_| invalid_lock_timeout());
+    }
+    if let Some(seconds) = lower.strip_suffix('s') {
+        return seconds
+            .trim()
+            .parse::<u64>()
+            .map(Duration::from_secs)
+            .map_err(|_| invalid_lock_timeout());
+    }
+    lower
+        .trim()
+        .parse::<u64>()
+        .map(Duration::from_millis)
+        .map_err(|_| invalid_lock_timeout())
+}
+
+fn lock_timeout_error() -> PgError {
+    PgError::new(
+        SqlState::LockNotAvailable,
+        "canceling statement due to lock timeout",
+    )
 }
 
 fn isolation_from_modes(modes: &[TransactionMode]) -> Result<Option<IsolationLevel>> {
@@ -92,10 +147,86 @@ fn isolation_from_modes(modes: &[TransactionMode]) -> Result<Option<IsolationLev
     Ok(isolation)
 }
 
+fn acquire_row_locks<'a>(
+    condvar: &Condvar,
+    timeout: Duration,
+    mut state: MutexGuard<'a, DatabaseState>,
+    statement: &parser::Statement,
+    xid: Xid,
+    isolation: IsolationLevel,
+    mut snapshot: Snapshot,
+) -> Result<(MutexGuard<'a, DatabaseState>, Snapshot)> {
+    let deadline = (timeout != Duration::ZERO).then(|| Instant::now() + timeout);
+    loop {
+        let required = executor::required_row_locks(&state, statement, xid, &snapshot)?;
+        let mut blocked = None;
+        for required_lock in required {
+            match state
+                .row_locks
+                .acquire(required_lock.key, xid, required_lock.mode)
+            {
+                LockAttempt::Acquired => condvar.notify_all(),
+                LockAttempt::Blocked(conflicts) => {
+                    blocked = Some((required_lock.key, conflicts));
+                    break;
+                }
+            }
+        }
+        let Some((key, conflicts)) = blocked else {
+            return Ok((state, snapshot));
+        };
+        state = if let Some(deadline) = deadline {
+            let remaining = deadline.saturating_duration_since(Instant::now());
+            if remaining.is_zero() {
+                state.row_locks.cancel_wait(key, xid);
+                return Err(lock_timeout_error());
+            }
+            let (state, timeout) = condvar
+                .wait_timeout(state, remaining)
+                .expect("database mutex is poisoned");
+            if timeout.timed_out() {
+                let mut state = state;
+                state.row_locks.cancel_wait(key, xid);
+                return Err(lock_timeout_error());
+            }
+            state
+        } else {
+            condvar.wait(state).expect("database mutex is poisoned")
+        };
+        state.row_locks.cancel_wait(key, xid);
+        if isolation == IsolationLevel::RepeatableRead
+            && conflicts.iter().any(|holder| {
+                matches!(
+                    state.transactions.status(*holder),
+                    Some(TransactionStatus::Committed(_))
+                )
+            })
+        {
+            return Err(PgError::new(
+                SqlState::SerializationFailure,
+                "could not serialize access due to concurrent update",
+            ));
+        }
+        if isolation == IsolationLevel::ReadCommitted
+            && conflicts.iter().any(|holder| {
+                !matches!(
+                    state.transactions.status(*holder),
+                    Some(TransactionStatus::InFlight)
+                )
+            })
+        {
+            snapshot = Snapshot::new(&state.transactions);
+        }
+    }
+}
+
 impl Db {
     pub fn new() -> Self {
-        Db {
-            state: Arc::new(Mutex::new(DatabaseState::new())),
+        Db::builder().build()
+    }
+    pub fn builder() -> DbBuilder {
+        DbBuilder {
+            lock_timeout: Duration::from_secs(1),
         }
     }
     pub fn session(&self) -> Session {
@@ -103,6 +234,20 @@ impl Db {
             db: self.clone(),
             transaction: None,
             default_isolation: IsolationLevel::ReadCommitted,
+            lock_timeout: self.default_lock_timeout,
+        }
+    }
+}
+impl DbBuilder {
+    pub fn lock_timeout(mut self, timeout: Duration) -> Self {
+        self.lock_timeout = timeout;
+        self
+    }
+    pub fn build(self) -> Db {
+        Db {
+            state: Arc::new(Mutex::new(DatabaseState::new())),
+            condvar: Arc::new(Condvar::new()),
+            default_lock_timeout: self.lock_timeout,
         }
     }
 }
@@ -169,6 +314,8 @@ impl Session {
             SessionTransaction::Active(transaction) if commit => {
                 let mut state = self.db.state.lock().expect("database mutex is poisoned");
                 state.transactions.commit(transaction.xid);
+                state.row_locks.release(transaction.xid);
+                self.db.condvar.notify_all();
                 return;
             }
             SessionTransaction::Active(transaction) => transaction.xid,
@@ -176,6 +323,7 @@ impl Session {
         };
         let mut state = self.db.state.lock().expect("database mutex is poisoned");
         abort(&mut state, xid);
+        self.db.condvar.notify_all();
     }
     fn abort_transaction(&mut self) {
         if let Some(SessionTransaction::Active(transaction)) = self.transaction {
@@ -258,6 +406,38 @@ impl Session {
                 self.transaction = Some(SessionTransaction::Active(transaction));
                 return Ok(ExecutionResult::Affected(0));
             }
+            parser::Statement::SetVariable {
+                local,
+                hivevar,
+                variables,
+                value,
+            } => {
+                let OneOrManyWithParens::One(variable) = variables else {
+                    return self.failed(PgError::new(
+                        SqlState::FeatureNotSupported,
+                        "setting multiple variables is not implemented",
+                    ));
+                };
+                if variable.to_string().eq_ignore_ascii_case("lock_timeout") {
+                    if matches!(self.transaction, Some(SessionTransaction::Aborted(_))) {
+                        return Err(PgError::new(
+                            SqlState::InFailedSqlTransaction,
+                            "current transaction is aborted",
+                        ));
+                    }
+                    if *local || *hivevar || value.len() != 1 {
+                        return self.failed(PgError::new(
+                            SqlState::FeatureNotSupported,
+                            "lock_timeout setting variant is not implemented",
+                        ));
+                    }
+                    self.lock_timeout = match parse_lock_timeout(&value[0]) {
+                        Ok(timeout) => timeout,
+                        Err(error) => return self.failed(error),
+                    };
+                    return Ok(ExecutionResult::Affected(0));
+                }
+            }
             parser::Statement::Commit { chain } => {
                 if *chain {
                     return self.failed(PgError::new(
@@ -295,7 +475,9 @@ impl Session {
             ));
         }
         if let Some(SessionTransaction::Active(mut transaction)) = self.transaction {
-            let mut state = self.db.state.lock().expect("database mutex is poisoned");
+            let state_lock = self.db.state.clone();
+            let condvar = self.db.condvar.clone();
+            let state = state_lock.lock().expect("database mutex is poisoned");
             let snapshot = match transaction.isolation {
                 IsolationLevel::ReadCommitted => Snapshot::new(&state.transactions),
                 IsolationLevel::RepeatableRead => *transaction
@@ -304,6 +486,18 @@ impl Session {
             };
             transaction.statement_started = true;
             self.transaction = Some(SessionTransaction::Active(transaction));
+            let (mut state, snapshot) = match acquire_row_locks(
+                &condvar,
+                self.lock_timeout,
+                state,
+                &statement,
+                transaction.xid,
+                transaction.isolation,
+                snapshot,
+            ) {
+                Ok(acquired) => acquired,
+                Err(error) => return self.failed(error),
+            };
             return match executor::dispatch(&mut state, &statement, transaction.xid, &snapshot) {
                 Ok(result) => Ok(result),
                 Err(error) => {
@@ -315,13 +509,33 @@ impl Session {
         let mut state = self.db.state.lock().expect("database mutex is poisoned");
         let xid = state.transactions.begin();
         let snapshot = Snapshot::new(&state.transactions);
+        let (mut state, snapshot) = match acquire_row_locks(
+            &self.db.condvar,
+            self.lock_timeout,
+            state,
+            &statement,
+            xid,
+            self.default_isolation,
+            snapshot,
+        ) {
+            Ok(acquired) => acquired,
+            Err(error) => {
+                let mut state = self.db.state.lock().expect("database mutex is poisoned");
+                abort(&mut state, xid);
+                self.db.condvar.notify_all();
+                return Err(error);
+            }
+        };
         match executor::dispatch(&mut state, &statement, xid, &snapshot) {
             Ok(result) => {
                 state.transactions.commit(xid);
+                state.row_locks.release(xid);
+                self.db.condvar.notify_all();
                 Ok(result)
             }
             Err(error) => {
                 abort(&mut state, xid);
+                self.db.condvar.notify_all();
                 Err(error)
             }
         }
@@ -357,12 +571,25 @@ impl Drop for Transaction<'_> {
 
 #[cfg(test)]
 mod tests {
+    use std::{sync::mpsc, thread};
+
     use crate::{
         txn::{Snapshot, visible_version},
         value::BaseType,
     };
 
     use super::*;
+
+    fn wait_until_blocked(db: &Db) {
+        let deadline = Instant::now() + Duration::from_secs(1);
+        loop {
+            if db.state.lock().unwrap().row_locks.has_waiters() {
+                return;
+            }
+            assert!(Instant::now() < deadline, "transaction did not block");
+            thread::yield_now();
+        }
+    }
 
     #[test]
     fn autocommit_creates_and_drops_tables() {
@@ -1525,6 +1752,200 @@ mod tests {
             SqlState::InFailedSqlTransaction
         );
         first.execute("ROLLBACK").unwrap();
+    }
+
+    #[test]
+    fn read_committed_writer_blocks_then_rechecks_after_commit() {
+        let db = Db::builder().lock_timeout(Duration::from_secs(2)).build();
+        let mut first = db.session();
+        let mut second = db.session();
+        first
+            .execute("CREATE TABLE items (id INTEGER, amount INTEGER)")
+            .unwrap();
+        first.execute("INSERT INTO items VALUES (1, 1)").unwrap();
+        first.execute("BEGIN").unwrap();
+        first.execute("UPDATE items SET amount = 2").unwrap();
+
+        let (result_sender, result_receiver) = mpsc::channel();
+        let handle = thread::spawn(move || {
+            result_sender
+                .send(second.execute("UPDATE items SET amount = amount + 1 WHERE id = 1"))
+                .unwrap();
+        });
+        wait_until_blocked(&db);
+        first.execute("COMMIT").unwrap();
+
+        assert_eq!(
+            result_receiver
+                .recv_timeout(Duration::from_secs(1))
+                .unwrap(),
+            Ok(1)
+        );
+        handle.join().unwrap();
+        assert_eq!(
+            first.query("SELECT amount FROM items", &[]).unwrap().rows,
+            vec![vec![Value::Int4(3)]]
+        );
+    }
+
+    #[test]
+    fn blocked_writer_proceeds_after_holder_rollback() {
+        let db = Db::builder().lock_timeout(Duration::from_secs(2)).build();
+        let mut first = db.session();
+        let mut second = db.session();
+        first
+            .execute("CREATE TABLE items (id INTEGER, amount INTEGER)")
+            .unwrap();
+        first.execute("INSERT INTO items VALUES (1, 1)").unwrap();
+        first.execute("BEGIN").unwrap();
+        first.execute("UPDATE items SET amount = 5").unwrap();
+
+        let (result_sender, result_receiver) = mpsc::channel();
+        let handle = thread::spawn(move || {
+            result_sender
+                .send(second.execute("UPDATE items SET amount = amount + 1 WHERE id = 1"))
+                .unwrap();
+        });
+        wait_until_blocked(&db);
+        first.execute("ROLLBACK").unwrap();
+
+        assert_eq!(
+            result_receiver
+                .recv_timeout(Duration::from_secs(1))
+                .unwrap(),
+            Ok(1)
+        );
+        handle.join().unwrap();
+        assert_eq!(
+            first.query("SELECT amount FROM items", &[]).unwrap().rows,
+            vec![vec![Value::Int4(2)]]
+        );
+    }
+
+    #[test]
+    fn repeatable_read_writer_fails_after_concurrent_commit() {
+        let db = Db::builder().lock_timeout(Duration::from_secs(2)).build();
+        let mut first = db.session();
+        let mut second = db.session();
+        first
+            .execute("CREATE TABLE items (id INTEGER, amount INTEGER)")
+            .unwrap();
+        first.execute("INSERT INTO items VALUES (1, 1)").unwrap();
+        second
+            .execute("BEGIN ISOLATION LEVEL REPEATABLE READ")
+            .unwrap();
+        second.query("SELECT * FROM items", &[]).unwrap();
+        first.execute("BEGIN").unwrap();
+        first.execute("UPDATE items SET amount = 2").unwrap();
+
+        let (result_sender, result_receiver) = mpsc::channel();
+        let handle = thread::spawn(move || {
+            let error = second
+                .execute("UPDATE items SET amount = amount + 1 WHERE id = 1")
+                .unwrap_err();
+            second.execute("ROLLBACK").unwrap();
+            result_sender.send(error.sqlstate).unwrap();
+        });
+        wait_until_blocked(&db);
+        first.execute("COMMIT").unwrap();
+
+        assert_eq!(
+            result_receiver
+                .recv_timeout(Duration::from_secs(1))
+                .unwrap(),
+            SqlState::SerializationFailure
+        );
+        handle.join().unwrap();
+    }
+
+    #[test]
+    fn row_lock_clauses_use_update_and_share_compatibility() {
+        let db = Db::builder().lock_timeout(Duration::from_secs(2)).build();
+        let mut first = db.session();
+        let mut second = db.session();
+        let mut third = db.session();
+        first.execute("CREATE TABLE items (id INTEGER)").unwrap();
+        first.execute("INSERT INTO items VALUES (1)").unwrap();
+        first.execute("BEGIN").unwrap();
+        second.execute("BEGIN").unwrap();
+        first.query("SELECT * FROM items FOR SHARE", &[]).unwrap();
+        second.query("SELECT * FROM items FOR SHARE", &[]).unwrap();
+
+        let (result_sender, result_receiver) = mpsc::channel();
+        let handle = thread::spawn(move || {
+            result_sender
+                .send(third.execute("DELETE FROM items WHERE id = 1"))
+                .unwrap();
+        });
+        wait_until_blocked(&db);
+        first.execute("COMMIT").unwrap();
+        assert!(matches!(
+            result_receiver.try_recv(),
+            Err(mpsc::TryRecvError::Empty)
+        ));
+        second.execute("COMMIT").unwrap();
+        assert_eq!(
+            result_receiver
+                .recv_timeout(Duration::from_secs(1))
+                .unwrap(),
+            Ok(1)
+        );
+        handle.join().unwrap();
+
+        first.execute("INSERT INTO items VALUES (2)").unwrap();
+        first.execute("BEGIN").unwrap();
+        first
+            .query("SELECT * FROM items WHERE id = 2 FOR UPDATE", &[])
+            .unwrap();
+        let mut writer = db.session();
+        let (result_sender, result_receiver) = mpsc::channel();
+        let handle = thread::spawn(move || {
+            result_sender
+                .send(writer.execute("UPDATE items SET id = 3 WHERE id = 2"))
+                .unwrap();
+        });
+        wait_until_blocked(&db);
+        first.execute("COMMIT").unwrap();
+        assert_eq!(
+            result_receiver
+                .recv_timeout(Duration::from_secs(1))
+                .unwrap(),
+            Ok(1)
+        );
+        handle.join().unwrap();
+    }
+
+    #[test]
+    fn lock_timeout_builder_and_session_setting_control_waits() {
+        let db = Db::builder()
+            .lock_timeout(Duration::from_millis(40))
+            .build();
+        let mut first = db.session();
+        let mut second = db.session();
+        assert_eq!(second.lock_timeout, Duration::from_millis(40));
+        second.execute("SET lock_timeout = 250").unwrap();
+        assert_eq!(second.lock_timeout, Duration::from_millis(250));
+        second.execute("SET lock_timeout = '2s'").unwrap();
+        assert_eq!(second.lock_timeout, Duration::from_secs(2));
+        second.execute("SET lock_timeout = '20ms'").unwrap();
+        assert_eq!(second.lock_timeout, Duration::from_millis(20));
+
+        first.execute("CREATE TABLE items (id INTEGER)").unwrap();
+        first.execute("INSERT INTO items VALUES (1)").unwrap();
+        first.execute("BEGIN").unwrap();
+        first.execute("UPDATE items SET id = 2").unwrap();
+        let started = Instant::now();
+        assert_eq!(
+            second
+                .execute("UPDATE items SET id = 3")
+                .unwrap_err()
+                .sqlstate,
+            SqlState::LockNotAvailable
+        );
+        assert!(started.elapsed() >= Duration::from_millis(10));
+        first.execute("ROLLBACK").unwrap();
+        second.execute("SET lock_timeout = 0").unwrap();
+        assert_eq!(second.lock_timeout, Duration::ZERO);
     }
 
     #[test]

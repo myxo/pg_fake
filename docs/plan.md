@@ -514,7 +514,7 @@ concurrency edge cases are further validated in Milestone G.
 **Notes:** Write-conflict serialization errors (`40001`) are exercised together
 with task 29. SERIALIZABLE is Phase 3.
 
-### Task 29 — Row locking + write-write blocking + lock timeout
+### Task 29 — Row locking + write-write blocking + lock timeout [COMPLETE]
 **Goal:** True blocking on concurrent writes, with a lock timeout (§5.5, §6).
 
 **DoD:**

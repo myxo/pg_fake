@@ -3,6 +3,21 @@
 An in-memory, embeddable fake of PostgreSQL for use as a test double in
 automated tests.
 
+## Lock timeout
+
+Row-lock waits time out after one second by default. Configure the database
+default with the builder, or change an individual session with SQL:
+
+```rust
+let db = Db::builder()
+    .lock_timeout(Duration::from_millis(250))
+    .build();
+let mut session = db.session();
+session.execute("SET lock_timeout = '100ms'")?;
+```
+
+A zero timeout waits indefinitely, matching PostgreSQL.
+
 ## Benchmarks
 
 The Criterion suite compares `pg_fake` with PostgreSQL 18 for create/drop,

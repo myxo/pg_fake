@@ -312,6 +312,26 @@ fn isolation_levels_match_postgres_across_sessions() {
 }
 
 #[test]
+fn lock_timeout_and_row_lock_clauses_match_postgres() {
+    assert_differential(
+        "SET lock_timeout = 250; \
+         SET lock_timeout = '100ms'; \
+         SET lock_timeout = '2s'; \
+         SET lock_timeout = 0; \
+         SET lock_timeout = 'invalid'; \
+         CREATE TABLE __TABLE__ (id INTEGER); \
+         INSERT INTO __TABLE__ VALUES (1), (2); \
+         BEGIN; \
+         SELECT * FROM __TABLE__ ORDER BY id FOR UPDATE; \
+         ROLLBACK; \
+         BEGIN; \
+         SELECT * FROM __TABLE__ ORDER BY id FOR SHARE; \
+         ROLLBACK",
+        RowOrder::Ordered,
+    );
+}
+
+#[test]
 fn case_boundaries_and_function_errors_match_postgres() {
     assert_differential(
         "CREATE TABLE __TABLE__ (id INTEGER); \
