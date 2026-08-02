@@ -154,6 +154,12 @@ pub(crate) fn dispatch(
                     }
                 }
             }
+            validate_check_constraint_types(&TableSchema {
+                id: TableId(0),
+                name: name.clone(),
+                columns: columns.clone(),
+                constraints: constraints.clone(),
+            })?;
             let id = state
                 .catalog
                 .create_table(name.clone(), columns, constraints)?;
@@ -284,6 +290,7 @@ fn insert_rows(
             };
         }
         validate_not_null(&schema, &row)?;
+        validate_check_constraints(&schema, &row)?;
         Ok(row)
     };
     let rows = if let Some(source) = &insert.source {
@@ -307,6 +314,7 @@ fn insert_rows(
             .collect::<Result<Vec<_>>>()
             .and_then(|row| {
                 validate_not_null(&schema, &row)?;
+                validate_check_constraints(&schema, &row)?;
                 Ok(vec![row])
             })?
     };
@@ -450,6 +458,7 @@ fn update_rows(
             };
         }
         validate_not_null(&schema, &updated)?;
+        validate_check_constraints(&schema, &updated)?;
         if table.unique_conflict(&updated, snapshot, xid, &state.transactions, Some(row_id)) {
             return Err(PgError::new(
                 SqlState::UniqueViolation,
@@ -892,6 +901,53 @@ fn validate_not_null(schema: &TableSchema, row: &[Value]) -> Result<()> {
                 column.name, schema.name
             ),
         ));
+    }
+    Ok(())
+}
+
+fn validate_check_constraint_types(schema: &TableSchema) -> Result<()> {
+    for constraint in &schema.constraints {
+        let crate::catalog::Constraint::Check(expression) = constraint else {
+            continue;
+        };
+        let base = expression_type(expression, schema)?;
+        if base != BaseType::Bool
+            && !null_expression(expression)
+            && unknown_string(expression).is_none()
+        {
+            return Err(PgError::new(
+                SqlState::DatatypeMismatch,
+                "CHECK constraint must be a boolean expression",
+            ));
+        }
+    }
+    Ok(())
+}
+
+fn validate_check_constraints(schema: &TableSchema, row: &[Value]) -> Result<()> {
+    for constraint in &schema.constraints {
+        let crate::catalog::Constraint::Check(expression) = constraint else {
+            continue;
+        };
+        match evaluate_as(
+            expression,
+            BaseType::Bool,
+            CastContext::Implicit,
+            schema,
+            row,
+        )? {
+            Value::Bool(true) | Value::Null => {}
+            Value::Bool(false) => {
+                return Err(PgError::new(
+                    SqlState::CheckViolation,
+                    format!(
+                        "new row for relation {:?} violates check constraint",
+                        schema.name
+                    ),
+                ));
+            }
+            _ => unreachable!("CHECK expression was type-checked"),
+        }
     }
     Ok(())
 }

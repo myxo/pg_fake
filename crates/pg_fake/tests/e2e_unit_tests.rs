@@ -387,6 +387,25 @@ fn primary_and_unique_constraints_match_postgres() {
 }
 
 #[test]
+fn check_constraints_match_postgres() {
+    assert_differential(
+        "CREATE TABLE __TABLE__ (
+             id INTEGER CHECK (id > 0),
+             lower_bound INTEGER,
+             upper_bound INTEGER,
+             CHECK (lower_bound < upper_bound)
+         ); \
+         INSERT INTO __TABLE__ VALUES (1, 1, 2), (NULL, NULL, NULL); \
+         INSERT INTO __TABLE__ VALUES (-1, 1, 2); \
+         INSERT INTO __TABLE__ VALUES (2, 3, 2); \
+         UPDATE __TABLE__ SET id = -1 WHERE id = 1; \
+         UPDATE __TABLE__ SET lower_bound = NULL WHERE id = 1; \
+         SELECT * FROM __TABLE__ ORDER BY id",
+        RowOrder::Ordered,
+    );
+}
+
+#[test]
 fn unique_value_semantics_match_postgres() {
     assert_differential(
         "CREATE TABLE __TABLE__ (

@@ -27,6 +27,7 @@ enum Outcome {
         values: Vec<Vec<Option<String>>>,
         type_oids: Option<Vec<u32>>,
     },
+    Error(String),
 }
 
 #[derive(Clone, Copy)]
@@ -97,12 +98,18 @@ fn postgres_server() -> PostgresServer {
 }
 
 fn postgres_outcome(client: &mut Client, statement: &Statement, sql: &str) -> Outcome {
-    let messages = client.simple_query(sql).unwrap_or_else(|error| {
-        panic!(
-            "generated SQL must be valid for PostgreSQL: {sql}\nSQLSTATE: {:?}\n{error}",
-            error.code().map(|code| code.code())
-        )
-    });
+    let messages = match client.simple_query(sql) {
+        Ok(messages) => messages,
+        Err(error) => {
+            return Outcome::Error(
+                error
+                    .code()
+                    .expect("PostgreSQL execution errors must have a SQLSTATE")
+                    .code()
+                    .into(),
+            );
+        }
+    };
     match statement {
         Statement::Query(_) => Outcome::Rows {
             values: messages
@@ -133,14 +140,8 @@ fn postgres_outcome(client: &mut Client, statement: &Statement, sql: &str) -> Ou
 
 fn fake_outcome(session: &mut Session, statement: &Statement, sql: &str) -> Outcome {
     match statement {
-        Statement::Query(_) => {
-            let result = session.query(sql, &[]).unwrap_or_else(|error| {
-                panic!(
-                    "generated SQL must be supported by pg_fake: {sql}\nSQLSTATE: {}\n{error}",
-                    error.sqlstate.code()
-                )
-            });
-            Outcome::Rows {
+        Statement::Query(_) => match session.query(sql, &[]) {
+            Ok(result) => Outcome::Rows {
                 values: result
                     .rows
                     .iter()
@@ -160,14 +161,13 @@ fn fake_outcome(session: &mut Session, statement: &Statement, sql: &str) -> Outc
                         .map(|column| column.type_oid)
                         .collect(),
                 ),
-            }
-        }
-        _ => Outcome::Affected(session.execute(sql).unwrap_or_else(|error| {
-            panic!(
-                "generated SQL must be supported by pg_fake: {sql}\nSQLSTATE: {}\n{error}",
-                error.sqlstate.code()
-            )
-        })),
+            },
+            Err(error) => Outcome::Error(error.sqlstate.code().into()),
+        },
+        _ => match session.execute(sql) {
+            Ok(rows) => Outcome::Affected(rows),
+            Err(error) => Outcome::Error(error.sqlstate.code().into()),
+        },
     }
 }
 
@@ -601,7 +601,7 @@ fn create_table_sql(table: &str) -> String {
     format!(
         "CREATE TABLE {table} (\
              row_key BIGINT NOT NULL PRIMARY KEY, \
-             small_value SMALLINT CHECK (small_value IS NULL OR small_value >= -100), \
+             small_value SMALLINT CHECK (small_value IS NULL OR small_value >= -10), \
              int_value INTEGER DEFAULT 0, \
              big_value BIGINT, \
              numeric_value NUMERIC(8, 2) DEFAULT 1 + 2, \
@@ -612,7 +612,8 @@ fn create_table_sql(table: &str) -> String {
              varchar_value VARCHAR(12), \
              char_value CHAR(8), \
              bytes BYTEA, \
-             UNIQUE (row_key, int_value)\
+             UNIQUE (row_key, int_value), \
+             CHECK (int_value IS NULL OR big_value IS NULL OR int_value <= big_value)\
          )"
     )
 }

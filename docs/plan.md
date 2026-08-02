@@ -483,7 +483,7 @@ target.
 **Notes:** Uniqueness must interact correctly with concurrent transactions; the
 concurrency edge cases are further validated in Milestone G.
 
-### Task 26 — `CHECK`
+### Task 26 — `CHECK` [COMPLETE]
 **Goal:** Enforce check constraints.
 
 **DoD:**

@@ -1128,6 +1128,57 @@ mod tests {
     }
 
     #[test]
+    fn enforces_check_constraints_on_insert_and_update() {
+        let db = Db::new();
+        let mut session = db.session();
+        session
+            .execute(
+                "CREATE TABLE ranges (
+                    value INTEGER CHECK (value > 0),
+                    lower_bound INTEGER,
+                    upper_bound INTEGER,
+                    CHECK (lower_bound < upper_bound)
+                )",
+            )
+            .unwrap();
+
+        session
+            .execute("INSERT INTO ranges VALUES (1, 1, 2), (NULL, NULL, NULL)")
+            .unwrap();
+        assert_eq!(
+            session
+                .execute("INSERT INTO ranges VALUES (-1, 1, 2)")
+                .unwrap_err()
+                .sqlstate,
+            SqlState::CheckViolation
+        );
+        assert_eq!(
+            session
+                .execute("INSERT INTO ranges VALUES (2, 3, 2)")
+                .unwrap_err()
+                .sqlstate,
+            SqlState::CheckViolation
+        );
+        assert_eq!(
+            session
+                .execute("UPDATE ranges SET value = -1 WHERE value = 1")
+                .unwrap_err()
+                .sqlstate,
+            SqlState::CheckViolation
+        );
+        session
+            .execute("UPDATE ranges SET lower_bound = NULL WHERE value = 1")
+            .unwrap();
+        assert_eq!(
+            session
+                .execute("CREATE TABLE invalid_check (value INTEGER CHECK (value + 1))")
+                .unwrap_err()
+                .sqlstate,
+            SqlState::DatatypeMismatch
+        );
+    }
+
+    #[test]
     fn enforces_primary_and_multi_column_unique_constraints() {
         let db = Db::new();
         let mut session = db.session();
