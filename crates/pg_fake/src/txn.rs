@@ -1,4 +1,4 @@
-use std::collections::{BTreeMap, VecDeque};
+use std::collections::{BTreeMap, BTreeSet, VecDeque};
 
 use crate::{
     catalog::TableId,
@@ -46,6 +46,12 @@ pub struct RowLockManager {
     locks: BTreeMap<RowLockKey, RowLock>,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct WaitForGraph {
+    edges: BTreeMap<Xid, BTreeSet<Xid>>,
+    victims: BTreeSet<Xid>,
+}
+
 pub enum LockAttempt {
     Acquired,
     Blocked(Vec<Xid>),
@@ -65,6 +71,12 @@ impl Default for TransactionManager {
 }
 
 impl Default for RowLockManager {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl Default for WaitForGraph {
     fn default() -> Self {
         Self::new()
     }
@@ -106,7 +118,11 @@ impl RowLockManager {
         if !lock.waiters.contains(&xid) {
             lock.waiters.push_back(xid);
         }
-        LockAttempt::Blocked(holder_conflicts)
+        let mut blockers = holder_conflicts.into_iter().collect::<BTreeSet<_>>();
+        if let Some(waiter) = first_waiter.filter(|waiter| *waiter != xid) {
+            blockers.insert(waiter);
+        }
+        LockAttempt::Blocked(blockers.into_iter().collect())
     }
 
     pub fn cancel_wait(&mut self, key: RowLockKey, xid: Xid) {
@@ -129,6 +145,83 @@ impl RowLockManager {
 
     pub fn has_waiters(&self) -> bool {
         self.locks.values().any(|lock| !lock.waiters.is_empty())
+    }
+}
+
+impl WaitForGraph {
+    pub fn new() -> Self {
+        WaitForGraph {
+            edges: BTreeMap::new(),
+            victims: BTreeSet::new(),
+        }
+    }
+
+    pub fn wait_for(&mut self, waiter: Xid, blockers: &[Xid]) -> Option<Xid> {
+        let blockers = blockers
+            .iter()
+            .copied()
+            .filter(|blocker| *blocker != waiter)
+            .collect::<BTreeSet<_>>();
+        if blockers.is_empty() {
+            self.edges.remove(&waiter);
+            return None;
+        }
+        self.edges.insert(waiter, blockers);
+        let cycle = self.cycle_containing(waiter)?;
+        let victim = *cycle
+            .iter()
+            .next_back()
+            .expect("a cycle must contain a transaction");
+        self.victims.insert(victim);
+        Some(victim)
+    }
+
+    pub fn clear_wait(&mut self, waiter: Xid) {
+        self.edges.remove(&waiter);
+    }
+
+    pub fn remove_transaction(&mut self, xid: Xid) {
+        self.edges.remove(&xid);
+        for blockers in self.edges.values_mut() {
+            blockers.remove(&xid);
+        }
+        self.edges.retain(|_, blockers| !blockers.is_empty());
+        self.victims.remove(&xid);
+    }
+
+    pub fn take_victim(&mut self, xid: Xid) -> bool {
+        self.victims.remove(&xid)
+    }
+
+    fn cycle_containing(&self, xid: Xid) -> Option<BTreeSet<Xid>> {
+        let reachable = self.reachable(xid, false);
+        let reaches_xid = self.reachable(xid, true);
+        let cycle = reachable
+            .intersection(&reaches_xid)
+            .copied()
+            .collect::<BTreeSet<_>>();
+        (cycle.len() > 1).then_some(cycle)
+    }
+
+    fn reachable(&self, start: Xid, reverse: bool) -> BTreeSet<Xid> {
+        let mut reached = BTreeSet::from([start]);
+        let mut pending = vec![start];
+        while let Some(xid) = pending.pop() {
+            if reverse {
+                for (waiter, blockers) in &self.edges {
+                    if blockers.contains(&xid) && reached.insert(*waiter) {
+                        pending.push(*waiter);
+                    }
+                }
+            } else if let Some(blockers) = self.edges.get(&xid) {
+                for blocker in blockers {
+                    if reached.insert(*blocker) {
+                        pending.push(*blocker);
+                    }
+                }
+            }
+        }
+        reached
     }
 }
 
@@ -363,5 +456,28 @@ mod tests {
             visible_version(&chain, &snapshot, reader, &manager),
             Some(&chain.versions[0])
         );
+    }
+
+    #[test]
+    fn wait_for_graph_selects_highest_xid_in_cycle() {
+        let mut graph = WaitForGraph::new();
+
+        assert_eq!(graph.wait_for(Xid(1), &[Xid(2)]), None);
+        assert_eq!(graph.wait_for(Xid(2), &[Xid(3)]), None);
+        assert_eq!(graph.wait_for(Xid(3), &[Xid(1)]), Some(Xid(3)));
+        assert!(graph.take_victim(Xid(3)));
+        assert!(!graph.take_victim(Xid(1)));
+    }
+
+    #[test]
+    fn removing_wait_edge_breaks_cycle() {
+        let mut graph = WaitForGraph::new();
+        graph.wait_for(Xid(4), &[Xid(7)]);
+        assert_eq!(graph.wait_for(Xid(7), &[Xid(4)]), Some(Xid(7)));
+
+        graph.clear_wait(Xid(7));
+        assert_eq!(graph.wait_for(Xid(8), &[Xid(4)]), None);
+        graph.remove_transaction(Xid(4));
+        assert_eq!(graph.wait_for(Xid(7), &[Xid(8)]), None);
     }
 }

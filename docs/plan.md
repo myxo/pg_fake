@@ -532,7 +532,7 @@ with task 29. SERIALIZABLE is Phase 3.
 **Notes:** Deadlock detection is the next task; until then, cyclic waits rely on
 the timeout as a backstop.
 
-### Task 30 — Deadlock detection
+### Task 30 — Deadlock detection [COMPLETE]
 **Goal:** Detect cyclic waits and abort a victim (§5.5).
 
 **DoD:**

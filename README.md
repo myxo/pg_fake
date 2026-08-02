@@ -16,6 +16,12 @@ let mut session = db.session();
 session.execute("SET lock_timeout = '100ms'")?;
 ```
 
+Deadlocks are detected from the transaction wait-for graph as soon as a new
+row-lock wait closes a cycle. The transaction with the highest XID in that
+cycle (the newest transaction) is chosen deterministically as the victim. Its
+blocked statement returns `40P01`, and the transaction remains failed while
+retaining its locks until the caller issues `ROLLBACK`.
+
 A zero timeout waits indefinitely, matching PostgreSQL.
 
 ## Benchmarks

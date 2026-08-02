@@ -70,6 +70,7 @@ fn abort(state: &mut DatabaseState, xid: Xid) {
         table.abort(xid);
     }
     state.row_locks.release(xid);
+    state.wait_for.remove_transaction(xid);
 }
 
 fn invalid_lock_timeout() -> PgError {
@@ -112,6 +113,10 @@ fn lock_timeout_error() -> PgError {
         SqlState::LockNotAvailable,
         "canceling statement due to lock timeout",
     )
+}
+
+fn deadlock_error() -> PgError {
+    PgError::new(SqlState::DeadlockDetected, "deadlock detected")
 }
 
 fn isolation_from_modes(modes: &[TransactionMode]) -> Result<Option<IsolationLevel>> {
@@ -167,33 +172,47 @@ fn acquire_row_locks<'a>(
             {
                 LockAttempt::Acquired => condvar.notify_all(),
                 LockAttempt::Blocked(conflicts) => {
+                    if state.wait_for.wait_for(xid, &conflicts).is_some() {
+                        condvar.notify_all();
+                    }
                     blocked = Some((required_lock.key, conflicts));
                     break;
                 }
             }
         }
         let Some((key, conflicts)) = blocked else {
+            state.wait_for.clear_wait(xid);
             return Ok((state, snapshot));
         };
+        if state.wait_for.take_victim(xid) {
+            state.row_locks.cancel_wait(key, xid);
+            state.wait_for.clear_wait(xid);
+            return Err(deadlock_error());
+        }
+        let mut timed_out = false;
         state = if let Some(deadline) = deadline {
             let remaining = deadline.saturating_duration_since(Instant::now());
             if remaining.is_zero() {
                 state.row_locks.cancel_wait(key, xid);
+                state.wait_for.clear_wait(xid);
                 return Err(lock_timeout_error());
             }
-            let (state, timeout) = condvar
+            let (state, wait_result) = condvar
                 .wait_timeout(state, remaining)
                 .expect("database mutex is poisoned");
-            if timeout.timed_out() {
-                let mut state = state;
-                state.row_locks.cancel_wait(key, xid);
-                return Err(lock_timeout_error());
-            }
+            timed_out = wait_result.timed_out();
             state
         } else {
             condvar.wait(state).expect("database mutex is poisoned")
         };
         state.row_locks.cancel_wait(key, xid);
+        state.wait_for.clear_wait(xid);
+        if state.wait_for.take_victim(xid) {
+            return Err(deadlock_error());
+        }
+        if timed_out {
+            return Err(lock_timeout_error());
+        }
         if isolation == IsolationLevel::RepeatableRead
             && conflicts.iter().any(|holder| {
                 matches!(
@@ -315,6 +334,7 @@ impl Session {
                 let mut state = self.db.state.lock().expect("database mutex is poisoned");
                 state.transactions.commit(transaction.xid);
                 state.row_locks.release(transaction.xid);
+                state.wait_for.remove_transaction(transaction.xid);
                 self.db.condvar.notify_all();
                 return;
             }
@@ -530,6 +550,7 @@ impl Session {
             Ok(result) => {
                 state.transactions.commit(xid);
                 state.row_locks.release(xid);
+                state.wait_for.remove_transaction(xid);
                 self.db.condvar.notify_all();
                 Ok(result)
             }
@@ -1819,6 +1840,62 @@ mod tests {
         assert_eq!(
             first.query("SELECT amount FROM items", &[]).unwrap().rows,
             vec![vec![Value::Int4(2)]]
+        );
+    }
+
+    #[test]
+    fn deadlock_aborts_newest_transaction_and_survivor_proceeds() {
+        let db = Db::builder().lock_timeout(Duration::from_secs(2)).build();
+        let mut setup = db.session();
+        let mut first = db.session();
+        let mut second = db.session();
+        setup
+            .execute("CREATE TABLE items (id INTEGER, amount INTEGER)")
+            .unwrap();
+        setup
+            .execute("INSERT INTO items VALUES (1, 0), (2, 0)")
+            .unwrap();
+
+        first.execute("BEGIN").unwrap();
+        first
+            .execute("UPDATE items SET amount = 10 WHERE id = 1")
+            .unwrap();
+        second.execute("BEGIN").unwrap();
+        second
+            .execute("UPDATE items SET amount = 20 WHERE id = 2")
+            .unwrap();
+
+        let (victim_sender, victim_receiver) = mpsc::channel();
+        let handle = thread::spawn(move || {
+            let error = second
+                .execute("UPDATE items SET amount = 11 WHERE id = 1")
+                .unwrap_err();
+            let failed = second.query("SELECT * FROM items", &[]).unwrap_err();
+            second.execute("ROLLBACK").unwrap();
+            victim_sender
+                .send((error.sqlstate, failed.sqlstate))
+                .unwrap();
+        });
+        wait_until_blocked(&db);
+
+        assert_eq!(
+            first.execute("UPDATE items SET amount = 1 WHERE id = 2"),
+            Ok(1)
+        );
+        assert_eq!(
+            victim_receiver
+                .recv_timeout(Duration::from_secs(1))
+                .unwrap(),
+            (SqlState::DeadlockDetected, SqlState::InFailedSqlTransaction)
+        );
+        handle.join().unwrap();
+        first.execute("COMMIT").unwrap();
+        assert_eq!(
+            setup
+                .query("SELECT amount FROM items ORDER BY id", &[])
+                .unwrap()
+                .rows,
+            vec![vec![Value::Int4(10)], vec![Value::Int4(1)]]
         );
     }
 

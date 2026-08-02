@@ -6,7 +6,7 @@ use crate::{
     storage::Table,
     txn::{
         RowLockKey, RowLockManager, RowLockMode, Snapshot, TransactionManager, TransactionStatus,
-        Xid, visible_version,
+        WaitForGraph, Xid, visible_version,
     },
     value::{BaseType, PgType, Value},
 };
@@ -26,6 +26,7 @@ pub(crate) struct DatabaseState {
     pub tables: BTreeMap<TableId, Table>,
     pub transactions: TransactionManager,
     pub row_locks: RowLockManager,
+    pub wait_for: WaitForGraph,
 }
 pub(crate) enum ExecutionResult {
     Affected(u64),
@@ -63,6 +64,7 @@ impl DatabaseState {
             tables: BTreeMap::new(),
             transactions: TransactionManager::new(),
             row_locks: RowLockManager::new(),
+            wait_for: WaitForGraph::new(),
         }
     }
 }
