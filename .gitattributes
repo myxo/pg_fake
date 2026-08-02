@@ -1,1 +1,2 @@
 agent_sessions/* linguist-generated=true
+crates/pg_fake_sqlx/tests/postgres_regress/upstream/* linguist-generated=true
