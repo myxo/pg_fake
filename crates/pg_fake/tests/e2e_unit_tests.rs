@@ -332,6 +332,112 @@ fn lock_timeout_and_row_lock_clauses_match_postgres() {
 }
 
 #[test]
+fn parameters_and_prepared_reuse_match_postgres() {
+    let _test_lock = TEST_LOCK.lock().expect("test mutex must not be poisoned");
+    let configured_url = env::var("PG_FAKE_DATABASE_URL").ok();
+    if configured_url.is_none() && env::var_os("DOCKER_HOST").is_none() {
+        let socket = PathBuf::from(env::var_os("HOME").expect("HOME must be set"))
+            .join(".colima/default/docker.sock");
+        if socket.exists() {
+            unsafe { env::set_var("DOCKER_HOST", format!("unix://{}", socket.display())) };
+        }
+    }
+    let container = configured_url.is_none().then(|| {
+        Postgres::default()
+            .with_tag("18")
+            .start()
+            .expect("must start PostgreSQL 18 container")
+    });
+    let url = configured_url.unwrap_or_else(|| {
+        let container = container.as_ref().expect("container must be started");
+        format!(
+            "postgresql://postgres:postgres@{}:{}/postgres",
+            container.get_host().unwrap(),
+            container.get_host_port_ipv4(5432).unwrap()
+        )
+    });
+    let table = format!(
+        "pg_fake_differential_{}_{}",
+        std::process::id(),
+        TABLE_NUMBER.fetch_add(1, Ordering::Relaxed)
+    );
+    let mut postgres = Client::connect(&url, NoTls).expect("must connect to PostgreSQL");
+    let db = Db::new();
+    let mut fake = db.session();
+    let create = format!("CREATE TABLE {table} (id INTEGER, name TEXT, amount SMALLINT)");
+    postgres.batch_execute(&create).unwrap();
+    fake.execute(&create).unwrap();
+
+    let insert_sql = format!("INSERT INTO {table} VALUES ($1, $2, $3)");
+    let postgres_insert = postgres.prepare(&insert_sql).unwrap();
+    let fake_insert = fake.prepare(&insert_sql).unwrap();
+    for (id, name, amount) in [(1_i32, "first", 10_i16), (2, "second", 20)] {
+        assert_eq!(
+            fake.execute_prepared(
+                &fake_insert,
+                &[
+                    Value::Int4(id),
+                    Value::Text(name.into()),
+                    Value::Int2(amount),
+                ],
+            )
+            .unwrap(),
+            postgres
+                .execute(&postgres_insert, &[&id, &name, &amount])
+                .unwrap()
+        );
+    }
+
+    let select_sql = format!("SELECT name, amount FROM {table} WHERE id = $1");
+    let postgres_select = postgres.prepare(&select_sql).unwrap();
+    let fake_select = fake.prepare(&select_sql).unwrap();
+    for id in [1_i32, 2] {
+        let expected = postgres
+            .query(&postgres_select, &[&id])
+            .unwrap()
+            .into_iter()
+            .map(|row| (row.get::<_, String>(0), row.get::<_, i16>(1)))
+            .collect::<Vec<_>>();
+        let actual = fake
+            .query_prepared(&fake_select, &[Value::Int4(id)])
+            .unwrap()
+            .rows
+            .into_iter()
+            .map(|row| match row.as_slice() {
+                [Value::Text(name), Value::Int2(amount)] => (name.clone(), *amount),
+                _ => panic!("unexpected fake row"),
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(actual, expected);
+
+        let postgres_inline = postgres
+            .query(
+                &format!("SELECT name, amount FROM {table} WHERE id = {id}"),
+                &[],
+            )
+            .unwrap()
+            .into_iter()
+            .map(|row| (row.get::<_, String>(0), row.get::<_, i16>(1)))
+            .collect::<Vec<_>>();
+        let fake_inline = fake
+            .query(
+                &format!("SELECT name, amount FROM {table} WHERE id = {id}"),
+                &[],
+            )
+            .unwrap()
+            .rows
+            .into_iter()
+            .map(|row| match row.as_slice() {
+                [Value::Text(name), Value::Int2(amount)] => (name.clone(), *amount),
+                _ => panic!("unexpected fake row"),
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(actual, postgres_inline);
+        assert_eq!(actual, fake_inline);
+    }
+}
+
+#[test]
 fn case_boundaries_and_function_errors_match_postgres() {
     assert_differential(
         "CREATE TABLE __TABLE__ (id INTEGER); \

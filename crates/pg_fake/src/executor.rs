@@ -346,7 +346,7 @@ pub(crate) fn dispatch(
         )),
     }
 }
-fn name(name: &sqlparser::ast::ObjectName) -> Result<String> {
+pub(crate) fn name(name: &sqlparser::ast::ObjectName) -> Result<String> {
     if name.0.len() != 1 {
         return Err(PgError::new(
             SqlState::FeatureNotSupported,
@@ -356,7 +356,7 @@ fn name(name: &sqlparser::ast::ObjectName) -> Result<String> {
     Ok(identifier_name(&name.0[0]))
 }
 
-fn identifier_name(identifier: &Ident) -> String {
+pub(crate) fn identifier_name(identifier: &Ident) -> String {
     if identifier.quote_style.is_some() {
         identifier.value.clone()
     } else {
@@ -1106,7 +1106,7 @@ fn default_expression(expr: &Expr) -> bool {
     matches!(expr, Expr::Identifier(identifier) if identifier.quote_style.is_none() && identifier.value.eq_ignore_ascii_case("default"))
 }
 
-fn constant_schema() -> TableSchema {
+pub(crate) fn constant_schema() -> TableSchema {
     TableSchema {
         id: TableId(0),
         name: String::new(),
@@ -1187,7 +1187,7 @@ fn column_index(schema: &TableSchema, column: &Ident) -> Result<usize> {
         })
 }
 
-fn expression_type(expr: &Expr, schema: &TableSchema) -> Result<BaseType> {
+pub(crate) fn expression_type(expr: &Expr, schema: &TableSchema) -> Result<BaseType> {
     match expr {
         Expr::Identifier(column) => {
             Ok(schema.columns[column_index(schema, column)?].data_type.base)
@@ -1372,7 +1372,7 @@ fn expression_type(expr: &Expr, schema: &TableSchema) -> Result<BaseType> {
     }
 }
 
-fn null_expression(expr: &Expr) -> bool {
+pub(crate) fn null_expression(expr: &Expr) -> bool {
     match expr {
         Expr::Value(AstValue::Null) => true,
         Expr::Nested(expr) => null_expression(expr),

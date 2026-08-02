@@ -6,7 +6,7 @@ license.workspace = true
 
 [dependencies]
 bigdecimal = "0.4"
-sqlparser = "0.53"
+sqlparser = { version = "0.53", features = ["visitor"] }
 thiserror = "2"
 
 [dev-dependencies]

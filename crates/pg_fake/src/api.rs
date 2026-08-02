@@ -9,6 +9,7 @@ use sqlparser::ast::{
 };
 
 use crate::{
+    analyzer,
     error::{PgError, Result, SqlState},
     executor::{self, DatabaseState, ExecutionResult},
     parser,
@@ -26,6 +27,11 @@ pub struct ColumnMeta {
 pub struct QueryResult {
     pub columns: Vec<ColumnMeta>,
     pub rows: Vec<Vec<Value>>,
+}
+#[derive(Debug, Clone)]
+pub struct Statement {
+    statement: parser::Statement,
+    parameter_types: Vec<crate::value::BaseType>,
 }
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum IsolationLevel {
@@ -285,18 +291,73 @@ impl Session {
             )),
         }
     }
+    pub fn execute_params(&mut self, sql: &str, params: &[Value]) -> Result<u64> {
+        let statement = self.prepare(sql)?;
+        self.execute_prepared(&statement, params)
+    }
     pub fn query(&mut self, sql: &str, params: &[Value]) -> Result<QueryResult> {
-        if !params.is_empty() {
+        let statement = self.prepare(sql)?;
+        self.query_prepared(&statement, params)
+    }
+    pub fn prepare(&mut self, sql: &str) -> Result<Statement> {
+        if matches!(self.transaction, Some(SessionTransaction::Aborted(_))) {
             return Err(PgError::new(
-                SqlState::FeatureNotSupported,
-                "parameters are not implemented",
+                SqlState::InFailedSqlTransaction,
+                "current transaction is aborted",
             ));
         }
-        match self.run(sql)? {
+        let mut statements = match parser::parse(sql) {
+            Ok(statements) => statements,
+            Err(error) => return self.failed(error),
+        };
+        if statements.len() != 1 {
+            return self.failed(PgError::new(
+                SqlState::SyntaxError,
+                "prepared statements require exactly one statement",
+            ));
+        }
+        let statement = statements.pop().expect("statement count was checked");
+        let parameter_types = {
+            let state = self.db.state.lock().expect("database mutex is poisoned");
+            analyzer::parameter_types(&statement, &state.catalog)
+        };
+        match parameter_types {
+            Ok(parameter_types) => Ok(Statement {
+                statement,
+                parameter_types,
+            }),
+            Err(error) => self.failed(error),
+        }
+    }
+    pub fn execute_prepared(&mut self, statement: &Statement, params: &[Value]) -> Result<u64> {
+        let statement =
+            match analyzer::bind(&statement.statement, &statement.parameter_types, params) {
+                Ok(statement) => statement,
+                Err(error) => return self.failed(error),
+            };
+        match self.run_statement(statement)? {
+            ExecutionResult::Affected(rows) => Ok(rows),
+            ExecutionResult::Query(_) => Err(PgError::new(
+                SqlState::FeatureNotSupported,
+                "use query_prepared for SELECT statements",
+            )),
+        }
+    }
+    pub fn query_prepared(
+        &mut self,
+        statement: &Statement,
+        params: &[Value],
+    ) -> Result<QueryResult> {
+        let statement =
+            match analyzer::bind(&statement.statement, &statement.parameter_types, params) {
+                Ok(statement) => statement,
+                Err(error) => return self.failed(error),
+            };
+        match self.run_statement(statement)? {
             ExecutionResult::Query(result) => Ok(result),
             ExecutionResult::Affected(_) => Err(PgError::new(
                 SqlState::FeatureNotSupported,
-                "query requires a SELECT statement",
+                "query_prepared requires a SELECT statement",
             )),
         }
     }
@@ -366,6 +427,9 @@ impl Session {
             ));
         }
         let statement = statements.pop().expect("statement count was checked");
+        self.run_statement(statement)
+    }
+    fn run_statement(&mut self, statement: parser::Statement) -> Result<ExecutionResult> {
         match &statement {
             parser::Statement::StartTransaction { modes, .. } => {
                 return match self.transaction {
@@ -567,8 +631,24 @@ impl Transaction<'_> {
     pub fn execute(&mut self, sql: &str) -> Result<u64> {
         self.session.execute(sql)
     }
+    pub fn execute_params(&mut self, sql: &str, params: &[Value]) -> Result<u64> {
+        self.session.execute_params(sql, params)
+    }
     pub fn query(&mut self, sql: &str, params: &[Value]) -> Result<QueryResult> {
         self.session.query(sql, params)
+    }
+    pub fn prepare(&mut self, sql: &str) -> Result<Statement> {
+        self.session.prepare(sql)
+    }
+    pub fn execute_prepared(&mut self, statement: &Statement, params: &[Value]) -> Result<u64> {
+        self.session.execute_prepared(statement, params)
+    }
+    pub fn query_prepared(
+        &mut self,
+        statement: &Statement,
+        params: &[Value],
+    ) -> Result<QueryResult> {
+        self.session.query_prepared(statement, params)
     }
     pub fn commit(mut self) -> Result<()> {
         self.session.finish_transaction(true);
@@ -668,6 +748,165 @@ mod tests {
                 vec![Value::Int4(2), Value::Text("second".into())],
                 vec![Value::Int4(1), Value::Text("first".into())],
             ]
+        );
+    }
+
+    #[test]
+    fn parameters_and_prepared_statements_bind_typed_values() {
+        let db = Db::new();
+        let mut session = db.session();
+        session
+            .execute("CREATE TABLE items (id INTEGER, name TEXT, amount SMALLINT)")
+            .unwrap();
+
+        let insert = session
+            .prepare("INSERT INTO items VALUES ($1, $2, $3)")
+            .unwrap();
+        assert_eq!(
+            session.execute_prepared(
+                &insert,
+                &[Value::Int4(1), Value::Text("first".into()), Value::Int2(10),],
+            ),
+            Ok(1)
+        );
+        assert_eq!(
+            session.execute_prepared(
+                &insert,
+                &[
+                    Value::Int4(2),
+                    Value::Text("second".into()),
+                    Value::Int2(20),
+                ],
+            ),
+            Ok(1)
+        );
+        assert_eq!(
+            session.execute_params(
+                "UPDATE items SET amount = $1 WHERE id = $2",
+                &[Value::Int2(11), Value::Int4(1)],
+            ),
+            Ok(1)
+        );
+
+        let select = session
+            .prepare("SELECT name, amount FROM items WHERE id = $1")
+            .unwrap();
+        assert_eq!(
+            session
+                .query_prepared(&select, &[Value::Int4(1)])
+                .unwrap()
+                .rows,
+            vec![vec![Value::Text("first".into()), Value::Int2(11)]]
+        );
+        assert_eq!(
+            session
+                .query_prepared(&select, &[Value::Int4(2)])
+                .unwrap()
+                .rows,
+            vec![vec![Value::Text("second".into()), Value::Int2(20)]]
+        );
+        assert!(
+            session
+                .query(
+                    "SELECT id FROM items WHERE name = $1 AND amount = $2",
+                    &[Value::Text("missing".into()), Value::Null],
+                )
+                .unwrap()
+                .rows
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn parameter_validation_matches_prepared_statement_contract() {
+        let db = Db::new();
+        let mut session = db.session();
+        session.execute("CREATE TABLE items (id INTEGER)").unwrap();
+        session.execute("INSERT INTO items VALUES (1)").unwrap();
+        let skipped = session
+            .prepare("SELECT id FROM items WHERE id = $2 OR id = $2")
+            .unwrap();
+
+        assert_eq!(
+            session
+                .query_prepared(&skipped, &[Value::Text("unused".into())])
+                .unwrap_err()
+                .sqlstate,
+            SqlState::ProtocolViolation
+        );
+        assert_eq!(
+            session
+                .query_prepared(
+                    &skipped,
+                    &[Value::Text("unused".into()), Value::Text("wrong".into())],
+                )
+                .unwrap_err()
+                .sqlstate,
+            SqlState::CannotCoerce
+        );
+        assert_eq!(
+            session
+                .query_prepared(&skipped, &[Value::Text("unused".into()), Value::Int4(1)],)
+                .unwrap()
+                .rows,
+            vec![vec![Value::Int4(1)]]
+        );
+        assert_eq!(
+            session
+                .query("SELECT id FROM items WHERE id = $1", &[])
+                .unwrap_err()
+                .sqlstate,
+            SqlState::ProtocolViolation
+        );
+        assert_eq!(
+            session
+                .execute_params(
+                    "INSERT INTO items VALUES ($1); INSERT INTO items VALUES ($1)",
+                    &[Value::Int4(2)],
+                )
+                .unwrap_err()
+                .sqlstate,
+            SqlState::SyntaxError
+        );
+        assert_eq!(
+            session
+                .prepare("SELECT missing FROM items WHERE id = $1")
+                .unwrap_err()
+                .sqlstate,
+            SqlState::UndefinedColumn
+        );
+        assert_eq!(
+            session
+                .prepare("SELECT id + TRUE FROM items WHERE id = $1")
+                .unwrap_err()
+                .sqlstate,
+            SqlState::DatatypeMismatch
+        );
+        assert_eq!(
+            session
+                .prepare("SELECT id FROM missing WHERE id = $1")
+                .unwrap_err()
+                .sqlstate,
+            SqlState::UndefinedTable
+        );
+        assert_eq!(
+            session
+                .prepare("SELECT id FROM items WHERE id = $0")
+                .unwrap_err()
+                .sqlstate,
+            SqlState::UndefinedParameter
+        );
+
+        let prepared = session
+            .prepare("SELECT id FROM items WHERE id = $1")
+            .unwrap();
+        session.execute("DROP TABLE items").unwrap();
+        assert_eq!(
+            session
+                .query_prepared(&prepared, &[Value::Int4(1)])
+                .unwrap_err()
+                .sqlstate,
+            SqlState::UndefinedTable
         );
     }
 

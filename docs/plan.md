@@ -550,7 +550,7 @@ chosen). Completes the concurrency milestone.
 
 ## Milestone H — API completeness
 
-### Task 31 — Parameters & prepared statements
+### Task 31 — Parameters & prepared statements [COMPLETE]
 **Goal:** First-class parameter binding and prepared statements (§8).
 
 **DoD:**

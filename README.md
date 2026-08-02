@@ -22,6 +22,29 @@ cycle (the newest transaction) is chosen deterministically as the victim. Its
 blocked statement returns `40P01`, and the transaction remains failed while
 retaining its locks until the caller issues `ROLLBACK`.
 
+## Parameters and prepared statements
+
+Use `$1` placeholders with `query` or the non-breaking `execute_params` method.
+Call `prepare` to parse and analyze a single statement once, then reuse the
+owned statement with different typed values:
+
+```rust
+let insert = session.prepare("INSERT INTO items VALUES ($1, $2)")?;
+session.execute_prepared(
+    &insert,
+    &[Value::Int4(1), Value::Text("first".into())],
+)?;
+
+let select = session.prepare("SELECT * FROM items WHERE id = $1")?;
+let rows = session.query_prepared(&select, &[Value::Int4(1)])?;
+```
+
+One-shot parameterized calls and prepared statements accept exactly one SQL
+statement. Placeholder types are inferred from their Phase-1 expression and
+column contexts; supplied values are checked using PostgreSQL implicit-cast
+rules. The highest placeholder number determines the argument count, so a
+statement using only `$2` still requires two values.
+
 A zero timeout waits indefinitely, matching PostgreSQL.
 
 ## Benchmarks

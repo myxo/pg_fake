@@ -9,6 +9,9 @@ pub enum SqlState {
     // 00 — Successful Completion
     SuccessfulCompletion, // 00000
 
+    // 08 — Connection Exception
+    ProtocolViolation, // 08P01
+
     // 0A — Feature Not Supported
     FeatureNotSupported, // 0A000
 
@@ -41,6 +44,8 @@ pub enum SqlState {
     UndefinedColumn,        // 42703
     UndefinedFunction,      // 42883
     UndefinedObject,        // 42704
+    UndefinedParameter,     // 42P02
+    AmbiguousParameter,     // 42P08
     CannotCoerce,           // 42846
     DatatypeMismatch,       // 42804
     InvalidColumnReference, // 42P10
@@ -57,6 +62,7 @@ impl SqlState {
     pub fn code(self) -> &'static str {
         match self {
             SqlState::SuccessfulCompletion => "00000",
+            SqlState::ProtocolViolation => "08P01",
             SqlState::FeatureNotSupported => "0A000",
             SqlState::NumericValueOutOfRange => "22003",
             SqlState::DivisionByZero => "22012",
@@ -78,6 +84,8 @@ impl SqlState {
             SqlState::UndefinedColumn => "42703",
             SqlState::UndefinedFunction => "42883",
             SqlState::UndefinedObject => "42704",
+            SqlState::UndefinedParameter => "42P02",
+            SqlState::AmbiguousParameter => "42P08",
             SqlState::CannotCoerce => "42846",
             SqlState::DatatypeMismatch => "42804",
             SqlState::InvalidColumnReference => "42P10",
