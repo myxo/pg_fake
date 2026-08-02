@@ -64,7 +64,7 @@ impl Drop for PostgresCase<'_> {
 }
 
 fn postgres_server() -> PostgresServer {
-    if let Ok(url) = env::var("PG_FAKE_TEST_DATABASE_URL") {
+    if let Ok(url) = env::var("PG_FAKE_DATABASE_URL") {
         return PostgresServer {
             url,
             _container: None,

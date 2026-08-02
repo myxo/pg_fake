@@ -40,7 +40,7 @@ static TEST_LOCK: Mutex<()> = Mutex::new(());
 
 fn assert_differential(script: &str, row_order: RowOrder) {
     let _test_lock = TEST_LOCK.lock().expect("test mutex must not be poisoned");
-    let configured_url = env::var("PG_FAKE_TEST_DATABASE_URL").ok();
+    let configured_url = env::var("PG_FAKE_DATABASE_URL").ok();
     if configured_url.is_none() && env::var_os("DOCKER_HOST").is_none() {
         let socket = PathBuf::from(env::var_os("HOME").expect("HOME must be set"))
             .join(".colima/default/docker.sock");
@@ -97,7 +97,7 @@ fn assert_differential(script: &str, row_order: RowOrder) {
 
 fn assert_session_differential(operations: &[(SessionName, &str)], row_order: RowOrder) {
     let _test_lock = TEST_LOCK.lock().expect("test mutex must not be poisoned");
-    let configured_url = env::var("PG_FAKE_TEST_DATABASE_URL").ok();
+    let configured_url = env::var("PG_FAKE_DATABASE_URL").ok();
     if configured_url.is_none() && env::var_os("DOCKER_HOST").is_none() {
         let socket = PathBuf::from(env::var_os("HOME").expect("HOME must be set"))
             .join(".colima/default/docker.sock");

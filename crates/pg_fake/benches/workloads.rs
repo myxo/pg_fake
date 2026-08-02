@@ -26,7 +26,8 @@ fn postgres_benchmark() -> PostgresBenchmark {
     let _environment_lock = ENVIRONMENT_LOCK
         .lock()
         .expect("environment mutex must not be poisoned");
-    if let Ok(url) = env::var("PG_FAKE_BENCHMARK_DATABASE_URL") {
+    if let Ok(url) = env::var("PG_FAKE_DATABASE_URL") {
+        println!("connect to manually setup postgres on {url}");
         return PostgresBenchmark {
             client: Client::connect(&url, NoTls).expect("must connect to PostgreSQL 18"),
             _container: None,
@@ -52,6 +53,7 @@ fn postgres_benchmark() -> PostgresBenchmark {
             .get_host_port_ipv4(5432)
             .expect("PostgreSQL port must be available")
     );
+    println!("connect to postgres in container on {url}");
     PostgresBenchmark {
         client: Client::connect(&url, NoTls).expect("must connect to PostgreSQL 18"),
         _container: Some(container),
