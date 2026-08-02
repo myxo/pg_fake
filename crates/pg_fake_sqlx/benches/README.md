@@ -1,7 +1,7 @@
 # Benchmarks
 
-The Criterion suite compares in-process `pg_fake` calls with the same SQL sent
-through a `postgres` client connection to PostgreSQL 18. It covers a create/drop
+The Criterion suite compares `pg_fake` through its in-process SQLx driver with
+the same SQL sent through a `postgres` client connection to PostgreSQL 18. It covers a create/drop
 table lifecycle, individual constrained explicit/defaulted inserts, updates,
 deletes, explicit transactions at READ COMMITTED and REPEATABLE READ, row-lock
 acquisition with `SELECT ... FOR UPDATE`, a 100-row full-table select, and a
@@ -18,14 +18,14 @@ To benchmark an existing PostgreSQL 18 instance instead, set
 
 ```sh
 PG_FAKE_DATABASE_URL=postgresql://postgres:password@localhost:5432/postgres \
-  cargo bench --bench workloads
+  cargo bench -p pg_fake_sqlx --bench workloads
 ```
 
 Otherwise run:
 
 ```sh
-cargo bench --bench workloads
-python3 crates/pg_fake/benches/report_speedups.py
+cargo bench -p pg_fake_sqlx --bench workloads
+python3 crates/pg_fake_sqlx/benches/report_speedups.py
 ```
 
 Criterion writes latency and throughput reports under `target/criterion`. The

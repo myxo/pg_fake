@@ -12,7 +12,7 @@ test:
 
 # Run PostgreSQL 18 comparison benchmarks
 bench:
-    cargo bench --bench workloads
+    cargo bench -p pg_fake_sqlx --bench workloads
 
 # Record one pg_fake benchmark and open its flame graph
 profile-bench filter duration='10':

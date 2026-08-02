@@ -32,6 +32,26 @@ pub(crate) struct RequiredRowLock {
     pub key: RowLockKey,
     pub mode: RowLockMode,
 }
+
+pub(crate) fn query_columns(
+    state: &DatabaseState,
+    statement: &Statement,
+) -> Result<Vec<ColumnMeta>> {
+    let Statement::Query(query) = statement else {
+        return Ok(Vec::new());
+    };
+    let SetExpr::Select(select) = query.body.as_ref() else {
+        return Ok(Vec::new());
+    };
+    let Some(from) = select.from.first() else {
+        return Ok(Vec::new());
+    };
+    let TableFactor::Table { name: table, .. } = &from.relation else {
+        return Ok(Vec::new());
+    };
+    let schema = state.catalog.table(&name(table)?)?;
+    projections_and_columns(&select.projection, schema).map(|(_, columns)| columns)
+}
 enum Projection<'a> {
     Column(usize),
     Expression(&'a Expr),
@@ -792,47 +812,7 @@ fn select_rows(
             ));
         }
     }
-    let mut projections = Vec::new();
-    let mut columns = Vec::new();
-    for item in &select.projection {
-        match item {
-            SelectItem::Wildcard(_) => {
-                for (index, column) in schema.columns.iter().enumerate() {
-                    projections.push(Projection::Column(index));
-                    columns.push(ColumnMeta {
-                        name: column.name.clone(),
-                        type_oid: column.data_type.oid(),
-                        typmod: column.data_type.typmod,
-                    });
-                }
-            }
-            SelectItem::UnnamedExpr(Expr::Identifier(column)) => {
-                let index = column_index(schema, column)?;
-                let column = &schema.columns[index];
-                projections.push(Projection::Column(index));
-                columns.push(ColumnMeta {
-                    name: column.name.clone(),
-                    type_oid: column.data_type.oid(),
-                    typmod: column.data_type.typmod,
-                });
-            }
-            SelectItem::UnnamedExpr(expr) => {
-                let data_type = expression_type(expr, schema)?;
-                projections.push(Projection::Expression(expr));
-                columns.push(ColumnMeta {
-                    name: "?column?".into(),
-                    type_oid: data_type.oid(),
-                    typmod: PgType::NO_TYPEMOD,
-                });
-            }
-            _ => {
-                return Err(PgError::new(
-                    SqlState::FeatureNotSupported,
-                    "SELECT projection is not implemented",
-                ));
-            }
-        }
-    }
+    let (projections, columns) = projections_and_columns(&select.projection, schema)?;
     let order_specs = query
         .order_by
         .as_ref()
@@ -958,6 +938,54 @@ fn select_rows(
         .map(|row| row.values)
         .collect();
     Ok(StatementResult::Query(QueryResult { columns, rows }))
+}
+
+fn projections_and_columns<'a>(
+    projection: &'a [SelectItem],
+    schema: &TableSchema,
+) -> Result<(Vec<Projection<'a>>, Vec<ColumnMeta>)> {
+    let mut projections = Vec::new();
+    let mut columns = Vec::new();
+    for item in projection {
+        match item {
+            SelectItem::Wildcard(_) => {
+                for (index, column) in schema.columns.iter().enumerate() {
+                    projections.push(Projection::Column(index));
+                    columns.push(ColumnMeta {
+                        name: column.name.clone(),
+                        type_oid: column.data_type.oid(),
+                        typmod: column.data_type.typmod,
+                    });
+                }
+            }
+            SelectItem::UnnamedExpr(Expr::Identifier(column)) => {
+                let index = column_index(schema, column)?;
+                let column = &schema.columns[index];
+                projections.push(Projection::Column(index));
+                columns.push(ColumnMeta {
+                    name: column.name.clone(),
+                    type_oid: column.data_type.oid(),
+                    typmod: column.data_type.typmod,
+                });
+            }
+            SelectItem::UnnamedExpr(expr) => {
+                let data_type = expression_type(expr, schema)?;
+                projections.push(Projection::Expression(expr));
+                columns.push(ColumnMeta {
+                    name: "?column?".into(),
+                    type_oid: data_type.oid(),
+                    typmod: PgType::NO_TYPEMOD,
+                });
+            }
+            _ => {
+                return Err(PgError::new(
+                    SqlState::FeatureNotSupported,
+                    "SELECT projection is not implemented",
+                ));
+            }
+        }
+    }
+    Ok((projections, columns))
 }
 
 fn row_count(expr: &Expr, clause: RowCountClause) -> Result<Option<usize>> {

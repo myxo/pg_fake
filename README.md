@@ -71,7 +71,7 @@ single-statement operations.
 
 The Criterion suite compares `pg_fake` with PostgreSQL 18 for create/drop,
 insert, update, delete, transaction, and select workloads. See
-[`crates/pg_fake/benches/README.md`](crates/pg_fake/benches/README.md) for
+[`crates/pg_fake_sqlx/benches/README.md`](crates/pg_fake_sqlx/benches/README.md) for
 Docker/database configuration, commands, reports, and speedup interpretation.
 
 ## Differential tests
@@ -94,8 +94,9 @@ PG_FAKE_DATABASE_URL=postgresql://postgres:password@localhost:5432/postgres \
   cargo test --tests
 ```
 
-The property test generates stateful sequences of valid SQL and compares every
-statement with PostgreSQL. `chaos_theory` prints `CHAOS_THEORY_REPLAY` when it
+The property test runs `pg_fake` through its SQLx driver, generates stateful
+sequences of valid SQL, and compares every statement with PostgreSQL.
+`chaos_theory` prints `CHAOS_THEORY_REPLAY` when it
 finds a failing sequence. Generated tables are dropped during success and
 failure cleanup. The intentional-error examples leave uniquely named tables in
 the configured target database, so a database dedicated to differential testing

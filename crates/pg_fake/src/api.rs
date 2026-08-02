@@ -39,6 +39,7 @@ pub enum StatementResult {
 pub struct Statement {
     statement: parser::Statement,
     parameter_types: Vec<crate::value::BaseType>,
+    columns: Vec<ColumnMeta>,
 }
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum IsolationLevel {
@@ -374,12 +375,6 @@ impl Session {
         self.query_prepared(&statement, params)
     }
     pub fn prepare(&mut self, sql: &str) -> Result<Statement> {
-        if matches!(self.transaction, Some(SessionTransaction::Aborted { .. })) {
-            return Err(PgError::new(
-                SqlState::InFailedSqlTransaction,
-                "current transaction is aborted",
-            ));
-        }
         let mut statements = match parser::parse(sql) {
             Ok(statements) => statements,
             Err(error) => return self.failed(error),
@@ -391,25 +386,40 @@ impl Session {
             ));
         }
         let statement = statements.pop().expect("statement count was checked");
-        let parameter_types = {
+        if matches!(self.transaction, Some(SessionTransaction::Aborted { .. }))
+            && !matches!(
+                &statement,
+                parser::Statement::Commit { .. } | parser::Statement::Rollback { .. }
+            )
+        {
+            return Err(PgError::new(
+                SqlState::InFailedSqlTransaction,
+                "current transaction is aborted",
+            ));
+        }
+        let prepared = {
             let state = self.db.state.lock().expect("database mutex is poisoned");
-            analyzer::parameter_types(&statement, &state.catalog)
+            analyzer::parameter_types(&statement, &state.catalog).and_then(|parameter_types| {
+                let described = analyzer::bind(
+                    &statement,
+                    &parameter_types,
+                    &vec![Value::Null; parameter_types.len()],
+                )?;
+                let columns = executor::query_columns(&state, &described)?;
+                Ok((parameter_types, columns))
+            })
         };
-        match parameter_types {
-            Ok(parameter_types) => Ok(Statement {
+        match prepared {
+            Ok((parameter_types, columns)) => Ok(Statement {
                 statement,
                 parameter_types,
+                columns,
             }),
             Err(error) => self.failed(error),
         }
     }
     pub fn execute_prepared(&mut self, statement: &Statement, params: &[Value]) -> Result<u64> {
-        let statement =
-            match analyzer::bind(&statement.statement, &statement.parameter_types, params) {
-                Ok(statement) => statement,
-                Err(error) => return self.failed(error),
-            };
-        match self.run_statement(statement)? {
+        match self.run_prepared(statement, params)? {
             StatementResult::Affected(rows) => Ok(rows),
             StatementResult::Query(_) => Err(PgError::new(
                 SqlState::FeatureNotSupported,
@@ -422,18 +432,25 @@ impl Session {
         statement: &Statement,
         params: &[Value],
     ) -> Result<QueryResult> {
-        let statement =
-            match analyzer::bind(&statement.statement, &statement.parameter_types, params) {
-                Ok(statement) => statement,
-                Err(error) => return self.failed(error),
-            };
-        match self.run_statement(statement)? {
+        match self.run_prepared(statement, params)? {
             StatementResult::Query(result) => Ok(result),
             StatementResult::Affected(_) => Err(PgError::new(
                 SqlState::FeatureNotSupported,
                 "query_prepared requires a SELECT statement",
             )),
         }
+    }
+    pub fn run_prepared(
+        &mut self,
+        statement: &Statement,
+        params: &[Value],
+    ) -> Result<StatementResult> {
+        let statement =
+            match analyzer::bind(&statement.statement, &statement.parameter_types, params) {
+                Ok(statement) => statement,
+                Err(error) => return self.failed(error),
+            };
+        self.run_statement(statement)
     }
     pub fn begin(&mut self) -> Result<Transaction<'_>> {
         self.begin_with(self.default_isolation)
@@ -748,6 +765,16 @@ impl Session {
                 Err(error)
             }
         }
+    }
+}
+
+impl Statement {
+    pub fn parameter_types(&self) -> &[crate::value::BaseType] {
+        &self.parameter_types
+    }
+
+    pub fn columns(&self) -> &[ColumnMeta] {
+        &self.columns
     }
 }
 

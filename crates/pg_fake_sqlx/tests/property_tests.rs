@@ -11,14 +11,13 @@ use std::{
 
 use bigdecimal::BigDecimal;
 use chaos_theory::{Effect, Source, check, make::int_in_range};
-use pg_fake::{
-    api::{Db, Session, StatementResult},
-    parser::{self, Statement},
-    value::Value,
-};
+use pg_fake::parser::{self, Statement};
+use pg_fake_sqlx::{Db, PgFakeConnection};
 use postgres::{Client, NoTls, SimpleQueryMessage};
+use sqlx::{AssertSqlSafe, Column, Row, ValueRef};
 use testcontainers::{Container, ImageExt, runners::SyncRunner};
 use testcontainers_modules::postgres::Postgres;
+use tokio::runtime::Runtime;
 
 #[derive(Debug, PartialEq, Eq)]
 enum Outcome {
@@ -138,43 +137,74 @@ fn postgres_outcome(client: &mut Client, statement: &Statement, sql: &str) -> Ou
     }
 }
 
-fn fake_outcome(session: &mut Session, statement: &Statement, sql: &str) -> Outcome {
+async fn fake_outcome(
+    connection: &mut PgFakeConnection,
+    statement: &Statement,
+    sql: &str,
+) -> Outcome {
     match statement {
-        Statement::Query(_) => match session.query(sql, &[]) {
-            Ok(result) => Outcome::Rows {
-                values: result
-                    .rows
+        Statement::Query(_) => match sqlx::query(AssertSqlSafe(sql)).fetch_all(connection).await {
+            Ok(rows) => Outcome::Rows {
+                type_oids: Some(
+                    rows.first()
+                        .map(|row| {
+                            row.columns()
+                                .iter()
+                                .map(|column| {
+                                    column
+                                        .type_info()
+                                        .base
+                                        .expect("query columns must have a Phase-1 type")
+                                        .oid()
+                                })
+                                .collect()
+                        })
+                        .unwrap_or_default(),
+                ),
+                values: rows
                     .iter()
                     .map(|row| {
-                        row.iter()
-                            .map(|value| match value {
-                                Value::Null => None,
-                                value => Some(value.to_text()),
+                        (0..row.len())
+                            .map(|index| {
+                                let value = row.try_get_raw(index).unwrap();
+                                if value.is_null() {
+                                    None
+                                } else {
+                                    Some(row.try_get_unchecked::<String, _>(index).unwrap())
+                                }
                             })
                             .collect()
                     })
                     .collect(),
-                type_oids: Some(
-                    result
-                        .columns
-                        .iter()
-                        .map(|column| column.type_oid)
-                        .collect(),
-                ),
             },
-            Err(error) => Outcome::Error(error.sqlstate.code().into()),
+            Err(error) => Outcome::Error(
+                error
+                    .as_database_error()
+                    .and_then(|error| error.code())
+                    .expect("database execution errors must have a SQLSTATE")
+                    .into_owned(),
+            ),
         },
-        _ => match session.execute(sql) {
-            Ok(results) => match results.as_slice() {
-                [StatementResult::Affected(rows)] => Outcome::Affected(*rows),
-                _ => panic!("single non-query statement must return an affected-row result"),
-            },
-            Err(error) => Outcome::Error(error.sqlstate.code().into()),
+        _ => match sqlx::query(AssertSqlSafe(sql)).execute(connection).await {
+            Ok(result) => Outcome::Affected(result.rows_affected()),
+            Err(error) => Outcome::Error(
+                error
+                    .as_database_error()
+                    .and_then(|error| error.code())
+                    .expect("database execution errors must have a SQLSTATE")
+                    .into_owned(),
+            ),
         },
     }
 }
 
-fn assert_statement(postgres: &mut Client, fake: &mut Session, sql: &str, row_order: RowOrder) {
+fn assert_statement(
+    runtime: &Runtime,
+    postgres: &mut Client,
+    fake: &mut PgFakeConnection,
+    sql: &str,
+    row_order: RowOrder,
+) {
     let mut statements = parser::parse(sql)
         .unwrap_or_else(|error| panic!("generated SQL must parse: {sql}\n{error}"));
     assert_eq!(
@@ -184,7 +214,7 @@ fn assert_statement(postgres: &mut Client, fake: &mut Session, sql: &str, row_or
     );
     let statement = statements.pop().expect("statement count was checked");
     let expected = postgres_outcome(postgres, &statement, sql);
-    let actual = fake_outcome(fake, &statement, sql);
+    let actual = runtime.block_on(fake_outcome(fake, &statement, sql));
     match (expected, actual) {
         (
             Outcome::Rows {
@@ -668,6 +698,10 @@ fn generated_sql_matches_postgres() {
     let postgres = RefCell::new(
         Client::connect(&server.url, NoTls).expect("must connect to PostgreSQL 18 once"),
     );
+    let runtime = tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()
+        .unwrap();
     check(|src| {
         let table = format!(
             "pg_fake_property_{}_{}",
@@ -679,27 +713,40 @@ fn generated_sql_matches_postgres() {
             client: &mut postgres,
             table: table.clone(),
         };
-        let db = Db::new();
-        let mut fake = db.session();
+        let mut fake = PgFakeConnection::new(Db::new());
         let mut next_row_key = 1;
         let mut in_transaction = false;
 
         assert_statement(
+            &runtime,
             postgres.client(),
             &mut fake,
             "SET SESSION CHARACTERISTICS AS TRANSACTION ISOLATION LEVEL READ COMMITTED",
             RowOrder::Unordered,
         );
         assert_statement(
+            &runtime,
             postgres.client(),
             &mut fake,
             "SET lock_timeout = 1000",
             RowOrder::Unordered,
         );
         let create = create_table_sql(&table);
-        assert_statement(postgres.client(), &mut fake, &create, RowOrder::Unordered);
+        assert_statement(
+            &runtime,
+            postgres.client(),
+            &mut fake,
+            &create,
+            RowOrder::Unordered,
+        );
         let insert = insert_sql(src, &table, &mut next_row_key);
-        assert_statement(postgres.client(), &mut fake, &insert, RowOrder::Unordered);
+        assert_statement(
+            &runtime,
+            postgres.client(),
+            &mut fake,
+            &insert,
+            RowOrder::Unordered,
+        );
 
         src.repeat_n("statements", 3..=14, |src| {
             let actions: &[&'static str] = if in_transaction {
@@ -768,13 +815,14 @@ fn generated_sql_matches_postgres() {
                     _ => unreachable!(),
                 };
                 src.log_value("sql", &sql);
-                assert_statement(postgres.client(), &mut fake, &sql, order);
+                assert_statement(&runtime, postgres.client(), &mut fake, &sql, order);
                 Effect::Success
             })
         });
 
         if in_transaction {
             assert_statement(
+                &runtime,
                 postgres.client(),
                 &mut fake,
                 "ROLLBACK",

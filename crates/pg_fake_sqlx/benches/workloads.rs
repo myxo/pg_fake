@@ -9,16 +9,27 @@ use std::{
 };
 
 use criterion::{Criterion, black_box, criterion_group, criterion_main};
-use pg_fake::api::{Db, StatementResult};
+use pg_fake_sqlx::{Db, PgFakeConnection, PgFakeRow};
 use postgres::{Client, NoTls, SimpleQueryMessage};
+use sqlx::{AssertSqlSafe, Connection};
 use testcontainers::{Container, ImageExt, runners::SyncRunner};
 use testcontainers_modules::postgres::Postgres;
+use tokio::runtime::Runtime;
 
 static TABLE_NUMBER: AtomicU64 = AtomicU64::new(1);
 static ENVIRONMENT_LOCK: Mutex<()> = Mutex::new(());
 
-fn affected(rows: u64) -> Vec<StatementResult> {
-    vec![StatementResult::Affected(rows)]
+fn fake_execute(runtime: &Runtime, connection: &mut PgFakeConnection, sql: &str) -> u64 {
+    runtime
+        .block_on(sqlx::query(AssertSqlSafe(sql)).execute(connection))
+        .unwrap()
+        .rows_affected()
+}
+
+fn fake_query(runtime: &Runtime, connection: &mut PgFakeConnection, sql: &str) -> Vec<PgFakeRow> {
+    runtime
+        .block_on(sqlx::query(AssertSqlSafe(sql)).fetch_all(connection))
+        .unwrap()
 }
 
 struct PostgresBenchmark {
@@ -72,21 +83,20 @@ fn unique_table_name(workload: &str) -> String {
     )
 }
 
-fn create_table_benchmark(criterion: &mut Criterion, postgres: &mut Client) {
+fn create_table_benchmark(criterion: &mut Criterion, runtime: &Runtime, postgres: &mut Client) {
     let fake_table = unique_table_name("create_fake");
     let postgres_table = unique_table_name("create_postgres");
     let fake_create = format!("CREATE TABLE {fake_table} (id INTEGER, name TEXT)");
     let fake_drop = format!("DROP TABLE {fake_table}");
     let postgres_create = format!("CREATE TABLE {postgres_table} (id INTEGER, name TEXT)");
     let postgres_drop = format!("DROP TABLE {postgres_table}");
-    let db = Db::new();
-    let mut fake = db.session();
+    let mut fake = PgFakeConnection::new(Db::new());
     let mut group = criterion.benchmark_group("create_table");
 
     group.bench_function("pg_fake", |benchmark| {
         benchmark.iter(|| {
-            assert_eq!(fake.execute(&fake_create).unwrap(), affected(0));
-            assert_eq!(fake.execute(&fake_drop).unwrap(), affected(1));
+            assert_eq!(fake_execute(runtime, &mut fake, &fake_create), 0);
+            assert_eq!(fake_execute(runtime, &mut fake, &fake_drop), 1);
         });
     });
     group.bench_function("postgres_18", |benchmark| {
@@ -98,17 +108,19 @@ fn create_table_benchmark(criterion: &mut Criterion, postgres: &mut Client) {
     group.finish();
 }
 
-fn insert_benchmark(criterion: &mut Criterion, postgres: &mut Client) {
+fn insert_benchmark(criterion: &mut Criterion, runtime: &Runtime, postgres: &mut Client) {
     let fake_table = unique_table_name("insert_fake");
     let postgres_table = unique_table_name("insert_postgres");
-    let db = Db::new();
-    let mut fake = db.session();
+    let mut fake = PgFakeConnection::new(Db::new());
     assert_eq!(
-        fake.execute(&format!(
-            "CREATE TABLE {fake_table} (id INTEGER PRIMARY KEY CHECK (id > 0), name TEXT NOT NULL DEFAULT upper('benchmark'), CHECK (length(name) > 0))"
-        ))
-        .unwrap(),
-        affected(0)
+        fake_execute(
+            runtime,
+            &mut fake,
+            &format!(
+                "CREATE TABLE {fake_table} (id INTEGER PRIMARY KEY CHECK (id > 0), name TEXT NOT NULL DEFAULT upper('benchmark'), CHECK (length(name) > 0))"
+            )
+        ),
+        0
     );
     assert_eq!(
         postgres
@@ -129,11 +141,12 @@ fn insert_benchmark(criterion: &mut Criterion, postgres: &mut Client) {
         benchmark.iter(|| {
             fake_id += 1;
             assert_eq!(
-                fake.execute(&format!(
-                    "INSERT INTO {fake_table} VALUES ({fake_id}, 'benchmark')"
-                ))
-                .unwrap(),
-                affected(1)
+                fake_execute(
+                    runtime,
+                    &mut fake,
+                    &format!("INSERT INTO {fake_table} VALUES ({fake_id}, 'benchmark')")
+                ),
+                1
             );
         });
     });
@@ -161,9 +174,12 @@ fn insert_benchmark(criterion: &mut Criterion, postgres: &mut Client) {
         benchmark.iter(|| {
             fake_id += 1;
             assert_eq!(
-                fake.execute(&format!("INSERT INTO {fake_table} (id) VALUES ({fake_id})"))
-                    .unwrap(),
-                affected(1)
+                fake_execute(
+                    runtime,
+                    &mut fake,
+                    &format!("INSERT INTO {fake_table} (id) VALUES ({fake_id})"),
+                ),
+                1
             );
         });
     });
@@ -187,17 +203,17 @@ fn insert_benchmark(criterion: &mut Criterion, postgres: &mut Client) {
         .unwrap();
 }
 
-fn update_benchmark(criterion: &mut Criterion, postgres: &mut Client) {
+fn update_benchmark(criterion: &mut Criterion, runtime: &Runtime, postgres: &mut Client) {
     let fake_table = unique_table_name("update_fake");
     let postgres_table = unique_table_name("update_postgres");
-    let db = Db::new();
-    let mut fake = db.session();
+    let mut fake = PgFakeConnection::new(Db::new());
     assert_eq!(
-        fake.execute(&format!(
-            "CREATE TABLE {fake_table} (id INTEGER, amount INTEGER)"
-        ))
-        .unwrap(),
-        affected(0)
+        fake_execute(
+            runtime,
+            &mut fake,
+            &format!("CREATE TABLE {fake_table} (id INTEGER, amount INTEGER)"),
+        ),
+        0
     );
     assert_eq!(
         postgres
@@ -209,9 +225,12 @@ fn update_benchmark(criterion: &mut Criterion, postgres: &mut Client) {
         0
     );
     assert_eq!(
-        fake.execute(&format!("INSERT INTO {fake_table} VALUES (1, 0)"))
-            .unwrap(),
-        affected(1)
+        fake_execute(
+            runtime,
+            &mut fake,
+            &format!("INSERT INTO {fake_table} VALUES (1, 0)"),
+        ),
+        1
     );
     assert_eq!(
         postgres
@@ -224,7 +243,7 @@ fn update_benchmark(criterion: &mut Criterion, postgres: &mut Client) {
     let mut group = criterion.benchmark_group("update_row");
 
     group.bench_function("pg_fake", |benchmark| {
-        benchmark.iter(|| assert_eq!(fake.execute(&fake_update).unwrap(), affected(1)));
+        benchmark.iter(|| assert_eq!(fake_execute(runtime, &mut fake, &fake_update), 1));
     });
     group.bench_function("postgres_18", |benchmark| {
         benchmark.iter(|| assert_eq!(postgres.execute(&postgres_update, &[]).unwrap(), 1));
@@ -235,7 +254,7 @@ fn update_benchmark(criterion: &mut Criterion, postgres: &mut Client) {
         .unwrap();
 }
 
-fn delete_benchmark(criterion: &mut Criterion, postgres: &mut Client) {
+fn delete_benchmark(criterion: &mut Criterion, runtime: &Runtime, postgres: &mut Client) {
     let fake_table = unique_table_name("delete_fake");
     let postgres_table = unique_table_name("delete_postgres");
     postgres
@@ -247,15 +266,20 @@ fn delete_benchmark(criterion: &mut Criterion, postgres: &mut Client) {
         benchmark.iter_custom(|iterations| {
             let mut elapsed = Duration::ZERO;
             for id in 0..iterations {
-                let db = Db::new();
-                let mut fake = db.session();
-                fake.execute(&format!("CREATE TABLE {fake_table} (id INTEGER)"))
-                    .unwrap();
-                fake.execute(&format!("INSERT INTO {fake_table} VALUES ({id})"))
-                    .unwrap();
+                let mut fake = PgFakeConnection::new(Db::new());
+                fake_execute(
+                    runtime,
+                    &mut fake,
+                    &format!("CREATE TABLE {fake_table} (id INTEGER)"),
+                );
+                fake_execute(
+                    runtime,
+                    &mut fake,
+                    &format!("INSERT INTO {fake_table} VALUES ({id})"),
+                );
                 let delete = format!("DELETE FROM {fake_table} WHERE id = {id}");
                 let started = Instant::now();
-                assert_eq!(fake.execute(&delete).unwrap(), affected(1));
+                assert_eq!(fake_execute(runtime, &mut fake, &delete), 1);
                 elapsed += started.elapsed();
             }
             elapsed
@@ -282,15 +306,17 @@ fn delete_benchmark(criterion: &mut Criterion, postgres: &mut Client) {
         .unwrap();
 }
 
-fn transaction_benchmark(criterion: &mut Criterion, postgres: &mut Client) {
+fn transaction_benchmark(criterion: &mut Criterion, runtime: &Runtime, postgres: &mut Client) {
     let fake_table = unique_table_name("transaction_fake");
     let postgres_table = unique_table_name("transaction_postgres");
-    let db = Db::new();
-    let mut fake = db.session();
+    let mut fake = PgFakeConnection::new(Db::new());
     assert_eq!(
-        fake.execute(&format!("CREATE TABLE {fake_table} (id INTEGER)"))
-            .unwrap(),
-        affected(0)
+        fake_execute(
+            runtime,
+            &mut fake,
+            &format!("CREATE TABLE {fake_table} (id INTEGER)"),
+        ),
+        0
     );
     assert_eq!(
         postgres
@@ -305,13 +331,20 @@ fn transaction_benchmark(criterion: &mut Criterion, postgres: &mut Client) {
     group.bench_function("pg_fake", |benchmark| {
         benchmark.iter(|| {
             fake_id += 1;
-            assert_eq!(fake.execute("BEGIN").unwrap(), affected(0));
-            assert_eq!(
-                fake.execute(&format!("INSERT INTO {fake_table} VALUES ({fake_id})"))
-                    .unwrap(),
-                affected(1)
-            );
-            assert_eq!(fake.execute("COMMIT").unwrap(), affected(0));
+            runtime.block_on(async {
+                let mut transaction = fake.begin().await.unwrap();
+                assert_eq!(
+                    sqlx::query(AssertSqlSafe(format!(
+                        "INSERT INTO {fake_table} VALUES ({fake_id})"
+                    )))
+                    .execute(&mut *transaction)
+                    .await
+                    .unwrap()
+                    .rows_affected(),
+                    1
+                );
+                transaction.commit().await.unwrap();
+            });
         });
     });
     group.bench_function("postgres_18", |benchmark| {
@@ -336,15 +369,20 @@ fn transaction_benchmark(criterion: &mut Criterion, postgres: &mut Client) {
         .unwrap();
 }
 
-fn repeatable_read_benchmark(criterion: &mut Criterion, postgres: &mut Client) {
+fn repeatable_read_benchmark(criterion: &mut Criterion, runtime: &Runtime, postgres: &mut Client) {
     let fake_table = unique_table_name("repeatable_read_fake");
     let postgres_table = unique_table_name("repeatable_read_postgres");
-    let db = Db::new();
-    let mut fake = db.session();
-    fake.execute(&format!("CREATE TABLE {fake_table} (id INTEGER)"))
-        .unwrap();
-    fake.execute(&format!("INSERT INTO {fake_table} VALUES (1)"))
-        .unwrap();
+    let mut fake = PgFakeConnection::new(Db::new());
+    fake_execute(
+        runtime,
+        &mut fake,
+        &format!("CREATE TABLE {fake_table} (id INTEGER)"),
+    );
+    fake_execute(
+        runtime,
+        &mut fake,
+        &format!("INSERT INTO {fake_table} VALUES (1)"),
+    );
     postgres
         .execute(&format!("CREATE TABLE {postgres_table} (id INTEGER)"), &[])
         .unwrap();
@@ -357,11 +395,19 @@ fn repeatable_read_benchmark(criterion: &mut Criterion, postgres: &mut Client) {
 
     group.bench_function("pg_fake", |benchmark| {
         benchmark.iter(|| {
-            fake.execute("BEGIN ISOLATION LEVEL REPEATABLE READ")
-                .unwrap();
-            let result = fake.query(&fake_select, &[]).unwrap();
-            assert_eq!(result.rows.len(), 1);
-            fake.execute("COMMIT").unwrap();
+            let result = runtime.block_on(async {
+                let mut transaction = fake
+                    .begin_with("BEGIN ISOLATION LEVEL REPEATABLE READ")
+                    .await
+                    .unwrap();
+                let result = sqlx::query(AssertSqlSafe(fake_select.as_str()))
+                    .fetch_all(&mut *transaction)
+                    .await
+                    .unwrap();
+                transaction.commit().await.unwrap();
+                result
+            });
+            assert_eq!(result.len(), 1);
             black_box(result);
         });
     });
@@ -388,17 +434,17 @@ fn repeatable_read_benchmark(criterion: &mut Criterion, postgres: &mut Client) {
         .unwrap();
 }
 
-fn select_benchmark(criterion: &mut Criterion, postgres: &mut Client) {
+fn select_benchmark(criterion: &mut Criterion, runtime: &Runtime, postgres: &mut Client) {
     let fake_table = unique_table_name("select_fake");
     let postgres_table = unique_table_name("select_postgres");
-    let db = Db::new();
-    let mut fake = db.session();
+    let mut fake = PgFakeConnection::new(Db::new());
     assert_eq!(
-        fake.execute(&format!(
-            "CREATE TABLE {fake_table} (id INTEGER, name TEXT)"
-        ))
-        .unwrap(),
-        affected(0)
+        fake_execute(
+            runtime,
+            &mut fake,
+            &format!("CREATE TABLE {fake_table} (id INTEGER, name TEXT)"),
+        ),
+        0
     );
     assert_eq!(
         postgres
@@ -411,11 +457,12 @@ fn select_benchmark(criterion: &mut Criterion, postgres: &mut Client) {
     );
     for id in 1..=100 {
         assert_eq!(
-            fake.execute(&format!(
-                "INSERT INTO {fake_table} VALUES ({id}, 'benchmark')"
-            ))
-            .unwrap(),
-            affected(1)
+            fake_execute(
+                runtime,
+                &mut fake,
+                &format!("INSERT INTO {fake_table} VALUES ({id}, 'benchmark')"),
+            ),
+            1
         );
         assert_eq!(
             postgres
@@ -433,8 +480,8 @@ fn select_benchmark(criterion: &mut Criterion, postgres: &mut Client) {
 
     group.bench_function("pg_fake", |benchmark| {
         benchmark.iter(|| {
-            let result = fake.query(&fake_select, &[]).unwrap();
-            assert_eq!(result.rows.len(), 100);
+            let result = fake_query(runtime, &mut fake, &fake_select);
+            assert_eq!(result.len(), 100);
             black_box(result);
         });
     });
@@ -461,8 +508,8 @@ fn select_benchmark(criterion: &mut Criterion, postgres: &mut Client) {
 
     group.bench_function("pg_fake", |benchmark| {
         benchmark.iter(|| {
-            let result = fake.query(&fake_select, &[]).unwrap();
-            assert_eq!(result.rows.len(), 10);
+            let result = fake_query(runtime, &mut fake, &fake_select);
+            assert_eq!(result.len(), 10);
             black_box(result);
         });
     });
@@ -485,17 +532,17 @@ fn select_benchmark(criterion: &mut Criterion, postgres: &mut Client) {
         .unwrap();
 }
 
-fn order_by_benchmark(criterion: &mut Criterion, postgres: &mut Client) {
+fn order_by_benchmark(criterion: &mut Criterion, runtime: &Runtime, postgres: &mut Client) {
     let fake_table = unique_table_name("order_by_fake");
     let postgres_table = unique_table_name("order_by_postgres");
-    let db = Db::new();
-    let mut fake = db.session();
+    let mut fake = PgFakeConnection::new(Db::new());
     assert_eq!(
-        fake.execute(&format!(
-            "CREATE TABLE {fake_table} (id INTEGER, bucket INTEGER)"
-        ))
-        .unwrap(),
-        affected(0)
+        fake_execute(
+            runtime,
+            &mut fake,
+            &format!("CREATE TABLE {fake_table} (id INTEGER, bucket INTEGER)"),
+        ),
+        0
     );
     assert_eq!(
         postgres
@@ -513,9 +560,12 @@ fn order_by_benchmark(criterion: &mut Criterion, postgres: &mut Client) {
             (id % 10).to_string()
         };
         assert_eq!(
-            fake.execute(&format!("INSERT INTO {fake_table} VALUES ({id}, {bucket})"))
-                .unwrap(),
-            affected(1)
+            fake_execute(
+                runtime,
+                &mut fake,
+                &format!("INSERT INTO {fake_table} VALUES ({id}, {bucket})"),
+            ),
+            1
         );
         assert_eq!(
             postgres
@@ -535,8 +585,8 @@ fn order_by_benchmark(criterion: &mut Criterion, postgres: &mut Client) {
 
     group.bench_function("pg_fake", |benchmark| {
         benchmark.iter(|| {
-            let result = fake.query(&fake_select, &[]).unwrap();
-            assert_eq!(result.rows.len(), 100);
+            let result = fake_query(runtime, &mut fake, &fake_select);
+            assert_eq!(result.len(), 100);
             black_box(result);
         });
     });
@@ -561,15 +611,19 @@ fn order_by_benchmark(criterion: &mut Criterion, postgres: &mut Client) {
 
 fn benchmarks(criterion: &mut Criterion) {
     let mut postgres = postgres_benchmark();
+    let runtime = tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()
+        .unwrap();
 
-    create_table_benchmark(criterion, &mut postgres.client);
-    insert_benchmark(criterion, &mut postgres.client);
-    update_benchmark(criterion, &mut postgres.client);
-    delete_benchmark(criterion, &mut postgres.client);
-    transaction_benchmark(criterion, &mut postgres.client);
-    repeatable_read_benchmark(criterion, &mut postgres.client);
-    select_benchmark(criterion, &mut postgres.client);
-    order_by_benchmark(criterion, &mut postgres.client);
+    create_table_benchmark(criterion, &runtime, &mut postgres.client);
+    insert_benchmark(criterion, &runtime, &mut postgres.client);
+    update_benchmark(criterion, &runtime, &mut postgres.client);
+    delete_benchmark(criterion, &runtime, &mut postgres.client);
+    transaction_benchmark(criterion, &runtime, &mut postgres.client);
+    repeatable_read_benchmark(criterion, &runtime, &mut postgres.client);
+    select_benchmark(criterion, &runtime, &mut postgres.client);
+    order_by_benchmark(criterion, &runtime, &mut postgres.client);
 }
 
 criterion_group!(workloads, benchmarks);

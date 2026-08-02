@@ -239,6 +239,12 @@ fn infer_expr(
     let mut error = None;
     let _ = visit_expressions(expression, |expression| {
         let result = match expression {
+            Expr::Identifier(identifier)
+                if identifier.quote_style.is_none()
+                    && identifier.value.eq_ignore_ascii_case("default") =>
+            {
+                Ok(())
+            }
             Expr::Identifier(_) => executor::expression_type(expression, schema).map(|_| ()),
             Expr::Nested(inner) => constrain(inner, expected, types),
             Expr::Cast {

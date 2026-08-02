@@ -25,7 +25,7 @@ Conventions:
   explain why.
 - Before a task can be marked complete, the property test suite must pass at
   least 10,000 `chaos_theory` iterations, run with
-  `CHAOS_THEORY_CHECK_ITERS=10000 cargo test -p pg_fake --test property_tests`.
+  `CHAOS_THEORY_CHECK_ITERS=10000 cargo test -p pg_fake_sqlx --test property_tests`.
 
 ---
 
@@ -272,8 +272,9 @@ Postgres for the same workload — and keep it measurable over time.
 
 **DoD:**
 - A benchmark suite (e.g. `criterion`) measuring representative workloads
-  available so far (`CREATE`/`INSERT`/`SELECT`), comparing `pg_fake` in-process
-  calls against the same queries over a real Postgres 18 connection.
+  available so far (`CREATE`/`INSERT`/`SELECT`), comparing `pg_fake` through its
+  in-process SQLx driver against the same queries over a real Postgres 18
+  connection.
 - Reports per-operation latency/throughput for both, with a clear speedup ratio.
 - Documented how to run it and interpret results; results captured in the README
   or a `benches/README`.
@@ -583,7 +584,7 @@ chosen). Completes the concurrency milestone.
 
 ## Milestone I — Driver
 
-### Task 33 — `sqlx` driver crate (`pg_fake_sqlx`)
+### Task 33 — `sqlx` driver crate (`pg_fake_sqlx`) [COMPLETE]
 **Goal:** Let existing `sqlx` application code run against the in-process fake
 (§8.1).
 
@@ -597,6 +598,8 @@ chosen). Completes the concurrency milestone.
 - Transactions and prepared statements usable through the `sqlx` API.
 - An example test using `sqlx` queries against `pg_fake`, plus a differential
   case run through the `sqlx` layer to confirm error categories match.
+- The property-based differential suite and benchmark harness live in the
+  driver crate and execute `pg_fake` through SQLx as the primary public path.
 
 **Notes:** Other drivers or a wire-protocol server are future work (spec §13).
 
