@@ -3,10 +3,7 @@
 --
 
 -- directory path and dlsuffix are passed to us in environment variables
-\getenv libdir PG_LIBDIR
-\getenv dlsuffix PG_DLSUFFIX
 
-\set regresslib :libdir '/regress' :dlsuffix
 
 --
 -- Test the "old style" approach of making the I/O functions first,

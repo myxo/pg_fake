@@ -739,7 +739,6 @@ $$ language sql;
 select dfunc();
 
 -- verify it lists properly
-\df dfunc
 
 drop function dfunc(int, int);
 
@@ -819,7 +818,6 @@ select dfunc(10,20);
 create or replace function dfunc(a variadic int[]) returns int as
 $$ select array_upper($1, 1) $$ language sql;
 
-\df dfunc
 
 drop function dfunc(a variadic int[]);
 
@@ -993,7 +991,6 @@ CREATE VIEW dfview AS
 
 select * from dfview;
 
-\d+ dfview
 
 drop view dfview;
 drop function dfunc(anyelement, anyelement, bool);

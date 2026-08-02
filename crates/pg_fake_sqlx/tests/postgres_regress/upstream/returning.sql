@@ -417,5 +417,4 @@ BEGIN ATOMIC
               (SELECT count(*) FROM foo WHERE foo = n);
 END;
 
-\sf foo_update
 DROP FUNCTION foo_update;

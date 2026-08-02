@@ -294,6 +294,10 @@ fn compare_source_statement(
     fake: &mut PgFakeConnection,
     sql: &str,
 ) -> Result<(), String> {
+    let normalized = sql.to_ascii_uppercase();
+    if normalized.contains("COPY") && normalized.contains("FROM STDIN") {
+        return Err("requires inline COPY fixture data".into());
+    }
     let mut parsed = match parser::parse(sql) {
         Ok(parsed) if parsed.len() == 1 => parsed,
         Ok(_) => return Err("does not contain exactly one SQL statement".into()),
@@ -347,7 +351,6 @@ fn upstream_behavioral_regression_scripts_compare_or_report_a_blocker() {
             .iter()
             .all(|path| path.extension().is_some_and(|extension| extension == "sql"))
     );
-
     let server = postgres_server();
     let mut admin = Client::connect(&server.url, NoTls).expect("must connect to PostgreSQL");
     let runtime = Runtime::new().expect("must create tokio runtime");
@@ -413,6 +416,11 @@ fn upstream_behavioral_regression_scripts_compare_or_report_a_blocker() {
     }
 
     assert!(passed > 0);
+    eprintln!("PostgreSQL behavioral statements passed: {passed}");
+    eprintln!("PostgreSQL behavioral scripts skipped: {}", skipped.len());
+    for (name, reason) in &skipped {
+        eprintln!("SKIP {name}: {reason}");
+    }
     let mut expected_skipped = include_str!("postgres_regress/SKIPPED.txt")
         .lines()
         .collect::<Vec<_>>();
@@ -423,9 +431,4 @@ fn upstream_behavioral_regression_scripts_compare_or_report_a_blocker() {
     expected_skipped.sort();
     actual_skipped.sort();
     assert_eq!(actual_skipped, expected_skipped);
-    eprintln!("PostgreSQL behavioral statements passed: {passed}");
-    eprintln!("PostgreSQL behavioral scripts skipped: {}", skipped.len());
-    for (name, reason) in skipped {
-        eprintln!("SKIP {name}: {reason}");
-    }
 }

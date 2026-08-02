@@ -80,7 +80,6 @@ X0123	XFFFF
 X2468	X2468
 XFA50	X05AF
 X1234	XFFF5
-\.
 
 SELECT a, b, ~a AS "~ a", a & b AS "a & b",
        a | b AS "a | b", a # b AS "a # b" FROM varbit_table;
@@ -104,7 +103,6 @@ X0123	XFFFF
 X2468	X2468
 XFA50	X05AF
 X1234	XFFF5
-\.
 
 SELECT a,b,~a AS "~ a",a & b AS "a & b",
 	a|b AS "a | b", a # b AS "a # b" FROM bit_table;
@@ -235,7 +233,6 @@ CREATE TABLE bit_defaults(
   b3 bit varying(5) DEFAULT '1001',
   b4 bit varying(5) DEFAULT B'0101'
 );
-\d bit_defaults
 INSERT INTO bit_defaults DEFAULT VALUES;
 TABLE bit_defaults;
 

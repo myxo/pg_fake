@@ -6,9 +6,6 @@
 -- and for SQL_ASCII (jsonpath_encoding_1.out).  Skip otherwise.
 SELECT getdatabaseencoding() NOT IN ('UTF8', 'SQL_ASCII')
        AS skip_test \gset
-\if :skip_test
-\quit
-\endif
 
 SELECT getdatabaseencoding();           -- just to label the results files
 

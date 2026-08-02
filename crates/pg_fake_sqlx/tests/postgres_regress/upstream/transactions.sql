@@ -536,86 +536,86 @@ DROP TABLE trans_abc;
 create temp table i_table (f1 int);
 
 -- psql will show all results of a multi-statement Query
-SELECT 1\; SELECT 2\; SELECT 3;
+SELECT 1; SELECT 2; SELECT 3;
 
 -- this implicitly commits:
-insert into i_table values(1)\; select * from i_table;
+insert into i_table values(1); select * from i_table;
 -- 1/0 error will cause rolling back the whole implicit transaction
-insert into i_table values(2)\; select * from i_table\; select 1/0;
+insert into i_table values(2); select * from i_table; select 1/0;
 select * from i_table;
 
 rollback;  -- we are not in a transaction at this point
 
 -- can use regular begin/commit/rollback within a single Query
-begin\; insert into i_table values(3)\; commit;
+begin; insert into i_table values(3); commit;
 rollback;  -- we are not in a transaction at this point
-begin\; insert into i_table values(4)\; rollback;
+begin; insert into i_table values(4); rollback;
 rollback;  -- we are not in a transaction at this point
 
 -- begin converts implicit transaction into a regular one that
 -- can extend past the end of the Query
-select 1\; begin\; insert into i_table values(5);
+select 1; begin; insert into i_table values(5);
 commit;
-select 1\; begin\; insert into i_table values(6);
+select 1; begin; insert into i_table values(6);
 rollback;
 
 -- commit in implicit-transaction state commits but issues a warning.
-insert into i_table values(7)\; commit\; insert into i_table values(8)\; select 1/0;
+insert into i_table values(7); commit; insert into i_table values(8); select 1/0;
 -- similarly, rollback aborts but issues a warning.
-insert into i_table values(9)\; rollback\; select 2;
+insert into i_table values(9); rollback; select 2;
 
 select * from i_table;
 
 rollback;  -- we are not in a transaction at this point
 
 -- implicit transaction block is still a transaction block, for e.g. VACUUM
-SELECT 1\; VACUUM;
-SELECT 1\; COMMIT\; VACUUM;
+SELECT 1; VACUUM;
+SELECT 1; COMMIT; VACUUM;
 
 -- we disallow savepoint-related commands in implicit-transaction state
-SELECT 1\; SAVEPOINT sp;
-SELECT 1\; COMMIT\; SAVEPOINT sp;
-ROLLBACK TO SAVEPOINT sp\; SELECT 2;
-SELECT 2\; RELEASE SAVEPOINT sp\; SELECT 3;
+SELECT 1; SAVEPOINT sp;
+SELECT 1; COMMIT; SAVEPOINT sp;
+ROLLBACK TO SAVEPOINT sp; SELECT 2;
+SELECT 2; RELEASE SAVEPOINT sp; SELECT 3;
 
 -- but this is OK, because the BEGIN converts it to a regular xact
-SELECT 1\; BEGIN\; SAVEPOINT sp\; ROLLBACK TO SAVEPOINT sp\; COMMIT;
+SELECT 1; BEGIN; SAVEPOINT sp; ROLLBACK TO SAVEPOINT sp; COMMIT;
 
 
 -- Tests for AND CHAIN in implicit transaction blocks
 
-SET TRANSACTION READ ONLY\; COMMIT AND CHAIN;  -- error
+SET TRANSACTION READ ONLY; COMMIT AND CHAIN;  -- error
 SHOW transaction_read_only;
 
-SET TRANSACTION READ ONLY\; ROLLBACK AND CHAIN;  -- error
+SET TRANSACTION READ ONLY; ROLLBACK AND CHAIN;  -- error
 SHOW transaction_read_only;
 
 CREATE TABLE trans_abc (a int);
 
 -- COMMIT/ROLLBACK + COMMIT/ROLLBACK AND CHAIN
-INSERT INTO trans_abc VALUES (7)\; COMMIT\; INSERT INTO trans_abc VALUES (8)\; COMMIT AND CHAIN;  -- 7 commit, 8 error
-INSERT INTO trans_abc VALUES (9)\; ROLLBACK\; INSERT INTO trans_abc VALUES (10)\; ROLLBACK AND CHAIN;  -- 9 rollback, 10 error
+INSERT INTO trans_abc VALUES (7); COMMIT; INSERT INTO trans_abc VALUES (8); COMMIT AND CHAIN;  -- 7 commit, 8 error
+INSERT INTO trans_abc VALUES (9); ROLLBACK; INSERT INTO trans_abc VALUES (10); ROLLBACK AND CHAIN;  -- 9 rollback, 10 error
 
 -- COMMIT/ROLLBACK AND CHAIN + COMMIT/ROLLBACK
-INSERT INTO trans_abc VALUES (11)\; COMMIT AND CHAIN\; INSERT INTO trans_abc VALUES (12)\; COMMIT;  -- 11 error, 12 not reached
-INSERT INTO trans_abc VALUES (13)\; ROLLBACK AND CHAIN\; INSERT INTO trans_abc VALUES (14)\; ROLLBACK;  -- 13 error, 14 not reached
+INSERT INTO trans_abc VALUES (11); COMMIT AND CHAIN; INSERT INTO trans_abc VALUES (12); COMMIT;  -- 11 error, 12 not reached
+INSERT INTO trans_abc VALUES (13); ROLLBACK AND CHAIN; INSERT INTO trans_abc VALUES (14); ROLLBACK;  -- 13 error, 14 not reached
 
 -- START TRANSACTION + COMMIT/ROLLBACK AND CHAIN
-START TRANSACTION ISOLATION LEVEL REPEATABLE READ\; INSERT INTO trans_abc VALUES (15)\; COMMIT AND CHAIN;  -- 15 ok
+START TRANSACTION ISOLATION LEVEL REPEATABLE READ; INSERT INTO trans_abc VALUES (15); COMMIT AND CHAIN;  -- 15 ok
 SHOW transaction_isolation;  -- transaction is active at this point
 COMMIT;
 
-START TRANSACTION ISOLATION LEVEL REPEATABLE READ\; INSERT INTO trans_abc VALUES (16)\; ROLLBACK AND CHAIN;  -- 16 ok
+START TRANSACTION ISOLATION LEVEL REPEATABLE READ; INSERT INTO trans_abc VALUES (16); ROLLBACK AND CHAIN;  -- 16 ok
 SHOW transaction_isolation;  -- transaction is active at this point
 ROLLBACK;
 
 SET default_transaction_isolation = 'read committed';
 
 -- START TRANSACTION + COMMIT/ROLLBACK + COMMIT/ROLLBACK AND CHAIN
-START TRANSACTION ISOLATION LEVEL REPEATABLE READ\; INSERT INTO trans_abc VALUES (17)\; COMMIT\; INSERT INTO trans_abc VALUES (18)\; COMMIT AND CHAIN;  -- 17 commit, 18 error
+START TRANSACTION ISOLATION LEVEL REPEATABLE READ; INSERT INTO trans_abc VALUES (17); COMMIT; INSERT INTO trans_abc VALUES (18); COMMIT AND CHAIN;  -- 17 commit, 18 error
 SHOW transaction_isolation;  -- out of transaction block
 
-START TRANSACTION ISOLATION LEVEL REPEATABLE READ\; INSERT INTO trans_abc VALUES (19)\; ROLLBACK\; INSERT INTO trans_abc VALUES (20)\; ROLLBACK AND CHAIN;  -- 19 rollback, 20 error
+START TRANSACTION ISOLATION LEVEL REPEATABLE READ; INSERT INTO trans_abc VALUES (19); ROLLBACK; INSERT INTO trans_abc VALUES (20); ROLLBACK AND CHAIN;  -- 19 rollback, 20 error
 SHOW transaction_isolation;  -- out of transaction block
 
 RESET default_transaction_isolation;

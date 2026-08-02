@@ -8,9 +8,6 @@ SELECT getdatabaseencoding() <> 'UTF8' OR
        (SELECT count(*) FROM pg_collation WHERE collname IN ('de_DE', 'en_US', 'sv_SE', 'tr_TR') AND collencoding = pg_char_to_encoding('UTF8')) <> 4 OR
        version() !~ 'linux-gnu'
        AS skip_test \gset
-\if :skip_test
-\quit
-\endif
 
 SET client_encoding TO UTF8;
 
@@ -23,7 +20,6 @@ CREATE TABLE collate_test1 (
     b text COLLATE "en_US" NOT NULL
 );
 
-\d collate_test1
 
 CREATE TABLE collate_test_fail (
     a int,
@@ -44,7 +40,6 @@ CREATE TABLE collate_test_like (
     LIKE collate_test1
 );
 
-\d collate_test_like
 
 CREATE TABLE collate_test2 (
     a int,
@@ -429,8 +424,6 @@ CREATE INDEX collate_dep_test4i ON collate_dep_test4t (b COLLATE test0);
 DROP COLLATION test0 RESTRICT; -- fail
 DROP COLLATION test0 CASCADE;
 
-\d collate_dep_test1
-\d collate_dep_test2
 
 DROP TABLE collate_dep_test1, collate_dep_test4t;
 DROP TYPE collate_dep_test2;
