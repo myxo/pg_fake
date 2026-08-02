@@ -10,9 +10,11 @@ use sqlparser::ast::{
 
 use crate::{
     analyzer,
+    catalog::TableSchema,
     error::{PgError, Result, SqlState},
-    executor::{self, DatabaseState, ExecutionResult},
+    executor::{self, DatabaseState},
     parser,
+    storage::Table,
     txn::{LockAttempt, Snapshot, TransactionStatus, Xid},
     value::{Oid, Value},
 };
@@ -27,6 +29,11 @@ pub struct ColumnMeta {
 pub struct QueryResult {
     pub columns: Vec<ColumnMeta>,
     pub rows: Vec<Vec<Value>>,
+}
+#[derive(Debug, Clone, PartialEq)]
+pub enum StatementResult {
+    Affected(u64),
+    Query(QueryResult),
 }
 #[derive(Debug, Clone)]
 pub struct Statement {
@@ -52,11 +59,13 @@ pub struct Session {
     transaction: Option<SessionTransaction>,
     default_isolation: IsolationLevel,
     lock_timeout: Duration,
+    ddl_undo: Vec<DdlUndo>,
+    settings_undo: Option<(IsolationLevel, Duration)>,
 }
 #[derive(Clone, Copy)]
 enum SessionTransaction {
     Active(ActiveTransaction),
-    Aborted(Xid),
+    Aborted { xid: Xid, implicit_batch: bool },
 }
 #[derive(Clone, Copy)]
 struct ActiveTransaction {
@@ -64,6 +73,11 @@ struct ActiveTransaction {
     isolation: IsolationLevel,
     snapshot: Option<Snapshot>,
     statement_started: bool,
+    implicit_batch: bool,
+}
+enum DdlUndo {
+    DropCreated(String),
+    RestoreDropped(TableSchema, Table),
 }
 pub struct Transaction<'session> {
     session: &'session mut Session,
@@ -77,6 +91,48 @@ fn abort(state: &mut DatabaseState, xid: Xid) {
     }
     state.row_locks.release(xid);
     state.wait_for.remove_transaction(xid);
+}
+
+fn ddl_undo_for_statement(
+    state: &DatabaseState,
+    statement: &parser::Statement,
+) -> Result<Vec<DdlUndo>> {
+    match statement {
+        parser::Statement::CreateTable(create) => {
+            let name = executor::name(&create.name)?;
+            Ok(state
+                .catalog
+                .table(&name)
+                .is_err()
+                .then_some(DdlUndo::DropCreated(name))
+                .into_iter()
+                .collect())
+        }
+        parser::Statement::Drop {
+            object_type: sqlparser::ast::ObjectType::Table,
+            names,
+            ..
+        } => names
+            .iter()
+            .filter_map(|name| {
+                let name = match executor::name(name) {
+                    Ok(name) => name,
+                    Err(error) => return Some(Err(error)),
+                };
+                let schema = match state.catalog.table(&name) {
+                    Ok(schema) => schema.clone(),
+                    Err(_) => return None,
+                };
+                let table = state
+                    .tables
+                    .get(&schema.id)
+                    .expect("catalog table must have storage")
+                    .clone();
+                Some(Ok(DdlUndo::RestoreDropped(schema, table)))
+            })
+            .collect(),
+        _ => Ok(Vec::new()),
+    }
 }
 
 fn invalid_lock_timeout() -> PgError {
@@ -260,6 +316,8 @@ impl Db {
             transaction: None,
             default_isolation: IsolationLevel::ReadCommitted,
             lock_timeout: self.default_lock_timeout,
+            ddl_undo: Vec::new(),
+            settings_undo: None,
         }
     }
 }
@@ -282,14 +340,30 @@ impl Default for Db {
     }
 }
 impl Session {
-    pub fn execute(&mut self, sql: &str) -> Result<u64> {
-        match self.run(sql)? {
-            ExecutionResult::Affected(rows) => Ok(rows),
-            ExecutionResult::Query(_) => Err(PgError::new(
-                SqlState::FeatureNotSupported,
-                "use query for SELECT statements",
-            )),
+    pub fn execute(&mut self, sql: &str) -> Result<Vec<StatementResult>> {
+        let statements = match parser::parse(sql) {
+            Ok(statements) => statements,
+            Err(error) => return self.failed(error),
+        };
+        let mut results = Vec::with_capacity(statements.len());
+        for statement in statements {
+            if self.transaction.is_none() {
+                self.start_transaction(self.default_isolation, true);
+            }
+            match self.run_statement(statement) {
+                Ok(result) => results.push(result),
+                Err(error) => {
+                    if self.transaction_is_implicit_batch() {
+                        self.finish_transaction(false);
+                    }
+                    return Err(error);
+                }
+            }
         }
+        if self.transaction_is_implicit_batch() {
+            self.finish_transaction(true);
+        }
+        Ok(results)
     }
     pub fn execute_params(&mut self, sql: &str, params: &[Value]) -> Result<u64> {
         let statement = self.prepare(sql)?;
@@ -300,7 +374,7 @@ impl Session {
         self.query_prepared(&statement, params)
     }
     pub fn prepare(&mut self, sql: &str) -> Result<Statement> {
-        if matches!(self.transaction, Some(SessionTransaction::Aborted(_))) {
+        if matches!(self.transaction, Some(SessionTransaction::Aborted { .. })) {
             return Err(PgError::new(
                 SqlState::InFailedSqlTransaction,
                 "current transaction is aborted",
@@ -336,8 +410,8 @@ impl Session {
                 Err(error) => return self.failed(error),
             };
         match self.run_statement(statement)? {
-            ExecutionResult::Affected(rows) => Ok(rows),
-            ExecutionResult::Query(_) => Err(PgError::new(
+            StatementResult::Affected(rows) => Ok(rows),
+            StatementResult::Query(_) => Err(PgError::new(
                 SqlState::FeatureNotSupported,
                 "use query_prepared for SELECT statements",
             )),
@@ -354,8 +428,8 @@ impl Session {
                 Err(error) => return self.failed(error),
             };
         match self.run_statement(statement)? {
-            ExecutionResult::Query(result) => Ok(result),
-            ExecutionResult::Affected(_) => Err(PgError::new(
+            StatementResult::Query(result) => Ok(result),
+            StatementResult::Affected(_) => Err(PgError::new(
                 SqlState::FeatureNotSupported,
                 "query_prepared requires a SELECT statement",
             )),
@@ -371,19 +445,23 @@ impl Session {
                 "transaction already in progress",
             ));
         }
-        self.start_transaction(isolation);
+        self.start_transaction(isolation, false);
         Ok(Transaction {
             session: self,
             finished: false,
         })
     }
-    fn start_transaction(&mut self, isolation: IsolationLevel) {
+    fn start_transaction(&mut self, isolation: IsolationLevel, implicit_batch: bool) {
+        assert!(self.ddl_undo.is_empty());
+        assert!(self.settings_undo.is_none());
+        self.settings_undo = Some((self.default_isolation, self.lock_timeout));
         let mut state = self.db.state.lock().expect("database mutex is poisoned");
         self.transaction = Some(SessionTransaction::Active(ActiveTransaction {
             xid: state.transactions.begin(),
             isolation,
             snapshot: None,
             statement_started: false,
+            implicit_batch,
         }));
     }
     fn finish_transaction(&mut self, commit: bool) {
@@ -396,51 +474,86 @@ impl Session {
                 state.transactions.commit(transaction.xid);
                 state.row_locks.release(transaction.xid);
                 state.wait_for.remove_transaction(transaction.xid);
+                self.ddl_undo.clear();
+                self.settings_undo = None;
                 self.db.condvar.notify_all();
                 return;
             }
             SessionTransaction::Active(transaction) => transaction.xid,
-            SessionTransaction::Aborted(xid) => xid,
+            SessionTransaction::Aborted { xid, .. } => xid,
         };
-        let mut state = self.db.state.lock().expect("database mutex is poisoned");
+        let state_lock = self.db.state.clone();
+        let mut state = state_lock.lock().expect("database mutex is poisoned");
+        self.rollback_ddl(&mut state);
+        if let Some((default_isolation, lock_timeout)) = self.settings_undo.take() {
+            self.default_isolation = default_isolation;
+            self.lock_timeout = lock_timeout;
+        }
         abort(&mut state, xid);
         self.db.condvar.notify_all();
     }
     fn abort_transaction(&mut self) {
         if let Some(SessionTransaction::Active(transaction)) = self.transaction {
-            self.transaction = Some(SessionTransaction::Aborted(transaction.xid));
+            self.transaction = Some(SessionTransaction::Aborted {
+                xid: transaction.xid,
+                implicit_batch: transaction.implicit_batch,
+            });
+        }
+    }
+    fn transaction_is_implicit_batch(&self) -> bool {
+        match self.transaction {
+            Some(SessionTransaction::Active(transaction)) => transaction.implicit_batch,
+            Some(SessionTransaction::Aborted { implicit_batch, .. }) => implicit_batch,
+            None => false,
+        }
+    }
+    fn rollback_ddl(&mut self, state: &mut DatabaseState) {
+        for undo in self.ddl_undo.drain(..).rev() {
+            match undo {
+                DdlUndo::DropCreated(name) => {
+                    if let Ok(schema) = state.catalog.drop_table(&name) {
+                        state.tables.remove(&schema.id);
+                    }
+                }
+                DdlUndo::RestoreDropped(schema, table) => {
+                    state.tables.insert(schema.id, table);
+                    state.catalog.restore_table(schema);
+                }
+            }
         }
     }
     fn failed<T>(&mut self, error: PgError) -> Result<T> {
         self.abort_transaction();
         Err(error)
     }
-    fn run(&mut self, sql: &str) -> Result<ExecutionResult> {
-        let mut statements = match parser::parse(sql) {
-            Ok(statements) => statements,
-            Err(error) => return self.failed(error),
-        };
-        if statements.len() != 1 {
-            return self.failed(PgError::new(
-                SqlState::SyntaxError,
-                "exactly one statement is required",
-            ));
-        }
-        let statement = statements.pop().expect("statement count was checked");
-        self.run_statement(statement)
-    }
-    fn run_statement(&mut self, statement: parser::Statement) -> Result<ExecutionResult> {
+    fn run_statement(&mut self, statement: parser::Statement) -> Result<StatementResult> {
         match &statement {
             parser::Statement::StartTransaction { modes, .. } => {
                 return match self.transaction {
                     None => {
                         let isolation =
                             isolation_from_modes(modes)?.unwrap_or(self.default_isolation);
-                        self.start_transaction(isolation);
-                        Ok(ExecutionResult::Affected(0))
+                        self.start_transaction(isolation, false);
+                        Ok(StatementResult::Affected(0))
                     }
-                    Some(SessionTransaction::Active(_)) => Ok(ExecutionResult::Affected(0)),
-                    Some(SessionTransaction::Aborted(_)) => Err(PgError::new(
+                    Some(SessionTransaction::Active(mut transaction))
+                        if transaction.implicit_batch =>
+                    {
+                        if let Some(isolation) = isolation_from_modes(modes)? {
+                            if transaction.statement_started && isolation != transaction.isolation {
+                                return self.failed(PgError::new(
+                                    SqlState::ActiveSqlTransaction,
+                                    "transaction isolation level must be set before any query",
+                                ));
+                            }
+                            transaction.isolation = isolation;
+                        }
+                        transaction.implicit_batch = false;
+                        self.transaction = Some(SessionTransaction::Active(transaction));
+                        Ok(StatementResult::Affected(0))
+                    }
+                    Some(SessionTransaction::Active(_)) => Ok(StatementResult::Affected(0)),
+                    Some(SessionTransaction::Aborted { .. }) => Err(PgError::new(
                         SqlState::InFailedSqlTransaction,
                         "current transaction is aborted",
                     )),
@@ -451,7 +564,7 @@ impl Session {
                 snapshot,
                 session,
             } => {
-                if matches!(self.transaction, Some(SessionTransaction::Aborted(_))) {
+                if matches!(self.transaction, Some(SessionTransaction::Aborted { .. })) {
                     return Err(PgError::new(
                         SqlState::InFailedSqlTransaction,
                         "current transaction is aborted",
@@ -475,10 +588,10 @@ impl Session {
                 };
                 if *session {
                     self.default_isolation = isolation;
-                    return Ok(ExecutionResult::Affected(0));
+                    return Ok(StatementResult::Affected(0));
                 }
                 let Some(SessionTransaction::Active(mut transaction)) = self.transaction else {
-                    return Ok(ExecutionResult::Affected(0));
+                    return Ok(StatementResult::Affected(0));
                 };
                 if transaction.statement_started && isolation != transaction.isolation {
                     return self.failed(PgError::new(
@@ -488,7 +601,7 @@ impl Session {
                 }
                 transaction.isolation = isolation;
                 self.transaction = Some(SessionTransaction::Active(transaction));
-                return Ok(ExecutionResult::Affected(0));
+                return Ok(StatementResult::Affected(0));
             }
             parser::Statement::SetVariable {
                 local,
@@ -503,7 +616,7 @@ impl Session {
                     ));
                 };
                 if variable.to_string().eq_ignore_ascii_case("lock_timeout") {
-                    if matches!(self.transaction, Some(SessionTransaction::Aborted(_))) {
+                    if matches!(self.transaction, Some(SessionTransaction::Aborted { .. })) {
                         return Err(PgError::new(
                             SqlState::InFailedSqlTransaction,
                             "current transaction is aborted",
@@ -519,7 +632,7 @@ impl Session {
                         Ok(timeout) => timeout,
                         Err(error) => return self.failed(error),
                     };
-                    return Ok(ExecutionResult::Affected(0));
+                    return Ok(StatementResult::Affected(0));
                 }
             }
             parser::Statement::Commit { chain } => {
@@ -530,7 +643,7 @@ impl Session {
                     ));
                 }
                 self.finish_transaction(true);
-                return Ok(ExecutionResult::Affected(0));
+                return Ok(StatementResult::Affected(0));
             }
             parser::Statement::Rollback { chain, savepoint } => {
                 if *chain || savepoint.is_some() {
@@ -540,18 +653,20 @@ impl Session {
                     ));
                 }
                 self.finish_transaction(false);
-                return Ok(ExecutionResult::Affected(0));
+                return Ok(StatementResult::Affected(0));
             }
             _ => {}
         }
-        if matches!(self.transaction, Some(SessionTransaction::Aborted(_))) {
+        if matches!(self.transaction, Some(SessionTransaction::Aborted { .. })) {
             return Err(PgError::new(
                 SqlState::InFailedSqlTransaction,
                 "current transaction is aborted",
             ));
         }
-        if self.transaction.is_some()
-            && matches!(parser::classify(&statement), parser::StatementKind::Ddl)
+        if matches!(
+            self.transaction,
+            Some(SessionTransaction::Active(transaction)) if !transaction.implicit_batch
+        ) && matches!(parser::classify(&statement), parser::StatementKind::Ddl)
         {
             return self.failed(PgError::new(
                 SqlState::FeatureNotSupported,
@@ -570,6 +685,15 @@ impl Session {
             };
             transaction.statement_started = true;
             self.transaction = Some(SessionTransaction::Active(transaction));
+            if transaction.implicit_batch
+                && matches!(parser::classify(&statement), parser::StatementKind::Ddl)
+            {
+                let undo = match ddl_undo_for_statement(&state, &statement) {
+                    Ok(undo) => undo,
+                    Err(error) => return self.failed(error),
+                };
+                self.ddl_undo.extend(undo);
+            }
             let (mut state, snapshot) = match acquire_row_locks(
                 &condvar,
                 self.lock_timeout,
@@ -628,7 +752,7 @@ impl Session {
 }
 
 impl Transaction<'_> {
-    pub fn execute(&mut self, sql: &str) -> Result<u64> {
+    pub fn execute(&mut self, sql: &str) -> Result<Vec<StatementResult>> {
         self.session.execute(sql)
     }
     pub fn execute_params(&mut self, sql: &str, params: &[Value]) -> Result<u64> {
@@ -692,18 +816,22 @@ mod tests {
         }
     }
 
+    fn affected(rows: u64) -> Vec<StatementResult> {
+        vec![StatementResult::Affected(rows)]
+    }
+
     #[test]
     fn autocommit_creates_and_drops_tables() {
         let db = Db::new();
         let mut session = db.session();
-        assert_eq!(session.execute("CREATE TABLE items (id INTEGER NOT NULL, name VARCHAR(12), amount NUMERIC(8, 2))").unwrap(), 0);
+        assert_eq!(session.execute("CREATE TABLE items (id INTEGER NOT NULL, name VARCHAR(12), amount NUMERIC(8, 2))").unwrap(), affected(0));
         let state = db.state.lock().unwrap();
         let table = state.catalog.table("items").unwrap();
         assert_eq!(table.columns[0].data_type.base, BaseType::Int4);
         assert_eq!(table.columns[1].data_type.typmod, 16);
         assert_eq!(table.columns[2].data_type.typmod, (8 << 16) + 2 + 4);
         drop(state);
-        assert_eq!(session.execute("DROP TABLE items").unwrap(), 1);
+        assert_eq!(session.execute("DROP TABLE items").unwrap(), affected(1));
     }
 
     #[test]
@@ -907,6 +1035,213 @@ mod tests {
                 .unwrap_err()
                 .sqlstate,
             SqlState::UndefinedTable
+        );
+    }
+
+    #[test]
+    fn execute_returns_each_multi_statement_result() {
+        let db = Db::new();
+        let mut session = db.session();
+
+        let results = session
+            .execute(
+                "CREATE TABLE items (id INTEGER, name TEXT); \
+                 INSERT INTO items VALUES (1, 'one'), (2, 'two'); \
+                 UPDATE items SET name = upper(name) WHERE id = 2; \
+                 SELECT id, name FROM items ORDER BY id",
+            )
+            .unwrap();
+
+        assert_eq!(
+            results,
+            vec![
+                StatementResult::Affected(0),
+                StatementResult::Affected(2),
+                StatementResult::Affected(1),
+                StatementResult::Query(QueryResult {
+                    columns: vec![
+                        ColumnMeta {
+                            name: "id".into(),
+                            type_oid: BaseType::Int4.oid(),
+                            typmod: -1,
+                        },
+                        ColumnMeta {
+                            name: "name".into(),
+                            type_oid: BaseType::Text.oid(),
+                            typmod: -1,
+                        },
+                    ],
+                    rows: vec![
+                        vec![Value::Int4(1), Value::Text("one".into())],
+                        vec![Value::Int4(2), Value::Text("TWO".into())],
+                    ],
+                }),
+            ]
+        );
+        assert!(session.execute(" ; ; ").unwrap().is_empty());
+    }
+
+    #[test]
+    fn implicit_batches_roll_back_and_stop_at_first_error() {
+        let db = Db::new();
+        let mut session = db.session();
+        let original_timeout = session.lock_timeout;
+        assert_eq!(
+            session
+                .execute(
+                    "SET lock_timeout = '2s'; \
+                     CREATE TABLE discarded (id INTEGER); \
+                     INSERT INTO discarded VALUES (1); \
+                     INSERT INTO discarded VALUES ('bad'); \
+                     INSERT INTO discarded VALUES (2)",
+                )
+                .unwrap_err()
+                .sqlstate,
+            SqlState::InvalidTextRepresentation
+        );
+        assert_eq!(session.lock_timeout, original_timeout);
+        assert_eq!(
+            session
+                .query("SELECT * FROM discarded", &[])
+                .unwrap_err()
+                .sqlstate,
+            SqlState::UndefinedTable
+        );
+
+        session.execute("CREATE TABLE kept (id INTEGER)").unwrap();
+        assert_eq!(
+            session
+                .execute(
+                    "INSERT INTO kept VALUES (1); \
+                     INSERT INTO kept VALUES ('bad'); \
+                     INSERT INTO kept VALUES (2)",
+                )
+                .unwrap_err()
+                .sqlstate,
+            SqlState::InvalidTextRepresentation
+        );
+        assert!(
+            session
+                .query("SELECT * FROM kept", &[])
+                .unwrap()
+                .rows
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn explicit_controls_split_simple_query_transactions_like_postgres() {
+        let db = Db::new();
+        let mut session = db.session();
+        session.execute("CREATE TABLE items (id INTEGER)").unwrap();
+
+        assert_eq!(
+            session
+                .execute(
+                    "INSERT INTO items VALUES (1); \
+                     BEGIN; \
+                     INSERT INTO items VALUES (2); \
+                     COMMIT; \
+                     INSERT INTO items VALUES (3); \
+                     INSERT INTO items VALUES ('bad')",
+                )
+                .unwrap_err()
+                .sqlstate,
+            SqlState::InvalidTextRepresentation
+        );
+        assert_eq!(
+            session
+                .query("SELECT id FROM items ORDER BY id", &[])
+                .unwrap()
+                .rows,
+            vec![vec![Value::Int4(1)], vec![Value::Int4(2)]]
+        );
+
+        assert_eq!(
+            session
+                .execute(
+                    "BEGIN; \
+                     INSERT INTO items VALUES (4); \
+                     INSERT INTO items VALUES ('bad'); \
+                     ROLLBACK",
+                )
+                .unwrap_err()
+                .sqlstate,
+            SqlState::InvalidTextRepresentation
+        );
+        assert_eq!(
+            session
+                .query("SELECT * FROM items", &[])
+                .unwrap_err()
+                .sqlstate,
+            SqlState::InFailedSqlTransaction
+        );
+        session.execute("ROLLBACK").unwrap();
+        assert_eq!(
+            session
+                .query("SELECT id FROM items ORDER BY id", &[])
+                .unwrap()
+                .rows,
+            vec![vec![Value::Int4(1)], vec![Value::Int4(2)]]
+        );
+
+        assert_eq!(
+            session
+                .execute("INSERT INTO items VALUES (5); COMMIT; SELCT missing")
+                .unwrap_err()
+                .sqlstate,
+            SqlState::SyntaxError
+        );
+        assert_eq!(
+            session
+                .query("SELECT id FROM items ORDER BY id", &[])
+                .unwrap()
+                .rows,
+            vec![vec![Value::Int4(1)], vec![Value::Int4(2)]]
+        );
+    }
+
+    #[test]
+    fn query_metadata_covers_every_phase_one_type() {
+        let db = Db::new();
+        let mut session = db.session();
+        session
+            .execute(
+                "CREATE TABLE types (
+                    flag BOOLEAN,
+                    small_value SMALLINT,
+                    int_value INTEGER,
+                    big_value BIGINT,
+                    real_value REAL,
+                    double_value DOUBLE PRECISION,
+                    numeric_value NUMERIC(5, 2),
+                    text_value TEXT,
+                    varying_value VARCHAR(3),
+                    fixed_value CHAR(2),
+                    bytes BYTEA
+                )",
+            )
+            .unwrap();
+
+        let metadata = session.query("SELECT * FROM types", &[]).unwrap().columns;
+        assert_eq!(
+            metadata
+                .iter()
+                .map(|column| (column.type_oid, column.typmod))
+                .collect::<Vec<_>>(),
+            vec![
+                (BaseType::Bool.oid(), -1),
+                (BaseType::Int2.oid(), -1),
+                (BaseType::Int4.oid(), -1),
+                (BaseType::Int8.oid(), -1),
+                (BaseType::Float4.oid(), -1),
+                (BaseType::Float8.oid(), -1),
+                (BaseType::Numeric.oid(), (5 << 16) + 2 + 4),
+                (BaseType::Text.oid(), -1),
+                (BaseType::Varchar.oid(), 3 + 4),
+                (BaseType::Bpchar.oid(), 2 + 4),
+                (BaseType::Bytea.oid(), -1),
+            ]
         );
     }
 
@@ -2039,7 +2374,7 @@ mod tests {
             result_receiver
                 .recv_timeout(Duration::from_secs(1))
                 .unwrap(),
-            Ok(1)
+            Ok(affected(1))
         );
         handle.join().unwrap();
         assert_eq!(
@@ -2073,7 +2408,7 @@ mod tests {
             result_receiver
                 .recv_timeout(Duration::from_secs(1))
                 .unwrap(),
-            Ok(1)
+            Ok(affected(1))
         );
         handle.join().unwrap();
         assert_eq!(
@@ -2119,7 +2454,7 @@ mod tests {
 
         assert_eq!(
             first.execute("UPDATE items SET amount = 1 WHERE id = 2"),
-            Ok(1)
+            Ok(affected(1))
         );
         assert_eq!(
             victim_receiver
@@ -2204,7 +2539,7 @@ mod tests {
             result_receiver
                 .recv_timeout(Duration::from_secs(1))
                 .unwrap(),
-            Ok(1)
+            Ok(affected(1))
         );
         handle.join().unwrap();
 
@@ -2226,7 +2561,7 @@ mod tests {
             result_receiver
                 .recv_timeout(Duration::from_secs(1))
                 .unwrap(),
-            Ok(1)
+            Ok(affected(1))
         );
         handle.join().unwrap();
     }
@@ -2281,7 +2616,7 @@ mod tests {
             session.query("SELECT * FROM items", &[]).unwrap().rows,
             vec![vec![Value::Int4(1), Value::Int4(1)]]
         );
-        assert_eq!(session.execute("DELETE FROM items").unwrap(), 1);
+        assert_eq!(session.execute("DELETE FROM items").unwrap(), affected(1));
     }
 
     #[test]
@@ -2299,7 +2634,7 @@ mod tests {
             session
                 .execute("DELETE FROM items WHERE amount > 2")
                 .unwrap(),
-            1
+            affected(1)
         );
         assert_eq!(
             session.query("SELECT * FROM items", &[]).unwrap().rows,
@@ -2308,7 +2643,7 @@ mod tests {
                 vec![Value::Int4(2), Value::Null],
             ]
         );
-        assert_eq!(session.execute("DELETE FROM items").unwrap(), 2);
+        assert_eq!(session.execute("DELETE FROM items").unwrap(), affected(2));
         assert!(
             session
                 .query("SELECT * FROM items", &[])
@@ -2329,7 +2664,10 @@ mod tests {
             .unwrap();
 
         writer.execute("BEGIN").unwrap();
-        assert_eq!(writer.execute("DELETE FROM items WHERE id = 1").unwrap(), 1);
+        assert_eq!(
+            writer.execute("DELETE FROM items WHERE id = 1").unwrap(),
+            affected(1)
+        );
         assert_eq!(
             writer.query("SELECT * FROM items", &[]).unwrap().rows,
             vec![vec![Value::Int4(2)], vec![Value::Int4(3)]]
@@ -2458,7 +2796,7 @@ mod tests {
             session
                 .execute("INSERT INTO items (name, id) VALUES ('one', 1), ('two', 2)")
                 .unwrap(),
-            2
+            affected(2)
         );
         let mut state = db.state.lock().unwrap();
         let reader = state.transactions.begin();

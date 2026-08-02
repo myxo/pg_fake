@@ -112,6 +112,11 @@ impl Catalog {
             )
         })
     }
+
+    pub(crate) fn restore_table(&mut self, table: TableSchema) {
+        let previous = self.public.tables.insert(table.name.clone(), table);
+        assert!(previous.is_none(), "restored table must not already exist");
+    }
 }
 
 #[cfg(test)]

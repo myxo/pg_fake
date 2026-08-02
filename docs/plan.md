@@ -180,7 +180,8 @@ implicit autocommit transaction (§8).
 
 **DoD:**
 - `Db::new()`, `db.session() -> Session`.
-- `Session::execute(sql) -> Result<u64>` (affected rows) and
+- `Session::execute(sql) -> Result<Vec<StatementResult>>` (initially an affected
+  row count, expanded in task 32) and
   `Session::query(sql, params) -> Result<QueryResult>` — params accepted but may
   be empty for now (binding lands in task 31).
 - `QueryResult { columns: Vec<ColumnMeta>, rows: Vec<Vec<Value>> }` with a
@@ -564,7 +565,7 @@ chosen). Completes the concurrency milestone.
 
 **Notes:** No parse cache (spec §2.1); `prepare()` is the parse-once path.
 
-### Task 32 — Multi-statement `execute` + `QueryResult` metadata
+### Task 32 — Multi-statement `execute` + `QueryResult` metadata [COMPLETE]
 **Goal:** Simple-query multi-statement support and complete result metadata
 (§8).
 

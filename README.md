@@ -47,6 +47,26 @@ statement using only `$2` still requires two values.
 
 A zero timeout waits indefinitely, matching PostgreSQL.
 
+## Multi-statement execution
+
+`execute` accepts PostgreSQL simple-query batches and returns one public
+`StatementResult` per statement:
+
+```rust
+let results = session.execute(
+    "CREATE TABLE items (id INTEGER); \
+     INSERT INTO items VALUES (1), (2); \
+     SELECT * FROM items ORDER BY id",
+)?;
+```
+
+Each result is either `StatementResult::Affected(u64)` or
+`StatementResult::Query(QueryResult)`. PostgreSQL transaction boundaries are
+preserved: without explicit transaction control the whole batch is one
+implicit transaction, execution stops at the first error, and preceding
+changes are rolled back. Parameterized and prepared calls remain
+single-statement operations.
+
 ## Benchmarks
 
 The Criterion suite compares `pg_fake` with PostgreSQL 18 for create/drop,

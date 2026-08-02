@@ -8,7 +8,7 @@ use std::{
 };
 
 use pg_fake::{
-    api::Db,
+    api::{Db, StatementResult},
     parser::{self, Statement},
     value::Value,
 };
@@ -221,7 +221,10 @@ fn fake_outcome(session: &mut pg_fake::api::Session, statement: &Statement, sql:
             Err(error) => Outcome::Error(error.sqlstate.code().into()),
         },
         _ => match session.execute(sql) {
-            Ok(rows) => Outcome::Affected(rows),
+            Ok(results) => match results.as_slice() {
+                [StatementResult::Affected(rows)] => Outcome::Affected(*rows),
+                _ => panic!("single non-query statement must return an affected-row result"),
+            },
             Err(error) => Outcome::Error(error.sqlstate.code().into()),
         },
     }
@@ -435,6 +438,126 @@ fn parameters_and_prepared_reuse_match_postgres() {
         assert_eq!(actual, postgres_inline);
         assert_eq!(actual, fake_inline);
     }
+}
+
+#[test]
+fn multi_statement_batch_and_metadata_match_postgres() {
+    let _test_lock = TEST_LOCK.lock().expect("test mutex must not be poisoned");
+    let configured_url = env::var("PG_FAKE_DATABASE_URL").ok();
+    if configured_url.is_none() && env::var_os("DOCKER_HOST").is_none() {
+        let socket = PathBuf::from(env::var_os("HOME").expect("HOME must be set"))
+            .join(".colima/default/docker.sock");
+        if socket.exists() {
+            unsafe { env::set_var("DOCKER_HOST", format!("unix://{}", socket.display())) };
+        }
+    }
+    let container = configured_url.is_none().then(|| {
+        Postgres::default()
+            .with_tag("18")
+            .start()
+            .expect("must start PostgreSQL 18 container")
+    });
+    let url = configured_url.unwrap_or_else(|| {
+        let container = container.as_ref().expect("container must be started");
+        format!(
+            "postgresql://postgres:postgres@{}:{}/postgres",
+            container.get_host().unwrap(),
+            container.get_host_port_ipv4(5432).unwrap()
+        )
+    });
+    let suffix = TABLE_NUMBER.fetch_add(1, Ordering::Relaxed);
+    let batch_table = format!("pg_fake_batch_{}_{}", std::process::id(), suffix);
+    let types_table = format!("pg_fake_types_{}_{}", std::process::id(), suffix);
+    let failed_table = format!("pg_fake_failed_{}_{}", std::process::id(), suffix);
+    let mut postgres = Client::connect(&url, NoTls).expect("must connect to PostgreSQL");
+    let db = Db::new();
+    let mut fake = db.session();
+
+    let batch = format!(
+        "CREATE TABLE {batch_table} (id INTEGER, name TEXT); \
+         INSERT INTO {batch_table} VALUES (1, 'one'), (2, 'two'); \
+         UPDATE {batch_table} SET name = upper(name) WHERE id = 2; \
+         SELECT id, name FROM {batch_table} ORDER BY id"
+    );
+    let postgres_messages = postgres.simple_query(&batch).unwrap();
+    let postgres_counts = postgres_messages
+        .iter()
+        .filter_map(|message| match message {
+            SimpleQueryMessage::CommandComplete(rows) => Some(*rows),
+            _ => None,
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(postgres_counts, vec![0, 2, 1, 2]);
+    let fake_results = fake.execute(&batch).unwrap();
+    assert_eq!(fake_results.len(), 4);
+    assert_eq!(fake_results[0], StatementResult::Affected(0));
+    assert_eq!(fake_results[1], StatementResult::Affected(2));
+    assert_eq!(fake_results[2], StatementResult::Affected(1));
+    let StatementResult::Query(fake_query) = &fake_results[3] else {
+        panic!("last batch result must be a query");
+    };
+    assert_eq!(
+        fake_query.rows,
+        vec![
+            vec![Value::Int4(1), Value::Text("one".into())],
+            vec![Value::Int4(2), Value::Text("TWO".into())],
+        ]
+    );
+
+    let create_types = format!(
+        "CREATE TABLE {types_table} (
+            flag BOOLEAN, small_value SMALLINT, int_value INTEGER,
+            big_value BIGINT, real_value REAL, double_value DOUBLE PRECISION,
+            numeric_value NUMERIC(5, 2), text_value TEXT,
+            varying_value VARCHAR(3), fixed_value CHAR(2), bytes BYTEA
+        )"
+    );
+    postgres.batch_execute(&create_types).unwrap();
+    fake.execute(&create_types).unwrap();
+    let expected_metadata = postgres
+        .query(
+            "SELECT atttypid::int4, atttypmod
+             FROM pg_attribute
+             WHERE attrelid = $1::text::regclass AND attnum > 0 AND NOT attisdropped
+             ORDER BY attnum",
+            &[&types_table],
+        )
+        .unwrap()
+        .into_iter()
+        .map(|row| (row.get::<_, i32>(0) as u32, row.get::<_, i32>(1)))
+        .collect::<Vec<_>>();
+    let actual_metadata = fake
+        .query(&format!("SELECT * FROM {types_table}"), &[])
+        .unwrap()
+        .columns
+        .into_iter()
+        .map(|column| (column.type_oid, column.typmod))
+        .collect::<Vec<_>>();
+    assert_eq!(actual_metadata, expected_metadata);
+
+    let failed_batch = format!(
+        "CREATE TABLE {failed_table} (id INTEGER); \
+         INSERT INTO {failed_table} VALUES (1); \
+         INSERT INTO {failed_table} VALUES ('bad')"
+    );
+    let postgres_error = postgres.simple_query(&failed_batch).unwrap_err();
+    let fake_error = fake.execute(&failed_batch).unwrap_err();
+    assert_eq!(
+        fake_error.sqlstate.code(),
+        postgres_error.code().unwrap().code()
+    );
+    let relation: Option<String> = postgres
+        .query_one("SELECT to_regclass($1)::text", &[&failed_table])
+        .unwrap()
+        .get(0);
+    assert_eq!(relation, None);
+    assert_eq!(
+        fake.query(&format!("SELECT * FROM {failed_table}"), &[])
+            .unwrap_err()
+            .sqlstate
+            .code(),
+        "42P01"
+    );
 }
 
 #[test]

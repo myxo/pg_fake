@@ -9,13 +9,17 @@ use std::{
 };
 
 use criterion::{Criterion, black_box, criterion_group, criterion_main};
-use pg_fake::api::Db;
+use pg_fake::api::{Db, StatementResult};
 use postgres::{Client, NoTls, SimpleQueryMessage};
 use testcontainers::{Container, ImageExt, runners::SyncRunner};
 use testcontainers_modules::postgres::Postgres;
 
 static TABLE_NUMBER: AtomicU64 = AtomicU64::new(1);
 static ENVIRONMENT_LOCK: Mutex<()> = Mutex::new(());
+
+fn affected(rows: u64) -> Vec<StatementResult> {
+    vec![StatementResult::Affected(rows)]
+}
 
 struct PostgresBenchmark {
     client: Client,
@@ -81,8 +85,8 @@ fn create_table_benchmark(criterion: &mut Criterion, postgres: &mut Client) {
 
     group.bench_function("pg_fake", |benchmark| {
         benchmark.iter(|| {
-            assert_eq!(fake.execute(&fake_create).unwrap(), 0);
-            assert_eq!(fake.execute(&fake_drop).unwrap(), 1);
+            assert_eq!(fake.execute(&fake_create).unwrap(), affected(0));
+            assert_eq!(fake.execute(&fake_drop).unwrap(), affected(1));
         });
     });
     group.bench_function("postgres_18", |benchmark| {
@@ -104,7 +108,7 @@ fn insert_benchmark(criterion: &mut Criterion, postgres: &mut Client) {
             "CREATE TABLE {fake_table} (id INTEGER PRIMARY KEY CHECK (id > 0), name TEXT NOT NULL DEFAULT upper('benchmark'), CHECK (length(name) > 0))"
         ))
         .unwrap(),
-        0
+        affected(0)
     );
     assert_eq!(
         postgres
@@ -129,7 +133,7 @@ fn insert_benchmark(criterion: &mut Criterion, postgres: &mut Client) {
                     "INSERT INTO {fake_table} VALUES ({fake_id}, 'benchmark')"
                 ))
                 .unwrap(),
-                1
+                affected(1)
             );
         });
     });
@@ -159,7 +163,7 @@ fn insert_benchmark(criterion: &mut Criterion, postgres: &mut Client) {
             assert_eq!(
                 fake.execute(&format!("INSERT INTO {fake_table} (id) VALUES ({fake_id})"))
                     .unwrap(),
-                1
+                affected(1)
             );
         });
     });
@@ -193,7 +197,7 @@ fn update_benchmark(criterion: &mut Criterion, postgres: &mut Client) {
             "CREATE TABLE {fake_table} (id INTEGER, amount INTEGER)"
         ))
         .unwrap(),
-        0
+        affected(0)
     );
     assert_eq!(
         postgres
@@ -207,7 +211,7 @@ fn update_benchmark(criterion: &mut Criterion, postgres: &mut Client) {
     assert_eq!(
         fake.execute(&format!("INSERT INTO {fake_table} VALUES (1, 0)"))
             .unwrap(),
-        1
+        affected(1)
     );
     assert_eq!(
         postgres
@@ -220,7 +224,7 @@ fn update_benchmark(criterion: &mut Criterion, postgres: &mut Client) {
     let mut group = criterion.benchmark_group("update_row");
 
     group.bench_function("pg_fake", |benchmark| {
-        benchmark.iter(|| assert_eq!(fake.execute(&fake_update).unwrap(), 1));
+        benchmark.iter(|| assert_eq!(fake.execute(&fake_update).unwrap(), affected(1)));
     });
     group.bench_function("postgres_18", |benchmark| {
         benchmark.iter(|| assert_eq!(postgres.execute(&postgres_update, &[]).unwrap(), 1));
@@ -251,7 +255,7 @@ fn delete_benchmark(criterion: &mut Criterion, postgres: &mut Client) {
                     .unwrap();
                 let delete = format!("DELETE FROM {fake_table} WHERE id = {id}");
                 let started = Instant::now();
-                assert_eq!(fake.execute(&delete).unwrap(), 1);
+                assert_eq!(fake.execute(&delete).unwrap(), affected(1));
                 elapsed += started.elapsed();
             }
             elapsed
@@ -286,7 +290,7 @@ fn transaction_benchmark(criterion: &mut Criterion, postgres: &mut Client) {
     assert_eq!(
         fake.execute(&format!("CREATE TABLE {fake_table} (id INTEGER)"))
             .unwrap(),
-        0
+        affected(0)
     );
     assert_eq!(
         postgres
@@ -301,13 +305,13 @@ fn transaction_benchmark(criterion: &mut Criterion, postgres: &mut Client) {
     group.bench_function("pg_fake", |benchmark| {
         benchmark.iter(|| {
             fake_id += 1;
-            assert_eq!(fake.execute("BEGIN").unwrap(), 0);
+            assert_eq!(fake.execute("BEGIN").unwrap(), affected(0));
             assert_eq!(
                 fake.execute(&format!("INSERT INTO {fake_table} VALUES ({fake_id})"))
                     .unwrap(),
-                1
+                affected(1)
             );
-            assert_eq!(fake.execute("COMMIT").unwrap(), 0);
+            assert_eq!(fake.execute("COMMIT").unwrap(), affected(0));
         });
     });
     group.bench_function("postgres_18", |benchmark| {
@@ -394,7 +398,7 @@ fn select_benchmark(criterion: &mut Criterion, postgres: &mut Client) {
             "CREATE TABLE {fake_table} (id INTEGER, name TEXT)"
         ))
         .unwrap(),
-        0
+        affected(0)
     );
     assert_eq!(
         postgres
@@ -411,7 +415,7 @@ fn select_benchmark(criterion: &mut Criterion, postgres: &mut Client) {
                 "INSERT INTO {fake_table} VALUES ({id}, 'benchmark')"
             ))
             .unwrap(),
-            1
+            affected(1)
         );
         assert_eq!(
             postgres
@@ -491,7 +495,7 @@ fn order_by_benchmark(criterion: &mut Criterion, postgres: &mut Client) {
             "CREATE TABLE {fake_table} (id INTEGER, bucket INTEGER)"
         ))
         .unwrap(),
-        0
+        affected(0)
     );
     assert_eq!(
         postgres
@@ -511,7 +515,7 @@ fn order_by_benchmark(criterion: &mut Criterion, postgres: &mut Client) {
         assert_eq!(
             fake.execute(&format!("INSERT INTO {fake_table} VALUES ({id}, {bucket})"))
                 .unwrap(),
-            1
+            affected(1)
         );
         assert_eq!(
             postgres

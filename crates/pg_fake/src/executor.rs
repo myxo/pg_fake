@@ -1,5 +1,5 @@
 use crate::{
-    api::{ColumnMeta, QueryResult},
+    api::{ColumnMeta, QueryResult, StatementResult},
     catalog::{Catalog, ColumnDef, TableId, TableSchema},
     coercion::{self, CastContext},
     error::{PgError, Result, SqlState},
@@ -27,10 +27,6 @@ pub(crate) struct DatabaseState {
     pub transactions: TransactionManager,
     pub row_locks: RowLockManager,
     pub wait_for: WaitForGraph,
-}
-pub(crate) enum ExecutionResult {
-    Affected(u64),
-    Query(QueryResult),
 }
 pub(crate) struct RequiredRowLock {
     pub key: RowLockKey,
@@ -194,12 +190,12 @@ pub(crate) fn dispatch(
     statement: &Statement,
     xid: Xid,
     snapshot: &Snapshot,
-) -> Result<ExecutionResult> {
+) -> Result<StatementResult> {
     match statement {
         Statement::CreateTable(create) => {
             let name = name(&create.name)?;
             if create.if_not_exists && state.catalog.table(&name).is_ok() {
-                return Ok(ExecutionResult::Affected(0));
+                return Ok(StatementResult::Affected(0));
             }
             let mut columns = Vec::new();
             let mut constraints = Vec::new();
@@ -299,7 +295,7 @@ pub(crate) fn dispatch(
                 .table(&name)
                 .expect("created table must exist");
             state.tables.insert(id, Table::new(table.clone()));
-            Ok(ExecutionResult::Affected(0))
+            Ok(StatementResult::Affected(0))
         }
         Statement::Drop {
             object_type: ObjectType::Table,
@@ -319,7 +315,7 @@ pub(crate) fn dispatch(
                     Err(error) => return Err(error),
                 }
             }
-            Ok(ExecutionResult::Affected(affected))
+            Ok(StatementResult::Affected(affected))
         }
         Statement::Insert(insert) => insert_rows(state, insert, xid, snapshot),
         Statement::Update {
@@ -369,7 +365,7 @@ fn insert_rows(
     insert: &sqlparser::ast::Insert,
     xid: Xid,
     snapshot: &Snapshot,
-) -> Result<ExecutionResult> {
+) -> Result<StatementResult> {
     let table_name = name(&insert.table_name)?;
     let schema = state.catalog.table(&table_name)?.clone();
     if insert.returning.is_some() {
@@ -466,7 +462,7 @@ fn insert_rows(
         }
         table.insert(xid, row);
     }
-    Ok(ExecutionResult::Affected(affected))
+    Ok(StatementResult::Affected(affected))
 }
 
 fn update_rows(
@@ -476,7 +472,7 @@ fn update_rows(
     selection: Option<&Expr>,
     xid: Xid,
     snapshot: &Snapshot,
-) -> Result<ExecutionResult> {
+) -> Result<StatementResult> {
     if !update_table.joins.is_empty() {
         return Err(PgError::new(
             SqlState::FeatureNotSupported,
@@ -601,7 +597,7 @@ fn update_rows(
         }
         table.update(row_id, version_xmin, xid, updated);
     }
-    Ok(ExecutionResult::Affected(affected))
+    Ok(StatementResult::Affected(affected))
 }
 
 fn delete_rows(
@@ -609,7 +605,7 @@ fn delete_rows(
     delete: &Delete,
     xid: Xid,
     snapshot: &Snapshot,
-) -> Result<ExecutionResult> {
+) -> Result<StatementResult> {
     if !delete.tables.is_empty()
         || delete.using.is_some()
         || delete.returning.is_some()
@@ -687,7 +683,7 @@ fn delete_rows(
     for (row_id, version_xmin) in targets {
         table.tombstone(row_id, version_xmin, xid);
     }
-    Ok(ExecutionResult::Affected(affected))
+    Ok(StatementResult::Affected(affected))
 }
 
 fn select_lock_mode(query: &sqlparser::ast::Query) -> Result<Option<RowLockMode>> {
@@ -717,7 +713,7 @@ fn select_rows(
     query: &sqlparser::ast::Query,
     xid: Xid,
     snapshot: &Snapshot,
-) -> Result<ExecutionResult> {
+) -> Result<StatementResult> {
     if query.with.is_some() || !query.limit_by.is_empty() || query.fetch.is_some() {
         return Err(PgError::new(
             SqlState::FeatureNotSupported,
@@ -961,7 +957,7 @@ fn select_rows(
         .take(limit.unwrap_or(usize::MAX))
         .map(|row| row.values)
         .collect();
-    Ok(ExecutionResult::Query(QueryResult { columns, rows }))
+    Ok(StatementResult::Query(QueryResult { columns, rows }))
 }
 
 fn row_count(expr: &Expr, clause: RowCountClause) -> Result<Option<usize>> {

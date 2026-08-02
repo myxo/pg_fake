@@ -12,7 +12,7 @@ use std::{
 use bigdecimal::BigDecimal;
 use chaos_theory::{Effect, Source, check, make::int_in_range};
 use pg_fake::{
-    api::{Db, Session},
+    api::{Db, Session, StatementResult},
     parser::{self, Statement},
     value::Value,
 };
@@ -165,7 +165,10 @@ fn fake_outcome(session: &mut Session, statement: &Statement, sql: &str) -> Outc
             Err(error) => Outcome::Error(error.sqlstate.code().into()),
         },
         _ => match session.execute(sql) {
-            Ok(rows) => Outcome::Affected(rows),
+            Ok(results) => match results.as_slice() {
+                [StatementResult::Affected(rows)] => Outcome::Affected(*rows),
+                _ => panic!("single non-query statement must return an affected-row result"),
+            },
             Err(error) => Outcome::Error(error.sqlstate.code().into()),
         },
     }

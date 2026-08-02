@@ -408,7 +408,8 @@ let db2 = db.snapshot();                    // independent fork (§7)
 let mut sess = db.session();
 
 // One-shot (autocommit):
-let n: u64 = sess.execute("INSERT INTO t VALUES (1,'a')")?;      // rows affected
+let results: Vec<StatementResult> =
+    sess.execute("INSERT INTO t VALUES (1,'a')")?;
 let rows: QueryResult =
     sess.query("SELECT id, name FROM t WHERE id = $1", &[Value::Int4(1)])?;
 
@@ -424,10 +425,11 @@ let rows = sess.query_prepared(&stmt, &[Value::Int4(1)])?;
 
 - **Parameters and prepared statements** are first-class. Parameterized calls
   (`$1`) are single-statement only, mirroring the Postgres extended protocol.
-- **Result representation:** `QueryResult { columns: Vec<ColumnMeta>, rows:
+- **Result representation:** `StatementResult::Affected(u64)` represents a
+  non-query result. `StatementResult::Query(QueryResult)` carries
+  `QueryResult { columns: Vec<ColumnMeta>, rows:
   Vec<Row> }`, where `ColumnMeta` carries the column name, Postgres type OID, and
-  typmod. Non-`SELECT` statements return an affected-row count; `RETURNING`
-  returns rows.
+  typmod. `RETURNING` returns rows.
 - **Multi-statement strings** (`"INSERT ...; INSERT ...;"`) are supported in
   `execute`, returning a result per statement, mirroring the Postgres simple
   query protocol.
