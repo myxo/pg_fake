@@ -2,11 +2,12 @@
 
 The Criterion suite compares in-process `pg_fake` calls with the same SQL sent
 through a `postgres` client connection to PostgreSQL 18. It covers a create/drop
-table lifecycle, individual constrained explicit/defaulted inserts, updates, deletes,
-explicit transactions, a 100-row full-table select, and a 100-row multi-key
-`ORDER BY` with explicit NULL placement, including an ordered `LIMIT`/`OFFSET`
-paging workload. The insert workloads include primary-key, not-null, default,
-and column- and table-level `CHECK` validation.
+table lifecycle, individual constrained explicit/defaulted inserts, updates,
+deletes, explicit transactions at READ COMMITTED and REPEATABLE READ, a 100-row
+full-table select, and a 100-row multi-key `ORDER BY` with explicit NULL
+placement, including an ordered `LIMIT`/`OFFSET` paging workload. The insert
+workloads include primary-key, not-null, default, and column- and table-level
+`CHECK` validation.
 
 By default, it starts a PostgreSQL 18 Testcontainers container. It detects the
 default Colima socket (`~/.colima/default/docker.sock`); set `DOCKER_HOST` for

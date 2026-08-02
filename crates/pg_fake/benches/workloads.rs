@@ -332,6 +332,58 @@ fn transaction_benchmark(criterion: &mut Criterion, postgres: &mut Client) {
         .unwrap();
 }
 
+fn repeatable_read_benchmark(criterion: &mut Criterion, postgres: &mut Client) {
+    let fake_table = unique_table_name("repeatable_read_fake");
+    let postgres_table = unique_table_name("repeatable_read_postgres");
+    let db = Db::new();
+    let mut fake = db.session();
+    fake.execute(&format!("CREATE TABLE {fake_table} (id INTEGER)"))
+        .unwrap();
+    fake.execute(&format!("INSERT INTO {fake_table} VALUES (1)"))
+        .unwrap();
+    postgres
+        .execute(&format!("CREATE TABLE {postgres_table} (id INTEGER)"), &[])
+        .unwrap();
+    postgres
+        .execute(&format!("INSERT INTO {postgres_table} VALUES (1)"), &[])
+        .unwrap();
+    let fake_select = format!("SELECT * FROM {fake_table}");
+    let postgres_select = format!("SELECT * FROM {postgres_table}");
+    let mut group = criterion.benchmark_group("transaction_repeatable_read_select");
+
+    group.bench_function("pg_fake", |benchmark| {
+        benchmark.iter(|| {
+            fake.execute("BEGIN ISOLATION LEVEL REPEATABLE READ")
+                .unwrap();
+            let result = fake.query(&fake_select, &[]).unwrap();
+            assert_eq!(result.rows.len(), 1);
+            fake.execute("COMMIT").unwrap();
+            black_box(result);
+        });
+    });
+    group.bench_function("postgres_18", |benchmark| {
+        benchmark.iter(|| {
+            postgres
+                .execute("BEGIN ISOLATION LEVEL REPEATABLE READ", &[])
+                .unwrap();
+            let result = postgres.simple_query(&postgres_select).unwrap();
+            assert_eq!(
+                result
+                    .iter()
+                    .filter(|message| matches!(message, SimpleQueryMessage::Row(_)))
+                    .count(),
+                1
+            );
+            postgres.execute("COMMIT", &[]).unwrap();
+            black_box(result);
+        });
+    });
+    group.finish();
+    postgres
+        .execute(&format!("DROP TABLE {postgres_table}"), &[])
+        .unwrap();
+}
+
 fn select_benchmark(criterion: &mut Criterion, postgres: &mut Client) {
     let fake_table = unique_table_name("select_fake");
     let postgres_table = unique_table_name("select_postgres");
@@ -511,6 +563,7 @@ fn benchmarks(criterion: &mut Criterion) {
     update_benchmark(criterion, &mut postgres.client);
     delete_benchmark(criterion, &mut postgres.client);
     transaction_benchmark(criterion, &mut postgres.client);
+    repeatable_read_benchmark(criterion, &mut postgres.client);
     select_benchmark(criterion, &mut postgres.client);
     order_by_benchmark(criterion, &mut postgres.client);
 }

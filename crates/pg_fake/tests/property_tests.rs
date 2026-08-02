@@ -618,6 +618,14 @@ fn create_table_sql(table: &str) -> String {
     )
 }
 
+fn isolation_level(src: &mut Source) -> &'static str {
+    let levels = ["READ COMMITTED", "REPEATABLE READ"];
+    let (level, _) = src
+        .choose("isolation", &levels)
+        .expect("isolation levels must not be empty");
+    level
+}
+
 #[test]
 fn generated_sql_matches_postgres() {
     let _test_lock = TEST_LOCK.lock().expect("test mutex must not be poisoned");
@@ -641,6 +649,12 @@ fn generated_sql_matches_postgres() {
         let mut next_row_key = 1;
         let mut in_transaction = false;
 
+        assert_statement(
+            postgres.client(),
+            &mut fake,
+            "SET SESSION CHARACTERISTICS AS TRANSACTION ISOLATION LEVEL READ COMMITTED",
+            RowOrder::Unordered,
+        );
         let create = create_table_sql(&table);
         assert_statement(postgres.client(), &mut fake, &create, RowOrder::Unordered);
         let insert = insert_sql(src, &table, &mut next_row_key);
@@ -648,9 +662,24 @@ fn generated_sql_matches_postgres() {
 
         src.repeat_n("statements", 3..=14, |src| {
             let actions: &[&'static str] = if in_transaction {
-                &["insert", "select", "update", "delete", "commit", "rollback"]
+                &[
+                    "insert",
+                    "select",
+                    "update",
+                    "delete",
+                    "set_transaction",
+                    "commit",
+                    "rollback",
+                ]
             } else {
-                &["insert", "select", "update", "delete", "begin"]
+                &[
+                    "insert",
+                    "select",
+                    "update",
+                    "delete",
+                    "set_session",
+                    "begin",
+                ]
             };
             src.select("action", actions, |src, action, _| {
                 let (sql, order) = match action {
@@ -666,8 +695,24 @@ fn generated_sql_matches_postgres() {
                     ),
                     "begin" => {
                         in_transaction = true;
-                        ("BEGIN".into(), RowOrder::Unordered)
+                        let sql = if src.any("explicit_isolation") {
+                            format!("BEGIN ISOLATION LEVEL {}", isolation_level(src))
+                        } else {
+                            "BEGIN".into()
+                        };
+                        (sql, RowOrder::Unordered)
                     }
+                    "set_transaction" => (
+                        format!("SET TRANSACTION ISOLATION LEVEL {}", isolation_level(src)),
+                        RowOrder::Unordered,
+                    ),
+                    "set_session" => (
+                        format!(
+                            "SET SESSION CHARACTERISTICS AS TRANSACTION ISOLATION LEVEL {}",
+                            isolation_level(src)
+                        ),
+                        RowOrder::Unordered,
+                    ),
                     "commit" => {
                         in_transaction = false;
                         ("COMMIT".into(), RowOrder::Unordered)

@@ -260,6 +260,58 @@ fn explicit_transactions_match_postgres_across_sessions() {
 }
 
 #[test]
+fn isolation_levels_match_postgres_across_sessions() {
+    assert_session_differential(
+        &[
+            (SessionName::First, "CREATE TABLE __TABLE__ (id INTEGER)"),
+            (SessionName::First, "INSERT INTO __TABLE__ VALUES (1)"),
+            (SessionName::First, "BEGIN ISOLATION LEVEL READ COMMITTED"),
+            (SessionName::First, "SELECT * FROM __TABLE__ ORDER BY id"),
+            (SessionName::Second, "INSERT INTO __TABLE__ VALUES (2)"),
+            (SessionName::First, "SELECT * FROM __TABLE__ ORDER BY id"),
+            (SessionName::First, "COMMIT"),
+            (SessionName::First, "BEGIN ISOLATION LEVEL REPEATABLE READ"),
+            (SessionName::First, "SELECT * FROM __TABLE__ ORDER BY id"),
+            (SessionName::Second, "INSERT INTO __TABLE__ VALUES (3)"),
+            (SessionName::First, "SELECT * FROM __TABLE__ ORDER BY id"),
+            (SessionName::First, "COMMIT"),
+            (
+                SessionName::First,
+                "SET SESSION CHARACTERISTICS AS TRANSACTION ISOLATION LEVEL REPEATABLE READ",
+            ),
+            (SessionName::First, "BEGIN"),
+            (SessionName::First, "SELECT * FROM __TABLE__ ORDER BY id"),
+            (SessionName::Second, "INSERT INTO __TABLE__ VALUES (4)"),
+            (SessionName::First, "SELECT * FROM __TABLE__ ORDER BY id"),
+            (SessionName::First, "COMMIT"),
+            (SessionName::First, "BEGIN ISOLATION LEVEL READ COMMITTED"),
+            (SessionName::First, "SELECT * FROM __TABLE__ ORDER BY id"),
+            (SessionName::Second, "INSERT INTO __TABLE__ VALUES (5)"),
+            (SessionName::First, "SELECT * FROM __TABLE__ ORDER BY id"),
+            (SessionName::First, "COMMIT"),
+            (SessionName::First, "BEGIN"),
+            (
+                SessionName::First,
+                "SET TRANSACTION ISOLATION LEVEL READ COMMITTED",
+            ),
+            (SessionName::First, "SELECT * FROM __TABLE__ ORDER BY id"),
+            (SessionName::Second, "INSERT INTO __TABLE__ VALUES (6)"),
+            (SessionName::First, "SELECT * FROM __TABLE__ ORDER BY id"),
+            (SessionName::First, "COMMIT"),
+            (SessionName::First, "BEGIN"),
+            (SessionName::First, "SELECT * FROM __TABLE__ ORDER BY id"),
+            (
+                SessionName::First,
+                "SET TRANSACTION ISOLATION LEVEL READ COMMITTED",
+            ),
+            (SessionName::First, "SELECT * FROM __TABLE__ ORDER BY id"),
+            (SessionName::First, "ROLLBACK"),
+        ],
+        RowOrder::Ordered,
+    );
+}
+
+#[test]
 fn case_boundaries_and_function_errors_match_postgres() {
     assert_differential(
         "CREATE TABLE __TABLE__ (id INTEGER); \

@@ -1,5 +1,7 @@
 use std::sync::{Arc, Mutex};
 
+use sqlparser::ast::{TransactionIsolationLevel as AstIsolationLevel, TransactionMode};
+
 use crate::{
     error::{PgError, Result, SqlState},
     executor::{self, DatabaseState, ExecutionResult},
@@ -19,6 +21,11 @@ pub struct QueryResult {
     pub columns: Vec<ColumnMeta>,
     pub rows: Vec<Vec<Value>>,
 }
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum IsolationLevel {
+    ReadCommitted,
+    RepeatableRead,
+}
 #[derive(Clone)]
 pub struct Db {
     state: Arc<Mutex<DatabaseState>>,
@@ -26,11 +33,19 @@ pub struct Db {
 pub struct Session {
     db: Db,
     transaction: Option<SessionTransaction>,
+    default_isolation: IsolationLevel,
 }
 #[derive(Clone, Copy)]
 enum SessionTransaction {
-    Active(Xid),
+    Active(ActiveTransaction),
     Aborted(Xid),
+}
+#[derive(Clone, Copy)]
+struct ActiveTransaction {
+    xid: Xid,
+    isolation: IsolationLevel,
+    snapshot: Option<Snapshot>,
+    statement_started: bool,
 }
 pub struct Transaction<'session> {
     session: &'session mut Session,
@@ -44,6 +59,39 @@ fn abort(state: &mut DatabaseState, xid: Xid) {
     }
 }
 
+fn isolation_from_modes(modes: &[TransactionMode]) -> Result<Option<IsolationLevel>> {
+    let mut isolation = None;
+    for mode in modes {
+        let level = match mode {
+            TransactionMode::IsolationLevel(
+                AstIsolationLevel::ReadUncommitted | AstIsolationLevel::ReadCommitted,
+            ) => IsolationLevel::ReadCommitted,
+            TransactionMode::IsolationLevel(AstIsolationLevel::RepeatableRead) => {
+                IsolationLevel::RepeatableRead
+            }
+            TransactionMode::IsolationLevel(AstIsolationLevel::Serializable) => {
+                return Err(PgError::new(
+                    SqlState::FeatureNotSupported,
+                    "SERIALIZABLE isolation is not implemented",
+                ));
+            }
+            TransactionMode::AccessMode(_) => {
+                return Err(PgError::new(
+                    SqlState::FeatureNotSupported,
+                    "transaction access modes are not implemented",
+                ));
+            }
+        };
+        if isolation.replace(level).is_some() {
+            return Err(PgError::new(
+                SqlState::SyntaxError,
+                "isolation level specified more than once",
+            ));
+        }
+    }
+    Ok(isolation)
+}
+
 impl Db {
     pub fn new() -> Self {
         Db {
@@ -54,6 +102,7 @@ impl Db {
         Session {
             db: self.clone(),
             transaction: None,
+            default_isolation: IsolationLevel::ReadCommitted,
         }
     }
 }
@@ -88,40 +137,49 @@ impl Session {
         }
     }
     pub fn begin(&mut self) -> Result<Transaction<'_>> {
+        self.begin_with(self.default_isolation)
+    }
+    pub fn begin_with(&mut self, isolation: IsolationLevel) -> Result<Transaction<'_>> {
         if self.transaction.is_some() {
             return Err(PgError::new(
                 SqlState::ActiveSqlTransaction,
                 "transaction already in progress",
             ));
         }
-        self.start_transaction();
+        self.start_transaction(isolation);
         Ok(Transaction {
             session: self,
             finished: false,
         })
     }
-    fn start_transaction(&mut self) {
+    fn start_transaction(&mut self, isolation: IsolationLevel) {
         let mut state = self.db.state.lock().expect("database mutex is poisoned");
-        self.transaction = Some(SessionTransaction::Active(state.transactions.begin()));
+        self.transaction = Some(SessionTransaction::Active(ActiveTransaction {
+            xid: state.transactions.begin(),
+            isolation,
+            snapshot: None,
+            statement_started: false,
+        }));
     }
     fn finish_transaction(&mut self, commit: bool) {
         let Some(transaction) = self.transaction.take() else {
             return;
         };
         let xid = match transaction {
-            SessionTransaction::Active(xid) if commit => {
+            SessionTransaction::Active(transaction) if commit => {
                 let mut state = self.db.state.lock().expect("database mutex is poisoned");
-                state.transactions.commit(xid);
+                state.transactions.commit(transaction.xid);
                 return;
             }
-            SessionTransaction::Active(xid) | SessionTransaction::Aborted(xid) => xid,
+            SessionTransaction::Active(transaction) => transaction.xid,
+            SessionTransaction::Aborted(xid) => xid,
         };
         let mut state = self.db.state.lock().expect("database mutex is poisoned");
         abort(&mut state, xid);
     }
     fn abort_transaction(&mut self) {
-        if let Some(SessionTransaction::Active(xid)) = self.transaction {
-            self.transaction = Some(SessionTransaction::Aborted(xid));
+        if let Some(SessionTransaction::Active(transaction)) = self.transaction {
+            self.transaction = Some(SessionTransaction::Aborted(transaction.xid));
         }
     }
     fn failed<T>(&mut self, error: PgError) -> Result<T> {
@@ -142,15 +200,11 @@ impl Session {
         let statement = statements.pop().expect("statement count was checked");
         match &statement {
             parser::Statement::StartTransaction { modes, .. } => {
-                if !modes.is_empty() {
-                    return self.failed(PgError::new(
-                        SqlState::FeatureNotSupported,
-                        "transaction modes are not implemented",
-                    ));
-                }
                 return match self.transaction {
                     None => {
-                        self.start_transaction();
+                        let isolation =
+                            isolation_from_modes(modes)?.unwrap_or(self.default_isolation);
+                        self.start_transaction(isolation);
                         Ok(ExecutionResult::Affected(0))
                     }
                     Some(SessionTransaction::Active(_)) => Ok(ExecutionResult::Affected(0)),
@@ -159,6 +213,50 @@ impl Session {
                         "current transaction is aborted",
                     )),
                 };
+            }
+            parser::Statement::SetTransaction {
+                modes,
+                snapshot,
+                session,
+            } => {
+                if matches!(self.transaction, Some(SessionTransaction::Aborted(_))) {
+                    return Err(PgError::new(
+                        SqlState::InFailedSqlTransaction,
+                        "current transaction is aborted",
+                    ));
+                }
+                if snapshot.is_some() {
+                    return self.failed(PgError::new(
+                        SqlState::FeatureNotSupported,
+                        "transaction snapshots are not implemented",
+                    ));
+                }
+                let isolation = match isolation_from_modes(modes) {
+                    Ok(isolation) => isolation,
+                    Err(error) => return self.failed(error),
+                };
+                let Some(isolation) = isolation else {
+                    return self.failed(PgError::new(
+                        SqlState::SyntaxError,
+                        "transaction isolation level is required",
+                    ));
+                };
+                if *session {
+                    self.default_isolation = isolation;
+                    return Ok(ExecutionResult::Affected(0));
+                }
+                let Some(SessionTransaction::Active(mut transaction)) = self.transaction else {
+                    return Ok(ExecutionResult::Affected(0));
+                };
+                if transaction.statement_started && isolation != transaction.isolation {
+                    return self.failed(PgError::new(
+                        SqlState::ActiveSqlTransaction,
+                        "transaction isolation level must be set before any query",
+                    ));
+                }
+                transaction.isolation = isolation;
+                self.transaction = Some(SessionTransaction::Active(transaction));
+                return Ok(ExecutionResult::Affected(0));
             }
             parser::Statement::Commit { chain } => {
                 if *chain {
@@ -196,10 +294,17 @@ impl Session {
                 "DDL in an explicit transaction is not implemented",
             ));
         }
-        if let Some(SessionTransaction::Active(xid)) = self.transaction {
+        if let Some(SessionTransaction::Active(mut transaction)) = self.transaction {
             let mut state = self.db.state.lock().expect("database mutex is poisoned");
-            let snapshot = Snapshot::new(&state.transactions);
-            return match executor::dispatch(&mut state, &statement, xid, &snapshot) {
+            let snapshot = match transaction.isolation {
+                IsolationLevel::ReadCommitted => Snapshot::new(&state.transactions),
+                IsolationLevel::RepeatableRead => *transaction
+                    .snapshot
+                    .get_or_insert_with(|| Snapshot::new(&state.transactions)),
+            };
+            transaction.statement_started = true;
+            self.transaction = Some(SessionTransaction::Active(transaction));
+            return match executor::dispatch(&mut state, &statement, transaction.xid, &snapshot) {
                 Ok(result) => Ok(result),
                 Err(error) => {
                     drop(state);
@@ -1315,6 +1420,111 @@ mod tests {
                 vec![Value::Int4(4), Value::Int4(4)],
             ]
         );
+    }
+
+    #[test]
+    fn isolation_levels_control_snapshot_lifetime() {
+        let db = Db::new();
+        let mut first = db.session();
+        let mut second = db.session();
+        first.execute("CREATE TABLE items (id INTEGER)").unwrap();
+        first.execute("INSERT INTO items VALUES (1)").unwrap();
+
+        first.execute("BEGIN").unwrap();
+        assert_eq!(
+            first.query("SELECT * FROM items", &[]).unwrap().rows,
+            vec![vec![Value::Int4(1)]]
+        );
+        second.execute("INSERT INTO items VALUES (2)").unwrap();
+        assert_eq!(
+            first.query("SELECT * FROM items", &[]).unwrap().rows,
+            vec![vec![Value::Int4(1)], vec![Value::Int4(2)]]
+        );
+        first.execute("COMMIT").unwrap();
+
+        first
+            .execute("BEGIN ISOLATION LEVEL REPEATABLE READ")
+            .unwrap();
+        assert_eq!(
+            first.query("SELECT * FROM items", &[]).unwrap().rows,
+            vec![vec![Value::Int4(1)], vec![Value::Int4(2)]]
+        );
+        second.execute("INSERT INTO items VALUES (3)").unwrap();
+        assert_eq!(
+            first.query("SELECT * FROM items", &[]).unwrap().rows,
+            vec![vec![Value::Int4(1)], vec![Value::Int4(2)]]
+        );
+        first.execute("COMMIT").unwrap();
+    }
+
+    #[test]
+    fn isolation_level_selection_follows_postgres_order() {
+        let db = Db::new();
+        let mut first = db.session();
+        let mut second = db.session();
+        first.execute("CREATE TABLE items (id INTEGER)").unwrap();
+        first.execute("INSERT INTO items VALUES (1)").unwrap();
+        first
+            .execute("SET SESSION CHARACTERISTICS AS TRANSACTION ISOLATION LEVEL REPEATABLE READ")
+            .unwrap();
+
+        first.execute("BEGIN").unwrap();
+        first.query("SELECT * FROM items", &[]).unwrap();
+        second.execute("INSERT INTO items VALUES (2)").unwrap();
+        assert_eq!(
+            first.query("SELECT * FROM items", &[]).unwrap().rows,
+            vec![vec![Value::Int4(1)]]
+        );
+        first.execute("COMMIT").unwrap();
+
+        first.execute("BEGIN").unwrap();
+        first
+            .execute("SET TRANSACTION ISOLATION LEVEL READ COMMITTED")
+            .unwrap();
+        first.query("SELECT * FROM items", &[]).unwrap();
+        second.execute("INSERT INTO items VALUES (3)").unwrap();
+        assert_eq!(
+            first.query("SELECT * FROM items", &[]).unwrap().rows,
+            vec![
+                vec![Value::Int4(1)],
+                vec![Value::Int4(2)],
+                vec![Value::Int4(3)]
+            ]
+        );
+        first.execute("COMMIT").unwrap();
+
+        {
+            let mut transaction = first.begin_with(IsolationLevel::RepeatableRead).unwrap();
+            transaction.query("SELECT * FROM items", &[]).unwrap();
+            second.execute("INSERT INTO items VALUES (4)").unwrap();
+            assert_eq!(
+                transaction
+                    .query("SELECT * FROM items", &[])
+                    .unwrap()
+                    .rows
+                    .len(),
+                3
+            );
+            transaction.commit().unwrap();
+        }
+
+        first.execute("BEGIN").unwrap();
+        first.query("SELECT * FROM items", &[]).unwrap();
+        assert_eq!(
+            first
+                .execute("SET TRANSACTION ISOLATION LEVEL READ COMMITTED")
+                .unwrap_err()
+                .sqlstate,
+            SqlState::ActiveSqlTransaction
+        );
+        assert_eq!(
+            first
+                .query("SELECT * FROM items", &[])
+                .unwrap_err()
+                .sqlstate,
+            SqlState::InFailedSqlTransaction
+        );
+        first.execute("ROLLBACK").unwrap();
     }
 
     #[test]

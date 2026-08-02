@@ -498,7 +498,7 @@ concurrency edge cases are further validated in Milestone G.
 
 ## Milestone G — Transactions & concurrency
 
-### Task 28 — Isolation levels (READ COMMITTED + REPEATABLE READ)
+### Task 28 — Isolation levels (READ COMMITTED + REPEATABLE READ) [COMPLETE]
 **Goal:** Per-statement vs per-transaction snapshots and level selection (§5.4).
 
 **DoD:**
