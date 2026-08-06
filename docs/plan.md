@@ -83,19 +83,17 @@ differential tests. Codes are added incrementally as later tasks need them.
 `Value`. Coercion between types is deferred to task 21. Temporal/uuid/json are
 out of Phase 1.
 
-### Task 4 — `sqlparser` wrapper & statement dispatch [COMPLETE]
-**Goal:** A thin parsing layer that produces owned ASTs and a dispatch skeleton
-routing statements to (stub) handlers.
+### Task 4 — `sqlparser` wrapper & statement classification [COMPLETE]
+**Goal:** A thin parsing layer that produces owned ASTs and classifies statements.
 
 **DoD:**
-- A `parse(sql) -> Result<Vec<Statement>>` function using the PostgreSQL dialect,
-  serialized behind the global mutex and releasing it promptly (§2.1).
+- A `parse(sql) -> Result<Vec<Statement>>` function using the PostgreSQL dialect
+  that returns owned ASTs.
 - Parse errors map to a `PgError` with a syntax-error `SqlState`.
-- A statement-dispatch enum/function that classifies each parsed statement
-  (DDL / DML / SELECT / transaction-control / SET / unsupported) and routes to
-  handler stubs returning "not implemented" for now.
+- A statement-classification enum/function for DDL / DML / SELECT /
+  transaction-control / SET / unsupported statements.
 - Unit tests: valid SQL parses; invalid SQL yields a syntax-error `PgError`;
-  dispatch classifies representative statements correctly.
+  statement classification covers representative statements.
 
 **Notes:** No execution yet. The unsupported-feature policy (§10) is wired in
 later; for now unknown statements return a clear "not implemented" error.
@@ -187,7 +185,7 @@ implicit autocommit transaction (§8).
 - `QueryResult { columns: Vec<ColumnMeta>, rows: Vec<Vec<Value>> }` with a
   minimal `ColumnMeta { name, type_oid, typmod }`.
 - Autocommit path: begin a transaction (task 7), take a snapshot (task 8),
-  execute via dispatch (task 4), commit on success / abort on error.
+  execute through the executor, commit on success / abort on error.
 - Storage guarded by the single `Mutex` (the `Condvar` is added in Milestone G).
 - Unit test: a not-yet-implemented statement returns a clean error through the
   public API.

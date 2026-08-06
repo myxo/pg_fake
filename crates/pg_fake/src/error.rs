@@ -116,7 +116,7 @@ pub struct PgError {
 }
 
 impl PgError {
-    pub fn new(sqlstate: SqlState, message: impl Into<String>) -> Self {
+    pub(crate) fn new(sqlstate: SqlState, message: impl Into<String>) -> Self {
         PgError {
             sqlstate,
             message: message.into(),
@@ -124,21 +124,6 @@ impl PgError {
             hint: None,
             position: None,
         }
-    }
-
-    pub fn with_detail(mut self, detail: impl Into<String>) -> Self {
-        self.detail = Some(detail.into());
-        self
-    }
-
-    pub fn with_hint(mut self, hint: impl Into<String>) -> Self {
-        self.hint = Some(hint.into());
-        self
-    }
-
-    pub fn with_position(mut self, pos: usize) -> Self {
-        self.position = Some(pos);
-        self
     }
 }
 

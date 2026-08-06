@@ -6,31 +6,31 @@ use crate::{
 };
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
-pub struct Xid(pub u64);
+pub(crate) struct Xid(pub(crate) u64);
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
-pub struct CommitSeq(pub u64);
+pub(crate) struct CommitSeq(pub(crate) u64);
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum TransactionStatus {
+pub(crate) enum TransactionStatus {
     InFlight,
     Committed(CommitSeq),
     Aborted,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct Snapshot {
-    pub commit_seq: CommitSeq,
+pub(crate) struct Snapshot {
+    pub(crate) commit_seq: CommitSeq,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
-pub struct RowLockKey {
-    pub table_id: TableId,
-    pub row_id: RowId,
+pub(crate) struct RowLockKey {
+    pub(crate) table_id: TableId,
+    pub(crate) row_id: RowId,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum RowLockMode {
+pub(crate) enum RowLockMode {
     Share,
     Update,
 }
@@ -42,23 +42,23 @@ struct RowLock {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct RowLockManager {
+pub(crate) struct RowLockManager {
     locks: BTreeMap<RowLockKey, RowLock>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct WaitForGraph {
+pub(crate) struct WaitForGraph {
     edges: BTreeMap<Xid, BTreeSet<Xid>>,
     victims: BTreeSet<Xid>,
 }
 
-pub enum LockAttempt {
+pub(crate) enum LockAttempt {
     Acquired,
     Blocked(Vec<Xid>),
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct TransactionManager {
+pub(crate) struct TransactionManager {
     next_xid: u64,
     commit_seq: CommitSeq,
     statuses: BTreeMap<Xid, TransactionStatus>,
@@ -83,13 +83,13 @@ impl Default for WaitForGraph {
 }
 
 impl RowLockManager {
-    pub fn new() -> Self {
+    pub(crate) fn new() -> Self {
         RowLockManager {
             locks: BTreeMap::new(),
         }
     }
 
-    pub fn acquire(&mut self, key: RowLockKey, xid: Xid, mode: RowLockMode) -> LockAttempt {
+    pub(crate) fn acquire(&mut self, key: RowLockKey, xid: Xid, mode: RowLockMode) -> LockAttempt {
         let lock = self.locks.entry(key).or_insert_with(|| RowLock {
             holders: BTreeMap::new(),
             waiters: VecDeque::new(),
@@ -125,7 +125,7 @@ impl RowLockManager {
         LockAttempt::Blocked(blockers.into_iter().collect())
     }
 
-    pub fn cancel_wait(&mut self, key: RowLockKey, xid: Xid) {
+    pub(crate) fn cancel_wait(&mut self, key: RowLockKey, xid: Xid) {
         let Some(lock) = self.locks.get_mut(&key) else {
             return;
         };
@@ -135,7 +135,7 @@ impl RowLockManager {
         }
     }
 
-    pub fn release(&mut self, xid: Xid) {
+    pub(crate) fn release(&mut self, xid: Xid) {
         self.locks.retain(|_, lock| {
             lock.holders.remove(&xid);
             lock.waiters.retain(|waiter| *waiter != xid);
@@ -143,20 +143,21 @@ impl RowLockManager {
         });
     }
 
-    pub fn has_waiters(&self) -> bool {
+    #[cfg(test)]
+    pub(crate) fn has_waiters(&self) -> bool {
         self.locks.values().any(|lock| !lock.waiters.is_empty())
     }
 }
 
 impl WaitForGraph {
-    pub fn new() -> Self {
+    pub(crate) fn new() -> Self {
         WaitForGraph {
             edges: BTreeMap::new(),
             victims: BTreeSet::new(),
         }
     }
 
-    pub fn wait_for(&mut self, waiter: Xid, blockers: &[Xid]) -> Option<Xid> {
+    pub(crate) fn wait_for(&mut self, waiter: Xid, blockers: &[Xid]) -> Option<Xid> {
         let blockers = blockers
             .iter()
             .copied()
@@ -176,11 +177,11 @@ impl WaitForGraph {
         Some(victim)
     }
 
-    pub fn clear_wait(&mut self, waiter: Xid) {
+    pub(crate) fn clear_wait(&mut self, waiter: Xid) {
         self.edges.remove(&waiter);
     }
 
-    pub fn remove_transaction(&mut self, xid: Xid) {
+    pub(crate) fn remove_transaction(&mut self, xid: Xid) {
         self.edges.remove(&xid);
         for blockers in self.edges.values_mut() {
             blockers.remove(&xid);
@@ -189,7 +190,7 @@ impl WaitForGraph {
         self.victims.remove(&xid);
     }
 
-    pub fn take_victim(&mut self, xid: Xid) -> bool {
+    pub(crate) fn take_victim(&mut self, xid: Xid) -> bool {
         self.victims.remove(&xid)
     }
 
@@ -226,7 +227,7 @@ impl WaitForGraph {
 }
 
 impl TransactionManager {
-    pub fn new() -> Self {
+    pub(crate) fn new() -> Self {
         TransactionManager {
             next_xid: 1,
             commit_seq: CommitSeq(0),
@@ -234,7 +235,7 @@ impl TransactionManager {
         }
     }
 
-    pub fn begin(&mut self) -> Xid {
+    pub(crate) fn begin(&mut self) -> Xid {
         let xid = Xid(self.next_xid);
         self.next_xid += 1;
         let previous = self.statuses.insert(xid, TransactionStatus::InFlight);
@@ -242,7 +243,7 @@ impl TransactionManager {
         xid
     }
 
-    pub fn commit(&mut self, xid: Xid) -> CommitSeq {
+    pub(crate) fn commit(&mut self, xid: Xid) -> CommitSeq {
         assert!(matches!(
             self.status(xid),
             Some(TransactionStatus::InFlight)
@@ -254,7 +255,7 @@ impl TransactionManager {
         commit_seq
     }
 
-    pub fn abort(&mut self, xid: Xid) {
+    pub(crate) fn abort(&mut self, xid: Xid) {
         assert!(matches!(
             self.status(xid),
             Some(TransactionStatus::InFlight)
@@ -262,24 +263,20 @@ impl TransactionManager {
         *self.statuses.get_mut(&xid).expect("transaction must exist") = TransactionStatus::Aborted;
     }
 
-    pub fn status(&self, xid: Xid) -> Option<TransactionStatus> {
+    pub(crate) fn status(&self, xid: Xid) -> Option<TransactionStatus> {
         self.statuses.get(&xid).copied()
-    }
-
-    pub fn commit_seq(&self) -> CommitSeq {
-        self.commit_seq
     }
 }
 
 impl Snapshot {
-    pub fn new(manager: &TransactionManager) -> Self {
+    pub(crate) fn new(manager: &TransactionManager) -> Self {
         Snapshot {
             commit_seq: manager.commit_seq,
         }
     }
 }
 
-pub fn is_visible(
+pub(crate) fn is_visible(
     version: &Version,
     snapshot: &Snapshot,
     current_xid: Xid,
@@ -304,7 +301,7 @@ pub fn is_visible(
     xmin_visible && !xmax_invisible
 }
 
-pub fn visible_version<'a>(
+pub(crate) fn visible_version<'a>(
     chain: &'a VersionChain,
     snapshot: &Snapshot,
     current_xid: Xid,
@@ -350,7 +347,7 @@ mod tests {
         assert_eq!(second, Xid(2));
         assert_eq!(manager.commit(second), CommitSeq(1));
         assert_eq!(manager.commit(first), CommitSeq(2));
-        assert_eq!(manager.commit_seq(), CommitSeq(2));
+        assert_eq!(manager.commit_seq, CommitSeq(2));
     }
 
     fn version(xmin: Xid, xmax: Option<Xid>) -> Version {

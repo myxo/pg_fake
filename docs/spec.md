@@ -12,8 +12,7 @@ magnitude faster.
 - Pure Rust library; no external process, no networking. The API is plain
   in-process function calls.
 - SQL is parsed with `sqlparser-rs`.
-- Multiple queries / transactions can be in flight concurrently (even though
-  `sqlparser-rs` parsing is serialized behind a global mutex).
+- Multiple queries / transactions can be in flight concurrently.
 - Transactional semantics match PostgreSQL.
 - Database snapshots are cheap, for use as test fixtures.
 
@@ -85,7 +84,7 @@ Time-dependent behavior can be made deterministic:
                 +----------------------+------------------------+
                                        |
                 +----------------------v------------------------+
-                |  Parser (sqlparser-rs, behind global mutex)   |
+                |  Parser (sqlparser-rs)                        |
                 +----------------------+------------------------+
                                        |
                 +----------------------v------------------------+
@@ -112,11 +111,10 @@ Time-dependent behavior can be made deterministic:
   connection/backend. Holds the current transaction (if any) and its snapshot.
   Statements issued outside an explicit transaction run as implicit
   (autocommit) single-statement transactions.
-- **Parser** — a thin wrapper over `sqlparser-rs`. Parsing is serialized by a
-  global mutex, so ASTs are produced and the mutex released quickly. Parsing is
-  cheap relative to execution. No parse/plan cache: the explicit `prepare()`
-  path (§8) covers parse-once/execute-many, and a plan cache would carry
-  invalidation complexity under transactional DDL.
+- **Parser** — a thin wrapper over `sqlparser-rs`. Each parse creates an
+  independent parser and returns owned ASTs. No parse/plan cache: the explicit
+  `prepare()` path (§8) covers parse-once/execute-many, and a plan cache would
+  carry invalidation complexity under transactional DDL.
 - **Analyzer/Binder** — resolves identifiers against the catalog, checks and
   infers types, applies coercions, and produces a bound logical plan.
 - **Executor** — interprets the bound plan against the storage engine.
@@ -363,8 +361,6 @@ implicit autocommit.
   locking could replace the single lock if parallel throughput ever matters.
 - The deadlock detector (§5.5) operates on the user-transaction wait-for graph;
   with a single lock there is no separate internal lock-ordering concern.
-- Parsing is serialized behind `sqlparser`'s global mutex; ASTs are produced and
-  the mutex released promptly.
 
 ### 6.1 Determinism
 There is no special deterministic execution mode or cooperative scheduler.

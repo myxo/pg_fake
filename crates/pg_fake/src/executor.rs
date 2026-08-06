@@ -22,15 +22,15 @@ use std::{
 };
 
 pub(crate) struct DatabaseState {
-    pub catalog: Catalog,
-    pub tables: BTreeMap<TableId, Table>,
-    pub transactions: TransactionManager,
-    pub row_locks: RowLockManager,
-    pub wait_for: WaitForGraph,
+    pub(crate) catalog: Catalog,
+    pub(crate) tables: BTreeMap<TableId, Table>,
+    pub(crate) transactions: TransactionManager,
+    pub(crate) row_locks: RowLockManager,
+    pub(crate) wait_for: WaitForGraph,
 }
 pub(crate) struct RequiredRowLock {
-    pub key: RowLockKey,
-    pub mode: RowLockMode,
+    pub(crate) key: RowLockKey,
+    pub(crate) mode: RowLockMode,
 }
 
 pub(crate) fn query_columns(
@@ -74,7 +74,7 @@ struct OrderedRow {
     keys: Vec<Value>,
 }
 impl DatabaseState {
-    pub fn new() -> Self {
+    pub(crate) fn new() -> Self {
         DatabaseState {
             catalog: Catalog::new(),
             tables: BTreeMap::new(),

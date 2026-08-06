@@ -6,21 +6,21 @@ use crate::{
     value::{BaseType, Value},
 };
 
-pub type Row = Vec<Value>;
+pub(crate) type Row = Vec<Value>;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
-pub struct RowId(pub u64);
+pub(crate) struct RowId(pub(crate) u64);
 
 #[derive(Debug, Clone, PartialEq)]
-pub struct Version {
-    pub xmin: Xid,
-    pub xmax: Option<Xid>,
-    pub row: Row,
+pub(crate) struct Version {
+    pub(crate) xmin: Xid,
+    pub(crate) xmax: Option<Xid>,
+    pub(crate) row: Row,
 }
 
 #[derive(Debug, Clone, PartialEq)]
-pub struct VersionChain {
-    pub versions: Vec<Version>,
+pub(crate) struct VersionChain {
+    pub(crate) versions: Vec<Version>,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -51,15 +51,15 @@ struct UniqueIndex {
 }
 
 #[derive(Debug, Clone, PartialEq)]
-pub struct Table {
-    pub schema: TableSchema,
+pub(crate) struct Table {
+    pub(crate) schema: TableSchema,
     rows: RowStore,
     indexes: Vec<UniqueIndex>,
     next_rowid: u64,
 }
 
 impl Table {
-    pub fn new(schema: TableSchema) -> Self {
+    pub(crate) fn new(schema: TableSchema) -> Self {
         let indexes = schema
             .constraints
             .iter()
@@ -92,7 +92,7 @@ impl Table {
         }
     }
 
-    pub fn insert(&mut self, xmin: Xid, row: Row) -> RowId {
+    pub(crate) fn insert(&mut self, xmin: Xid, row: Row) -> RowId {
         let row_id = RowId(self.next_rowid);
         self.next_rowid += 1;
         let index_row = row.clone();
@@ -111,7 +111,7 @@ impl Table {
         row_id
     }
 
-    pub fn tombstone(&mut self, row_id: RowId, version_xmin: Xid, xmax: Xid) -> RowId {
+    pub(crate) fn tombstone(&mut self, row_id: RowId, version_xmin: Xid, xmax: Xid) -> RowId {
         let chain = self.rows.chains.get_mut(&row_id).expect("row must exist");
         let version = chain
             .versions
@@ -123,7 +123,13 @@ impl Table {
         row_id
     }
 
-    pub fn update(&mut self, row_id: RowId, version_xmin: Xid, xmin: Xid, row: Row) -> RowId {
+    pub(crate) fn update(
+        &mut self,
+        row_id: RowId,
+        version_xmin: Xid,
+        xmin: Xid,
+        row: Row,
+    ) -> RowId {
         self.tombstone(row_id, version_xmin, xmin);
         let index_row = row.clone();
         self.rows
@@ -140,7 +146,7 @@ impl Table {
         row_id
     }
 
-    pub fn abort(&mut self, xid: Xid) {
+    pub(crate) fn abort(&mut self, xid: Xid) {
         self.rows.chains.retain(|_, chain| {
             chain.versions.retain(|version| version.xmin != xid);
             for version in &mut chain.versions {
@@ -153,18 +159,14 @@ impl Table {
         self.rebuild_indexes();
     }
 
-    pub fn versions(&self, row_id: RowId) -> Option<&VersionChain> {
-        self.rows.chains.get(&row_id)
-    }
-
-    pub fn rows(&self) -> impl Iterator<Item = (RowId, &VersionChain)> {
+    pub(crate) fn rows(&self) -> impl Iterator<Item = (RowId, &VersionChain)> {
         self.rows
             .chains
             .iter()
             .map(|(row_id, chain)| (*row_id, chain))
     }
 
-    pub fn unique_conflict(
+    pub(crate) fn unique_conflict(
         &self,
         row: &Row,
         snapshot: &Snapshot,
@@ -315,7 +317,7 @@ mod tests {
 
         assert_eq!(row_id, RowId(1));
         assert_eq!(
-            table.versions(row_id).unwrap().versions,
+            table.rows.chains.get(&row_id).unwrap().versions,
             vec![Version {
                 xmin: Xid(10),
                 xmax: None,
@@ -334,7 +336,7 @@ mod tests {
             row_id
         );
         assert_eq!(
-            table.versions(row_id).unwrap().versions,
+            table.rows.chains.get(&row_id).unwrap().versions,
             vec![
                 Version {
                     xmin: Xid(10),
@@ -360,14 +362,14 @@ mod tests {
         table.abort(Xid(11));
 
         assert_eq!(
-            table.versions(existing).unwrap().versions,
+            table.rows.chains.get(&existing).unwrap().versions,
             vec![Version {
                 xmin: Xid(10),
                 xmax: None,
                 row: vec![Value::Int4(1)],
             }]
         );
-        assert!(table.versions(inserted).is_none());
+        assert!(!table.rows.chains.contains_key(&inserted));
     }
 
     #[test]
@@ -378,7 +380,7 @@ mod tests {
 
         assert_eq!(table.tombstone(row_id, Xid(11), Xid(12)), row_id);
         assert_eq!(
-            table.versions(row_id).unwrap().versions,
+            table.rows.chains.get(&row_id).unwrap().versions,
             vec![
                 Version {
                     xmin: Xid(10),

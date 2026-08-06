@@ -7,13 +7,13 @@ use crate::{
 };
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
-pub enum CastContext {
+pub(crate) enum CastContext {
     Implicit,
     Assignment,
     Explicit,
 }
 
-pub fn type_from_ast(data_type: &DataType) -> Result<PgType> {
+pub(crate) fn type_from_ast(data_type: &DataType) -> Result<PgType> {
     let (base, typmod) = match data_type {
         DataType::Bool | DataType::Boolean => (BaseType::Bool, PgType::NO_TYPEMOD),
         DataType::Int2(None) | DataType::SmallInt(None) => (BaseType::Int2, PgType::NO_TYPEMOD),
@@ -95,7 +95,7 @@ fn numeric_typmod(info: ExactNumberInfo) -> Result<i32> {
     Ok(((precision as i32) << 16) + scale as i32 + 4)
 }
 
-pub fn common_type(left: BaseType, right: BaseType) -> Option<BaseType> {
+pub(crate) fn common_type(left: BaseType, right: BaseType) -> Option<BaseType> {
     if left == right {
         return Some(left);
     }
@@ -107,7 +107,7 @@ pub fn common_type(left: BaseType, right: BaseType) -> Option<BaseType> {
     Some(if left_rank > right_rank { left } else { right })
 }
 
-pub fn can_cast(source: BaseType, target: BaseType, context: CastContext) -> bool {
+pub(crate) fn can_cast(source: BaseType, target: BaseType, context: CastContext) -> bool {
     required_context(source, target).is_some_and(|required| context >= required)
 }
 
@@ -146,7 +146,7 @@ fn required_context(source: BaseType, target: BaseType) -> Option<CastContext> {
     None
 }
 
-pub fn coerce(
+pub(crate) fn coerce(
     value: Value,
     source: BaseType,
     target: PgType,
@@ -177,7 +177,7 @@ pub fn coerce(
     apply_typmod(value, target, context)
 }
 
-pub fn coerce_unknown(text: &str, target: PgType, context: CastContext) -> Result<Value> {
+pub(crate) fn coerce_unknown(text: &str, target: PgType, context: CastContext) -> Result<Value> {
     let value = if string(target.base) {
         Value::Text(text.into())
     } else {

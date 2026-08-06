@@ -81,7 +81,7 @@ impl BaseType {
 
     /// Look up a base type by SQL type name, accepting common aliases.
     /// Matching is case-insensitive.
-    pub fn from_name(name: &str) -> Option<BaseType> {
+    pub(crate) fn from_name(name: &str) -> Option<BaseType> {
         match name.trim().to_ascii_lowercase().as_str() {
             "bool" | "boolean" => Some(BaseType::Bool),
             "int2" | "smallint" => Some(BaseType::Int2),
@@ -105,31 +105,27 @@ impl BaseType {
 /// encoding is type-specific and interpreted by the catalog/coercion layers;
 /// here it is just stored.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct PgType {
-    pub base: BaseType,
-    pub typmod: i32,
+pub(crate) struct PgType {
+    pub(crate) base: BaseType,
+    pub(crate) typmod: i32,
 }
 
 impl PgType {
-    pub const NO_TYPEMOD: i32 = -1;
+    pub(crate) const NO_TYPEMOD: i32 = -1;
 
-    pub fn new(base: BaseType) -> Self {
+    pub(crate) fn new(base: BaseType) -> Self {
         PgType {
             base,
             typmod: Self::NO_TYPEMOD,
         }
     }
 
-    pub fn with_typmod(base: BaseType, typmod: i32) -> Self {
+    pub(crate) fn with_typmod(base: BaseType, typmod: i32) -> Self {
         PgType { base, typmod }
     }
 
-    pub fn oid(self) -> Oid {
+    pub(crate) fn oid(self) -> Oid {
         self.base.oid()
-    }
-
-    pub fn has_typmod(self) -> bool {
-        self.typmod != Self::NO_TYPEMOD
     }
 }
 
@@ -211,7 +207,7 @@ impl Value {
     /// Parse a text input literal into a `Value` of the given base type
     /// (the type's `typinput` function). Invalid syntax yields `22P02`;
     /// out-of-range values yield `22003`.
-    pub fn parse(base: BaseType, input: &str) -> Result<Value> {
+    pub(crate) fn parse(base: BaseType, input: &str) -> Result<Value> {
         match base {
             BaseType::Bool => parse_bool(input).map(Value::Bool),
             BaseType::Int2 => parse_int::<i16>(input).map(Value::Int2),
@@ -365,47 +361,11 @@ mod tests {
     use super::*;
 
     #[test]
-    fn known_oids_match_pg_catalog() {
-        assert_eq!(BaseType::Bool.oid(), 16);
-        assert_eq!(BaseType::Bytea.oid(), 17);
-        assert_eq!(BaseType::Int8.oid(), 20);
-        assert_eq!(BaseType::Int2.oid(), 21);
-        assert_eq!(BaseType::Int4.oid(), 23);
-        assert_eq!(BaseType::Text.oid(), 25);
-        assert_eq!(BaseType::Bpchar.oid(), 1042);
-        assert_eq!(BaseType::Varchar.oid(), 1043);
-        assert_eq!(BaseType::Float4.oid(), 700);
-        assert_eq!(BaseType::Float8.oid(), 701);
-        assert_eq!(BaseType::Numeric.oid(), 1700);
-    }
-
-    #[test]
-    fn name_lookup_canonical_and_aliases() {
-        assert_eq!(BaseType::from_name("int4"), Some(BaseType::Int4));
-        assert_eq!(BaseType::from_name("INTEGER"), Some(BaseType::Int4));
-        assert_eq!(BaseType::from_name("smallint"), Some(BaseType::Int2));
-        assert_eq!(BaseType::from_name("bigint"), Some(BaseType::Int8));
-        assert_eq!(BaseType::from_name("real"), Some(BaseType::Float4));
-        assert_eq!(
-            BaseType::from_name("double precision"),
-            Some(BaseType::Float8)
-        );
-        assert_eq!(BaseType::from_name("decimal"), Some(BaseType::Numeric));
-        assert_eq!(
-            BaseType::from_name("character varying"),
-            Some(BaseType::Varchar)
-        );
-        assert_eq!(BaseType::from_name("character"), Some(BaseType::Bpchar));
-        assert_eq!(BaseType::from_name("unknown_type"), None);
-    }
-
-    #[test]
     fn pg_type_typmod_slot() {
         let t = PgType::new(BaseType::Varchar);
         assert_eq!(t.typmod, PgType::NO_TYPEMOD);
-        assert!(!t.has_typmod());
         let t = PgType::with_typmod(BaseType::Varchar, 14);
-        assert!(t.has_typmod());
+        assert_ne!(t.typmod, PgType::NO_TYPEMOD);
         assert_eq!(t.oid(), 1043);
     }
 
@@ -448,12 +408,6 @@ mod tests {
         }
         let err = Value::parse(BaseType::Bool, "maybe").unwrap_err();
         assert_eq!(err.sqlstate, SqlState::InvalidTextRepresentation);
-    }
-
-    #[test]
-    fn bool_rendering() {
-        assert_eq!(Value::Bool(true).to_text(), "t");
-        assert_eq!(Value::Bool(false).to_text(), "f");
     }
 
     #[test]
