@@ -19,9 +19,47 @@ use sqlparser::ast::{
     TableFactor, TableWithJoins, UnaryOperator, Value as AstValue,
 };
 use std::{
+    cell::RefCell,
     cmp::Ordering,
     collections::{BTreeMap, BTreeSet},
 };
+
+#[derive(Clone, Copy)]
+struct TimeContext {
+    transaction: chrono::DateTime<chrono::Utc>,
+    statement: chrono::DateTime<chrono::Utc>,
+    clock: chrono::DateTime<chrono::Utc>,
+}
+
+thread_local! {
+    static TIME_CONTEXT: RefCell<Option<TimeContext>> = const { RefCell::new(None) };
+}
+
+pub(crate) struct TimeContextGuard(Option<TimeContext>);
+
+impl Drop for TimeContextGuard {
+    fn drop(&mut self) {
+        TIME_CONTEXT.with(|context| *context.borrow_mut() = self.0.take());
+    }
+}
+
+pub(crate) fn set_time_context(
+    transaction: chrono::DateTime<chrono::Utc>,
+    statement: chrono::DateTime<chrono::Utc>,
+    clock: chrono::DateTime<chrono::Utc>,
+) -> TimeContextGuard {
+    TimeContextGuard(TIME_CONTEXT.with(|context| {
+        context.borrow_mut().replace(TimeContext {
+            transaction,
+            statement,
+            clock,
+        })
+    }))
+}
+
+fn time_context() -> Option<TimeContext> {
+    TIME_CONTEXT.with(|context| *context.borrow())
+}
 
 pub(crate) struct DatabaseState {
     pub(crate) catalog: Catalog,
@@ -2331,6 +2369,11 @@ fn function_type(function: &Function, schema: &TableSchema) -> Result<BaseType> 
             Ok(base)
         }
         "gen_random_uuid" | "uuidv4" if arguments.is_empty() => Ok(BaseType::Uuid),
+        "now" | "transaction_timestamp" | "statement_timestamp" | "clock_timestamp"
+            if arguments.is_empty() =>
+        {
+            Ok(BaseType::TimestampTz)
+        }
         "coalesce" | "nullif" | "greatest" | "least" | "length" | "lower" | "upper" | "abs" => {
             Err(signature_error())
         }
@@ -2537,6 +2580,25 @@ fn evaluate_function(function: &Function, schema: &TableSchema, row: &[Value]) -
     let result_type = function_type(function, schema)?;
     match function_name.as_str() {
         "gen_random_uuid" | "uuidv4" => Ok(Value::Uuid(uuid::Uuid::new_v4())),
+        "now" | "transaction_timestamp" | "statement_timestamp" | "clock_timestamp" => {
+            let context = time_context().unwrap_or_else(|| {
+                let now = chrono::Utc::now();
+                TimeContext {
+                    transaction: now,
+                    statement: now,
+                    clock: now,
+                }
+            });
+            let value = match function_name.as_str() {
+                "now" | "transaction_timestamp" => context.transaction,
+                "statement_timestamp" => context.statement,
+                "clock_timestamp" => context.clock,
+                _ => unreachable!(),
+            };
+            Ok(Value::TimestampTz(crate::value::PgTimestampTz::Finite(
+                value,
+            )))
+        }
         "coalesce" => {
             for argument in arguments {
                 let value = evaluate_as(argument, result_type, CastContext::Implicit, schema, row)?;

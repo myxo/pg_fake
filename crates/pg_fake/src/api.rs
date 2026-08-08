@@ -52,9 +52,16 @@ pub struct Db {
     state: Arc<Mutex<DatabaseState>>,
     condvar: Arc<Condvar>,
     default_lock_timeout: Duration,
+    clock: Arc<Mutex<Clock>>,
 }
 pub struct DbBuilder {
     lock_timeout: Duration,
+    mock_time: bool,
+}
+#[derive(Clone, Copy)]
+enum Clock {
+    Real,
+    Mock(chrono::DateTime<chrono::Utc>),
 }
 pub struct Session {
     db: Db,
@@ -79,6 +86,7 @@ struct ActiveTransaction {
     snapshot: Option<Snapshot>,
     statement_started: bool,
     implicit_batch: bool,
+    transaction_timestamp: chrono::DateTime<chrono::Utc>,
 }
 enum DdlUndo {
     DropCreated(String),
@@ -336,6 +344,7 @@ impl Db {
     pub fn builder() -> DbBuilder {
         DbBuilder {
             lock_timeout: Duration::from_secs(1),
+            mock_time: false,
         }
     }
     pub fn session(&self) -> Session {
@@ -357,17 +366,70 @@ impl DbBuilder {
         self.lock_timeout = timeout;
         self
     }
+    /// Enable a frozen, deterministic database clock. It begins at the Unix
+    /// epoch and can subsequently be controlled through `Db::set_time` and
+    /// `Db::advance_time`.
+    pub fn mock_time(mut self, enabled: bool) -> Self {
+        self.mock_time = enabled;
+        self
+    }
     pub fn build(self) -> Db {
         Db {
             state: Arc::new(Mutex::new(DatabaseState::new())),
             condvar: Arc::new(Condvar::new()),
             default_lock_timeout: self.lock_timeout,
+            clock: Arc::new(Mutex::new(if self.mock_time {
+                Clock::Mock(chrono::DateTime::<chrono::Utc>::UNIX_EPOCH)
+            } else {
+                Clock::Real
+            })),
         }
     }
 }
 impl Default for Db {
     fn default() -> Self {
         Self::new()
+    }
+}
+impl Db {
+    fn now(&self) -> chrono::DateTime<chrono::Utc> {
+        match *self.clock.lock().expect("clock mutex is poisoned") {
+            Clock::Real => chrono::Utc::now(),
+            Clock::Mock(value) => value,
+        }
+    }
+
+    /// Set the frozen mock clock. Real-clock databases reject the operation.
+    pub fn set_time(&self, time: chrono::DateTime<chrono::Utc>) -> Result<()> {
+        let mut clock = self.clock.lock().expect("clock mutex is poisoned");
+        match &mut *clock {
+            Clock::Mock(value) => {
+                *value = time;
+                Ok(())
+            }
+            Clock::Real => Err(PgError::new(
+                SqlState::InvalidParameterValue,
+                "mock time is disabled",
+            )),
+        }
+    }
+
+    /// Advance the frozen mock clock by `duration`. Real-clock databases reject
+    /// the operation.
+    pub fn advance_time(&self, duration: chrono::Duration) -> Result<()> {
+        let mut clock = self.clock.lock().expect("clock mutex is poisoned");
+        match &mut *clock {
+            Clock::Mock(value) => {
+                *value = value.checked_add_signed(duration).ok_or_else(|| {
+                    PgError::new(SqlState::NumericValueOutOfRange, "clock time out of range")
+                })?;
+                Ok(())
+            }
+            Clock::Real => Err(PgError::new(
+                SqlState::InvalidParameterValue,
+                "mock time is disabled",
+            )),
+        }
     }
 }
 impl Session {
@@ -633,6 +695,7 @@ impl Session {
             snapshot: None,
             statement_started: false,
             implicit_batch,
+            transaction_timestamp: self.db.now(),
         }));
     }
     fn finish_transaction(&mut self, commit: bool) -> Result<()> {
@@ -927,6 +990,11 @@ impl Session {
                 Ok(acquired) => acquired,
                 Err(error) => return self.failed(error),
             };
+            let _time_context = executor::set_time_context(
+                transaction.transaction_timestamp,
+                self.db.now(),
+                self.db.now(),
+            );
             return match executor::dispatch(
                 &mut state,
                 &statement,
@@ -1302,6 +1370,58 @@ mod tests {
         );
         assert_eq!(result.rows[0][0].to_text(), "2024-03-02 15:04:05");
         assert_eq!(result.rows[0][1].to_text(), "2 mons 4 days 06:08:10");
+    }
+
+    #[test]
+    fn mock_clock_is_frozen_and_publicly_controllable() {
+        let db = Db::builder().mock_time(true).build();
+        let initial = chrono::DateTime::parse_from_rfc3339("2024-01-01T00:00:00Z")
+            .unwrap()
+            .with_timezone(&chrono::Utc);
+        db.set_time(initial).unwrap();
+        assert_eq!(db.now(), initial);
+        db.advance_time(chrono::Duration::minutes(90)).unwrap();
+        assert_eq!(db.now(), initial + chrono::Duration::minutes(90));
+        assert!(Db::new().set_time(initial).is_err());
+        assert!(
+            Db::new()
+                .advance_time(chrono::Duration::seconds(1))
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn timestamp_functions_observe_transaction_statement_and_clock_boundaries() {
+        let db = Db::builder().mock_time(true).build();
+        let initial = chrono::DateTime::parse_from_rfc3339("2024-01-01T00:00:00Z")
+            .unwrap()
+            .with_timezone(&chrono::Utc);
+        db.set_time(initial).unwrap();
+        let mut session = db.session();
+        session
+            .execute("CREATE TABLE clock_source (id INTEGER)")
+            .unwrap();
+        session
+            .execute("INSERT INTO clock_source VALUES (1)")
+            .unwrap();
+        session.execute("BEGIN").unwrap();
+        let first = session
+            .query(
+                "SELECT now(), statement_timestamp(), clock_timestamp() FROM clock_source",
+                &[],
+            )
+            .unwrap();
+        db.advance_time(chrono::Duration::seconds(1)).unwrap();
+        let second = session
+            .query(
+                "SELECT now(), statement_timestamp(), clock_timestamp() FROM clock_source",
+                &[],
+            )
+            .unwrap();
+        assert_eq!(first.rows[0][0], second.rows[0][0]);
+        assert_ne!(first.rows[0][1], second.rows[0][1]);
+        assert_ne!(first.rows[0][2], second.rows[0][2]);
+        session.execute("COMMIT").unwrap();
     }
 
     #[test]
