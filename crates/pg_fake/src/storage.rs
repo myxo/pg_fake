@@ -72,7 +72,7 @@ impl Table {
                                 schema
                                     .columns
                                     .iter()
-                                    .position(|column| column.name == *name)
+                                    .position(|column| &column.name == name)
                                     .expect("constraint columns must exist")
                             })
                             .collect(),

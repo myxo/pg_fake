@@ -69,8 +69,7 @@ single-statement operations.
 
 ## Benchmarks
 
-The Criterion suite compares `pg_fake` with PostgreSQL 18 for create/drop,
-insert, update, delete, transaction, and select workloads. See
+The Criterion suite compares `pg_fake` with PostgreSQL 18. See
 [`crates/pg_fake_sqlx/benches/README.md`](crates/pg_fake_sqlx/benches/README.md) for
 Docker/database configuration, commands, reports, and speedup interpretation.
 
