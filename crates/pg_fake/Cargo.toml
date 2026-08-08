@@ -6,6 +6,7 @@ license.workspace = true
 
 [dependencies]
 bigdecimal = "0.4"
+chrono = { version = "0.4", default-features = false, features = ["std", "now"] }
 sqlparser = { version = "0.53", features = ["visitor"] }
 thiserror = "2"
 uuid = { version = "1", features = ["v4"] }

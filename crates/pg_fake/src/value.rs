@@ -1,10 +1,21 @@
 use bigdecimal::BigDecimal;
+use chrono::Timelike;
 use std::str::FromStr;
 
 use crate::error::{PgError, Result, SqlState};
 
 /// A PostgreSQL type OID (unsigned 32-bit, matching `pg_type.oid`).
 pub type Oid = u32;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub enum PgDate {
+    NegInfinity,
+    Finite(chrono::NaiveDate),
+    Infinity,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub struct PgTime(pub i64);
 
 /// Phase-1 PostgreSQL base types (§3.1).
 ///
@@ -25,6 +36,8 @@ pub enum BaseType {
     Bpchar,
     Bytea,
     Uuid,
+    Date,
+    Time,
 }
 
 impl BaseType {
@@ -43,6 +56,8 @@ impl BaseType {
             BaseType::Float8 => 701,
             BaseType::Numeric => 1700,
             BaseType::Uuid => 2950,
+            BaseType::Date => 1082,
+            BaseType::Time => 1083,
         }
     }
 
@@ -61,6 +76,8 @@ impl BaseType {
             BaseType::Bpchar => "bpchar",
             BaseType::Bytea => "bytea",
             BaseType::Uuid => "uuid",
+            BaseType::Date => "date",
+            BaseType::Time => "time",
         }
     }
 
@@ -79,6 +96,8 @@ impl BaseType {
             701 => Some(BaseType::Float8),
             1700 => Some(BaseType::Numeric),
             2950 => Some(BaseType::Uuid),
+            1082 => Some(BaseType::Date),
+            1083 => Some(BaseType::Time),
             _ => None,
         }
     }
@@ -99,6 +118,8 @@ impl BaseType {
             "bpchar" | "character" => Some(BaseType::Bpchar),
             "bytea" => Some(BaseType::Bytea),
             "uuid" => Some(BaseType::Uuid),
+            "date" => Some(BaseType::Date),
+            "time" | "time without time zone" => Some(BaseType::Time),
             _ => None,
         }
     }
@@ -152,6 +173,8 @@ pub enum Value {
     Text(String),
     Bytea(Vec<u8>),
     Uuid(uuid::Uuid),
+    Date(PgDate),
+    Time(PgTime),
 }
 
 impl Value {
@@ -176,6 +199,8 @@ impl Value {
             Value::Text(_) => Some(BaseType::Text),
             Value::Bytea(_) => Some(BaseType::Bytea),
             Value::Uuid(_) => Some(BaseType::Uuid),
+            Value::Date(_) => Some(BaseType::Date),
+            Value::Time(_) => Some(BaseType::Time),
         }
     }
 
@@ -209,6 +234,23 @@ impl Value {
                 out
             }
             Value::Uuid(value) => value.to_string(),
+            Value::Date(PgDate::NegInfinity) => "-infinity".into(),
+            Value::Date(PgDate::Infinity) => "infinity".into(),
+            Value::Date(PgDate::Finite(value)) => value.format("%Y-%m-%d").to_string(),
+            Value::Time(PgTime(value)) if *value == 86_400_000_000 => "24:00:00".into(),
+            Value::Time(PgTime(value)) => {
+                let hours = value / 3_600_000_000;
+                let minutes = value / 60_000_000 % 60;
+                let seconds = value / 1_000_000 % 60;
+                let micros = value % 1_000_000;
+                if micros == 0 {
+                    format!("{hours:02}:{minutes:02}:{seconds:02}")
+                } else {
+                    format!("{hours:02}:{minutes:02}:{seconds:02}.{micros:06}")
+                        .trim_end_matches('0')
+                        .into()
+                }
+            }
         }
     }
 
@@ -233,6 +275,8 @@ impl Value {
             BaseType::Uuid => uuid::Uuid::parse_str(input)
                 .map(Value::Uuid)
                 .map_err(|_| invalid_text(input, "uuid")),
+            BaseType::Date => parse_date(input).map(Value::Date),
+            BaseType::Time => parse_time(input).map(Value::Time),
         }
     }
 }
@@ -249,6 +293,30 @@ fn format_float(f: f64) -> String {
         };
     }
     format!("{}", f)
+}
+
+fn parse_date(input: &str) -> Result<PgDate> {
+    match input.trim().to_ascii_lowercase().as_str() {
+        "infinity" => Ok(PgDate::Infinity),
+        "-infinity" => Ok(PgDate::NegInfinity),
+        _ => chrono::NaiveDate::parse_from_str(input.trim(), "%Y-%m-%d")
+            .map(PgDate::Finite)
+            .map_err(|_| invalid_text(input, "date")),
+    }
+}
+
+fn parse_time(input: &str) -> Result<PgTime> {
+    let input = input.trim();
+    if input == "24:00" || input == "24:00:00" || input == "24:00:00.0" {
+        return Ok(PgTime(86_400_000_000));
+    }
+    let value = chrono::NaiveTime::parse_from_str(input, "%H:%M:%S%.f")
+        .or_else(|_| chrono::NaiveTime::parse_from_str(input, "%H:%M"))
+        .map_err(|_| invalid_text(input, "time"))?;
+    Ok(PgTime(
+        i64::from(value.num_seconds_from_midnight()) * 1_000_000
+            + i64::from(value.nanosecond() / 1_000),
+    ))
 }
 
 fn parse_bool(input: &str) -> Result<bool> {

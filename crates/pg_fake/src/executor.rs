@@ -11,10 +11,10 @@ use crate::{
     value::{BaseType, PgType, Value},
 };
 use sqlparser::ast::{
-    AssignmentTarget, BinaryOperator, CastKind, ColumnOption, Delete, Expr, FromTable, Function,
-    FunctionArg, FunctionArgExpr, FunctionArguments, GroupByExpr, Ident, LockType, ObjectType,
-    ReferentialAction, SelectItem, SetExpr, Statement, TableConstraint, TableFactor,
-    TableWithJoins, UnaryOperator, Value as AstValue,
+    AssignmentTarget, BinaryOperator, CastKind, ColumnOption, DateTimeField, Delete, Expr,
+    FromTable, Function, FunctionArg, FunctionArgExpr, FunctionArguments, GroupByExpr, Ident,
+    LockType, ObjectType, ReferentialAction, SelectItem, SetExpr, Statement, TableConstraint,
+    TableFactor, TableWithJoins, UnaryOperator, Value as AstValue,
 };
 use std::{
     cmp::Ordering,
@@ -2152,6 +2152,17 @@ pub(crate) fn expression_type(expr: &Expr, schema: &TableSchema) -> Result<BaseT
             }
             Ok(target.base)
         }
+        Expr::Extract { expr, .. } => {
+            let base = expression_type(expr, schema)?;
+            if matches!(base, BaseType::Date | BaseType::Time) || null_expression(expr) {
+                Ok(BaseType::Numeric)
+            } else {
+                Err(PgError::new(
+                    SqlState::DatatypeMismatch,
+                    "extract source must be date or time",
+                ))
+            }
+        }
         _ => Err(PgError::new(
             SqlState::FeatureNotSupported,
             "expression is not implemented",
@@ -2459,6 +2470,9 @@ fn evaluate(expr: &Expr, schema: &TableSchema, row: &[Value]) -> Result<Value> {
                 )
             }
         }
+        Expr::Extract { field, expr, .. } => {
+            extract_value(field.clone(), evaluate(expr, schema, row)?)
+        }
         _ => Err(PgError::new(
             SqlState::FeatureNotSupported,
             "expression is not implemented",
@@ -2761,6 +2775,53 @@ fn comparison(operator: &BinaryOperator, left: &Value, right: &Value) -> Result<
     }))
 }
 
+fn extract_value(field: DateTimeField, value: Value) -> Result<Value> {
+    use chrono::Datelike;
+    let value = match value {
+        Value::Null => return Ok(Value::Null),
+        Value::Date(crate::value::PgDate::Finite(value)) => match field {
+            DateTimeField::Year => value.year() as i64,
+            DateTimeField::Month => i64::from(value.month()),
+            DateTimeField::Day => i64::from(value.day()),
+            DateTimeField::Dow => i64::from(value.weekday().num_days_from_sunday()),
+            DateTimeField::Doy => i64::from(value.ordinal()),
+            DateTimeField::Epoch => i64::from(value.num_days_from_ce()) * 86_400,
+            _ => {
+                return Err(PgError::new(
+                    SqlState::FeatureNotSupported,
+                    "date part is not implemented",
+                ));
+            }
+        },
+        Value::Time(crate::value::PgTime(value)) => match field {
+            DateTimeField::Hour => value / 3_600_000_000,
+            DateTimeField::Minute => value / 60_000_000 % 60,
+            DateTimeField::Second => value / 1_000_000 % 60,
+            DateTimeField::Microsecond | DateTimeField::Microseconds => value % 1_000_000,
+            DateTimeField::Epoch => value / 1_000_000,
+            _ => {
+                return Err(PgError::new(
+                    SqlState::FeatureNotSupported,
+                    "date part is not implemented",
+                ));
+            }
+        },
+        Value::Date(crate::value::PgDate::Infinity | crate::value::PgDate::NegInfinity) => {
+            return Err(PgError::new(
+                SqlState::NumericValueOutOfRange,
+                "cannot extract from infinite date",
+            ));
+        }
+        _ => {
+            return Err(PgError::new(
+                SqlState::DatatypeMismatch,
+                "extract source must be date or time",
+            ));
+        }
+    };
+    Ok(Value::Numeric(value.into()))
+}
+
 fn value_ordering(left: &Value, right: &Value) -> Result<Ordering> {
     Ok(match (left, right) {
         (Value::Bool(left), Value::Bool(right)) => left.cmp(right),
@@ -2773,6 +2834,8 @@ fn value_ordering(left: &Value, right: &Value) -> Result<Ordering> {
         (Value::Text(left), Value::Text(right)) => left.cmp(right),
         (Value::Bytea(left), Value::Bytea(right)) => left.cmp(right),
         (Value::Uuid(left), Value::Uuid(right)) => left.cmp(right),
+        (Value::Date(left), Value::Date(right)) => left.cmp(right),
+        (Value::Time(left), Value::Time(right)) => left.cmp(right),
         _ => {
             return Err(PgError::new(
                 SqlState::DatatypeMismatch,

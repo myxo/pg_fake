@@ -1191,6 +1191,25 @@ mod tests {
     }
 
     #[test]
+    fn date_and_time_values_preserve_postgres_special_forms() {
+        let db = Db::new();
+        let mut session = db.session();
+        session
+            .execute("CREATE TABLE values_table (day DATE, moment TIME(6))")
+            .unwrap();
+        session
+            .execute("INSERT INTO values_table VALUES ('infinity', '24:00:00')")
+            .unwrap();
+        let result = session
+            .query("SELECT day, moment FROM values_table", &[])
+            .unwrap();
+        assert_eq!(result.rows[0][0].to_text(), "infinity");
+        assert_eq!(result.rows[0][1].to_text(), "24:00:00");
+        assert_eq!(result.columns[0].type_oid, BaseType::Date.oid());
+        assert_eq!(result.columns[1].type_oid, BaseType::Time.oid());
+    }
+
+    #[test]
     fn match_full_rejects_partially_null_composite_keys() {
         let db = Db::new();
         let mut session = db.session();

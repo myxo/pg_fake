@@ -57,6 +57,8 @@ impl TypeInfo for PgFakeTypeInfo {
             Some(BaseType::Bpchar) => "BPCHAR",
             Some(BaseType::Bytea) => "BYTEA",
             Some(BaseType::Uuid) => "UUID",
+            Some(BaseType::Date) => "DATE",
+            Some(BaseType::Time) => "TIME",
             None => "NULL",
         }
     }
@@ -158,6 +160,62 @@ scalar_type!(f32, BaseType::Float4, Value::Float4);
 scalar_type!(f64, BaseType::Float8, Value::Float8);
 scalar_type!(BigDecimal, BaseType::Numeric, Value::Numeric);
 scalar_type!(uuid::Uuid, BaseType::Uuid, Value::Uuid);
+
+impl Type<PgFake> for chrono::NaiveDate {
+    fn type_info() -> PgFakeTypeInfo {
+        PgFakeTypeInfo::new(BaseType::Date)
+    }
+}
+
+impl<'q> Encode<'q, PgFake> for chrono::NaiveDate {
+    fn encode_by_ref(&self, buffer: &mut Vec<Value>) -> Result<IsNull, BoxDynError> {
+        buffer.push(Value::Date(pg_fake::value::PgDate::Finite(*self)));
+        Ok(IsNull::No)
+    }
+}
+
+impl<'r> Decode<'r, PgFake> for chrono::NaiveDate {
+    fn decode(value: PgFakeValueRef<'r>) -> Result<Self, BoxDynError> {
+        match value.value {
+            Value::Date(pg_fake::value::PgDate::Finite(value)) => Ok(*value),
+            Value::Null => Err(Box::new(UnexpectedNullError)),
+            value => Err(format!("cannot decode {value:?} as NaiveDate").into()),
+        }
+    }
+}
+
+impl Type<PgFake> for chrono::NaiveTime {
+    fn type_info() -> PgFakeTypeInfo {
+        PgFakeTypeInfo::new(BaseType::Time)
+    }
+}
+
+impl<'q> Encode<'q, PgFake> for chrono::NaiveTime {
+    fn encode_by_ref(&self, buffer: &mut Vec<Value>) -> Result<IsNull, BoxDynError> {
+        use chrono::Timelike;
+        buffer.push(Value::Time(pg_fake::value::PgTime(
+            i64::from(self.num_seconds_from_midnight()) * 1_000_000
+                + i64::from(self.nanosecond() / 1_000),
+        )));
+        Ok(IsNull::No)
+    }
+}
+
+impl<'r> Decode<'r, PgFake> for chrono::NaiveTime {
+    fn decode(value: PgFakeValueRef<'r>) -> Result<Self, BoxDynError> {
+        match value.value {
+            Value::Time(pg_fake::value::PgTime(value)) if *value < 86_400_000_000 => {
+                chrono::NaiveTime::from_num_seconds_from_midnight_opt(
+                    (*value / 1_000_000) as u32,
+                    ((*value % 1_000_000) * 1_000) as u32,
+                )
+                .ok_or_else(|| "invalid time value".into())
+            }
+            Value::Null => Err(Box::new(UnexpectedNullError)),
+            value => Err(format!("cannot decode {value:?} as NaiveTime").into()),
+        }
+    }
+}
 
 impl Type<PgFake> for str {
     fn type_info() -> PgFakeTypeInfo {

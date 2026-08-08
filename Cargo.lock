@@ -1647,6 +1647,7 @@ name = "pg_fake"
 version = "0.1.0"
 dependencies = [
  "bigdecimal",
+ "chrono",
  "postgres",
  "sqlparser",
  "testcontainers",
@@ -1661,6 +1662,7 @@ version = "0.1.0"
 dependencies = [
  "bigdecimal",
  "chaos_theory",
+ "chrono",
  "criterion",
  "either",
  "futures-core",

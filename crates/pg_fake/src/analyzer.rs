@@ -538,6 +538,8 @@ fn typed_literal(value: Value, data_type: BaseType) -> Expr {
         Value::Text(value) => AstValue::SingleQuotedString(value),
         Value::Bytea(value) => AstValue::SingleQuotedString(Value::Bytea(value).to_text()),
         Value::Uuid(value) => AstValue::SingleQuotedString(value.to_string()),
+        Value::Date(value) => AstValue::SingleQuotedString(Value::Date(value).to_text()),
+        Value::Time(value) => AstValue::SingleQuotedString(Value::Time(value).to_text()),
     };
     Expr::Cast {
         kind: CastKind::Cast,
@@ -561,5 +563,7 @@ fn ast_data_type(data_type: BaseType) -> DataType {
         BaseType::Bpchar => DataType::Char(None),
         BaseType::Bytea => DataType::Bytea,
         BaseType::Uuid => DataType::Uuid,
+        BaseType::Date => DataType::Date,
+        BaseType::Time => DataType::Time(None, sqlparser::ast::TimezoneInfo::WithoutTimeZone),
     }
 }

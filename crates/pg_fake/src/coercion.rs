@@ -1,5 +1,5 @@
 use bigdecimal::{BigDecimal, FromPrimitive, RoundingMode, ToPrimitive};
-use sqlparser::ast::{CharacterLength, DataType, ExactNumberInfo};
+use sqlparser::ast::{CharacterLength, DataType, ExactNumberInfo, TimezoneInfo};
 
 use crate::{
     error::{PgError, Result, SqlState},
@@ -37,6 +37,10 @@ pub(crate) fn type_from_ast(data_type: &DataType) -> Result<PgType> {
         }
         DataType::Bytea => (BaseType::Bytea, PgType::NO_TYPEMOD),
         DataType::Uuid => (BaseType::Uuid, PgType::NO_TYPEMOD),
+        DataType::Date => (BaseType::Date, PgType::NO_TYPEMOD),
+        DataType::Time(precision, TimezoneInfo::None | TimezoneInfo::WithoutTimeZone) => {
+            (BaseType::Time, time_typmod(*precision)?)
+        }
         DataType::Custom(_, _) if !data_type.to_string().contains('(') => {
             let Some(base) = BaseType::from_name(&data_type.to_string()) else {
                 return Err(PgError::new(
@@ -96,6 +100,17 @@ fn numeric_typmod(info: ExactNumberInfo) -> Result<i32> {
     Ok(((precision as i32) << 16) + scale as i32 + 4)
 }
 
+fn time_typmod(precision: Option<u64>) -> Result<i32> {
+    match precision {
+        None => Ok(PgType::NO_TYPEMOD),
+        Some(precision) if precision <= 6 => Ok(precision as i32),
+        Some(_) => Err(PgError::new(
+            SqlState::InvalidParameterValue,
+            "time precision must be between 0 and 6",
+        )),
+    }
+}
+
 pub(crate) fn common_type(left: BaseType, right: BaseType) -> Option<BaseType> {
     if left == right {
         return Some(left);
@@ -127,12 +142,12 @@ fn required_context(source: BaseType, target: BaseType) -> Option<CastContext> {
         return Some(CastContext::Assignment);
     }
     if string(source) {
-        if target == BaseType::Uuid {
+        if matches!(target, BaseType::Uuid | BaseType::Date | BaseType::Time) {
             return Some(CastContext::Assignment);
         }
         return Some(CastContext::Explicit);
     }
-    if source == BaseType::Uuid && string(target) {
+    if matches!(source, BaseType::Uuid | BaseType::Date | BaseType::Time) && string(target) {
         return Some(CastContext::Assignment);
     }
     if matches!(
@@ -355,6 +370,13 @@ fn apply_typmod(value: Value, target: PgType, context: CastContext) -> Result<Va
                 return Err(out_of_range(BaseType::Numeric));
             }
             Ok(Value::Numeric(value))
+        }
+        (Value::Time(value), BaseType::Time) => {
+            let precision = u32::try_from(target.typmod).expect("time typmod is non-negative");
+            let unit = 10_i64.pow(6 - precision);
+            Ok(Value::Time(crate::value::PgTime(
+                ((value.0 + unit / 2) / unit * unit).min(86_400_000_000),
+            )))
         }
         (value, _) => Ok(value),
     }

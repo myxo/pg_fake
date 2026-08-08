@@ -40,6 +40,8 @@ enum IndexValue {
     Text(String),
     Bytea(Vec<u8>),
     Uuid(uuid::Uuid),
+    Date(crate::value::PgDate),
+    Time(crate::value::PgTime),
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
@@ -278,6 +280,8 @@ fn index_key(schema: &TableSchema, index: &UniqueIndex, row: &Row) -> Option<Ind
                 }
                 (Value::Bytea(value), BaseType::Bytea) => Some(IndexValue::Bytea(value.clone())),
                 (Value::Uuid(value), BaseType::Uuid) => Some(IndexValue::Uuid(*value)),
+                (Value::Date(value), BaseType::Date) => Some(IndexValue::Date(*value)),
+                (Value::Time(value), BaseType::Time) => Some(IndexValue::Time(*value)),
                 _ => unreachable!("row values must match declared column types"),
             },
         )
