@@ -119,6 +119,31 @@ async fn sqlx_timestamp_values_round_trip() {
 }
 
 #[tokio::test]
+async fn sqlx_intervals_round_trip() {
+    let mut connection = PgFakeConnection::new(Db::new());
+    let interval = pg_fake::value::PgInterval {
+        months: 1,
+        days: 2,
+        micros: 3_000_000,
+    };
+    connection
+        .execute("CREATE TABLE intervals (value INTERVAL)")
+        .await
+        .unwrap();
+    sqlx::query("INSERT INTO intervals VALUES ($1)")
+        .bind(interval)
+        .execute(&mut connection)
+        .await
+        .unwrap();
+    let row = sqlx::query("SELECT value FROM intervals")
+        .fetch_one(&mut connection)
+        .await
+        .unwrap();
+    assert_eq!(row.get::<pg_fake::value::PgInterval, _>(0), interval);
+    assert_eq!(row.columns()[0].type_info().name(), "INTERVAL");
+}
+
+#[tokio::test]
 async fn prepared_statements_transactions_and_pools_use_the_sqlx_api() {
     let db = Db::new();
     let pool = PgFakePoolOptions::new()

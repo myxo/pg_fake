@@ -44,6 +44,7 @@ enum IndexValue {
     Time(crate::value::PgTime),
     Timestamp(crate::value::PgTimestamp),
     TimestampTz(crate::value::PgTimestampTz),
+    Interval(crate::value::PgInterval),
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
@@ -290,6 +291,7 @@ fn index_key(schema: &TableSchema, index: &UniqueIndex, row: &Row) -> Option<Ind
                 (Value::TimestampTz(value), BaseType::TimestampTz) => {
                     Some(IndexValue::TimestampTz(*value))
                 }
+                (Value::Interval(value), BaseType::Interval) => Some(IndexValue::Interval(*value)),
                 _ => unreachable!("row values must match declared column types"),
             },
         )

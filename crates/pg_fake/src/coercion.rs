@@ -48,6 +48,7 @@ pub(crate) fn type_from_ast(data_type: &DataType) -> Result<PgType> {
         DataType::Timestamp(precision, TimezoneInfo::WithTimeZone | TimezoneInfo::Tz) => {
             (BaseType::TimestampTz, time_typmod(*precision)?)
         }
+        DataType::Interval => (BaseType::Interval, PgType::NO_TYPEMOD),
         DataType::Custom(_, _) => {
             let Some(base) = BaseType::from_name(&data_type.to_string()) else {
                 return Err(PgError::new(
@@ -156,6 +157,7 @@ fn required_context(source: BaseType, target: BaseType) -> Option<CastContext> {
                 | BaseType::Time
                 | BaseType::Timestamp
                 | BaseType::TimestampTz
+                | BaseType::Interval
         ) {
             return Some(CastContext::Assignment);
         }
@@ -168,6 +170,7 @@ fn required_context(source: BaseType, target: BaseType) -> Option<CastContext> {
             | BaseType::Time
             | BaseType::Timestamp
             | BaseType::TimestampTz
+            | BaseType::Interval
     ) && string(target)
     {
         return Some(CastContext::Assignment);

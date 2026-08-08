@@ -61,6 +61,7 @@ impl TypeInfo for PgFakeTypeInfo {
             Some(BaseType::Time) => "TIME",
             Some(BaseType::Timestamp) => "TIMESTAMP",
             Some(BaseType::TimestampTz) => "TIMESTAMPTZ",
+            Some(BaseType::Interval) => "INTERVAL",
             None => "NULL",
         }
     }
@@ -162,6 +163,11 @@ scalar_type!(f32, BaseType::Float4, Value::Float4);
 scalar_type!(f64, BaseType::Float8, Value::Float8);
 scalar_type!(BigDecimal, BaseType::Numeric, Value::Numeric);
 scalar_type!(uuid::Uuid, BaseType::Uuid, Value::Uuid);
+scalar_type!(
+    pg_fake::value::PgInterval,
+    BaseType::Interval,
+    Value::Interval
+);
 
 impl Type<PgFake> for chrono::NaiveDate {
     fn type_info() -> PgFakeTypeInfo {

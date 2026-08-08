@@ -35,6 +35,15 @@ pub enum PgTimestampTz {
     Infinity,
 }
 
+/// PostgreSQL intervals retain calendar months, days, and clock microseconds
+/// independently; collapsing them to a duration loses month-end semantics.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub struct PgInterval {
+    pub months: i32,
+    pub days: i32,
+    pub micros: i64,
+}
+
 /// Phase-1 PostgreSQL base types (§3.1).
 ///
 /// Each variant maps to a distinct `pg_type` OID. The character types
@@ -58,6 +67,7 @@ pub enum BaseType {
     Time,
     Timestamp,
     TimestampTz,
+    Interval,
 }
 
 impl BaseType {
@@ -80,6 +90,7 @@ impl BaseType {
             BaseType::Time => 1083,
             BaseType::Timestamp => 1114,
             BaseType::TimestampTz => 1184,
+            BaseType::Interval => 1186,
         }
     }
 
@@ -102,6 +113,7 @@ impl BaseType {
             BaseType::Time => "time",
             BaseType::Timestamp => "timestamp",
             BaseType::TimestampTz => "timestamptz",
+            BaseType::Interval => "interval",
         }
     }
 
@@ -124,6 +136,7 @@ impl BaseType {
             1083 => Some(BaseType::Time),
             1114 => Some(BaseType::Timestamp),
             1184 => Some(BaseType::TimestampTz),
+            1186 => Some(BaseType::Interval),
             _ => None,
         }
     }
@@ -148,6 +161,7 @@ impl BaseType {
             "time" | "time without time zone" => Some(BaseType::Time),
             "timestamp" | "timestamp without time zone" => Some(BaseType::Timestamp),
             "timestamptz" | "timestamp with time zone" => Some(BaseType::TimestampTz),
+            "interval" => Some(BaseType::Interval),
             _ => None,
         }
     }
@@ -205,6 +219,7 @@ pub enum Value {
     Time(PgTime),
     Timestamp(PgTimestamp),
     TimestampTz(PgTimestampTz),
+    Interval(PgInterval),
 }
 
 impl Value {
@@ -233,6 +248,7 @@ impl Value {
             Value::Time(_) => Some(BaseType::Time),
             Value::Timestamp(_) => Some(BaseType::Timestamp),
             Value::TimestampTz(_) => Some(BaseType::TimestampTz),
+            Value::Interval(_) => Some(BaseType::Interval),
         }
     }
 
@@ -291,6 +307,7 @@ impl Value {
             Value::TimestampTz(PgTimestampTz::Finite(value)) => {
                 format!("{}+00", format_timestamp(value.naive_utc()))
             }
+            Value::Interval(value) => format_interval(*value),
         }
     }
 
@@ -319,8 +336,178 @@ impl Value {
             BaseType::Time => parse_time(input).map(Value::Time),
             BaseType::Timestamp => parse_timestamp(input).map(Value::Timestamp),
             BaseType::TimestampTz => parse_timestamptz(input).map(Value::TimestampTz),
+            BaseType::Interval => parse_interval(input).map(Value::Interval),
         }
     }
+}
+
+fn format_interval(value: PgInterval) -> String {
+    let mut fields = Vec::new();
+    if value.months != 0 {
+        let years = value.months / 12;
+        let months = value.months % 12;
+        if years != 0 {
+            fields.push(format!(
+                "{years} year{}",
+                if years.abs() == 1 { "" } else { "s" }
+            ));
+        }
+        if months != 0 {
+            fields.push(format!(
+                "{months} mon{}",
+                if months.abs() == 1 { "" } else { "s" }
+            ));
+        }
+    }
+    if value.days != 0 {
+        fields.push(format!(
+            "{} day{}",
+            value.days,
+            if value.days.abs() == 1 { "" } else { "s" }
+        ));
+    }
+    if value.micros != 0 || fields.is_empty() {
+        let sign = if value.micros < 0 { "-" } else { "" };
+        let micros = value.micros.unsigned_abs();
+        let hours = micros / 3_600_000_000;
+        let minutes = micros / 60_000_000 % 60;
+        let seconds = micros / 1_000_000 % 60;
+        let fraction = micros % 1_000_000;
+        let time = if fraction == 0 {
+            format!("{hours:02}:{minutes:02}:{seconds:02}")
+        } else {
+            format!("{hours:02}:{minutes:02}:{seconds:02}.{fraction:06}")
+                .trim_end_matches('0')
+                .to_string()
+        };
+        fields.push(format!("{sign}{time}"));
+    }
+    fields.join(" ")
+}
+
+fn parse_interval(input: &str) -> Result<PgInterval> {
+    let input = input.trim();
+    if input.is_empty() {
+        return Err(invalid_text(input, "interval"));
+    }
+    let mut value = PgInterval {
+        months: 0,
+        days: 0,
+        micros: 0,
+    };
+    let parts: Vec<_> = input.split_whitespace().collect();
+    let mut index = 0;
+    while index < parts.len() {
+        if parts[index].contains(':') {
+            let sign = if parts[index].starts_with('-') {
+                -1_i64
+            } else {
+                1
+            };
+            let time = parts[index].trim_start_matches(['+', '-']);
+            let fields: Vec<_> = time.split(':').collect();
+            if fields.len() != 3 {
+                return Err(invalid_text(input, "interval"));
+            }
+            let hour = fields[0]
+                .parse::<i64>()
+                .map_err(|_| invalid_text(input, "interval"))?;
+            let minute = fields[1]
+                .parse::<i64>()
+                .map_err(|_| invalid_text(input, "interval"))?;
+            let second = fields[2]
+                .parse::<f64>()
+                .map_err(|_| invalid_text(input, "interval"))?;
+            value.micros = value
+                .micros
+                .checked_add(
+                    sign * (hour * 3_600_000_000
+                        + minute * 60_000_000
+                        + (second * 1_000_000.0).round() as i64),
+                )
+                .ok_or_else(|| {
+                    PgError::new(SqlState::NumericValueOutOfRange, "interval out of range")
+                })?;
+            index += 1;
+            continue;
+        }
+        if index + 1 >= parts.len() {
+            return Err(invalid_text(input, "interval"));
+        }
+        let number = parts[index]
+            .parse::<i64>()
+            .map_err(|_| invalid_text(input, "interval"))?;
+        match parts[index + 1].to_ascii_lowercase().as_str() {
+            "year" | "years" => {
+                value.months = value
+                    .months
+                    .checked_add(
+                        i32::try_from(number.checked_mul(12).ok_or_else(|| {
+                            PgError::new(SqlState::NumericValueOutOfRange, "interval out of range")
+                        })?)
+                        .map_err(|_| {
+                            PgError::new(SqlState::NumericValueOutOfRange, "interval out of range")
+                        })?,
+                    )
+                    .ok_or_else(|| {
+                        PgError::new(SqlState::NumericValueOutOfRange, "interval out of range")
+                    })?
+            }
+            "mon" | "mons" | "month" | "months" => {
+                value.months = value
+                    .months
+                    .checked_add(i32::try_from(number).map_err(|_| {
+                        PgError::new(SqlState::NumericValueOutOfRange, "interval out of range")
+                    })?)
+                    .ok_or_else(|| {
+                        PgError::new(SqlState::NumericValueOutOfRange, "interval out of range")
+                    })?
+            }
+            "day" | "days" => {
+                value.days = value
+                    .days
+                    .checked_add(i32::try_from(number).map_err(|_| {
+                        PgError::new(SqlState::NumericValueOutOfRange, "interval out of range")
+                    })?)
+                    .ok_or_else(|| {
+                        PgError::new(SqlState::NumericValueOutOfRange, "interval out of range")
+                    })?
+            }
+            "hour" | "hours" => {
+                value.micros = value
+                    .micros
+                    .checked_add(number.checked_mul(3_600_000_000).ok_or_else(|| {
+                        PgError::new(SqlState::NumericValueOutOfRange, "interval out of range")
+                    })?)
+                    .ok_or_else(|| {
+                        PgError::new(SqlState::NumericValueOutOfRange, "interval out of range")
+                    })?
+            }
+            "minute" | "minutes" | "min" | "mins" => {
+                value.micros = value
+                    .micros
+                    .checked_add(number.checked_mul(60_000_000).ok_or_else(|| {
+                        PgError::new(SqlState::NumericValueOutOfRange, "interval out of range")
+                    })?)
+                    .ok_or_else(|| {
+                        PgError::new(SqlState::NumericValueOutOfRange, "interval out of range")
+                    })?
+            }
+            "second" | "seconds" | "sec" | "secs" => {
+                value.micros = value
+                    .micros
+                    .checked_add(number.checked_mul(1_000_000).ok_or_else(|| {
+                        PgError::new(SqlState::NumericValueOutOfRange, "interval out of range")
+                    })?)
+                    .ok_or_else(|| {
+                        PgError::new(SqlState::NumericValueOutOfRange, "interval out of range")
+                    })?
+            }
+            _ => return Err(invalid_text(input, "interval")),
+        }
+        index += 2;
+    }
+    Ok(value)
 }
 
 fn format_timestamp(value: NaiveDateTime) -> String {

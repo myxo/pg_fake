@@ -544,6 +544,7 @@ fn typed_literal(value: Value, data_type: BaseType) -> Expr {
         Value::TimestampTz(value) => {
             AstValue::SingleQuotedString(Value::TimestampTz(value).to_text())
         }
+        Value::Interval(value) => AstValue::SingleQuotedString(Value::Interval(value).to_text()),
     };
     Expr::Cast {
         kind: CastKind::Cast,
@@ -575,5 +576,6 @@ fn ast_data_type(data_type: BaseType) -> DataType {
         BaseType::TimestampTz => {
             DataType::Timestamp(None, sqlparser::ast::TimezoneInfo::WithTimeZone)
         }
+        BaseType::Interval => DataType::Interval,
     }
 }

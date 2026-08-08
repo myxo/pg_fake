@@ -1280,6 +1280,31 @@ mod tests {
     }
 
     #[test]
+    fn intervals_preserve_calendar_and_clock_parts() {
+        let db = Db::new();
+        let mut session = db.session();
+        session
+            .execute("CREATE TABLE events (started TIMESTAMP, duration INTERVAL)")
+            .unwrap();
+        session
+            .execute("INSERT INTO events VALUES ('2024-01-31 12:00:00', '1 month 2 days 03:04:05')")
+            .unwrap();
+        let result = session
+            .query("SELECT started + duration, duration * 2 FROM events", &[])
+            .unwrap();
+        assert_eq!(
+            result.columns[0].type_oid,
+            crate::value::BaseType::Timestamp.oid()
+        );
+        assert_eq!(
+            result.columns[1].type_oid,
+            crate::value::BaseType::Interval.oid()
+        );
+        assert_eq!(result.rows[0][0].to_text(), "2024-03-02 15:04:05");
+        assert_eq!(result.rows[0][1].to_text(), "2 mons 4 days 06:08:10");
+    }
+
+    #[test]
     fn date_and_time_values_preserve_postgres_special_forms() {
         let db = Db::new();
         let mut session = db.session();

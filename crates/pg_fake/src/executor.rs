@@ -1,3 +1,5 @@
+use bigdecimal::ToPrimitive;
+
 use crate::{
     api::{ColumnMeta, QueryResult, StatementResult},
     catalog::{Catalog, ColumnDef, ForeignKey, ForeignKeyAction, TableId, TableSchema},
@@ -2026,6 +2028,13 @@ pub(crate) fn expression_type(expr: &Expr, schema: &TableSchema) -> Result<BaseT
             | BinaryOperator::Multiply
             | BinaryOperator::Divide
             | BinaryOperator::Modulo => {
+                let left_type = expression_type(left, schema)?;
+                let right_type = expression_type(right, schema)?;
+                if matches!(left_type, BaseType::Interval)
+                    || matches!(right_type, BaseType::Interval)
+                {
+                    return interval_arithmetic_type(op, left_type, right_type);
+                }
                 let base = expression_common_type(left, right, schema)?;
                 if numeric(base) {
                     Ok(base)
@@ -2347,6 +2356,23 @@ fn evaluate(expr: &Expr, schema: &TableSchema, row: &[Value]) -> Result<Value> {
             unary(*op, evaluate(expr, schema, row)?)
         }
         Expr::BinaryOp { left, op, right } => {
+            let left_type = expression_type(left, schema)?;
+            let right_type = expression_type(right, schema)?;
+            if matches!(
+                op,
+                BinaryOperator::Plus
+                    | BinaryOperator::Minus
+                    | BinaryOperator::Multiply
+                    | BinaryOperator::Divide
+            ) && (left_type == BaseType::Interval || right_type == BaseType::Interval)
+            {
+                let left = evaluate(left, schema, row)?;
+                let right = evaluate(right, schema, row)?;
+                if left.is_null() || right.is_null() {
+                    return Ok(Value::Null);
+                }
+                return temporal_arithmetic(op, left, right);
+            }
             let target = if matches!(op, BinaryOperator::And | BinaryOperator::Or) {
                 BaseType::Bool
             } else {
@@ -2766,6 +2792,216 @@ fn arithmetic(operator: &BinaryOperator, left: Value, right: Value) -> Result<Va
     }
 }
 
+fn interval_arithmetic_type(
+    operator: &BinaryOperator,
+    left: BaseType,
+    right: BaseType,
+) -> Result<BaseType> {
+    let numeric = |value| {
+        matches!(
+            value,
+            BaseType::Int2
+                | BaseType::Int4
+                | BaseType::Int8
+                | BaseType::Float4
+                | BaseType::Float8
+                | BaseType::Numeric
+        )
+    };
+    match (operator, left, right) {
+        (BinaryOperator::Plus | BinaryOperator::Minus, BaseType::Interval, BaseType::Interval) => {
+            Ok(BaseType::Interval)
+        }
+        (
+            BinaryOperator::Plus,
+            BaseType::Date | BaseType::Timestamp | BaseType::TimestampTz,
+            BaseType::Interval,
+        )
+        | (
+            BinaryOperator::Plus,
+            BaseType::Interval,
+            BaseType::Date | BaseType::Timestamp | BaseType::TimestampTz,
+        )
+        | (
+            BinaryOperator::Minus,
+            BaseType::Date | BaseType::Timestamp | BaseType::TimestampTz,
+            BaseType::Interval,
+        ) => Ok(if left == BaseType::Interval {
+            right
+        } else {
+            left
+        }),
+        (BinaryOperator::Multiply, BaseType::Interval, right) if numeric(right) => {
+            Ok(BaseType::Interval)
+        }
+        (BinaryOperator::Multiply, left, BaseType::Interval) if numeric(left) => {
+            Ok(BaseType::Interval)
+        }
+        (BinaryOperator::Divide, BaseType::Interval, right) if numeric(right) => {
+            Ok(BaseType::Interval)
+        }
+        _ => Err(PgError::new(
+            SqlState::DatatypeMismatch,
+            "operator has incompatible types",
+        )),
+    }
+}
+
+fn temporal_arithmetic(operator: &BinaryOperator, left: Value, right: Value) -> Result<Value> {
+    use chrono::{Days, Months, TimeDelta};
+    fn interval_scale(
+        value: crate::value::PgInterval,
+        factor: f64,
+    ) -> Result<crate::value::PgInterval> {
+        if !factor.is_finite() {
+            return Err(PgError::new(
+                SqlState::NumericValueOutOfRange,
+                "interval out of range",
+            ));
+        }
+        Ok(crate::value::PgInterval {
+            months: (f64::from(value.months) * factor).round() as i32,
+            days: (f64::from(value.days) * factor).round() as i32,
+            micros: (value.micros as f64 * factor).round() as i64,
+        })
+    }
+    fn signed_interval(
+        mut interval: crate::value::PgInterval,
+        negative: bool,
+    ) -> crate::value::PgInterval {
+        if negative {
+            interval.months = -interval.months;
+            interval.days = -interval.days;
+            interval.micros = -interval.micros;
+        }
+        interval
+    }
+    fn add_naive(
+        mut value: chrono::NaiveDateTime,
+        interval: crate::value::PgInterval,
+    ) -> Result<chrono::NaiveDateTime> {
+        if interval.months != 0 {
+            value = if interval.months > 0 {
+                value.checked_add_months(Months::new(interval.months as u32))
+            } else {
+                value.checked_sub_months(Months::new(interval.months.unsigned_abs()))
+            }
+            .ok_or_else(|| {
+                PgError::new(SqlState::NumericValueOutOfRange, "timestamp out of range")
+            })?;
+        }
+        if interval.days != 0 {
+            value = if interval.days > 0 {
+                value.checked_add_days(Days::new(interval.days as u64))
+            } else {
+                value.checked_sub_days(Days::new(interval.days.unsigned_abs() as u64))
+            }
+            .ok_or_else(|| {
+                PgError::new(SqlState::NumericValueOutOfRange, "timestamp out of range")
+            })?;
+        }
+        value
+            .checked_add_signed(TimeDelta::microseconds(interval.micros))
+            .ok_or_else(|| PgError::new(SqlState::NumericValueOutOfRange, "timestamp out of range"))
+    }
+    match (operator, left, right) {
+        (
+            BinaryOperator::Plus | BinaryOperator::Minus,
+            Value::Interval(left),
+            Value::Interval(right),
+        ) => {
+            let right = signed_interval(right, matches!(operator, BinaryOperator::Minus));
+            Ok(Value::Interval(crate::value::PgInterval {
+                months: left.months.checked_add(right.months).ok_or_else(|| {
+                    PgError::new(SqlState::NumericValueOutOfRange, "interval out of range")
+                })?,
+                days: left.days.checked_add(right.days).ok_or_else(|| {
+                    PgError::new(SqlState::NumericValueOutOfRange, "interval out of range")
+                })?,
+                micros: left.micros.checked_add(right.micros).ok_or_else(|| {
+                    PgError::new(SqlState::NumericValueOutOfRange, "interval out of range")
+                })?,
+            }))
+        }
+        (BinaryOperator::Multiply | BinaryOperator::Divide, Value::Interval(value), number) => {
+            let factor = match number {
+                Value::Int2(v) => f64::from(v),
+                Value::Int4(v) => f64::from(v),
+                Value::Int8(v) => v as f64,
+                Value::Float4(v) => f64::from(v),
+                Value::Float8(v) => v,
+                Value::Numeric(v) => v.to_f64().ok_or_else(|| {
+                    PgError::new(SqlState::NumericValueOutOfRange, "interval out of range")
+                })?,
+                _ => {
+                    return Err(PgError::new(
+                        SqlState::DatatypeMismatch,
+                        "operator has incompatible types",
+                    ));
+                }
+            };
+            if matches!(operator, BinaryOperator::Divide) && factor == 0.0 {
+                return Err(PgError::new(SqlState::DivisionByZero, "division by zero"));
+            }
+            interval_scale(
+                value,
+                if matches!(operator, BinaryOperator::Divide) {
+                    1.0 / factor
+                } else {
+                    factor
+                },
+            )
+            .map(Value::Interval)
+        }
+        (BinaryOperator::Multiply, number, Value::Interval(value)) => {
+            temporal_arithmetic(operator, Value::Interval(value), number)
+        }
+        (
+            BinaryOperator::Plus | BinaryOperator::Minus,
+            Value::Date(crate::value::PgDate::Finite(date)),
+            Value::Interval(interval),
+        ) => {
+            let value = add_naive(
+                date.and_hms_opt(0, 0, 0).expect("midnight is valid"),
+                signed_interval(interval, matches!(operator, BinaryOperator::Minus)),
+            )?;
+            Ok(Value::Timestamp(crate::value::PgTimestamp::Finite(value)))
+        }
+        (BinaryOperator::Plus, Value::Interval(interval), value @ Value::Date(_)) => {
+            temporal_arithmetic(operator, value, Value::Interval(interval))
+        }
+        (
+            BinaryOperator::Plus | BinaryOperator::Minus,
+            Value::Timestamp(crate::value::PgTimestamp::Finite(value)),
+            Value::Interval(interval),
+        ) => Ok(Value::Timestamp(crate::value::PgTimestamp::Finite(
+            add_naive(
+                value,
+                signed_interval(interval, matches!(operator, BinaryOperator::Minus)),
+            )?,
+        ))),
+        (
+            BinaryOperator::Plus | BinaryOperator::Minus,
+            Value::TimestampTz(crate::value::PgTimestampTz::Finite(value)),
+            Value::Interval(interval),
+        ) => Ok(Value::TimestampTz(crate::value::PgTimestampTz::Finite(
+            add_naive(
+                value.naive_utc(),
+                signed_interval(interval, matches!(operator, BinaryOperator::Minus)),
+            )?
+            .and_utc(),
+        ))),
+        (BinaryOperator::Plus, Value::Interval(interval), value @ Value::Timestamp(_))
+        | (BinaryOperator::Plus, Value::Interval(interval), value @ Value::TimestampTz(_)) => {
+            temporal_arithmetic(operator, value, Value::Interval(interval))
+        }
+        _ => Err(PgError::new(
+            SqlState::DatatypeMismatch,
+            "operator has incompatible types",
+        )),
+    }
+}
+
 fn comparison(operator: &BinaryOperator, left: &Value, right: &Value) -> Result<Value> {
     let ordering = value_ordering(left, right)?;
     Ok(Value::Bool(match operator {
@@ -2889,6 +3125,7 @@ fn value_ordering(left: &Value, right: &Value) -> Result<Ordering> {
         (Value::Time(left), Value::Time(right)) => left.cmp(right),
         (Value::Timestamp(left), Value::Timestamp(right)) => left.cmp(right),
         (Value::TimestampTz(left), Value::TimestampTz(right)) => left.cmp(right),
+        (Value::Interval(left), Value::Interval(right)) => left.cmp(right),
         _ => {
             return Err(PgError::new(
                 SqlState::DatatypeMismatch,
