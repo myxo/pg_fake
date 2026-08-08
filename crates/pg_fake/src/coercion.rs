@@ -36,6 +36,7 @@ pub(crate) fn type_from_ast(data_type: &DataType) -> Result<PgType> {
             (BaseType::Bpchar, character_typmod(*length, true)?)
         }
         DataType::Bytea => (BaseType::Bytea, PgType::NO_TYPEMOD),
+        DataType::Uuid => (BaseType::Uuid, PgType::NO_TYPEMOD),
         DataType::Custom(_, _) if !data_type.to_string().contains('(') => {
             let Some(base) = BaseType::from_name(&data_type.to_string()) else {
                 return Err(PgError::new(
@@ -126,7 +127,13 @@ fn required_context(source: BaseType, target: BaseType) -> Option<CastContext> {
         return Some(CastContext::Assignment);
     }
     if string(source) {
+        if target == BaseType::Uuid {
+            return Some(CastContext::Assignment);
+        }
         return Some(CastContext::Explicit);
+    }
+    if source == BaseType::Uuid && string(target) {
+        return Some(CastContext::Assignment);
     }
     if matches!(
         (source, target),

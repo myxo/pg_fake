@@ -1162,6 +1162,35 @@ mod tests {
     }
 
     #[test]
+    fn uuid_values_parse_compare_and_generate() {
+        let db = Db::new();
+        let mut session = db.session();
+        session
+            .execute("CREATE TABLE items (id UUID PRIMARY KEY)")
+            .unwrap();
+        session
+            .execute("INSERT INTO items VALUES ('{A0EEBC99-9C0B-4EF8-BBA9-6A6C0F3B0AF7}')")
+            .unwrap();
+        assert_eq!(
+            session
+                .query(
+                    "SELECT id FROM items WHERE id = 'a0eebc99-9c0b-4ef8-bba9-6a6c0f3b0af7'",
+                    &[],
+                )
+                .unwrap()
+                .rows,
+            vec![vec![Value::Uuid(
+                uuid::Uuid::parse_str("a0eebc99-9c0b-4ef8-bba9-6a6c0f3b0af7").unwrap()
+            )]]
+        );
+        let generated = session
+            .query("SELECT gen_random_uuid(), uuidv4() FROM items", &[])
+            .unwrap();
+        assert!(matches!(generated.rows[0][0], Value::Uuid(_)));
+        assert_ne!(generated.rows[0][0], generated.rows[0][1]);
+    }
+
+    #[test]
     fn match_full_rejects_partially_null_composite_keys() {
         let db = Db::new();
         let mut session = db.session();

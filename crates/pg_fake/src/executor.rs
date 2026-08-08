@@ -2306,6 +2306,7 @@ fn function_type(function: &Function, schema: &TableSchema) -> Result<BaseType> 
             }
             Ok(base)
         }
+        "gen_random_uuid" | "uuidv4" if arguments.is_empty() => Ok(BaseType::Uuid),
         "coalesce" | "nullif" | "greatest" | "least" | "length" | "lower" | "upper" | "abs" => {
             Err(signature_error())
         }
@@ -2491,6 +2492,7 @@ fn evaluate_function(function: &Function, schema: &TableSchema, row: &[Value]) -
     let arguments = function_arguments(function)?;
     let result_type = function_type(function, schema)?;
     match function_name.as_str() {
+        "gen_random_uuid" | "uuidv4" => Ok(Value::Uuid(uuid::Uuid::new_v4())),
         "coalesce" => {
             for argument in arguments {
                 let value = evaluate_as(argument, result_type, CastContext::Implicit, schema, row)?;
@@ -2770,6 +2772,7 @@ fn value_ordering(left: &Value, right: &Value) -> Result<Ordering> {
         (Value::Numeric(left), Value::Numeric(right)) => left.cmp(right),
         (Value::Text(left), Value::Text(right)) => left.cmp(right),
         (Value::Bytea(left), Value::Bytea(right)) => left.cmp(right),
+        (Value::Uuid(left), Value::Uuid(right)) => left.cmp(right),
         _ => {
             return Err(PgError::new(
                 SqlState::DatatypeMismatch,

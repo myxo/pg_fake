@@ -68,6 +68,27 @@ async fn sqlx_queries_map_all_phase_one_types() {
 }
 
 #[tokio::test]
+async fn sqlx_uuid_values_round_trip() {
+    let mut connection = PgFakeConnection::new(Db::new());
+    let value = uuid::Uuid::parse_str("a0eebc99-9c0b-4ef8-bba9-6a6c0f3b0af7").unwrap();
+    connection
+        .execute("CREATE TABLE uuid_values (id UUID)")
+        .await
+        .unwrap();
+    sqlx::query("INSERT INTO uuid_values VALUES ($1)")
+        .bind(value)
+        .execute(&mut connection)
+        .await
+        .unwrap();
+    let row = sqlx::query("SELECT id FROM uuid_values")
+        .fetch_one(&mut connection)
+        .await
+        .unwrap();
+    assert_eq!(row.get::<uuid::Uuid, _>(0), value);
+    assert_eq!(row.columns()[0].type_info().name(), "UUID");
+}
+
+#[tokio::test]
 async fn prepared_statements_transactions_and_pools_use_the_sqlx_api() {
     let db = Db::new();
     let pool = PgFakePoolOptions::new()

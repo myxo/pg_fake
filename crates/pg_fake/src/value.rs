@@ -24,6 +24,7 @@ pub enum BaseType {
     Varchar,
     Bpchar,
     Bytea,
+    Uuid,
 }
 
 impl BaseType {
@@ -41,6 +42,7 @@ impl BaseType {
             BaseType::Float4 => 700,
             BaseType::Float8 => 701,
             BaseType::Numeric => 1700,
+            BaseType::Uuid => 2950,
         }
     }
 
@@ -58,6 +60,7 @@ impl BaseType {
             BaseType::Varchar => "varchar",
             BaseType::Bpchar => "bpchar",
             BaseType::Bytea => "bytea",
+            BaseType::Uuid => "uuid",
         }
     }
 
@@ -75,6 +78,7 @@ impl BaseType {
             700 => Some(BaseType::Float4),
             701 => Some(BaseType::Float8),
             1700 => Some(BaseType::Numeric),
+            2950 => Some(BaseType::Uuid),
             _ => None,
         }
     }
@@ -94,6 +98,7 @@ impl BaseType {
             "varchar" | "character varying" => Some(BaseType::Varchar),
             "bpchar" | "character" => Some(BaseType::Bpchar),
             "bytea" => Some(BaseType::Bytea),
+            "uuid" => Some(BaseType::Uuid),
             _ => None,
         }
     }
@@ -146,6 +151,7 @@ pub enum Value {
     Numeric(BigDecimal),
     Text(String),
     Bytea(Vec<u8>),
+    Uuid(uuid::Uuid),
 }
 
 impl Value {
@@ -169,6 +175,7 @@ impl Value {
             Value::Numeric(_) => Some(BaseType::Numeric),
             Value::Text(_) => Some(BaseType::Text),
             Value::Bytea(_) => Some(BaseType::Bytea),
+            Value::Uuid(_) => Some(BaseType::Uuid),
         }
     }
 
@@ -201,6 +208,7 @@ impl Value {
                 }
                 out
             }
+            Value::Uuid(value) => value.to_string(),
         }
     }
 
@@ -222,6 +230,9 @@ impl Value {
                 Ok(Value::Text(input.to_string()))
             }
             BaseType::Bytea => parse_bytea(input).map(Value::Bytea),
+            BaseType::Uuid => uuid::Uuid::parse_str(input)
+                .map(Value::Uuid)
+                .map_err(|_| invalid_text(input, "uuid")),
         }
     }
 }

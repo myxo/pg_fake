@@ -56,6 +56,7 @@ impl TypeInfo for PgFakeTypeInfo {
             Some(BaseType::Varchar) => "VARCHAR",
             Some(BaseType::Bpchar) => "BPCHAR",
             Some(BaseType::Bytea) => "BYTEA",
+            Some(BaseType::Uuid) => "UUID",
             None => "NULL",
         }
     }
@@ -156,6 +157,7 @@ scalar_type!(i64, BaseType::Int8, Value::Int8);
 scalar_type!(f32, BaseType::Float4, Value::Float4);
 scalar_type!(f64, BaseType::Float8, Value::Float8);
 scalar_type!(BigDecimal, BaseType::Numeric, Value::Numeric);
+scalar_type!(uuid::Uuid, BaseType::Uuid, Value::Uuid);
 
 impl Type<PgFake> for str {
     fn type_info() -> PgFakeTypeInfo {

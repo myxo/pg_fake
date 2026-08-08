@@ -39,6 +39,7 @@ enum IndexValue {
     Numeric(bigdecimal::BigDecimal),
     Text(String),
     Bytea(Vec<u8>),
+    Uuid(uuid::Uuid),
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
@@ -276,6 +277,7 @@ fn index_key(schema: &TableSchema, index: &UniqueIndex, row: &Row) -> Option<Ind
                     Some(IndexValue::Text(value.clone()))
                 }
                 (Value::Bytea(value), BaseType::Bytea) => Some(IndexValue::Bytea(value.clone())),
+                (Value::Uuid(value), BaseType::Uuid) => Some(IndexValue::Uuid(*value)),
                 _ => unreachable!("row values must match declared column types"),
             },
         )

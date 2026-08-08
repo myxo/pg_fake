@@ -537,6 +537,7 @@ fn typed_literal(value: Value, data_type: BaseType) -> Expr {
         Value::Numeric(value) => AstValue::Number(value.to_plain_string(), false),
         Value::Text(value) => AstValue::SingleQuotedString(value),
         Value::Bytea(value) => AstValue::SingleQuotedString(Value::Bytea(value).to_text()),
+        Value::Uuid(value) => AstValue::SingleQuotedString(value.to_string()),
     };
     Expr::Cast {
         kind: CastKind::Cast,
@@ -559,5 +560,6 @@ fn ast_data_type(data_type: BaseType) -> DataType {
         BaseType::Varchar => DataType::Varchar(None),
         BaseType::Bpchar => DataType::Char(None),
         BaseType::Bytea => DataType::Bytea,
+        BaseType::Uuid => DataType::Uuid,
     }
 }
