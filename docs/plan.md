@@ -394,7 +394,7 @@ machinery.
 
 ## Milestone F — Foreign keys
 
-### Task 16 — Foreign-key metadata and immediate enforcement
+### Task 16 — Foreign-key metadata and immediate enforcement [COMPLETE]
 
 **Goal:** Define foreign keys and enforce the default immediate referential
 integrity rules.
@@ -415,7 +415,7 @@ integrity rules.
 - Differential/property tests cover valid/missing keys, composite keys, NULL
   combinations, self-reference, errors, rollback, and `RETURNING`.
 
-### Task 17 — Foreign-key actions and concurrency
+### Task 17 — Foreign-key actions and concurrency [COMPLETE]
 
 **Goal:** Apply referential actions safely when referenced keys change.
 
@@ -434,7 +434,7 @@ integrity rules.
 - Differential/property tests cover every action, chains, cycles, self-reference,
   rollback, and concurrent races.
 
-### Task 18 — Deferred foreign-key checking
+### Task 18 — Deferred foreign-key checking [COMPLETE]
 
 **Goal:** Complete standard PostgreSQL foreign-key timing semantics.
 

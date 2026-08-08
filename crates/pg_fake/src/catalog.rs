@@ -25,6 +25,29 @@ pub(crate) enum Constraint {
     PrimaryKey(Vec<String>),
     Unique(Vec<String>),
     Check(Box<Expr>),
+    ForeignKey(ForeignKey),
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ForeignKeyAction {
+    NoAction,
+    Restrict,
+    Cascade,
+    SetNull,
+    SetDefault,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct ForeignKey {
+    pub(crate) name: String,
+    pub(crate) columns: Vec<String>,
+    pub(crate) foreign_table: String,
+    pub(crate) referred_columns: Vec<String>,
+    pub(crate) on_delete: ForeignKeyAction,
+    pub(crate) on_update: ForeignKeyAction,
+    pub(crate) deferrable: bool,
+    pub(crate) initially_deferred: bool,
+    pub(crate) match_full: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -100,7 +123,29 @@ impl Catalog {
         })
     }
 
+    pub(crate) fn tables(&self) -> impl Iterator<Item = &TableSchema> {
+        self.public.tables.values()
+    }
+
     pub(crate) fn drop_table(&mut self, name: &str) -> Result<TableSchema> {
+        if let Some((table, constraint)) = self.public.tables.values().find_map(|table| {
+            table
+                .constraints
+                .iter()
+                .find_map(|constraint| match constraint {
+                    Constraint::ForeignKey(foreign_key) if foreign_key.foreign_table == name => {
+                        Some((table.name.as_str(), foreign_key.name.as_str()))
+                    }
+                    _ => None,
+                })
+        }) {
+            return Err(PgError::new(
+                SqlState::FeatureNotSupported,
+                format!(
+                    "cannot drop table {name:?} because constraint {constraint:?} on table {table:?} depends on it"
+                ),
+            ));
+        }
         self.public.tables.remove(name).ok_or_else(|| {
             PgError::new(
                 SqlState::UndefinedTable,

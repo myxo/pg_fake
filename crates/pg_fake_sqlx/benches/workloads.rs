@@ -970,6 +970,87 @@ fn concurrency_benchmark(criterion: &mut Criterion, runtime: &Runtime) {
     group.finish();
 }
 
+fn foreign_key_insert_benchmark(
+    criterion: &mut Criterion,
+    runtime: &Runtime,
+    postgres: &mut Client,
+) {
+    let fake_parent = unique_table_name("foreign_key_parent_fake");
+    let fake_child = unique_table_name("foreign_key_child_fake");
+    let postgres_parent = unique_table_name("foreign_key_parent_postgres");
+    let postgres_child = unique_table_name("foreign_key_child_postgres");
+    let mut fake = PgFakeConnection::new(Db::new());
+    fake_execute(
+        runtime,
+        &mut fake,
+        &format!("CREATE TABLE {fake_parent} (id INTEGER PRIMARY KEY)"),
+    );
+    fake_execute(
+        runtime,
+        &mut fake,
+        &format!(
+            "CREATE TABLE {fake_child} (id INTEGER PRIMARY KEY, parent_id INTEGER REFERENCES {fake_parent})"
+        ),
+    );
+    postgres
+        .execute(
+            &format!("CREATE TABLE {postgres_parent} (id INTEGER PRIMARY KEY)"),
+            &[],
+        )
+        .unwrap();
+    postgres.execute(&format!("CREATE TABLE {postgres_child} (id INTEGER PRIMARY KEY, parent_id INTEGER REFERENCES {postgres_parent})"), &[]).unwrap();
+    let mut fake_id = 0_i32;
+    let mut postgres_id = 0_i32;
+    let mut group = criterion.benchmark_group("foreign_key_insert");
+    group.bench_function("pg_fake", |benchmark| {
+        benchmark.iter(|| {
+            fake_id += 1;
+            fake_execute(
+                runtime,
+                &mut fake,
+                &format!("INSERT INTO {fake_parent} VALUES ({fake_id})"),
+            );
+            assert_eq!(
+                fake_execute(
+                    runtime,
+                    &mut fake,
+                    &format!("INSERT INTO {fake_child} VALUES ({fake_id}, {fake_id})")
+                ),
+                1
+            );
+        });
+    });
+    group.bench_function("postgres_18", |benchmark| {
+        benchmark.iter(|| {
+            postgres_id += 1;
+            postgres
+                .execute(
+                    &format!("INSERT INTO {postgres_parent} VALUES ({postgres_id})"),
+                    &[],
+                )
+                .unwrap();
+            assert_eq!(
+                postgres
+                    .execute(
+                        &format!(
+                            "INSERT INTO {postgres_child} VALUES ({postgres_id}, {postgres_id})"
+                        ),
+                        &[]
+                    )
+                    .unwrap(),
+                1
+            );
+        });
+    });
+    group.finish();
+    postgres
+        .execute(&format!("DROP TABLE {postgres_child}"), &[])
+        .unwrap();
+    postgres
+        .execute(&format!("DROP TABLE {postgres_parent}"), &[])
+        .unwrap();
+}
+
 fn benchmarks(criterion: &mut Criterion) {
     let mut postgres = postgres_benchmark();
     let runtime = tokio::runtime::Builder::new_multi_thread()
@@ -991,6 +1072,7 @@ fn benchmarks(criterion: &mut Criterion) {
     mvcc_version_chain_benchmark(criterion);
     indexed_vs_scan_benchmark(criterion);
     concurrency_benchmark(criterion, &runtime);
+    foreign_key_insert_benchmark(criterion, &runtime, &mut postgres.client);
 }
 
 criterion_group!(workloads, benchmarks);

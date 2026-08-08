@@ -716,6 +716,8 @@ fn generated_sql_matches_postgres() {
         let mut fake = PgFakeConnection::new(Db::new());
         let mut next_row_key = 1;
         let mut in_transaction = false;
+        let foreign_parent = format!("{table}_foreign_parent");
+        let foreign_child = format!("{table}_foreign_child");
 
         assert_statement(
             &runtime,
@@ -745,6 +747,41 @@ fn generated_sql_matches_postgres() {
             postgres.client(),
             &mut fake,
             &insert,
+            RowOrder::Unordered,
+        );
+        assert_statement(
+            &runtime,
+            postgres.client(),
+            &mut fake,
+            &format!("CREATE TABLE {foreign_parent} (id INTEGER PRIMARY KEY)"),
+            RowOrder::Unordered,
+        );
+        assert_statement(
+            &runtime,
+            postgres.client(),
+            &mut fake,
+            &format!(
+                "CREATE TABLE {foreign_child} (id INTEGER PRIMARY KEY, parent_id INTEGER REFERENCES {foreign_parent})"
+            ),
+            RowOrder::Unordered,
+        );
+        assert_statement(
+            &runtime,
+            postgres.client(),
+            &mut fake,
+            &format!("INSERT INTO {foreign_parent} VALUES (1)"),
+            RowOrder::Unordered,
+        );
+        let foreign_key = if src.any("foreign_key_exists") {
+            1
+        } else {
+            integer(src, "foreign_key")
+        };
+        assert_statement(
+            &runtime,
+            postgres.client(),
+            &mut fake,
+            &format!("INSERT INTO {foreign_child} VALUES (1, {foreign_key})"),
             RowOrder::Unordered,
         );
 
@@ -829,5 +866,11 @@ fn generated_sql_matches_postgres() {
                 RowOrder::Unordered,
             );
         }
+        postgres
+            .client()
+            .batch_execute(&format!(
+                "DROP TABLE {foreign_child}; DROP TABLE {foreign_parent}"
+            ))
+            .unwrap();
     });
 }

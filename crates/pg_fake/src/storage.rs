@@ -79,7 +79,7 @@ impl Table {
                         entries: BTreeMap::new(),
                     })
                 }
-                Constraint::Check(_) => None,
+                Constraint::Check(_) | Constraint::ForeignKey(_) => None,
             })
             .collect();
         Table {

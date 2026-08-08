@@ -335,6 +335,22 @@ fn lock_timeout_and_row_lock_clauses_match_postgres() {
 }
 
 #[test]
+fn foreign_keys_and_referential_actions_match_postgres() {
+    assert_differential(
+        "CREATE TABLE __TABLE___parents (first_id INTEGER, second_id INTEGER, PRIMARY KEY (first_id, second_id)); \
+         CREATE TABLE __TABLE___children (id INTEGER PRIMARY KEY, first_id INTEGER, second_id INTEGER, FOREIGN KEY (first_id, second_id) REFERENCES __TABLE___parents (first_id, second_id) ON DELETE CASCADE ON UPDATE CASCADE); \
+         INSERT INTO __TABLE___parents VALUES (1, 2); \
+         INSERT INTO __TABLE___children VALUES (1, 1, 2); \
+         INSERT INTO __TABLE___children VALUES (2, 1, 3); \
+         UPDATE __TABLE___parents SET first_id = 3 WHERE first_id = 1; \
+         SELECT first_id, second_id FROM __TABLE___children ORDER BY id; \
+         DELETE FROM __TABLE___parents WHERE first_id = 3; \
+         SELECT * FROM __TABLE___children",
+        RowOrder::Ordered,
+    );
+}
+
+#[test]
 fn parameters_and_prepared_reuse_match_postgres() {
     let _test_lock = TEST_LOCK.lock().expect("test mutex must not be poisoned");
     let configured_url = env::var("PG_FAKE_DATABASE_URL").ok();

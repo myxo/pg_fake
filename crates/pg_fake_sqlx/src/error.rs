@@ -62,6 +62,7 @@ impl DatabaseError for PgFakeDatabaseError {
             SqlState::UniqueViolation => ErrorKind::UniqueViolation,
             SqlState::NotNullViolation => ErrorKind::NotNullViolation,
             SqlState::CheckViolation => ErrorKind::CheckViolation,
+            SqlState::ForeignKeyViolation => ErrorKind::ForeignKeyViolation,
             _ => ErrorKind::Other,
         }
     }

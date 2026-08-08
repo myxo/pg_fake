@@ -1,9 +1,9 @@
 use crate::{
     api::{ColumnMeta, QueryResult, StatementResult},
-    catalog::{Catalog, ColumnDef, TableId, TableSchema},
+    catalog::{Catalog, ColumnDef, ForeignKey, ForeignKeyAction, TableId, TableSchema},
     coercion::{self, CastContext},
     error::{PgError, Result, SqlState},
-    storage::Table,
+    storage::{RowId, Table},
     txn::{
         RowLockKey, RowLockManager, RowLockMode, Snapshot, TransactionManager, TransactionStatus,
         WaitForGraph, Xid, visible_version,
@@ -13,8 +13,8 @@ use crate::{
 use sqlparser::ast::{
     AssignmentTarget, BinaryOperator, CastKind, ColumnOption, Delete, Expr, FromTable, Function,
     FunctionArg, FunctionArgExpr, FunctionArguments, GroupByExpr, Ident, LockType, ObjectType,
-    SelectItem, SetExpr, Statement, TableConstraint, TableFactor, TableWithJoins, UnaryOperator,
-    Value as AstValue,
+    ReferentialAction, SelectItem, SetExpr, Statement, TableConstraint, TableFactor,
+    TableWithJoins, UnaryOperator, Value as AstValue,
 };
 use std::{
     cmp::Ordering,
@@ -91,6 +91,9 @@ pub(crate) fn required_row_locks(
     xid: Xid,
     snapshot: &Snapshot,
 ) -> Result<Vec<RequiredRowLock>> {
+    if let Statement::Insert(insert) = statement {
+        return required_insert_foreign_key_locks(state, insert, xid, snapshot);
+    }
     let (schema, selection, mode) = match statement {
         Statement::Update {
             table, selection, ..
@@ -205,16 +208,128 @@ pub(crate) fn required_row_locks(
         })
 }
 
+fn required_insert_foreign_key_locks(
+    state: &DatabaseState,
+    insert: &sqlparser::ast::Insert,
+    xid: Xid,
+    snapshot: &Snapshot,
+) -> Result<Vec<RequiredRowLock>> {
+    let schema = state.catalog.table(&name(&insert.table_name)?)?;
+    let Some(source) = &insert.source else {
+        return Ok(Vec::new());
+    };
+    let SetExpr::Values(values) = source.body.as_ref() else {
+        return Ok(Vec::new());
+    };
+    let column_indexes = if insert.columns.is_empty() {
+        (0..schema.columns.len()).collect::<Vec<_>>()
+    } else {
+        insert
+            .columns
+            .iter()
+            .map(|column| {
+                schema
+                    .columns
+                    .iter()
+                    .position(|definition| definition.name == identifier_name(column))
+                    .ok_or_else(|| {
+                        PgError::new(
+                            SqlState::UndefinedColumn,
+                            format!("column {:?} does not exist", column.value),
+                        )
+                    })
+            })
+            .collect::<Result<Vec<_>>>()?
+    };
+    let mut locks = Vec::new();
+    for expressions in &values.rows {
+        if expressions.len() != column_indexes.len() {
+            continue;
+        }
+        let mut row = schema
+            .columns
+            .iter()
+            .map(column_default)
+            .collect::<Result<Vec<_>>>()?;
+        for (expression, index) in expressions.iter().zip(&column_indexes) {
+            row[*index] = if default_expression(expression) {
+                column_default(&schema.columns[*index])?
+            } else {
+                expression_value(
+                    expression,
+                    schema.columns[*index].data_type,
+                    &constant_schema(),
+                    &[],
+                )?
+            };
+        }
+        for constraint in &schema.constraints {
+            let crate::catalog::Constraint::ForeignKey(foreign_key) = constraint else {
+                continue;
+            };
+            let local = foreign_key_column_indexes(schema, &foreign_key.columns)?;
+            let key = local
+                .iter()
+                .map(|index| row[*index].clone())
+                .collect::<Vec<_>>();
+            if key.iter().any(Value::is_null) {
+                continue;
+            }
+            let foreign_schema = state.catalog.table(&foreign_key.foreign_table)?;
+            let referred = if foreign_key.referred_columns.is_empty() {
+                foreign_schema
+                    .constraints
+                    .iter()
+                    .find_map(|constraint| match constraint {
+                        crate::catalog::Constraint::PrimaryKey(columns) => Some(columns.clone()),
+                        _ => None,
+                    })
+                    .expect("foreign key definition was validated")
+            } else {
+                foreign_key.referred_columns.clone()
+            };
+            let referred = foreign_key_column_indexes(foreign_schema, &referred)?;
+            for (row_id, chain) in state
+                .tables
+                .get(&foreign_schema.id)
+                .expect("catalog table must have storage")
+                .rows()
+            {
+                let Some(version) = visible_version(chain, snapshot, xid, &state.transactions)
+                else {
+                    continue;
+                };
+                let foreign_key = referred
+                    .iter()
+                    .map(|index| version.row[*index].clone())
+                    .collect::<Vec<_>>();
+                if key_matches(&key, &foreign_key)? {
+                    locks.push(RequiredRowLock {
+                        key: RowLockKey {
+                            table_id: foreign_schema.id,
+                            row_id,
+                        },
+                        mode: RowLockMode::Share,
+                    });
+                }
+            }
+        }
+    }
+    Ok(locks)
+}
+
 pub(crate) fn dispatch(
     state: &mut DatabaseState,
     statement: &Statement,
     xid: Xid,
     snapshot: &Snapshot,
+    deferred_constraints: &BTreeSet<String>,
+    defer_all: bool,
 ) -> Result<StatementResult> {
     match statement {
         Statement::CreateTable(create) => {
-            let name = name(&create.name)?;
-            if create.if_not_exists && state.catalog.table(&name).is_ok() {
+            let table_name = name(&create.name)?;
+            if create.if_not_exists && state.catalog.table(&table_name).is_ok() {
                 return Ok(StatementResult::Affected(0));
             }
             let mut columns = Vec::new();
@@ -238,6 +353,39 @@ pub(crate) fn dispatch(
                         }
                         ColumnOption::Check(expr) => constraints
                             .push(crate::catalog::Constraint::Check(Box::new(expr.clone()))),
+                        ColumnOption::ForeignKey {
+                            foreign_table,
+                            referred_columns,
+                            on_delete,
+                            on_update,
+                            characteristics,
+                        } => {
+                            let (name, match_full) = foreign_key_name(
+                                option.name.as_ref(),
+                                format!("{}_{}_fkey", table_name, identifier_name(&column.name)),
+                            );
+                            constraints.push(crate::catalog::Constraint::ForeignKey(ForeignKey {
+                                name,
+                                columns: vec![identifier_name(&column.name)],
+                                foreign_table: crate::executor::name(foreign_table)?,
+                                referred_columns: referred_columns
+                                    .iter()
+                                    .map(identifier_name)
+                                    .collect(),
+                                on_delete: foreign_key_action(*on_delete),
+                                on_update: foreign_key_action(*on_update),
+                                deferrable: characteristics.is_some_and(|characteristics| {
+                                    characteristics.deferrable.unwrap_or(false)
+                                }),
+                                initially_deferred: characteristics.is_some_and(
+                                    |characteristics| {
+                                        characteristics.initially
+                                            == Some(sqlparser::ast::DeferrableInitial::Deferred)
+                                    },
+                                ),
+                                match_full,
+                            }))
+                        }
                         option => {
                             return Err(PgError::new(
                                 SqlState::FeatureNotSupported,
@@ -272,6 +420,39 @@ pub(crate) fn dispatch(
                     TableConstraint::Check { expr, .. } => {
                         constraints.push(crate::catalog::Constraint::Check(expr.clone()))
                     }
+                    TableConstraint::ForeignKey {
+                        name: constraint_name,
+                        columns: foreign_columns,
+                        foreign_table,
+                        referred_columns,
+                        on_delete,
+                        on_update,
+                        characteristics,
+                    } => {
+                        let (name, match_full) = foreign_key_name(
+                            constraint_name.as_ref(),
+                            format!("{}_fkey", table_name),
+                        );
+                        constraints.push(crate::catalog::Constraint::ForeignKey(ForeignKey {
+                            name,
+                            columns: foreign_columns.iter().map(identifier_name).collect(),
+                            foreign_table: crate::executor::name(foreign_table)?,
+                            referred_columns: referred_columns
+                                .iter()
+                                .map(identifier_name)
+                                .collect(),
+                            on_delete: foreign_key_action(*on_delete),
+                            on_update: foreign_key_action(*on_update),
+                            deferrable: characteristics.is_some_and(|characteristics| {
+                                characteristics.deferrable.unwrap_or(false)
+                            }),
+                            initially_deferred: characteristics.is_some_and(|characteristics| {
+                                characteristics.initially
+                                    == Some(sqlparser::ast::DeferrableInitial::Deferred)
+                            }),
+                            match_full,
+                        }))
+                    }
                     constraint => {
                         return Err(PgError::new(
                             SqlState::FeatureNotSupported,
@@ -284,7 +465,8 @@ pub(crate) fn dispatch(
                 let (constraint_columns, primary_key) = match constraint {
                     crate::catalog::Constraint::PrimaryKey(columns) => (columns, true),
                     crate::catalog::Constraint::Unique(columns) => (columns, false),
-                    crate::catalog::Constraint::Check(_) => continue,
+                    crate::catalog::Constraint::Check(_)
+                    | crate::catalog::Constraint::ForeignKey(_) => continue,
                 };
                 for name in constraint_columns {
                     let column = columns
@@ -303,16 +485,23 @@ pub(crate) fn dispatch(
             }
             validate_check_constraint_types(&TableSchema {
                 id: TableId(0),
-                name: name.clone(),
+                name: table_name.clone(),
                 columns: columns.clone(),
                 constraints: constraints.clone(),
             })?;
+            let proposed = TableSchema {
+                id: TableId(0),
+                name: table_name.clone(),
+                columns: columns.clone(),
+                constraints: constraints.clone(),
+            };
+            validate_foreign_key_definitions(&state.catalog, &proposed)?;
             let id = state
                 .catalog
-                .create_table(name.clone(), columns, constraints)?;
+                .create_table(table_name.clone(), columns, constraints)?;
             let table = state
                 .catalog
-                .table(&name)
+                .table(&table_name)
                 .expect("created table must exist");
             state.tables.insert(id, Table::new(table.clone()));
             Ok(StatementResult::Affected(0))
@@ -337,7 +526,14 @@ pub(crate) fn dispatch(
             }
             Ok(StatementResult::Affected(affected))
         }
-        Statement::Insert(insert) => insert_rows(state, insert, xid, snapshot),
+        Statement::Insert(insert) => insert_rows(
+            state,
+            insert,
+            xid,
+            snapshot,
+            deferred_constraints,
+            defer_all,
+        ),
         Statement::Update {
             table,
             assignments,
@@ -352,9 +548,25 @@ pub(crate) fn dispatch(
                     "UPDATE feature is not implemented",
                 ));
             }
-            update_rows(state, table, assignments, selection.as_ref(), xid, snapshot)
+            update_rows(
+                state,
+                table,
+                assignments,
+                selection.as_ref(),
+                xid,
+                snapshot,
+                deferred_constraints,
+                defer_all,
+            )
         }
-        Statement::Delete(delete) => delete_rows(state, delete, xid, snapshot),
+        Statement::Delete(delete) => delete_rows(
+            state,
+            delete,
+            xid,
+            snapshot,
+            deferred_constraints,
+            defer_all,
+        ),
         Statement::Query(query) => select_rows(state, query, xid, snapshot),
         _ => Err(PgError::new(
             SqlState::FeatureNotSupported,
@@ -385,6 +597,8 @@ fn insert_rows(
     insert: &sqlparser::ast::Insert,
     xid: Xid,
     snapshot: &Snapshot,
+    deferred_constraints: &BTreeSet<String>,
+    defer_all: bool,
 ) -> Result<StatementResult> {
     let table_name = name(&insert.table_name)?;
     let schema = state.catalog.table(&table_name)?.clone();
@@ -465,13 +679,14 @@ fn insert_rows(
                 Ok(vec![row])
             })?
     };
-    let table = state
-        .tables
-        .get_mut(&schema.id)
-        .expect("catalog table must have storage");
     let affected = rows.len() as u64;
     for row in rows {
-        if table.unique_conflict(&row, snapshot, xid, &state.transactions, None) {
+        if state
+            .tables
+            .get(&schema.id)
+            .expect("catalog table must have storage")
+            .unique_conflict(&row, snapshot, xid, &state.transactions, None)
+        {
             return Err(PgError::new(
                 SqlState::UniqueViolation,
                 format!(
@@ -480,7 +695,20 @@ fn insert_rows(
                 ),
             ));
         }
-        table.insert(xid, row);
+        state
+            .tables
+            .get_mut(&schema.id)
+            .expect("catalog table must have storage")
+            .insert(xid, row.clone());
+        validate_row_foreign_keys(
+            state,
+            &schema,
+            &row,
+            xid,
+            snapshot,
+            deferred_constraints,
+            defer_all,
+        )?;
     }
     Ok(StatementResult::Affected(affected))
 }
@@ -492,6 +720,8 @@ fn update_rows(
     selection: Option<&Expr>,
     xid: Xid,
     snapshot: &Snapshot,
+    deferred_constraints: &BTreeSet<String>,
+    defer_all: bool,
 ) -> Result<StatementResult> {
     if !update_table.joins.is_empty() {
         return Err(PgError::new(
@@ -590,10 +820,6 @@ fn update_rows(
             Ok(targets)
         })?;
     let affected = targets.len() as u64;
-    let table = state
-        .tables
-        .get_mut(&schema.id)
-        .expect("catalog table must have storage");
     for (row_id, version_xmin, row) in targets {
         let mut updated = row.clone();
         for (index, expression) in &assignments {
@@ -606,7 +832,12 @@ fn update_rows(
         }
         validate_not_null(&schema, &updated)?;
         validate_check_constraints(&schema, &updated)?;
-        if table.unique_conflict(&updated, snapshot, xid, &state.transactions, Some(row_id)) {
+        if state
+            .tables
+            .get(&schema.id)
+            .expect("catalog table must have storage")
+            .unique_conflict(&updated, snapshot, xid, &state.transactions, Some(row_id))
+        {
             return Err(PgError::new(
                 SqlState::UniqueViolation,
                 format!(
@@ -615,7 +846,31 @@ fn update_rows(
                 ),
             ));
         }
-        table.update(row_id, version_xmin, xid, updated);
+        state
+            .tables
+            .get_mut(&schema.id)
+            .expect("catalog table must have storage")
+            .update(row_id, version_xmin, xid, updated.clone());
+        validate_row_foreign_keys(
+            state,
+            &schema,
+            &updated,
+            xid,
+            snapshot,
+            deferred_constraints,
+            defer_all,
+        )?;
+        apply_parent_actions(
+            state,
+            &schema,
+            &row,
+            Some(&updated),
+            xid,
+            snapshot,
+            deferred_constraints,
+            defer_all,
+            &mut BTreeSet::new(),
+        )?;
     }
     Ok(StatementResult::Affected(affected))
 }
@@ -625,6 +880,8 @@ fn delete_rows(
     delete: &Delete,
     xid: Xid,
     snapshot: &Snapshot,
+    deferred_constraints: &BTreeSet<String>,
+    defer_all: bool,
 ) -> Result<StatementResult> {
     if !delete.tables.is_empty()
         || delete.using.is_some()
@@ -696,14 +953,520 @@ fn delete_rows(
             Ok(targets)
         })?;
     let affected = targets.len() as u64;
-    let table = state
-        .tables
-        .get_mut(&schema.id)
-        .expect("catalog table must have storage");
     for (row_id, version_xmin) in targets {
-        table.tombstone(row_id, version_xmin, xid);
+        let row = state
+            .tables
+            .get(&schema.id)
+            .expect("catalog table must have storage")
+            .rows()
+            .find_map(|(candidate, chain)| {
+                (candidate == row_id).then(|| {
+                    visible_version(chain, snapshot, xid, &state.transactions)
+                        .map(|version| version.row.clone())
+                })
+            })
+            .flatten()
+            .expect("target row must remain visible");
+        apply_parent_actions(
+            state,
+            &schema,
+            &row,
+            None,
+            xid,
+            snapshot,
+            deferred_constraints,
+            defer_all,
+            &mut BTreeSet::new(),
+        )?;
+        state
+            .tables
+            .get_mut(&schema.id)
+            .expect("catalog table must have storage")
+            .tombstone(row_id, version_xmin, xid);
     }
     Ok(StatementResult::Affected(affected))
+}
+
+fn foreign_key_action(action: Option<ReferentialAction>) -> ForeignKeyAction {
+    match action.unwrap_or(ReferentialAction::NoAction) {
+        ReferentialAction::NoAction => ForeignKeyAction::NoAction,
+        ReferentialAction::Restrict => ForeignKeyAction::Restrict,
+        ReferentialAction::Cascade => ForeignKeyAction::Cascade,
+        ReferentialAction::SetNull => ForeignKeyAction::SetNull,
+        ReferentialAction::SetDefault => ForeignKeyAction::SetDefault,
+    }
+}
+
+fn foreign_key_name(name: Option<&Ident>, default: String) -> (String, bool) {
+    const MATCH_FULL: &str = "__pg_fake_match_full__";
+    let name = name.map(identifier_name).unwrap_or_default();
+    let Some(name) = name.strip_prefix(MATCH_FULL) else {
+        return (if name.is_empty() { default } else { name }, false);
+    };
+    (
+        if name.is_empty() {
+            default
+        } else {
+            name.into()
+        },
+        true,
+    )
+}
+
+fn foreign_key_is_deferred(
+    foreign_key: &ForeignKey,
+    deferred_constraints: &BTreeSet<String>,
+    defer_all: bool,
+) -> bool {
+    foreign_key.deferrable
+        && (foreign_key.initially_deferred
+            || defer_all
+            || deferred_constraints.contains(&foreign_key.name))
+}
+
+fn foreign_key_column_indexes(schema: &TableSchema, columns: &[String]) -> Result<Vec<usize>> {
+    columns
+        .iter()
+        .map(|name| {
+            schema
+                .columns
+                .iter()
+                .position(|column| column.name == *name)
+                .ok_or_else(|| {
+                    PgError::new(
+                        SqlState::UndefinedColumn,
+                        format!("column {name:?} does not exist"),
+                    )
+                })
+        })
+        .collect()
+}
+
+fn key_matches(left: &[Value], right: &[Value]) -> Result<bool> {
+    left.iter()
+        .zip(right)
+        .try_fold(true, |matches, (left, right)| {
+            if !matches {
+                return Ok(false);
+            }
+            Ok(matches!(
+                comparison(&BinaryOperator::Eq, left, right)?,
+                Value::Bool(true)
+            ))
+        })
+}
+
+fn validate_foreign_key_definitions(catalog: &Catalog, schema: &TableSchema) -> Result<()> {
+    for constraint in &schema.constraints {
+        let crate::catalog::Constraint::ForeignKey(foreign_key) = constraint else {
+            continue;
+        };
+        if foreign_key.initially_deferred && !foreign_key.deferrable {
+            return Err(PgError::new(
+                SqlState::SyntaxError,
+                "constraint cannot be initially deferred because it is not deferrable",
+            ));
+        }
+        let referred = if foreign_key.foreign_table == schema.name {
+            schema
+        } else {
+            catalog.table(&foreign_key.foreign_table)?
+        };
+        let referred_columns = if foreign_key.referred_columns.is_empty() {
+            referred
+                .constraints
+                .iter()
+                .find_map(|constraint| match constraint {
+                    crate::catalog::Constraint::PrimaryKey(columns) => Some(columns.clone()),
+                    _ => None,
+                })
+                .ok_or_else(|| {
+                    PgError::new(
+                        SqlState::InvalidColumnReference,
+                        "there is no primary key for referenced table",
+                    )
+                })?
+        } else {
+            foreign_key.referred_columns.clone()
+        };
+        let local_indexes = foreign_key_column_indexes(schema, &foreign_key.columns)?;
+        let referred_indexes = foreign_key_column_indexes(referred, &referred_columns)?;
+        if local_indexes.len() != referred_indexes.len() {
+            return Err(PgError::new(
+                SqlState::SyntaxError,
+                "number of referencing and referenced columns for foreign key disagree",
+            ));
+        }
+        if !referred.constraints.iter().any(|constraint| matches!(constraint,
+            crate::catalog::Constraint::PrimaryKey(columns) | crate::catalog::Constraint::Unique(columns) if *columns == referred_columns
+        )) {
+            return Err(PgError::new(SqlState::InvalidColumnReference, "there is no unique constraint matching given keys for referenced table"));
+        }
+        for (local, referred_index) in local_indexes.iter().zip(referred_indexes) {
+            if schema.columns[*local].data_type.base
+                != referred.columns[referred_index].data_type.base
+            {
+                return Err(PgError::new(
+                    SqlState::DatatypeMismatch,
+                    "foreign key constraint cannot be implemented",
+                ));
+            }
+        }
+    }
+    Ok(())
+}
+
+fn validate_row_foreign_keys(
+    state: &DatabaseState,
+    schema: &TableSchema,
+    row: &[Value],
+    xid: Xid,
+    snapshot: &Snapshot,
+    deferred_constraints: &BTreeSet<String>,
+    defer_all: bool,
+) -> Result<()> {
+    for constraint in &schema.constraints {
+        let crate::catalog::Constraint::ForeignKey(foreign_key) = constraint else {
+            continue;
+        };
+        if foreign_key_is_deferred(foreign_key, deferred_constraints, defer_all) {
+            continue;
+        }
+        let local_indexes = foreign_key_column_indexes(schema, &foreign_key.columns)?;
+        let key = local_indexes
+            .iter()
+            .map(|index| row[*index].clone())
+            .collect::<Vec<_>>();
+        if key.iter().any(Value::is_null) {
+            if foreign_key.match_full && !key.iter().all(Value::is_null) {
+                return Err(PgError::new(
+                    SqlState::ForeignKeyViolation,
+                    format!(
+                        "insert or update on table {:?} violates foreign key constraint {:?}",
+                        schema.name, foreign_key.name
+                    ),
+                ));
+            }
+            continue;
+        }
+        let foreign_schema = state.catalog.table(&foreign_key.foreign_table)?;
+        let referred_columns = if foreign_key.referred_columns.is_empty() {
+            foreign_schema
+                .constraints
+                .iter()
+                .find_map(|constraint| match constraint {
+                    crate::catalog::Constraint::PrimaryKey(columns) => Some(columns.clone()),
+                    _ => None,
+                })
+                .expect("foreign key definition was validated")
+        } else {
+            foreign_key.referred_columns.clone()
+        };
+        let referred_indexes = foreign_key_column_indexes(foreign_schema, &referred_columns)?;
+        let found = state
+            .tables
+            .get(&foreign_schema.id)
+            .expect("catalog table must have storage")
+            .rows()
+            .try_fold(false, |found, (_, chain)| {
+                if found {
+                    return Ok(true);
+                }
+                let Some(version) = visible_version(chain, snapshot, xid, &state.transactions)
+                else {
+                    return Ok(false);
+                };
+                key_matches(
+                    &key,
+                    &referred_indexes
+                        .iter()
+                        .map(|index| version.row[*index].clone())
+                        .collect::<Vec<_>>(),
+                )
+            })?;
+        if !found {
+            return Err(PgError::new(
+                SqlState::ForeignKeyViolation,
+                format!(
+                    "insert or update on table {:?} violates foreign key constraint {:?}",
+                    schema.name, foreign_key.name
+                ),
+            ));
+        }
+    }
+    Ok(())
+}
+
+pub(crate) fn validate_deferred_foreign_keys(state: &DatabaseState, xid: Xid) -> Result<()> {
+    let snapshot = Snapshot::new(&state.transactions);
+    for schema in state.catalog.tables() {
+        let mut schema = schema.clone();
+        for constraint in &mut schema.constraints {
+            if let crate::catalog::Constraint::ForeignKey(foreign_key) = constraint {
+                foreign_key.initially_deferred = false;
+            }
+        }
+        let table = state
+            .tables
+            .get(&schema.id)
+            .expect("catalog table must have storage");
+        for (_, chain) in table.rows() {
+            if let Some(version) = visible_version(chain, &snapshot, xid, &state.transactions) {
+                validate_row_foreign_keys(
+                    state,
+                    &schema,
+                    &version.row,
+                    xid,
+                    &snapshot,
+                    &BTreeSet::new(),
+                    false,
+                )?;
+            }
+        }
+    }
+    Ok(())
+}
+
+fn apply_parent_actions(
+    state: &mut DatabaseState,
+    parent_schema: &TableSchema,
+    old_row: &[Value],
+    new_row: Option<&[Value]>,
+    xid: Xid,
+    snapshot: &Snapshot,
+    deferred_constraints: &BTreeSet<String>,
+    defer_all: bool,
+    visited: &mut BTreeSet<(TableId, RowId)>,
+) -> Result<()> {
+    let foreign_keys = state
+        .catalog
+        .tables()
+        .flat_map(|schema| {
+            schema
+                .constraints
+                .iter()
+                .filter_map(move |constraint| match constraint {
+                    crate::catalog::Constraint::ForeignKey(foreign_key)
+                        if foreign_key.foreign_table == parent_schema.name =>
+                    {
+                        Some((schema.clone(), foreign_key.clone()))
+                    }
+                    _ => None,
+                })
+        })
+        .collect::<Vec<_>>();
+    for (child_schema, foreign_key) in foreign_keys {
+        let referred_columns = if foreign_key.referred_columns.is_empty() {
+            parent_schema
+                .constraints
+                .iter()
+                .find_map(|constraint| match constraint {
+                    crate::catalog::Constraint::PrimaryKey(columns) => Some(columns.clone()),
+                    _ => None,
+                })
+                .expect("foreign key definition was validated")
+        } else {
+            foreign_key.referred_columns.clone()
+        };
+        let parent_indexes = foreign_key_column_indexes(parent_schema, &referred_columns)?;
+        let old_key = parent_indexes
+            .iter()
+            .map(|index| old_row[*index].clone())
+            .collect::<Vec<_>>();
+        let new_key = new_row.map(|row| {
+            parent_indexes
+                .iter()
+                .map(|index| row[*index].clone())
+                .collect::<Vec<_>>()
+        });
+        if new_key.as_ref().is_some_and(|key| {
+            key_matches(&old_key, key).expect("matching compatible foreign key values must work")
+        }) {
+            continue;
+        }
+        let child_indexes = foreign_key_column_indexes(&child_schema, &foreign_key.columns)?;
+        let children = state
+            .tables
+            .get(&child_schema.id)
+            .expect("catalog table must have storage")
+            .rows()
+            .try_fold(Vec::new(), |mut children, (row_id, chain)| {
+                let Some(version) = visible_version(chain, snapshot, xid, &state.transactions)
+                else {
+                    return Ok(children);
+                };
+                let key = child_indexes
+                    .iter()
+                    .map(|index| version.row[*index].clone())
+                    .collect::<Vec<_>>();
+                if !key.iter().any(Value::is_null) && key_matches(&key, &old_key)? {
+                    children.push((row_id, version.xmin, version.row.clone()));
+                }
+                Ok(children)
+            })?;
+        for (row_id, version_xmin, row) in children {
+            if !visited.insert((child_schema.id, row_id)) {
+                continue;
+            }
+            let action = if new_row.is_some() {
+                foreign_key.on_update
+            } else {
+                foreign_key.on_delete
+            };
+            if matches!(action, ForeignKeyAction::NoAction)
+                && foreign_key_is_deferred(&foreign_key, deferred_constraints, defer_all)
+            {
+                continue;
+            }
+            match action {
+                ForeignKeyAction::NoAction | ForeignKeyAction::Restrict => {
+                    return Err(PgError::new(
+                        SqlState::ForeignKeyViolation,
+                        format!(
+                            "update or delete on table {:?} violates foreign key constraint {:?} on table {:?}",
+                            parent_schema.name, foreign_key.name, child_schema.name
+                        ),
+                    ));
+                }
+                ForeignKeyAction::Cascade if new_row.is_none() => {
+                    apply_parent_actions(
+                        state,
+                        &child_schema,
+                        &row,
+                        None,
+                        xid,
+                        snapshot,
+                        deferred_constraints,
+                        defer_all,
+                        visited,
+                    )?;
+                    state
+                        .tables
+                        .get_mut(&child_schema.id)
+                        .expect("catalog table must have storage")
+                        .tombstone(row_id, version_xmin, xid);
+                }
+                ForeignKeyAction::Cascade => {
+                    let mut updated = row.clone();
+                    for (child, value) in child_indexes
+                        .iter()
+                        .zip(new_key.as_ref().expect("update has a new key"))
+                    {
+                        updated[*child] = value.clone();
+                    }
+                    update_cascaded_row(
+                        state,
+                        &child_schema,
+                        row_id,
+                        version_xmin,
+                        &row,
+                        updated,
+                        xid,
+                        snapshot,
+                        deferred_constraints,
+                        defer_all,
+                        visited,
+                    )?;
+                }
+                ForeignKeyAction::SetNull => {
+                    let mut updated = row.clone();
+                    for child in &child_indexes {
+                        updated[*child] = Value::Null;
+                    }
+                    update_cascaded_row(
+                        state,
+                        &child_schema,
+                        row_id,
+                        version_xmin,
+                        &row,
+                        updated,
+                        xid,
+                        snapshot,
+                        deferred_constraints,
+                        defer_all,
+                        visited,
+                    )?;
+                }
+                ForeignKeyAction::SetDefault => {
+                    let mut updated = row.clone();
+                    for child in &child_indexes {
+                        updated[*child] = column_default(&child_schema.columns[*child])?;
+                    }
+                    update_cascaded_row(
+                        state,
+                        &child_schema,
+                        row_id,
+                        version_xmin,
+                        &row,
+                        updated,
+                        xid,
+                        snapshot,
+                        deferred_constraints,
+                        defer_all,
+                        visited,
+                    )?;
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
+fn update_cascaded_row(
+    state: &mut DatabaseState,
+    schema: &TableSchema,
+    row_id: RowId,
+    version_xmin: Xid,
+    old_row: &[Value],
+    updated: Vec<Value>,
+    xid: Xid,
+    snapshot: &Snapshot,
+    deferred_constraints: &BTreeSet<String>,
+    defer_all: bool,
+    visited: &mut BTreeSet<(TableId, RowId)>,
+) -> Result<()> {
+    validate_not_null(schema, &updated)?;
+    validate_check_constraints(schema, &updated)?;
+    if state
+        .tables
+        .get(&schema.id)
+        .expect("catalog table must have storage")
+        .unique_conflict(&updated, snapshot, xid, &state.transactions, Some(row_id))
+    {
+        return Err(PgError::new(
+            SqlState::UniqueViolation,
+            format!(
+                "duplicate key value violates unique constraint on {:?}",
+                schema.name
+            ),
+        ));
+    }
+    state
+        .tables
+        .get_mut(&schema.id)
+        .expect("catalog table must have storage")
+        .update(row_id, version_xmin, xid, updated.clone());
+    validate_row_foreign_keys(
+        state,
+        schema,
+        &updated,
+        xid,
+        snapshot,
+        deferred_constraints,
+        defer_all,
+    )?;
+    apply_parent_actions(
+        state,
+        schema,
+        old_row,
+        Some(&updated),
+        xid,
+        snapshot,
+        deferred_constraints,
+        defer_all,
+        visited,
+    )?;
+    Ok(())
 }
 
 fn select_lock_mode(query: &sqlparser::ast::Query) -> Result<Option<RowLockMode>> {

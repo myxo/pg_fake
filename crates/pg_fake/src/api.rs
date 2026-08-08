@@ -1,4 +1,5 @@
 use std::{
+    collections::BTreeSet,
     sync::{Arc, Condvar, Mutex, MutexGuard},
     time::{Duration, Instant},
 };
@@ -62,6 +63,8 @@ pub struct Session {
     lock_timeout: Duration,
     ddl_undo: Vec<DdlUndo>,
     settings_undo: Option<(IsolationLevel, Duration)>,
+    deferred_constraints: BTreeSet<String>,
+    defer_all_constraints: bool,
 }
 #[derive(Clone, Copy)]
 enum SessionTransaction {
@@ -319,6 +322,8 @@ impl Db {
             lock_timeout: self.default_lock_timeout,
             ddl_undo: Vec::new(),
             settings_undo: None,
+            deferred_constraints: BTreeSet::new(),
+            defer_all_constraints: false,
         }
     }
 }
@@ -342,6 +347,9 @@ impl Default for Db {
 }
 impl Session {
     pub fn execute(&mut self, sql: &str) -> Result<Vec<StatementResult>> {
+        if let Some(result) = self.set_constraints(sql) {
+            return result.map(|result| vec![result]);
+        }
         let statements = match parser::parse(sql) {
             Ok(statements) => statements,
             Err(error) => return self.failed(error),
@@ -355,16 +363,131 @@ impl Session {
                 Ok(result) => results.push(result),
                 Err(error) => {
                     if self.transaction_is_implicit_batch() {
-                        self.finish_transaction(false);
+                        let _ = self.finish_transaction(false);
                     }
                     return Err(error);
                 }
             }
         }
         if self.transaction_is_implicit_batch() {
-            self.finish_transaction(true);
+            self.finish_transaction(true)?;
         }
         Ok(results)
+    }
+    fn set_constraints(&mut self, sql: &str) -> Option<Result<StatementResult>> {
+        let sql = sql.trim().trim_end_matches(';').trim();
+        let upper = sql.to_ascii_uppercase();
+        let Some(rest) = upper.strip_prefix("SET CONSTRAINTS ") else {
+            return None;
+        };
+        let deferred = if rest.strip_suffix(" DEFERRED").is_some() {
+            true
+        } else if rest.strip_suffix(" IMMEDIATE").is_some() {
+            false
+        } else {
+            return Some(Err(PgError::new(
+                SqlState::SyntaxError,
+                "SET CONSTRAINTS requires DEFERRED or IMMEDIATE",
+            )));
+        };
+        let names = rest
+            .strip_suffix(if deferred { " DEFERRED" } else { " IMMEDIATE" })
+            .expect("suffix was checked");
+        if self.transaction.is_none() {
+            self.start_transaction(self.default_isolation, true);
+        }
+        if matches!(self.transaction, Some(SessionTransaction::Aborted { .. })) {
+            return Some(Err(PgError::new(
+                SqlState::InFailedSqlTransaction,
+                "current transaction is aborted",
+            )));
+        }
+        let requested = if names.trim() == "ALL" {
+            None
+        } else {
+            Some(
+                names
+                    .split(',')
+                    .map(|name| name.trim().trim_matches('"').to_ascii_lowercase())
+                    .collect::<Vec<_>>(),
+            )
+        };
+        let state = self.db.state.lock().expect("database mutex is poisoned");
+        let constraints = state
+            .catalog
+            .tables()
+            .flat_map(|schema| schema.constraints.iter())
+            .filter_map(|constraint| match constraint {
+                crate::catalog::Constraint::ForeignKey(foreign_key) => Some(foreign_key),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        let all_requested = requested.is_none();
+        let selected = match requested {
+            None => constraints.into_iter().cloned().collect(),
+            Some(names) => {
+                let selected = names
+                    .iter()
+                    .map(|name| {
+                        constraints
+                            .iter()
+                            .find(|foreign_key| foreign_key.name == *name)
+                            .map(|foreign_key| (*foreign_key).clone())
+                            .ok_or_else(|| {
+                                PgError::new(
+                                    SqlState::UndefinedObject,
+                                    format!("constraint {name:?} does not exist"),
+                                )
+                            })
+                    })
+                    .collect::<Result<Vec<_>>>();
+                match selected {
+                    Ok(selected) => selected,
+                    Err(error) => {
+                        drop(state);
+                        return Some(self.failed(error));
+                    }
+                }
+            }
+        };
+        if selected.iter().any(|foreign_key| !foreign_key.deferrable) {
+            drop(state);
+            return Some(self.failed(PgError::new(
+                SqlState::FeatureNotSupported,
+                "constraint is not deferrable",
+            )));
+        }
+        drop(state);
+        if all_requested {
+            self.defer_all_constraints = deferred;
+            self.deferred_constraints.clear();
+        } else {
+            for foreign_key in selected {
+                if deferred {
+                    self.deferred_constraints.insert(foreign_key.name.clone());
+                } else {
+                    self.deferred_constraints.remove(&foreign_key.name);
+                }
+            }
+        }
+        if !deferred {
+            let state = self.db.state.lock().expect("database mutex is poisoned");
+            let xid = match self.transaction {
+                Some(SessionTransaction::Active(transaction)) => transaction.xid,
+                _ => unreachable!(),
+            };
+            if let Err(error) = executor::validate_deferred_foreign_keys(&state, xid) {
+                drop(state);
+                return Some(self.failed(error));
+            }
+        }
+        if self.transaction_is_implicit_batch() {
+            return Some(
+                self.finish_transaction(true)
+                    .map(|()| StatementResult::Affected(0)),
+            );
+        }
+        Some(Ok(StatementResult::Affected(0)))
     }
     pub fn execute_params(&mut self, sql: &str, params: &[Value]) -> Result<u64> {
         let statement = self.prepare(sql)?;
@@ -471,6 +594,8 @@ impl Session {
     fn start_transaction(&mut self, isolation: IsolationLevel, implicit_batch: bool) {
         assert!(self.ddl_undo.is_empty());
         assert!(self.settings_undo.is_none());
+        self.deferred_constraints.clear();
+        self.defer_all_constraints = false;
         self.settings_undo = Some((self.default_isolation, self.lock_timeout));
         let mut state = self.db.state.lock().expect("database mutex is poisoned");
         self.transaction = Some(SessionTransaction::Active(ActiveTransaction {
@@ -481,20 +606,37 @@ impl Session {
             implicit_batch,
         }));
     }
-    fn finish_transaction(&mut self, commit: bool) {
+    fn finish_transaction(&mut self, commit: bool) -> Result<()> {
         let Some(transaction) = self.transaction.take() else {
-            return;
+            return Ok(());
         };
         let xid = match transaction {
             SessionTransaction::Active(transaction) if commit => {
-                let mut state = self.db.state.lock().expect("database mutex is poisoned");
+                let state_lock = self.db.state.clone();
+                let mut state = state_lock.lock().expect("database mutex is poisoned");
+                if let Err(error) =
+                    executor::validate_deferred_foreign_keys(&state, transaction.xid)
+                {
+                    self.rollback_ddl(&mut state);
+                    if let Some((default_isolation, lock_timeout)) = self.settings_undo.take() {
+                        self.default_isolation = default_isolation;
+                        self.lock_timeout = lock_timeout;
+                    }
+                    self.deferred_constraints.clear();
+                    self.defer_all_constraints = false;
+                    abort(&mut state, transaction.xid);
+                    self.db.condvar.notify_all();
+                    return Err(error);
+                }
                 state.transactions.commit(transaction.xid);
                 state.row_locks.release(transaction.xid);
                 state.wait_for.remove_transaction(transaction.xid);
                 self.ddl_undo.clear();
                 self.settings_undo = None;
+                self.deferred_constraints.clear();
+                self.defer_all_constraints = false;
                 self.db.condvar.notify_all();
-                return;
+                return Ok(());
             }
             SessionTransaction::Active(transaction) => transaction.xid,
             SessionTransaction::Aborted { xid, .. } => xid,
@@ -506,8 +648,11 @@ impl Session {
             self.default_isolation = default_isolation;
             self.lock_timeout = lock_timeout;
         }
+        self.deferred_constraints.clear();
+        self.defer_all_constraints = false;
         abort(&mut state, xid);
         self.db.condvar.notify_all();
+        Ok(())
     }
     fn abort_transaction(&mut self) {
         if let Some(SessionTransaction::Active(transaction)) = self.transaction {
@@ -659,7 +804,7 @@ impl Session {
                         "COMMIT AND CHAIN is not implemented",
                     ));
                 }
-                self.finish_transaction(true);
+                self.finish_transaction(true)?;
                 return Ok(StatementResult::Affected(0));
             }
             parser::Statement::Rollback { chain, savepoint } => {
@@ -669,7 +814,7 @@ impl Session {
                         "ROLLBACK variant is not implemented",
                     ));
                 }
-                self.finish_transaction(false);
+                self.finish_transaction(false)?;
                 return Ok(StatementResult::Affected(0));
             }
             _ => {}
@@ -723,7 +868,14 @@ impl Session {
                 Ok(acquired) => acquired,
                 Err(error) => return self.failed(error),
             };
-            return match executor::dispatch(&mut state, &statement, transaction.xid, &snapshot) {
+            return match executor::dispatch(
+                &mut state,
+                &statement,
+                transaction.xid,
+                &snapshot,
+                &self.deferred_constraints,
+                self.defer_all_constraints,
+            ) {
                 Ok(result) => Ok(result),
                 Err(error) => {
                     drop(state);
@@ -751,7 +903,14 @@ impl Session {
                 return Err(error);
             }
         };
-        match executor::dispatch(&mut state, &statement, xid, &snapshot) {
+        match executor::dispatch(
+            &mut state,
+            &statement,
+            xid,
+            &snapshot,
+            &self.deferred_constraints,
+            self.defer_all_constraints,
+        ) {
             Ok(result) => {
                 state.transactions.commit(xid);
                 state.row_locks.release(xid);
@@ -802,12 +961,12 @@ impl Transaction<'_> {
         self.session.query_prepared(statement, params)
     }
     pub fn commit(mut self) -> Result<()> {
-        self.session.finish_transaction(true);
+        self.session.finish_transaction(true)?;
         self.finished = true;
         Ok(())
     }
     pub fn rollback(mut self) -> Result<()> {
-        self.session.finish_transaction(false);
+        self.session.finish_transaction(false)?;
         self.finished = true;
         Ok(())
     }
@@ -816,7 +975,7 @@ impl Transaction<'_> {
 impl Drop for Transaction<'_> {
     fn drop(&mut self) {
         if !self.finished {
-            self.session.finish_transaction(false);
+            let _ = self.session.finish_transaction(false);
         }
     }
 }
@@ -845,6 +1004,183 @@ mod tests {
 
     fn affected(rows: u64) -> Vec<StatementResult> {
         vec![StatementResult::Affected(rows)]
+    }
+
+    #[test]
+    fn foreign_keys_enforce_keys_and_keep_failed_multi_row_writes_atomic() {
+        let db = Db::new();
+        let mut session = db.session();
+        session
+            .execute("CREATE TABLE parents (id INTEGER PRIMARY KEY)")
+            .unwrap();
+        session.execute("CREATE TABLE children (id INTEGER PRIMARY KEY, parent_id INTEGER REFERENCES parents)").unwrap();
+        let error = session
+            .execute("INSERT INTO children VALUES (1, 99), (2, 99)")
+            .unwrap_err();
+        assert_eq!(error.sqlstate, SqlState::ForeignKeyViolation);
+        assert!(
+            session
+                .query("SELECT * FROM children", &[])
+                .unwrap()
+                .rows
+                .is_empty()
+        );
+        session.execute("INSERT INTO parents VALUES (99)").unwrap();
+        session
+            .execute("INSERT INTO children VALUES (1, 99)")
+            .unwrap();
+        assert_eq!(
+            session
+                .query("SELECT parent_id FROM children", &[])
+                .unwrap()
+                .rows,
+            vec![vec![Value::Int4(99)]]
+        );
+    }
+
+    #[test]
+    fn foreign_key_actions_apply_to_updates_and_deletes() {
+        let db = Db::new();
+        let mut session = db.session();
+        session
+            .execute("CREATE TABLE parents (id INTEGER PRIMARY KEY, replacement INTEGER)")
+            .unwrap();
+        session.execute("CREATE TABLE cascade_children (id INTEGER PRIMARY KEY, parent_id INTEGER REFERENCES parents(id) ON DELETE CASCADE ON UPDATE CASCADE)").unwrap();
+        session.execute("CREATE TABLE null_children (id INTEGER PRIMARY KEY, parent_id INTEGER REFERENCES parents(id) ON DELETE SET NULL ON UPDATE CASCADE)").unwrap();
+        session.execute("CREATE TABLE default_children (id INTEGER PRIMARY KEY, parent_id INTEGER DEFAULT 7 REFERENCES parents(id) ON DELETE SET DEFAULT ON UPDATE CASCADE)").unwrap();
+        session
+            .execute("INSERT INTO parents VALUES (7, NULL), (1, NULL)")
+            .unwrap();
+        session
+            .execute("INSERT INTO cascade_children VALUES (1, 1)")
+            .unwrap();
+        session
+            .execute("INSERT INTO null_children VALUES (1, 1)")
+            .unwrap();
+        session
+            .execute("INSERT INTO default_children VALUES (1, 1)")
+            .unwrap();
+        session
+            .execute("UPDATE parents SET id = 2 WHERE id = 1")
+            .unwrap();
+        assert_eq!(
+            session
+                .query("SELECT parent_id FROM cascade_children", &[])
+                .unwrap()
+                .rows,
+            vec![vec![Value::Int4(2)]]
+        );
+        session.execute("DELETE FROM parents WHERE id = 2").unwrap();
+        assert!(
+            session
+                .query("SELECT * FROM cascade_children", &[])
+                .unwrap()
+                .rows
+                .is_empty()
+        );
+        assert_eq!(
+            session
+                .query("SELECT parent_id FROM null_children", &[])
+                .unwrap()
+                .rows,
+            vec![vec![Value::Null]]
+        );
+        assert_eq!(
+            session
+                .query("SELECT parent_id FROM default_children", &[])
+                .unwrap()
+                .rows,
+            vec![vec![Value::Int4(7)]]
+        );
+    }
+
+    #[test]
+    fn deferred_foreign_keys_validate_at_commit_and_can_be_repaired() {
+        let db = Db::new();
+        let mut session = db.session();
+        session
+            .execute("CREATE TABLE parents (id INTEGER PRIMARY KEY)")
+            .unwrap();
+        session.execute("CREATE TABLE children (id INTEGER PRIMARY KEY, parent_id INTEGER CONSTRAINT children_parent_fkey REFERENCES parents DEFERRABLE INITIALLY DEFERRED)").unwrap();
+        session.execute("BEGIN").unwrap();
+        session
+            .execute("INSERT INTO children VALUES (1, 2)")
+            .unwrap();
+        session.execute("INSERT INTO parents VALUES (2)").unwrap();
+        session.execute("COMMIT").unwrap();
+        session.execute("BEGIN").unwrap();
+        session
+            .execute("INSERT INTO children VALUES (3, 4)")
+            .unwrap();
+        let error = session.execute("COMMIT").unwrap_err();
+        assert_eq!(error.sqlstate, SqlState::ForeignKeyViolation);
+        assert_eq!(
+            session.query("SELECT id FROM children", &[]).unwrap().rows,
+            vec![vec![Value::Int4(1)]]
+        );
+    }
+
+    #[test]
+    fn set_constraints_changes_deferrable_foreign_key_timing() {
+        let db = Db::new();
+        let mut session = db.session();
+        session
+            .execute("CREATE TABLE parents (id INTEGER PRIMARY KEY)")
+            .unwrap();
+        session.execute("CREATE TABLE children (id INTEGER PRIMARY KEY, parent_id INTEGER CONSTRAINT children_parent_fkey REFERENCES parents DEFERRABLE)").unwrap();
+        session.execute("BEGIN").unwrap();
+        session
+            .execute("SET CONSTRAINTS children_parent_fkey DEFERRED")
+            .unwrap();
+        session
+            .execute("INSERT INTO children VALUES (1, 2)")
+            .unwrap();
+        session.execute("INSERT INTO parents VALUES (2)").unwrap();
+        session.execute("SET CONSTRAINTS ALL IMMEDIATE").unwrap();
+        session.execute("COMMIT").unwrap();
+    }
+
+    #[test]
+    fn self_references_and_match_simple_nulls_are_valid() {
+        let db = Db::new();
+        let mut session = db.session();
+        session
+            .execute(
+                "CREATE TABLE nodes (id INTEGER PRIMARY KEY, parent_id INTEGER REFERENCES nodes)",
+            )
+            .unwrap();
+        session.execute("INSERT INTO nodes VALUES (1, 1)").unwrap();
+        session
+            .execute("CREATE TABLE parents (first_id INTEGER, second_id INTEGER, PRIMARY KEY (first_id, second_id))")
+            .unwrap();
+        session
+            .execute("CREATE TABLE children (id INTEGER PRIMARY KEY, first_id INTEGER, second_id INTEGER, FOREIGN KEY (first_id, second_id) REFERENCES parents(first_id, second_id))")
+            .unwrap();
+        session
+            .execute("INSERT INTO children VALUES (1, NULL, 2), (2, 1, NULL), (3, NULL, NULL)")
+            .unwrap();
+    }
+
+    #[test]
+    fn match_full_rejects_partially_null_composite_keys() {
+        let db = Db::new();
+        let mut session = db.session();
+        session
+            .execute("CREATE TABLE parents (first_id INTEGER, second_id INTEGER, PRIMARY KEY (first_id, second_id))")
+            .unwrap();
+        session
+            .execute("CREATE TABLE children (id INTEGER PRIMARY KEY, first_id INTEGER, second_id INTEGER, FOREIGN KEY (first_id, second_id) REFERENCES parents(first_id, second_id) MATCH FULL)")
+            .unwrap();
+        session
+            .execute("INSERT INTO children VALUES (1, NULL, NULL)")
+            .unwrap();
+        assert_eq!(
+            session
+                .execute("INSERT INTO children VALUES (2, NULL, 1)")
+                .unwrap_err()
+                .sqlstate,
+            SqlState::ForeignKeyViolation
+        );
     }
 
     #[test]

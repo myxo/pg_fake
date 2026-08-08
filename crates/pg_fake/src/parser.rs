@@ -7,8 +7,46 @@ use crate::error::{PgError, Result, SqlState};
 
 /// Parses one or more PostgreSQL statements into owned syntax trees.
 pub fn parse(sql: &str) -> Result<Vec<Statement>> {
-    Parser::parse_sql(&PostgreSqlDialect {}, sql)
-        .map_err(|error| PgError::new(SqlState::SyntaxError, error.to_string()))
+    let match_full = sql.to_ascii_uppercase().contains("MATCH FULL");
+    let mut statements = Parser::parse_sql(
+        &PostgreSqlDialect {},
+        &sql.replace("MATCH FULL", "").replace("match full", ""),
+    )
+    .map_err(|error| PgError::new(SqlState::SyntaxError, error.to_string()))?;
+    if match_full {
+        for statement in &mut statements {
+            let Statement::CreateTable(create) = statement else {
+                continue;
+            };
+            for column in &mut create.columns {
+                for option in &mut column.options {
+                    if matches!(
+                        option.option,
+                        sqlparser::ast::ColumnOption::ForeignKey { .. }
+                    ) {
+                        let name = option
+                            .name
+                            .as_ref()
+                            .map(|name| name.value.as_str())
+                            .unwrap_or("");
+                        option.name = Some(sqlparser::ast::Ident::new(format!(
+                            "__pg_fake_match_full__{name}"
+                        )));
+                    }
+                }
+            }
+            for constraint in &mut create.constraints {
+                if let sqlparser::ast::TableConstraint::ForeignKey { name, .. } = constraint {
+                    let constraint_name =
+                        name.as_ref().map(|name| name.value.as_str()).unwrap_or("");
+                    *name = Some(sqlparser::ast::Ident::new(format!(
+                        "__pg_fake_match_full__{constraint_name}"
+                    )));
+                }
+            }
+        }
+    }
+    Ok(statements)
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

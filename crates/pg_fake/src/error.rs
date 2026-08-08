@@ -25,9 +25,10 @@ pub enum SqlState {
     StringDataRightTruncation,           // 22001
 
     // 23 — Integrity Constraint Violation
-    NotNullViolation, // 23502
-    UniqueViolation,  // 23505
-    CheckViolation,   // 23514
+    NotNullViolation,    // 23502
+    UniqueViolation,     // 23505
+    CheckViolation,      // 23514
+    ForeignKeyViolation, // 23503
 
     // 25 — Invalid Transaction State
     ActiveSqlTransaction,   // 25001
@@ -74,6 +75,7 @@ impl SqlState {
             SqlState::NotNullViolation => "23502",
             SqlState::UniqueViolation => "23505",
             SqlState::CheckViolation => "23514",
+            SqlState::ForeignKeyViolation => "23503",
             SqlState::ActiveSqlTransaction => "25001",
             SqlState::InFailedSqlTransaction => "25P02",
             SqlState::SerializationFailure => "40001",
