@@ -89,6 +89,36 @@ async fn sqlx_uuid_values_round_trip() {
 }
 
 #[tokio::test]
+async fn sqlx_timestamp_values_round_trip() {
+    let mut connection = PgFakeConnection::new(Db::new());
+    let local = chrono::NaiveDate::from_ymd_opt(2024, 2, 29)
+        .unwrap()
+        .and_hms_micro_opt(12, 34, 56, 789_000)
+        .unwrap();
+    let instant = chrono::DateTime::parse_from_rfc3339("2024-02-29T12:34:56+03:00")
+        .unwrap()
+        .with_timezone(&chrono::Utc);
+    connection
+        .execute("CREATE TABLE timestamps (local TIMESTAMP, instant TIMESTAMPTZ)")
+        .await
+        .unwrap();
+    sqlx::query("INSERT INTO timestamps VALUES ($1, $2)")
+        .bind(local)
+        .bind(instant)
+        .execute(&mut connection)
+        .await
+        .unwrap();
+    let row = sqlx::query("SELECT local, instant FROM timestamps")
+        .fetch_one(&mut connection)
+        .await
+        .unwrap();
+    assert_eq!(row.get::<chrono::NaiveDateTime, _>(0), local);
+    assert_eq!(row.get::<chrono::DateTime<chrono::Utc>, _>(1), instant);
+    assert_eq!(row.columns()[0].type_info().name(), "TIMESTAMP");
+    assert_eq!(row.columns()[1].type_info().name(), "TIMESTAMPTZ");
+}
+
+#[tokio::test]
 async fn prepared_statements_transactions_and_pools_use_the_sqlx_api() {
     let db = Db::new();
     let pool = PgFakePoolOptions::new()

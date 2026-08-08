@@ -42,6 +42,8 @@ enum IndexValue {
     Uuid(uuid::Uuid),
     Date(crate::value::PgDate),
     Time(crate::value::PgTime),
+    Timestamp(crate::value::PgTimestamp),
+    TimestampTz(crate::value::PgTimestampTz),
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
@@ -282,6 +284,12 @@ fn index_key(schema: &TableSchema, index: &UniqueIndex, row: &Row) -> Option<Ind
                 (Value::Uuid(value), BaseType::Uuid) => Some(IndexValue::Uuid(*value)),
                 (Value::Date(value), BaseType::Date) => Some(IndexValue::Date(*value)),
                 (Value::Time(value), BaseType::Time) => Some(IndexValue::Time(*value)),
+                (Value::Timestamp(value), BaseType::Timestamp) => {
+                    Some(IndexValue::Timestamp(*value))
+                }
+                (Value::TimestampTz(value), BaseType::TimestampTz) => {
+                    Some(IndexValue::TimestampTz(*value))
+                }
                 _ => unreachable!("row values must match declared column types"),
             },
         )

@@ -2154,12 +2154,16 @@ pub(crate) fn expression_type(expr: &Expr, schema: &TableSchema) -> Result<BaseT
         }
         Expr::Extract { expr, .. } => {
             let base = expression_type(expr, schema)?;
-            if matches!(base, BaseType::Date | BaseType::Time) || null_expression(expr) {
+            if matches!(
+                base,
+                BaseType::Date | BaseType::Time | BaseType::Timestamp | BaseType::TimestampTz
+            ) || null_expression(expr)
+            {
                 Ok(BaseType::Numeric)
             } else {
                 Err(PgError::new(
                     SqlState::DatatypeMismatch,
-                    "extract source must be date or time",
+                    "extract source must be a temporal value",
                 ))
             }
         }
@@ -2776,7 +2780,7 @@ fn comparison(operator: &BinaryOperator, left: &Value, right: &Value) -> Result<
 }
 
 fn extract_value(field: DateTimeField, value: Value) -> Result<Value> {
-    use chrono::Datelike;
+    use chrono::{Datelike, Timelike};
     let value = match value {
         Value::Null => return Ok(Value::Null),
         Value::Date(crate::value::PgDate::Finite(value)) => match field {
@@ -2812,6 +2816,53 @@ fn extract_value(field: DateTimeField, value: Value) -> Result<Value> {
                 "cannot extract from infinite date",
             ));
         }
+        Value::Timestamp(crate::value::PgTimestamp::Finite(value)) => match field {
+            DateTimeField::Year => value.year() as i64,
+            DateTimeField::Month => i64::from(value.month()),
+            DateTimeField::Day => i64::from(value.day()),
+            DateTimeField::Hour => i64::from(value.hour()),
+            DateTimeField::Minute => i64::from(value.minute()),
+            DateTimeField::Second => i64::from(value.second()),
+            DateTimeField::Microsecond | DateTimeField::Microseconds => {
+                i64::from(value.nanosecond() / 1_000)
+            }
+            DateTimeField::Epoch => value.and_utc().timestamp(),
+            _ => {
+                return Err(PgError::new(
+                    SqlState::FeatureNotSupported,
+                    "date part is not implemented",
+                ));
+            }
+        },
+        Value::TimestampTz(crate::value::PgTimestampTz::Finite(value)) => match field {
+            DateTimeField::Year => value.year() as i64,
+            DateTimeField::Month => i64::from(value.month()),
+            DateTimeField::Day => i64::from(value.day()),
+            DateTimeField::Hour => i64::from(value.hour()),
+            DateTimeField::Minute => i64::from(value.minute()),
+            DateTimeField::Second => i64::from(value.second()),
+            DateTimeField::Microsecond | DateTimeField::Microseconds => {
+                i64::from(value.nanosecond() / 1_000)
+            }
+            DateTimeField::Epoch => value.timestamp(),
+            _ => {
+                return Err(PgError::new(
+                    SqlState::FeatureNotSupported,
+                    "date part is not implemented",
+                ));
+            }
+        },
+        Value::Timestamp(
+            crate::value::PgTimestamp::Infinity | crate::value::PgTimestamp::NegInfinity,
+        )
+        | Value::TimestampTz(
+            crate::value::PgTimestampTz::Infinity | crate::value::PgTimestampTz::NegInfinity,
+        ) => {
+            return Err(PgError::new(
+                SqlState::NumericValueOutOfRange,
+                "cannot extract from infinite timestamp",
+            ));
+        }
         _ => {
             return Err(PgError::new(
                 SqlState::DatatypeMismatch,
@@ -2836,6 +2887,8 @@ fn value_ordering(left: &Value, right: &Value) -> Result<Ordering> {
         (Value::Uuid(left), Value::Uuid(right)) => left.cmp(right),
         (Value::Date(left), Value::Date(right)) => left.cmp(right),
         (Value::Time(left), Value::Time(right)) => left.cmp(right),
+        (Value::Timestamp(left), Value::Timestamp(right)) => left.cmp(right),
+        (Value::TimestampTz(left), Value::TimestampTz(right)) => left.cmp(right),
         _ => {
             return Err(PgError::new(
                 SqlState::DatatypeMismatch,

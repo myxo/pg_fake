@@ -61,8 +61,9 @@ pub struct Session {
     transaction: Option<SessionTransaction>,
     default_isolation: IsolationLevel,
     lock_timeout: Duration,
+    timezone: String,
     ddl_undo: Vec<DdlUndo>,
-    settings_undo: Option<(IsolationLevel, Duration)>,
+    settings_undo: Option<(IsolationLevel, Duration, String)>,
     deferred_constraints: BTreeSet<String>,
     defer_all_constraints: bool,
 }
@@ -172,6 +173,29 @@ fn parse_lock_timeout(expression: &Expr) -> Result<Duration> {
         .parse::<u64>()
         .map(Duration::from_millis)
         .map_err(|_| invalid_lock_timeout())
+}
+
+fn parse_timezone(expression: &Expr) -> Result<String> {
+    let value = match expression {
+        Expr::Value(AstValue::SingleQuotedString(value))
+        | Expr::Identifier(sqlparser::ast::Ident { value, .. }) => value,
+        _ => {
+            return Err(PgError::new(
+                SqlState::InvalidParameterValue,
+                "invalid value for parameter TimeZone",
+            ));
+        }
+    };
+    // UTC and numeric offsets are accepted here. Named-zone interpretation is
+    // intentionally validated by the timestamp input layer when it is used.
+    if value.eq_ignore_ascii_case("utc") || value.parse::<chrono::FixedOffset>().is_ok() {
+        Ok(value.to_string())
+    } else {
+        Err(PgError::new(
+            SqlState::InvalidParameterValue,
+            "invalid value for parameter TimeZone",
+        ))
+    }
 }
 
 fn lock_timeout_error() -> PgError {
@@ -320,6 +344,7 @@ impl Db {
             transaction: None,
             default_isolation: IsolationLevel::ReadCommitted,
             lock_timeout: self.default_lock_timeout,
+            timezone: "UTC".into(),
             ddl_undo: Vec::new(),
             settings_undo: None,
             deferred_constraints: BTreeSet::new(),
@@ -596,7 +621,11 @@ impl Session {
         assert!(self.settings_undo.is_none());
         self.deferred_constraints.clear();
         self.defer_all_constraints = false;
-        self.settings_undo = Some((self.default_isolation, self.lock_timeout));
+        self.settings_undo = Some((
+            self.default_isolation,
+            self.lock_timeout,
+            self.timezone.clone(),
+        ));
         let mut state = self.db.state.lock().expect("database mutex is poisoned");
         self.transaction = Some(SessionTransaction::Active(ActiveTransaction {
             xid: state.transactions.begin(),
@@ -618,9 +647,12 @@ impl Session {
                     executor::validate_deferred_foreign_keys(&state, transaction.xid)
                 {
                     self.rollback_ddl(&mut state);
-                    if let Some((default_isolation, lock_timeout)) = self.settings_undo.take() {
+                    if let Some((default_isolation, lock_timeout, timezone)) =
+                        self.settings_undo.take()
+                    {
                         self.default_isolation = default_isolation;
                         self.lock_timeout = lock_timeout;
+                        self.timezone = timezone;
                     }
                     self.deferred_constraints.clear();
                     self.defer_all_constraints = false;
@@ -644,9 +676,10 @@ impl Session {
         let state_lock = self.db.state.clone();
         let mut state = state_lock.lock().expect("database mutex is poisoned");
         self.rollback_ddl(&mut state);
-        if let Some((default_isolation, lock_timeout)) = self.settings_undo.take() {
+        if let Some((default_isolation, lock_timeout, timezone)) = self.settings_undo.take() {
             self.default_isolation = default_isolation;
             self.lock_timeout = lock_timeout;
+            self.timezone = timezone;
         }
         self.deferred_constraints.clear();
         self.defer_all_constraints = false;
@@ -690,6 +723,22 @@ impl Session {
     }
     fn run_statement(&mut self, statement: parser::Statement) -> Result<StatementResult> {
         match &statement {
+            parser::Statement::SetTimeZone { local: _, value } => {
+                self.timezone = parse_timezone(value)?;
+                return Ok(StatementResult::Affected(0));
+            }
+            parser::Statement::ShowVariable { variable }
+                if variable.len() == 1 && variable[0].value.eq_ignore_ascii_case("timezone") =>
+            {
+                return Ok(StatementResult::Query(QueryResult {
+                    columns: vec![ColumnMeta {
+                        name: "TimeZone".into(),
+                        type_oid: crate::value::BaseType::Text.oid(),
+                        typmod: -1,
+                    }],
+                    rows: vec![vec![Value::Text(self.timezone.clone())]],
+                }));
+            }
             parser::Statement::StartTransaction { modes, .. } => {
                 return match self.transaction {
                     None => {
@@ -777,6 +826,16 @@ impl Session {
                         "setting multiple variables is not implemented",
                     ));
                 };
+                if variable.to_string().eq_ignore_ascii_case("timezone") {
+                    if *hivevar || value.len() != 1 {
+                        return self.failed(PgError::new(
+                            SqlState::FeatureNotSupported,
+                            "TimeZone setting variant is not implemented",
+                        ));
+                    }
+                    self.timezone = parse_timezone(&value[0])?;
+                    return Ok(StatementResult::Affected(0));
+                }
                 if variable.to_string().eq_ignore_ascii_case("lock_timeout") {
                     if matches!(self.transaction, Some(SessionTransaction::Aborted { .. })) {
                         return Err(PgError::new(
@@ -1188,6 +1247,36 @@ mod tests {
             .unwrap();
         assert!(matches!(generated.rows[0][0], Value::Uuid(_)));
         assert_ne!(generated.rows[0][0], generated.rows[0][1]);
+    }
+
+    #[test]
+    fn timestamp_values_and_timezone_setting_work() {
+        let db = Db::new();
+        let mut session = db.session();
+        session
+            .execute("CREATE TABLE events (plain TIMESTAMP(3), instant TIMESTAMPTZ)")
+            .unwrap();
+        session
+            .execute("INSERT INTO events VALUES ('2024-02-29 12:34:56.789123', '2024-02-29T12:34:56+03:00')")
+            .unwrap();
+        let result = session
+            .query("SELECT plain, instant FROM events", &[])
+            .unwrap();
+        assert_eq!(
+            result.columns[0].type_oid,
+            crate::value::BaseType::Timestamp.oid()
+        );
+        assert_eq!(
+            result.columns[1].type_oid,
+            crate::value::BaseType::TimestampTz.oid()
+        );
+        assert_eq!(result.rows[0][0].to_text(), "2024-02-29 12:34:56.789");
+        assert_eq!(result.rows[0][1].to_text(), "2024-02-29 09:34:56+00");
+        session.execute("SET TIME ZONE 'UTC'").unwrap();
+        assert_eq!(
+            session.query("SHOW TimeZone", &[]).unwrap().rows,
+            vec![vec![Value::Text("UTC".into())]]
+        );
     }
 
     #[test]

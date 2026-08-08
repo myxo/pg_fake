@@ -1,5 +1,5 @@
 use bigdecimal::BigDecimal;
-use chrono::Timelike;
+use chrono::{DateTime, NaiveDateTime, Timelike, Utc};
 use std::str::FromStr;
 
 use crate::error::{PgError, Result, SqlState};
@@ -16,6 +16,24 @@ pub enum PgDate {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 pub struct PgTime(pub i64);
+
+/// PostgreSQL `timestamp without time zone`, including its two sentinel values.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub enum PgTimestamp {
+    NegInfinity,
+    Finite(NaiveDateTime),
+    Infinity,
+}
+
+/// PostgreSQL `timestamp with time zone`: a UTC instant plus PostgreSQL's
+/// infinity sentinels. Rendering in a session zone is deliberately kept above
+/// the value layer so persisted values never acquire a display-zone.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub enum PgTimestampTz {
+    NegInfinity,
+    Finite(DateTime<Utc>),
+    Infinity,
+}
 
 /// Phase-1 PostgreSQL base types (§3.1).
 ///
@@ -38,6 +56,8 @@ pub enum BaseType {
     Uuid,
     Date,
     Time,
+    Timestamp,
+    TimestampTz,
 }
 
 impl BaseType {
@@ -58,6 +78,8 @@ impl BaseType {
             BaseType::Uuid => 2950,
             BaseType::Date => 1082,
             BaseType::Time => 1083,
+            BaseType::Timestamp => 1114,
+            BaseType::TimestampTz => 1184,
         }
     }
 
@@ -78,6 +100,8 @@ impl BaseType {
             BaseType::Uuid => "uuid",
             BaseType::Date => "date",
             BaseType::Time => "time",
+            BaseType::Timestamp => "timestamp",
+            BaseType::TimestampTz => "timestamptz",
         }
     }
 
@@ -98,6 +122,8 @@ impl BaseType {
             2950 => Some(BaseType::Uuid),
             1082 => Some(BaseType::Date),
             1083 => Some(BaseType::Time),
+            1114 => Some(BaseType::Timestamp),
+            1184 => Some(BaseType::TimestampTz),
             _ => None,
         }
     }
@@ -120,6 +146,8 @@ impl BaseType {
             "uuid" => Some(BaseType::Uuid),
             "date" => Some(BaseType::Date),
             "time" | "time without time zone" => Some(BaseType::Time),
+            "timestamp" | "timestamp without time zone" => Some(BaseType::Timestamp),
+            "timestamptz" | "timestamp with time zone" => Some(BaseType::TimestampTz),
             _ => None,
         }
     }
@@ -175,6 +203,8 @@ pub enum Value {
     Uuid(uuid::Uuid),
     Date(PgDate),
     Time(PgTime),
+    Timestamp(PgTimestamp),
+    TimestampTz(PgTimestampTz),
 }
 
 impl Value {
@@ -201,6 +231,8 @@ impl Value {
             Value::Uuid(_) => Some(BaseType::Uuid),
             Value::Date(_) => Some(BaseType::Date),
             Value::Time(_) => Some(BaseType::Time),
+            Value::Timestamp(_) => Some(BaseType::Timestamp),
+            Value::TimestampTz(_) => Some(BaseType::TimestampTz),
         }
     }
 
@@ -251,6 +283,14 @@ impl Value {
                         .into()
                 }
             }
+            Value::Timestamp(PgTimestamp::NegInfinity)
+            | Value::TimestampTz(PgTimestampTz::NegInfinity) => "-infinity".into(),
+            Value::Timestamp(PgTimestamp::Infinity)
+            | Value::TimestampTz(PgTimestampTz::Infinity) => "infinity".into(),
+            Value::Timestamp(PgTimestamp::Finite(value)) => format_timestamp(*value),
+            Value::TimestampTz(PgTimestampTz::Finite(value)) => {
+                format!("{}+00", format_timestamp(value.naive_utc()))
+            }
         }
     }
 
@@ -277,8 +317,18 @@ impl Value {
                 .map_err(|_| invalid_text(input, "uuid")),
             BaseType::Date => parse_date(input).map(Value::Date),
             BaseType::Time => parse_time(input).map(Value::Time),
+            BaseType::Timestamp => parse_timestamp(input).map(Value::Timestamp),
+            BaseType::TimestampTz => parse_timestamptz(input).map(Value::TimestampTz),
         }
     }
+}
+
+fn format_timestamp(value: NaiveDateTime) -> String {
+    let output = value.format("%Y-%m-%d %H:%M:%S%.6f").to_string();
+    output
+        .trim_end_matches('0')
+        .trim_end_matches('.')
+        .to_string()
 }
 
 fn format_float(f: f64) -> String {
@@ -317,6 +367,61 @@ fn parse_time(input: &str) -> Result<PgTime> {
         i64::from(value.num_seconds_from_midnight()) * 1_000_000
             + i64::from(value.nanosecond() / 1_000),
     ))
+}
+
+fn parse_timestamp(input: &str) -> Result<PgTimestamp> {
+    let input = input.trim();
+    match input.to_ascii_lowercase().as_str() {
+        "infinity" => return Ok(PgTimestamp::Infinity),
+        "-infinity" => return Ok(PgTimestamp::NegInfinity),
+        _ => {}
+    }
+    // PostgreSQL accepts a time-zone suffix for timestamp input, validates it,
+    // then discards it. RFC3339 covers the unambiguous offset spellings.
+    if let Ok(value) = DateTime::parse_from_rfc3339(&rfc3339_input(input)) {
+        return Ok(PgTimestamp::Finite(value.naive_local()));
+    }
+    [
+        "%Y-%m-%d %H:%M:%S%.f",
+        "%Y-%m-%d %H:%M",
+        "%Y-%m-%dT%H:%M:%S%.f",
+    ]
+    .iter()
+    .find_map(|format| NaiveDateTime::parse_from_str(input, format).ok())
+    .map(PgTimestamp::Finite)
+    .ok_or_else(|| invalid_text(input, "timestamp"))
+}
+
+fn parse_timestamptz(input: &str) -> Result<PgTimestampTz> {
+    let input = input.trim();
+    match input.to_ascii_lowercase().as_str() {
+        "infinity" => return Ok(PgTimestampTz::Infinity),
+        "-infinity" => return Ok(PgTimestampTz::NegInfinity),
+        _ => {}
+    }
+    if let Ok(value) = DateTime::parse_from_rfc3339(&rfc3339_input(input)) {
+        return Ok(PgTimestampTz::Finite(value.with_timezone(&Utc)));
+    }
+    [
+        "%Y-%m-%d %H:%M:%S%.f",
+        "%Y-%m-%d %H:%M",
+        "%Y-%m-%dT%H:%M:%S%.f",
+    ]
+    .iter()
+    .find_map(|format| NaiveDateTime::parse_from_str(input, format).ok())
+    .map(|value| PgTimestampTz::Finite(value.and_utc()))
+    .ok_or_else(|| invalid_text(input, "timestamp with time zone"))
+}
+
+fn rfc3339_input(input: &str) -> String {
+    let mut input = input.replacen(' ', "T", 1);
+    if input.len() >= 3 {
+        let suffix = &input[input.len() - 3..];
+        if suffix.starts_with('+') || suffix.starts_with('-') {
+            input.push_str(":00");
+        }
+    }
+    input
 }
 
 fn parse_bool(input: &str) -> Result<bool> {

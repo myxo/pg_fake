@@ -59,6 +59,8 @@ impl TypeInfo for PgFakeTypeInfo {
             Some(BaseType::Uuid) => "UUID",
             Some(BaseType::Date) => "DATE",
             Some(BaseType::Time) => "TIME",
+            Some(BaseType::Timestamp) => "TIMESTAMP",
+            Some(BaseType::TimestampTz) => "TIMESTAMPTZ",
             None => "NULL",
         }
     }
@@ -213,6 +215,54 @@ impl<'r> Decode<'r, PgFake> for chrono::NaiveTime {
             }
             Value::Null => Err(Box::new(UnexpectedNullError)),
             value => Err(format!("cannot decode {value:?} as NaiveTime").into()),
+        }
+    }
+}
+
+impl Type<PgFake> for chrono::NaiveDateTime {
+    fn type_info() -> PgFakeTypeInfo {
+        PgFakeTypeInfo::new(BaseType::Timestamp)
+    }
+}
+
+impl<'q> Encode<'q, PgFake> for chrono::NaiveDateTime {
+    fn encode_by_ref(&self, buffer: &mut Vec<Value>) -> Result<IsNull, BoxDynError> {
+        buffer.push(Value::Timestamp(pg_fake::value::PgTimestamp::Finite(*self)));
+        Ok(IsNull::No)
+    }
+}
+
+impl<'r> Decode<'r, PgFake> for chrono::NaiveDateTime {
+    fn decode(value: PgFakeValueRef<'r>) -> Result<Self, BoxDynError> {
+        match value.value {
+            Value::Timestamp(pg_fake::value::PgTimestamp::Finite(value)) => Ok(*value),
+            Value::Null => Err(Box::new(UnexpectedNullError)),
+            value => Err(format!("cannot decode {value:?} as NaiveDateTime").into()),
+        }
+    }
+}
+
+impl Type<PgFake> for chrono::DateTime<chrono::Utc> {
+    fn type_info() -> PgFakeTypeInfo {
+        PgFakeTypeInfo::new(BaseType::TimestampTz)
+    }
+}
+
+impl<'q> Encode<'q, PgFake> for chrono::DateTime<chrono::Utc> {
+    fn encode_by_ref(&self, buffer: &mut Vec<Value>) -> Result<IsNull, BoxDynError> {
+        buffer.push(Value::TimestampTz(pg_fake::value::PgTimestampTz::Finite(
+            *self,
+        )));
+        Ok(IsNull::No)
+    }
+}
+
+impl<'r> Decode<'r, PgFake> for chrono::DateTime<chrono::Utc> {
+    fn decode(value: PgFakeValueRef<'r>) -> Result<Self, BoxDynError> {
+        match value.value {
+            Value::TimestampTz(pg_fake::value::PgTimestampTz::Finite(value)) => Ok(*value),
+            Value::Null => Err(Box::new(UnexpectedNullError)),
+            value => Err(format!("cannot decode {value:?} as DateTime<Utc>").into()),
         }
     }
 }

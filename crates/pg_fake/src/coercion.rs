@@ -1,4 +1,5 @@
 use bigdecimal::{BigDecimal, FromPrimitive, RoundingMode, ToPrimitive};
+use chrono::Timelike;
 use sqlparser::ast::{CharacterLength, DataType, ExactNumberInfo, TimezoneInfo};
 
 use crate::{
@@ -41,7 +42,13 @@ pub(crate) fn type_from_ast(data_type: &DataType) -> Result<PgType> {
         DataType::Time(precision, TimezoneInfo::None | TimezoneInfo::WithoutTimeZone) => {
             (BaseType::Time, time_typmod(*precision)?)
         }
-        DataType::Custom(_, _) if !data_type.to_string().contains('(') => {
+        DataType::Timestamp(precision, TimezoneInfo::None | TimezoneInfo::WithoutTimeZone) => {
+            (BaseType::Timestamp, time_typmod(*precision)?)
+        }
+        DataType::Timestamp(precision, TimezoneInfo::WithTimeZone | TimezoneInfo::Tz) => {
+            (BaseType::TimestampTz, time_typmod(*precision)?)
+        }
+        DataType::Custom(_, _) => {
             let Some(base) = BaseType::from_name(&data_type.to_string()) else {
                 return Err(PgError::new(
                     SqlState::UndefinedObject,
@@ -142,12 +149,35 @@ fn required_context(source: BaseType, target: BaseType) -> Option<CastContext> {
         return Some(CastContext::Assignment);
     }
     if string(source) {
-        if matches!(target, BaseType::Uuid | BaseType::Date | BaseType::Time) {
+        if matches!(
+            target,
+            BaseType::Uuid
+                | BaseType::Date
+                | BaseType::Time
+                | BaseType::Timestamp
+                | BaseType::TimestampTz
+        ) {
             return Some(CastContext::Assignment);
         }
         return Some(CastContext::Explicit);
     }
-    if matches!(source, BaseType::Uuid | BaseType::Date | BaseType::Time) && string(target) {
+    if matches!(
+        source,
+        BaseType::Uuid
+            | BaseType::Date
+            | BaseType::Time
+            | BaseType::Timestamp
+            | BaseType::TimestampTz
+    ) && string(target)
+    {
+        return Some(CastContext::Assignment);
+    }
+    if matches!(
+        (source, target),
+        (BaseType::Date, BaseType::Timestamp | BaseType::TimestampTz)
+            | (BaseType::Timestamp, BaseType::Date | BaseType::TimestampTz)
+            | (BaseType::TimestampTz, BaseType::Date | BaseType::Timestamp)
+    ) {
         return Some(CastContext::Assignment);
     }
     if matches!(
@@ -210,6 +240,63 @@ pub(crate) fn coerce_unknown(text: &str, target: PgType, context: CastContext) -
 
 fn convert_non_string(value: Value, target: BaseType) -> Result<Value> {
     match (value, target) {
+        (Value::Date(crate::value::PgDate::Finite(value)), BaseType::Timestamp) => {
+            Ok(Value::Timestamp(crate::value::PgTimestamp::Finite(
+                value.and_hms_opt(0, 0, 0).expect("midnight is valid"),
+            )))
+        }
+        (Value::Date(crate::value::PgDate::Infinity), BaseType::Timestamp) => {
+            Ok(Value::Timestamp(crate::value::PgTimestamp::Infinity))
+        }
+        (Value::Date(crate::value::PgDate::NegInfinity), BaseType::Timestamp) => {
+            Ok(Value::Timestamp(crate::value::PgTimestamp::NegInfinity))
+        }
+        (Value::Date(crate::value::PgDate::Finite(value)), BaseType::TimestampTz) => {
+            Ok(Value::TimestampTz(crate::value::PgTimestampTz::Finite(
+                value
+                    .and_hms_opt(0, 0, 0)
+                    .expect("midnight is valid")
+                    .and_utc(),
+            )))
+        }
+        (Value::Date(crate::value::PgDate::Infinity), BaseType::TimestampTz) => {
+            Ok(Value::TimestampTz(crate::value::PgTimestampTz::Infinity))
+        }
+        (Value::Date(crate::value::PgDate::NegInfinity), BaseType::TimestampTz) => {
+            Ok(Value::TimestampTz(crate::value::PgTimestampTz::NegInfinity))
+        }
+        (Value::Timestamp(crate::value::PgTimestamp::Finite(value)), BaseType::Date) => {
+            Ok(Value::Date(crate::value::PgDate::Finite(value.date())))
+        }
+        (Value::Timestamp(crate::value::PgTimestamp::Infinity), BaseType::Date) => {
+            Ok(Value::Date(crate::value::PgDate::Infinity))
+        }
+        (Value::Timestamp(crate::value::PgTimestamp::NegInfinity), BaseType::Date) => {
+            Ok(Value::Date(crate::value::PgDate::NegInfinity))
+        }
+        (Value::Timestamp(value), BaseType::TimestampTz) => Ok(Value::TimestampTz(match value {
+            crate::value::PgTimestamp::NegInfinity => crate::value::PgTimestampTz::NegInfinity,
+            crate::value::PgTimestamp::Infinity => crate::value::PgTimestampTz::Infinity,
+            crate::value::PgTimestamp::Finite(value) => {
+                crate::value::PgTimestampTz::Finite(value.and_utc())
+            }
+        })),
+        (Value::TimestampTz(value), BaseType::Timestamp) => Ok(Value::Timestamp(match value {
+            crate::value::PgTimestampTz::NegInfinity => crate::value::PgTimestamp::NegInfinity,
+            crate::value::PgTimestampTz::Infinity => crate::value::PgTimestamp::Infinity,
+            crate::value::PgTimestampTz::Finite(value) => {
+                crate::value::PgTimestamp::Finite(value.naive_utc())
+            }
+        })),
+        (Value::TimestampTz(crate::value::PgTimestampTz::Finite(value)), BaseType::Date) => Ok(
+            Value::Date(crate::value::PgDate::Finite(value.date_naive())),
+        ),
+        (Value::TimestampTz(crate::value::PgTimestampTz::Infinity), BaseType::Date) => {
+            Ok(Value::Date(crate::value::PgDate::Infinity))
+        }
+        (Value::TimestampTz(crate::value::PgTimestampTz::NegInfinity), BaseType::Date) => {
+            Ok(Value::Date(crate::value::PgDate::NegInfinity))
+        }
         (Value::Int2(value), BaseType::Int4) => Ok(Value::Int4(value.into())),
         (Value::Int2(value), BaseType::Int8) => Ok(Value::Int8(value.into())),
         (Value::Int2(value), BaseType::Float4) => Ok(Value::Float4(value.into())),
@@ -378,8 +465,46 @@ fn apply_typmod(value: Value, target: PgType, context: CastContext) -> Result<Va
                 ((value.0 + unit / 2) / unit * unit).min(86_400_000_000),
             )))
         }
+        (Value::Timestamp(value), BaseType::Timestamp) => {
+            Ok(Value::Timestamp(round_timestamp(value, target.typmod)?))
+        }
+        (Value::TimestampTz(value), BaseType::TimestampTz) => {
+            Ok(Value::TimestampTz(round_timestamptz(value, target.typmod)?))
+        }
         (value, _) => Ok(value),
     }
+}
+
+fn round_timestamp(
+    value: crate::value::PgTimestamp,
+    typmod: i32,
+) -> Result<crate::value::PgTimestamp> {
+    let precision = u32::try_from(typmod).map_err(|_| out_of_range(BaseType::Timestamp))?;
+    let unit = 10_u32.pow(6 - precision);
+    Ok(match value {
+        crate::value::PgTimestamp::Finite(value) => crate::value::PgTimestamp::Finite(
+            value
+                .with_nanosecond((value.nanosecond() / (unit * 1_000)) * unit * 1_000)
+                .expect("rounded timestamp remains valid"),
+        ),
+        value => value,
+    })
+}
+
+fn round_timestamptz(
+    value: crate::value::PgTimestampTz,
+    typmod: i32,
+) -> Result<crate::value::PgTimestampTz> {
+    let precision = u32::try_from(typmod).map_err(|_| out_of_range(BaseType::TimestampTz))?;
+    let unit = 10_u32.pow(6 - precision);
+    Ok(match value {
+        crate::value::PgTimestampTz::Finite(value) => crate::value::PgTimestampTz::Finite(
+            value
+                .with_nanosecond((value.nanosecond() / (unit * 1_000)) * unit * 1_000)
+                .expect("rounded timestamp remains valid"),
+        ),
+        value => value,
+    })
 }
 
 fn numeric_rank(base: BaseType) -> Option<u8> {
