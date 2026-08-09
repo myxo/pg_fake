@@ -7,46 +7,8 @@ use crate::error::{PgError, Result, SqlState};
 
 /// Parses one or more PostgreSQL statements into owned syntax trees.
 pub fn parse(sql: &str) -> Result<Vec<Statement>> {
-    let match_full = sql.to_ascii_uppercase().contains("MATCH FULL");
-    let mut statements = Parser::parse_sql(
-        &PostgreSqlDialect {},
-        &sql.replace("MATCH FULL", "").replace("match full", ""),
-    )
-    .map_err(|error| PgError::new(SqlState::SyntaxError, error.to_string()))?;
-    if match_full {
-        for statement in &mut statements {
-            let Statement::CreateTable(create) = statement else {
-                continue;
-            };
-            for column in &mut create.columns {
-                for option in &mut column.options {
-                    if matches!(
-                        option.option,
-                        sqlparser::ast::ColumnOption::ForeignKey { .. }
-                    ) {
-                        let name = option
-                            .name
-                            .as_ref()
-                            .map(|name| name.value.as_str())
-                            .unwrap_or("");
-                        option.name = Some(sqlparser::ast::Ident::new(format!(
-                            "__pg_fake_match_full__{name}"
-                        )));
-                    }
-                }
-            }
-            for constraint in &mut create.constraints {
-                if let sqlparser::ast::TableConstraint::ForeignKey { name, .. } = constraint {
-                    let constraint_name =
-                        name.as_ref().map(|name| name.value.as_str()).unwrap_or("");
-                    *name = Some(sqlparser::ast::Ident::new(format!(
-                        "__pg_fake_match_full__{constraint_name}"
-                    )));
-                }
-            }
-        }
-    }
-    Ok(statements)
+    Parser::parse_sql(&PostgreSqlDialect {}, sql)
+        .map_err(|error| PgError::new(SqlState::SyntaxError, error.to_string()))
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -69,19 +31,14 @@ pub(crate) fn classify(statement: &Statement) -> StatementKind {
         | Statement::AlterIndex { .. }
         | Statement::AlterView { .. }
         | Statement::Drop { .. } => StatementKind::Ddl,
-        Statement::Insert(_) | Statement::Update { .. } | Statement::Delete(_) => {
-            StatementKind::Dml
-        }
+        Statement::Insert(_) | Statement::Update(_) | Statement::Delete(_) => StatementKind::Dml,
         Statement::Query(_) => StatementKind::Select,
         Statement::StartTransaction { .. }
-        | Statement::SetTransaction { .. }
         | Statement::Commit { .. }
         | Statement::Rollback { .. }
         | Statement::Savepoint { .. }
         | Statement::ReleaseSavepoint { .. } => StatementKind::TransactionControl,
-        Statement::SetVariable { .. }
-        | Statement::SetTimeZone { .. }
-        | Statement::SetRole { .. } => StatementKind::Set,
+        Statement::Set(_) => StatementKind::Set,
         _ => StatementKind::Unsupported,
     }
 }
@@ -104,6 +61,30 @@ mod tests {
         let error = parse("SELECT FROM").unwrap_err();
 
         assert_eq!(error.sqlstate, SqlState::SyntaxError);
+    }
+
+    #[test]
+    fn preserves_foreign_key_match_kind() {
+        let statements = parse(
+            "CREATE TABLE child (parent_id INTEGER, CONSTRAINT child_parent_fkey FOREIGN KEY (parent_id) REFERENCES parent (id) MATCH FULL)",
+        )
+        .unwrap();
+        let Statement::CreateTable(create) = &statements[0] else {
+            panic!("statement should be CREATE TABLE");
+        };
+        let sqlparser::ast::TableConstraint::ForeignKey(foreign_key) = &create.constraints[0]
+        else {
+            panic!("constraint should be FOREIGN KEY");
+        };
+
+        assert_eq!(
+            foreign_key.match_kind,
+            Some(sqlparser::ast::ConstraintReferenceMatchKind::Full)
+        );
+        assert_eq!(
+            foreign_key.name.as_ref().map(|name| name.value.as_str()),
+            Some("child_parent_fkey")
+        );
     }
 
     #[test]

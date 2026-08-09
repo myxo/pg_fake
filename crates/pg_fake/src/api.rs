@@ -6,7 +6,7 @@ use std::{
 
 use rand_chacha::{ChaCha12Rng, rand_core::SeedableRng};
 use sqlparser::ast::{
-    Expr, OneOrManyWithParens, TransactionIsolationLevel as AstIsolationLevel, TransactionMode,
+    ContextModifier, Expr, Set, TransactionIsolationLevel as AstIsolationLevel, TransactionMode,
     Value as AstValue,
 };
 
@@ -160,8 +160,11 @@ fn invalid_lock_timeout() -> PgError {
 
 fn parse_lock_timeout(expression: &Expr) -> Result<Duration> {
     let text = match expression {
-        Expr::Value(AstValue::Number(value, _)) => value.as_str(),
-        Expr::Value(AstValue::SingleQuotedString(value)) => value.trim(),
+        Expr::Value(value) => match &value.value {
+            AstValue::Number(value, _) => value.as_str(),
+            AstValue::SingleQuotedString(value) => value.trim(),
+            _ => return Err(invalid_lock_timeout()),
+        },
         _ => return Err(invalid_lock_timeout()),
     };
     let lower = text.to_ascii_lowercase();
@@ -188,8 +191,16 @@ fn parse_lock_timeout(expression: &Expr) -> Result<Duration> {
 
 fn parse_timezone(expression: &Expr) -> Result<String> {
     let value = match expression {
-        Expr::Value(AstValue::SingleQuotedString(value))
-        | Expr::Identifier(sqlparser::ast::Ident { value, .. }) => value,
+        Expr::Value(value) => {
+            let AstValue::SingleQuotedString(value) = &value.value else {
+                return Err(PgError::new(
+                    SqlState::InvalidParameterValue,
+                    "invalid value for parameter TimeZone",
+                ));
+            };
+            value
+        }
+        Expr::Identifier(sqlparser::ast::Ident { value, .. }) => value,
         _ => {
             return Err(PgError::new(
                 SqlState::InvalidParameterValue,
@@ -234,6 +245,12 @@ fn isolation_from_modes(modes: &[TransactionMode]) -> Result<Option<IsolationLev
                 return Err(PgError::new(
                     SqlState::FeatureNotSupported,
                     "SERIALIZABLE isolation is not implemented",
+                ));
+            }
+            TransactionMode::IsolationLevel(AstIsolationLevel::Snapshot) => {
+                return Err(PgError::new(
+                    SqlState::FeatureNotSupported,
+                    "SNAPSHOT isolation is not implemented",
                 ));
             }
             TransactionMode::AccessMode(_) => {
@@ -799,7 +816,7 @@ impl Session {
     }
     fn run_statement(&mut self, statement: parser::Statement) -> Result<StatementResult> {
         match &statement {
-            parser::Statement::SetTimeZone { local: _, value } => {
+            parser::Statement::Set(Set::SetTimeZone { local: _, value }) => {
                 self.timezone = parse_timezone(value)?;
                 return Ok(StatementResult::Affected(0));
             }
@@ -846,11 +863,11 @@ impl Session {
                     )),
                 };
             }
-            parser::Statement::SetTransaction {
+            parser::Statement::Set(Set::SetTransaction {
                 modes,
                 snapshot,
                 session,
-            } => {
+            }) => {
                 if matches!(self.transaction, Some(SessionTransaction::Aborted { .. })) {
                     return Err(PgError::new(
                         SqlState::InFailedSqlTransaction,
@@ -890,26 +907,20 @@ impl Session {
                 self.transaction = Some(SessionTransaction::Active(transaction));
                 return Ok(StatementResult::Affected(0));
             }
-            parser::Statement::SetVariable {
-                local,
+            parser::Statement::Set(Set::SingleAssignment {
+                scope,
                 hivevar,
-                variables,
-                value,
-            } => {
-                let OneOrManyWithParens::One(variable) = variables else {
-                    return self.failed(PgError::new(
-                        SqlState::FeatureNotSupported,
-                        "setting multiple variables is not implemented",
-                    ));
-                };
+                variable,
+                values,
+            }) => {
                 if variable.to_string().eq_ignore_ascii_case("timezone") {
-                    if *hivevar || value.len() != 1 {
+                    if *hivevar || values.len() != 1 {
                         return self.failed(PgError::new(
                             SqlState::FeatureNotSupported,
                             "TimeZone setting variant is not implemented",
                         ));
                     }
-                    self.timezone = parse_timezone(&value[0])?;
+                    self.timezone = parse_timezone(&values[0])?;
                     return Ok(StatementResult::Affected(0));
                 }
                 if variable.to_string().eq_ignore_ascii_case("lock_timeout") {
@@ -919,20 +930,20 @@ impl Session {
                             "current transaction is aborted",
                         ));
                     }
-                    if *local || *hivevar || value.len() != 1 {
+                    if *scope == Some(ContextModifier::Local) || *hivevar || values.len() != 1 {
                         return self.failed(PgError::new(
                             SqlState::FeatureNotSupported,
                             "lock_timeout setting variant is not implemented",
                         ));
                     }
-                    self.lock_timeout = match parse_lock_timeout(&value[0]) {
+                    self.lock_timeout = match parse_lock_timeout(&values[0]) {
                         Ok(timeout) => timeout,
                         Err(error) => return self.failed(error),
                     };
                     return Ok(StatementResult::Affected(0));
                 }
             }
-            parser::Statement::Commit { chain } => {
+            parser::Statement::Commit { chain, .. } => {
                 if *chain {
                     return self.failed(PgError::new(
                         SqlState::FeatureNotSupported,

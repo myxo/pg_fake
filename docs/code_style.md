@@ -1,5 +1,5 @@
 - prefer enums over trait
-- prefer inlining functions over make small function helper. Make separate function if it really used in several places
+- prefer inlining functions over making small function helper. Make separate function if it actually used in several places
 - prefer asserts over defensive programming (returning errors). Return error only if it make sence (e.g. we return error to user)
   if some code _should_ work, add assert for that. But don't make assert with side-effects
 - Do not add comments or doc comments by default, including module-level and public-API documentation. Prefer clear names and straightforward code.
@@ -9,3 +9,6 @@
   different from existing
 - prefer property tests against small local unit tests
 - do not make links from code to specification
+- do not make any global state
+- if we cannot parse valid sql (meaning postgres parse it, but we dont), we are not making workaround in our library, we make fix in sqlparser dependency
+- every function name should start with verb

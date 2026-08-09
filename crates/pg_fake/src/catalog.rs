@@ -1,6 +1,6 @@
 use std::collections::BTreeMap;
 
-use sqlparser::ast::Expr;
+use sqlparser::ast::{ConstraintReferenceMatchKind, Expr};
 
 use crate::{
     error::{PgError, Result, SqlState},
@@ -47,7 +47,7 @@ pub(crate) struct ForeignKey {
     pub(crate) on_update: ForeignKeyAction,
     pub(crate) deferrable: bool,
     pub(crate) initially_deferred: bool,
-    pub(crate) match_full: bool,
+    pub(crate) match_kind: Option<ConstraintReferenceMatchKind>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]

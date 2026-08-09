@@ -23,9 +23,10 @@ pub(crate) fn type_from_ast(data_type: &DataType) -> Result<PgType> {
         }
         DataType::Int8(None) | DataType::BigInt(None) => (BaseType::Int8, PgType::NO_TYPEMOD),
         DataType::Real | DataType::Float4 => (BaseType::Float4, PgType::NO_TYPEMOD),
-        DataType::Double | DataType::DoublePrecision | DataType::Float8 | DataType::Float(None) => {
-            (BaseType::Float8, PgType::NO_TYPEMOD)
-        }
+        DataType::Double(_)
+        | DataType::DoublePrecision
+        | DataType::Float8
+        | DataType::Float(ExactNumberInfo::None) => (BaseType::Float8, PgType::NO_TYPEMOD),
         DataType::Numeric(info) | DataType::Decimal(info) => {
             (BaseType::Numeric, numeric_typmod(*info)?)
         }
@@ -48,7 +49,7 @@ pub(crate) fn type_from_ast(data_type: &DataType) -> Result<PgType> {
         DataType::Timestamp(precision, TimezoneInfo::WithTimeZone | TimezoneInfo::Tz) => {
             (BaseType::TimestampTz, time_typmod(*precision)?)
         }
-        DataType::Interval => (BaseType::Interval, PgType::NO_TYPEMOD),
+        DataType::Interval { .. } => (BaseType::Interval, PgType::NO_TYPEMOD),
         DataType::Custom(_, _) => {
             let Some(base) = BaseType::from_name(&data_type.to_string()) else {
                 return Err(PgError::new(
@@ -99,7 +100,7 @@ fn numeric_typmod(info: ExactNumberInfo) -> Result<i32> {
         ExactNumberInfo::Precision(precision) => (precision, 0),
         ExactNumberInfo::PrecisionAndScale(precision, scale) => (precision, scale),
     };
-    if precision == 0 || precision > 1000 || scale > precision {
+    if precision == 0 || precision > 1000 || scale < 0 || scale as u64 > precision {
         return Err(PgError::new(
             SqlState::NumericValueOutOfRange,
             "numeric precision or scale is out of range",

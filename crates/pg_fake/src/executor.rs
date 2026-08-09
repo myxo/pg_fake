@@ -14,10 +14,11 @@ use crate::{
     value::{BaseType, PgType, Value},
 };
 use sqlparser::ast::{
-    AssignmentTarget, BinaryOperator, CastKind, ColumnOption, DateTimeField, Delete, Expr,
-    FromTable, Function, FunctionArg, FunctionArgExpr, FunctionArguments, GroupByExpr, Ident,
-    LockType, ObjectType, ReferentialAction, SelectItem, SetExpr, Statement, TableConstraint,
-    TableFactor, TableWithJoins, UnaryOperator, Value as AstValue,
+    AssignmentTarget, BinaryOperator, CastKind, ColumnOption, ConstraintReferenceMatchKind,
+    DateTimeField, Delete, Expr, FromTable, Function, FunctionArg, FunctionArgExpr,
+    FunctionArguments, GroupByExpr, Ident, IndexColumn, LockType, ObjectType, ReferentialAction,
+    SelectItem, SetExpr, Statement, TableConstraint, TableFactor, TableObject, TableWithJoins,
+    UnaryOperator, Value as AstValue,
 };
 use std::{
     cmp::Ordering,
@@ -108,9 +109,8 @@ pub(crate) fn required_row_locks(
         return required_insert_foreign_key_locks(state, insert, xid, snapshot, context);
     }
     let (schema, selection, mode) = match statement {
-        Statement::Update {
-            table, selection, ..
-        } => {
+        Statement::Update(update) => {
+            let table = &update.table;
             if !table.joins.is_empty() {
                 return Ok(Vec::new());
             }
@@ -124,7 +124,7 @@ pub(crate) fn required_row_locks(
             };
             (
                 state.catalog.table(&name(table_name)?)?,
-                selection.as_ref(),
+                update.selection.as_ref(),
                 RowLockMode::Update,
             )
         }
@@ -228,7 +228,7 @@ fn required_insert_foreign_key_locks(
     snapshot: &Snapshot,
     context: &ExecutionContext,
 ) -> Result<Vec<RequiredRowLock>> {
-    let schema = state.catalog.table(&name(&insert.table_name)?)?;
+    let schema = state.catalog.table(&insert_table_name(&insert.table)?)?;
     let Some(source) = &insert.source else {
         return Ok(Vec::new());
     };
@@ -242,14 +242,15 @@ fn required_insert_foreign_key_locks(
             .columns
             .iter()
             .map(|column| {
+                let column_name = name(column)?;
                 schema
                     .columns
                     .iter()
-                    .position(|definition| definition.name == identifier_name(column))
+                    .position(|definition| definition.name == column_name)
                     .ok_or_else(|| {
                         PgError::new(
                             SqlState::UndefinedColumn,
-                            format!("column {:?} does not exist", column.value),
+                            format!("column {:?} does not exist", column),
                         )
                     })
             })
@@ -359,47 +360,43 @@ pub(crate) fn dispatch(
                         ColumnOption::Null => nullable = true,
                         ColumnOption::NotNull => nullable = false,
                         ColumnOption::Default(expr) => default = Some(expr.clone()),
-                        ColumnOption::Unique { is_primary, .. } => {
+                        ColumnOption::PrimaryKey(_) => {
                             let columns = vec![identifier_name(&column.name)];
-                            constraints.push(if *is_primary {
-                                crate::catalog::Constraint::PrimaryKey(columns)
-                            } else {
-                                crate::catalog::Constraint::Unique(columns)
-                            });
+                            constraints.push(crate::catalog::Constraint::PrimaryKey(columns));
                         }
-                        ColumnOption::Check(expr) => constraints
-                            .push(crate::catalog::Constraint::Check(Box::new(expr.clone()))),
-                        ColumnOption::ForeignKey {
-                            foreign_table,
-                            referred_columns,
-                            on_delete,
-                            on_update,
-                            characteristics,
-                        } => {
-                            let (name, match_full) = foreign_key_name(
+                        ColumnOption::Unique(_) => {
+                            let columns = vec![identifier_name(&column.name)];
+                            constraints.push(crate::catalog::Constraint::Unique(columns));
+                        }
+                        ColumnOption::Check(check) => {
+                            constraints.push(crate::catalog::Constraint::Check(check.expr.clone()))
+                        }
+                        ColumnOption::ForeignKey(foreign_key) => {
+                            let name = foreign_key_name(
                                 option.name.as_ref(),
                                 format!("{}_{}_fkey", table_name, identifier_name(&column.name)),
                             );
                             constraints.push(crate::catalog::Constraint::ForeignKey(ForeignKey {
                                 name,
                                 columns: vec![identifier_name(&column.name)],
-                                foreign_table: crate::executor::name(foreign_table)?,
-                                referred_columns: referred_columns
+                                foreign_table: crate::executor::name(&foreign_key.foreign_table)?,
+                                referred_columns: foreign_key
+                                    .referred_columns
                                     .iter()
                                     .map(identifier_name)
                                     .collect(),
-                                on_delete: foreign_key_action(*on_delete),
-                                on_update: foreign_key_action(*on_update),
-                                deferrable: characteristics.is_some_and(|characteristics| {
-                                    characteristics.deferrable.unwrap_or(false)
-                                }),
-                                initially_deferred: characteristics.is_some_and(
+                                on_delete: foreign_key_action(foreign_key.on_delete),
+                                on_update: foreign_key_action(foreign_key.on_update),
+                                deferrable: foreign_key.characteristics.is_some_and(
+                                    |characteristics| characteristics.deferrable.unwrap_or(false),
+                                ),
+                                initially_deferred: foreign_key.characteristics.is_some_and(
                                     |characteristics| {
                                         characteristics.initially
                                             == Some(sqlparser::ast::DeferrableInitial::Deferred)
                                     },
                                 ),
-                                match_full,
+                                match_kind: foreign_key.match_kind,
                             }))
                         }
                         option => {
@@ -423,50 +420,53 @@ pub(crate) fn dispatch(
             }
             for constraint in &create.constraints {
                 match constraint {
-                    TableConstraint::PrimaryKey { columns, .. } => {
+                    TableConstraint::PrimaryKey(primary_key) => {
                         constraints.push(crate::catalog::Constraint::PrimaryKey(
-                            columns.iter().map(identifier_name).collect(),
+                            primary_key
+                                .columns
+                                .iter()
+                                .map(index_column_name)
+                                .collect::<Result<Vec<_>>>()?,
                         ))
                     }
-                    TableConstraint::Unique { columns, .. } => {
+                    TableConstraint::Unique(unique) => {
                         constraints.push(crate::catalog::Constraint::Unique(
-                            columns.iter().map(identifier_name).collect(),
+                            unique
+                                .columns
+                                .iter()
+                                .map(index_column_name)
+                                .collect::<Result<Vec<_>>>()?,
                         ))
                     }
-                    TableConstraint::Check { expr, .. } => {
-                        constraints.push(crate::catalog::Constraint::Check(expr.clone()))
+                    TableConstraint::Check(check) => {
+                        constraints.push(crate::catalog::Constraint::Check(check.expr.clone()))
                     }
-                    TableConstraint::ForeignKey {
-                        name: constraint_name,
-                        columns: foreign_columns,
-                        foreign_table,
-                        referred_columns,
-                        on_delete,
-                        on_update,
-                        characteristics,
-                    } => {
-                        let (name, match_full) = foreign_key_name(
-                            constraint_name.as_ref(),
+                    TableConstraint::ForeignKey(foreign_key) => {
+                        let name = foreign_key_name(
+                            foreign_key.name.as_ref(),
                             format!("{}_fkey", table_name),
                         );
                         constraints.push(crate::catalog::Constraint::ForeignKey(ForeignKey {
                             name,
-                            columns: foreign_columns.iter().map(identifier_name).collect(),
-                            foreign_table: crate::executor::name(foreign_table)?,
-                            referred_columns: referred_columns
+                            columns: foreign_key.columns.iter().map(identifier_name).collect(),
+                            foreign_table: crate::executor::name(&foreign_key.foreign_table)?,
+                            referred_columns: foreign_key
+                                .referred_columns
                                 .iter()
                                 .map(identifier_name)
                                 .collect(),
-                            on_delete: foreign_key_action(*on_delete),
-                            on_update: foreign_key_action(*on_update),
-                            deferrable: characteristics.is_some_and(|characteristics| {
-                                characteristics.deferrable.unwrap_or(false)
-                            }),
-                            initially_deferred: characteristics.is_some_and(|characteristics| {
-                                characteristics.initially
-                                    == Some(sqlparser::ast::DeferrableInitial::Deferred)
-                            }),
-                            match_full,
+                            on_delete: foreign_key_action(foreign_key.on_delete),
+                            on_update: foreign_key_action(foreign_key.on_update),
+                            deferrable: foreign_key.characteristics.is_some_and(
+                                |characteristics| characteristics.deferrable.unwrap_or(false),
+                            ),
+                            initially_deferred: foreign_key.characteristics.is_some_and(
+                                |characteristics| {
+                                    characteristics.initially
+                                        == Some(sqlparser::ast::DeferrableInitial::Deferred)
+                                },
+                            ),
+                            match_kind: foreign_key.match_kind,
                         }))
                     }
                     constraint => {
@@ -551,15 +551,8 @@ pub(crate) fn dispatch(
             defer_all,
             context,
         ),
-        Statement::Update {
-            table,
-            assignments,
-            from,
-            selection,
-            returning,
-            or,
-        } => {
-            if from.is_some() || returning.is_some() || or.is_some() {
+        Statement::Update(update) => {
+            if update.from.is_some() || update.returning.is_some() || update.or.is_some() {
                 return Err(PgError::new(
                     SqlState::FeatureNotSupported,
                     "UPDATE feature is not implemented",
@@ -567,9 +560,9 @@ pub(crate) fn dispatch(
             }
             update_rows(
                 state,
-                table,
-                assignments,
-                selection.as_ref(),
+                &update.table,
+                &update.assignments,
+                update.selection.as_ref(),
                 xid,
                 snapshot,
                 deferred_constraints,
@@ -600,7 +593,23 @@ pub(crate) fn name(name: &sqlparser::ast::ObjectName) -> Result<String> {
             "schemas are not implemented",
         ));
     }
-    Ok(identifier_name(&name.0[0]))
+    let Some(identifier) = name.0[0].as_ident() else {
+        return Err(PgError::new(
+            SqlState::FeatureNotSupported,
+            "dynamic object names are not implemented",
+        ));
+    };
+    Ok(identifier_name(identifier))
+}
+
+pub(crate) fn insert_table_name(table: &TableObject) -> Result<String> {
+    let TableObject::TableName(table_name) = table else {
+        return Err(PgError::new(
+            SqlState::FeatureNotSupported,
+            "insert target is not a table",
+        ));
+    };
+    name(table_name)
 }
 
 pub(crate) fn identifier_name(identifier: &Ident) -> String {
@@ -609,6 +618,16 @@ pub(crate) fn identifier_name(identifier: &Ident) -> String {
     } else {
         identifier.value.to_ascii_lowercase()
     }
+}
+
+fn index_column_name(column: &IndexColumn) -> Result<String> {
+    let Expr::Identifier(identifier) = &column.column.expr else {
+        return Err(PgError::new(
+            SqlState::FeatureNotSupported,
+            "index expressions are not implemented",
+        ));
+    };
+    Ok(identifier_name(identifier))
 }
 
 fn insert_rows(
@@ -620,7 +639,7 @@ fn insert_rows(
     defer_all: bool,
     context: &ExecutionContext,
 ) -> Result<StatementResult> {
-    let table_name = name(&insert.table_name)?;
+    let table_name = insert_table_name(&insert.table)?;
     let schema = state.catalog.table(&table_name)?.clone();
     if insert.returning.is_some() {
         return Err(PgError::new(
@@ -635,14 +654,15 @@ fn insert_rows(
             .columns
             .iter()
             .map(|name| {
+                let name = crate::executor::name(name)?;
                 schema
                     .columns
                     .iter()
-                    .position(|column| column.name == identifier_name(name))
+                    .position(|column| column.name == name)
                     .ok_or_else(|| {
                         PgError::new(
                             SqlState::UndefinedColumn,
-                            format!("column {:?} does not exist", name.value),
+                            format!("column {:?} does not exist", name),
                         )
                     })
             })
@@ -1027,20 +1047,9 @@ fn foreign_key_action(action: Option<ReferentialAction>) -> ForeignKeyAction {
     }
 }
 
-fn foreign_key_name(name: Option<&Ident>, default: String) -> (String, bool) {
-    const MATCH_FULL: &str = "__pg_fake_match_full__";
+fn foreign_key_name(name: Option<&Ident>, default: String) -> String {
     let name = name.map(identifier_name).unwrap_or_default();
-    let Some(name) = name.strip_prefix(MATCH_FULL) else {
-        return (if name.is_empty() { default } else { name }, false);
-    };
-    (
-        if name.is_empty() {
-            default
-        } else {
-            name.into()
-        },
-        true,
-    )
+    if name.is_empty() { default } else { name }
 }
 
 fn foreign_key_is_deferred(
@@ -1168,7 +1177,9 @@ fn validate_row_foreign_keys(
             .map(|index| row[*index].clone())
             .collect::<Vec<_>>();
         if key.iter().any(Value::is_null) {
-            if foreign_key.match_full && !key.iter().all(Value::is_null) {
+            if foreign_key.match_kind == Some(ConstraintReferenceMatchKind::Full)
+                && !key.iter().all(Value::is_null)
+            {
                 return Err(PgError::new(
                     SqlState::ForeignKeyViolation,
                     format!(
@@ -1535,7 +1546,7 @@ fn select_rows(
     snapshot: &Snapshot,
     context: &ExecutionContext,
 ) -> Result<StatementResult> {
-    if query.with.is_some() || !query.limit_by.is_empty() || query.fetch.is_some() {
+    if query.with.is_some() || query.fetch.is_some() {
         return Err(PgError::new(
             SqlState::FeatureNotSupported,
             "query clause is not implemented",
@@ -1591,19 +1602,39 @@ fn select_rows(
         ));
     }
     let schema = state.catalog.table(&name(table_name)?)?;
-    let limit = query
-        .limit
-        .as_ref()
-        .map(|limit| row_count(limit, RowCountClause::Limit, context))
-        .transpose()?
-        .flatten();
-    let offset = query
-        .offset
-        .as_ref()
-        .map(|offset| row_count(&offset.value, RowCountClause::Offset, context))
-        .transpose()?
-        .flatten()
-        .unwrap_or(0);
+    let (limit, offset) = match &query.limit_clause {
+        None => (None, 0),
+        Some(sqlparser::ast::LimitClause::LimitOffset {
+            limit,
+            offset,
+            limit_by,
+        }) => {
+            if !limit_by.is_empty() {
+                return Err(PgError::new(
+                    SqlState::FeatureNotSupported,
+                    "LIMIT BY is not implemented",
+                ));
+            }
+            let limit = limit
+                .as_ref()
+                .map(|limit| row_count(limit, RowCountClause::Limit, context))
+                .transpose()?
+                .flatten();
+            let offset = offset
+                .as_ref()
+                .map(|offset| row_count(&offset.value, RowCountClause::Offset, context))
+                .transpose()?
+                .flatten()
+                .unwrap_or(0);
+            (limit, offset)
+        }
+        Some(sqlparser::ast::LimitClause::OffsetCommaLimit { .. }) => {
+            return Err(PgError::new(
+                SqlState::FeatureNotSupported,
+                "LIMIT clause is not implemented",
+            ));
+        }
+    };
     if let Some(selection) = &select.selection {
         let base = expression_type(selection, schema)?;
         if base != BaseType::Bool && !null_expression(selection) {
@@ -1624,8 +1655,13 @@ fn select_rows(
                     "ORDER BY INTERPOLATE is not implemented",
                 ));
             }
-            order_by
-                .exprs
+            let sqlparser::ast::OrderByKind::Expressions(orders) = &order_by.kind else {
+                return Err(PgError::new(
+                    SqlState::FeatureNotSupported,
+                    "ORDER BY ALL is not implemented",
+                ));
+            };
+            orders
                 .iter()
                 .map(|order| {
                     if order.with_fill.is_some() {
@@ -1634,7 +1670,7 @@ fn select_rows(
                             "ORDER BY WITH FILL is not implemented",
                         ));
                     }
-                    let key = if let Expr::Value(AstValue::Number(position, _)) = &order.expr
+                    let key = if let Some(position) = number_literal(&order.expr)
                         && !position.contains(['.', 'e', 'E'])
                     {
                         let position = position.parse::<usize>().map_err(|_| {
@@ -1654,11 +1690,11 @@ fn select_rows(
                         expression_type(&order.expr, schema)?;
                         OrderKey::Expression(&order.expr)
                     };
-                    let ascending = order.asc.unwrap_or(true);
+                    let ascending = order.options.asc.unwrap_or(true);
                     Ok(OrderSpec {
                         key,
                         ascending,
-                        nulls_first: order.nulls_first.unwrap_or(!ascending),
+                        nulls_first: order.options.nulls_first.unwrap_or(!ascending),
                     })
                 })
                 .collect::<Result<Vec<_>>>()
@@ -1958,15 +1994,37 @@ pub(crate) fn constant_schema() -> TableSchema {
     }
 }
 
+fn ast_value(expr: &Expr) -> Option<&AstValue> {
+    let Expr::Value(value) = expr else {
+        return None;
+    };
+    Some(&value.value)
+}
+
+fn number_literal(expr: &Expr) -> Option<&str> {
+    let AstValue::Number(value, _) = ast_value(expr)? else {
+        return None;
+    };
+    Some(value)
+}
+
 fn literal_value(expr: &Expr) -> Result<Value> {
+    if let Some(value) = ast_value(expr) {
+        return match value {
+            AstValue::Null => Ok(Value::Null),
+            AstValue::Boolean(value) => Ok(Value::Bool(*value)),
+            AstValue::SingleQuotedString(value) => Ok(Value::Text(value.clone())),
+            AstValue::Number(value, _) if value.contains(['.', 'e', 'E']) => {
+                Value::parse(BaseType::Numeric, value)
+            }
+            AstValue::Number(value, _) => integer_literal(value),
+            _ => Err(PgError::new(
+                SqlState::CannotCoerce,
+                "literal has incompatible type",
+            )),
+        };
+    }
     match expr {
-        Expr::Value(AstValue::Null) => Ok(Value::Null),
-        Expr::Value(AstValue::Boolean(value)) => Ok(Value::Bool(*value)),
-        Expr::Value(AstValue::SingleQuotedString(value)) => Ok(Value::Text(value.clone())),
-        Expr::Value(AstValue::Number(value, _)) if value.contains(['.', 'e', 'E']) => {
-            Value::parse(BaseType::Numeric, value)
-        }
-        Expr::Value(AstValue::Number(value, _)) => integer_literal(value),
         Expr::UnaryOp {
             op: UnaryOperator::Plus,
             expr,
@@ -1974,24 +2032,15 @@ fn literal_value(expr: &Expr) -> Result<Value> {
         Expr::UnaryOp {
             op: UnaryOperator::Minus,
             expr,
-        } if matches!(expr.as_ref(), Expr::Value(AstValue::Number(value, _)) if !value.contains(['.', 'e', 'E'])) =>
-        {
-            let Expr::Value(AstValue::Number(value, _)) = expr.as_ref() else {
-                unreachable!("integer literal pattern was checked")
-            };
+        } if number_literal(expr).is_some_and(|value| !value.contains(['.', 'e', 'E'])) => {
+            let value = number_literal(expr).expect("integer literal pattern was checked");
             integer_literal(&format!("-{value}"))
         }
         Expr::UnaryOp {
             op: UnaryOperator::Minus,
             expr,
-        } if matches!(expr.as_ref(), Expr::Value(AstValue::Number(_, _))) => {
-            unary(UnaryOperator::Minus, literal_value(expr)?)
-        }
+        } if number_literal(expr).is_some() => unary(UnaryOperator::Minus, literal_value(expr)?),
         Expr::Nested(expr) => literal_value(expr),
-        Expr::Value(_) => Err(PgError::new(
-            SqlState::CannotCoerce,
-            "literal has incompatible type",
-        )),
         _ => Err(PgError::new(
             SqlState::FeatureNotSupported,
             "expression is not implemented",
@@ -2011,7 +2060,10 @@ fn integer_literal(value: &str) -> Result<Value> {
 
 fn unknown_string(expr: &Expr) -> Option<&str> {
     match expr {
-        Expr::Value(AstValue::SingleQuotedString(value)) => Some(value),
+        Expr::Value(value) => match &value.value {
+            AstValue::SingleQuotedString(value) => Some(value),
+            _ => None,
+        },
         Expr::Nested(expr) => unknown_string(expr),
         _ => None,
     }
@@ -2031,32 +2083,31 @@ fn column_index(schema: &TableSchema, column: &Ident) -> Result<usize> {
 }
 
 pub(crate) fn expression_type(expr: &Expr, schema: &TableSchema) -> Result<BaseType> {
+    if let Some(value) = ast_value(expr) {
+        return match value {
+            AstValue::Null => Ok(BaseType::Text),
+            AstValue::Boolean(_) => Ok(BaseType::Bool),
+            AstValue::SingleQuotedString(_) => Ok(BaseType::Text),
+            AstValue::Number(value, _) if value.contains(['.', 'e', 'E']) => Ok(BaseType::Numeric),
+            AstValue::Number(value, _) => Ok(integer_literal(value)?
+                .base_type()
+                .expect("numeric literal is not null")),
+            _ => Err(PgError::new(
+                SqlState::FeatureNotSupported,
+                "literal is not implemented",
+            )),
+        };
+    }
     match expr {
         Expr::Identifier(column) => {
             Ok(schema.columns[column_index(schema, column)?].data_type.base)
         }
-        Expr::Value(AstValue::Null) => Ok(BaseType::Text),
-        Expr::Value(AstValue::Boolean(_)) => Ok(BaseType::Bool),
-        Expr::Value(AstValue::SingleQuotedString(_)) => Ok(BaseType::Text),
-        Expr::Value(AstValue::Number(value, _)) if value.contains(['.', 'e', 'E']) => {
-            Ok(BaseType::Numeric)
-        }
-        Expr::Value(AstValue::Number(value, _)) => Ok(integer_literal(value)?
-            .base_type()
-            .expect("numeric literal is not null")),
-        Expr::Value(_) => Err(PgError::new(
-            SqlState::FeatureNotSupported,
-            "literal is not implemented",
-        )),
         Expr::Nested(expr) => expression_type(expr, schema),
         Expr::UnaryOp {
             op: UnaryOperator::Minus,
             expr,
-        } if matches!(expr.as_ref(), Expr::Value(AstValue::Number(value, _)) if !value.contains(['.', 'e', 'E'])) =>
-        {
-            let Expr::Value(AstValue::Number(value, _)) = expr.as_ref() else {
-                unreachable!("integer literal pattern was checked")
-            };
+        } if number_literal(expr).is_some_and(|value| !value.contains(['.', 'e', 'E'])) => {
+            let value = number_literal(expr).expect("integer literal pattern was checked");
             Ok(integer_literal(&format!("-{value}"))?
                 .base_type()
                 .expect("integer literal is not null"))
@@ -2159,20 +2210,19 @@ pub(crate) fn expression_type(expr: &Expr, schema: &TableSchema) -> Result<BaseT
         Expr::Case {
             operand,
             conditions,
-            results,
             else_result,
+            ..
         } => {
-            assert_eq!(conditions.len(), results.len());
             if let Some(operand) = operand {
                 for condition in conditions {
-                    expression_common_type(operand, condition, schema).map_err(|_| {
-                        PgError::new(SqlState::DatatypeMismatch, "CASE types are incompatible")
-                    })?;
+                    expression_common_type(operand, &condition.condition, schema).map_err(
+                        |_| PgError::new(SqlState::DatatypeMismatch, "CASE types are incompatible"),
+                    )?;
                 }
             } else {
                 for condition in conditions {
-                    let base = expression_type(condition, schema)?;
-                    if base != BaseType::Bool && !null_expression(condition) {
+                    let base = expression_type(&condition.condition, schema)?;
+                    if base != BaseType::Bool && !null_expression(&condition.condition) {
                         return Err(PgError::new(
                             SqlState::DatatypeMismatch,
                             "CASE condition must be boolean",
@@ -2181,8 +2231,9 @@ pub(crate) fn expression_type(expr: &Expr, schema: &TableSchema) -> Result<BaseT
                 }
             }
             common_expression_type(
-                results
+                conditions
                     .iter()
+                    .map(|condition| &condition.result)
                     .chain(else_result.as_deref())
                     .collect::<Vec<_>>()
                     .as_slice(),
@@ -2195,6 +2246,7 @@ pub(crate) fn expression_type(expr: &Expr, schema: &TableSchema) -> Result<BaseT
             expr,
             data_type,
             format,
+            ..
         } => {
             if !matches!(kind, CastKind::Cast | CastKind::DoubleColon) || format.is_some() {
                 return Err(PgError::new(
@@ -2239,7 +2291,7 @@ pub(crate) fn expression_type(expr: &Expr, schema: &TableSchema) -> Result<BaseT
 
 pub(crate) fn null_expression(expr: &Expr) -> bool {
     match expr {
-        Expr::Value(AstValue::Null) => true,
+        Expr::Value(value) if matches!(&value.value, AstValue::Null) => true,
         Expr::Nested(expr) => null_expression(expr),
         _ => false,
     }
@@ -2412,7 +2464,7 @@ fn evaluate(
         Expr::Nested(expr) => evaluate(expr, schema, row, context),
         Expr::UnaryOp { op, expr } => {
             if matches!(op, UnaryOperator::Minus)
-                && let Expr::Value(AstValue::Number(value, _)) = expr.as_ref()
+                && let Some(value) = number_literal(expr)
                 && !value.contains(['.', 'e', 'E'])
             {
                 return integer_literal(&format!("-{value}"));
@@ -2523,25 +2575,26 @@ fn evaluate(
         Expr::Case {
             operand,
             conditions,
-            results,
             else_result,
+            ..
         } => {
             let result_type = common_expression_type(
-                results
+                conditions
                     .iter()
+                    .map(|condition| &condition.result)
                     .chain(else_result.as_deref())
                     .collect::<Vec<_>>()
                     .as_slice(),
                 schema,
             )?;
             let operand = operand.as_deref();
-            for (condition, result) in conditions.iter().zip(results) {
+            for condition in conditions {
                 let matches = if let Some(operand) = &operand {
-                    let target = expression_common_type(operand, condition, schema)?;
+                    let target = expression_common_type(operand, &condition.condition, schema)?;
                     let operand =
                         evaluate_as(operand, target, CastContext::Implicit, schema, row, context)?;
                     let condition = evaluate_as(
-                        condition,
+                        &condition.condition,
                         target,
                         CastContext::Implicit,
                         schema,
@@ -2558,13 +2611,13 @@ fn evaluate(
                     }
                 } else {
                     matches!(
-                        evaluate(condition, schema, row, context)?,
+                        evaluate(&condition.condition, schema, row, context)?,
                         Value::Bool(true)
                     )
                 };
                 if matches {
                     return evaluate_as(
-                        result,
+                        &condition.result,
                         result_type,
                         CastContext::Implicit,
                         schema,
@@ -2591,6 +2644,7 @@ fn evaluate(
             expr,
             data_type,
             format,
+            ..
         } => {
             if !matches!(kind, CastKind::Cast | CastKind::DoubleColon) || format.is_some() {
                 return Err(PgError::new(

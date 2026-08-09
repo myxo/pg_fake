@@ -4,8 +4,8 @@ use std::ops::ControlFlow;
 
 use sqlparser::ast::{
     AssignmentTarget, BinaryOperator, CastKind, DataType, Expr, FromTable, FunctionArg,
-    FunctionArgExpr, FunctionArguments, SelectItem, SetExpr, Statement, TableFactor,
-    Value as AstValue, visit_expressions, visit_expressions_mut,
+    FunctionArgExpr, FunctionArguments, LimitClause, OrderByKind, SelectItem, SetExpr, Statement,
+    TableFactor, Value as AstValue, visit_expressions, visit_expressions_mut,
 };
 
 use crate::{
@@ -20,7 +20,7 @@ pub(crate) fn parameter_types(statement: &Statement, catalog: &Catalog) -> Resul
     let mut types = vec![None; parameter_count(statement)?];
     match statement {
         Statement::Insert(insert) => {
-            let schema = catalog.table(&executor::name(&insert.table_name)?)?;
+            let schema = catalog.table(&executor::insert_table_name(&insert.table)?)?;
             let columns = if insert.columns.is_empty() {
                 (0..schema.columns.len()).collect::<Vec<_>>()
             } else {
@@ -28,14 +28,15 @@ pub(crate) fn parameter_types(statement: &Statement, catalog: &Catalog) -> Resul
                     .columns
                     .iter()
                     .map(|name| {
+                        let name = executor::name(name)?;
                         schema
                             .columns
                             .iter()
-                            .position(|column| column.name == executor::identifier_name(name))
+                            .position(|column| column.name == name)
                             .ok_or_else(|| {
                                 PgError::new(
                                     SqlState::UndefinedColumn,
-                                    format!("column {:?} does not exist", name.value),
+                                    format!("column {:?} does not exist", name),
                                 )
                             })
                     })
@@ -62,18 +63,13 @@ pub(crate) fn parameter_types(statement: &Statement, catalog: &Catalog) -> Resul
                 }
             }
         }
-        Statement::Update {
-            table,
-            assignments,
-            selection,
-            ..
-        } => {
-            let schema = table_schema(&table.relation, catalog)?;
-            for assignment in assignments {
+        Statement::Update(update) => {
+            let schema = table_schema(&update.table.relation, catalog)?;
+            for assignment in &update.assignments {
                 let AssignmentTarget::ColumnName(name) = &assignment.target else {
                     continue;
                 };
-                let name = executor::name(name)?;
+                let name = executor::name(&name)?;
                 let column = schema
                     .columns
                     .iter()
@@ -91,7 +87,7 @@ pub(crate) fn parameter_types(statement: &Statement, catalog: &Catalog) -> Resul
                     &mut types,
                 )?;
             }
-            if let Some(selection) = selection {
+            if let Some(selection) = &update.selection {
                 infer_expr(selection, schema, Some(BaseType::Bool), &mut types)?;
             }
         }
@@ -122,16 +118,20 @@ pub(crate) fn parameter_types(statement: &Statement, catalog: &Catalog) -> Resul
                     infer_expr(expression, schema, None, &mut types)?;
                 }
             }
-            if let Some(order_by) = &query.order_by {
-                for order in &order_by.exprs {
+            if let Some(order_by) = &query.order_by
+                && let OrderByKind::Expressions(orders) = &order_by.kind
+            {
+                for order in orders {
                     infer_expr(&order.expr, schema, None, &mut types)?;
                 }
             }
-            if let Some(limit) = &query.limit {
-                infer_expr(limit, schema, Some(BaseType::Int8), &mut types)?;
-            }
-            if let Some(offset) = &query.offset {
-                infer_expr(&offset.value, schema, Some(BaseType::Int8), &mut types)?;
+            if let Some(LimitClause::LimitOffset { limit, offset, .. }) = &query.limit_clause {
+                if let Some(limit) = limit {
+                    infer_expr(limit, schema, Some(BaseType::Int8), &mut types)?;
+                }
+                if let Some(offset) = offset {
+                    infer_expr(&offset.value, schema, Some(BaseType::Int8), &mut types)?;
+                }
             }
         }
         _ => {}
@@ -160,7 +160,10 @@ pub(crate) fn bind(
     let mut statement = statement.clone();
     let mut error = None;
     let _ = visit_expressions_mut(&mut statement, |expression| {
-        let Expr::Value(AstValue::Placeholder(placeholder)) = expression else {
+        let Expr::Value(value) = expression else {
+            return ControlFlow::Continue(());
+        };
+        let AstValue::Placeholder(placeholder) = &value.value else {
             return ControlFlow::Continue(());
         };
         let index = match placeholder_index(placeholder) {
@@ -187,7 +190,10 @@ fn parameter_count(statement: &Statement) -> Result<usize> {
     let mut maximum = 0;
     let mut error = None;
     let _ = visit_expressions(statement, |expression| {
-        let Expr::Value(AstValue::Placeholder(placeholder)) = expression else {
+        let Expr::Value(value) = expression else {
+            return ControlFlow::Continue(());
+        };
+        let AstValue::Placeholder(placeholder) = &value.value else {
             return ControlFlow::Continue(());
         };
         match placeholder_index(placeholder) {
@@ -331,7 +337,10 @@ fn constrain(
         Expr::Nested(inner) => inner.as_ref(),
         expression => expression,
     };
-    let Expr::Value(AstValue::Placeholder(placeholder)) = expression else {
+    let Expr::Value(value) = expression else {
+        return Ok(());
+    };
+    let AstValue::Placeholder(placeholder) = &value.value else {
         return Ok(());
     };
     let index = placeholder_index(placeholder)?;
@@ -362,7 +371,7 @@ fn finalize(types: Vec<Option<BaseType>>) -> Vec<BaseType> {
 fn validate_statement(statement: &Statement, catalog: &Catalog) -> Result<()> {
     match statement {
         Statement::Insert(insert) => {
-            let schema = catalog.table(&executor::name(&insert.table_name)?)?;
+            let schema = catalog.table(&executor::insert_table_name(&insert.table)?)?;
             let columns = if insert.columns.is_empty() {
                 (0..schema.columns.len()).collect::<Vec<_>>()
             } else {
@@ -370,14 +379,15 @@ fn validate_statement(statement: &Statement, catalog: &Catalog) -> Result<()> {
                     .columns
                     .iter()
                     .map(|name| {
+                        let name = executor::name(name)?;
                         schema
                             .columns
                             .iter()
-                            .position(|column| column.name == executor::identifier_name(name))
+                            .position(|column| column.name == name)
                             .ok_or_else(|| {
                                 PgError::new(
                                     SqlState::UndefinedColumn,
-                                    format!("column {:?} does not exist", name.value),
+                                    format!("column {:?} does not exist", name),
                                 )
                             })
                     })
@@ -397,21 +407,16 @@ fn validate_statement(statement: &Statement, catalog: &Catalog) -> Result<()> {
                 }
             }
         }
-        Statement::Update {
-            table,
-            assignments,
-            selection,
-            ..
-        } => {
-            let schema = table_schema(&table.relation, catalog)?;
-            if let Some(selection) = selection {
+        Statement::Update(update) => {
+            let schema = table_schema(&update.table.relation, catalog)?;
+            if let Some(selection) = &update.selection {
                 validate_boolean(selection, schema, "WHERE requires a boolean expression")?;
             }
-            for assignment in assignments {
+            for assignment in &update.assignments {
                 let AssignmentTarget::ColumnName(name) = &assignment.target else {
                     continue;
                 };
-                let name = executor::name(name)?;
+                let name = executor::name(&name)?;
                 let column = schema
                     .columns
                     .iter()
@@ -455,18 +460,22 @@ fn validate_statement(statement: &Statement, catalog: &Catalog) -> Result<()> {
                     executor::expression_type(expression, schema)?;
                 }
             }
-            if let Some(order_by) = &query.order_by {
-                for order in &order_by.exprs {
+            if let Some(order_by) = &query.order_by
+                && let OrderByKind::Expressions(orders) = &order_by.kind
+            {
+                for order in orders {
                     executor::expression_type(&order.expr, schema)?;
                 }
             }
-            if let Some(limit) = &query.limit
-                && !matches!(limit, Expr::Identifier(name) if name.value.eq_ignore_ascii_case("all"))
-            {
-                validate_implicit_type(limit, BaseType::Int8, schema)?;
-            }
-            if let Some(offset) = &query.offset {
-                validate_implicit_type(&offset.value, BaseType::Int8, schema)?;
+            if let Some(LimitClause::LimitOffset { limit, offset, .. }) = &query.limit_clause {
+                if let Some(limit) = limit
+                    && !matches!(limit, Expr::Identifier(name) if name.value.eq_ignore_ascii_case("all"))
+                {
+                    validate_implicit_type(limit, BaseType::Int8, schema)?;
+                }
+                if let Some(offset) = offset {
+                    validate_implicit_type(&offset.value, BaseType::Int8, schema)?;
+                }
             }
         }
         _ => {}
@@ -485,7 +494,7 @@ fn validate_boolean(expression: &Expr, schema: &TableSchema, message: &str) -> R
 
 fn validate_assignment(expression: &Expr, target: PgType, schema: &TableSchema) -> Result<()> {
     if matches!(expression, Expr::Identifier(name) if name.value.eq_ignore_ascii_case("default"))
-        || matches!(expression, Expr::Value(AstValue::SingleQuotedString(_)))
+        || matches!(expression, Expr::Value(value) if matches!(&value.value, AstValue::SingleQuotedString(_)))
         || executor::null_expression(expression)
     {
         return Ok(());
@@ -503,7 +512,7 @@ fn validate_assignment(expression: &Expr, target: PgType, schema: &TableSchema) 
 
 fn validate_implicit_type(expression: &Expr, target: BaseType, schema: &TableSchema) -> Result<()> {
     if executor::null_expression(expression)
-        || matches!(expression, Expr::Value(AstValue::SingleQuotedString(_)))
+        || matches!(expression, Expr::Value(value) if matches!(&value.value, AstValue::SingleQuotedString(_)))
     {
         return Ok(());
     }
@@ -548,8 +557,9 @@ fn typed_literal(value: Value, data_type: BaseType) -> Expr {
     };
     Expr::Cast {
         kind: CastKind::Cast,
-        expr: Box::new(Expr::Value(literal)),
+        expr: Box::new(Expr::Value(literal.into())),
         data_type: ast_data_type(data_type),
+        array: false,
         format: None,
     }
 }
@@ -576,6 +586,9 @@ fn ast_data_type(data_type: BaseType) -> DataType {
         BaseType::TimestampTz => {
             DataType::Timestamp(None, sqlparser::ast::TimezoneInfo::WithTimeZone)
         }
-        BaseType::Interval => DataType::Interval,
+        BaseType::Interval => DataType::Interval {
+            fields: None,
+            precision: None,
+        },
     }
 }
