@@ -47,6 +47,16 @@ struct OrderedRow {
     values: Vec<Value>,
     keys: Vec<Value>,
 }
+#[derive(Eq, Hash, PartialEq)]
+enum JoinKey {
+    Bool(bool),
+    Int2(i16),
+    Int4(i32),
+    Int8(i64),
+    Text(String),
+    Bytea(Vec<u8>),
+    Uuid(uuid::Uuid),
+}
 pub(super) fn select_lock_mode(query: &sqlparser::ast::Query) -> Result<Option<RowLockMode>> {
     if query.locks.len() > 1 {
         return Err(PgError::new(
@@ -744,6 +754,15 @@ fn visit_inner_rows(
         starts.push(next_slot);
         next_slot += state.catalog.table(&name(table_name)?)?.columns.len();
     }
+    if table.joins.len() == 1
+        && let Some((left_slot, right_slot)) =
+            hash_join_slots(&table.joins[0].join_operator, scope, starts[0], starts[1])
+    {
+        return visit_hash_inner_rows(
+            state, table, scope, xid, snapshot, context, selection, starts[0], starts[1],
+            left_slot, right_slot, visit,
+        );
+    }
     visit_factor_rows(
         state,
         &table.relation,
@@ -759,6 +778,142 @@ fn visit_inner_rows(
             )
         },
     )
+}
+
+fn hash_join_slots(
+    operator: &sqlparser::ast::JoinOperator,
+    scope: &BoundScope,
+    left_start: usize,
+    right_start: usize,
+) -> Option<(usize, usize)> {
+    let (sqlparser::ast::JoinOperator::Join(sqlparser::ast::JoinConstraint::On(expression))
+    | sqlparser::ast::JoinOperator::Inner(sqlparser::ast::JoinConstraint::On(expression))) =
+        operator
+    else {
+        return None;
+    };
+    let Expr::BinaryOp {
+        left,
+        op: BinaryOperator::Eq,
+        right,
+    } = expression
+    else {
+        return None;
+    };
+    let (left_slot, left_type) = hash_expression_slot(left, scope)?;
+    let (right_slot, right_type) = hash_expression_slot(right, scope)?;
+    if left_type.base != right_type.base
+        || !matches!(
+            left_type.base,
+            BaseType::Bool
+                | BaseType::Int2
+                | BaseType::Int4
+                | BaseType::Int8
+                | BaseType::Text
+                | BaseType::Varchar
+                | BaseType::Bpchar
+                | BaseType::Bytea
+                | BaseType::Uuid
+        )
+    {
+        return None;
+    }
+    if (left_start..right_start).contains(&right_slot)
+        && (right_start..scope.columns.len()).contains(&left_slot)
+    {
+        return Some((right_slot, left_slot));
+    }
+    ((left_start..right_start).contains(&left_slot)
+        && (right_start..scope.columns.len()).contains(&right_slot))
+    .then_some((left_slot, right_slot))
+}
+
+fn hash_expression_slot(expression: &Expr, scope: &BoundScope) -> Option<(usize, PgType)> {
+    match expression {
+        Expr::Identifier(identifier) => scope.resolve_column(std::slice::from_ref(identifier)).ok(),
+        Expr::CompoundIdentifier(identifiers) => scope.resolve_column(identifiers).ok(),
+        _ => None,
+    }
+}
+
+fn visit_hash_inner_rows(
+    state: &DatabaseState,
+    table: &sqlparser::ast::TableWithJoins,
+    scope: &BoundScope,
+    xid: Xid,
+    snapshot: &Snapshot,
+    context: &ExecutionContext,
+    selection: Option<&Expr>,
+    left_start: usize,
+    right_start: usize,
+    left_slot: usize,
+    right_slot: usize,
+    visit: &mut dyn FnMut(&[Value]) -> Result<()>,
+) -> Result<()> {
+    let mut right_rows = std::collections::HashMap::<JoinKey, Vec<Vec<Value>>>::new();
+    visit_factor_rows(
+        state,
+        &table.joins[0].relation,
+        scope,
+        xid,
+        snapshot,
+        context,
+        selection,
+        right_start,
+        &mut |row| {
+            if let Some(key) = hash_key(&row[right_slot]) {
+                right_rows.entry(key).or_default().push(row.to_vec());
+            }
+            Ok(())
+        },
+    )?;
+    visit_factor_rows(
+        state,
+        &table.relation,
+        scope,
+        xid,
+        snapshot,
+        context,
+        selection,
+        left_start,
+        &mut |left| {
+            let Some(key) = hash_key(&left[left_slot]) else {
+                return Ok(());
+            };
+            let Some(matches) = right_rows.get(&key) else {
+                return Ok(());
+            };
+            for right in matches {
+                let row = left
+                    .iter()
+                    .zip(right)
+                    .map(|(left, right)| {
+                        if left.is_null() {
+                            right.clone()
+                        } else {
+                            left.clone()
+                        }
+                    })
+                    .collect::<Vec<_>>();
+                visit(&row)?;
+            }
+            Ok(())
+        },
+    )
+}
+
+fn hash_key(value: &Value) -> Option<JoinKey> {
+    match value {
+        Value::Null => None,
+        Value::Bool(value) => Some(JoinKey::Bool(*value)),
+        Value::Int2(value) => Some(JoinKey::Int2(*value)),
+        Value::Int4(value) => Some(JoinKey::Int4(*value)),
+        Value::Int8(value) => Some(JoinKey::Int8(*value)),
+        Value::Text(value) => Some(JoinKey::Text(value.clone())),
+        Value::Bytea(value) => Some(JoinKey::Bytea(value.clone())),
+        Value::Uuid(value) => Some(JoinKey::Uuid(*value)),
+        _ => None,
+    }
 }
 
 fn visit_inner_join_rows(
