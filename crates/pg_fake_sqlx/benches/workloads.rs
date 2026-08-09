@@ -13,6 +13,7 @@ use pg_fake::{
     api::{IsolationLevel, Session, StatementResult},
     value::Value,
 };
+use pg_fake_benchmarks as benchmarks;
 use pg_fake_sqlx::{Db, PgFakeConnection, PgFakeRow};
 use postgres::{Client, NoTls, SimpleQueryMessage};
 use sqlx::{AssertSqlSafe, Connection};
@@ -115,7 +116,7 @@ fn create_table_benchmark(criterion: &mut Criterion, runtime: &Runtime, postgres
     let postgres_create = format!("CREATE TABLE {postgres_table} (id INTEGER, name TEXT)");
     let postgres_drop = format!("DROP TABLE {postgres_table}");
     let mut fake = PgFakeConnection::new(Db::new());
-    let mut group = criterion.benchmark_group("create_table");
+    let mut group = criterion.benchmark_group(benchmarks::find_benchmark("create_table").name);
 
     group.bench_function("pg_fake", |benchmark| {
         benchmark.iter(|| {
@@ -159,7 +160,7 @@ fn insert_benchmark(criterion: &mut Criterion, runtime: &Runtime, postgres: &mut
     );
     let mut fake_id = 0;
     let mut postgres_id = 0;
-    let mut group = criterion.benchmark_group("insert_row");
+    let mut group = criterion.benchmark_group(benchmarks::find_benchmark("insert_row").name);
 
     group.bench_function("pg_fake", |benchmark| {
         benchmark.iter(|| {
@@ -192,7 +193,8 @@ fn insert_benchmark(criterion: &mut Criterion, runtime: &Runtime, postgres: &mut
     });
     group.finish();
 
-    let mut group = criterion.benchmark_group("insert_row_with_defaults");
+    let mut group =
+        criterion.benchmark_group(benchmarks::find_benchmark("insert_row_with_defaults").name);
 
     group.bench_function("pg_fake", |benchmark| {
         benchmark.iter(|| {
@@ -245,7 +247,7 @@ fn update_benchmark(criterion: &mut Criterion, runtime: &Runtime, postgres: &mut
             .unwrap(),
         0
     );
-    let mut group = criterion.benchmark_group("update_row");
+    let mut group = criterion.benchmark_group(benchmarks::find_benchmark("update_row").name);
 
     group.bench_function("pg_fake", |benchmark| {
         benchmark.iter_custom(|iterations| {
@@ -289,7 +291,7 @@ fn delete_benchmark(criterion: &mut Criterion, runtime: &Runtime, postgres: &mut
     postgres
         .execute(&format!("CREATE TABLE {postgres_table} (id INTEGER)"), &[])
         .unwrap();
-    let mut group = criterion.benchmark_group("delete_row");
+    let mut group = criterion.benchmark_group(benchmarks::find_benchmark("delete_row").name);
 
     group.bench_function("pg_fake", |benchmark| {
         benchmark.iter_custom(|iterations| {
@@ -355,7 +357,8 @@ fn transaction_benchmark(criterion: &mut Criterion, runtime: &Runtime, postgres:
     );
     let mut fake_id = 0;
     let mut postgres_id = 0;
-    let mut group = criterion.benchmark_group("transaction_insert");
+    let mut group =
+        criterion.benchmark_group(benchmarks::find_benchmark("transaction_insert").name);
 
     group.bench_function("pg_fake", |benchmark| {
         benchmark.iter(|| {
@@ -420,7 +423,9 @@ fn repeatable_read_benchmark(criterion: &mut Criterion, runtime: &Runtime, postg
         .unwrap();
     let fake_select = format!("SELECT * FROM {fake_table} FOR UPDATE");
     let postgres_select = format!("SELECT * FROM {postgres_table} FOR UPDATE");
-    let mut group = criterion.benchmark_group("transaction_repeatable_read_select_for_update");
+    let mut group = criterion.benchmark_group(
+        benchmarks::find_benchmark("transaction_repeatable_read_select_for_update").name,
+    );
 
     group.bench_function("pg_fake", |benchmark| {
         benchmark.iter(|| {
@@ -505,7 +510,7 @@ fn select_benchmark(criterion: &mut Criterion, runtime: &Runtime, postgres: &mut
     }
     let fake_select = format!("SELECT * FROM {fake_table}");
     let postgres_select = format!("SELECT * FROM {postgres_table}");
-    let mut group = criterion.benchmark_group("select_100_rows");
+    let mut group = criterion.benchmark_group(benchmarks::find_benchmark("select_100_rows").name);
 
     group.bench_function("pg_fake", |benchmark| {
         benchmark.iter(|| {
@@ -533,7 +538,8 @@ fn select_benchmark(criterion: &mut Criterion, runtime: &Runtime, postgres: &mut
         format!("SELECT id, name FROM {fake_table} ORDER BY id DESC LIMIT 10 OFFSET 40");
     let postgres_select =
         format!("SELECT id, name FROM {postgres_table} ORDER BY id DESC LIMIT 10 OFFSET 40");
-    let mut group = criterion.benchmark_group("limit_offset_ordered_100_rows");
+    let mut group =
+        criterion.benchmark_group(benchmarks::find_benchmark("limit_offset_ordered_100_rows").name);
 
     group.bench_function("pg_fake", |benchmark| {
         benchmark.iter(|| {
@@ -610,7 +616,7 @@ fn order_by_benchmark(criterion: &mut Criterion, runtime: &Runtime, postgres: &m
         format!("SELECT id, bucket FROM {fake_table} ORDER BY bucket DESC NULLS LAST, id ASC");
     let postgres_select =
         format!("SELECT id, bucket FROM {postgres_table} ORDER BY bucket DESC NULLS LAST, id ASC");
-    let mut group = criterion.benchmark_group("order_by_100_rows");
+    let mut group = criterion.benchmark_group(benchmarks::find_benchmark("order_by_100_rows").name);
 
     group.bench_function("pg_fake", |benchmark| {
         benchmark.iter(|| {
@@ -660,7 +666,8 @@ fn core_vs_sqlx_benchmark(criterion: &mut Criterion, runtime: &Runtime) {
     fake_execute(runtime, &mut sqlx, "BEGIN");
     let sqlx_query = format!("SELECT id, name FROM {sqlx_table} ORDER BY id");
 
-    let mut group = criterion.benchmark_group("adapter_overhead_select_100_rows");
+    let mut group = criterion
+        .benchmark_group(benchmarks::find_benchmark("adapter_overhead_select_100_rows").name);
     group.throughput(Throughput::Elements(100));
     group.bench_function("core", |benchmark| {
         benchmark.iter(|| {
@@ -695,7 +702,8 @@ fn parsed_vs_prepared_benchmark(criterion: &mut Criterion) {
     core_execute(&mut session, "BEGIN");
     let parameters = [Value::Int4(50)];
 
-    let mut group = criterion.benchmark_group("core_parsed_vs_prepared_point_select");
+    let mut group = criterion
+        .benchmark_group(benchmarks::find_benchmark("core_parsed_vs_prepared_point_select").name);
     group.bench_function("parse_and_analyze", |benchmark| {
         benchmark.iter(|| {
             let result = session.query(&query, &parameters).unwrap();
@@ -716,7 +724,8 @@ fn parsed_vs_prepared_benchmark(criterion: &mut Criterion) {
 }
 
 fn transaction_history_benchmark(criterion: &mut Criterion) {
-    let mut group = criterion.benchmark_group("transaction_history_point_select");
+    let mut group = criterion
+        .benchmark_group(benchmarks::find_benchmark("transaction_history_point_select").name);
     for completed in [1_u64, 100, 10_000, 100_000] {
         let mut session = Db::new().session();
         core_execute(
@@ -751,7 +760,8 @@ fn transaction_history_benchmark(criterion: &mut Criterion) {
 }
 
 fn mvcc_version_chain_benchmark(criterion: &mut Criterion) {
-    let mut group = criterion.benchmark_group("mvcc_old_snapshot_read");
+    let mut group =
+        criterion.benchmark_group(benchmarks::find_benchmark("mvcc_old_snapshot_read").name);
     for updates in [1_u64, 100, 10_000] {
         let db = Db::new();
         let mut setup = db.session();
@@ -795,7 +805,8 @@ fn mvcc_version_chain_benchmark(criterion: &mut Criterion) {
 }
 
 fn indexed_vs_scan_benchmark(criterion: &mut Criterion) {
-    let mut group = criterion.benchmark_group("point_lookup_index_vs_scan");
+    let mut group =
+        criterion.benchmark_group(benchmarks::find_benchmark("point_lookup_index_vs_scan").name);
     for rows in [100_usize, 10_000] {
         group.throughput(Throughput::Elements(rows as u64));
 
@@ -881,7 +892,8 @@ fn concurrency_benchmark(criterion: &mut Criterion, runtime: &Runtime) {
         fake_execute(runtime, connection, "BEGIN");
     }
 
-    let mut group = criterion.benchmark_group("concurrent_uncontended_reads");
+    let mut group =
+        criterion.benchmark_group(benchmarks::find_benchmark("concurrent_uncontended_reads").name);
     group.throughput(Throughput::Elements(2));
     group.bench_function("sequential", |benchmark| {
         benchmark.iter(|| {
@@ -940,7 +952,8 @@ fn concurrency_benchmark(criterion: &mut Criterion, runtime: &Runtime) {
     );
     let mut first = PgFakeConnection::new(db.clone());
     let mut second = PgFakeConnection::new(db);
-    let mut group = criterion.benchmark_group("concurrent_same_row_contention");
+    let mut group = criterion
+        .benchmark_group(benchmarks::find_benchmark("concurrent_same_row_contention").name);
     group.sample_size(20);
     group.measurement_time(Duration::from_secs(2));
     group.bench_function("wait_then_rollback", |benchmark| {
@@ -1001,7 +1014,8 @@ fn foreign_key_insert_benchmark(
     postgres.execute(&format!("CREATE TABLE {postgres_child} (id INTEGER PRIMARY KEY, parent_id INTEGER REFERENCES {postgres_parent})"), &[]).unwrap();
     let mut fake_id = 0_i32;
     let mut postgres_id = 0_i32;
-    let mut group = criterion.benchmark_group("foreign_key_insert");
+    let mut group =
+        criterion.benchmark_group(benchmarks::find_benchmark("foreign_key_insert").name);
     group.bench_function("pg_fake", |benchmark| {
         benchmark.iter(|| {
             fake_id += 1;

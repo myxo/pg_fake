@@ -39,21 +39,15 @@ To benchmark an existing PostgreSQL 18 instance instead, set
 
 ```sh
 PG_FAKE_DATABASE_URL=postgresql://postgres:password@localhost:5432/postgres \
-  cargo bench -p pg_fake_sqlx --bench workloads
+  cargo x bench
 ```
 
 Otherwise run:
 
 ```sh
-cargo bench -p pg_fake_sqlx --bench workloads
-python3 crates/pg_fake_sqlx/benches/report_speedups.py
+cargo x bench
 ```
 
-Criterion writes latency and throughput reports under `target/criterion`. The
-report script discovers every workload with paired `pg_fake` and PostgreSQL
-results and prints their average latencies together with the
-PostgreSQL-to-`pg_fake` speedup. It also prints readable tables for adapter and
-prepared-statement overhead, transaction-history and MVCC scaling, indexed
-predicates, and concurrent sessions. The expected result on a local
-Docker-backed PostgreSQL is at least 10x; this is not a CI threshold because
-host and Docker configuration materially affect the ratio.
+The command runs Criterion and prints every benchmark's average latency, then
+prints the relative timing for every comparison declared by the shared benchmark
+catalog. Criterion writes latency and throughput reports under `target/criterion`.

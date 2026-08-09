@@ -1676,6 +1676,10 @@ dependencies = [
 ]
 
 [[package]]
+name = "pg_fake_benchmarks"
+version = "0.1.0"
+
+[[package]]
 name = "pg_fake_sqlx"
 version = "0.1.0"
 dependencies = [
@@ -1688,6 +1692,7 @@ dependencies = [
  "futures-util",
  "log",
  "pg_fake",
+ "pg_fake_benchmarks",
  "postgres",
  "sqlx",
  "sqlx-core",
@@ -3415,6 +3420,14 @@ checksum = "32e45ad4206f6d2479085147f02bc2ef834ac85886624a23575ae137c8aa8156"
 dependencies = [
  "libc",
  "rustix",
+]
+
+[[package]]
+name = "xtask"
+version = "0.1.0"
+dependencies = [
+ "pg_fake_benchmarks",
+ "serde_json",
 ]
 
 [[package]]
