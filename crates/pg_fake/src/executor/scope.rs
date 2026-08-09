@@ -2,9 +2,12 @@ use super::{DatabaseState, identifier_name, name};
 use crate::{
     catalog::{Catalog, TableSchema},
     error::{PgError, Result, SqlState},
-    value::PgType,
+    value::{BaseType, PgType},
 };
-use sqlparser::ast::{Ident, Join, JoinConstraint, JoinOperator, TableFactor, TableWithJoins};
+use sqlparser::ast::{
+    Expr, Ident, Join, JoinConstraint, JoinOperator, SelectItem, SetExpr, TableFactor,
+    TableWithJoins,
+};
 
 #[derive(Clone)]
 pub(super) struct BoundColumn {
@@ -263,6 +266,50 @@ fn bind_table_factor(
         }
         return Ok(());
     }
+    if let TableFactor::Derived {
+        lateral,
+        subquery,
+        alias,
+        ..
+    } = factor
+    {
+        if *lateral {
+            return Err(PgError::new(
+                SqlState::FeatureNotSupported,
+                "LATERAL derived tables are not implemented",
+            ));
+        }
+        let alias = alias.as_ref().ok_or_else(|| {
+            PgError::new(SqlState::SyntaxError, "subquery in FROM must have an alias")
+        })?;
+        let columns = query_columns(catalog, subquery)?;
+        if alias.columns.len() > columns.len() {
+            return Err(PgError::new(
+                SqlState::InvalidColumnReference,
+                "derived table has fewer columns than specified in the column alias list",
+            ));
+        }
+        let qualifier = identifier_name(&alias.name);
+        let start = scope.columns.len();
+        scope
+            .columns
+            .extend(columns.into_iter().enumerate().map(|(index, column)| {
+                BoundColumn {
+                    name: alias
+                        .columns
+                        .get(index)
+                        .map(|alias| identifier_name(&alias.name))
+                        .unwrap_or(column.name),
+                    data_type: column.data_type,
+                    qualifier: qualifier.clone(),
+                    slot: start + index,
+                    merged: None,
+                    unqualified: true,
+                    wildcard: true,
+                }
+            }));
+        return Ok(());
+    }
     let TableFactor::Table {
         name: table_name,
         alias,
@@ -288,6 +335,179 @@ fn bind_table_factor(
     )?;
     scope.columns.extend(table.columns);
     Ok(())
+}
+
+pub(crate) fn query_output_columns(
+    catalog: &Catalog,
+    query: &sqlparser::ast::Query,
+) -> Result<Vec<(String, PgType)>> {
+    query_columns(catalog, query).map(|columns| {
+        columns
+            .into_iter()
+            .map(|column| (column.name, column.data_type))
+            .collect()
+    })
+}
+
+fn query_columns(catalog: &Catalog, query: &sqlparser::ast::Query) -> Result<Vec<BoundColumn>> {
+    match query.body.as_ref() {
+        SetExpr::Select(select) => {
+            let scope = bind_query_scope(catalog, select)?;
+            select
+                .projection
+                .iter()
+                .flat_map(|item| match item {
+                    SelectItem::Wildcard(_) => scope
+                        .columns
+                        .iter()
+                        .filter(|column| column.wildcard)
+                        .map(|column| Ok((column.name.clone(), column.data_type)))
+                        .collect::<Vec<_>>(),
+                    SelectItem::QualifiedWildcard(
+                        sqlparser::ast::SelectItemQualifiedWildcardKind::ObjectName(name),
+                        _,
+                    ) => {
+                        let qualifier = match super::name(name) {
+                            Ok(qualifier) => qualifier,
+                            Err(error) => return vec![Err(error)],
+                        };
+                        let columns = scope
+                            .columns
+                            .iter()
+                            .filter(|column| column.qualifier == qualifier && column.wildcard)
+                            .map(|column| Ok((column.name.clone(), column.data_type)))
+                            .collect::<Vec<_>>();
+                        if columns.is_empty()
+                            && !scope
+                                .columns
+                                .iter()
+                                .any(|column| column.qualifier == qualifier)
+                        {
+                            vec![Err(PgError::new(
+                                SqlState::UndefinedTable,
+                                format!("missing FROM-clause entry for table {qualifier:?}"),
+                            ))]
+                        } else {
+                            columns
+                        }
+                    }
+                    SelectItem::UnnamedExpr(Expr::Identifier(identifier)) => {
+                        vec![
+                            scope
+                                .resolve_column(std::slice::from_ref(identifier))
+                                .map(|(_, data_type)| (identifier_name(identifier), data_type)),
+                        ]
+                    }
+                    SelectItem::UnnamedExpr(Expr::CompoundIdentifier(identifiers)) => {
+                        vec![scope.resolve_column(identifiers).map(|(_, data_type)| {
+                            (
+                                identifier_name(
+                                    identifiers
+                                        .last()
+                                        .expect("compound identifier is non-empty"),
+                                ),
+                                data_type,
+                            )
+                        })]
+                    }
+                    SelectItem::ExprWithAlias { expr, alias } => vec![
+                        expression_data_type(catalog, expr, &scope)
+                            .map(|data_type| (identifier_name(alias), data_type)),
+                    ],
+                    SelectItem::UnnamedExpr(expr) => vec![
+                        expression_data_type(catalog, expr, &scope)
+                            .map(|data_type| ("?column?".into(), data_type)),
+                    ],
+                    _ => vec![Err(PgError::new(
+                        SqlState::FeatureNotSupported,
+                        "SELECT projection is not implemented",
+                    ))],
+                })
+                .collect::<Result<Vec<_>>>()
+                .map(|columns| {
+                    columns
+                        .into_iter()
+                        .enumerate()
+                        .map(|(slot, (name, data_type))| BoundColumn {
+                            name,
+                            data_type,
+                            qualifier: String::new(),
+                            slot,
+                            merged: None,
+                            unqualified: true,
+                            wildcard: true,
+                        })
+                        .collect()
+                })
+        }
+        SetExpr::Values(values) => {
+            let width = values.rows.first().map(|row| row.len()).unwrap_or(0);
+            if values.rows.iter().any(|row| row.len() != width) {
+                return Err(PgError::new(
+                    SqlState::SyntaxError,
+                    "VALUES lists must all be the same length",
+                ));
+            }
+            (0..width)
+                .map(|slot| {
+                    let data_type = values
+                        .rows
+                        .iter()
+                        .map(|row| &row[slot])
+                        .filter(|expr| {
+                            !super::null_expression(expr) && super::unknown_string(expr).is_none()
+                        })
+                        .try_fold(None, |common, expr| {
+                            let data_type = super::expression_type(
+                                expr,
+                                RowScope::Table(&super::constant_schema()),
+                            )?;
+                            Ok(Some(match common {
+                                Some(common) => crate::coercion::common_type(common, data_type)
+                                    .ok_or_else(|| {
+                                        PgError::new(
+                                            SqlState::DatatypeMismatch,
+                                            "VALUES types cannot be matched",
+                                        )
+                                    })?,
+                                None => data_type,
+                            }))
+                        })?
+                        .unwrap_or(BaseType::Text);
+                    Ok(BoundColumn {
+                        name: format!("column{}", slot + 1),
+                        data_type: PgType::new(data_type),
+                        qualifier: String::new(),
+                        slot,
+                        merged: None,
+                        unqualified: true,
+                        wildcard: true,
+                    })
+                })
+                .collect()
+        }
+        _ => Err(PgError::new(
+            SqlState::FeatureNotSupported,
+            "query source is not implemented",
+        )),
+    }
+}
+
+fn expression_data_type(catalog: &Catalog, expr: &Expr, scope: &BoundScope) -> Result<PgType> {
+    if let Expr::Subquery(query) = expr {
+        let columns = query_columns(catalog, query)?;
+        if columns.len() != 1 {
+            return Err(PgError::new(
+                SqlState::SyntaxError,
+                "subquery must return only one column",
+            ));
+        }
+        return Ok(columns[0].data_type);
+    }
+    Ok(PgType::new(super::expression_type(
+        expr,
+        RowScope::Bound(scope),
+    )?))
 }
 
 fn bind_join_constraint(

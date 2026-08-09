@@ -24,6 +24,9 @@ pub enum SqlState {
     InvalidParameterValue,               // 22023
     StringDataRightTruncation,           // 22001
 
+    // 21 — Cardinality Violation
+    CardinalityViolation, // 21000
+
     // 23 — Integrity Constraint Violation
     NotNullViolation,    // 23502
     UniqueViolation,     // 23505
@@ -73,6 +76,7 @@ impl SqlState {
             SqlState::InvalidTextRepresentation => "22P02",
             SqlState::InvalidParameterValue => "22023",
             SqlState::StringDataRightTruncation => "22001",
+            SqlState::CardinalityViolation => "21000",
             SqlState::NotNullViolation => "23502",
             SqlState::UniqueViolation => "23505",
             SqlState::CheckViolation => "23514",

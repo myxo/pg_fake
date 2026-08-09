@@ -647,14 +647,16 @@ impl Session {
         }
         let prepared = {
             let state = self.db.state.lock().expect("database mutex is poisoned");
-            analyzer::parameter_types(&statement, &state.catalog).and_then(|parameter_types| {
-                let described = analyzer::bind(
-                    &statement,
-                    &parameter_types,
-                    &vec![Value::Null; parameter_types.len()],
-                )?;
-                let columns = executor::query_columns(&state, &described)?;
-                Ok((parameter_types, columns))
+            analyzer::describe_subqueries(&statement, &state.catalog).and_then(|described| {
+                analyzer::parameter_types(&described, &state.catalog).and_then(|parameter_types| {
+                    let described = analyzer::bind(
+                        &described,
+                        &parameter_types,
+                        &vec![Value::Null; parameter_types.len()],
+                    )?;
+                    let columns = executor::query_columns(&state, &described)?;
+                    Ok((parameter_types, columns))
+                })
             })
         };
         match prepared {
@@ -1021,6 +1023,16 @@ impl Session {
                 clock_timestamp: self.db.now(),
                 rng: self.db.rng.clone(),
             };
+            let statement = match executor::materialize_scalar_subqueries(
+                &state,
+                &statement,
+                transaction.xid,
+                &snapshot,
+                &context,
+            ) {
+                Ok(statement) => statement,
+                Err(error) => return self.failed(error),
+            };
             if transaction.implicit_batch
                 && matches!(parser::classify(&statement), parser::StatementKind::Ddl)
             {
@@ -1079,6 +1091,16 @@ impl Session {
             statement_timestamp: now,
             clock_timestamp: now,
             rng: self.db.rng.clone(),
+        };
+        let statement = match executor::materialize_scalar_subqueries(
+            &state, &statement, xid, &snapshot, &context,
+        ) {
+            Ok(statement) => statement,
+            Err(error) => {
+                abort(&mut state, xid);
+                self.db.condvar.notify_all();
+                return Err(error);
+            }
         };
         let (mut state, snapshot) = match acquire_row_locks(
             &self.db.condvar,
@@ -3898,6 +3920,75 @@ mod tests {
                 ]]
             );
         }
+    }
+
+    #[test]
+    fn materializes_derived_tables_and_uncorrelated_scalar_subqueries() {
+        let db = Db::new();
+        let mut session = db.session();
+        session
+            .execute("CREATE TABLE items (id INTEGER, value INTEGER)")
+            .unwrap();
+        session
+            .execute("INSERT INTO items VALUES (1, 10), (2, 20), (3, 30)")
+            .unwrap();
+
+        let derived = session
+            .query(
+                "SELECT source.item_id FROM (SELECT id AS item_id FROM items WHERE id > 1) AS source ORDER BY source.item_id",
+                &[],
+            )
+            .unwrap();
+        assert_eq!(
+            derived.rows,
+            vec![vec![Value::Int4(2)], vec![Value::Int4(3)]]
+        );
+        assert_eq!(
+            session
+                .query(
+                    "SELECT nested.item_id FROM (SELECT source.item_id FROM (SELECT id AS item_id FROM items) AS source) AS nested ORDER BY nested.item_id",
+                    &[],
+                )
+                .unwrap()
+                .rows,
+            vec![vec![Value::Int4(1)], vec![Value::Int4(2)], vec![Value::Int4(3)]]
+        );
+
+        let scalar = session
+            .query(
+                "SELECT id FROM items WHERE value < (SELECT 25) ORDER BY (SELECT 100) - id",
+                &[],
+            )
+            .unwrap();
+        assert_eq!(
+            scalar.rows,
+            vec![vec![Value::Int4(2)], vec![Value::Int4(1)]]
+        );
+
+        session
+            .execute("UPDATE items SET value = (SELECT 99) WHERE id = (SELECT 1)")
+            .unwrap();
+        assert_eq!(
+            session
+                .query("SELECT value FROM items WHERE id = 1", &[])
+                .unwrap()
+                .rows,
+            vec![vec![Value::Int4(99)]]
+        );
+        assert_eq!(
+            session
+                .query("SELECT (SELECT value FROM items WHERE id > 1)", &[])
+                .unwrap_err()
+                .sqlstate,
+            SqlState::CardinalityViolation
+        );
+        session.execute("ROLLBACK").unwrap();
+        let prepared = session.prepare("SELECT (SELECT 7)").unwrap();
+        assert_eq!(prepared.columns()[0].type_oid, BaseType::Int4.oid());
+        assert_eq!(
+            session.query_prepared(&prepared, &[]).unwrap().rows,
+            vec![vec![Value::Int4(7)]]
+        );
     }
 
     #[test]

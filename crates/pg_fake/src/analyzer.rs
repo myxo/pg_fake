@@ -158,6 +158,34 @@ pub(crate) fn parameter_types(statement: &Statement, catalog: &Catalog) -> Resul
     Ok(types)
 }
 
+pub(crate) fn describe_subqueries(statement: &Statement, catalog: &Catalog) -> Result<Statement> {
+    let mut statement = statement.clone();
+    let mut error = None;
+    let _ = visit_expressions_mut(&mut statement, |expression| {
+        if error.is_some() {
+            return ControlFlow::Break(());
+        }
+        let Expr::Subquery(query) = expression else {
+            return ControlFlow::Continue(());
+        };
+        let result = executor::query_output_columns(catalog, query).and_then(|columns| {
+            if columns.len() != 1 {
+                return Err(PgError::new(
+                    SqlState::SyntaxError,
+                    "subquery must return only one column",
+                ));
+            }
+            Ok(typed_literal(Value::Null, columns[0].1.base))
+        });
+        match result {
+            Ok(value) => *expression = value,
+            Err(describe_error) => error = Some(describe_error),
+        }
+        ControlFlow::Continue(())
+    });
+    error.map_or(Ok(statement), Err)
+}
+
 pub(crate) fn bind(
     statement: &Statement,
     parameter_types: &[BaseType],
@@ -586,7 +614,7 @@ fn coerce_parameter(value: Value, target: BaseType) -> Result<Value> {
     coercion::coerce(value, source, PgType::new(target), CastContext::Implicit)
 }
 
-fn typed_literal(value: Value, data_type: BaseType) -> Expr {
+pub(crate) fn typed_literal(value: Value, data_type: BaseType) -> Expr {
     let literal = match value {
         Value::Null => AstValue::Null,
         Value::Bool(value) => AstValue::Boolean(value),

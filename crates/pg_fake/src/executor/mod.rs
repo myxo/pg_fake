@@ -49,6 +49,7 @@ use foreign_keys::{
 };
 pub(crate) use foreign_keys::{contains_deferred_foreign_keys, validate_deferred_foreign_keys};
 pub(crate) use locks::required_row_locks;
+pub(crate) use scope::query_output_columns;
 use scope::{BoundColumn, bind_select_scope};
 pub(crate) use scope::{BoundScope, RowScope, bind_query_scope};
 use writes::{delete_rows, insert_rows, update_rows};
@@ -73,6 +74,7 @@ pub(crate) struct RequiredRowLock {
     pub(crate) mode: RowLockMode,
 }
 
+pub(crate) use query::materialize_scalar_subqueries;
 pub(crate) use query::query_columns;
 
 impl DatabaseState {
@@ -96,7 +98,8 @@ pub(crate) fn dispatch(
     defer_all: bool,
     context: &ExecutionContext,
 ) -> Result<StatementResult> {
-    match statement {
+    let statement = query::materialize_scalar_subqueries(state, statement, xid, snapshot, context)?;
+    match &statement {
         Statement::CreateTable(create) => {
             let table_name = name(&create.name)?;
             if create.if_not_exists && state.catalog.table(&table_name).is_ok() {

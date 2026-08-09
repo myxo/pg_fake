@@ -94,13 +94,25 @@ pub const FEATURES: &[Feature] = &[
     },
     Feature {
         name: "derived and scalar subqueries",
-        cases: &[Case {
-            id: "scalar_subquery",
-            source: "subselect.sql:16",
-            setup: &[],
-            sql: "SELECT (SELECT 1)",
-            baseline: Baseline::Pending,
-        }],
+        cases: &[
+            Case {
+                id: "scalar_subquery",
+                source: "subselect.sql:16",
+                setup: &[],
+                sql: "SELECT (SELECT 1)",
+                baseline: Baseline::MustPass,
+            },
+            Case {
+                id: "derived_table",
+                source: "subselect.sql:32",
+                setup: &[
+                    "CREATE TABLE derived_rows (id INTEGER)",
+                    "INSERT INTO derived_rows VALUES (2), (1)",
+                ],
+                sql: "SELECT source.id FROM (SELECT id FROM derived_rows) AS source ORDER BY source.id",
+                baseline: Baseline::MustPass,
+            },
+        ],
     },
     Feature {
         name: "subquery predicates",

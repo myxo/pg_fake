@@ -133,6 +133,11 @@ pub fn list_benchmarks() -> Vec<Benchmark> {
             postgres_values(),
             postgres_comparisons(),
         ),
+        build_benchmark(
+            "derived_and_scalar_subquery_100_rows",
+            postgres_values(),
+            postgres_comparisons(),
+        ),
     ]
 }
 

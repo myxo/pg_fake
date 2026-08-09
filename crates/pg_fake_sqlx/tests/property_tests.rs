@@ -780,6 +780,24 @@ fn generated_sql_matches_postgres() {
             &runtime,
             postgres.client(),
             &mut fake,
+            &format!(
+                "SELECT source.row_key FROM (SELECT row_key FROM {table}) AS source ORDER BY source.row_key"
+            ),
+            RowOrder::Ordered,
+        );
+        assert_statement(
+            &runtime,
+            postgres.client(),
+            &mut fake,
+            &format!(
+                "SELECT row_key FROM {table} WHERE row_key = (SELECT row_key FROM {table} ORDER BY row_key LIMIT 1)"
+            ),
+            RowOrder::Unordered,
+        );
+        assert_statement(
+            &runtime,
+            postgres.client(),
+            &mut fake,
             &format!("CREATE TABLE {foreign_parent} (id INTEGER PRIMARY KEY)"),
             RowOrder::Unordered,
         );

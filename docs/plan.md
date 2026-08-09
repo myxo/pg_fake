@@ -171,7 +171,7 @@ semantics.
 
 **Notes:** Join reordering is unnecessary; execute the parsed join tree.
 
-### Task 6 — Derived tables and uncorrelated scalar subqueries
+### Task 6 — Derived tables and uncorrelated scalar subqueries [COMPLETE]
 
 **Goal:** Allow queries to consume the result of another query as a relation or
 scalar value.

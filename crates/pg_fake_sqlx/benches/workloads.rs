@@ -1088,6 +1088,73 @@ fn benchmarks(criterion: &mut Criterion) {
     concurrency_benchmark(criterion, &runtime);
     foreign_key_insert_benchmark(criterion, &runtime, &mut postgres.client);
     inner_join_benchmark(criterion, &runtime, &mut postgres.client);
+    derived_and_scalar_subquery_benchmark(criterion, &runtime, &mut postgres.client);
+}
+
+fn derived_and_scalar_subquery_benchmark(
+    criterion: &mut Criterion,
+    runtime: &Runtime,
+    postgres: &mut Client,
+) {
+    let fake_table = unique_table_name("derived_scalar_fake");
+    let postgres_table = unique_table_name("derived_scalar_postgres");
+    let values = (1..=100)
+        .map(|id| format!("({id})"))
+        .collect::<Vec<_>>()
+        .join(",");
+    let mut fake = PgFakeConnection::new(Db::new());
+    fake_execute(
+        runtime,
+        &mut fake,
+        &format!("CREATE TABLE {fake_table} (id INTEGER)"),
+    );
+    fake_execute(
+        runtime,
+        &mut fake,
+        &format!("INSERT INTO {fake_table} VALUES {values}"),
+    );
+    postgres
+        .execute(&format!("CREATE TABLE {postgres_table} (id INTEGER)"), &[])
+        .unwrap();
+    postgres
+        .execute(
+            &format!("INSERT INTO {postgres_table} VALUES {values}"),
+            &[],
+        )
+        .unwrap();
+    let fake_query_sql = format!(
+        "SELECT source.id FROM (SELECT id FROM {fake_table} WHERE id <= (SELECT 100)) AS source ORDER BY source.id"
+    );
+    let postgres_query_sql = format!(
+        "SELECT source.id FROM (SELECT id FROM {postgres_table} WHERE id <= (SELECT 100)) AS source ORDER BY source.id"
+    );
+    let mut group = criterion
+        .benchmark_group(benchmarks::find_benchmark("derived_and_scalar_subquery_100_rows").name);
+    group.throughput(Throughput::Elements(100));
+    group.bench_function("pg_fake", |benchmark| {
+        benchmark.iter(|| {
+            let result = fake_query(runtime, &mut fake, &fake_query_sql);
+            assert_eq!(result.len(), 100);
+            black_box(result);
+        });
+    });
+    group.bench_function("postgres_18", |benchmark| {
+        benchmark.iter(|| {
+            let result = postgres.simple_query(&postgres_query_sql).unwrap();
+            assert_eq!(
+                result
+                    .iter()
+                    .filter(|message| matches!(message, SimpleQueryMessage::Row(_)))
+                    .count(),
+                100
+            );
+            black_box(result);
+        });
+    });
+    group.finish();
+    postgres
+        .execute(&format!("DROP TABLE {postgres_table}"), &[])
+        .unwrap();
 }
 
 fn inner_join_benchmark(criterion: &mut Criterion, runtime: &Runtime, postgres: &mut Client) {

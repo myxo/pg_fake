@@ -791,3 +791,17 @@ fn query_foundations_and_single_table_aliases_match_postgres() {
         RowOrder::Ordered,
     );
 }
+
+#[test]
+fn derived_tables_and_uncorrelated_scalar_subqueries_match_postgres() {
+    assert_differential(
+        "CREATE TABLE __TABLE__ (id INTEGER, value INTEGER); \
+         INSERT INTO __TABLE__ VALUES (1, 10), (2, 20), (3, 30); \
+         SELECT source.item_id FROM (SELECT id AS item_id FROM __TABLE__ WHERE id > 1) AS source ORDER BY source.item_id; \
+         SELECT id FROM __TABLE__ WHERE value < (SELECT 25) ORDER BY (SELECT 100) - id; \
+         UPDATE __TABLE__ SET value = (SELECT 99) WHERE id = (SELECT 1); \
+         SELECT value FROM __TABLE__ WHERE id = 1; \
+         SELECT (SELECT value FROM __TABLE__ WHERE id > 1)",
+        RowOrder::Ordered,
+    );
+}

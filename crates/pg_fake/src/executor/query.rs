@@ -1,4 +1,70 @@
 use super::*;
+use sqlparser::ast::visit_expressions_mut;
+
+pub(crate) fn materialize_scalar_subqueries(
+    state: &DatabaseState,
+    statement: &Statement,
+    xid: Xid,
+    snapshot: &Snapshot,
+    context: &ExecutionContext,
+) -> Result<Statement> {
+    let mut statement = statement.clone();
+    let mut error = None;
+    let _ = visit_expressions_mut(&mut statement, |expr| {
+        if error.is_some() {
+            return std::ops::ControlFlow::Break(());
+        }
+        let Expr::Subquery(query) = expr else {
+            return std::ops::ControlFlow::Continue(());
+        };
+        let result = (|| {
+            let query = materialize_scalar_subqueries(
+                state,
+                &Statement::Query(query.clone()),
+                xid,
+                snapshot,
+                context,
+            )?;
+            let Statement::Query(query) = query else {
+                unreachable!("subquery statement remains a query");
+            };
+            let StatementResult::Query(result) =
+                select_rows(state, &query, xid, snapshot, context)?
+            else {
+                unreachable!("subquery execution returns query rows");
+            };
+            if result.columns.len() != 1 {
+                return Err(PgError::new(
+                    SqlState::SyntaxError,
+                    "subquery must return only one column",
+                ));
+            }
+            if result.rows.len() > 1 {
+                return Err(PgError::new(
+                    SqlState::CardinalityViolation,
+                    "more than one row returned by a subquery used as an expression",
+                ));
+            }
+            let data_type = BaseType::from_oid(result.columns[0].type_oid)
+                .expect("query result type OID is supported");
+            Ok(crate::analyzer::typed_literal(
+                result
+                    .rows
+                    .into_iter()
+                    .next()
+                    .map(|row| row[0].clone())
+                    .unwrap_or(Value::Null),
+                data_type,
+            ))
+        })();
+        match result {
+            Ok(value) => *expr = value,
+            Err(materialize_error) => error = Some(materialize_error),
+        }
+        std::ops::ControlFlow::Continue(())
+    });
+    error.map_or(Ok(statement), Err)
+}
 
 pub(crate) fn query_columns(
     state: &DatabaseState,
@@ -9,7 +75,7 @@ pub(crate) fn query_columns(
     };
     match query.body.as_ref() {
         SetExpr::Select(select) => bind_select_scope(state, select).and_then(|scope| {
-            projections_and_columns(&select.projection, &scope).map(|(_, columns)| columns)
+            projections_and_columns(state, &select.projection, &scope).map(|(_, columns)| columns)
         }),
         SetExpr::Values(values) => bind_values_scope(values).map(|scope| {
             scope
@@ -360,7 +426,7 @@ pub(super) fn select_rows(
             ));
         }
     }
-    let (projections, columns) = projections_and_columns(&select.projection, &scope)?;
+    let (projections, columns) = projections_and_columns(state, &select.projection, &scope)?;
     let order_specs = query
         .order_by
         .as_ref()
@@ -526,6 +592,7 @@ pub(super) fn select_rows(
 }
 
 fn projections_and_columns<'a>(
+    state: &DatabaseState,
     projection: &'a [SelectItem],
     scope: &BoundScope,
 ) -> Result<(Vec<Projection<'a>>, Vec<ColumnMeta>)> {
@@ -603,7 +670,7 @@ fn projections_and_columns<'a>(
                 });
             }
             SelectItem::UnnamedExpr(expr) => {
-                let data_type = expression_type(expr, RowScope::Bound(scope))?;
+                let data_type = expression_data_type(state, expr, scope)?;
                 projections.push(Projection::Expression(expr));
                 columns.push(ColumnMeta {
                     name: "?column?".into(),
@@ -626,7 +693,7 @@ fn projections_and_columns<'a>(
                         (Projection::Expression(expr), data_type, data_type.typmod)
                     }
                     None => {
-                        let data_type = PgType::new(expression_type(expr, RowScope::Bound(scope))?);
+                        let data_type = expression_data_type(state, expr, scope)?;
                         (Projection::Expression(expr), data_type, PgType::NO_TYPEMOD)
                     }
                 };
@@ -646,6 +713,22 @@ fn projections_and_columns<'a>(
         }
     }
     Ok((projections, columns))
+}
+
+fn expression_data_type(state: &DatabaseState, expr: &Expr, scope: &BoundScope) -> Result<PgType> {
+    if let Expr::Subquery(query) = expr {
+        let columns = query_columns(state, &Statement::Query(query.clone()))?;
+        if columns.len() != 1 {
+            return Err(PgError::new(
+                SqlState::SyntaxError,
+                "subquery must return only one column",
+            ));
+        }
+        return Ok(PgType::new(
+            BaseType::from_oid(columns[0].type_oid).expect("query result type OID is supported"),
+        ));
+    }
+    Ok(PgType::new(expression_type(expr, RowScope::Bound(scope))?))
 }
 
 fn source_rows(
@@ -1158,6 +1241,35 @@ fn factor_rows(
             selection,
             next_slot,
         );
+    }
+    if let TableFactor::Derived {
+        lateral,
+        subquery,
+        alias: Some(_),
+        ..
+    } = factor
+    {
+        if *lateral {
+            return Err(PgError::new(
+                SqlState::FeatureNotSupported,
+                "LATERAL derived tables are not implemented",
+            ));
+        }
+        let StatementResult::Query(result) = select_rows(state, subquery, xid, snapshot, context)?
+        else {
+            unreachable!("derived query execution returns query rows");
+        };
+        let start = *next_slot;
+        *next_slot += result.columns.len();
+        return Ok(result
+            .rows
+            .into_iter()
+            .map(|values| {
+                let mut row = vec![Value::Null; scope.columns.len()];
+                row[start..start + values.len()].clone_from_slice(&values);
+                row
+            })
+            .collect());
     }
     let TableFactor::Table {
         name: table_name,
