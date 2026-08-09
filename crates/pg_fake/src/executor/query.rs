@@ -27,6 +27,7 @@ pub(crate) fn query_columns(
 }
 enum Projection<'a> {
     Column(usize),
+    Merged(usize, usize, PgType),
     Expression(&'a Expr),
 }
 enum OrderKey<'a> {
@@ -106,6 +107,7 @@ fn bind_values_scope(values: &sqlparser::ast::Values) -> Result<BoundScope> {
                 data_type: PgType::new(data_type),
                 qualifier: String::new(),
                 slot,
+                merged: None,
                 unqualified: true,
                 wildcard: true,
             })
@@ -427,6 +429,23 @@ pub(super) fn select_rows(
                     .iter()
                     .map(|projection| match projection {
                         Projection::Column(index) => Ok(row[*index].clone()),
+                        Projection::Merged(left, right, data_type) => {
+                            let value = if row[*left].is_null() {
+                                row[*right].clone()
+                            } else {
+                                row[*left].clone()
+                            };
+                            if value.is_null() {
+                                Ok(value)
+                            } else {
+                                coercion::coerce(
+                                    value.clone(),
+                                    value.base_type().expect("non-null value has a base type"),
+                                    *data_type,
+                                    CastContext::Implicit,
+                                )
+                            }
+                        }
                         Projection::Expression(expr) => {
                             evaluate(expr, RowScope::Bound(&scope), row, context)
                         }
@@ -499,7 +518,12 @@ fn projections_and_columns<'a>(
             SelectItem::Wildcard(_) => {
                 for column in &scope.columns {
                     if column.wildcard {
-                        projections.push(Projection::Column(column.slot));
+                        projections.push(match column.merged {
+                            Some((left, right)) => {
+                                Projection::Merged(left, right, column.data_type)
+                            }
+                            None => Projection::Column(column.slot),
+                        });
                         columns.push(ColumnMeta {
                             name: column.name.clone(),
                             type_oid: column.data_type.oid(),
@@ -538,18 +562,18 @@ fn projections_and_columns<'a>(
                     });
                 }
             }
-            SelectItem::UnnamedExpr(Expr::Identifier(column)) => {
-                let (index, data_type) = scope.resolve_column(std::slice::from_ref(column))?;
-                projections.push(Projection::Column(index));
+            SelectItem::UnnamedExpr(expression @ Expr::Identifier(column)) => {
+                let (_, data_type) = scope.resolve_column(std::slice::from_ref(column))?;
+                projections.push(Projection::Expression(expression));
                 columns.push(ColumnMeta {
                     name: column.value.clone(),
                     type_oid: data_type.oid(),
                     typmod: data_type.typmod,
                 });
             }
-            SelectItem::UnnamedExpr(Expr::CompoundIdentifier(identifiers)) => {
-                let (index, data_type) = scope.resolve_column(identifiers)?;
-                projections.push(Projection::Column(index));
+            SelectItem::UnnamedExpr(expression @ Expr::CompoundIdentifier(identifiers)) => {
+                let (_, data_type) = scope.resolve_column(identifiers)?;
+                projections.push(Projection::Expression(expression));
                 columns.push(ColumnMeta {
                     name: identifiers
                         .last()
@@ -580,8 +604,8 @@ fn projections_and_columns<'a>(
                     _ => None,
                 };
                 let (projection, data_type, typmod) = match resolved {
-                    Some((slot, data_type)) => {
-                        (Projection::Column(slot), data_type, data_type.typmod)
+                    Some((_, data_type)) => {
+                        (Projection::Expression(expr), data_type, data_type.typmod)
                     }
                     None => {
                         let data_type = PgType::new(expression_type(expr, RowScope::Bound(scope))?);
@@ -673,8 +697,10 @@ fn table_rows(
             next_slot,
         )?;
         let mut joined = Vec::new();
+        let mut matched_right = vec![false; right_rows.len()];
         for left in &rows {
-            for right in &right_rows {
+            let mut matched_left = false;
+            for (index, right) in right_rows.iter().enumerate() {
                 let row = left
                     .iter()
                     .zip(right)
@@ -694,9 +720,34 @@ fn table_rows(
                     right_start,
                     context,
                 )? {
+                    matched_left = true;
+                    matched_right[index] = true;
                     joined.push(row);
                 }
             }
+            if !matched_left
+                && matches!(
+                    join.join_operator,
+                    sqlparser::ast::JoinOperator::Left(_)
+                        | sqlparser::ast::JoinOperator::LeftOuter(_)
+                        | sqlparser::ast::JoinOperator::FullOuter(_)
+                )
+            {
+                joined.push(left.clone());
+            }
+        }
+        if matches!(
+            join.join_operator,
+            sqlparser::ast::JoinOperator::Right(_)
+                | sqlparser::ast::JoinOperator::RightOuter(_)
+                | sqlparser::ast::JoinOperator::FullOuter(_)
+        ) {
+            joined.extend(
+                right_rows
+                    .iter()
+                    .zip(matched_right)
+                    .filter_map(|(row, matched)| (!matched).then_some(row.clone())),
+            );
         }
         rows = joined;
     }
@@ -771,7 +822,12 @@ fn join_matches(
     let constraint = match operator {
         sqlparser::ast::JoinOperator::Join(constraint)
         | sqlparser::ast::JoinOperator::Inner(constraint)
-        | sqlparser::ast::JoinOperator::CrossJoin(constraint) => constraint,
+        | sqlparser::ast::JoinOperator::CrossJoin(constraint)
+        | sqlparser::ast::JoinOperator::Left(constraint)
+        | sqlparser::ast::JoinOperator::LeftOuter(constraint)
+        | sqlparser::ast::JoinOperator::Right(constraint)
+        | sqlparser::ast::JoinOperator::RightOuter(constraint)
+        | sqlparser::ast::JoinOperator::FullOuter(constraint) => constraint,
         _ => {
             return Err(PgError::new(
                 SqlState::FeatureNotSupported,

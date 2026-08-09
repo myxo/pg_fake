@@ -193,12 +193,6 @@ pub(super) fn unknown_string(expr: &Expr) -> Option<&str> {
     }
 }
 
-fn column_index(schema: RowScope<'_>, column: &Ident) -> Result<usize> {
-    schema
-        .resolve_column(std::slice::from_ref(column))
-        .map(|(index, _)| index)
-}
-
 pub(crate) fn expression_type(expr: &Expr, schema: RowScope<'_>) -> Result<BaseType> {
     if let Some(value) = ast_value(expr) {
         return match value {
@@ -575,8 +569,8 @@ pub(super) fn evaluate(
     context: &ExecutionContext,
 ) -> Result<Value> {
     match expr {
-        Expr::Identifier(column) => Ok(row[column_index(schema, column)?].clone()),
-        Expr::CompoundIdentifier(columns) => Ok(row[schema.resolve_column(columns)?.0].clone()),
+        Expr::Identifier(column) => schema.column_value(std::slice::from_ref(column), row),
+        Expr::CompoundIdentifier(columns) => schema.column_value(columns, row),
         Expr::Value(_) => literal_value(expr),
         Expr::Nested(expr) => evaluate(expr, schema, row, context),
         Expr::UnaryOp { op, expr } => {

@@ -771,6 +771,15 @@ fn generated_sql_matches_postgres() {
             &runtime,
             postgres.client(),
             &mut fake,
+            &format!(
+                "SELECT left_row.row_key, right_row.row_key FROM {table} AS left_row FULL JOIN {table} AS right_row ON left_row.row_key = right_row.row_key + 1000000 ORDER BY 1, 2"
+            ),
+            RowOrder::Ordered,
+        );
+        assert_statement(
+            &runtime,
+            postgres.client(),
+            &mut fake,
             &format!("CREATE TABLE {foreign_parent} (id INTEGER PRIMARY KEY)"),
             RowOrder::Unordered,
         );

@@ -12,6 +12,7 @@ pub(super) struct BoundColumn {
     pub(super) data_type: PgType,
     pub(super) qualifier: String,
     pub(super) slot: usize,
+    pub(super) merged: Option<(usize, usize)>,
     pub(super) unqualified: bool,
     pub(super) wildcard: bool,
 }
@@ -89,6 +90,48 @@ impl RowScope<'_> {
             }
         }
     }
+
+    pub(super) fn column_value(
+        self,
+        identifiers: &[Ident],
+        row: &[crate::value::Value],
+    ) -> Result<crate::value::Value> {
+        match self {
+            RowScope::Table(_) => Ok(row[self.resolve_column(identifiers)?.0].clone()),
+            RowScope::Bound(scope) => {
+                let names = identifiers.iter().map(identifier_name).collect::<Vec<_>>();
+                let (_, data_type) = self.resolve_column(identifiers)?;
+                let column = scope
+                    .columns
+                    .iter()
+                    .find(|column| match names.as_slice() {
+                        [name] => column.unqualified && column.name == *name,
+                        [qualifier, name] => column.qualifier == *qualifier && column.name == *name,
+                        _ => false,
+                    })
+                    .expect("resolved column must be present in scope");
+                if names.len() == 1
+                    && let Some((left, right)) = column.merged
+                {
+                    let value = if row[left].is_null() {
+                        row[right].clone()
+                    } else {
+                        row[left].clone()
+                    };
+                    if value.is_null() {
+                        return Ok(value);
+                    }
+                    return crate::coercion::coerce(
+                        value.clone(),
+                        value.base_type().expect("non-null value has a base type"),
+                        data_type,
+                        crate::coercion::CastContext::Implicit,
+                    );
+                }
+                Ok(row[column.slot].clone())
+            }
+        }
+    }
 }
 
 impl BoundScope {
@@ -123,6 +166,7 @@ impl BoundScope {
                     data_type: column.data_type,
                     qualifier: qualifier.clone(),
                     slot: slot + index,
+                    merged: None,
                     unqualified: true,
                     wildcard: true,
                 })
@@ -162,7 +206,12 @@ fn bind_table_with_joins(
         let constraint = match &join.join_operator {
             JoinOperator::Join(constraint)
             | JoinOperator::Inner(constraint)
-            | JoinOperator::CrossJoin(constraint) => constraint,
+            | JoinOperator::CrossJoin(constraint)
+            | JoinOperator::Left(constraint)
+            | JoinOperator::LeftOuter(constraint)
+            | JoinOperator::Right(constraint)
+            | JoinOperator::RightOuter(constraint)
+            | JoinOperator::FullOuter(constraint) => constraint,
             _ => {
                 return Err(PgError::new(
                     SqlState::FeatureNotSupported,
@@ -294,10 +343,10 @@ fn bind_join_columns(
     right_start: usize,
 ) -> Result<()> {
     for name in names {
-        let left_type = scope.columns[left_start..right_start]
-            .iter()
+        let (left_columns, right_columns) = scope.columns.split_at_mut(right_start);
+        let left = left_columns[left_start..]
+            .iter_mut()
             .find(|column| column.unqualified && column.name == *name)
-            .map(|column| column.data_type.base)
             .ok_or_else(|| {
                 PgError::new(
                     SqlState::UndefinedColumn,
@@ -306,7 +355,7 @@ fn bind_join_columns(
                     ),
                 )
             })?;
-        let right = scope.columns[right_start..]
+        let right = right_columns
             .iter_mut()
             .find(|column| column.unqualified && column.name == *name)
             .ok_or_else(|| {
@@ -317,12 +366,15 @@ fn bind_join_columns(
                     ),
                 )
             })?;
-        if crate::coercion::common_type(left_type, right.data_type.base).is_none() {
-            return Err(PgError::new(
-                SqlState::DatatypeMismatch,
-                "JOIN/USING types cannot be matched",
-            ));
-        }
+        let data_type = crate::coercion::common_type(left.data_type.base, right.data_type.base)
+            .ok_or_else(|| {
+                PgError::new(
+                    SqlState::DatatypeMismatch,
+                    "JOIN/USING types cannot be matched",
+                )
+            })?;
+        left.data_type = PgType::new(data_type);
+        left.merged = Some((left.slot, right.slot));
         right.unqualified = false;
         right.wildcard = false;
     }

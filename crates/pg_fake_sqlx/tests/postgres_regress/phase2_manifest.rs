@@ -89,7 +89,7 @@ pub const FEATURES: &[Feature] = &[
                 "INSERT INTO outer_left VALUES (1)",
             ],
             sql: "SELECT outer_left.id, outer_right.id FROM outer_left LEFT JOIN outer_right ON outer_left.id = outer_right.id",
-            baseline: Baseline::Pending,
+            baseline: Baseline::MustPass,
         }],
     },
     Feature {

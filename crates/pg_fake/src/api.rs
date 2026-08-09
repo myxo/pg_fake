@@ -3817,6 +3817,44 @@ mod tests {
                 .sqlstate,
             SqlState::AmbiguousColumn
         );
+
+        let left = session
+            .query(
+                "SELECT l.id, r.id FROM left_rows l LEFT JOIN right_rows r ON l.id = r.id ORDER BY l.id, r.id",
+                &[],
+            )
+            .unwrap();
+        assert_eq!(
+            left.rows,
+            vec![
+                vec![Value::Int4(1), Value::Int4(1)],
+                vec![Value::Int4(1), Value::Int4(1)],
+                vec![Value::Int4(2), Value::Null],
+            ]
+        );
+        let full = session
+            .query(
+                "SELECT id, left_value, right_value FROM left_rows FULL JOIN right_rows USING (id) ORDER BY id, right_value",
+                &[],
+            )
+            .unwrap();
+        assert_eq!(
+            full.rows,
+            vec![
+                vec![
+                    Value::Int4(1),
+                    Value::Text("one".into()),
+                    Value::Text("first".into())
+                ],
+                vec![
+                    Value::Int4(1),
+                    Value::Text("one".into()),
+                    Value::Text("second".into())
+                ],
+                vec![Value::Int4(2), Value::Text("two".into()), Value::Null],
+                vec![Value::Int4(3), Value::Null, Value::Text("third".into())],
+            ]
+        );
     }
 
     #[test]

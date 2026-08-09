@@ -153,7 +153,7 @@ parallel special cases in the executor.
 **Notes:** A tree-walking nested-loop implementation is sufficient. Physical
 join algorithms and planner behavior are Tier C.
 
-### Task 5 — `LEFT`, `RIGHT`, and `FULL OUTER JOIN`
+### Task 5 — `LEFT`, `RIGHT`, and `FULL OUTER JOIN` [COMPLETE]
 
 **Goal:** Complete the Phase 2 join family with PostgreSQL null-extension
 semantics.
