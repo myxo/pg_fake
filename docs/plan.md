@@ -58,7 +58,7 @@ statements into the Phase 2 conformance set and records newly exposed blockers.
 
 ## Milestone A — Conformance baseline and query foundations
 
-### Task 1 — Phase 2 regression manifest and progress reporting
+### Task 1 — Phase 2 regression manifest and progress reporting [COMPLETE]
 
 **Goal:** Make the embedded PostgreSQL corpus an actionable Phase 2 scorecard
 without treating unrelated later-phase blockers as failures.

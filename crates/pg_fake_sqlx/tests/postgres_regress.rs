@@ -9,6 +9,9 @@ use testcontainers_modules::postgres::Postgres;
 use tokio::runtime::Runtime;
 use url::Url;
 
+#[path = "postgres_regress/phase2_manifest.rs"]
+mod phase2_manifest;
+
 #[derive(Debug, PartialEq, Eq)]
 enum Outcome {
     Affected(u64),
@@ -22,6 +25,9 @@ struct PostgresServer {
 }
 
 static TEST_LOCK: Mutex<()> = Mutex::new(());
+
+const MINIMUM_PASSED_STATEMENTS: usize = 248;
+const REVIEWED_SKIPPED_SCRIPTS: usize = 141;
 
 fn postgres_server() -> PostgresServer {
     if let Ok(url) = env::var("PG_FAKE_DATABASE_URL") {
@@ -331,8 +337,63 @@ fn compare_source_statement(
     }
 }
 
+fn collect_phase2_report(
+    runtime: &Runtime,
+    admin: &mut Client,
+    server_url: &str,
+) -> (usize, Vec<String>, Vec<String>) {
+    let database = format!("pg_fake_regress_phase2_{}", std::process::id());
+    admin
+        .batch_execute(&format!("CREATE DATABASE {database}"))
+        .expect("must create PostgreSQL Phase 2 regression database");
+    let database_url = database_url(server_url, &database);
+    let mut postgres = Client::connect(&database_url, NoTls)
+        .expect("must connect to PostgreSQL Phase 2 regression database");
+    let mut passed = 0;
+    let mut blockers = Vec::new();
+    let mut regressions = Vec::new();
+
+    for feature in phase2_manifest::FEATURES {
+        let mut fake = PgFakeConnection::new(Db::new());
+        let mut first_blocker = None;
+        for case in feature.cases {
+            let mut result = Ok(());
+            for setup in case.setup {
+                result = compare_source_statement(runtime, &mut postgres, &mut fake, setup);
+                if result.is_err() {
+                    break;
+                }
+            }
+            if result.is_ok() {
+                result = compare_source_statement(runtime, &mut postgres, &mut fake, case.sql);
+            }
+            match result {
+                Ok(()) => passed += 1,
+                Err(error) => {
+                    if matches!(case.baseline, phase2_manifest::Baseline::MustPass) {
+                        regressions.push(format!("{}:{}: {error}", feature.name, case.id));
+                    }
+                    if first_blocker.is_none() {
+                        first_blocker = Some(format!(
+                            "{} ({}) at {}: {error}",
+                            case.id, feature.name, case.source
+                        ));
+                    }
+                }
+            }
+        }
+        blockers.push(first_blocker.unwrap_or_else(|| format!("{}: none", feature.name)));
+    }
+
+    drop(postgres);
+    admin
+        .batch_execute(&format!("DROP DATABASE {database} WITH (FORCE)"))
+        .expect("must drop PostgreSQL Phase 2 regression database");
+    (passed, blockers, regressions)
+}
+
 #[test]
-fn upstream_behavioral_regression_scripts_compare_or_report_a_blocker() {
+fn reports_phase2_regression_progress() {
     let _test_lock = TEST_LOCK.lock().expect("test mutex must not be poisoned");
     let directory =
         PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/postgres_regress/upstream");
@@ -415,15 +476,39 @@ fn upstream_behavioral_regression_scripts_compare_or_report_a_blocker() {
         }
     }
 
-    assert!(passed > 0);
+    assert!(
+        passed >= MINIMUM_PASSED_STATEMENTS,
+        "full corpus regressed below the reviewed baseline of {MINIMUM_PASSED_STATEMENTS}: {passed} statements passed"
+    );
+    assert_eq!(
+        skipped.len(),
+        REVIEWED_SKIPPED_SCRIPTS,
+        "full corpus skipped-script count changed from the reviewed baseline"
+    );
+    let (phase2_passed, phase2_blockers, phase2_regressions) =
+        collect_phase2_report(&runtime, &mut admin, &server.url);
     eprintln!("PostgreSQL behavioral statements passed: {passed}");
     eprintln!("PostgreSQL behavioral scripts skipped: {}", skipped.len());
+    eprintln!("Phase 2 conformance cases passed: {phase2_passed}");
     for (name, reason) in &skipped {
         eprintln!("SKIP {name}: {reason}");
     }
+    for blocker in phase2_blockers {
+        eprintln!("PHASE2 BLOCKER {blocker}");
+    }
+    assert!(
+        phase2_regressions.is_empty(),
+        "reviewed Phase 2 cases regressed:\n{}",
+        phase2_regressions.join("\n")
+    );
     let mut expected_skipped = include_str!("postgres_regress/SKIPPED.txt")
         .lines()
         .collect::<Vec<_>>();
+    assert_eq!(
+        expected_skipped.len(),
+        REVIEWED_SKIPPED_SCRIPTS,
+        "reviewed skip manifest must retain the baseline script count"
+    );
     let mut actual_skipped = skipped
         .iter()
         .map(|(name, _)| name.as_str())
