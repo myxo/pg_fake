@@ -1,4 +1,5 @@
 use bigdecimal::ToPrimitive;
+use rand_chacha::{ChaCha12Rng, rand_core::RngCore};
 
 use crate::{
     api::{ColumnMeta, QueryResult, StatementResult},
@@ -21,13 +22,15 @@ use sqlparser::ast::{
 use std::{
     cmp::Ordering,
     collections::{BTreeMap, BTreeSet},
+    sync::{Arc, Mutex},
 };
 
-#[derive(Clone, Copy)]
+#[derive(Clone)]
 pub(crate) struct ExecutionContext {
     pub(crate) transaction_timestamp: chrono::DateTime<chrono::Utc>,
     pub(crate) statement_timestamp: chrono::DateTime<chrono::Utc>,
     pub(crate) clock_timestamp: chrono::DateTime<chrono::Utc>,
+    pub(crate) rng: Arc<Mutex<ChaCha12Rng>>,
 }
 
 pub(crate) struct DatabaseState {
@@ -2381,7 +2384,7 @@ fn function_type(function: &Function, schema: &TableSchema) -> Result<BaseType> 
             }
             Ok(base)
         }
-        "gen_random_uuid" | "uuidv4" if arguments.is_empty() => Ok(BaseType::Uuid),
+        "gen_random_uuid" | "uuidv4" | "uuidv7" if arguments.is_empty() => Ok(BaseType::Uuid),
         "now" | "transaction_timestamp" | "statement_timestamp" | "clock_timestamp"
             if arguments.is_empty() =>
         {
@@ -2649,7 +2652,35 @@ fn evaluate_function(
     let arguments = function_arguments(function)?;
     let result_type = function_type(function, schema)?;
     match function_name.as_str() {
-        "gen_random_uuid" | "uuidv4" => Ok(Value::Uuid(uuid::Uuid::new_v4())),
+        "gen_random_uuid" | "uuidv4" => {
+            let mut bytes = [0; 16];
+            context
+                .rng
+                .lock()
+                .expect("rng mutex is poisoned")
+                .fill_bytes(&mut bytes);
+            Ok(Value::Uuid(
+                uuid::Builder::from_random_bytes(bytes).into_uuid(),
+            ))
+        }
+        "uuidv7" => {
+            let milliseconds =
+                u64::try_from(context.clock_timestamp.timestamp_millis()).map_err(|_| {
+                    PgError::new(
+                        SqlState::NumericValueOutOfRange,
+                        "uuidv7 timestamp is out of range",
+                    )
+                })?;
+            let mut bytes = [0; 10];
+            context
+                .rng
+                .lock()
+                .expect("rng mutex is poisoned")
+                .fill_bytes(&mut bytes);
+            Ok(Value::Uuid(
+                uuid::Builder::from_unix_timestamp_millis(milliseconds, &bytes).into_uuid(),
+            ))
+        }
         "now" | "transaction_timestamp" | "statement_timestamp" | "clock_timestamp" => {
             let value = match function_name.as_str() {
                 "now" | "transaction_timestamp" => context.transaction_timestamp,

@@ -1649,6 +1649,7 @@ dependencies = [
  "bigdecimal",
  "chrono",
  "postgres",
+ "rand_chacha",
  "sqlparser",
  "testcontainers",
  "testcontainers-modules",

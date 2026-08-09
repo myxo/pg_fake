@@ -4,6 +4,7 @@ use std::{
     time::{Duration, Instant},
 };
 
+use rand_chacha::{ChaCha12Rng, rand_core::SeedableRng};
 use sqlparser::ast::{
     Expr, OneOrManyWithParens, TransactionIsolationLevel as AstIsolationLevel, TransactionMode,
     Value as AstValue,
@@ -53,10 +54,12 @@ pub struct Db {
     condvar: Arc<Condvar>,
     default_lock_timeout: Duration,
     clock: Arc<Mutex<Clock>>,
+    rng: Arc<Mutex<ChaCha12Rng>>,
 }
 pub struct DbBuilder {
     lock_timeout: Duration,
     mock_time: bool,
+    seed: Option<u64>,
 }
 #[derive(Clone, Copy)]
 enum Clock {
@@ -346,6 +349,7 @@ impl Db {
         DbBuilder {
             lock_timeout: Duration::from_secs(1),
             mock_time: false,
+            seed: None,
         }
     }
     pub fn session(&self) -> Session {
@@ -374,6 +378,10 @@ impl DbBuilder {
         self.mock_time = enabled;
         self
     }
+    pub fn seed(mut self, seed: u64) -> Self {
+        self.seed = Some(seed);
+        self
+    }
     pub fn build(self) -> Db {
         Db {
             state: Arc::new(Mutex::new(DatabaseState::new())),
@@ -383,6 +391,10 @@ impl DbBuilder {
                 Clock::Mock(chrono::DateTime::<chrono::Utc>::UNIX_EPOCH)
             } else {
                 Clock::Real
+            })),
+            rng: Arc::new(Mutex::new(match self.seed {
+                Some(seed) => ChaCha12Rng::seed_from_u64(seed),
+                None => ChaCha12Rng::from_os_rng(),
             })),
         }
     }
@@ -974,6 +986,7 @@ impl Session {
                 transaction_timestamp: transaction.transaction_timestamp,
                 statement_timestamp: self.db.now(),
                 clock_timestamp: self.db.now(),
+                rng: self.db.rng.clone(),
             };
             if transaction.implicit_batch
                 && matches!(parser::classify(&statement), parser::StatementKind::Ddl)
@@ -1021,6 +1034,7 @@ impl Session {
             transaction_timestamp: now,
             statement_timestamp: now,
             clock_timestamp: now,
+            rng: self.db.rng.clone(),
         };
         let (mut state, snapshot) = match acquire_row_locks(
             &self.db.condvar,
@@ -1326,6 +1340,37 @@ mod tests {
             .unwrap();
         assert!(matches!(generated.rows[0][0], Value::Uuid(_)));
         assert_ne!(generated.rows[0][0], generated.rows[0][1]);
+    }
+
+    #[test]
+    fn seeded_uuid_generation_is_reproducible_and_supports_v7() {
+        let initial = chrono::DateTime::parse_from_rfc3339("2024-02-29T12:34:56Z")
+            .unwrap()
+            .with_timezone(&chrono::Utc);
+        let generate = |db: &Db| {
+            db.set_time(initial).unwrap();
+            let mut session = db.session();
+            session.execute("CREATE TABLE source (id INTEGER)").unwrap();
+            session.execute("INSERT INTO source VALUES (1)").unwrap();
+            session
+                .query(
+                    "SELECT gen_random_uuid(), uuidv4(), uuidv7() FROM source",
+                    &[],
+                )
+                .unwrap()
+                .rows
+        };
+        let first = generate(&Db::builder().mock_time(true).seed(42).build());
+        let second = generate(&Db::builder().mock_time(true).seed(42).build());
+        assert_eq!(first, second);
+        let Value::Uuid(v4) = first[0][0] else {
+            panic!("uuid generator must return uuid")
+        };
+        let Value::Uuid(v7) = first[0][2] else {
+            panic!("uuidv7 must return uuid")
+        };
+        assert_eq!(v4.get_version(), Some(uuid::Version::Random));
+        assert_eq!(v7.get_version(), Some(uuid::Version::SortRand));
     }
 
     #[test]
