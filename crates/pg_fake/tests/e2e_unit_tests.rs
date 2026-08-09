@@ -776,3 +776,18 @@ fn compares_sqlstate_errors() {
         RowOrder::Unordered,
     );
 }
+
+#[test]
+fn query_foundations_and_single_table_aliases_match_postgres() {
+    assert_differential(
+        "SELECT 2 + 1 AS result ORDER BY result LIMIT 1; \
+         VALUES (2), ('1'), (3) ORDER BY column1 LIMIT 2 OFFSET 1; \
+         CREATE TABLE __TABLE__ (id INTEGER DEFAULT 7, value TEXT); \
+         INSERT INTO __TABLE__ DEFAULT VALUES; \
+         INSERT INTO __TABLE__ VALUES (2, 'two'); \
+         SELECT item.value AS label, item.* FROM __TABLE__ AS item WHERE item.id = 2 ORDER BY label; \
+         SELECT label FROM __TABLE__ AS item(label, label); \
+         SELECT missing FROM __TABLE__",
+        RowOrder::Ordered,
+    );
+}

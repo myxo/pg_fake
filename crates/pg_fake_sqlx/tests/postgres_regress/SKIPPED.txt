@@ -6,9 +6,9 @@ alter_table:1
 arrays:1
 async:1
 bit:1
-boolean:1
+boolean:4
 box:1
-case:13
+case:18
 char:1
 circle:1
 collate.icu.utf8:2
@@ -16,7 +16,7 @@ collate.linux.utf8:2
 collate.utf8:2
 collate.windows.win1252:encoding
 collate:1
-comments:1
+comments:7
 constraints:3
 conversion:2
 copy2:1
@@ -42,10 +42,10 @@ drop_if_exists:4
 drop_operator:1
 encoding:8
 enum:1
-errors:1
+errors:2
 expressions:1
 float4:9
-float8:7
+float8:9
 foreign_key:3
 generated_stored:1
 generated_virtual:1
@@ -59,8 +59,8 @@ int2:10
 int4:10
 int8:9
 interval:1
-join:25
-join_hash:2
+join:30
+join_hash:5
 json:1
 json_encoding:2
 jsonb:1
@@ -80,7 +80,7 @@ merge:1
 misc:10
 misc_functions:1
 money:1
-multirangetypes:1
+multirangetypes:41
 name:1
 numeric:15
 numeric_big:25
@@ -96,7 +96,7 @@ portals_p2:2
 predicate:2
 prepare:1
 rangefuncs:5
-rangetypes:1
+rangetypes:31
 regex:1
 regproc:1
 reloptions:2
@@ -133,7 +133,7 @@ union:1
 updatable_views:1
 update:8
 uuid:3
-varchar:11
+varchar:13
 window:3
 with:1
 without_overlaps:1

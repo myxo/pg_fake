@@ -55,11 +55,13 @@ pub struct Db {
     default_lock_timeout: Duration,
     clock: Arc<Mutex<Clock>>,
     rng: Arc<Mutex<ChaCha12Rng>>,
+    strict: bool,
 }
 pub struct DbBuilder {
     lock_timeout: Duration,
     mock_time: bool,
     seed: Option<u64>,
+    strict: bool,
 }
 #[derive(Clone, Copy)]
 enum Clock {
@@ -368,6 +370,7 @@ impl Db {
             lock_timeout: Duration::from_secs(1),
             mock_time: false,
             seed: None,
+            strict: false,
         }
     }
     pub fn session(&self) -> Session {
@@ -401,6 +404,10 @@ impl DbBuilder {
         self.seed = Some(seed);
         self
     }
+    pub fn strict(mut self, enabled: bool) -> Self {
+        self.strict = enabled;
+        self
+    }
     pub fn build(self) -> Db {
         Db {
             state: Arc::new(Mutex::new(DatabaseState::new())),
@@ -415,6 +422,7 @@ impl DbBuilder {
                 Some(seed) => ChaCha12Rng::seed_from_u64(seed),
                 None => ChaCha12Rng::from_os_rng(),
             })),
+            strict: self.strict,
         }
     }
 }
@@ -821,6 +829,12 @@ impl Session {
     }
     fn run_statement(&mut self, statement: parser::Statement) -> Result<StatementResult> {
         match &statement {
+            parser::Statement::Analyze(_) if !self.db.strict => {
+                return Ok(StatementResult::Affected(0));
+            }
+            parser::Statement::Reset(reset) if !self.db.strict && planner_reset(&reset.reset) => {
+                return Ok(StatementResult::Affected(0));
+            }
             parser::Statement::Set(Set::SetTimeZone { local: _, value }) => {
                 self.timezone = parse_timezone(value)?;
                 return Ok(StatementResult::Affected(0));
@@ -945,6 +959,9 @@ impl Session {
                         Ok(timeout) => timeout,
                         Err(error) => return self.failed(error),
                     };
+                    return Ok(StatementResult::Affected(0));
+                }
+                if !self.db.strict && planner_setting(variable) {
                     return Ok(StatementResult::Affected(0));
                 }
             }
@@ -1123,6 +1140,36 @@ fn contains_dml(statement: &parser::Statement) -> bool {
         statement,
         parser::Statement::Insert(_) | parser::Statement::Update(_) | parser::Statement::Delete(_)
     )
+}
+
+fn planner_setting(variable: &sqlparser::ast::ObjectName) -> bool {
+    let variable = variable.to_string().to_ascii_lowercase();
+    matches!(
+        variable.as_str(),
+        "work_mem"
+            | "effective_cache_size"
+            | "random_page_cost"
+            | "seq_page_cost"
+            | "cpu_tuple_cost"
+            | "cpu_index_tuple_cost"
+            | "cpu_operator_cost"
+            | "parallel_setup_cost"
+            | "parallel_tuple_cost"
+            | "min_parallel_table_scan_size"
+            | "min_parallel_index_scan_size"
+            | "join_collapse_limit"
+            | "from_collapse_limit"
+            | "plan_cache_mode"
+            | "geqo"
+    ) || variable.starts_with("enable_")
+        || variable.starts_with("jit_")
+}
+
+fn planner_reset(reset: &sqlparser::ast::Reset) -> bool {
+    match reset {
+        sqlparser::ast::Reset::ALL => false,
+        sqlparser::ast::Reset::ConfigurationParameter(variable) => planner_setting(variable),
+    }
 }
 
 impl Statement {
@@ -3572,5 +3619,194 @@ mod tests {
             .execute("INSERT INTO items VALUES ('wrong', 'type')")
             .unwrap_err();
         assert_eq!(error.sqlstate, SqlState::InvalidTextRepresentation);
+    }
+
+    #[test]
+    fn executes_constant_select_values_and_default_rows() {
+        let db = Db::new();
+        let mut session = db.session();
+
+        assert_eq!(
+            session
+                .query("SELECT 2 + 1 AS result ORDER BY result LIMIT 1", &[])
+                .unwrap()
+                .rows,
+            vec![vec![Value::Int4(3)]]
+        );
+        let values = session
+            .query(
+                "VALUES (2), (1), (3) ORDER BY column1 LIMIT 1 OFFSET 1",
+                &[],
+            )
+            .unwrap();
+        assert_eq!(values.columns[0].name, "column1");
+        assert_eq!(values.rows, vec![vec![Value::Int4(2)]]);
+        session
+            .execute("CREATE TABLE defaults (id INTEGER DEFAULT 7)")
+            .unwrap();
+        session
+            .execute("INSERT INTO defaults DEFAULT VALUES")
+            .unwrap();
+        assert_eq!(
+            session.query("SELECT id FROM defaults", &[]).unwrap().rows,
+            vec![vec![Value::Int4(7)]]
+        );
+    }
+
+    #[test]
+    fn binds_single_table_aliases_and_qualified_columns() {
+        let db = Db::new();
+        let mut session = db.session();
+
+        session
+            .execute("CREATE TABLE items (id INTEGER, value TEXT)")
+            .unwrap();
+        session
+            .execute("INSERT INTO items VALUES (1, 'one')")
+            .unwrap();
+        let statement = session
+            .prepare("SELECT item.value AS label, item.* FROM items AS item WHERE item.id = $1 ORDER BY label")
+            .unwrap();
+        assert_eq!(statement.parameter_types(), &[BaseType::Int4]);
+        let result = session
+            .query_prepared(&statement, &[Value::Int4(1)])
+            .unwrap();
+        assert_eq!(
+            result
+                .columns
+                .iter()
+                .map(|column| &column.name)
+                .collect::<Vec<_>>(),
+            vec!["label", "id", "value"]
+        );
+        assert_eq!(
+            result.rows,
+            vec![vec![
+                Value::Text("one".into()),
+                Value::Int4(1),
+                Value::Text("one".into())
+            ]]
+        );
+    }
+
+    #[test]
+    fn scopes_apply_quoted_aliases_and_report_column_errors() {
+        let db = Db::new();
+        let mut session = db.session();
+
+        session
+            .execute("CREATE TABLE \"Items\" (\"Value\" VARCHAR(5), other INTEGER)")
+            .unwrap();
+        session
+            .execute("INSERT INTO \"Items\" VALUES ('two', 2)")
+            .unwrap();
+        let result = session
+            .query(
+                "SELECT \"I\".\"V\" AS \"Result\", \"I\".* FROM \"Items\" AS \"I\"(\"V\", \"Other\") WHERE \"I\".\"V\" = 'two' ORDER BY \"Result\"",
+                &[],
+            )
+            .unwrap();
+        assert_eq!(
+            result
+                .columns
+                .iter()
+                .map(|column| &column.name)
+                .collect::<Vec<_>>(),
+            vec!["Result", "V", "Other"]
+        );
+        assert_eq!(result.columns[0].typmod, result.columns[1].typmod);
+        assert_eq!(
+            result.rows,
+            vec![vec![
+                Value::Text("two".into()),
+                Value::Text("two".into()),
+                Value::Int4(2)
+            ]]
+        );
+        assert_eq!(
+            session
+                .query("SELECT missing FROM \"Items\"", &[])
+                .unwrap_err()
+                .sqlstate,
+            SqlState::UndefinedColumn
+        );
+        assert_eq!(
+            session
+                .query("SELECT label FROM \"Items\" AS item(label, label)", &[])
+                .unwrap_err()
+                .sqlstate,
+            SqlState::AmbiguousColumn
+        );
+        assert_eq!(
+            session
+                .query("SELECT \"Items\".\"Value\" FROM \"Items\" AS item", &[])
+                .unwrap_err()
+                .sqlstate,
+            SqlState::UndefinedTable
+        );
+    }
+
+    #[test]
+    fn single_table_alias_scope_property() {
+        for index in 0..32 {
+            let db = Db::new();
+            let mut session = db.session();
+            let alias = format!("item_{index}");
+            let output = format!("value_{index}");
+            session
+                .execute("CREATE TABLE items (id INTEGER, value TEXT)")
+                .unwrap();
+            session
+                .execute(&format!(
+                    "INSERT INTO items VALUES ({index}, 'value_{index}')"
+                ))
+                .unwrap();
+            let statement = session
+                .prepare(&format!(
+                    "SELECT {alias}.value AS {output}, {alias}.* FROM items AS {alias} WHERE {alias}.id = $1 ORDER BY {output}"
+                ))
+                .unwrap();
+            assert_eq!(statement.parameter_types(), &[BaseType::Int4]);
+            let result = session
+                .query_prepared(&statement, &[Value::Int4(index)])
+                .unwrap();
+            assert_eq!(
+                result
+                    .columns
+                    .iter()
+                    .map(|column| &column.name)
+                    .collect::<Vec<_>>(),
+                vec![&output, "id", "value"]
+            );
+            assert_eq!(
+                result.rows,
+                vec![vec![
+                    Value::Text(format!("value_{index}")),
+                    Value::Int4(index),
+                    Value::Text(format!("value_{index}"))
+                ]]
+            );
+        }
+    }
+
+    #[test]
+    fn tolerates_only_planner_settings_outside_strict_mode() {
+        let db = Db::new();
+        let mut session = db.session();
+
+        assert_eq!(session.execute("ANALYZE").unwrap(), affected(0));
+        assert_eq!(
+            session.execute("SET enable_hashjoin = off").unwrap(),
+            affected(0)
+        );
+        assert_eq!(
+            session.execute("RESET enable_hashjoin").unwrap(),
+            affected(0)
+        );
+        let strict = Db::builder().strict(true).build();
+        assert_eq!(
+            strict.session().execute("ANALYZE").unwrap_err().sqlstate,
+            SqlState::FeatureNotSupported
+        );
     }
 }

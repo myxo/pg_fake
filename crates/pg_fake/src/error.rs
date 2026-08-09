@@ -41,6 +41,7 @@ pub enum SqlState {
     // 42 — Syntax Error / Access Rule
     UndefinedTable,         // 42P01
     DuplicateTable,         // 42P07
+    AmbiguousColumn,        // 42702
     SyntaxError,            // 42601
     UndefinedColumn,        // 42703
     UndefinedFunction,      // 42883
@@ -82,6 +83,7 @@ impl SqlState {
             SqlState::DeadlockDetected => "40P01",
             SqlState::UndefinedTable => "42P01",
             SqlState::DuplicateTable => "42P07",
+            SqlState::AmbiguousColumn => "42702",
             SqlState::SyntaxError => "42601",
             SqlState::UndefinedColumn => "42703",
             SqlState::UndefinedFunction => "42883",

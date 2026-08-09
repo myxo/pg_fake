@@ -81,7 +81,7 @@ without treating unrelated later-phase blockers as failures.
 **Notes:** This task changes test infrastructure only. It does not make the full
 upstream corpus a Phase 2 exit criterion.
 
-### Task 2 — Small compatibility wins
+### Task 2 — Small compatibility wins [COMPLETE]
 
 **Goal:** Add low-cost PostgreSQL behavior that supports Phase 2 queries and
 allows the regression runner to reach more meaningful statements.
@@ -104,7 +104,7 @@ allows the regression runner to reach more meaningful statements.
 arbitrary unsupported syntax. `TRUNCATE`, temporary-table semantics, and broad
 DDL expansion remain out of scope.
 
-### Task 3 — Bound relation scopes, aliases, and qualified columns
+### Task 3 — Bound relation scopes, aliases, and qualified columns [COMPLETE]
 
 **Goal:** Replace the single-table expression context with a bound row schema
 that later joins, grouping, and subqueries can share.

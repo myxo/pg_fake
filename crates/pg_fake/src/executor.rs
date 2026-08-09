@@ -17,8 +17,8 @@ use sqlparser::ast::{
     AssignmentTarget, BinaryOperator, CastKind, ColumnOption, ConstraintReferenceMatchKind,
     DateTimeField, Delete, Expr, FromTable, Function, FunctionArg, FunctionArgExpr,
     FunctionArguments, GroupByExpr, Ident, IndexColumn, LockType, ObjectType, ReferentialAction,
-    SelectItem, SetExpr, Statement, TableConstraint, TableFactor, TableObject, TableWithJoins,
-    UnaryOperator, Value as AstValue,
+    SelectItem, SelectItemQualifiedWildcardKind, SetExpr, Statement, TableConstraint, TableFactor,
+    TableObject, TableWithJoins, UnaryOperator, Value as AstValue,
 };
 use std::{
     cmp::Ordering,
@@ -53,17 +53,23 @@ pub(crate) fn query_columns(
     let Statement::Query(query) = statement else {
         return Ok(Vec::new());
     };
-    let SetExpr::Select(select) = query.body.as_ref() else {
-        return Ok(Vec::new());
-    };
-    let Some(from) = select.from.first() else {
-        return Ok(Vec::new());
-    };
-    let TableFactor::Table { name: table, .. } = &from.relation else {
-        return Ok(Vec::new());
-    };
-    let schema = state.catalog.table(&name(table)?)?;
-    projections_and_columns(&select.projection, schema).map(|(_, columns)| columns)
+    match query.body.as_ref() {
+        SetExpr::Select(select) => bind_select_scope(state, select).and_then(|scope| {
+            projections_and_columns(&select.projection, &scope).map(|(_, columns)| columns)
+        }),
+        SetExpr::Values(values) => bind_values_scope(values).map(|scope| {
+            scope
+                .columns
+                .iter()
+                .map(|column| ColumnMeta {
+                    name: column.name.clone(),
+                    type_oid: column.data_type.oid(),
+                    typmod: column.data_type.typmod,
+                })
+                .collect()
+        }),
+        _ => Ok(Vec::new()),
+    }
 }
 enum Projection<'a> {
     Column(usize),
@@ -85,6 +91,170 @@ struct OrderSpec<'a> {
 struct OrderedRow {
     values: Vec<Value>,
     keys: Vec<Value>,
+}
+#[derive(Clone)]
+struct BoundColumn {
+    name: String,
+    data_type: PgType,
+    relation: String,
+    qualifier: String,
+    slot: usize,
+}
+#[derive(Clone)]
+pub(crate) struct BoundScope {
+    columns: Vec<BoundColumn>,
+    relation: Option<String>,
+    qualifier: Option<String>,
+}
+#[derive(Clone, Copy)]
+pub(crate) enum RowScope<'a> {
+    Table(&'a TableSchema),
+    Bound(&'a BoundScope),
+}
+impl RowScope<'_> {
+    fn resolve_column(self, identifiers: &[Ident]) -> Result<(usize, PgType)> {
+        match self {
+            RowScope::Table(schema) => {
+                if identifiers.len() != 1 {
+                    return Err(PgError::new(
+                        SqlState::UndefinedColumn,
+                        format!("column {:?} does not exist", identifiers),
+                    ));
+                }
+                let index = schema
+                    .columns
+                    .iter()
+                    .position(|column| column.name == identifier_name(&identifiers[0]))
+                    .ok_or_else(|| {
+                        PgError::new(
+                            SqlState::UndefinedColumn,
+                            format!("column {:?} does not exist", identifiers[0].value),
+                        )
+                    })?;
+                Ok((index, schema.columns[index].data_type))
+            }
+            RowScope::Bound(scope) => {
+                let names = identifiers.iter().map(identifier_name).collect::<Vec<_>>();
+                let matches = match names.as_slice() {
+                    [column] => scope
+                        .columns
+                        .iter()
+                        .filter(|bound| bound.name == *column)
+                        .collect::<Vec<_>>(),
+                    [qualifier, column] => scope
+                        .columns
+                        .iter()
+                        .filter(|bound| bound.qualifier == *qualifier && bound.name == *column)
+                        .collect::<Vec<_>>(),
+                    _ => Vec::new(),
+                };
+                match matches.as_slice() {
+                    [] if names.len() == 2
+                        && scope.qualifier.as_deref() != Some(names[0].as_str()) =>
+                    {
+                        Err(PgError::new(
+                            SqlState::UndefinedTable,
+                            format!("missing FROM-clause entry for table {:?}", names[0]),
+                        ))
+                    }
+                    [] => Err(PgError::new(
+                        SqlState::UndefinedColumn,
+                        format!("column {:?} does not exist", identifiers),
+                    )),
+                    [column] => Ok((column.slot, column.data_type)),
+                    _ => Err(PgError::new(
+                        SqlState::AmbiguousColumn,
+                        format!("column {:?} is ambiguous", identifiers),
+                    )),
+                }
+            }
+        }
+    }
+}
+impl BoundScope {
+    fn resolve_column(&self, identifiers: &[Ident]) -> Result<(usize, PgType)> {
+        RowScope::Bound(self).resolve_column(identifiers)
+    }
+
+    fn source_relation(&self) -> Option<&str> {
+        self.columns
+            .first()
+            .map(|column| column.relation.as_str())
+            .or(self.relation.as_deref())
+    }
+
+    fn bind_table(
+        schema: &TableSchema,
+        alias: Option<&sqlparser::ast::TableAlias>,
+    ) -> Result<Self> {
+        let qualifier = alias
+            .map(|alias| identifier_name(&alias.name))
+            .unwrap_or_else(|| schema.name.clone());
+        if alias.is_some_and(|alias| alias.columns.len() > schema.columns.len()) {
+            return Err(PgError::new(
+                SqlState::InvalidColumnReference,
+                "table has fewer columns than specified in the column alias list",
+            ));
+        }
+        Ok(BoundScope {
+            relation: Some(schema.name.clone()),
+            qualifier: Some(qualifier.clone()),
+            columns: schema
+                .columns
+                .iter()
+                .enumerate()
+                .map(|(slot, column)| BoundColumn {
+                    name: alias
+                        .and_then(|alias| alias.columns.get(slot))
+                        .map(|alias| identifier_name(&alias.name))
+                        .unwrap_or_else(|| column.name.clone()),
+                    data_type: column.data_type,
+                    relation: schema.name.clone(),
+                    qualifier: qualifier.clone(),
+                    slot,
+                })
+                .collect(),
+        })
+    }
+}
+
+pub(crate) fn bind_query_scope(
+    catalog: &Catalog,
+    select: &sqlparser::ast::Select,
+) -> Result<BoundScope> {
+    if select.from.is_empty() {
+        return Ok(BoundScope {
+            columns: Vec::new(),
+            relation: None,
+            qualifier: None,
+        });
+    }
+    if select.from.len() != 1 || !select.from[0].joins.is_empty() {
+        return Err(PgError::new(
+            SqlState::FeatureNotSupported,
+            "joins are not implemented",
+        ));
+    }
+    let TableFactor::Table {
+        name, alias, args, ..
+    } = &select.from[0].relation
+    else {
+        return Err(PgError::new(
+            SqlState::FeatureNotSupported,
+            "FROM source is not implemented",
+        ));
+    };
+    if args.is_some() {
+        return Err(PgError::new(
+            SqlState::FeatureNotSupported,
+            "table functions are not implemented",
+        ));
+    }
+    BoundScope::bind_table(catalog.table(&self::name(name)?)?, alias.as_ref())
+}
+
+fn bind_select_scope(state: &DatabaseState, select: &sqlparser::ast::Select) -> Result<BoundScope> {
+    bind_query_scope(&state.catalog, select)
 }
 impl DatabaseState {
     pub(crate) fn new() -> Self {
@@ -176,7 +346,7 @@ pub(crate) fn required_row_locks(
         _ => return Ok(Vec::new()),
     };
     if let Some(selection) = selection {
-        let base = expression_type(selection, schema)?;
+        let base = expression_type(selection, RowScope::Table(schema))?;
         if base != BaseType::Bool && !null_expression(selection) {
             return Ok(Vec::new());
         }
@@ -191,7 +361,7 @@ pub(crate) fn required_row_locks(
                 return Ok(locks);
             };
             if let Some(selection) = selection {
-                match evaluate(selection, schema, &version.row, context)? {
+                match evaluate(selection, RowScope::Table(schema), &version.row, context)? {
                     Value::Bool(true) => {}
                     Value::Bool(false) | Value::Null => return Ok(locks),
                     _ => return Ok(locks),
@@ -786,7 +956,7 @@ fn update_rows(
     }
     let schema = state.catalog.table(&name(table_name)?)?.clone();
     if let Some(selection) = selection {
-        let base = expression_type(selection, &schema)?;
+        let base = expression_type(selection, RowScope::Table(&schema))?;
         if base != BaseType::Bool && !null_expression(selection) {
             return Err(PgError::new(
                 SqlState::DatatypeMismatch,
@@ -825,7 +995,7 @@ fn update_rows(
                 && !null_expression(&assignment.value)
                 && unknown_string(&assignment.value).is_none()
                 && !coercion::can_cast(
-                    expression_type(&assignment.value, &schema)?,
+                    expression_type(&assignment.value, RowScope::Table(&schema))?,
                     schema.columns[index].data_type.base,
                     CastContext::Assignment,
                 )
@@ -848,7 +1018,7 @@ fn update_rows(
                 return Ok(targets);
             };
             if let Some(selection) = selection {
-                match evaluate(selection, &schema, &version.row, context)? {
+                match evaluate(selection, RowScope::Table(&schema), &version.row, context)? {
                     Value::Bool(true) => {}
                     Value::Bool(false) | Value::Null => return Ok(targets),
                     _ => unreachable!("WHERE expression was type-checked"),
@@ -965,7 +1135,7 @@ fn delete_rows(
     }
     let schema = state.catalog.table(&name(table_name)?)?.clone();
     if let Some(selection) = &delete.selection {
-        let base = expression_type(selection, &schema)?;
+        let base = expression_type(selection, RowScope::Table(&schema))?;
         if base != BaseType::Bool && !null_expression(selection) {
             return Err(PgError::new(
                 SqlState::DatatypeMismatch,
@@ -983,7 +1153,7 @@ fn delete_rows(
                 return Ok(targets);
             };
             if let Some(selection) = &delete.selection {
-                match evaluate(selection, &schema, &version.row, context)? {
+                match evaluate(selection, RowScope::Table(&schema), &version.row, context)? {
                     Value::Bool(true) => {}
                     Value::Bool(false) | Value::Null => return Ok(targets),
                     _ => unreachable!("WHERE expression was type-checked"),
@@ -1530,6 +1700,206 @@ fn select_lock_mode(query: &sqlparser::ast::Query) -> Result<Option<RowLockMode>
     }))
 }
 
+fn bind_values_scope(values: &sqlparser::ast::Values) -> Result<BoundScope> {
+    let width = values.rows.first().map(|row| row.len()).unwrap_or(0);
+    if values.rows.iter().any(|row| row.len() != width) {
+        return Err(PgError::new(
+            SqlState::SyntaxError,
+            "VALUES lists must all be the same length",
+        ));
+    }
+    let constants = constant_schema();
+    let columns = (0..width)
+        .map(|slot| {
+            let data_type = values
+                .rows
+                .iter()
+                .map(|row| &row[slot])
+                .filter(|expression| {
+                    !null_expression(expression) && unknown_string(expression).is_none()
+                })
+                .try_fold(None, |common, expression| {
+                    let data_type = expression_type(expression, RowScope::Table(&constants))?;
+                    Ok(Some(match common {
+                        Some(common) => {
+                            coercion::common_type(common, data_type).ok_or_else(|| {
+                                PgError::new(
+                                    SqlState::DatatypeMismatch,
+                                    "VALUES types cannot be matched",
+                                )
+                            })?
+                        }
+                        None => data_type,
+                    }))
+                })?
+                .unwrap_or(BaseType::Text);
+            Ok(BoundColumn {
+                name: format!("column{}", slot + 1),
+                data_type: PgType::new(data_type),
+                relation: String::new(),
+                qualifier: String::new(),
+                slot,
+            })
+        })
+        .collect::<Result<Vec<_>>>()?;
+    Ok(BoundScope {
+        columns,
+        relation: None,
+        qualifier: None,
+    })
+}
+
+fn values_rows(
+    query: &sqlparser::ast::Query,
+    values: &sqlparser::ast::Values,
+    context: &ExecutionContext,
+) -> Result<StatementResult> {
+    let scope = bind_values_scope(values)?;
+    let columns = scope
+        .columns
+        .iter()
+        .map(|column| ColumnMeta {
+            name: column.name.clone(),
+            type_oid: column.data_type.oid(),
+            typmod: column.data_type.typmod,
+        })
+        .collect::<Vec<_>>();
+    let constants = constant_schema();
+    let mut rows = values
+        .rows
+        .iter()
+        .map(|row| {
+            row.iter()
+                .zip(&scope.columns)
+                .map(|(expression, column)| {
+                    evaluate_as(
+                        expression,
+                        column.data_type.base,
+                        CastContext::Implicit,
+                        RowScope::Table(&constants),
+                        &[],
+                        context,
+                    )
+                })
+                .collect::<Result<Vec<_>>>()
+        })
+        .collect::<Result<Vec<_>>>()?;
+    if let Some(order_by) = &query.order_by {
+        let sqlparser::ast::OrderByKind::Expressions(orders) = &order_by.kind else {
+            return Err(PgError::new(
+                SqlState::FeatureNotSupported,
+                "ORDER BY ALL is not implemented",
+            ));
+        };
+        let orders = orders
+            .iter()
+            .map(|order| {
+                let index = if let Some(position) = number_literal(&order.expr)
+                    && !position.contains(['.', 'e', 'E'])
+                {
+                    position
+                        .parse::<usize>()
+                        .ok()
+                        .and_then(|position| position.checked_sub(1))
+                } else if let Expr::Identifier(identifier) = &order.expr {
+                    scope
+                        .resolve_column(std::slice::from_ref(identifier))
+                        .ok()
+                        .map(|(slot, _)| slot)
+                } else {
+                    None
+                }
+                .ok_or_else(|| {
+                    PgError::new(
+                        SqlState::InvalidColumnReference,
+                        "ORDER BY position is not in select list",
+                    )
+                })?;
+                if index >= columns.len() {
+                    return Err(PgError::new(
+                        SqlState::InvalidColumnReference,
+                        "ORDER BY position is not in select list",
+                    ));
+                }
+                let ascending = order.options.asc.unwrap_or(true);
+                Ok((
+                    index,
+                    ascending,
+                    order.options.nulls_first.unwrap_or(!ascending),
+                ))
+            })
+            .collect::<Result<Vec<_>>>()?;
+        rows.sort_by(|left, right| {
+            orders
+                .iter()
+                .find_map(|(index, ascending, nulls_first)| {
+                    let ordering = match (&left[*index], &right[*index]) {
+                        (Value::Null, Value::Null) => Ordering::Equal,
+                        (Value::Null, _) => {
+                            if *nulls_first {
+                                Ordering::Less
+                            } else {
+                                Ordering::Greater
+                            }
+                        }
+                        (_, Value::Null) => {
+                            if *nulls_first {
+                                Ordering::Greater
+                            } else {
+                                Ordering::Less
+                            }
+                        }
+                        (left, right) => {
+                            let ordering = value_ordering(left, right)
+                                .expect("VALUES columns have one common type");
+                            if *ascending {
+                                ordering
+                            } else {
+                                ordering.reverse()
+                            }
+                        }
+                    };
+                    (ordering != Ordering::Equal).then_some(ordering)
+                })
+                .unwrap_or(Ordering::Equal)
+        });
+    }
+    let (limit, offset) = match &query.limit_clause {
+        None => (None, 0),
+        Some(sqlparser::ast::LimitClause::LimitOffset {
+            limit,
+            offset,
+            limit_by,
+        }) if limit_by.is_empty() => (
+            limit
+                .as_ref()
+                .map(|limit| row_count(limit, RowCountClause::Limit, context))
+                .transpose()?
+                .flatten(),
+            offset
+                .as_ref()
+                .map(|offset| row_count(&offset.value, RowCountClause::Offset, context))
+                .transpose()?
+                .flatten()
+                .unwrap_or(0),
+        ),
+        _ => {
+            return Err(PgError::new(
+                SqlState::FeatureNotSupported,
+                "LIMIT clause is not implemented",
+            ));
+        }
+    };
+    Ok(StatementResult::Query(QueryResult {
+        columns,
+        rows: rows
+            .into_iter()
+            .skip(offset)
+            .take(limit.unwrap_or(usize::MAX))
+            .collect(),
+    }))
+}
+
 fn select_rows(
     state: &DatabaseState,
     query: &sqlparser::ast::Query,
@@ -1545,6 +1915,9 @@ fn select_rows(
     }
     select_lock_mode(query)?;
     let SetExpr::Select(select) = query.body.as_ref() else {
+        if let SetExpr::Values(values) = query.body.as_ref() {
+            return values_rows(query, values, context);
+        }
         return Err(PgError::new(
             SqlState::FeatureNotSupported,
             "query source is not implemented",
@@ -1561,38 +1934,13 @@ fn select_rows(
         || !group_by.is_empty()
         || !modifiers.is_empty()
         || select.having.is_some()
-        || select.from.len() != 1
     {
         return Err(PgError::new(
             SqlState::FeatureNotSupported,
             "SELECT feature is not implemented",
         ));
     }
-    let from = &select.from[0];
-    if !from.joins.is_empty() {
-        return Err(PgError::new(
-            SqlState::FeatureNotSupported,
-            "joins are not implemented",
-        ));
-    }
-    let TableFactor::Table {
-        name: table_name,
-        args,
-        ..
-    } = &from.relation
-    else {
-        return Err(PgError::new(
-            SqlState::FeatureNotSupported,
-            "FROM source is not implemented",
-        ));
-    };
-    if args.is_some() {
-        return Err(PgError::new(
-            SqlState::FeatureNotSupported,
-            "table functions are not implemented",
-        ));
-    }
-    let schema = state.catalog.table(&name(table_name)?)?;
+    let scope = bind_select_scope(state, select)?;
     let (limit, offset) = match &query.limit_clause {
         None => (None, 0),
         Some(sqlparser::ast::LimitClause::LimitOffset {
@@ -1627,7 +1975,7 @@ fn select_rows(
         }
     };
     if let Some(selection) = &select.selection {
-        let base = expression_type(selection, schema)?;
+        let base = expression_type(selection, RowScope::Bound(&scope))?;
         if base != BaseType::Bool && !null_expression(selection) {
             return Err(PgError::new(
                 SqlState::DatatypeMismatch,
@@ -1635,7 +1983,7 @@ fn select_rows(
             ));
         }
     }
-    let (projections, columns) = projections_and_columns(&select.projection, schema)?;
+    let (projections, columns) = projections_and_columns(&select.projection, &scope)?;
     let order_specs = query
         .order_by
         .as_ref()
@@ -1677,8 +2025,14 @@ fn select_rows(
                             ));
                         }
                         OrderKey::Output(position - 1)
+                    } else if let Expr::Identifier(identifier) = &order.expr
+                        && let Some(index) = columns
+                            .iter()
+                            .position(|column| column.name == identifier_name(identifier))
+                    {
+                        OrderKey::Output(index)
                     } else {
-                        expression_type(&order.expr, schema)?;
+                        expression_type(&order.expr, RowScope::Bound(&scope))?;
                         OrderKey::Expression(&order.expr)
                     };
                     let ascending = order.options.asc.unwrap_or(true);
@@ -1692,40 +2046,55 @@ fn select_rows(
         })
         .transpose()?
         .unwrap_or_default();
-    let table = state
-        .tables
-        .get(&schema.id)
-        .expect("catalog table must have storage");
-    let mut rows = table
-        .rows()
-        .filter_map(|(_, chain)| visible_version(chain, snapshot, xid, &state.transactions))
-        .try_fold(Vec::new(), |mut rows, version| -> Result<Vec<OrderedRow>> {
-            if let Some(selection) = &select.selection {
-                match evaluate(selection, schema, &version.row, context)? {
-                    Value::Bool(true) => {}
-                    Value::Bool(false) | Value::Null => return Ok(rows),
-                    _ => unreachable!("WHERE expression was type-checked"),
-                }
-            }
-            let values = projections
-                .iter()
-                .map(|projection| match projection {
-                    Projection::Column(index) => Ok(version.row[*index].clone()),
-                    Projection::Expression(expr) => evaluate(expr, schema, &version.row, context),
-                })
-                .collect::<Result<Vec<_>>>()?;
-            let keys = order_specs
-                .iter()
-                .map(|order| match order.key {
-                    OrderKey::Output(index) => Ok(values[index].clone()),
-                    OrderKey::Expression(expression) => {
-                        evaluate(expression, schema, &version.row, context)
+    let input_rows = if select.from.is_empty() {
+        vec![Vec::new()]
+    } else {
+        let schema = state.catalog.table(
+            scope
+                .source_relation()
+                .expect("FROM binding must retain its relation"),
+        )?;
+        state
+            .tables
+            .get(&schema.id)
+            .expect("catalog table must have storage")
+            .rows()
+            .filter_map(|(_, chain)| visible_version(chain, snapshot, xid, &state.transactions))
+            .map(|version| version.row.clone())
+            .collect()
+    };
+    let mut rows =
+        input_rows
+            .iter()
+            .try_fold(Vec::new(), |mut rows, row| -> Result<Vec<OrderedRow>> {
+                if let Some(selection) = &select.selection {
+                    match evaluate(selection, RowScope::Bound(&scope), row, context)? {
+                        Value::Bool(true) => {}
+                        Value::Bool(false) | Value::Null => return Ok(rows),
+                        _ => unreachable!("WHERE expression was type-checked"),
                     }
-                })
-                .collect::<Result<Vec<_>>>()?;
-            rows.push(OrderedRow { values, keys });
-            Ok(rows)
-        })?;
+                }
+                let values = projections
+                    .iter()
+                    .map(|projection| match projection {
+                        Projection::Column(index) => Ok(row[*index].clone()),
+                        Projection::Expression(expr) => {
+                            evaluate(expr, RowScope::Bound(&scope), row, context)
+                        }
+                    })
+                    .collect::<Result<Vec<_>>>()?;
+                let keys = order_specs
+                    .iter()
+                    .map(|order| match order.key {
+                        OrderKey::Output(index) => Ok(values[index].clone()),
+                        OrderKey::Expression(expression) => {
+                            evaluate(expression, RowScope::Bound(&scope), row, context)
+                        }
+                    })
+                    .collect::<Result<Vec<_>>>()?;
+                rows.push(OrderedRow { values, keys });
+                Ok(rows)
+            })?;
     rows.sort_by(|left, right| {
         order_specs
             .iter()
@@ -1772,15 +2141,40 @@ fn select_rows(
 
 fn projections_and_columns<'a>(
     projection: &'a [SelectItem],
-    schema: &TableSchema,
+    scope: &BoundScope,
 ) -> Result<(Vec<Projection<'a>>, Vec<ColumnMeta>)> {
     let mut projections = Vec::new();
     let mut columns = Vec::new();
     for item in projection {
         match item {
             SelectItem::Wildcard(_) => {
-                for (index, column) in schema.columns.iter().enumerate() {
-                    projections.push(Projection::Column(index));
+                for column in &scope.columns {
+                    projections.push(Projection::Column(column.slot));
+                    columns.push(ColumnMeta {
+                        name: column.name.clone(),
+                        type_oid: column.data_type.oid(),
+                        typmod: column.data_type.typmod,
+                    });
+                }
+            }
+            SelectItem::QualifiedWildcard(
+                SelectItemQualifiedWildcardKind::ObjectName(object_name),
+                _,
+            ) => {
+                let qualifier = name(object_name)?;
+                let matching = scope
+                    .columns
+                    .iter()
+                    .filter(|column| column.qualifier == qualifier)
+                    .collect::<Vec<_>>();
+                if matching.is_empty() && scope.qualifier.as_deref() != Some(qualifier.as_str()) {
+                    return Err(PgError::new(
+                        SqlState::UndefinedTable,
+                        format!("missing FROM-clause entry for table {qualifier:?}"),
+                    ));
+                }
+                for column in matching {
+                    projections.push(Projection::Column(column.slot));
                     columns.push(ColumnMeta {
                         name: column.name.clone(),
                         type_oid: column.data_type.oid(),
@@ -1789,22 +2183,60 @@ fn projections_and_columns<'a>(
                 }
             }
             SelectItem::UnnamedExpr(Expr::Identifier(column)) => {
-                let index = column_index(schema, column)?;
-                let column = &schema.columns[index];
+                let (index, data_type) = scope.resolve_column(std::slice::from_ref(column))?;
                 projections.push(Projection::Column(index));
                 columns.push(ColumnMeta {
-                    name: column.name.clone(),
-                    type_oid: column.data_type.oid(),
-                    typmod: column.data_type.typmod,
+                    name: column.value.clone(),
+                    type_oid: data_type.oid(),
+                    typmod: data_type.typmod,
+                });
+            }
+            SelectItem::UnnamedExpr(Expr::CompoundIdentifier(identifiers)) => {
+                let (index, data_type) = scope.resolve_column(identifiers)?;
+                projections.push(Projection::Column(index));
+                columns.push(ColumnMeta {
+                    name: identifiers
+                        .last()
+                        .expect("compound identifier is non-empty")
+                        .value
+                        .clone(),
+                    type_oid: data_type.oid(),
+                    typmod: data_type.typmod,
                 });
             }
             SelectItem::UnnamedExpr(expr) => {
-                let data_type = expression_type(expr, schema)?;
+                let data_type = expression_type(expr, RowScope::Bound(scope))?;
                 projections.push(Projection::Expression(expr));
                 columns.push(ColumnMeta {
                     name: "?column?".into(),
                     type_oid: data_type.oid(),
                     typmod: PgType::NO_TYPEMOD,
+                });
+            }
+            SelectItem::ExprWithAlias { expr, alias } => {
+                let resolved = match expr {
+                    Expr::Identifier(column) => {
+                        Some(scope.resolve_column(std::slice::from_ref(column))?)
+                    }
+                    Expr::CompoundIdentifier(identifiers) => {
+                        Some(scope.resolve_column(identifiers)?)
+                    }
+                    _ => None,
+                };
+                let (projection, data_type, typmod) = match resolved {
+                    Some((slot, data_type)) => {
+                        (Projection::Column(slot), data_type, data_type.typmod)
+                    }
+                    None => {
+                        let data_type = PgType::new(expression_type(expr, RowScope::Bound(scope))?);
+                        (Projection::Expression(expr), data_type, PgType::NO_TYPEMOD)
+                    }
+                };
+                projections.push(projection);
+                columns.push(ColumnMeta {
+                    name: identifier_name(alias),
+                    type_oid: data_type.oid(),
+                    typmod,
                 });
             }
             _ => {
@@ -1833,7 +2265,7 @@ fn row_count(
         expr,
         BaseType::Int8,
         CastContext::Implicit,
-        &schema,
+        RowScope::Table(&schema),
         &[],
         context,
     )
@@ -1878,8 +2310,8 @@ fn expression_value(
         coercion::coerce_unknown(text, target, CastContext::Assignment)
     } else {
         coercion::coerce(
-            evaluate(expr, schema, row, context)?,
-            expression_type(expr, schema)?,
+            evaluate(expr, RowScope::Table(schema), row, context)?,
+            expression_type(expr, RowScope::Table(schema))?,
             target,
             CastContext::Assignment,
         )
@@ -1925,7 +2357,7 @@ fn validate_check_constraint_types(schema: &TableSchema) -> Result<()> {
         let crate::catalog::Constraint::Check(expression) = constraint else {
             continue;
         };
-        let base = expression_type(expression, schema)?;
+        let base = expression_type(expression, RowScope::Table(schema))?;
         if base != BaseType::Bool
             && !null_expression(expression)
             && unknown_string(expression).is_none()
@@ -1952,7 +2384,7 @@ fn validate_check_constraints(
             expression,
             BaseType::Bool,
             CastContext::Implicit,
-            schema,
+            RowScope::Table(schema),
             row,
             context,
         )? {
@@ -2060,20 +2492,13 @@ fn unknown_string(expr: &Expr) -> Option<&str> {
     }
 }
 
-fn column_index(schema: &TableSchema, column: &Ident) -> Result<usize> {
+fn column_index(schema: RowScope<'_>, column: &Ident) -> Result<usize> {
     schema
-        .columns
-        .iter()
-        .position(|definition| definition.name == identifier_name(column))
-        .ok_or_else(|| {
-            PgError::new(
-                SqlState::UndefinedColumn,
-                format!("column {:?} does not exist", column.value),
-            )
-        })
+        .resolve_column(std::slice::from_ref(column))
+        .map(|(index, _)| index)
 }
 
-pub(crate) fn expression_type(expr: &Expr, schema: &TableSchema) -> Result<BaseType> {
+pub(crate) fn expression_type(expr: &Expr, schema: RowScope<'_>) -> Result<BaseType> {
     if let Some(value) = ast_value(expr) {
         return match value {
             AstValue::Null => Ok(BaseType::Text),
@@ -2090,9 +2515,8 @@ pub(crate) fn expression_type(expr: &Expr, schema: &TableSchema) -> Result<BaseT
         };
     }
     match expr {
-        Expr::Identifier(column) => {
-            Ok(schema.columns[column_index(schema, column)?].data_type.base)
-        }
+        Expr::Identifier(column) => Ok(schema.resolve_column(std::slice::from_ref(column))?.1.base),
+        Expr::CompoundIdentifier(columns) => Ok(schema.resolve_column(columns)?.1.base),
         Expr::Nested(expr) => expression_type(expr, schema),
         Expr::UnaryOp {
             op: UnaryOperator::Minus,
@@ -2304,7 +2728,7 @@ fn comparable(left: BaseType, right: BaseType) -> bool {
     coercion::common_type(left, right).is_some()
 }
 
-fn expression_common_type(left: &Expr, right: &Expr, schema: &TableSchema) -> Result<BaseType> {
+fn expression_common_type(left: &Expr, right: &Expr, schema: RowScope<'_>) -> Result<BaseType> {
     if null_expression(left) && null_expression(right)
         || unknown_string(left).is_some() && unknown_string(right).is_some()
     {
@@ -2328,7 +2752,7 @@ fn expression_common_type(left: &Expr, right: &Expr, schema: &TableSchema) -> Re
     })
 }
 
-fn common_expression_type(expressions: &[&Expr], schema: &TableSchema) -> Result<BaseType> {
+fn common_expression_type(expressions: &[&Expr], schema: RowScope<'_>) -> Result<BaseType> {
     let mut result = None;
     for expression in expressions {
         if null_expression(expression) || unknown_string(expression).is_some() {
@@ -2390,7 +2814,7 @@ fn function_arguments(function: &Function) -> Result<Vec<&Expr>> {
         .collect()
 }
 
-fn function_type(function: &Function, schema: &TableSchema) -> Result<BaseType> {
+fn function_type(function: &Function, schema: RowScope<'_>) -> Result<BaseType> {
     let function_name = name(&function.name)?;
     let arguments = function_arguments(function)?;
     let signature_error = || {
@@ -2445,12 +2869,13 @@ fn function_type(function: &Function, schema: &TableSchema) -> Result<BaseType> 
 
 fn evaluate(
     expr: &Expr,
-    schema: &TableSchema,
+    schema: RowScope<'_>,
     row: &[Value],
     context: &ExecutionContext,
 ) -> Result<Value> {
     match expr {
         Expr::Identifier(column) => Ok(row[column_index(schema, column)?].clone()),
+        Expr::CompoundIdentifier(columns) => Ok(row[schema.resolve_column(columns)?.0].clone()),
         Expr::Value(_) => literal_value(expr),
         Expr::Nested(expr) => evaluate(expr, schema, row, context),
         Expr::UnaryOp { op, expr } => {
@@ -2669,7 +3094,7 @@ fn evaluate_as(
     expression: &Expr,
     target: BaseType,
     context: CastContext,
-    schema: &TableSchema,
+    schema: RowScope<'_>,
     row: &[Value],
     execution: &ExecutionContext,
 ) -> Result<Value> {
@@ -2688,7 +3113,7 @@ fn evaluate_as(
 
 fn evaluate_function(
     function: &Function,
-    schema: &TableSchema,
+    schema: RowScope<'_>,
     row: &[Value],
     context: &ExecutionContext,
 ) -> Result<Value> {

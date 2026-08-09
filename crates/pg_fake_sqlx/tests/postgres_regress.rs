@@ -26,7 +26,7 @@ struct PostgresServer {
 
 static TEST_LOCK: Mutex<()> = Mutex::new(());
 
-const MINIMUM_PASSED_STATEMENTS: usize = 248;
+const MINIMUM_PASSED_STATEMENTS: usize = 403;
 const REVIEWED_SKIPPED_SCRIPTS: usize = 141;
 
 fn postgres_server() -> PostgresServer {

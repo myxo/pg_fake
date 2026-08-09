@@ -19,13 +19,36 @@ pub struct Feature {
 pub const FEATURES: &[Feature] = &[
     Feature {
         name: "query foundations",
-        cases: &[Case {
-            id: "constant_select",
-            source: "subselect.sql:5",
-            setup: &[],
-            sql: "SELECT 1 AS one",
-            baseline: Baseline::Pending,
-        }],
+        cases: &[
+            Case {
+                id: "constant_select",
+                source: "select.sql:242",
+                setup: &[],
+                sql: "SELECT 1 AS one ORDER BY one",
+                baseline: Baseline::MustPass,
+            },
+            Case {
+                id: "standalone_values",
+                source: "select.sql:138",
+                setup: &[],
+                sql: "VALUES (2), (1), (3) ORDER BY column1 LIMIT 1 OFFSET 1",
+                baseline: Baseline::MustPass,
+            },
+            Case {
+                id: "default_values",
+                source: "select.sql:148",
+                setup: &["CREATE TABLE default_rows (id INTEGER DEFAULT 7)"],
+                sql: "INSERT INTO default_rows DEFAULT VALUES",
+                baseline: Baseline::MustPass,
+            },
+            Case {
+                id: "analyze_noop",
+                source: "select.sql:65",
+                setup: &["CREATE TABLE analyzed_rows (id INTEGER)"],
+                sql: "ANALYZE analyzed_rows",
+                baseline: Baseline::MustPass,
+            },
+        ],
     },
     Feature {
         name: "bound relation scopes",
@@ -37,7 +60,7 @@ pub const FEATURES: &[Feature] = &[
                 "INSERT INTO scope_rows VALUES (1)",
             ],
             sql: "SELECT row_alias.id FROM scope_rows AS row_alias",
-            baseline: Baseline::Pending,
+            baseline: Baseline::MustPass,
         }],
     },
     Feature {

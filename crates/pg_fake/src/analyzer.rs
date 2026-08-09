@@ -55,7 +55,7 @@ pub(crate) fn parameter_types(statement: &Statement, catalog: &Catalog) -> Resul
                     for (expression, column) in row.iter().zip(&columns) {
                         infer_expr(
                             expression,
-                            &executor::constant_schema(),
+                            executor::RowScope::Table(&executor::constant_schema()),
                             Some(schema.columns[*column].data_type.base),
                             &mut types,
                         )?;
@@ -82,13 +82,18 @@ pub(crate) fn parameter_types(statement: &Statement, catalog: &Catalog) -> Resul
                     })?;
                 infer_expr(
                     &assignment.value,
-                    schema,
+                    executor::RowScope::Table(schema),
                     Some(column.data_type.base),
                     &mut types,
                 )?;
             }
             if let Some(selection) = &update.selection {
-                infer_expr(selection, schema, Some(BaseType::Bool), &mut types)?;
+                infer_expr(
+                    selection,
+                    executor::RowScope::Table(schema),
+                    Some(BaseType::Bool),
+                    &mut types,
+                )?;
             }
         }
         Statement::Delete(delete) => {
@@ -98,7 +103,12 @@ pub(crate) fn parameter_types(statement: &Statement, catalog: &Catalog) -> Resul
             if let Some(first) = from.first() {
                 let schema = table_schema(&first.relation, catalog)?;
                 if let Some(selection) = &delete.selection {
-                    infer_expr(selection, schema, Some(BaseType::Bool), &mut types)?;
+                    infer_expr(
+                        selection,
+                        executor::RowScope::Table(schema),
+                        Some(BaseType::Bool),
+                        &mut types,
+                    )?;
                 }
             }
         }
@@ -106,23 +116,29 @@ pub(crate) fn parameter_types(statement: &Statement, catalog: &Catalog) -> Resul
             let SetExpr::Select(select) = query.body.as_ref() else {
                 return Ok(finalize(types));
             };
-            let Some(from) = select.from.first() else {
-                return Ok(finalize(types));
-            };
-            let schema = table_schema(&from.relation, catalog)?;
+            let bound = executor::bind_query_scope(catalog, select)?;
+            let schema = executor::RowScope::Bound(&bound);
             if let Some(selection) = &select.selection {
                 infer_expr(selection, schema, Some(BaseType::Bool), &mut types)?;
             }
             for item in &select.projection {
-                if let SelectItem::UnnamedExpr(expression) = item {
-                    infer_expr(expression, schema, None, &mut types)?;
+                match item {
+                    SelectItem::UnnamedExpr(expression)
+                    | SelectItem::ExprWithAlias {
+                        expr: expression, ..
+                    } => {
+                        infer_expr(expression, schema, None, &mut types)?;
+                    }
+                    _ => {}
                 }
             }
             if let Some(order_by) = &query.order_by
                 && let OrderByKind::Expressions(orders) = &order_by.kind
             {
                 for order in orders {
-                    infer_expr(&order.expr, schema, None, &mut types)?;
+                    if !projection_alias(&order.expr, &select.projection) {
+                        infer_expr(&order.expr, schema, None, &mut types)?;
+                    }
                 }
             }
             if let Some(LimitClause::LimitOffset { limit, offset, .. }) = &query.limit_clause {
@@ -237,7 +253,7 @@ fn table_schema<'a>(factor: &TableFactor, catalog: &'a Catalog) -> Result<&'a Ta
 
 fn infer_expr(
     expression: &Expr,
-    schema: &TableSchema,
+    schema: executor::RowScope<'_>,
     expected: Option<BaseType>,
     types: &mut [Option<BaseType>],
 ) -> Result<()> {
@@ -298,7 +314,7 @@ fn infer_expr(
 
 fn infer_function(
     function: &sqlparser::ast::Function,
-    schema: &TableSchema,
+    schema: executor::RowScope<'_>,
     types: &mut [Option<BaseType>],
 ) -> Result<()> {
     let FunctionArguments::List(list) = &function.args else {
@@ -401,7 +417,7 @@ fn validate_statement(statement: &Statement, catalog: &Catalog) -> Result<()> {
                         validate_assignment(
                             expression,
                             schema.columns[*column].data_type,
-                            &executor::constant_schema(),
+                            executor::RowScope::Table(&executor::constant_schema()),
                         )?;
                     }
                 }
@@ -410,7 +426,11 @@ fn validate_statement(statement: &Statement, catalog: &Catalog) -> Result<()> {
         Statement::Update(update) => {
             let schema = table_schema(&update.table.relation, catalog)?;
             if let Some(selection) = &update.selection {
-                validate_boolean(selection, schema, "WHERE requires a boolean expression")?;
+                validate_boolean(
+                    selection,
+                    executor::RowScope::Table(schema),
+                    "WHERE requires a boolean expression",
+                )?;
             }
             for assignment in &update.assignments {
                 let AssignmentTarget::ColumnName(name) = &assignment.target else {
@@ -427,7 +447,11 @@ fn validate_statement(statement: &Statement, catalog: &Catalog) -> Result<()> {
                             format!("column {name:?} does not exist"),
                         )
                     })?;
-                validate_assignment(&assignment.value, column.data_type, schema)?;
+                validate_assignment(
+                    &assignment.value,
+                    column.data_type,
+                    executor::RowScope::Table(schema),
+                )?;
             }
         }
         Statement::Delete(delete) => {
@@ -439,7 +463,7 @@ fn validate_statement(statement: &Statement, catalog: &Catalog) -> Result<()> {
             {
                 validate_boolean(
                     selection,
-                    table_schema(&first.relation, catalog)?,
+                    executor::RowScope::Table(table_schema(&first.relation, catalog)?),
                     "WHERE requires a boolean expression",
                 )?;
             }
@@ -448,23 +472,29 @@ fn validate_statement(statement: &Statement, catalog: &Catalog) -> Result<()> {
             let SetExpr::Select(select) = query.body.as_ref() else {
                 return Ok(());
             };
-            let Some(from) = select.from.first() else {
-                return Ok(());
-            };
-            let schema = table_schema(&from.relation, catalog)?;
+            let bound = executor::bind_query_scope(catalog, select)?;
+            let schema = executor::RowScope::Bound(&bound);
             if let Some(selection) = &select.selection {
                 validate_boolean(selection, schema, "WHERE requires a boolean expression")?;
             }
             for item in &select.projection {
-                if let SelectItem::UnnamedExpr(expression) = item {
-                    executor::expression_type(expression, schema)?;
+                match item {
+                    SelectItem::UnnamedExpr(expression)
+                    | SelectItem::ExprWithAlias {
+                        expr: expression, ..
+                    } => {
+                        executor::expression_type(expression, schema)?;
+                    }
+                    _ => {}
                 }
             }
             if let Some(order_by) = &query.order_by
                 && let OrderByKind::Expressions(orders) = &order_by.kind
             {
                 for order in orders {
-                    executor::expression_type(&order.expr, schema)?;
+                    if !projection_alias(&order.expr, &select.projection) {
+                        executor::expression_type(&order.expr, schema)?;
+                    }
                 }
             }
             if let Some(LimitClause::LimitOffset { limit, offset, .. }) = &query.limit_clause {
@@ -483,7 +513,21 @@ fn validate_statement(statement: &Statement, catalog: &Catalog) -> Result<()> {
     Ok(())
 }
 
-fn validate_boolean(expression: &Expr, schema: &TableSchema, message: &str) -> Result<()> {
+fn projection_alias(expression: &Expr, projection: &[SelectItem]) -> bool {
+    let Expr::Identifier(identifier) = expression else {
+        return false;
+    };
+    projection.iter().any(|item| {
+        matches!(item, SelectItem::ExprWithAlias { alias, .. }
+            if executor::identifier_name(alias) == executor::identifier_name(identifier))
+    })
+}
+
+fn validate_boolean(
+    expression: &Expr,
+    schema: executor::RowScope<'_>,
+    message: &str,
+) -> Result<()> {
     let data_type = executor::expression_type(expression, schema)?;
     if data_type == BaseType::Bool || executor::null_expression(expression) {
         Ok(())
@@ -492,7 +536,11 @@ fn validate_boolean(expression: &Expr, schema: &TableSchema, message: &str) -> R
     }
 }
 
-fn validate_assignment(expression: &Expr, target: PgType, schema: &TableSchema) -> Result<()> {
+fn validate_assignment(
+    expression: &Expr,
+    target: PgType,
+    schema: executor::RowScope<'_>,
+) -> Result<()> {
     if matches!(expression, Expr::Identifier(name) if name.value.eq_ignore_ascii_case("default"))
         || matches!(expression, Expr::Value(value) if matches!(&value.value, AstValue::SingleQuotedString(_)))
         || executor::null_expression(expression)
@@ -510,7 +558,11 @@ fn validate_assignment(expression: &Expr, target: PgType, schema: &TableSchema) 
     }
 }
 
-fn validate_implicit_type(expression: &Expr, target: BaseType, schema: &TableSchema) -> Result<()> {
+fn validate_implicit_type(
+    expression: &Expr,
+    target: BaseType,
+    schema: executor::RowScope<'_>,
+) -> Result<()> {
     if executor::null_expression(expression)
         || matches!(expression, Expr::Value(value) if matches!(&value.value, AstValue::SingleQuotedString(_)))
     {
