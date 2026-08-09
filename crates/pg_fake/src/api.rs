@@ -258,10 +258,11 @@ fn acquire_row_locks<'a>(
     xid: Xid,
     isolation: IsolationLevel,
     mut snapshot: Snapshot,
+    context: &executor::ExecutionContext,
 ) -> Result<(MutexGuard<'a, DatabaseState>, Snapshot)> {
     let deadline = (timeout != Duration::ZERO).then(|| Instant::now() + timeout);
     loop {
-        let required = executor::required_row_locks(&state, statement, xid, &snapshot)?;
+        let required = executor::required_row_locks(&state, statement, xid, &snapshot, context)?;
         let mut blocked = None;
         for required_lock in required {
             match state
@@ -969,6 +970,11 @@ impl Session {
             };
             transaction.statement_started = true;
             self.transaction = Some(SessionTransaction::Active(transaction));
+            let context = executor::ExecutionContext {
+                transaction_timestamp: transaction.transaction_timestamp,
+                statement_timestamp: self.db.now(),
+                clock_timestamp: self.db.now(),
+            };
             if transaction.implicit_batch
                 && matches!(parser::classify(&statement), parser::StatementKind::Ddl)
             {
@@ -986,15 +992,11 @@ impl Session {
                 transaction.xid,
                 transaction.isolation,
                 snapshot,
+                &context,
             ) {
                 Ok(acquired) => acquired,
                 Err(error) => return self.failed(error),
             };
-            let _time_context = executor::set_time_context(
-                transaction.transaction_timestamp,
-                self.db.now(),
-                self.db.now(),
-            );
             return match executor::dispatch(
                 &mut state,
                 &statement,
@@ -1002,6 +1004,7 @@ impl Session {
                 &snapshot,
                 &self.deferred_constraints,
                 self.defer_all_constraints,
+                &context,
             ) {
                 Ok(result) => Ok(result),
                 Err(error) => {
@@ -1013,6 +1016,12 @@ impl Session {
         let mut state = self.db.state.lock().expect("database mutex is poisoned");
         let xid = state.transactions.begin();
         let snapshot = Snapshot::new(&state.transactions);
+        let now = self.db.now();
+        let context = executor::ExecutionContext {
+            transaction_timestamp: now,
+            statement_timestamp: now,
+            clock_timestamp: now,
+        };
         let (mut state, snapshot) = match acquire_row_locks(
             &self.db.condvar,
             self.lock_timeout,
@@ -1021,6 +1030,7 @@ impl Session {
             xid,
             self.default_isolation,
             snapshot,
+            &context,
         ) {
             Ok(acquired) => acquired,
             Err(error) => {
@@ -1037,6 +1047,7 @@ impl Session {
             &snapshot,
             &self.deferred_constraints,
             self.defer_all_constraints,
+            &context,
         ) {
             Ok(result) => {
                 state.transactions.commit(xid);

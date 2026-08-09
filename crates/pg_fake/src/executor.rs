@@ -19,46 +19,15 @@ use sqlparser::ast::{
     TableFactor, TableWithJoins, UnaryOperator, Value as AstValue,
 };
 use std::{
-    cell::RefCell,
     cmp::Ordering,
     collections::{BTreeMap, BTreeSet},
 };
 
 #[derive(Clone, Copy)]
-struct TimeContext {
-    transaction: chrono::DateTime<chrono::Utc>,
-    statement: chrono::DateTime<chrono::Utc>,
-    clock: chrono::DateTime<chrono::Utc>,
-}
-
-thread_local! {
-    static TIME_CONTEXT: RefCell<Option<TimeContext>> = const { RefCell::new(None) };
-}
-
-pub(crate) struct TimeContextGuard(Option<TimeContext>);
-
-impl Drop for TimeContextGuard {
-    fn drop(&mut self) {
-        TIME_CONTEXT.with(|context| *context.borrow_mut() = self.0.take());
-    }
-}
-
-pub(crate) fn set_time_context(
-    transaction: chrono::DateTime<chrono::Utc>,
-    statement: chrono::DateTime<chrono::Utc>,
-    clock: chrono::DateTime<chrono::Utc>,
-) -> TimeContextGuard {
-    TimeContextGuard(TIME_CONTEXT.with(|context| {
-        context.borrow_mut().replace(TimeContext {
-            transaction,
-            statement,
-            clock,
-        })
-    }))
-}
-
-fn time_context() -> Option<TimeContext> {
-    TIME_CONTEXT.with(|context| *context.borrow())
+pub(crate) struct ExecutionContext {
+    pub(crate) transaction_timestamp: chrono::DateTime<chrono::Utc>,
+    pub(crate) statement_timestamp: chrono::DateTime<chrono::Utc>,
+    pub(crate) clock_timestamp: chrono::DateTime<chrono::Utc>,
 }
 
 pub(crate) struct DatabaseState {
@@ -130,9 +99,10 @@ pub(crate) fn required_row_locks(
     statement: &Statement,
     xid: Xid,
     snapshot: &Snapshot,
+    context: &ExecutionContext,
 ) -> Result<Vec<RequiredRowLock>> {
     if let Statement::Insert(insert) = statement {
-        return required_insert_foreign_key_locks(state, insert, xid, snapshot);
+        return required_insert_foreign_key_locks(state, insert, xid, snapshot, context);
     }
     let (schema, selection, mode) = match statement {
         Statement::Update {
@@ -218,7 +188,7 @@ pub(crate) fn required_row_locks(
                 return Ok(locks);
             };
             if let Some(selection) = selection {
-                match evaluate(selection, schema, &version.row)? {
+                match evaluate(selection, schema, &version.row, context)? {
                     Value::Bool(true) => {}
                     Value::Bool(false) | Value::Null => return Ok(locks),
                     _ => return Ok(locks),
@@ -253,6 +223,7 @@ fn required_insert_foreign_key_locks(
     insert: &sqlparser::ast::Insert,
     xid: Xid,
     snapshot: &Snapshot,
+    context: &ExecutionContext,
 ) -> Result<Vec<RequiredRowLock>> {
     let schema = state.catalog.table(&name(&insert.table_name)?)?;
     let Some(source) = &insert.source else {
@@ -289,17 +260,18 @@ fn required_insert_foreign_key_locks(
         let mut row = schema
             .columns
             .iter()
-            .map(column_default)
+            .map(|column| column_default(column, context))
             .collect::<Result<Vec<_>>>()?;
         for (expression, index) in expressions.iter().zip(&column_indexes) {
             row[*index] = if default_expression(expression) {
-                column_default(&schema.columns[*index])?
+                column_default(&schema.columns[*index], context)?
             } else {
                 expression_value(
                     expression,
                     schema.columns[*index].data_type,
                     &constant_schema(),
                     &[],
+                    context,
                 )?
             };
         }
@@ -365,6 +337,7 @@ pub(crate) fn dispatch(
     snapshot: &Snapshot,
     deferred_constraints: &BTreeSet<String>,
     defer_all: bool,
+    context: &ExecutionContext,
 ) -> Result<StatementResult> {
     match statement {
         Statement::CreateTable(create) => {
@@ -441,7 +414,7 @@ pub(crate) fn dispatch(
                     default,
                 };
                 if column.default.is_some() {
-                    column_default(&column)?;
+                    column_default(&column, context)?;
                 }
                 columns.push(column);
             }
@@ -573,6 +546,7 @@ pub(crate) fn dispatch(
             snapshot,
             deferred_constraints,
             defer_all,
+            context,
         ),
         Statement::Update {
             table,
@@ -597,6 +571,7 @@ pub(crate) fn dispatch(
                 snapshot,
                 deferred_constraints,
                 defer_all,
+                context,
             )
         }
         Statement::Delete(delete) => delete_rows(
@@ -606,8 +581,9 @@ pub(crate) fn dispatch(
             snapshot,
             deferred_constraints,
             defer_all,
+            context,
         ),
-        Statement::Query(query) => select_rows(state, query, xid, snapshot),
+        Statement::Query(query) => select_rows(state, query, xid, snapshot, context),
         _ => Err(PgError::new(
             SqlState::FeatureNotSupported,
             "statement is not implemented",
@@ -639,6 +615,7 @@ fn insert_rows(
     snapshot: &Snapshot,
     deferred_constraints: &BTreeSet<String>,
     defer_all: bool,
+    context: &ExecutionContext,
 ) -> Result<StatementResult> {
     let table_name = name(&insert.table_name)?;
     let schema = state.catalog.table(&table_name)?.clone();
@@ -679,19 +656,25 @@ fn insert_rows(
         let mut row = vec![Value::Null; schema.columns.len()];
         for (index, column) in schema.columns.iter().enumerate() {
             if !provided.contains(&index) {
-                row[index] = column_default(column)?;
+                row[index] = column_default(column, context)?;
             }
         }
         let constants = constant_schema();
         for (expr, index) in expressions.iter().zip(&column_indexes) {
             row[*index] = if default_expression(expr) {
-                column_default(&schema.columns[*index])?
+                column_default(&schema.columns[*index], context)?
             } else {
-                expression_value(expr, schema.columns[*index].data_type, &constants, &[])?
+                expression_value(
+                    expr,
+                    schema.columns[*index].data_type,
+                    &constants,
+                    &[],
+                    context,
+                )?
             };
         }
         validate_not_null(&schema, &row)?;
-        validate_check_constraints(&schema, &row)?;
+        validate_check_constraints(&schema, &row, context)?;
         Ok(row)
     };
     let rows = if let Some(source) = &insert.source {
@@ -711,11 +694,11 @@ fn insert_rows(
         schema
             .columns
             .iter()
-            .map(column_default)
+            .map(|column| column_default(column, context))
             .collect::<Result<Vec<_>>>()
             .and_then(|row| {
                 validate_not_null(&schema, &row)?;
-                validate_check_constraints(&schema, &row)?;
+                validate_check_constraints(&schema, &row, context)?;
                 Ok(vec![row])
             })?
     };
@@ -762,6 +745,7 @@ fn update_rows(
     snapshot: &Snapshot,
     deferred_constraints: &BTreeSet<String>,
     defer_all: bool,
+    context: &ExecutionContext,
 ) -> Result<StatementResult> {
     if !update_table.joins.is_empty() {
         return Err(PgError::new(
@@ -850,7 +834,7 @@ fn update_rows(
                 return Ok(targets);
             };
             if let Some(selection) = selection {
-                match evaluate(selection, &schema, &version.row)? {
+                match evaluate(selection, &schema, &version.row, context)? {
                     Value::Bool(true) => {}
                     Value::Bool(false) | Value::Null => return Ok(targets),
                     _ => unreachable!("WHERE expression was type-checked"),
@@ -865,13 +849,13 @@ fn update_rows(
         for (index, expression) in &assignments {
             let target = schema.columns[*index].data_type;
             updated[*index] = if default_expression(expression) {
-                column_default(&schema.columns[*index])?
+                column_default(&schema.columns[*index], context)?
             } else {
-                expression_value(expression, target, &schema, &row)?
+                expression_value(expression, target, &schema, &row, context)?
             };
         }
         validate_not_null(&schema, &updated)?;
-        validate_check_constraints(&schema, &updated)?;
+        validate_check_constraints(&schema, &updated, context)?;
         if state
             .tables
             .get(&schema.id)
@@ -910,6 +894,7 @@ fn update_rows(
             deferred_constraints,
             defer_all,
             &mut BTreeSet::new(),
+            context,
         )?;
     }
     Ok(StatementResult::Affected(affected))
@@ -922,6 +907,7 @@ fn delete_rows(
     snapshot: &Snapshot,
     deferred_constraints: &BTreeSet<String>,
     defer_all: bool,
+    context: &ExecutionContext,
 ) -> Result<StatementResult> {
     if !delete.tables.is_empty()
         || delete.using.is_some()
@@ -983,7 +969,7 @@ fn delete_rows(
                 return Ok(targets);
             };
             if let Some(selection) = &delete.selection {
-                match evaluate(selection, &schema, &version.row)? {
+                match evaluate(selection, &schema, &version.row, context)? {
                     Value::Bool(true) => {}
                     Value::Bool(false) | Value::Null => return Ok(targets),
                     _ => unreachable!("WHERE expression was type-checked"),
@@ -1017,6 +1003,7 @@ fn delete_rows(
             deferred_constraints,
             defer_all,
             &mut BTreeSet::new(),
+            context,
         )?;
         state
             .tables
@@ -1277,6 +1264,7 @@ fn apply_parent_actions(
     deferred_constraints: &BTreeSet<String>,
     defer_all: bool,
     visited: &mut BTreeSet<(TableId, RowId)>,
+    context: &ExecutionContext,
 ) -> Result<()> {
     let foreign_keys = state
         .catalog
@@ -1379,6 +1367,7 @@ fn apply_parent_actions(
                         deferred_constraints,
                         defer_all,
                         visited,
+                        context,
                     )?;
                     state
                         .tables
@@ -1406,6 +1395,7 @@ fn apply_parent_actions(
                         deferred_constraints,
                         defer_all,
                         visited,
+                        context,
                     )?;
                 }
                 ForeignKeyAction::SetNull => {
@@ -1425,12 +1415,13 @@ fn apply_parent_actions(
                         deferred_constraints,
                         defer_all,
                         visited,
+                        context,
                     )?;
                 }
                 ForeignKeyAction::SetDefault => {
                     let mut updated = row.clone();
                     for child in &child_indexes {
-                        updated[*child] = column_default(&child_schema.columns[*child])?;
+                        updated[*child] = column_default(&child_schema.columns[*child], context)?;
                     }
                     update_cascaded_row(
                         state,
@@ -1444,6 +1435,7 @@ fn apply_parent_actions(
                         deferred_constraints,
                         defer_all,
                         visited,
+                        context,
                     )?;
                 }
             }
@@ -1464,9 +1456,10 @@ fn update_cascaded_row(
     deferred_constraints: &BTreeSet<String>,
     defer_all: bool,
     visited: &mut BTreeSet<(TableId, RowId)>,
+    context: &ExecutionContext,
 ) -> Result<()> {
     validate_not_null(schema, &updated)?;
-    validate_check_constraints(schema, &updated)?;
+    validate_check_constraints(schema, &updated, context)?;
     if state
         .tables
         .get(&schema.id)
@@ -1505,6 +1498,7 @@ fn update_cascaded_row(
         deferred_constraints,
         defer_all,
         visited,
+        context,
     )?;
     Ok(())
 }
@@ -1536,6 +1530,7 @@ fn select_rows(
     query: &sqlparser::ast::Query,
     xid: Xid,
     snapshot: &Snapshot,
+    context: &ExecutionContext,
 ) -> Result<StatementResult> {
     if query.with.is_some() || !query.limit_by.is_empty() || query.fetch.is_some() {
         return Err(PgError::new(
@@ -1596,13 +1591,13 @@ fn select_rows(
     let limit = query
         .limit
         .as_ref()
-        .map(|limit| row_count(limit, RowCountClause::Limit))
+        .map(|limit| row_count(limit, RowCountClause::Limit, context))
         .transpose()?
         .flatten();
     let offset = query
         .offset
         .as_ref()
-        .map(|offset| row_count(&offset.value, RowCountClause::Offset))
+        .map(|offset| row_count(&offset.value, RowCountClause::Offset, context))
         .transpose()?
         .flatten()
         .unwrap_or(0);
@@ -1676,7 +1671,7 @@ fn select_rows(
         .filter_map(|(_, chain)| visible_version(chain, snapshot, xid, &state.transactions))
         .try_fold(Vec::new(), |mut rows, version| -> Result<Vec<OrderedRow>> {
             if let Some(selection) = &select.selection {
-                match evaluate(selection, schema, &version.row)? {
+                match evaluate(selection, schema, &version.row, context)? {
                     Value::Bool(true) => {}
                     Value::Bool(false) | Value::Null => return Ok(rows),
                     _ => unreachable!("WHERE expression was type-checked"),
@@ -1686,14 +1681,16 @@ fn select_rows(
                 .iter()
                 .map(|projection| match projection {
                     Projection::Column(index) => Ok(version.row[*index].clone()),
-                    Projection::Expression(expr) => evaluate(expr, schema, &version.row),
+                    Projection::Expression(expr) => evaluate(expr, schema, &version.row, context),
                 })
                 .collect::<Result<Vec<_>>>()?;
             let keys = order_specs
                 .iter()
                 .map(|order| match order.key {
                     OrderKey::Output(index) => Ok(values[index].clone()),
-                    OrderKey::Expression(expression) => evaluate(expression, schema, &version.row),
+                    OrderKey::Expression(expression) => {
+                        evaluate(expression, schema, &version.row, context)
+                    }
                 })
                 .collect::<Result<Vec<_>>>()?;
             rows.push(OrderedRow { values, keys });
@@ -1791,28 +1788,38 @@ fn projections_and_columns<'a>(
     Ok((projections, columns))
 }
 
-fn row_count(expr: &Expr, clause: RowCountClause) -> Result<Option<usize>> {
+fn row_count(
+    expr: &Expr,
+    clause: RowCountClause,
+    context: &ExecutionContext,
+) -> Result<Option<usize>> {
     if matches!(clause, RowCountClause::Limit)
         && matches!(expr, Expr::Identifier(identifier) if identifier.quote_style.is_none() && identifier.value.eq_ignore_ascii_case("all"))
     {
         return Ok(None);
     }
     let schema = constant_schema();
-    let value = evaluate_as(expr, BaseType::Int8, CastContext::Implicit, &schema, &[]).map_err(
-        |error| {
-            if error.sqlstate == SqlState::CannotCoerce {
-                PgError::new(
-                    SqlState::DatatypeMismatch,
-                    match clause {
-                        RowCountClause::Limit => "argument of LIMIT must be type bigint",
-                        RowCountClause::Offset => "argument of OFFSET must be type bigint",
-                    },
-                )
-            } else {
-                error
-            }
-        },
-    )?;
+    let value = evaluate_as(
+        expr,
+        BaseType::Int8,
+        CastContext::Implicit,
+        &schema,
+        &[],
+        context,
+    )
+    .map_err(|error| {
+        if error.sqlstate == SqlState::CannotCoerce {
+            PgError::new(
+                SqlState::DatatypeMismatch,
+                match clause {
+                    RowCountClause::Limit => "argument of LIMIT must be type bigint",
+                    RowCountClause::Offset => "argument of OFFSET must be type bigint",
+                },
+            )
+        } else {
+            error
+        }
+    })?;
     match value {
         Value::Null => Ok(None),
         Value::Int8(value) if value >= 0 => Ok(Some(usize::try_from(value).unwrap_or(usize::MAX))),
@@ -1835,12 +1842,13 @@ fn expression_value(
     target: PgType,
     schema: &TableSchema,
     row: &[Value],
+    context: &ExecutionContext,
 ) -> Result<Value> {
     if let Some(text) = unknown_string(expr) {
         coercion::coerce_unknown(text, target, CastContext::Assignment)
     } else {
         coercion::coerce(
-            evaluate(expr, schema, row)?,
+            evaluate(expr, schema, row, context)?,
             expression_type(expr, schema)?,
             target,
             CastContext::Assignment,
@@ -1848,11 +1856,11 @@ fn expression_value(
     }
 }
 
-fn column_default(column: &ColumnDef) -> Result<Value> {
+fn column_default(column: &ColumnDef, context: &ExecutionContext) -> Result<Value> {
     let Some(expr) = &column.default else {
         return Ok(Value::Null);
     };
-    expression_value(expr, column.data_type, &constant_schema(), &[]).map_err(|error| {
+    expression_value(expr, column.data_type, &constant_schema(), &[], context).map_err(|error| {
         if error.sqlstate == SqlState::UndefinedColumn {
             PgError::new(
                 SqlState::FeatureNotSupported,
@@ -1901,7 +1909,11 @@ fn validate_check_constraint_types(schema: &TableSchema) -> Result<()> {
     Ok(())
 }
 
-fn validate_check_constraints(schema: &TableSchema, row: &[Value]) -> Result<()> {
+fn validate_check_constraints(
+    schema: &TableSchema,
+    row: &[Value],
+    context: &ExecutionContext,
+) -> Result<()> {
     for constraint in &schema.constraints {
         let crate::catalog::Constraint::Check(expression) = constraint else {
             continue;
@@ -1912,6 +1924,7 @@ fn validate_check_constraints(schema: &TableSchema, row: &[Value]) -> Result<()>
             CastContext::Implicit,
             schema,
             row,
+            context,
         )? {
             Value::Bool(true) | Value::Null => {}
             Value::Bool(false) => {
@@ -2384,11 +2397,16 @@ fn function_type(function: &Function, schema: &TableSchema) -> Result<BaseType> 
     }
 }
 
-fn evaluate(expr: &Expr, schema: &TableSchema, row: &[Value]) -> Result<Value> {
+fn evaluate(
+    expr: &Expr,
+    schema: &TableSchema,
+    row: &[Value],
+    context: &ExecutionContext,
+) -> Result<Value> {
     match expr {
         Expr::Identifier(column) => Ok(row[column_index(schema, column)?].clone()),
         Expr::Value(_) => literal_value(expr),
-        Expr::Nested(expr) => evaluate(expr, schema, row),
+        Expr::Nested(expr) => evaluate(expr, schema, row, context),
         Expr::UnaryOp { op, expr } => {
             if matches!(op, UnaryOperator::Minus)
                 && let Expr::Value(AstValue::Number(value, _)) = expr.as_ref()
@@ -2396,7 +2414,7 @@ fn evaluate(expr: &Expr, schema: &TableSchema, row: &[Value]) -> Result<Value> {
             {
                 return integer_literal(&format!("-{value}"));
             }
-            unary(*op, evaluate(expr, schema, row)?)
+            unary(*op, evaluate(expr, schema, row, context)?)
         }
         Expr::BinaryOp { left, op, right } => {
             let left_type = expression_type(left, schema)?;
@@ -2409,8 +2427,8 @@ fn evaluate(expr: &Expr, schema: &TableSchema, row: &[Value]) -> Result<Value> {
                     | BinaryOperator::Divide
             ) && (left_type == BaseType::Interval || right_type == BaseType::Interval)
             {
-                let left = evaluate(left, schema, row)?;
-                let right = evaluate(right, schema, row)?;
+                let left = evaluate(left, schema, row, context)?;
+                let right = evaluate(right, schema, row, context)?;
                 if left.is_null() || right.is_null() {
                     return Ok(Value::Null);
                 }
@@ -2421,8 +2439,8 @@ fn evaluate(expr: &Expr, schema: &TableSchema, row: &[Value]) -> Result<Value> {
             } else {
                 expression_common_type(left, right, schema)?
             };
-            let left = evaluate_as(left, target, CastContext::Implicit, schema, row)?;
-            let right = evaluate_as(right, target, CastContext::Implicit, schema, row)?;
+            let left = evaluate_as(left, target, CastContext::Implicit, schema, row, context)?;
+            let right = evaluate_as(right, target, CastContext::Implicit, schema, row, context)?;
             match op {
                 BinaryOperator::Plus
                 | BinaryOperator::Minus
@@ -2454,24 +2472,48 @@ fn evaluate(expr: &Expr, schema: &TableSchema, row: &[Value]) -> Result<Value> {
                 )),
             }
         }
-        Expr::IsNull(expr) => Ok(Value::Bool(evaluate(expr, schema, row)?.is_null())),
-        Expr::IsNotNull(expr) => Ok(Value::Bool(!evaluate(expr, schema, row)?.is_null())),
+        Expr::IsNull(expr) => Ok(Value::Bool(evaluate(expr, schema, row, context)?.is_null())),
+        Expr::IsNotNull(expr) => Ok(Value::Bool(
+            !evaluate(expr, schema, row, context)?.is_null(),
+        )),
         Expr::IsTrue(expr) => Ok(Value::Bool(matches!(
-            evaluate_as(expr, BaseType::Bool, CastContext::Implicit, schema, row)?,
+            evaluate_as(
+                expr,
+                BaseType::Bool,
+                CastContext::Implicit,
+                schema,
+                row,
+                context
+            )?,
             Value::Bool(true)
         ))),
         Expr::IsFalse(expr) => Ok(Value::Bool(matches!(
-            evaluate_as(expr, BaseType::Bool, CastContext::Implicit, schema, row)?,
+            evaluate_as(
+                expr,
+                BaseType::Bool,
+                CastContext::Implicit,
+                schema,
+                row,
+                context
+            )?,
             Value::Bool(false)
         ))),
         Expr::IsUnknown(expr) => Ok(Value::Bool(
-            evaluate_as(expr, BaseType::Bool, CastContext::Implicit, schema, row)?.is_null(),
+            evaluate_as(
+                expr,
+                BaseType::Bool,
+                CastContext::Implicit,
+                schema,
+                row,
+                context,
+            )?
+            .is_null(),
         )),
         Expr::IsDistinctFrom(left, right) | Expr::IsNotDistinctFrom(left, right) => {
             let target = expression_common_type(left, right, schema)?;
             distinct(
-                evaluate_as(left, target, CastContext::Implicit, schema, row)?,
-                evaluate_as(right, target, CastContext::Implicit, schema, row)?,
+                evaluate_as(left, target, CastContext::Implicit, schema, row, context)?,
+                evaluate_as(right, target, CastContext::Implicit, schema, row, context)?,
                 matches!(expr, Expr::IsNotDistinctFrom(_, _)),
             )
         }
@@ -2493,9 +2535,16 @@ fn evaluate(expr: &Expr, schema: &TableSchema, row: &[Value]) -> Result<Value> {
             for (condition, result) in conditions.iter().zip(results) {
                 let matches = if let Some(operand) = &operand {
                     let target = expression_common_type(operand, condition, schema)?;
-                    let operand = evaluate_as(operand, target, CastContext::Implicit, schema, row)?;
-                    let condition =
-                        evaluate_as(condition, target, CastContext::Implicit, schema, row)?;
+                    let operand =
+                        evaluate_as(operand, target, CastContext::Implicit, schema, row, context)?;
+                    let condition = evaluate_as(
+                        condition,
+                        target,
+                        CastContext::Implicit,
+                        schema,
+                        row,
+                        context,
+                    )?;
                     if operand.is_null() || condition.is_null() {
                         false
                     } else {
@@ -2505,20 +2554,35 @@ fn evaluate(expr: &Expr, schema: &TableSchema, row: &[Value]) -> Result<Value> {
                         )
                     }
                 } else {
-                    matches!(evaluate(condition, schema, row)?, Value::Bool(true))
+                    matches!(
+                        evaluate(condition, schema, row, context)?,
+                        Value::Bool(true)
+                    )
                 };
                 if matches {
-                    return evaluate_as(result, result_type, CastContext::Implicit, schema, row);
+                    return evaluate_as(
+                        result,
+                        result_type,
+                        CastContext::Implicit,
+                        schema,
+                        row,
+                        context,
+                    );
                 }
             }
             match else_result {
-                Some(result) => {
-                    evaluate_as(result, result_type, CastContext::Implicit, schema, row)
-                }
+                Some(result) => evaluate_as(
+                    result,
+                    result_type,
+                    CastContext::Implicit,
+                    schema,
+                    row,
+                    context,
+                ),
                 None => Ok(Value::Null),
             }
         }
-        Expr::Function(function) => evaluate_function(function, schema, row),
+        Expr::Function(function) => evaluate_function(function, schema, row, context),
         Expr::Cast {
             kind,
             expr,
@@ -2536,7 +2600,7 @@ fn evaluate(expr: &Expr, schema: &TableSchema, row: &[Value]) -> Result<Value> {
                 coercion::coerce_unknown(text, target, CastContext::Explicit)
             } else {
                 coercion::coerce(
-                    evaluate(expr, schema, row)?,
+                    evaluate(expr, schema, row, context)?,
                     expression_type(expr, schema)?,
                     target,
                     CastContext::Explicit,
@@ -2544,7 +2608,7 @@ fn evaluate(expr: &Expr, schema: &TableSchema, row: &[Value]) -> Result<Value> {
             }
         }
         Expr::Extract { field, expr, .. } => {
-            extract_value(field.clone(), evaluate(expr, schema, row)?)
+            extract_value(field.clone(), evaluate(expr, schema, row, context)?)
         }
         _ => Err(PgError::new(
             SqlState::FeatureNotSupported,
@@ -2559,13 +2623,14 @@ fn evaluate_as(
     context: CastContext,
     schema: &TableSchema,
     row: &[Value],
+    execution: &ExecutionContext,
 ) -> Result<Value> {
     if let Some(text) = unknown_string(expression) {
         coercion::coerce_unknown(text, PgType::new(target), context)
     } else {
         let source = expression_type(expression, schema)?;
         coercion::coerce(
-            evaluate(expression, schema, row)?,
+            evaluate(expression, schema, row, execution)?,
             source,
             PgType::new(target),
             context,
@@ -2573,7 +2638,12 @@ fn evaluate_as(
     }
 }
 
-fn evaluate_function(function: &Function, schema: &TableSchema, row: &[Value]) -> Result<Value> {
+fn evaluate_function(
+    function: &Function,
+    schema: &TableSchema,
+    row: &[Value],
+    context: &ExecutionContext,
+) -> Result<Value> {
     function_type(function, schema)?;
     let function_name = name(&function.name)?;
     let arguments = function_arguments(function)?;
@@ -2581,18 +2651,10 @@ fn evaluate_function(function: &Function, schema: &TableSchema, row: &[Value]) -
     match function_name.as_str() {
         "gen_random_uuid" | "uuidv4" => Ok(Value::Uuid(uuid::Uuid::new_v4())),
         "now" | "transaction_timestamp" | "statement_timestamp" | "clock_timestamp" => {
-            let context = time_context().unwrap_or_else(|| {
-                let now = chrono::Utc::now();
-                TimeContext {
-                    transaction: now,
-                    statement: now,
-                    clock: now,
-                }
-            });
             let value = match function_name.as_str() {
-                "now" | "transaction_timestamp" => context.transaction,
-                "statement_timestamp" => context.statement,
-                "clock_timestamp" => context.clock,
+                "now" | "transaction_timestamp" => context.transaction_timestamp,
+                "statement_timestamp" => context.statement_timestamp,
+                "clock_timestamp" => context.clock_timestamp,
                 _ => unreachable!(),
             };
             Ok(Value::TimestampTz(crate::value::PgTimestampTz::Finite(
@@ -2601,7 +2663,14 @@ fn evaluate_function(function: &Function, schema: &TableSchema, row: &[Value]) -
         }
         "coalesce" => {
             for argument in arguments {
-                let value = evaluate_as(argument, result_type, CastContext::Implicit, schema, row)?;
+                let value = evaluate_as(
+                    argument,
+                    result_type,
+                    CastContext::Implicit,
+                    schema,
+                    row,
+                    context,
+                )?;
                 if !value.is_null() {
                     return Ok(value);
                 }
@@ -2615,6 +2684,7 @@ fn evaluate_function(function: &Function, schema: &TableSchema, row: &[Value]) -
                 CastContext::Implicit,
                 schema,
                 row,
+                context,
             )?;
             if left.is_null() {
                 return Ok(Value::Null);
@@ -2625,6 +2695,7 @@ fn evaluate_function(function: &Function, schema: &TableSchema, row: &[Value]) -
                 CastContext::Implicit,
                 schema,
                 row,
+                context,
             )?;
             if !right.is_null()
                 && matches!(
@@ -2640,7 +2711,14 @@ fn evaluate_function(function: &Function, schema: &TableSchema, row: &[Value]) -
         "greatest" | "least" => {
             let mut selected = None;
             for argument in arguments {
-                let value = evaluate_as(argument, result_type, CastContext::Implicit, schema, row)?;
+                let value = evaluate_as(
+                    argument,
+                    result_type,
+                    CastContext::Implicit,
+                    schema,
+                    row,
+                    context,
+                )?;
                 if value.is_null() {
                     continue;
                 }
@@ -2662,24 +2740,24 @@ fn evaluate_function(function: &Function, schema: &TableSchema, row: &[Value]) -
             }
             Ok(selected.unwrap_or(Value::Null))
         }
-        "length" => match evaluate(arguments[0], schema, row)? {
+        "length" => match evaluate(arguments[0], schema, row, context)? {
             Value::Null => Ok(Value::Null),
             Value::Text(value) => Ok(Value::Int4(
                 i32::try_from(value.chars().count()).expect("text length must fit in int4"),
             )),
             _ => unreachable!("length argument was type-checked"),
         },
-        "lower" => match evaluate(arguments[0], schema, row)? {
+        "lower" => match evaluate(arguments[0], schema, row, context)? {
             Value::Null => Ok(Value::Null),
             Value::Text(value) => Ok(Value::Text(value.to_lowercase())),
             _ => unreachable!("lower argument was type-checked"),
         },
-        "upper" => match evaluate(arguments[0], schema, row)? {
+        "upper" => match evaluate(arguments[0], schema, row, context)? {
             Value::Null => Ok(Value::Null),
             Value::Text(value) => Ok(Value::Text(value.to_uppercase())),
             _ => unreachable!("upper argument was type-checked"),
         },
-        "abs" => match evaluate(arguments[0], schema, row)? {
+        "abs" => match evaluate(arguments[0], schema, row, context)? {
             Value::Null => Ok(Value::Null),
             Value::Int2(value) => value.checked_abs().map(Value::Int2).ok_or_else(|| {
                 PgError::new(SqlState::NumericValueOutOfRange, "smallint out of range")
