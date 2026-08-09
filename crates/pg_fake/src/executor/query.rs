@@ -413,91 +413,99 @@ pub(super) fn select_rows(
         })
         .transpose()?
         .unwrap_or_default();
-    let input_rows = source_rows(state, select, &scope, xid, snapshot, context)?;
-    let mut rows =
-        input_rows
-            .iter()
-            .try_fold(Vec::new(), |mut rows, row| -> Result<Vec<OrderedRow>> {
-                if let Some(selection) = &select.selection {
-                    match evaluate(selection, RowScope::Bound(&scope), row, context)? {
-                        Value::Bool(true) => {}
-                        Value::Bool(false) | Value::Null => return Ok(rows),
-                        _ => unreachable!("WHERE expression was type-checked"),
-                    }
+    let mut rows = Vec::new();
+    visit_source_rows(
+        state,
+        select,
+        &scope,
+        xid,
+        snapshot,
+        context,
+        select.selection.as_ref(),
+        &mut |row| {
+            if let Some(selection) = &select.selection {
+                match evaluate(selection, RowScope::Bound(&scope), row, context)? {
+                    Value::Bool(true) => {}
+                    Value::Bool(false) | Value::Null => return Ok(()),
+                    _ => unreachable!("WHERE expression was type-checked"),
                 }
-                let values = projections
-                    .iter()
-                    .map(|projection| match projection {
-                        Projection::Column(index) => Ok(row[*index].clone()),
-                        Projection::Merged(left, right, data_type) => {
-                            let value = if row[*left].is_null() {
-                                row[*right].clone()
+            }
+            let values = projections
+                .iter()
+                .map(|projection| match projection {
+                    Projection::Column(index) => Ok(row[*index].clone()),
+                    Projection::Merged(left, right, data_type) => {
+                        let value = if row[*left].is_null() {
+                            row[*right].clone()
+                        } else {
+                            row[*left].clone()
+                        };
+                        if value.is_null() {
+                            Ok(value)
+                        } else {
+                            coercion::coerce(
+                                value.clone(),
+                                value.base_type().expect("non-null value has a base type"),
+                                *data_type,
+                                CastContext::Implicit,
+                            )
+                        }
+                    }
+                    Projection::Expression(expr) => {
+                        evaluate(expr, RowScope::Bound(&scope), row, context)
+                    }
+                })
+                .collect::<Result<Vec<_>>>()?;
+            let keys = order_specs
+                .iter()
+                .map(|order| match order.key {
+                    OrderKey::Output(index) => Ok(values[index].clone()),
+                    OrderKey::Expression(expression) => {
+                        evaluate(expression, RowScope::Bound(&scope), row, context)
+                    }
+                })
+                .collect::<Result<Vec<_>>>()?;
+            rows.push(OrderedRow { values, keys });
+            Ok(())
+        },
+    )?;
+    if !order_specs.is_empty() {
+        rows.sort_by(|left, right| {
+            order_specs
+                .iter()
+                .zip(left.keys.iter().zip(&right.keys))
+                .find_map(|(spec, (left, right))| {
+                    let ordering = match (left, right) {
+                        (Value::Null, Value::Null) => Ordering::Equal,
+                        (Value::Null, _) => {
+                            if spec.nulls_first {
+                                Ordering::Less
                             } else {
-                                row[*left].clone()
-                            };
-                            if value.is_null() {
-                                Ok(value)
-                            } else {
-                                coercion::coerce(
-                                    value.clone(),
-                                    value.base_type().expect("non-null value has a base type"),
-                                    *data_type,
-                                    CastContext::Implicit,
-                                )
+                                Ordering::Greater
                             }
                         }
-                        Projection::Expression(expr) => {
-                            evaluate(expr, RowScope::Bound(&scope), row, context)
+                        (_, Value::Null) => {
+                            if spec.nulls_first {
+                                Ordering::Greater
+                            } else {
+                                Ordering::Less
+                            }
                         }
-                    })
-                    .collect::<Result<Vec<_>>>()?;
-                let keys = order_specs
-                    .iter()
-                    .map(|order| match order.key {
-                        OrderKey::Output(index) => Ok(values[index].clone()),
-                        OrderKey::Expression(expression) => {
-                            evaluate(expression, RowScope::Bound(&scope), row, context)
+                        _ => {
+                            let ordering = value_ordering(left, right)
+                                .expect("ORDER BY expression type was checked");
+                            if spec.ascending {
+                                ordering
+                            } else {
+                                ordering.reverse()
+                            }
                         }
-                    })
-                    .collect::<Result<Vec<_>>>()?;
-                rows.push(OrderedRow { values, keys });
-                Ok(rows)
-            })?;
-    rows.sort_by(|left, right| {
-        order_specs
-            .iter()
-            .zip(left.keys.iter().zip(&right.keys))
-            .find_map(|(spec, (left, right))| {
-                let ordering = match (left, right) {
-                    (Value::Null, Value::Null) => Ordering::Equal,
-                    (Value::Null, _) => {
-                        if spec.nulls_first {
-                            Ordering::Less
-                        } else {
-                            Ordering::Greater
-                        }
-                    }
-                    (_, Value::Null) => {
-                        if spec.nulls_first {
-                            Ordering::Greater
-                        } else {
-                            Ordering::Less
-                        }
-                    }
-                    _ => {
-                        let ordering = value_ordering(left, right)
-                            .expect("ORDER BY expression type was checked");
-                        if spec.ascending {
-                            ordering
-                        } else {
-                            ordering.reverse()
-                        }
-                    }
-                };
-                (ordering != Ordering::Equal).then_some(ordering)
-            })
-            .unwrap_or(Ordering::Equal)
-    });
+                    };
+                    (ordering != Ordering::Equal).then_some(ordering)
+                })
+                .unwrap_or(Ordering::Equal)
+        });
+    }
     let rows = rows
         .into_iter()
         .skip(offset)
@@ -637,6 +645,7 @@ fn source_rows(
     xid: Xid,
     snapshot: &Snapshot,
     context: &ExecutionContext,
+    selection: Option<&Expr>,
 ) -> Result<Vec<Vec<Value>>> {
     if select.from.is_empty() {
         return Ok(vec![Vec::new()]);
@@ -644,7 +653,16 @@ fn source_rows(
     let mut next_slot = 0;
     let mut rows = vec![vec![Value::Null; scope.columns.len()]];
     for table in &select.from {
-        let source = table_rows(state, table, scope, xid, snapshot, context, &mut next_slot)?;
+        let source = table_rows(
+            state,
+            table,
+            scope,
+            xid,
+            snapshot,
+            context,
+            selection,
+            &mut next_slot,
+        )?;
         rows = rows
             .into_iter()
             .flat_map(|left| {
@@ -666,6 +684,210 @@ fn source_rows(
     Ok(rows)
 }
 
+fn visit_source_rows(
+    state: &DatabaseState,
+    select: &sqlparser::ast::Select,
+    scope: &BoundScope,
+    xid: Xid,
+    snapshot: &Snapshot,
+    context: &ExecutionContext,
+    selection: Option<&Expr>,
+    visit: &mut dyn FnMut(&[Value]) -> Result<()>,
+) -> Result<()> {
+    if let [table] = select.from.as_slice()
+        && streams_inner_rows(table)
+    {
+        return visit_inner_rows(
+            state, table, scope, xid, snapshot, context, selection, visit,
+        );
+    }
+    for row in source_rows(state, select, scope, xid, snapshot, context, selection)? {
+        visit(&row)?;
+    }
+    Ok(())
+}
+
+fn streams_inner_rows(table: &sqlparser::ast::TableWithJoins) -> bool {
+    matches!(table.relation, TableFactor::Table { .. })
+        && table.joins.iter().all(|join| {
+            matches!(join.relation, TableFactor::Table { .. })
+                && matches!(
+                    join.join_operator,
+                    sqlparser::ast::JoinOperator::Join(_)
+                        | sqlparser::ast::JoinOperator::Inner(_)
+                        | sqlparser::ast::JoinOperator::CrossJoin(_)
+                )
+        })
+}
+
+fn visit_inner_rows(
+    state: &DatabaseState,
+    table: &sqlparser::ast::TableWithJoins,
+    scope: &BoundScope,
+    xid: Xid,
+    snapshot: &Snapshot,
+    context: &ExecutionContext,
+    selection: Option<&Expr>,
+    visit: &mut dyn FnMut(&[Value]) -> Result<()>,
+) -> Result<()> {
+    let mut starts = Vec::with_capacity(table.joins.len() + 1);
+    let mut next_slot = 0;
+    for factor in
+        std::iter::once(&table.relation).chain(table.joins.iter().map(|join| &join.relation))
+    {
+        let TableFactor::Table {
+            name: table_name, ..
+        } = factor
+        else {
+            unreachable!("streamable sources are tables");
+        };
+        starts.push(next_slot);
+        next_slot += state.catalog.table(&name(table_name)?)?.columns.len();
+    }
+    visit_factor_rows(
+        state,
+        &table.relation,
+        scope,
+        xid,
+        snapshot,
+        context,
+        selection,
+        starts[0],
+        &mut |row| {
+            visit_inner_join_rows(
+                state, table, scope, xid, snapshot, context, selection, &starts, 0, row, visit,
+            )
+        },
+    )
+}
+
+fn visit_inner_join_rows(
+    state: &DatabaseState,
+    table: &sqlparser::ast::TableWithJoins,
+    scope: &BoundScope,
+    xid: Xid,
+    snapshot: &Snapshot,
+    context: &ExecutionContext,
+    selection: Option<&Expr>,
+    starts: &[usize],
+    index: usize,
+    left: &[Value],
+    visit: &mut dyn FnMut(&[Value]) -> Result<()>,
+) -> Result<()> {
+    let Some(join) = table.joins.get(index) else {
+        return visit(left);
+    };
+    visit_factor_rows(
+        state,
+        &join.relation,
+        scope,
+        xid,
+        snapshot,
+        context,
+        selection,
+        starts[index + 1],
+        &mut |right| {
+            let row = left
+                .iter()
+                .zip(right)
+                .map(|(left, right)| {
+                    if left.is_null() {
+                        right.clone()
+                    } else {
+                        left.clone()
+                    }
+                })
+                .collect::<Vec<_>>();
+            if join_matches(
+                &join.join_operator,
+                &row,
+                scope,
+                starts[0],
+                starts[index + 1],
+                context,
+            )? {
+                visit_inner_join_rows(
+                    state,
+                    table,
+                    scope,
+                    xid,
+                    snapshot,
+                    context,
+                    selection,
+                    starts,
+                    index + 1,
+                    &row,
+                    visit,
+                )?;
+            }
+            Ok(())
+        },
+    )
+}
+
+fn visit_factor_rows(
+    state: &DatabaseState,
+    factor: &TableFactor,
+    scope: &BoundScope,
+    xid: Xid,
+    snapshot: &Snapshot,
+    context: &ExecutionContext,
+    selection: Option<&Expr>,
+    start: usize,
+    visit: &mut dyn FnMut(&[Value]) -> Result<()>,
+) -> Result<()> {
+    let TableFactor::Table {
+        name: table_name,
+        args,
+        ..
+    } = factor
+    else {
+        unreachable!("streamable source is a table");
+    };
+    if args.is_some() {
+        return Err(PgError::new(
+            SqlState::FeatureNotSupported,
+            "table functions are not implemented",
+        ));
+    }
+    let schema = state.catalog.table(&name(table_name)?)?;
+    let mut filters = Vec::new();
+    if let Some(selection) = selection {
+        push_filters(
+            selection,
+            scope,
+            start,
+            start + schema.columns.len(),
+            &mut filters,
+        );
+    }
+    for (_, chain) in state
+        .tables
+        .get(&schema.id)
+        .expect("catalog table must have storage")
+        .rows()
+    {
+        let Some(version) = visible_version(chain, snapshot, xid, &state.transactions) else {
+            continue;
+        };
+        let mut row = vec![Value::Null; scope.columns.len()];
+        row[start..start + version.row.len()].clone_from_slice(&version.row);
+        let passes = filters.iter().try_fold(true, |passes, filter| {
+            if !passes {
+                return Ok(false);
+            }
+            Ok(matches!(
+                evaluate(filter, RowScope::Bound(scope), &row, context)?,
+                Value::Bool(true)
+            ))
+        })?;
+        if passes {
+            visit(&row)?;
+        }
+    }
+    Ok(())
+}
+
 fn table_rows(
     state: &DatabaseState,
     table: &sqlparser::ast::TableWithJoins,
@@ -673,6 +895,7 @@ fn table_rows(
     xid: Xid,
     snapshot: &Snapshot,
     context: &ExecutionContext,
+    selection: Option<&Expr>,
     next_slot: &mut usize,
 ) -> Result<Vec<Vec<Value>>> {
     let left_start = *next_slot;
@@ -683,6 +906,7 @@ fn table_rows(
         xid,
         snapshot,
         context,
+        selection,
         next_slot,
     )?;
     for join in &table.joins {
@@ -694,6 +918,7 @@ fn table_rows(
             xid,
             snapshot,
             context,
+            selection,
             next_slot,
         )?;
         let mut joined = Vec::new();
@@ -761,6 +986,7 @@ fn factor_rows(
     xid: Xid,
     snapshot: &Snapshot,
     context: &ExecutionContext,
+    selection: Option<&Expr>,
     next_slot: &mut usize,
 ) -> Result<Vec<Vec<Value>>> {
     if let TableFactor::NestedJoin {
@@ -774,6 +1000,7 @@ fn factor_rows(
             xid,
             snapshot,
             context,
+            selection,
             next_slot,
         );
     }
@@ -797,7 +1024,17 @@ fn factor_rows(
     let schema = state.catalog.table(&name(table_name)?)?;
     let start = *next_slot;
     *next_slot += schema.columns.len();
-    Ok(state
+    let mut filters = Vec::new();
+    if let Some(selection) = selection {
+        push_filters(
+            selection,
+            scope,
+            start,
+            start + schema.columns.len(),
+            &mut filters,
+        );
+    }
+    state
         .tables
         .get(&schema.id)
         .expect("catalog table must have storage")
@@ -806,9 +1043,61 @@ fn factor_rows(
         .map(|version| {
             let mut row = vec![Value::Null; scope.columns.len()];
             row[start..start + version.row.len()].clone_from_slice(&version.row);
-            row
+            let passes = filters.iter().try_fold(true, |passes, filter| {
+                if !passes {
+                    return Ok(false);
+                }
+                Ok(matches!(
+                    evaluate(filter, RowScope::Bound(scope), &row, context)?,
+                    Value::Bool(true)
+                ))
+            })?;
+            Ok(passes.then_some(row))
         })
-        .collect())
+        .collect::<Result<Vec<_>>>()
+        .map(|rows| rows.into_iter().flatten().collect())
+}
+
+fn push_filters<'a>(
+    expr: &'a Expr,
+    scope: &BoundScope,
+    start: usize,
+    end: usize,
+    filters: &mut Vec<&'a Expr>,
+) {
+    if let Expr::BinaryOp {
+        left,
+        op: BinaryOperator::And,
+        right,
+    } = expr
+    {
+        push_filters(left, scope, start, end, filters);
+        push_filters(right, scope, start, end, filters);
+        return;
+    }
+    let Expr::BinaryOp { left, right, .. } = expr else {
+        return;
+    };
+    let column = match (left.as_ref(), right.as_ref()) {
+        (Expr::Identifier(column), Expr::Value(_)) => scope
+            .resolve_column(std::slice::from_ref(column))
+            .ok()
+            .map(|(slot, _)| slot),
+        (Expr::CompoundIdentifier(columns), Expr::Value(_)) => {
+            scope.resolve_column(columns).ok().map(|(slot, _)| slot)
+        }
+        (Expr::Value(_), Expr::Identifier(column)) => scope
+            .resolve_column(std::slice::from_ref(column))
+            .ok()
+            .map(|(slot, _)| slot),
+        (Expr::Value(_), Expr::CompoundIdentifier(columns)) => {
+            scope.resolve_column(columns).ok().map(|(slot, _)| slot)
+        }
+        _ => None,
+    };
+    if column.is_some_and(|slot| (start..end).contains(&slot)) {
+        filters.push(expr);
+    }
 }
 
 fn join_matches(
