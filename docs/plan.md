@@ -460,7 +460,7 @@ phase.
 
 ## Milestone G — UUID and temporal types
 
-### Task 19 — UUID type
+### Task 19 — UUID type [COMPLETE]
 
 **Goal:** Add PostgreSQL UUID storage and common operations end to end.
 
@@ -483,7 +483,7 @@ phase.
 **Notes:** UUIDv7 generation/extraction may be added only if it remains a small
 extension after the base type lands; it is not a Phase 2 exit requirement.
 
-### Task 20 — Date and time types
+### Task 20 — Date and time types [COMPLETE]
 
 **Goal:** Add PostgreSQL `date` and `time without time zone` values with their
 basic semantics.
@@ -506,7 +506,7 @@ basic semantics.
 **Notes:** `time with time zone` (`timetz`) is not listed in the Phase 2 type
 table and remains unsupported.
 
-### Task 21 — Timestamp, timestamptz, and session timezone
+### Task 21 — Timestamp, timestamptz, and session timezone [COMPLETE]
 
 **Goal:** Add timestamp values and PostgreSQL timezone interpretation.
 
@@ -527,7 +527,7 @@ table and remains unsupported.
 - Differential/property cases cover offsets, named zones, DST boundaries,
   infinity/BC, typmods, casts, ordering, and session/transaction state.
 
-### Task 22 — Interval type and temporal arithmetic
+### Task 22 — Interval type and temporal arithmetic [COMPLETE]
 
 **Goal:** Add PostgreSQL's three-part interval value and the common temporal
 operator matrix.
@@ -550,7 +550,7 @@ operator matrix.
   DST transitions, overflow, infinity, ordering, and arithmetic identities that
   PostgreSQL guarantees.
 
-### Task 23 — Clock hierarchy and deterministic time control
+### Task 23 — Clock hierarchy and deterministic time control [COMPLETE]
 
 **Goal:** Implement the public mock-time API and PostgreSQL transaction/
 statement/clock timestamp hierarchy from `spec.md` §1.4.

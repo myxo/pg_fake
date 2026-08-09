@@ -200,6 +200,25 @@ impl Table {
         })
     }
 
+    pub(crate) fn find_unique_row(
+        &self,
+        columns: &[usize],
+        values: &[Value],
+        snapshot: &Snapshot,
+        current_xid: Xid,
+        transactions: &TransactionManager,
+    ) -> Option<RowId> {
+        let index = self.indexes.iter().find(|index| index.columns == columns)?;
+        let key = build_index_key(&self.schema, columns, values)?;
+        index.entries.get(&key)?.iter().find_map(|row_id| {
+            let version =
+                self.rows.chains.get(row_id).and_then(|chain| {
+                    visible_version(chain, snapshot, current_xid, transactions)
+                })?;
+            (index_key(&self.schema, index, &version.row).as_ref() == Some(&key)).then_some(*row_id)
+        })
+    }
+
     fn add_index_entries(&mut self, row_id: RowId, row: &Row) {
         let entries = self
             .indexes
@@ -244,59 +263,61 @@ impl Table {
 }
 
 fn index_key(schema: &TableSchema, index: &UniqueIndex, row: &Row) -> Option<IndexKey> {
-    index
+    let values = index
         .columns
         .iter()
-        .map(
-            |column| match (&row[*column], schema.columns[*column].data_type.base) {
-                (Value::Null, _) => None,
-                (Value::Bool(value), BaseType::Bool) => Some(IndexValue::Bool(*value)),
-                (Value::Int2(value), BaseType::Int2) => Some(IndexValue::Int2(*value)),
-                (Value::Int4(value), BaseType::Int4) => Some(IndexValue::Int4(*value)),
-                (Value::Int8(value), BaseType::Int8) => Some(IndexValue::Int8(*value)),
-                (Value::Float4(value), BaseType::Float4) => {
-                    Some(IndexValue::Float4(if value.is_nan() {
-                        f32::NAN.to_bits()
-                    } else if *value == 0.0 {
-                        0
-                    } else {
-                        value.to_bits()
-                    }))
-                }
-                (Value::Float8(value), BaseType::Float8) => {
-                    Some(IndexValue::Float8(if value.is_nan() {
-                        f64::NAN.to_bits()
-                    } else if *value == 0.0 {
-                        0
-                    } else {
-                        value.to_bits()
-                    }))
-                }
-                (Value::Numeric(value), BaseType::Numeric) => {
-                    Some(IndexValue::Numeric(value.normalized()))
-                }
-                (Value::Text(value), BaseType::Bpchar) => {
-                    Some(IndexValue::Text(value.trim_end_matches(' ').into()))
-                }
-                (Value::Text(value), BaseType::Text | BaseType::Varchar) => {
-                    Some(IndexValue::Text(value.clone()))
-                }
-                (Value::Bytea(value), BaseType::Bytea) => Some(IndexValue::Bytea(value.clone())),
-                (Value::Uuid(value), BaseType::Uuid) => Some(IndexValue::Uuid(*value)),
-                (Value::Date(value), BaseType::Date) => Some(IndexValue::Date(*value)),
-                (Value::Time(value), BaseType::Time) => Some(IndexValue::Time(*value)),
-                (Value::Timestamp(value), BaseType::Timestamp) => {
-                    Some(IndexValue::Timestamp(*value))
-                }
-                (Value::TimestampTz(value), BaseType::TimestampTz) => {
-                    Some(IndexValue::TimestampTz(*value))
-                }
-                (Value::Interval(value), BaseType::Interval) => Some(IndexValue::Interval(*value)),
-                _ => unreachable!("row values must match declared column types"),
-            },
-        )
+        .map(|column| row[*column].clone())
+        .collect::<Vec<_>>();
+    build_index_key(schema, &index.columns, &values)
+}
+
+fn build_index_key(schema: &TableSchema, columns: &[usize], values: &[Value]) -> Option<IndexKey> {
+    assert_eq!(columns.len(), values.len());
+    columns
+        .iter()
+        .zip(values)
+        .map(|(column, value)| index_value(value, schema.columns[*column].data_type.base))
         .collect::<Option<Vec<_>>>()
         .map(IndexKey)
+}
+
+fn index_value(value: &Value, base: BaseType) -> Option<IndexValue> {
+    match (value, base) {
+        (Value::Null, _) => None,
+        (Value::Bool(value), BaseType::Bool) => Some(IndexValue::Bool(*value)),
+        (Value::Int2(value), BaseType::Int2) => Some(IndexValue::Int2(*value)),
+        (Value::Int4(value), BaseType::Int4) => Some(IndexValue::Int4(*value)),
+        (Value::Int8(value), BaseType::Int8) => Some(IndexValue::Int8(*value)),
+        (Value::Float4(value), BaseType::Float4) => Some(IndexValue::Float4(if value.is_nan() {
+            f32::NAN.to_bits()
+        } else if *value == 0.0 {
+            0
+        } else {
+            value.to_bits()
+        })),
+        (Value::Float8(value), BaseType::Float8) => Some(IndexValue::Float8(if value.is_nan() {
+            f64::NAN.to_bits()
+        } else if *value == 0.0 {
+            0
+        } else {
+            value.to_bits()
+        })),
+        (Value::Numeric(value), BaseType::Numeric) => Some(IndexValue::Numeric(value.normalized())),
+        (Value::Text(value), BaseType::Bpchar) => {
+            Some(IndexValue::Text(value.trim_end_matches(' ').into()))
+        }
+        (Value::Text(value), BaseType::Text | BaseType::Varchar) => {
+            Some(IndexValue::Text(value.clone()))
+        }
+        (Value::Bytea(value), BaseType::Bytea) => Some(IndexValue::Bytea(value.clone())),
+        (Value::Uuid(value), BaseType::Uuid) => Some(IndexValue::Uuid(*value)),
+        (Value::Date(value), BaseType::Date) => Some(IndexValue::Date(*value)),
+        (Value::Time(value), BaseType::Time) => Some(IndexValue::Time(*value)),
+        (Value::Timestamp(value), BaseType::Timestamp) => Some(IndexValue::Timestamp(*value)),
+        (Value::TimestampTz(value), BaseType::TimestampTz) => Some(IndexValue::TimestampTz(*value)),
+        (Value::Interval(value), BaseType::Interval) => Some(IndexValue::Interval(*value)),
+        _ => unreachable!("row values must match declared column types"),
+    }
 }
 
 #[cfg(test)]
@@ -326,6 +347,23 @@ mod tests {
         Table::new(catalog.table("items").unwrap().clone())
     }
 
+    fn indexed_table() -> Table {
+        let mut catalog = Catalog::new();
+        catalog
+            .create_table(
+                "items".into(),
+                vec![ColumnDef {
+                    name: "value".into(),
+                    data_type: PgType::new(BaseType::Int4),
+                    nullable: false,
+                    default: None,
+                }],
+                vec![Constraint::PrimaryKey(vec!["value".into()])],
+            )
+            .unwrap();
+        Table::new(catalog.table("items").unwrap().clone())
+    }
+
     #[test]
     fn insert_creates_a_new_version_chain() {
         let mut table = table();
@@ -339,6 +377,20 @@ mod tests {
                 xmax: None,
                 row: vec![Value::Int4(1)],
             }]
+        );
+    }
+
+    #[test]
+    fn finds_visible_rows_through_a_unique_index() {
+        let mut table = indexed_table();
+        let mut transactions = TransactionManager::new();
+        let xid = transactions.begin();
+        let snapshot = Snapshot::new(&transactions);
+        let row_id = table.insert(xid, vec![Value::Int4(1)]);
+
+        assert_eq!(
+            table.find_unique_row(&[0], &[Value::Int4(1)], &snapshot, xid, &transactions,),
+            Some(row_id)
         );
     }
 

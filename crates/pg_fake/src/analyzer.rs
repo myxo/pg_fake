@@ -69,7 +69,7 @@ pub(crate) fn parameter_types(statement: &Statement, catalog: &Catalog) -> Resul
                 let AssignmentTarget::ColumnName(name) = &assignment.target else {
                     continue;
                 };
-                let name = executor::name(&name)?;
+                let name = executor::name(name)?;
                 let column = schema
                     .columns
                     .iter()
@@ -416,7 +416,7 @@ fn validate_statement(statement: &Statement, catalog: &Catalog) -> Result<()> {
                 let AssignmentTarget::ColumnName(name) = &assignment.target else {
                     continue;
                 };
-                let name = executor::name(&name)?;
+                let name = executor::name(name)?;
                 let column = schema
                     .columns
                     .iter()

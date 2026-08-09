@@ -76,6 +76,7 @@ pub struct Session {
     settings_undo: Option<(IsolationLevel, Duration, String)>,
     deferred_constraints: BTreeSet<String>,
     defer_all_constraints: bool,
+    deferred_foreign_keys_dirty: bool,
 }
 #[derive(Clone, Copy)]
 enum SessionTransaction {
@@ -380,6 +381,7 @@ impl Db {
             settings_undo: None,
             deferred_constraints: BTreeSet::new(),
             defer_all_constraints: false,
+            deferred_foreign_keys_dirty: false,
         }
     }
 }
@@ -494,9 +496,7 @@ impl Session {
     fn set_constraints(&mut self, sql: &str) -> Option<Result<StatementResult>> {
         let sql = sql.trim().trim_end_matches(';').trim();
         let upper = sql.to_ascii_uppercase();
-        let Some(rest) = upper.strip_prefix("SET CONSTRAINTS ") else {
-            return None;
-        };
+        let rest = upper.strip_prefix("SET CONSTRAINTS ")?;
         let deferred = if rest.strip_suffix(" DEFERRED").is_some() {
             true
         } else if rest.strip_suffix(" IMMEDIATE").is_some() {
@@ -587,7 +587,7 @@ impl Session {
                 }
             }
         }
-        if !deferred {
+        if !deferred && self.deferred_foreign_keys_dirty {
             let state = self.db.state.lock().expect("database mutex is poisoned");
             let xid = match self.transaction {
                 Some(SessionTransaction::Active(transaction)) => transaction.xid,
@@ -713,6 +713,7 @@ impl Session {
         assert!(self.settings_undo.is_none());
         self.deferred_constraints.clear();
         self.defer_all_constraints = false;
+        self.deferred_foreign_keys_dirty = false;
         self.settings_undo = Some((
             self.default_isolation,
             self.lock_timeout,
@@ -736,8 +737,9 @@ impl Session {
             SessionTransaction::Active(transaction) if commit => {
                 let state_lock = self.db.state.clone();
                 let mut state = state_lock.lock().expect("database mutex is poisoned");
-                if let Err(error) =
-                    executor::validate_deferred_foreign_keys(&state, transaction.xid)
+                if self.deferred_foreign_keys_dirty
+                    && let Err(error) =
+                        executor::validate_deferred_foreign_keys(&state, transaction.xid)
                 {
                     self.rollback_ddl(&mut state);
                     if let Some((default_isolation, lock_timeout, timezone)) =
@@ -749,6 +751,7 @@ impl Session {
                     }
                     self.deferred_constraints.clear();
                     self.defer_all_constraints = false;
+                    self.deferred_foreign_keys_dirty = false;
                     abort(&mut state, transaction.xid);
                     self.db.condvar.notify_all();
                     return Err(error);
@@ -760,6 +763,7 @@ impl Session {
                 self.settings_undo = None;
                 self.deferred_constraints.clear();
                 self.defer_all_constraints = false;
+                self.deferred_foreign_keys_dirty = false;
                 self.db.condvar.notify_all();
                 return Ok(());
             }
@@ -776,6 +780,7 @@ impl Session {
         }
         self.deferred_constraints.clear();
         self.defer_all_constraints = false;
+        self.deferred_foreign_keys_dirty = false;
         abort(&mut state, xid);
         self.db.condvar.notify_all();
         Ok(())
@@ -1030,7 +1035,18 @@ impl Session {
                 self.defer_all_constraints,
                 &context,
             ) {
-                Ok(result) => Ok(result),
+                Ok(result) => {
+                    if contains_dml(&statement)
+                        && executor::contains_deferred_foreign_keys(
+                            &state,
+                            &self.deferred_constraints,
+                            self.defer_all_constraints,
+                        )
+                    {
+                        self.deferred_foreign_keys_dirty = true;
+                    }
+                    Ok(result)
+                }
                 Err(error) => {
                     drop(state);
                     self.failed(error)
@@ -1075,6 +1091,18 @@ impl Session {
             &context,
         ) {
             Ok(result) => {
+                if contains_dml(&statement)
+                    && executor::contains_deferred_foreign_keys(
+                        &state,
+                        &self.deferred_constraints,
+                        self.defer_all_constraints,
+                    )
+                    && let Err(error) = executor::validate_deferred_foreign_keys(&state, xid)
+                {
+                    abort(&mut state, xid);
+                    self.db.condvar.notify_all();
+                    return Err(error);
+                }
                 state.transactions.commit(xid);
                 state.row_locks.release(xid);
                 state.wait_for.remove_transaction(xid);
@@ -1088,6 +1116,13 @@ impl Session {
             }
         }
     }
+}
+
+fn contains_dml(statement: &parser::Statement) -> bool {
+    matches!(
+        statement,
+        parser::Statement::Insert(_) | parser::Statement::Update(_) | parser::Statement::Delete(_)
+    )
 }
 
 impl Statement {

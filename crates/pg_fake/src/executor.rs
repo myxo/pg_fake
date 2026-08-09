@@ -305,29 +305,20 @@ fn required_insert_foreign_key_locks(
                 foreign_key.referred_columns.clone()
             };
             let referred = foreign_key_column_indexes(foreign_schema, &referred)?;
-            for (row_id, chain) in state
+            let table = state
                 .tables
                 .get(&foreign_schema.id)
-                .expect("catalog table must have storage")
-                .rows()
+                .expect("catalog table must have storage");
+            if let Some(row_id) =
+                table.find_unique_row(&referred, &key, snapshot, xid, &state.transactions)
             {
-                let Some(version) = visible_version(chain, snapshot, xid, &state.transactions)
-                else {
-                    continue;
-                };
-                let foreign_key = referred
-                    .iter()
-                    .map(|index| version.row[*index].clone())
-                    .collect::<Vec<_>>();
-                if key_matches(&key, &foreign_key)? {
-                    locks.push(RequiredRowLock {
-                        key: RowLockKey {
-                            table_id: foreign_schema.id,
-                            row_id,
-                        },
-                        mode: RowLockMode::Share,
-                    });
-                }
+                locks.push(RequiredRowLock {
+                    key: RowLockKey {
+                        table_id: foreign_schema.id,
+                        row_id,
+                    },
+                    mode: RowLockMode::Share,
+                });
             }
         }
     }
@@ -1063,6 +1054,21 @@ fn foreign_key_is_deferred(
             || deferred_constraints.contains(&foreign_key.name))
 }
 
+pub(crate) fn contains_deferred_foreign_keys(
+    state: &DatabaseState,
+    deferred_constraints: &BTreeSet<String>,
+    defer_all: bool,
+) -> bool {
+    state.catalog.tables().any(|schema| {
+        schema.constraints.iter().any(|constraint| {
+            let crate::catalog::Constraint::ForeignKey(foreign_key) = constraint else {
+                return false;
+            };
+            foreign_key_is_deferred(foreign_key, deferred_constraints, defer_all)
+        })
+    })
+}
+
 fn foreign_key_column_indexes(schema: &TableSchema, columns: &[String]) -> Result<Vec<usize>> {
     columns
         .iter()
@@ -1208,23 +1214,8 @@ fn validate_row_foreign_keys(
             .tables
             .get(&foreign_schema.id)
             .expect("catalog table must have storage")
-            .rows()
-            .try_fold(false, |found, (_, chain)| {
-                if found {
-                    return Ok(true);
-                }
-                let Some(version) = visible_version(chain, snapshot, xid, &state.transactions)
-                else {
-                    return Ok(false);
-                };
-                key_matches(
-                    &key,
-                    &referred_indexes
-                        .iter()
-                        .map(|index| version.row[*index].clone())
-                        .collect::<Vec<_>>(),
-                )
-            })?;
+            .find_unique_row(&referred_indexes, &key, snapshot, xid, &state.transactions)
+            .is_some();
         if !found {
             return Err(PgError::new(
                 SqlState::ForeignKeyViolation,
