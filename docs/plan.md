@@ -133,7 +133,7 @@ parallel special cases in the executor.
 
 ## Milestone B — Joins and subqueries
 
-### Task 4 — Multiple sources, `CROSS JOIN`, and `INNER JOIN`
+### Task 4 — Multiple sources, `CROSS JOIN`, and `INNER JOIN` [COMPLETE]
 
 **Goal:** Execute inner relational combinations using the bound row model.
 

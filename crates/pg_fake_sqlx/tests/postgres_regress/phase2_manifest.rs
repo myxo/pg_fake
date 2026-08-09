@@ -75,7 +75,7 @@ pub const FEATURES: &[Feature] = &[
                 "INSERT INTO join_right VALUES (2)",
             ],
             sql: "SELECT * FROM join_left CROSS JOIN join_right",
-            baseline: Baseline::Pending,
+            baseline: Baseline::MustPass,
         }],
     },
     Feature {

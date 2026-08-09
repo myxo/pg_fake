@@ -1087,6 +1087,101 @@ fn benchmarks(criterion: &mut Criterion) {
     indexed_vs_scan_benchmark(criterion);
     concurrency_benchmark(criterion, &runtime);
     foreign_key_insert_benchmark(criterion, &runtime, &mut postgres.client);
+    inner_join_benchmark(criterion, &runtime, &mut postgres.client);
+}
+
+fn inner_join_benchmark(criterion: &mut Criterion, runtime: &Runtime, postgres: &mut Client) {
+    let fake_left = unique_table_name("join_left_fake");
+    let fake_right = unique_table_name("join_right_fake");
+    let postgres_left = unique_table_name("join_left_postgres");
+    let postgres_right = unique_table_name("join_right_postgres");
+    let mut fake = PgFakeConnection::new(Db::new());
+    let values = (1..=100)
+        .map(|id| format!("({id}, {})", id % 10))
+        .collect::<Vec<_>>()
+        .join(",");
+    for (left, right, postgres_target) in [
+        (&fake_left, &fake_right, false),
+        (&postgres_left, &postgres_right, true),
+    ] {
+        let create_left = format!("CREATE TABLE {left} (id INTEGER, bucket INTEGER)");
+        let create_right = format!("CREATE TABLE {right} (id INTEGER, bucket INTEGER)");
+        if postgres_target {
+            postgres.execute(&create_left, &[]).unwrap();
+            postgres.execute(&create_right, &[]).unwrap();
+            postgres
+                .execute(&format!("INSERT INTO {left} VALUES {values}"), &[])
+                .unwrap();
+            postgres
+                .execute(&format!("INSERT INTO {right} VALUES {values}"), &[])
+                .unwrap();
+        } else {
+            fake_execute(runtime, &mut fake, &create_left);
+            fake_execute(runtime, &mut fake, &create_right);
+            fake_execute(
+                runtime,
+                &mut fake,
+                &format!("INSERT INTO {left} VALUES {values}"),
+            );
+            fake_execute(
+                runtime,
+                &mut fake,
+                &format!("INSERT INTO {right} VALUES {values}"),
+            );
+        }
+    }
+    for (name, fake_query_sql, postgres_query_sql, expected) in [
+        (
+            "selective_inner_join",
+            format!(
+                "SELECT left_row.id FROM {fake_left} left_row INNER JOIN {fake_right} right_row ON left_row.id = right_row.id WHERE left_row.id = 50"
+            ),
+            format!(
+                "SELECT left_row.id FROM {postgres_left} left_row INNER JOIN {postgres_right} right_row ON left_row.id = right_row.id WHERE left_row.id = 50"
+            ),
+            1,
+        ),
+        (
+            "many_match_inner_join",
+            format!(
+                "SELECT left_row.id FROM {fake_left} left_row INNER JOIN {fake_right} right_row ON left_row.bucket = right_row.bucket WHERE left_row.bucket = 0"
+            ),
+            format!(
+                "SELECT left_row.id FROM {postgres_left} left_row INNER JOIN {postgres_right} right_row ON left_row.bucket = right_row.bucket WHERE left_row.bucket = 0"
+            ),
+            100,
+        ),
+    ] {
+        let mut group = criterion.benchmark_group(benchmarks::find_benchmark(name).name);
+        group.throughput(Throughput::Elements(expected));
+        group.bench_function("pg_fake", |benchmark| {
+            benchmark.iter(|| {
+                let result = fake_query(runtime, &mut fake, &fake_query_sql);
+                assert_eq!(result.len(), expected as usize);
+                black_box(result);
+            });
+        });
+        group.bench_function("postgres_18", |benchmark| {
+            benchmark.iter(|| {
+                let result = postgres.simple_query(&postgres_query_sql).unwrap();
+                assert_eq!(
+                    result
+                        .iter()
+                        .filter(|message| matches!(message, SimpleQueryMessage::Row(_)))
+                        .count(),
+                    expected as usize
+                );
+                black_box(result);
+            });
+        });
+        group.finish();
+    }
+    postgres
+        .execute(&format!("DROP TABLE {postgres_left}"), &[])
+        .unwrap();
+    postgres
+        .execute(&format!("DROP TABLE {postgres_right}"), &[])
+        .unwrap();
 }
 
 criterion_group!(workloads, benchmarks);

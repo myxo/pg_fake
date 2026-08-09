@@ -123,6 +123,16 @@ pub fn list_benchmarks() -> Vec<Benchmark> {
             postgres_values(),
             postgres_comparisons(),
         ),
+        build_benchmark(
+            "selective_inner_join",
+            postgres_values(),
+            postgres_comparisons(),
+        ),
+        build_benchmark(
+            "many_match_inner_join",
+            postgres_values(),
+            postgres_comparisons(),
+        ),
     ]
 }
 

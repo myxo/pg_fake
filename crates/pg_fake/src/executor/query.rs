@@ -104,17 +104,14 @@ fn bind_values_scope(values: &sqlparser::ast::Values) -> Result<BoundScope> {
             Ok(BoundColumn {
                 name: format!("column{}", slot + 1),
                 data_type: PgType::new(data_type),
-                relation: String::new(),
                 qualifier: String::new(),
                 slot,
+                unqualified: true,
+                wildcard: true,
             })
         })
         .collect::<Result<Vec<_>>>()?;
-    Ok(BoundScope {
-        columns,
-        relation: None,
-        qualifier: None,
-    })
+    Ok(BoundScope { columns })
 }
 
 fn values_rows(
@@ -414,23 +411,7 @@ pub(super) fn select_rows(
         })
         .transpose()?
         .unwrap_or_default();
-    let input_rows = if select.from.is_empty() {
-        vec![Vec::new()]
-    } else {
-        let schema = state.catalog.table(
-            scope
-                .source_relation()
-                .expect("FROM binding must retain its relation"),
-        )?;
-        state
-            .tables
-            .get(&schema.id)
-            .expect("catalog table must have storage")
-            .rows()
-            .filter_map(|(_, chain)| visible_version(chain, snapshot, xid, &state.transactions))
-            .map(|version| version.row.clone())
-            .collect()
-    };
+    let input_rows = source_rows(state, select, &scope, xid, snapshot, context)?;
     let mut rows =
         input_rows
             .iter()
@@ -517,12 +498,14 @@ fn projections_and_columns<'a>(
         match item {
             SelectItem::Wildcard(_) => {
                 for column in &scope.columns {
-                    projections.push(Projection::Column(column.slot));
-                    columns.push(ColumnMeta {
-                        name: column.name.clone(),
-                        type_oid: column.data_type.oid(),
-                        typmod: column.data_type.typmod,
-                    });
+                    if column.wildcard {
+                        projections.push(Projection::Column(column.slot));
+                        columns.push(ColumnMeta {
+                            name: column.name.clone(),
+                            type_oid: column.data_type.oid(),
+                            typmod: column.data_type.typmod,
+                        });
+                    }
                 }
             }
             SelectItem::QualifiedWildcard(
@@ -533,9 +516,14 @@ fn projections_and_columns<'a>(
                 let matching = scope
                     .columns
                     .iter()
-                    .filter(|column| column.qualifier == qualifier)
+                    .filter(|column| column.qualifier == qualifier && column.wildcard)
                     .collect::<Vec<_>>();
-                if matching.is_empty() && scope.qualifier.as_deref() != Some(qualifier.as_str()) {
+                if matching.is_empty()
+                    && !scope
+                        .columns
+                        .iter()
+                        .any(|column| column.qualifier == qualifier)
+                {
                     return Err(PgError::new(
                         SqlState::UndefinedTable,
                         format!("missing FROM-clause entry for table {qualifier:?}"),
@@ -616,6 +604,251 @@ fn projections_and_columns<'a>(
         }
     }
     Ok((projections, columns))
+}
+
+fn source_rows(
+    state: &DatabaseState,
+    select: &sqlparser::ast::Select,
+    scope: &BoundScope,
+    xid: Xid,
+    snapshot: &Snapshot,
+    context: &ExecutionContext,
+) -> Result<Vec<Vec<Value>>> {
+    if select.from.is_empty() {
+        return Ok(vec![Vec::new()]);
+    }
+    let mut next_slot = 0;
+    let mut rows = vec![vec![Value::Null; scope.columns.len()]];
+    for table in &select.from {
+        let source = table_rows(state, table, scope, xid, snapshot, context, &mut next_slot)?;
+        rows = rows
+            .into_iter()
+            .flat_map(|left| {
+                source.iter().map(move |right| {
+                    left.iter()
+                        .zip(right)
+                        .map(|(left, right)| {
+                            if left.is_null() {
+                                right.clone()
+                            } else {
+                                left.clone()
+                            }
+                        })
+                        .collect()
+                })
+            })
+            .collect();
+    }
+    Ok(rows)
+}
+
+fn table_rows(
+    state: &DatabaseState,
+    table: &sqlparser::ast::TableWithJoins,
+    scope: &BoundScope,
+    xid: Xid,
+    snapshot: &Snapshot,
+    context: &ExecutionContext,
+    next_slot: &mut usize,
+) -> Result<Vec<Vec<Value>>> {
+    let left_start = *next_slot;
+    let mut rows = factor_rows(
+        state,
+        &table.relation,
+        scope,
+        xid,
+        snapshot,
+        context,
+        next_slot,
+    )?;
+    for join in &table.joins {
+        let right_start = *next_slot;
+        let right_rows = factor_rows(
+            state,
+            &join.relation,
+            scope,
+            xid,
+            snapshot,
+            context,
+            next_slot,
+        )?;
+        let mut joined = Vec::new();
+        for left in &rows {
+            for right in &right_rows {
+                let row = left
+                    .iter()
+                    .zip(right)
+                    .map(|(left, right)| {
+                        if left.is_null() {
+                            right.clone()
+                        } else {
+                            left.clone()
+                        }
+                    })
+                    .collect::<Vec<_>>();
+                if join_matches(
+                    &join.join_operator,
+                    &row,
+                    scope,
+                    left_start,
+                    right_start,
+                    context,
+                )? {
+                    joined.push(row);
+                }
+            }
+        }
+        rows = joined;
+    }
+    Ok(rows)
+}
+
+fn factor_rows(
+    state: &DatabaseState,
+    factor: &TableFactor,
+    scope: &BoundScope,
+    xid: Xid,
+    snapshot: &Snapshot,
+    context: &ExecutionContext,
+    next_slot: &mut usize,
+) -> Result<Vec<Vec<Value>>> {
+    if let TableFactor::NestedJoin {
+        table_with_joins, ..
+    } = factor
+    {
+        return table_rows(
+            state,
+            table_with_joins,
+            scope,
+            xid,
+            snapshot,
+            context,
+            next_slot,
+        );
+    }
+    let TableFactor::Table {
+        name: table_name,
+        args,
+        ..
+    } = factor
+    else {
+        return Err(PgError::new(
+            SqlState::FeatureNotSupported,
+            "FROM source is not implemented",
+        ));
+    };
+    if args.is_some() {
+        return Err(PgError::new(
+            SqlState::FeatureNotSupported,
+            "table functions are not implemented",
+        ));
+    }
+    let schema = state.catalog.table(&name(table_name)?)?;
+    let start = *next_slot;
+    *next_slot += schema.columns.len();
+    Ok(state
+        .tables
+        .get(&schema.id)
+        .expect("catalog table must have storage")
+        .rows()
+        .filter_map(|(_, chain)| visible_version(chain, snapshot, xid, &state.transactions))
+        .map(|version| {
+            let mut row = vec![Value::Null; scope.columns.len()];
+            row[start..start + version.row.len()].clone_from_slice(&version.row);
+            row
+        })
+        .collect())
+}
+
+fn join_matches(
+    operator: &sqlparser::ast::JoinOperator,
+    row: &[Value],
+    scope: &BoundScope,
+    left_start: usize,
+    right_start: usize,
+    context: &ExecutionContext,
+) -> Result<bool> {
+    let constraint = match operator {
+        sqlparser::ast::JoinOperator::Join(constraint)
+        | sqlparser::ast::JoinOperator::Inner(constraint)
+        | sqlparser::ast::JoinOperator::CrossJoin(constraint) => constraint,
+        _ => {
+            return Err(PgError::new(
+                SqlState::FeatureNotSupported,
+                "join type is not implemented",
+            ));
+        }
+    };
+    match constraint {
+        sqlparser::ast::JoinConstraint::None => Ok(matches!(
+            operator,
+            sqlparser::ast::JoinOperator::CrossJoin(_)
+        )),
+        sqlparser::ast::JoinConstraint::On(expression) => Ok(matches!(
+            evaluate(expression, RowScope::Bound(scope), row, context)?,
+            Value::Bool(true)
+        )),
+        sqlparser::ast::JoinConstraint::Using(names) => join_using_matches(
+            names
+                .iter()
+                .map(name)
+                .collect::<Result<Vec<_>>>()?
+                .as_slice(),
+            row,
+            scope,
+            left_start,
+            right_start,
+        ),
+        sqlparser::ast::JoinConstraint::Natural => {
+            let names = scope.columns[left_start..right_start]
+                .iter()
+                .filter(|left| {
+                    scope.columns[right_start..]
+                        .iter()
+                        .any(|right| right.name == left.name)
+                })
+                .map(|column| column.name.clone())
+                .collect::<Vec<_>>();
+            join_using_matches(&names, row, scope, left_start, right_start)
+        }
+    }
+}
+
+fn join_using_matches(
+    names: &[String],
+    row: &[Value],
+    scope: &BoundScope,
+    left_start: usize,
+    right_start: usize,
+) -> Result<bool> {
+    for name in names {
+        let left = scope.columns[left_start..right_start]
+            .iter()
+            .find(|column| column.unqualified && column.name == *name)
+            .expect("bound USING column must exist in left source");
+        let right = scope.columns[right_start..]
+            .iter()
+            .find(|column| !column.unqualified && column.name == *name)
+            .expect("bound USING column must exist in right source");
+        let data_type = coercion::common_type(left.data_type.base, right.data_type.base)
+            .expect("bound USING columns must have a common type");
+        let left = coercion::coerce(
+            row[left.slot].clone(),
+            left.data_type.base,
+            PgType::new(data_type),
+            CastContext::Implicit,
+        )?;
+        let right = coercion::coerce(
+            row[right.slot].clone(),
+            right.data_type.base,
+            PgType::new(data_type),
+            CastContext::Implicit,
+        )?;
+        if left.is_null() || right.is_null() || left != right {
+            return Ok(false);
+        }
+    }
+    Ok(true)
 }
 
 fn row_count(

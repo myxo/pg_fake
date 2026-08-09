@@ -3747,6 +3747,79 @@ mod tests {
     }
 
     #[test]
+    fn joins_sources_and_merges_using_columns() {
+        let db = Db::new();
+        let mut session = db.session();
+
+        session
+            .execute(
+                "CREATE TABLE left_rows (id INTEGER, left_value TEXT); \
+                 CREATE TABLE right_rows (id INTEGER, right_value TEXT); \
+                 INSERT INTO left_rows VALUES (1, 'one'), (2, 'two'); \
+                 INSERT INTO right_rows VALUES (1, 'first'), (1, 'second'), (3, 'third')",
+            )
+            .unwrap();
+
+        let cross = session
+            .query(
+                "SELECT left_rows.id, right_rows.id FROM left_rows, right_rows ORDER BY 1, 2",
+                &[],
+            )
+            .unwrap();
+        assert_eq!(cross.rows.len(), 6);
+
+        let joined = session
+            .query(
+                "SELECT l.id, r.right_value FROM left_rows l INNER JOIN right_rows r ON l.id = r.id ORDER BY r.right_value",
+                &[],
+            )
+            .unwrap();
+        assert_eq!(
+            joined.rows,
+            vec![
+                vec![Value::Int4(1), Value::Text("first".into())],
+                vec![Value::Int4(1), Value::Text("second".into())],
+            ]
+        );
+
+        let using = session
+            .query(
+                "SELECT * FROM (left_rows JOIN right_rows USING (id)) AS joined_rows ORDER BY id, right_value",
+                &[],
+            )
+            .unwrap();
+        assert_eq!(
+            using
+                .columns
+                .iter()
+                .map(|column| &column.name)
+                .collect::<Vec<_>>(),
+            vec!["id", "left_value", "right_value"]
+        );
+        assert_eq!(using.rows.len(), 2);
+        let natural = session
+            .query(
+                "SELECT l.id, r.id FROM left_rows l NATURAL JOIN right_rows r ORDER BY l.id, r.id",
+                &[],
+            )
+            .unwrap();
+        assert_eq!(
+            natural.rows,
+            vec![
+                vec![Value::Int4(1), Value::Int4(1)],
+                vec![Value::Int4(1), Value::Int4(1)],
+            ]
+        );
+        assert_eq!(
+            session
+                .query("SELECT id FROM left_rows CROSS JOIN right_rows", &[])
+                .unwrap_err()
+                .sqlstate,
+            SqlState::AmbiguousColumn
+        );
+    }
+
+    #[test]
     fn single_table_alias_scope_property() {
         for index in 0..32 {
             let db = Db::new();

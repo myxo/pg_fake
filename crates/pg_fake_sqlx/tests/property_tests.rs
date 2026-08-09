@@ -753,6 +753,24 @@ fn generated_sql_matches_postgres() {
             &runtime,
             postgres.client(),
             &mut fake,
+            &format!(
+                "SELECT left_row.row_key, right_row.row_key FROM {table} AS left_row INNER JOIN {table} AS right_row ON left_row.row_key = right_row.row_key ORDER BY left_row.row_key"
+            ),
+            RowOrder::Ordered,
+        );
+        assert_statement(
+            &runtime,
+            postgres.client(),
+            &mut fake,
+            &format!(
+                "SELECT left_row.row_key, right_row.row_key FROM {table} AS left_row CROSS JOIN {table} AS right_row WHERE left_row.row_key = right_row.row_key ORDER BY left_row.row_key"
+            ),
+            RowOrder::Ordered,
+        );
+        assert_statement(
+            &runtime,
+            postgres.client(),
+            &mut fake,
             &format!("CREATE TABLE {foreign_parent} (id INTEGER PRIMARY KEY)"),
             RowOrder::Unordered,
         );
