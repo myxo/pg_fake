@@ -798,6 +798,24 @@ fn generated_sql_matches_postgres() {
             &runtime,
             postgres.client(),
             &mut fake,
+            &format!(
+                "SELECT row_key FROM {table} WHERE row_key IN (SELECT row_key FROM {table}) ORDER BY row_key"
+            ),
+            RowOrder::Ordered,
+        );
+        assert_statement(
+            &runtime,
+            postgres.client(),
+            &mut fake,
+            &format!(
+                "SELECT EXISTS (SELECT 1 FROM {table}), 1000000 = ANY (SELECT row_key FROM {table}), 1000000 > ALL (SELECT row_key FROM {table})"
+            ),
+            RowOrder::Ordered,
+        );
+        assert_statement(
+            &runtime,
+            postgres.client(),
+            &mut fake,
             &format!("CREATE TABLE {foreign_parent} (id INTEGER PRIMARY KEY)"),
             RowOrder::Unordered,
         );

@@ -805,3 +805,20 @@ fn derived_tables_and_uncorrelated_scalar_subqueries_match_postgres() {
         RowOrder::Ordered,
     );
 }
+
+#[test]
+fn uncorrelated_subquery_predicates_match_postgres() {
+    assert_differential(
+        "CREATE TABLE __TABLE__ (id INTEGER, pair INTEGER); \
+         INSERT INTO __TABLE__ VALUES (1, 1), (2, 2), (NULL, 3); \
+         SELECT EXISTS (SELECT 1 FROM __TABLE__ WHERE id = 1), NOT EXISTS (SELECT 1 FROM __TABLE__ WHERE id = 9); \
+         SELECT 1 IN (SELECT id FROM __TABLE__), 3 IN (SELECT id FROM __TABLE__), 3 NOT IN (SELECT id FROM __TABLE__); \
+         SELECT id FROM __TABLE__ WHERE id = ANY (SELECT id FROM __TABLE__) ORDER BY id; \
+         SELECT 3 > ALL (SELECT id FROM __TABLE__); \
+         SELECT (1, 1) IN (SELECT id, pair FROM __TABLE__), (3, 3) IN (SELECT id, pair FROM __TABLE__); \
+         UPDATE __TABLE__ SET pair = 20 WHERE id IN (SELECT id FROM __TABLE__ WHERE pair = 2); \
+         SELECT pair FROM __TABLE__ WHERE id = 2; \
+         SELECT 1 IN (SELECT id, pair FROM __TABLE__)",
+        RowOrder::Ordered,
+    );
+}

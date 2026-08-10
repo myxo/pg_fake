@@ -116,13 +116,39 @@ pub const FEATURES: &[Feature] = &[
     },
     Feature {
         name: "subquery predicates",
-        cases: &[Case {
-            id: "in_subquery",
-            source: "subselect.sql:5",
-            setup: &[],
-            sql: "SELECT 1 WHERE 1 IN (SELECT 1)",
-            baseline: Baseline::Pending,
-        }],
+        cases: &[
+            Case {
+                id: "exists_and_not_exists",
+                source: "subselect.sql:4",
+                setup: &[],
+                sql: "SELECT EXISTS (SELECT 1), NOT EXISTS (SELECT 1 WHERE false)",
+                baseline: Baseline::MustPass,
+            },
+            Case {
+                id: "in_not_in_and_null",
+                source: "subselect.sql:5",
+                setup: &[],
+                sql: "SELECT 1 IN (SELECT 1), 2 NOT IN (VALUES (1), (NULL))",
+                baseline: Baseline::MustPass,
+            },
+            Case {
+                id: "any_and_all",
+                source: "subselect.sql:6",
+                setup: &[
+                    "CREATE TABLE predicate_rows (id INTEGER)",
+                    "INSERT INTO predicate_rows VALUES (1), (2), (NULL)",
+                ],
+                sql: "SELECT 2 = ANY (SELECT id FROM predicate_rows), 3 > ALL (SELECT id FROM predicate_rows)",
+                baseline: Baseline::MustPass,
+            },
+            Case {
+                id: "row_value_membership",
+                source: "subselect.sql:7",
+                setup: &[],
+                sql: "SELECT (1, 2) IN (VALUES (1, 2), (3, 4))",
+                baseline: Baseline::MustPass,
+            },
+        ],
     },
     Feature {
         name: "correlated subqueries",

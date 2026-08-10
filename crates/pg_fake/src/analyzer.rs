@@ -165,18 +165,50 @@ pub(crate) fn describe_subqueries(statement: &Statement, catalog: &Catalog) -> R
         if error.is_some() {
             return ControlFlow::Break(());
         }
-        let Expr::Subquery(query) = expression else {
-            return ControlFlow::Continue(());
-        };
-        let result = executor::query_output_columns(catalog, query).and_then(|columns| {
-            if columns.len() != 1 {
-                return Err(PgError::new(
-                    SqlState::SyntaxError,
-                    "subquery must return only one column",
-                ));
+        let result = match expression {
+            Expr::Subquery(query) => {
+                executor::query_output_columns(catalog, query).and_then(|columns| {
+                    if columns.len() != 1 {
+                        return Err(PgError::new(
+                            SqlState::SyntaxError,
+                            "subquery must return only one column",
+                        ));
+                    }
+                    Ok(typed_literal(Value::Null, columns[0].1.base))
+                })
             }
-            Ok(typed_literal(Value::Null, columns[0].1.base))
-        });
+            Expr::Exists { .. } => Ok(typed_literal(Value::Bool(false), BaseType::Bool)),
+            Expr::InSubquery {
+                expr,
+                subquery,
+                negated,
+            } => executor::query_output_columns(catalog, subquery).and_then(|columns| {
+                let left_width = match expr.as_ref() {
+                    Expr::Tuple(fields) => fields.len(),
+                    _ => 1,
+                };
+                if columns.len() != left_width {
+                    return Err(PgError::new(
+                        SqlState::SyntaxError,
+                        "subquery has too many columns",
+                    ));
+                }
+                let fields = columns
+                    .into_iter()
+                    .map(|(_, data_type)| typed_literal(Value::Null, data_type.base))
+                    .collect::<Vec<_>>();
+                Ok(Expr::InList {
+                    expr: expr.clone(),
+                    list: vec![if fields.len() == 1 {
+                        fields.into_iter().next().expect("subquery has one column")
+                    } else {
+                        Expr::Tuple(fields)
+                    }],
+                    negated: *negated,
+                })
+            }),
+            _ => return ControlFlow::Continue(()),
+        };
         match result {
             Ok(value) => *expression = value,
             Err(describe_error) => error = Some(describe_error),
@@ -320,6 +352,34 @@ fn infer_expr(
                 };
                 constrain(left, left_expected, types)
                     .and_then(|()| constrain(right, right_expected, types))
+            }
+            Expr::InList { expr, list, .. } => (|| {
+                let left = match expr.as_ref() {
+                    Expr::Tuple(fields) => fields.as_slice(),
+                    expr => std::slice::from_ref(expr),
+                };
+                for candidate in list {
+                    let right = match candidate {
+                        Expr::Tuple(fields) => fields.as_slice(),
+                        candidate => std::slice::from_ref(candidate),
+                    };
+                    if left.len() != right.len() {
+                        return Err(PgError::new(
+                            SqlState::SyntaxError,
+                            "subquery has too many columns",
+                        ));
+                    }
+                    for (left, right) in left.iter().zip(right) {
+                        constrain(left, executor::expression_type(right, schema).ok(), types)?;
+                        constrain(right, executor::expression_type(left, schema).ok(), types)?;
+                    }
+                }
+                Ok(())
+            })(),
+            Expr::AnyOp { left, right, .. } | Expr::AllOp { left, right, .. } => {
+                constrain(left, executor::expression_type(right, schema).ok(), types).and_then(
+                    |()| constrain(right, executor::expression_type(left, schema).ok(), types),
+                )
             }
             Expr::IsTrue(inner)
             | Expr::IsFalse(inner)

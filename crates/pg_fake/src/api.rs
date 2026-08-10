@@ -3992,6 +3992,49 @@ mod tests {
     }
 
     #[test]
+    fn materializes_uncorrelated_subquery_predicates() {
+        let db = Db::new();
+        let mut session = db.session();
+        session
+            .execute("CREATE TABLE items (id INTEGER, pair INTEGER)")
+            .unwrap();
+        session
+            .execute("INSERT INTO items VALUES (1, 1), (2, 2), (NULL, 3)")
+            .unwrap();
+
+        let statement = session
+            .prepare(
+                "SELECT id FROM items WHERE id = $1 AND id IN (SELECT id FROM items) ORDER BY id",
+            )
+            .unwrap();
+        assert_eq!(statement.parameter_types(), &[BaseType::Int4]);
+        assert_eq!(
+            session
+                .query_prepared(&statement, &[Value::Int4(2)])
+                .unwrap()
+                .rows,
+            vec![vec![Value::Int4(2)]]
+        );
+        assert_eq!(
+            session
+                .query(
+                    "SELECT EXISTS (SELECT 1 FROM items WHERE id = 1), 3 NOT IN (SELECT id FROM items), 3 > ALL (SELECT id FROM items)",
+                    &[],
+                )
+                .unwrap()
+                .rows,
+            vec![vec![Value::Bool(true), Value::Null, Value::Null]]
+        );
+        assert_eq!(
+            session
+                .query("SELECT (1, 1) IN (SELECT id, pair FROM items)", &[])
+                .unwrap()
+                .rows,
+            vec![vec![Value::Bool(true)]]
+        );
+    }
+
+    #[test]
     fn tolerates_only_planner_settings_outside_strict_mode() {
         let db = Db::new();
         let mut session = db.session();

@@ -192,7 +192,7 @@ scalar value.
 
 **Notes:** Correlation and subquery predicates land in the following tasks.
 
-### Task 7 — `EXISTS`, `IN`, `NOT IN`, `ANY`, and `ALL`
+### Task 7 — `EXISTS`, `IN`, `NOT IN`, `ANY`, and `ALL` [COMPLETE]
 
 **Goal:** Implement PostgreSQL's row-membership and quantified-subquery
 semantics.

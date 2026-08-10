@@ -293,6 +293,13 @@ pub(crate) fn expression_type(expr: &Expr, schema: RowScope<'_>) -> Result<BaseT
             )),
         },
         Expr::IsNull(_) | Expr::IsNotNull(_) => Ok(BaseType::Bool),
+        Expr::InList { expr, list, .. } => {
+            validate_membership_types(expr, list, schema)?;
+            Ok(BaseType::Bool)
+        }
+        Expr::InSubquery { .. } | Expr::Exists { .. } | Expr::AnyOp { .. } | Expr::AllOp { .. } => {
+            Ok(BaseType::Bool)
+        }
         Expr::IsTrue(expr) | Expr::IsFalse(expr) | Expr::IsUnknown(expr) => {
             let base = expression_type(expr, schema)?;
             if base == BaseType::Bool || null_expression(expr) || unknown_string(expr).is_some() {
@@ -642,6 +649,22 @@ pub(super) fn evaluate(
         Expr::IsNotNull(expr) => Ok(Value::Bool(
             !evaluate(expr, schema, row, context)?.is_null(),
         )),
+        Expr::InList {
+            expr,
+            list,
+            negated,
+        } => evaluate_membership(expr, list, *negated, schema, row, context),
+        Expr::AnyOp {
+            left,
+            compare_op,
+            right,
+            ..
+        } => evaluate_quantified(left, compare_op, right, false, schema, row, context),
+        Expr::AllOp {
+            left,
+            compare_op,
+            right,
+        } => evaluate_quantified(left, compare_op, right, true, schema, row, context),
         Expr::IsTrue(expr) => Ok(Value::Bool(matches!(
             evaluate_as(
                 expr,
@@ -783,6 +806,119 @@ pub(super) fn evaluate(
             "expression is not implemented",
         )),
     }
+}
+
+fn validate_membership_types(expr: &Expr, list: &[Expr], schema: RowScope<'_>) -> Result<()> {
+    let left = split_tuple_fields(expr);
+    for candidate in list {
+        let right = split_tuple_fields(candidate);
+        if left.len() != right.len() {
+            return Err(PgError::new(
+                SqlState::SyntaxError,
+                "subquery has too many columns",
+            ));
+        }
+        for (left, right) in left.iter().zip(right) {
+            expression_common_type(left, right, schema)?;
+        }
+    }
+    Ok(())
+}
+
+fn split_tuple_fields(expr: &Expr) -> &[Expr] {
+    match expr {
+        Expr::Tuple(fields) => fields,
+        expr => std::slice::from_ref(expr),
+    }
+}
+
+fn evaluate_membership(
+    expr: &Expr,
+    list: &[Expr],
+    negated: bool,
+    schema: RowScope<'_>,
+    row: &[Value],
+    context: &ExecutionContext,
+) -> Result<Value> {
+    validate_membership_types(expr, list, schema)?;
+    let mut result = Value::Bool(false);
+    for candidate in list {
+        result = boolean_binary(
+            &BinaryOperator::Or,
+            result,
+            evaluate_row_comparison(expr, candidate, &BinaryOperator::Eq, schema, row, context)?,
+        )?;
+        if result == Value::Bool(true) {
+            break;
+        }
+    }
+    if negated {
+        unary(UnaryOperator::Not, result)
+    } else {
+        Ok(result)
+    }
+}
+
+fn evaluate_quantified(
+    left: &Expr,
+    compare_op: &BinaryOperator,
+    right: &Expr,
+    all: bool,
+    schema: RowScope<'_>,
+    row: &[Value],
+    context: &ExecutionContext,
+) -> Result<Value> {
+    let candidates = split_tuple_fields(right);
+    let mut result = Value::Bool(all);
+    for candidate in candidates {
+        result = boolean_binary(
+            if all {
+                &BinaryOperator::And
+            } else {
+                &BinaryOperator::Or
+            },
+            result,
+            evaluate_row_comparison(left, candidate, compare_op, schema, row, context)?,
+        )?;
+        if result == Value::Bool(!all) {
+            break;
+        }
+    }
+    Ok(result)
+}
+
+fn evaluate_row_comparison(
+    left: &Expr,
+    right: &Expr,
+    operator: &BinaryOperator,
+    schema: RowScope<'_>,
+    row: &[Value],
+    context: &ExecutionContext,
+) -> Result<Value> {
+    let left = split_tuple_fields(left);
+    let right = split_tuple_fields(right);
+    if left.len() != right.len() {
+        return Err(PgError::new(
+            SqlState::SyntaxError,
+            "subquery has too many columns",
+        ));
+    }
+    let mut result = Value::Bool(true);
+    for (left, right) in left.iter().zip(right) {
+        let target = expression_common_type(left, right, schema)?;
+        let left = evaluate_as(left, target, CastContext::Implicit, schema, row, context)?;
+        let right = evaluate_as(right, target, CastContext::Implicit, schema, row, context)?;
+        let comparison = if left.is_null() || right.is_null() {
+            Value::Null
+        } else {
+            comparison(operator, &left, &right)?
+        };
+        result = boolean_binary(&BinaryOperator::And, result, comparison)?;
+        if result == Value::Bool(false) {
+            break;
+        }
+    }
+    Ok(result)
 }
 
 pub(super) fn evaluate_as(

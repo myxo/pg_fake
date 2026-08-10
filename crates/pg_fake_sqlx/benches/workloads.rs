@@ -1123,10 +1123,10 @@ fn derived_and_scalar_subquery_benchmark(
         )
         .unwrap();
     let fake_query_sql = format!(
-        "SELECT source.id FROM (SELECT id FROM {fake_table} WHERE id <= (SELECT 100)) AS source ORDER BY source.id"
+        "SELECT source.id FROM (SELECT id FROM {fake_table} WHERE id <= (SELECT 100)) AS source WHERE source.id = ANY (SELECT id FROM {fake_table}) ORDER BY source.id"
     );
     let postgres_query_sql = format!(
-        "SELECT source.id FROM (SELECT id FROM {postgres_table} WHERE id <= (SELECT 100)) AS source ORDER BY source.id"
+        "SELECT source.id FROM (SELECT id FROM {postgres_table} WHERE id <= (SELECT 100)) AS source WHERE source.id = ANY (SELECT id FROM {postgres_table}) ORDER BY source.id"
     );
     let mut group = criterion
         .benchmark_group(benchmarks::find_benchmark("derived_and_scalar_subquery_100_rows").name);
