@@ -1,9 +1,9 @@
 # Benchmarks
 
-The Criterion suite compares `pg_fake` through its in-process SQLx driver with
-the same SQL sent through a `postgres` client connection to PostgreSQL 18. It covers a create/drop
-table lifecycle, individual constrained explicit/defaulted inserts, updates,
-deletes, explicit transactions at READ COMMITTED and REPEATABLE READ, row-lock
+The Criterion suite compares `pg_fake` with PostgreSQL 18 through SQLx. It
+covers a create/drop table lifecycle, individual constrained
+explicit/defaulted inserts, updates, deletes, explicit transactions at READ
+COMMITTED and REPEATABLE READ, row-lock
 acquisition with `SELECT ... FOR UPDATE`, a 100-row full-table select, and a
 100-row multi-key `ORDER BY` with explicit NULL placement, including an ordered
 `LIMIT`/`OFFSET` paging workload. The insert workloads include primary-key,
@@ -26,9 +26,8 @@ Diagnostic groups isolate costs within `pg_fake`:
 The point-lookup comparison is intentionally useful before index-assisted query
 execution exists: similar timings expose the missing optimization, while future
 changes can demonstrate the expected separation. The MVCC benchmark retains old
-versions intentionally; the regular update benchmark constructs a fresh fake
-database per timed update so its latency does not drift with an ever-growing
-version chain.
+versions intentionally; the regular update benchmark deletes its fixture row
+after each timed update.
 
 By default, it starts a PostgreSQL 18 Testcontainers container. It detects the
 default Colima socket (`~/.colima/default/docker.sock`); set `DOCKER_HOST` for
