@@ -12,7 +12,7 @@ test:
 
 # Run PostgreSQL 18 comparison benchmarks
 bench:
-    PG_FAKE_DATABASE_URL='postgresql://myxo@127.0.0.1:5432/postgres' cargo bench -p pg_fake_sqlx --bench workloads
+    PG_FAKE_DATABASE_URL='postgresql://myxo@127.0.0.1:5432/postgres' cargo bench -p pg_fake_benchmarks --bench workloads
 
 # Record one pg_fake benchmark and open its flame graph
 profile-bench filter duration='10':

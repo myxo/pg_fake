@@ -3,3 +3,17 @@ name = "pg_fake_benchmarks"
 version = "0.1.0"
 edition.workspace = true
 license.workspace = true
+
+[dev-dependencies]
+criterion = "0.5"
+pg_fake = { path = "../pg_fake" }
+pg_fake_sqlx = { path = "../pg_fake_sqlx" }
+sqlx = { version = "0.9", default-features = false, features = ["runtime-tokio"] }
+sqlx-postgres = "0.9"
+testcontainers = { version = "0.27", features = ["blocking"] }
+testcontainers-modules = { version = "0.15", features = ["blocking", "postgres"] }
+tokio = { version = "1", features = ["macros", "rt-multi-thread", "sync", "time"] }
+
+[[bench]]
+name = "workloads"
+harness = false

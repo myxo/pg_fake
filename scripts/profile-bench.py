@@ -19,7 +19,7 @@ build = subprocess.run(
         "bench",
         "--no-run",
         "-p",
-        "pg_fake_sqlx",
+        "pg_fake_benchmarks",
         "--bench",
         "workloads",
         "--message-format=json",

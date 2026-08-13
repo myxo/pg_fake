@@ -16,7 +16,7 @@ fn main() {
 
 fn run_benchmarks() {
     let status = Command::new("cargo")
-        .args(["bench", "-p", "pg_fake_sqlx", "--bench", "workloads"])
+        .args(["bench", "-p", "pg_fake_benchmarks", "--bench", "workloads"])
         .status()
         .expect("benchmark command must start");
     assert!(status.success(), "benchmark command must succeed");

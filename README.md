@@ -70,7 +70,7 @@ single-statement operations.
 ## Benchmarks
 
 The Criterion suite compares `pg_fake` with PostgreSQL 18. See
-[`crates/pg_fake_sqlx/benches/README.md`](crates/pg_fake_sqlx/benches/README.md) for
+[`crates/pg_fake_benchmarks/README.md`](crates/pg_fake_benchmarks/README.md) for
 Docker/database configuration, commands, reports, and speedup interpretation.
 
 ## Differential tests

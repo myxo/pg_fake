@@ -1678,6 +1678,16 @@ dependencies = [
 [[package]]
 name = "pg_fake_benchmarks"
 version = "0.1.0"
+dependencies = [
+ "criterion",
+ "pg_fake",
+ "pg_fake_sqlx",
+ "sqlx",
+ "sqlx-postgres",
+ "testcontainers",
+ "testcontainers-modules",
+ "tokio",
+]
 
 [[package]]
 name = "pg_fake_sqlx"
@@ -1686,16 +1696,14 @@ dependencies = [
  "bigdecimal",
  "chaos_theory",
  "chrono",
- "criterion",
  "either",
  "futures-core",
  "futures-util",
  "log",
  "pg_fake",
- "pg_fake_benchmarks",
+ "postgres",
  "sqlx",
  "sqlx-core",
- "sqlx-postgres",
  "testcontainers",
  "testcontainers-modules",
  "tokio",
