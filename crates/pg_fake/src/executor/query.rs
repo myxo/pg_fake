@@ -1,82 +1,226 @@
 use super::*;
-use sqlparser::ast::{VisitMut, VisitorMut, visit_expressions_mut};
+use sqlparser::ast::{VisitMut, VisitorMut};
 
-struct QuantifiedSubqueryMaterializer<'a> {
+struct SubqueryMaterializer<'a> {
     state: &'a DatabaseState,
     xid: Xid,
     snapshot: &'a Snapshot,
     context: &'a ExecutionContext,
     error: Option<PgError>,
+    defer_unresolved: bool,
+    scopes: Vec<BoundScope>,
 }
 
-impl VisitorMut for QuantifiedSubqueryMaterializer<'_> {
+impl SubqueryMaterializer<'_> {
+    fn execute(&self, query: &sqlparser::ast::Query) -> Result<QueryResult> {
+        let query = materialize_scalar_subqueries(
+            self.state,
+            &Statement::Query(Box::new(query.clone())),
+            self.xid,
+            self.snapshot,
+            self.context,
+        )?;
+        let Statement::Query(query) = query else {
+            unreachable!("subquery statement remains a query");
+        };
+        let StatementResult::Query(result) =
+            select_rows(self.state, &query, self.xid, self.snapshot, self.context)?
+        else {
+            unreachable!("subquery execution returns query rows");
+        };
+        Ok(result)
+    }
+}
+
+impl VisitorMut for SubqueryMaterializer<'_> {
     type Break = ();
 
+    fn pre_visit_query(
+        &mut self,
+        query: &mut sqlparser::ast::Query,
+    ) -> std::ops::ControlFlow<Self::Break> {
+        let scope = match query.body.as_ref() {
+            SetExpr::Select(select) => bind_query_scope(&self.state.catalog, select),
+            _ => Ok(BoundScope {
+                columns: Vec::new(),
+            }),
+        }
+        .unwrap_or(BoundScope {
+            columns: Vec::new(),
+        });
+        self.scopes.push(scope);
+        std::ops::ControlFlow::Continue(())
+    }
+
+    fn post_visit_query(
+        &mut self,
+        _query: &mut sqlparser::ast::Query,
+    ) -> std::ops::ControlFlow<Self::Break> {
+        self.scopes.pop().expect("visited query pushed a scope");
+        std::ops::ControlFlow::Continue(())
+    }
+
     fn pre_visit_expr(&mut self, expr: &mut Expr) -> std::ops::ControlFlow<Self::Break> {
-        let (left, compare_op, right, some) = match expr {
+        let original = expr.clone();
+        let correlation_candidate = original.clone();
+        let result = (|| match original {
             Expr::AnyOp {
                 left,
                 compare_op,
                 right,
                 is_some,
-            } => (left.clone(), compare_op.clone(), right, Some(*is_some)),
+            } => {
+                let Expr::Subquery(subquery) = right.as_ref() else {
+                    return Ok(None);
+                };
+                let result = self.execute(subquery)?;
+                if result.columns.len() != 1 {
+                    return Err(PgError::new(
+                        SqlState::SyntaxError,
+                        "subquery has too many columns",
+                    ));
+                }
+                let data_type = BaseType::from_oid(result.columns[0].type_oid)
+                    .expect("query result type OID is supported");
+                Ok(Some(Expr::AnyOp {
+                    left,
+                    compare_op,
+                    right: Box::new(Expr::Tuple(
+                        result
+                            .rows
+                            .into_iter()
+                            .map(|row| crate::analyzer::typed_literal(row[0].clone(), data_type))
+                            .collect(),
+                    )),
+                    is_some,
+                }))
+            }
             Expr::AllOp {
                 left,
                 compare_op,
                 right,
-            } => (left.clone(), compare_op.clone(), right, None),
-            _ => return std::ops::ControlFlow::Continue(()),
-        };
-        let Expr::Subquery(subquery) = right.as_ref() else {
-            return std::ops::ControlFlow::Continue(());
-        };
-        let result = (|| {
-            let statement = materialize_scalar_subqueries(
-                self.state,
-                &Statement::Query(subquery.clone()),
-                self.xid,
-                self.snapshot,
-                self.context,
-            )?;
-            let Statement::Query(query) = statement else {
-                unreachable!("subquery statement remains a query");
-            };
-            let StatementResult::Query(result) =
-                select_rows(self.state, &query, self.xid, self.snapshot, self.context)?
-            else {
-                unreachable!("subquery execution returns query rows");
-            };
-            if result.columns.len() != 1 {
-                return Err(PgError::new(
-                    SqlState::SyntaxError,
-                    "subquery has too many columns",
-                ));
+            } => {
+                let Expr::Subquery(subquery) = right.as_ref() else {
+                    return Ok(None);
+                };
+                let result = self.execute(subquery)?;
+                if result.columns.len() != 1 {
+                    return Err(PgError::new(
+                        SqlState::SyntaxError,
+                        "subquery has too many columns",
+                    ));
+                }
+                let data_type = BaseType::from_oid(result.columns[0].type_oid)
+                    .expect("query result type OID is supported");
+                Ok(Some(Expr::AllOp {
+                    left,
+                    compare_op,
+                    right: Box::new(Expr::Tuple(
+                        result
+                            .rows
+                            .into_iter()
+                            .map(|row| crate::analyzer::typed_literal(row[0].clone(), data_type))
+                            .collect(),
+                    )),
+                }))
             }
-            let data_type = BaseType::from_oid(result.columns[0].type_oid)
-                .expect("query result type OID is supported");
-            let right = Expr::Tuple(
-                result
-                    .rows
-                    .into_iter()
-                    .map(|row| crate::analyzer::typed_literal(row[0].clone(), data_type))
-                    .collect(),
-            );
-            Ok(match some {
-                Some(is_some) => Expr::AnyOp {
-                    left,
-                    compare_op,
-                    right: Box::new(right),
-                    is_some,
-                },
-                None => Expr::AllOp {
-                    left,
-                    compare_op,
-                    right: Box::new(right),
-                },
-            })
+            Expr::Subquery(query) => {
+                let result = self.execute(&query)?;
+                if result.columns.len() != 1 {
+                    return Err(PgError::new(
+                        SqlState::SyntaxError,
+                        "subquery must return only one column",
+                    ));
+                }
+                if result.rows.len() > 1 {
+                    return Err(PgError::new(
+                        SqlState::CardinalityViolation,
+                        "more than one row returned by a subquery used as an expression",
+                    ));
+                }
+                let data_type = BaseType::from_oid(result.columns[0].type_oid)
+                    .expect("query result type OID is supported");
+                Ok(Some(crate::analyzer::typed_literal(
+                    result
+                        .rows
+                        .into_iter()
+                        .next()
+                        .map(|row| row[0].clone())
+                        .unwrap_or(Value::Null),
+                    data_type,
+                )))
+            }
+            Expr::Exists { subquery, negated } => Ok(Some(crate::analyzer::typed_literal(
+                Value::Bool(self.execute(&subquery)?.rows.is_empty() == negated),
+                BaseType::Bool,
+            ))),
+            Expr::InSubquery {
+                expr,
+                subquery,
+                negated,
+            } => {
+                let result = self.execute(&subquery)?;
+                let left_width = match expr.as_ref() {
+                    Expr::Tuple(fields) => fields.len(),
+                    _ => 1,
+                };
+                if result.columns.len() != left_width {
+                    return Err(PgError::new(
+                        SqlState::SyntaxError,
+                        "subquery has too many columns",
+                    ));
+                }
+                let types = result
+                    .columns
+                    .iter()
+                    .map(|column| {
+                        BaseType::from_oid(column.type_oid)
+                            .expect("query result type OID is supported")
+                    })
+                    .collect::<Vec<_>>();
+                Ok(Some(Expr::InList {
+                    expr,
+                    list: result
+                        .rows
+                        .into_iter()
+                        .map(|row| {
+                            let fields = row
+                                .into_iter()
+                                .zip(&types)
+                                .map(|(value, data_type)| {
+                                    crate::analyzer::typed_literal(value, *data_type)
+                                })
+                                .collect::<Vec<_>>();
+                            if fields.len() == 1 {
+                                fields.into_iter().next().expect("row has one field")
+                            } else {
+                                Expr::Tuple(fields)
+                            }
+                        })
+                        .collect(),
+                    negated,
+                }))
+            }
+            _ => Ok(None),
         })();
         match result {
-            Ok(value) => *expr = value,
+            Ok(Some(value)) => *expr = value,
+            Ok(None) => {}
+            Err(error)
+                if self.defer_unresolved
+                    && matches!(
+                        error.sqlstate,
+                        SqlState::UndefinedColumn | SqlState::UndefinedTable
+                    ) =>
+            {
+                match self.scopes.last().map(|outer| {
+                    expression_references_outer(&self.state.catalog, &correlation_candidate, outer)
+                }) {
+                    Some(Ok(true)) => {}
+                    Some(Err(scope_error)) => self.error = Some(scope_error),
+                    _ => self.error = Some(error),
+                }
+            }
             Err(error) => self.error = Some(error),
         }
         std::ops::ControlFlow::Continue(())
@@ -91,129 +235,171 @@ pub(crate) fn materialize_scalar_subqueries(
     context: &ExecutionContext,
 ) -> Result<Statement> {
     let mut statement = statement.clone();
-    let mut quantified = QuantifiedSubqueryMaterializer {
+    materialize_subqueries(state, &mut statement, xid, snapshot, context, true)?;
+    Ok(statement)
+}
+
+fn materialize_subqueries<V: VisitMut>(
+    state: &DatabaseState,
+    value: &mut V,
+    xid: Xid,
+    snapshot: &Snapshot,
+    context: &ExecutionContext,
+    defer_unresolved: bool,
+) -> Result<()> {
+    let mut materializer = SubqueryMaterializer {
         state,
         xid,
         snapshot,
         context,
         error: None,
+        defer_unresolved,
+        scopes: Vec::new(),
     };
-    let _ = statement.visit(&mut quantified);
-    if let Some(error) = quantified.error {
+    let _ = value.visit(&mut materializer);
+    if let Some(error) = materializer.error {
         return Err(error);
     }
-    let mut error = None;
-    let _ = visit_expressions_mut(&mut statement, |expr| {
-        if error.is_some() {
-            return std::ops::ControlFlow::Break(());
-        }
-        let result = (|| {
-            let query_result = |query: &sqlparser::ast::Query| {
-                let query = materialize_scalar_subqueries(
-                    state,
-                    &Statement::Query(Box::new(query.clone())),
-                    xid,
-                    snapshot,
-                    context,
-                )?;
-                let Statement::Query(query) = query else {
-                    unreachable!("subquery statement remains a query");
-                };
-                let StatementResult::Query(result) =
-                    select_rows(state, &query, xid, snapshot, context)?
-                else {
-                    unreachable!("subquery execution returns query rows");
-                };
-                Ok(result)
-            };
-            match expr {
-                Expr::Subquery(query) => {
-                    let result = query_result(query)?;
-                    if result.columns.len() != 1 {
-                        return Err(PgError::new(
-                            SqlState::SyntaxError,
-                            "subquery must return only one column",
-                        ));
-                    }
-                    if result.rows.len() > 1 {
-                        return Err(PgError::new(
-                            SqlState::CardinalityViolation,
-                            "more than one row returned by a subquery used as an expression",
-                        ));
-                    }
-                    let data_type = BaseType::from_oid(result.columns[0].type_oid)
-                        .expect("query result type OID is supported");
-                    Ok(crate::analyzer::typed_literal(
-                        result
-                            .rows
-                            .into_iter()
-                            .next()
-                            .map(|row| row[0].clone())
-                            .unwrap_or(Value::Null),
-                        data_type,
-                    ))
-                }
-                Expr::Exists { subquery, negated } => Ok(crate::analyzer::typed_literal(
-                    Value::Bool(query_result(subquery)?.rows.is_empty() == *negated),
-                    BaseType::Bool,
-                )),
-                Expr::InSubquery {
-                    expr,
-                    subquery,
-                    negated,
-                } => {
-                    let result = query_result(subquery)?;
-                    let left_width = match expr.as_ref() {
-                        Expr::Tuple(fields) => fields.len(),
-                        _ => 1,
-                    };
-                    if result.columns.len() != left_width {
-                        return Err(PgError::new(
-                            SqlState::SyntaxError,
-                            "subquery has too many columns",
-                        ));
-                    }
-                    let types = result
-                        .columns
-                        .iter()
-                        .map(|column| {
-                            BaseType::from_oid(column.type_oid)
-                                .expect("query result type OID is supported")
-                        })
-                        .collect::<Vec<_>>();
-                    Ok(Expr::InList {
-                        expr: expr.clone(),
-                        list: result
-                            .rows
-                            .into_iter()
-                            .map(|row| {
-                                let fields = row
-                                    .into_iter()
-                                    .zip(&types)
-                                    .map(|(value, data_type)| {
-                                        crate::analyzer::typed_literal(value, *data_type)
-                                    })
-                                    .collect::<Vec<_>>();
-                                if fields.len() == 1 {
-                                    fields.into_iter().next().expect("row has one field")
-                                } else {
-                                    Expr::Tuple(fields)
-                                }
-                            })
-                            .collect(),
-                        negated: *negated,
-                    })
-                }
-                _ => return Ok(expr.clone()),
+    Ok(())
+}
+
+struct OuterReferenceSubstituter<'a> {
+    catalog: &'a Catalog,
+    outer_scope: &'a BoundScope,
+    outer_row: &'a [Value],
+    scopes: Vec<BoundScope>,
+    error: Option<PgError>,
+    substituted: bool,
+}
+
+impl VisitorMut for OuterReferenceSubstituter<'_> {
+    type Break = ();
+
+    fn pre_visit_query(
+        &mut self,
+        query: &mut sqlparser::ast::Query,
+    ) -> std::ops::ControlFlow<Self::Break> {
+        let SetExpr::Select(select) = query.body.as_ref() else {
+            self.scopes.push(BoundScope {
+                columns: Vec::new(),
+            });
+            return std::ops::ControlFlow::Continue(());
+        };
+        match bind_query_scope(self.catalog, select) {
+            Ok(scope) => self.scopes.push(scope),
+            Err(error) => {
+                self.error = Some(error);
+                return std::ops::ControlFlow::Break(());
             }
-        })();
-        match result {
-            Ok(value) => *expr = value,
-            Err(materialize_error) => error = Some(materialize_error),
         }
         std::ops::ControlFlow::Continue(())
-    });
-    error.map_or(Ok(statement), Err)
+    }
+
+    fn post_visit_query(
+        &mut self,
+        _query: &mut sqlparser::ast::Query,
+    ) -> std::ops::ControlFlow<Self::Break> {
+        self.scopes.pop().expect("visited query pushed a scope");
+        std::ops::ControlFlow::Continue(())
+    }
+
+    fn pre_visit_expr(&mut self, expression: &mut Expr) -> std::ops::ControlFlow<Self::Break> {
+        let identifiers = match expression {
+            Expr::Identifier(identifier) => std::slice::from_ref(identifier),
+            Expr::CompoundIdentifier(identifiers) => identifiers.as_slice(),
+            _ => return std::ops::ControlFlow::Continue(()),
+        };
+        for scope in self.scopes.iter().rev() {
+            if identifiers.len() == 2 {
+                let qualifier = identifier_name(&identifiers[0]);
+                if !scope
+                    .columns
+                    .iter()
+                    .any(|column| column.qualifier == qualifier)
+                {
+                    continue;
+                }
+            }
+            match scope.resolve_column(identifiers) {
+                Ok(_) => return std::ops::ControlFlow::Continue(()),
+                Err(error)
+                    if identifiers.len() == 1 && error.sqlstate == SqlState::UndefinedColumn => {}
+                Err(error) => {
+                    self.error = Some(error);
+                    return std::ops::ControlFlow::Break(());
+                }
+            }
+        }
+        match self.outer_scope.resolve_column(identifiers) {
+            Ok((_, data_type)) => {
+                match RowScope::Bound(self.outer_scope).column_value(identifiers, self.outer_row) {
+                    Ok(value) => {
+                        *expression = crate::analyzer::typed_literal(value, data_type.base);
+                        self.substituted = true;
+                    }
+                    Err(error) => {
+                        self.error = Some(error);
+                        return std::ops::ControlFlow::Break(());
+                    }
+                }
+            }
+            Err(error)
+                if matches!(
+                    error.sqlstate,
+                    SqlState::UndefinedColumn | SqlState::UndefinedTable
+                ) => {}
+            Err(error) => {
+                self.error = Some(error);
+                return std::ops::ControlFlow::Break(());
+            }
+        }
+        std::ops::ControlFlow::Continue(())
+    }
+}
+
+fn expression_references_outer(
+    catalog: &Catalog,
+    expression: &Expr,
+    outer_scope: &BoundScope,
+) -> Result<bool> {
+    let mut expression = expression.clone();
+    let outer_row = vec![Value::Null; outer_scope.columns.len()];
+    let mut substituter = OuterReferenceSubstituter {
+        catalog,
+        outer_scope,
+        outer_row: &outer_row,
+        scopes: Vec::new(),
+        error: None,
+        substituted: false,
+    };
+    let _ = expression.visit(&mut substituter);
+    substituter.error.map_or(Ok(substituter.substituted), Err)
+}
+
+fn evaluate_query_expression(
+    state: &DatabaseState,
+    expression: &Expr,
+    scope: &BoundScope,
+    row: &[Value],
+    xid: Xid,
+    snapshot: &Snapshot,
+    context: &ExecutionContext,
+) -> Result<Value> {
+    let mut expression = expression.clone();
+    let mut substituter = OuterReferenceSubstituter {
+        catalog: &state.catalog,
+        outer_scope: scope,
+        outer_row: row,
+        scopes: Vec::new(),
+        error: None,
+        substituted: false,
+    };
+    let _ = expression.visit(&mut substituter);
+    if let Some(error) = substituter.error {
+        return Err(error);
+    }
+    materialize_subqueries(state, &mut expression, xid, snapshot, context, false)?;
+    evaluate(&expression, RowScope::Bound(scope), row, context)
 }
 
 pub(crate) fn query_columns(
@@ -336,6 +522,7 @@ fn bind_values_scope(values: &sqlparser::ast::Values) -> Result<BoundScope> {
                 merged: None,
                 unqualified: true,
                 wildcard: true,
+                depth: 0,
             })
         })
         .collect::<Result<Vec<_>>>()?;
@@ -568,7 +755,7 @@ pub(super) fn select_rows(
         }
     };
     if let Some(selection) = &select.selection {
-        let base = expression_type(selection, RowScope::Bound(&scope))?;
+        let base = expression_data_type(state, selection, &scope)?.base;
         if base != BaseType::Bool && !null_expression(selection) {
             return Err(PgError::new(
                 SqlState::DatatypeMismatch,
@@ -625,7 +812,7 @@ pub(super) fn select_rows(
                     {
                         OrderKey::Output(index)
                     } else {
-                        expression_type(&order.expr, RowScope::Bound(&scope))?;
+                        expression_data_type(state, &order.expr, &scope)?;
                         OrderKey::Expression(&order.expr)
                     };
                     let ascending = order.options.asc.unwrap_or(true);
@@ -650,7 +837,9 @@ pub(super) fn select_rows(
         select.selection.as_ref(),
         &mut |row| {
             if let Some(selection) = &select.selection {
-                match evaluate(selection, RowScope::Bound(&scope), row, context)? {
+                match evaluate_query_expression(
+                    state, selection, &scope, row, xid, snapshot, context,
+                )? {
                     Value::Bool(true) => {}
                     Value::Bool(false) | Value::Null => return Ok(()),
                     _ => unreachable!("WHERE expression was type-checked"),
@@ -678,7 +867,7 @@ pub(super) fn select_rows(
                         }
                     }
                     Projection::Expression(expr) => {
-                        evaluate(expr, RowScope::Bound(&scope), row, context)
+                        evaluate_query_expression(state, expr, &scope, row, xid, snapshot, context)
                     }
                 })
                 .collect::<Result<Vec<_>>>()?;
@@ -686,9 +875,9 @@ pub(super) fn select_rows(
                 .iter()
                 .map(|order| match order.key {
                     OrderKey::Output(index) => Ok(values[index].clone()),
-                    OrderKey::Expression(expression) => {
-                        evaluate(expression, RowScope::Bound(&scope), row, context)
-                    }
+                    OrderKey::Expression(expression) => evaluate_query_expression(
+                        state, expression, &scope, row, xid, snapshot, context,
+                    ),
                 })
                 .collect::<Result<Vec<_>>>()?;
             rows.push(OrderedRow { values, keys });
@@ -866,19 +1055,7 @@ fn projections_and_columns<'a>(
 }
 
 fn expression_data_type(state: &DatabaseState, expr: &Expr, scope: &BoundScope) -> Result<PgType> {
-    if let Expr::Subquery(query) = expr {
-        let columns = query_columns(state, &Statement::Query(query.clone()))?;
-        if columns.len() != 1 {
-            return Err(PgError::new(
-                SqlState::SyntaxError,
-                "subquery must return only one column",
-            ));
-        }
-        return Ok(PgType::new(
-            BaseType::from_oid(columns[0].type_oid).expect("query result type OID is supported"),
-        ));
-    }
-    Ok(PgType::new(expression_type(expr, RowScope::Bound(scope))?))
+    super::scope::expression_data_type(&state.catalog, expr, scope)
 }
 
 fn source_rows(
@@ -1187,11 +1364,14 @@ fn visit_inner_join_rows(
                 })
                 .collect::<Vec<_>>();
             if join_matches(
+                state,
                 &join.join_operator,
                 &row,
                 scope,
                 starts[0],
                 starts[index + 1],
+                xid,
+                snapshot,
                 context,
             )? {
                 visit_inner_join_rows(
@@ -1326,11 +1506,14 @@ fn table_rows(
                     })
                     .collect::<Vec<_>>();
                 if join_matches(
+                    state,
                     &join.join_operator,
                     &row,
                     scope,
                     left_start,
                     right_start,
+                    xid,
+                    snapshot,
                     context,
                 )? {
                     matched_left = true;
@@ -1518,11 +1701,14 @@ fn push_filters<'a>(
 }
 
 fn join_matches(
+    state: &DatabaseState,
     operator: &sqlparser::ast::JoinOperator,
     row: &[Value],
     scope: &BoundScope,
     left_start: usize,
     right_start: usize,
+    xid: Xid,
+    snapshot: &Snapshot,
     context: &ExecutionContext,
 ) -> Result<bool> {
     let constraint = match operator {
@@ -1547,7 +1733,7 @@ fn join_matches(
             sqlparser::ast::JoinOperator::CrossJoin(_)
         )),
         sqlparser::ast::JoinConstraint::On(expression) => Ok(matches!(
-            evaluate(expression, RowScope::Bound(scope), row, context)?,
+            evaluate_query_expression(state, expression, scope, row, xid, snapshot, context,)?,
             Value::Bool(true)
         )),
         sqlparser::ast::JoinConstraint::Using(names) => join_using_matches(

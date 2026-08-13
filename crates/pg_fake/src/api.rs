@@ -4035,6 +4035,123 @@ mod tests {
     }
 
     #[test]
+    fn executes_correlated_subqueries_with_lexical_scopes() {
+        let db = Db::new();
+        let mut session = db.session();
+        session
+            .execute("CREATE TABLE parents (id INTEGER, threshold INTEGER)")
+            .unwrap();
+        session
+            .execute("CREATE TABLE children (id INTEGER, parent_id INTEGER, value INTEGER)")
+            .unwrap();
+        session
+            .execute("INSERT INTO parents VALUES (1, 15), (2, 5), (3, NULL)")
+            .unwrap();
+        session
+            .execute("INSERT INTO children VALUES (10, 1, 10), (11, 1, 20), (12, 2, NULL)")
+            .unwrap();
+
+        let result = session
+            .query(
+                "SELECT p.id, EXISTS (SELECT 1 FROM children AS c WHERE c.parent_id = p.id AND c.value > p.threshold) AS has_match FROM parents AS p ORDER BY p.id",
+                &[],
+            )
+            .unwrap();
+        assert_eq!(
+            result.rows,
+            vec![
+                vec![Value::Int4(1), Value::Bool(true)],
+                vec![Value::Int4(2), Value::Bool(false)],
+                vec![Value::Int4(3), Value::Bool(false)],
+            ]
+        );
+
+        assert_eq!(
+            session
+                .query(
+                    "SELECT p.id FROM parents AS p WHERE p.id IN (SELECT c.parent_id FROM children AS c WHERE c.value > p.threshold) ORDER BY p.id",
+                    &[],
+                )
+                .unwrap()
+                .rows,
+            vec![vec![Value::Int4(1)]]
+        );
+        assert_eq!(
+            session
+                .query(
+                    "SELECT p.id FROM parents AS p WHERE p.threshold < ANY (SELECT c.value FROM children AS c WHERE c.parent_id = p.id) ORDER BY p.id",
+                    &[],
+                )
+                .unwrap()
+                .rows,
+            vec![vec![Value::Int4(1)]]
+        );
+        let nested = session
+            .prepare(
+                "SELECT p.id FROM parents AS p WHERE EXISTS (SELECT 1 FROM children AS c WHERE c.parent_id = p.id AND EXISTS (SELECT 1 WHERE c.value > p.threshold)) ORDER BY p.id",
+            )
+            .unwrap();
+        assert_eq!(
+            session.query_prepared(&nested, &[]).unwrap().rows,
+            vec![vec![Value::Int4(1)]]
+        );
+        assert_eq!(
+            session
+                .query(
+                    "SELECT p.id FROM parents AS p JOIN children AS c ON c.parent_id = p.id AND EXISTS (SELECT 1 WHERE c.value > p.threshold) ORDER BY p.id",
+                    &[],
+                )
+                .unwrap()
+                .rows,
+            vec![vec![Value::Int4(1)]]
+        );
+        assert_eq!(
+            session
+                .query(
+                    "SELECT p.id FROM parents AS p WHERE EXISTS (SELECT 1 FROM children AS p WHERE p.parent_id = p.id) ORDER BY p.id",
+                    &[],
+                )
+                .unwrap()
+                .rows,
+            Vec::<Vec<Value>>::new()
+        );
+        assert_eq!(
+            session
+                .query(
+                    "SELECT (SELECT c.value FROM children AS c WHERE c.parent_id = p.id) FROM parents AS p WHERE p.id = 1",
+                    &[],
+                )
+                .unwrap_err()
+                .sqlstate,
+            SqlState::CardinalityViolation
+        );
+
+        session
+            .execute("CREATE TABLE empty_parents (id INTEGER)")
+            .unwrap();
+        assert_eq!(
+            session
+                .query(
+                    "SELECT p.id FROM empty_parents AS p WHERE EXISTS (SELECT 1 WHERE missing = 1)",
+                    &[],
+                )
+                .unwrap_err()
+                .sqlstate,
+            SqlState::UndefinedColumn
+        );
+        assert_eq!(
+            session
+                .query(
+                    "SELECT p.id FROM parents AS p CROSS JOIN parents AS other WHERE EXISTS (SELECT 1 WHERE id = 1)",
+                    &[],
+                )
+                .unwrap_err()
+                .sqlstate,
+            SqlState::AmbiguousColumn
+        );
+    }
+
+    #[test]
     fn tolerates_only_planner_settings_outside_strict_mode() {
         let db = Db::new();
         let mut session = db.session();

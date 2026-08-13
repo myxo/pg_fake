@@ -812,6 +812,25 @@ fn generated_sql_matches_postgres() {
             ),
             RowOrder::Ordered,
         );
+        let correlation_threshold = integer(src, "correlation_threshold");
+        assert_statement(
+            &runtime,
+            postgres.client(),
+            &mut fake,
+            &format!(
+                "SELECT outer_row.row_key, \
+                    EXISTS (SELECT 1 FROM {table} AS inner_row \
+                        WHERE inner_row.row_key = outer_row.row_key \
+                          AND inner_row.int_value IS NOT DISTINCT FROM outer_row.int_value), \
+                    outer_row.row_key IN (SELECT inner_row.row_key FROM {table} AS inner_row \
+                        WHERE inner_row.int_value > outer_row.int_value + {correlation_threshold}), \
+                    EXISTS (SELECT 1 FROM {table} AS middle_row \
+                        WHERE middle_row.row_key = outer_row.row_key \
+                          AND EXISTS (SELECT 1 WHERE middle_row.int_value IS NOT DISTINCT FROM outer_row.int_value)) \
+                 FROM {table} AS outer_row ORDER BY outer_row.row_key"
+            ),
+            RowOrder::Ordered,
+        );
         assert_statement(
             &runtime,
             postgres.client(),

@@ -1152,6 +1152,37 @@ fn derived_and_scalar_subquery_benchmark(
         });
     });
     group.finish();
+
+    let fake_query_sql = format!(
+        "SELECT outer_row.id FROM {fake_table} AS outer_row WHERE EXISTS (SELECT 1 FROM {fake_table} AS inner_row WHERE inner_row.id = outer_row.id)"
+    );
+    let postgres_query_sql = format!(
+        "SELECT outer_row.id FROM {postgres_table} AS outer_row WHERE EXISTS (SELECT 1 FROM {postgres_table} AS inner_row WHERE inner_row.id = outer_row.id)"
+    );
+    let mut group =
+        criterion.benchmark_group(benchmarks::find_benchmark("correlated_exists_100_rows").name);
+    group.throughput(Throughput::Elements(100));
+    group.bench_function("pg_fake", |benchmark| {
+        benchmark.iter(|| {
+            let result = fake_query(runtime, &mut fake, &fake_query_sql);
+            assert_eq!(result.len(), 100);
+            black_box(result);
+        });
+    });
+    group.bench_function("postgres_18", |benchmark| {
+        benchmark.iter(|| {
+            let result = postgres.simple_query(&postgres_query_sql).unwrap();
+            assert_eq!(
+                result
+                    .iter()
+                    .filter(|message| matches!(message, SimpleQueryMessage::Row(_)))
+                    .count(),
+                100
+            );
+            black_box(result);
+        });
+    });
+    group.finish();
     postgres
         .execute(&format!("DROP TABLE {postgres_table}"), &[])
         .unwrap();

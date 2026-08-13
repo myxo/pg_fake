@@ -822,3 +822,23 @@ fn uncorrelated_subquery_predicates_match_postgres() {
         RowOrder::Ordered,
     );
 }
+
+#[test]
+fn correlated_subqueries_match_postgres() {
+    assert_differential(
+        "CREATE TABLE __TABLE__ (id INTEGER, threshold INTEGER); \
+         CREATE TABLE __TABLE___children (id INTEGER, parent_id INTEGER, value INTEGER); \
+         INSERT INTO __TABLE__ VALUES (1, 15), (2, 5), (3, NULL); \
+         INSERT INTO __TABLE___children VALUES (10, 1, 10), (11, 1, 20), (12, 2, NULL); \
+         SELECT p.id, (SELECT c.value FROM __TABLE___children AS c WHERE c.parent_id = p.id ORDER BY c.id LIMIT 1) FROM __TABLE__ AS p ORDER BY p.id; \
+         SELECT p.id FROM __TABLE__ AS p WHERE EXISTS (SELECT 1 FROM __TABLE___children AS c WHERE c.parent_id = p.id AND c.value > p.threshold) ORDER BY p.id; \
+         SELECT p.id FROM __TABLE__ AS p WHERE p.id IN (SELECT c.parent_id FROM __TABLE___children AS c WHERE c.value > p.threshold) ORDER BY p.id; \
+         SELECT p.id FROM __TABLE__ AS p WHERE p.threshold < ANY (SELECT c.value FROM __TABLE___children AS c WHERE c.parent_id = p.id) ORDER BY p.id; \
+         SELECT p.id FROM __TABLE__ AS p WHERE p.threshold < ALL (SELECT c.value FROM __TABLE___children AS c WHERE c.parent_id = p.id) ORDER BY p.id; \
+         SELECT p.id FROM __TABLE__ AS p WHERE EXISTS (SELECT 1 FROM __TABLE___children AS c WHERE c.parent_id = p.id AND EXISTS (SELECT 1 WHERE c.value > p.threshold)) ORDER BY p.id; \
+         SELECT p.id FROM __TABLE__ AS p JOIN __TABLE___children AS c ON c.parent_id = p.id AND EXISTS (SELECT 1 WHERE c.value > p.threshold) ORDER BY p.id; \
+         SELECT p.id FROM __TABLE__ AS p WHERE EXISTS (SELECT 1 FROM __TABLE___children AS p WHERE p.parent_id = p.id) ORDER BY p.id; \
+         SELECT (SELECT c.value FROM __TABLE___children AS c WHERE c.parent_id = p.id) FROM __TABLE__ AS p WHERE p.id = 1",
+        RowOrder::Ordered,
+    );
+}

@@ -51,7 +51,7 @@ pub(crate) use foreign_keys::{contains_deferred_foreign_keys, validate_deferred_
 pub(crate) use locks::required_row_locks;
 pub(crate) use scope::query_output_columns;
 use scope::{BoundColumn, bind_select_scope};
-pub(crate) use scope::{BoundScope, RowScope, bind_query_scope};
+pub(crate) use scope::{BoundScope, RowScope, bind_query_scope, describe_expression_subqueries};
 use writes::{delete_rows, insert_rows, update_rows};
 
 #[derive(Clone)]

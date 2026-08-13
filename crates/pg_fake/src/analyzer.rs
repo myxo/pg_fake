@@ -5,7 +5,7 @@ use std::ops::ControlFlow;
 use sqlparser::ast::{
     AssignmentTarget, BinaryOperator, CastKind, DataType, Expr, FromTable, FunctionArg,
     FunctionArgExpr, FunctionArguments, LimitClause, OrderByKind, SelectItem, SetExpr, Statement,
-    TableFactor, Value as AstValue, visit_expressions, visit_expressions_mut,
+    TableFactor, Value as AstValue, VisitMut, VisitorMut, visit_expressions, visit_expressions_mut,
 };
 
 use crate::{
@@ -160,6 +160,18 @@ pub(crate) fn parameter_types(statement: &Statement, catalog: &Catalog) -> Resul
 
 pub(crate) fn describe_subqueries(statement: &Statement, catalog: &Catalog) -> Result<Statement> {
     let mut statement = statement.clone();
+    if let Statement::Query(query) = &statement
+        && let SetExpr::Select(select) = query.body.as_ref()
+    {
+        let outer = executor::bind_query_scope(catalog, select)?;
+        let mut describer = ScopedSubqueryDescriber {
+            catalog,
+            outer: &outer,
+            error: None,
+        };
+        let _ = statement.visit(&mut describer);
+        return describer.error.map_or(Ok(statement), Err);
+    }
     let mut error = None;
     let _ = visit_expressions_mut(&mut statement, |expression| {
         if error.is_some() {
@@ -216,6 +228,40 @@ pub(crate) fn describe_subqueries(statement: &Statement, catalog: &Catalog) -> R
         ControlFlow::Continue(())
     });
     error.map_or(Ok(statement), Err)
+}
+
+struct ScopedSubqueryDescriber<'a> {
+    catalog: &'a Catalog,
+    outer: &'a executor::BoundScope,
+    error: Option<PgError>,
+}
+
+impl VisitorMut for ScopedSubqueryDescriber<'_> {
+    type Break = ();
+
+    fn pre_visit_expr(&mut self, expression: &mut Expr) -> ControlFlow<Self::Break> {
+        if self.error.is_some() {
+            return ControlFlow::Break(());
+        }
+        if !matches!(
+            expression,
+            Expr::Subquery(_)
+                | Expr::Exists { .. }
+                | Expr::InSubquery { .. }
+                | Expr::AnyOp { .. }
+                | Expr::AllOp { .. }
+        ) {
+            return ControlFlow::Continue(());
+        }
+        match executor::describe_expression_subqueries(self.catalog, expression, self.outer) {
+            Ok(described) => *expression = described,
+            Err(error) => {
+                self.error = Some(error);
+                return ControlFlow::Break(());
+            }
+        }
+        ControlFlow::Continue(())
+    }
 }
 
 pub(crate) fn bind(

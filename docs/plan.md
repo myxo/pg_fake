@@ -208,7 +208,7 @@ semantics.
 - Differential/property tests cover empty sets, matches, misses, NULLs on both
   sides, duplicates, row values, and incompatible types.
 
-### Task 8 — Correlated subqueries
+### Task 8 — Correlated subqueries [COMPLETE]
 
 **Goal:** Resolve and execute subqueries that reference enclosing query rows.
 
@@ -224,6 +224,23 @@ semantics.
   NULLs, and cardinality errors.
 
 **Notes:** `LATERAL` table sources are not required in Phase 2.
+
+**Completed:**
+
+- Correlated scalar, `EXISTS`, membership, and quantified subqueries resolve
+  enclosing rows at evaluation time, including nested outer scopes and join
+  predicates.
+- Scope-depth binding enforces nearest-scope lookup, qualified-name shadowing,
+  ambiguity errors, and per-row scalar cardinality checks without retaining
+  outer rows between evaluations.
+- Native, PostgreSQL differential, generated differential, and benchmark
+  coverage now includes correlation, nested scopes, alias shadowing, NULLs,
+  cardinality errors, and a 100-row correlated `EXISTS` workload.
+- The Phase 2 manifest promotes `correlated_exists` to `MustPass`; the current
+  report records 413 matching corpus statements, 141 skipped scripts, and 22
+  passing Phase 2 conformance cases with no correlated-subquery blocker.
+- `cargo test --workspace`, `cargo check --workspace --all-targets`, and the
+  10,000-iteration property suite pass.
 
 ---
 

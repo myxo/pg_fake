@@ -160,7 +160,7 @@ pub const FEATURES: &[Feature] = &[
                 "INSERT INTO correlated_rows VALUES (1)",
             ],
             sql: "SELECT id FROM correlated_rows outer_row WHERE EXISTS (SELECT 1 FROM correlated_rows inner_row WHERE inner_row.id = outer_row.id)",
-            baseline: Baseline::Pending,
+            baseline: Baseline::MustPass,
         }],
     },
     Feature {
