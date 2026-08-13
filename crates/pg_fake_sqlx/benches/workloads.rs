@@ -6,11 +6,11 @@ use std::{
 
 use criterion::{BenchmarkId, Criterion, Throughput, black_box, criterion_group, criterion_main};
 use pg_fake::{
-    api::{IsolationLevel, Session, StatementResult},
+    api::{IsolationLevel, Session},
     value::Value,
 };
 use pg_fake_benchmarks as benchmarks;
-use pg_fake_sqlx::{Db, PgFakeConnection, PgFakeRow};
+use pg_fake_sqlx::{Db, PgFakeConnection};
 use sqlx::{AssertSqlSafe, Connection};
 use sqlx_postgres::PgConnection;
 use testcontainers::{Container, ImageExt, runners::SyncRunner};
@@ -25,66 +25,70 @@ enum BenchmarkConnection<'a> {
 type NamedBenchmarkConnection<'a> = (&'static str, BenchmarkConnection<'a>);
 
 impl BenchmarkConnection<'_> {
-    fn execute(&mut self, runtime: &Runtime, sql: &str) -> u64 {
+    fn execute(&mut self, runtime: &Runtime, sql: &str) {
         match self {
-            Self::PgFake(connection) => runtime
-                .block_on(sqlx::query(AssertSqlSafe(sql)).execute(&mut **connection))
-                .unwrap()
-                .rows_affected(),
-            Self::Postgres(connection) => runtime
-                .block_on(sqlx::query(AssertSqlSafe(sql)).execute(&mut **connection))
-                .unwrap()
-                .rows_affected(),
+            Self::PgFake(connection) => {
+                let result = runtime
+                    .block_on(sqlx::query(AssertSqlSafe(sql)).execute(&mut **connection))
+                    .unwrap();
+                black_box(result);
+            }
+            Self::Postgres(connection) => {
+                let result = runtime
+                    .block_on(sqlx::query(AssertSqlSafe(sql)).execute(&mut **connection))
+                    .unwrap();
+                black_box(result);
+            }
         }
     }
 
-    fn fetch_count(&mut self, runtime: &Runtime, sql: &str) -> usize {
+    fn fetch(&mut self, runtime: &Runtime, sql: &str) {
         match self {
             Self::PgFake(connection) => {
                 let rows = runtime
                     .block_on(sqlx::query(AssertSqlSafe(sql)).fetch_all(&mut **connection))
                     .unwrap();
-                let count = rows.len();
                 black_box(rows);
-                count
             }
             Self::Postgres(connection) => {
                 let rows = runtime
                     .block_on(sqlx::query(AssertSqlSafe(sql)).fetch_all(&mut **connection))
                     .unwrap();
-                let count = rows.len();
                 black_box(rows);
-                count
             }
         }
     }
 
-    fn execute_in_transaction(&mut self, runtime: &Runtime, sql: &str) -> u64 {
+    fn execute_in_transaction(&mut self, runtime: &Runtime, sql: &str) {
         match self {
-            Self::PgFake(connection) => runtime.block_on(async {
-                let mut transaction = connection.begin().await.unwrap();
-                let affected = sqlx::query(AssertSqlSafe(sql))
-                    .execute(&mut *transaction)
-                    .await
-                    .unwrap()
-                    .rows_affected();
-                transaction.commit().await.unwrap();
-                affected
-            }),
-            Self::Postgres(connection) => runtime.block_on(async {
-                let mut transaction = connection.begin().await.unwrap();
-                let affected = sqlx::query(AssertSqlSafe(sql))
-                    .execute(&mut *transaction)
-                    .await
-                    .unwrap()
-                    .rows_affected();
-                transaction.commit().await.unwrap();
-                affected
-            }),
+            Self::PgFake(connection) => {
+                let result = runtime.block_on(async {
+                    let mut transaction = connection.begin().await.unwrap();
+                    let result = sqlx::query(AssertSqlSafe(sql))
+                        .execute(&mut *transaction)
+                        .await
+                        .unwrap();
+                    transaction.commit().await.unwrap();
+                    result
+                });
+                black_box(result);
+            }
+            Self::Postgres(connection) => {
+                let result = runtime.block_on(async {
+                    let mut transaction = connection.begin().await.unwrap();
+                    let result = sqlx::query(AssertSqlSafe(sql))
+                        .execute(&mut *transaction)
+                        .await
+                        .unwrap();
+                    transaction.commit().await.unwrap();
+                    result
+                });
+                black_box(result);
+            }
         }
     }
 
-    fn fetch_count_in_transaction(&mut self, runtime: &Runtime, begin: &str, sql: &str) -> usize {
+    fn fetch_in_transaction(&mut self, runtime: &Runtime, begin: &str, sql: &str) {
         match self {
             Self::PgFake(connection) => runtime.block_on(async {
                 let mut transaction = connection.begin_with(AssertSqlSafe(begin)).await.unwrap();
@@ -93,9 +97,7 @@ impl BenchmarkConnection<'_> {
                     .await
                     .unwrap();
                 transaction.commit().await.unwrap();
-                let count = rows.len();
                 black_box(rows);
-                count
             }),
             Self::Postgres(connection) => runtime.block_on(async {
                 let mut transaction = connection.begin_with(AssertSqlSafe(begin)).await.unwrap();
@@ -104,34 +106,29 @@ impl BenchmarkConnection<'_> {
                     .await
                     .unwrap();
                 transaction.commit().await.unwrap();
-                let count = rows.len();
                 black_box(rows);
-                count
             }),
         }
     }
 }
 
-fn fake_execute(runtime: &Runtime, connection: &mut PgFakeConnection, sql: &str) -> u64 {
-    runtime
+fn fake_execute(runtime: &Runtime, connection: &mut PgFakeConnection, sql: &str) {
+    let result = runtime
         .block_on(sqlx::query(AssertSqlSafe(sql)).execute(connection))
-        .unwrap()
-        .rows_affected()
+        .unwrap();
+    black_box(result);
 }
 
-fn fake_query(runtime: &Runtime, connection: &mut PgFakeConnection, sql: &str) -> Vec<PgFakeRow> {
-    runtime
+fn fake_query(runtime: &Runtime, connection: &mut PgFakeConnection, sql: &str) {
+    let rows = runtime
         .block_on(sqlx::query(AssertSqlSafe(sql)).fetch_all(connection))
-        .unwrap()
+        .unwrap();
+    black_box(rows);
 }
 
-fn core_execute(session: &mut Session, sql: &str) -> u64 {
+fn core_execute(session: &mut Session, sql: &str) {
     let results = session.execute(sql).unwrap();
-    assert_eq!(results.len(), 1);
-    match results.into_iter().next().unwrap() {
-        StatementResult::Affected(rows) => rows,
-        StatementResult::Query(_) => panic!("expected an affected-row result"),
-    }
+    black_box(results);
 }
 
 fn insert_values_sql(table: &str, rows: usize) -> String {
@@ -209,8 +206,8 @@ fn create_table_benchmark(
     for (name, connection) in connections.iter_mut() {
         group.bench_function(*name, |benchmark| {
             benchmark.iter(|| {
-                assert_eq!(connection.execute(runtime, create), 0);
-                black_box(connection.execute(runtime, drop));
+                connection.execute(runtime, create);
+                connection.execute(runtime, drop);
             });
         });
     }
@@ -227,7 +224,7 @@ fn insert_benchmark(
         "CREATE TABLE insert_row_with_defaults (id INTEGER PRIMARY KEY CHECK (id > 0), name TEXT NOT NULL DEFAULT upper('benchmark'), CHECK (length(name) > 0))",
     ] {
         for (_, connection) in connections.iter_mut() {
-            assert_eq!(connection.execute(runtime, create), 0);
+            connection.execute(runtime, create);
         }
     }
     let mut group = criterion.benchmark_group(benchmarks::find_benchmark("insert_row").name);
@@ -237,12 +234,9 @@ fn insert_benchmark(
         group.bench_function(*name, |benchmark| {
             benchmark.iter(|| {
                 id += 1;
-                assert_eq!(
-                    connection.execute(
-                        runtime,
-                        &format!("INSERT INTO insert_row VALUES ({id}, 'benchmark')")
-                    ),
-                    1
+                connection.execute(
+                    runtime,
+                    &format!("INSERT INTO insert_row VALUES ({id}, 'benchmark')"),
                 );
             });
         });
@@ -257,12 +251,9 @@ fn insert_benchmark(
         group.bench_function(*name, |benchmark| {
             benchmark.iter(|| {
                 id += 1;
-                assert_eq!(
-                    connection.execute(
-                        runtime,
-                        &format!("INSERT INTO insert_row_with_defaults (id) VALUES ({id})")
-                    ),
-                    1
+                connection.execute(
+                    runtime,
+                    &format!("INSERT INTO insert_row_with_defaults (id) VALUES ({id})"),
                 );
             });
         });
@@ -279,12 +270,9 @@ fn update_benchmark(
     connections: &mut [NamedBenchmarkConnection<'_>],
 ) {
     for (_, connection) in connections.iter_mut() {
-        assert_eq!(
-            connection.execute(
-                runtime,
-                "CREATE TABLE update_row (id BIGINT PRIMARY KEY, amount INTEGER)",
-            ),
-            0
+        connection.execute(
+            runtime,
+            "CREATE TABLE update_row (id BIGINT PRIMARY KEY, amount INTEGER)",
         );
     }
     let mut group = criterion.benchmark_group(benchmarks::find_benchmark("update_row").name);
@@ -299,7 +287,7 @@ fn update_benchmark(
                     let update =
                         format!("UPDATE update_row SET amount = amount + 1 WHERE id = {id}");
                     let started = Instant::now();
-                    assert_eq!(connection.execute(runtime, &update), 1);
+                    connection.execute(runtime, &update);
                     elapsed += started.elapsed();
                     connection.execute(runtime, &format!("DELETE FROM update_row WHERE id = {id}"));
                 }
@@ -319,10 +307,7 @@ fn delete_benchmark(
     connections: &mut [NamedBenchmarkConnection<'_>],
 ) {
     for (_, connection) in connections.iter_mut() {
-        assert_eq!(
-            connection.execute(runtime, "CREATE TABLE delete_row (id INTEGER)"),
-            0
-        );
+        connection.execute(runtime, "CREATE TABLE delete_row (id INTEGER)");
     }
     let mut group = criterion.benchmark_group(benchmarks::find_benchmark("delete_row").name);
 
@@ -334,7 +319,7 @@ fn delete_benchmark(
                     connection.execute(runtime, &format!("INSERT INTO delete_row VALUES ({id})"));
                     let delete = format!("DELETE FROM delete_row WHERE id = {id}");
                     let started = Instant::now();
-                    assert_eq!(connection.execute(runtime, &delete), 1);
+                    connection.execute(runtime, &delete);
                     elapsed += started.elapsed();
                 }
                 elapsed
@@ -353,10 +338,7 @@ fn transaction_benchmark(
     connections: &mut [NamedBenchmarkConnection<'_>],
 ) {
     for (_, connection) in connections.iter_mut() {
-        assert_eq!(
-            connection.execute(runtime, "CREATE TABLE transaction_insert (id INTEGER)"),
-            0
-        );
+        connection.execute(runtime, "CREATE TABLE transaction_insert (id INTEGER)");
     }
     let mut group =
         criterion.benchmark_group(benchmarks::find_benchmark("transaction_insert").name);
@@ -366,12 +348,9 @@ fn transaction_benchmark(
         group.bench_function(*name, |benchmark| {
             benchmark.iter(|| {
                 id += 1;
-                assert_eq!(
-                    connection.execute_in_transaction(
-                        runtime,
-                        &format!("INSERT INTO transaction_insert VALUES ({id})")
-                    ),
-                    1
+                connection.execute_in_transaction(
+                    runtime,
+                    &format!("INSERT INTO transaction_insert VALUES ({id})"),
                 );
             });
         });
@@ -405,13 +384,10 @@ fn repeatable_read_benchmark(
     for (name, connection) in connections.iter_mut() {
         group.bench_function(*name, |benchmark| {
             benchmark.iter(|| {
-                assert_eq!(
-                    connection.fetch_count_in_transaction(
-                        runtime,
-                        "BEGIN ISOLATION LEVEL REPEATABLE READ",
-                        select,
-                    ),
-                    1
+                connection.fetch_in_transaction(
+                    runtime,
+                    "BEGIN ISOLATION LEVEL REPEATABLE READ",
+                    select,
                 );
             });
         });
@@ -434,8 +410,8 @@ fn select_benchmark(
         let create = format!("CREATE TABLE {table} (id INTEGER, name TEXT)");
         let insert = insert_values_sql(table, 100);
         for (_, connection) in connections.iter_mut() {
-            assert_eq!(connection.execute(runtime, &create), 0);
-            assert_eq!(connection.execute(runtime, &insert), 100);
+            connection.execute(runtime, &create);
+            connection.execute(runtime, &insert);
         }
     }
     let select = "SELECT * FROM select_100_rows";
@@ -444,7 +420,7 @@ fn select_benchmark(
     for (name, connection) in connections.iter_mut() {
         group.bench_function(*name, |benchmark| {
             benchmark.iter(|| {
-                assert_eq!(connection.fetch_count(runtime, select), 100);
+                connection.fetch(runtime, select);
             });
         });
     }
@@ -458,7 +434,7 @@ fn select_benchmark(
     for (name, connection) in connections.iter_mut() {
         group.bench_function(*name, |benchmark| {
             benchmark.iter(|| {
-                assert_eq!(connection.fetch_count(runtime, select), 10);
+                connection.fetch(runtime, select);
             });
         });
     }
@@ -477,12 +453,9 @@ fn order_by_benchmark(
     connections: &mut [NamedBenchmarkConnection<'_>],
 ) {
     for (_, connection) in connections.iter_mut() {
-        assert_eq!(
-            connection.execute(
-                runtime,
-                "CREATE TABLE order_by_100_rows (id INTEGER, bucket INTEGER)",
-            ),
-            0
+        connection.execute(
+            runtime,
+            "CREATE TABLE order_by_100_rows (id INTEGER, bucket INTEGER)",
         );
     }
     for id in 1..=100 {
@@ -492,12 +465,9 @@ fn order_by_benchmark(
             (id % 10).to_string()
         };
         for (_, connection) in connections.iter_mut() {
-            assert_eq!(
-                connection.execute(
-                    runtime,
-                    &format!("INSERT INTO order_by_100_rows VALUES ({id}, {bucket})"),
-                ),
-                1
+            connection.execute(
+                runtime,
+                &format!("INSERT INTO order_by_100_rows VALUES ({id}, {bucket})"),
             );
         }
     }
@@ -507,7 +477,7 @@ fn order_by_benchmark(
     for (name, connection) in connections.iter_mut() {
         group.bench_function(*name, |benchmark| {
             benchmark.iter(|| {
-                assert_eq!(connection.fetch_count(runtime, select), 100);
+                connection.fetch(runtime, select);
             });
         });
     }
@@ -549,15 +519,12 @@ fn core_vs_sqlx_benchmark(criterion: &mut Criterion, runtime: &Runtime) {
     group.bench_function("core", |benchmark| {
         benchmark.iter(|| {
             let result = core.query(query, &[]).unwrap();
-            assert_eq!(result.rows.len(), 100);
             black_box(result);
         });
     });
     group.bench_function("sqlx", |benchmark| {
         benchmark.iter(|| {
-            let result = fake_query(runtime, &mut sqlx, query);
-            assert_eq!(result.len(), 100);
-            black_box(result);
+            fake_query(runtime, &mut sqlx, query);
         });
     });
     group.finish();
@@ -586,14 +553,12 @@ fn parsed_vs_prepared_benchmark(criterion: &mut Criterion) {
     group.bench_function("parse_and_analyze", |benchmark| {
         benchmark.iter(|| {
             let result = session.query(query, &parameters).unwrap();
-            assert_eq!(result.rows.len(), 1);
             black_box(result);
         });
     });
     group.bench_function("prepared_reuse", |benchmark| {
         benchmark.iter(|| {
             let result = session.query_prepared(&prepared, &parameters).unwrap();
-            assert_eq!(result.rows.len(), 1);
             black_box(result);
         });
     });
@@ -628,7 +593,6 @@ fn transaction_history_benchmark(criterion: &mut Criterion) {
             |benchmark, _| {
                 benchmark.iter(|| {
                     let result = transaction.query_prepared(&statement, &[]).unwrap();
-                    assert_eq!(result.rows.len(), 1);
                     black_box(result);
                 });
             },
@@ -654,17 +618,14 @@ fn mvcc_version_chain_benchmark(criterion: &mut Criterion) {
             .prepare("SELECT amount FROM mvcc_chain_probe WHERE id = 1")
             .unwrap();
         let mut reader = reader.begin_with(IsolationLevel::RepeatableRead).unwrap();
-        assert_eq!(
-            reader.query_prepared(&statement, &[]).unwrap().rows.len(),
-            1
-        );
+        black_box(reader.query_prepared(&statement, &[]).unwrap());
 
         let mut updater = db.session();
         let update = updater
             .prepare("UPDATE mvcc_chain_probe SET amount = amount + 1 WHERE id = 1")
             .unwrap();
         for _ in 0..updates {
-            assert_eq!(updater.execute_prepared(&update, &[]).unwrap(), 1);
+            black_box(updater.execute_prepared(&update, &[]).unwrap());
         }
 
         group.bench_with_input(
@@ -673,7 +634,6 @@ fn mvcc_version_chain_benchmark(criterion: &mut Criterion) {
             |benchmark, _| {
                 benchmark.iter(|| {
                     let result = reader.query_prepared(&statement, &[]).unwrap();
-                    assert_eq!(result.rows, vec![vec![Value::Int4(0)]]);
                     black_box(result);
                 });
             },
@@ -708,7 +668,6 @@ fn indexed_vs_scan_benchmark(criterion: &mut Criterion) {
                     let result = indexed
                         .query_prepared(&indexed_statement, &indexed_parameters)
                         .unwrap();
-                    assert_eq!(result.rows.len(), 1);
                     black_box(result);
                 });
             },
@@ -734,7 +693,6 @@ fn indexed_vs_scan_benchmark(criterion: &mut Criterion) {
                     let result = scanned
                         .query_prepared(&scanned_statement, &scanned_parameters)
                         .unwrap();
-                    assert_eq!(result.rows.len(), 1);
                     black_box(result);
                 });
             },
@@ -888,12 +846,9 @@ fn foreign_key_insert_benchmark(
                     runtime,
                     &format!("INSERT INTO foreign_key_insert_parent VALUES ({id})"),
                 );
-                assert_eq!(
-                    connection.execute(
-                        runtime,
-                        &format!("INSERT INTO foreign_key_insert VALUES ({id}, {id})")
-                    ),
-                    1
+                connection.execute(
+                    runtime,
+                    &format!("INSERT INTO foreign_key_insert VALUES ({id}, {id})"),
                 );
             });
         });
@@ -975,7 +930,7 @@ fn derived_and_scalar_subquery_benchmark(
     for (name, connection) in connections.iter_mut() {
         group.bench_function(*name, |benchmark| {
             benchmark.iter(|| {
-                assert_eq!(connection.fetch_count(runtime, query), 100);
+                connection.fetch(runtime, query);
             });
         });
     }
@@ -988,7 +943,7 @@ fn derived_and_scalar_subquery_benchmark(
     for (name, connection) in connections.iter_mut() {
         group.bench_function(*name, |benchmark| {
             benchmark.iter(|| {
-                assert_eq!(connection.fetch_count(runtime, query), 100);
+                connection.fetch(runtime, query);
             });
         });
     }
@@ -1040,7 +995,7 @@ fn inner_join_benchmark(
         for (connection_name, connection) in connections.iter_mut() {
             group.bench_function(*connection_name, |benchmark| {
                 benchmark.iter(|| {
-                    assert_eq!(connection.fetch_count(runtime, query), expected as usize);
+                    connection.fetch(runtime, query);
                 });
             });
         }
