@@ -296,6 +296,9 @@ impl Connection for PgFakeConnection {
     }
 
     fn ping(&mut self) -> impl Future<Output = Result<(), sqlx::Error>> + Send + '_ {
+        // Since rust don't have async Drop, we need to do rollback somewhere. This is the place.
+        // In `PgFakeTransactionManager::start_rollback` we set pending_rollback to true
+        // and make actual rollback next time runtime call this function
         let rollback = self.take_pending_rollback();
         let state = self.state.clone();
         async move {
