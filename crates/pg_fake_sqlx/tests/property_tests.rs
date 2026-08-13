@@ -214,6 +214,9 @@ fn assert_statement(
         TestConnection::Fake(fake),
     ]
     .map(|mut connection| connection.execute(runtime, &statement, sql));
+    if let Outcome::Error(sqlstate) = &expected {
+        panic!("generator produced invalid SQL ({sqlstate}): {sql}");
+    }
     match (expected, actual) {
         (Outcome::Rows(mut expected), Outcome::Rows(mut actual)) => {
             if matches!(row_order, RowOrder::Unordered) {
@@ -250,6 +253,190 @@ fn integer(src: &mut Source, label: &str) -> i32 {
     src.any_of(label, int_in_range(-20..=20))
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum SqlType {
+    SmallInt,
+    Integer,
+    BigInt,
+    Numeric,
+    Real,
+    Double,
+    Boolean,
+    Text,
+    Varchar,
+    Char,
+    Bytea,
+}
+
+impl SqlType {
+    fn sql(self) -> &'static str {
+        match self {
+            Self::SmallInt => "SMALLINT",
+            Self::Integer => "INTEGER",
+            Self::BigInt => "BIGINT",
+            Self::Numeric => "NUMERIC(8, 2)",
+            Self::Real => "REAL",
+            Self::Double => "DOUBLE PRECISION",
+            Self::Boolean => "BOOLEAN",
+            Self::Text => "TEXT",
+            Self::Varchar => "VARCHAR(12)",
+            Self::Char => "CHAR(8)",
+            Self::Bytea => "BYTEA",
+        }
+    }
+
+    fn is_numeric(self) -> bool {
+        matches!(
+            self,
+            Self::SmallInt
+                | Self::Integer
+                | Self::BigInt
+                | Self::Numeric
+                | Self::Real
+                | Self::Double
+        )
+    }
+
+    fn is_integral(self) -> bool {
+        matches!(self, Self::SmallInt | Self::Integer | Self::BigInt)
+    }
+
+    fn supports_text_functions(self) -> bool {
+        matches!(self, Self::Text | Self::Varchar)
+    }
+}
+
+#[derive(Debug)]
+struct ColumnSchema {
+    name: String,
+    data_type: SqlType,
+    nullable: bool,
+    default: Option<String>,
+}
+
+#[derive(Debug)]
+struct TableSchema {
+    name: String,
+    columns: Vec<ColumnSchema>,
+    check_key_positive: bool,
+    checked_column: Option<usize>,
+    unique_column: Option<usize>,
+}
+
+impl TableSchema {
+    fn key(&self) -> &ColumnSchema {
+        self.columns
+            .first()
+            .expect("generated tables must have a key")
+    }
+
+    fn create_sql(&self) -> String {
+        let mut definitions = self
+            .columns
+            .iter()
+            .enumerate()
+            .map(|(index, column)| {
+                let mut definition = format!("{} {}", column.name, column.data_type.sql());
+                if index == 0 {
+                    definition.push_str(" PRIMARY KEY");
+                } else {
+                    if !column.nullable {
+                        definition.push_str(" NOT NULL");
+                    }
+                    if let Some(default) = &column.default {
+                        definition.push_str(&format!(" DEFAULT {default}"));
+                    }
+                }
+                definition
+            })
+            .collect::<Vec<_>>();
+        if self.check_key_positive {
+            definitions.push(format!("CHECK ({} > 0)", self.key().name));
+        }
+        if let Some(index) = self.checked_column {
+            let column = &self.columns[index];
+            definitions.push(format!(
+                "CHECK ({} IS NULL OR ({} >= -100 AND {} <= 100))",
+                column.name, column.name, column.name
+            ));
+        }
+        if let Some(index) = self.unique_column {
+            definitions.push(format!(
+                "UNIQUE ({}, {})",
+                self.key().name,
+                self.columns[index].name
+            ));
+        }
+        format!("CREATE TABLE {} ({})", self.name, definitions.join(", "))
+    }
+}
+
+#[derive(Debug)]
+struct ForeignTables {
+    parent: String,
+    child: String,
+    nullable: bool,
+    default_parent: bool,
+    inline_reference: bool,
+    on_delete: &'static str,
+    on_update: &'static str,
+}
+
+impl ForeignTables {
+    fn create_parent_sql(&self) -> String {
+        format!("CREATE TABLE {} (id BIGINT PRIMARY KEY)", self.parent)
+    }
+
+    fn create_child_sql(&self) -> String {
+        let nullability = if self.nullable { "" } else { " NOT NULL" };
+        let default = if self.default_parent {
+            " DEFAULT 1"
+        } else {
+            ""
+        };
+        let reference = format!(
+            "REFERENCES {} (id) ON DELETE {} ON UPDATE {}",
+            self.parent, self.on_delete, self.on_update
+        );
+        if self.inline_reference {
+            format!(
+                "CREATE TABLE {} (id BIGINT PRIMARY KEY, parent_id BIGINT{nullability}{default} {reference})",
+                self.child
+            )
+        } else {
+            format!(
+                "CREATE TABLE {} (id BIGINT PRIMARY KEY, parent_id BIGINT{nullability}{default}, \
+                 FOREIGN KEY (parent_id) {reference})",
+                self.child
+            )
+        }
+    }
+}
+
+fn generate_type(src: &mut Source) -> SqlType {
+    src.select(
+        "type",
+        &[
+            "smallint", "integer", "bigint", "numeric", "real", "double", "boolean", "text",
+            "varchar", "char", "bytea",
+        ],
+        |_src, data_type, _| match data_type {
+            "smallint" => SqlType::SmallInt,
+            "integer" => SqlType::Integer,
+            "bigint" => SqlType::BigInt,
+            "numeric" => SqlType::Numeric,
+            "real" => SqlType::Real,
+            "double" => SqlType::Double,
+            "boolean" => SqlType::Boolean,
+            "text" => SqlType::Text,
+            "varchar" => SqlType::Varchar,
+            "char" => SqlType::Char,
+            "bytea" => SqlType::Bytea,
+            _ => unreachable!(),
+        },
+    )
+}
+
 fn decimal_literal(value: i32) -> String {
     let sign = if value < 0 { "-" } else { "" };
     let absolute = value.abs();
@@ -257,136 +444,306 @@ fn decimal_literal(value: i32) -> String {
 }
 
 fn text_literal(src: &mut Source, label: &str) -> String {
-    let values = ["", "a", "MiXeD", "two words", "quote's", "東京"];
+    let values = ["", "a", "MiXeD", "word", "'", "東京"];
     let (value, _) = src
         .choose(label, &values)
         .expect("text choices must not be empty");
     format!("'{}'", value.replace('\'', "''"))
 }
 
-fn maybe_null(src: &mut Source, label: &str, value: impl FnOnce(&mut Source) -> String) -> String {
-    src.maybe(label, value).unwrap_or_else(|| "NULL".into())
+fn generate_non_null_literal(src: &mut Source, data_type: SqlType) -> String {
+    match data_type {
+        SqlType::SmallInt | SqlType::Integer | SqlType::BigInt => {
+            integer(src, "integer").to_string()
+        }
+        SqlType::Numeric | SqlType::Real | SqlType::Double => {
+            decimal_literal(src.any_of("decimal", int_in_range(-2000..=2000)))
+        }
+        SqlType::Boolean => if src.any("boolean") { "TRUE" } else { "FALSE" }.into(),
+        SqlType::Text | SqlType::Varchar | SqlType::Char => text_literal(src, "text"),
+        SqlType::Bytea => {
+            let bytes = [
+                src.any_of("a", int_in_range(0_u8..=255)),
+                src.any_of("b", int_in_range(0_u8..=255)),
+                src.any_of("c", int_in_range(0_u8..=255)),
+                src.any_of("d", int_in_range(0_u8..=255)),
+            ];
+            format!(
+                r"'\x{:02x}{:02x}{:02x}{:02x}'",
+                bytes[0], bytes[1], bytes[2], bytes[3]
+            )
+        }
+    }
 }
 
-fn row(src: &mut Source, row_key: i64) -> String {
-    let small_value = maybe_null(src, "small", |src| integer(src, "value").to_string());
-    let int_value = maybe_null(src, "int", |src| integer(src, "value").to_string());
-    let big_value = maybe_null(src, "big", |src| integer(src, "value").to_string());
-    let numeric_value = maybe_null(src, "numeric", |src| {
-        decimal_literal(src.any_of("value", int_in_range(-2000..=2000)))
-    });
-    let real_value = maybe_null(src, "real", |src| {
-        decimal_literal(src.any_of("value", int_in_range(-2000..=2000)))
-    });
-    let double_value = maybe_null(src, "double", |src| {
-        decimal_literal(src.any_of("value", int_in_range(-2000..=2000)))
-    });
-    let flag = maybe_null(src, "flag", |src| {
-        if src.any("value") { "TRUE" } else { "FALSE" }.into()
-    });
-    let text_value = maybe_null(src, "text", |src| text_literal(src, "value"));
-    let varchar_value = maybe_null(src, "varchar", |src| text_literal(src, "value"));
-    let char_value = maybe_null(src, "char", |src| {
-        let values = ["", "x", "fixed", "eight888"];
-        let (value, _) = src
-            .choose("value", &values)
-            .expect("char choices must not be empty");
-        format!("'{value}'")
-    });
-    let bytes = maybe_null(src, "bytes", |src| {
-        let bytes = [
-            src.any_of("a", int_in_range(0_u8..=255)),
-            src.any_of("b", int_in_range(0_u8..=255)),
-            src.any_of("c", int_in_range(0_u8..=255)),
-            src.any_of("d", int_in_range(0_u8..=255)),
-        ];
-        format!(
-            r"'\x{:02x}{:02x}{:02x}{:02x}'",
-            bytes[0], bytes[1], bytes[2], bytes[3]
-        )
-    });
+fn generate_literal(src: &mut Source, column: &ColumnSchema) -> String {
+    if column.nullable {
+        src.maybe("null", |src| {
+            generate_non_null_literal(src, column.data_type)
+        })
+        .unwrap_or_else(|| "NULL".into())
+    } else {
+        generate_non_null_literal(src, column.data_type)
+    }
+}
+
+fn generate_typed_literal(src: &mut Source, data_type: SqlType) -> String {
     format!(
-        "({row_key}, {small_value}, {int_value}, {big_value}, {numeric_value}, \
-         {real_value}, {double_value}, {flag}, {text_value}, {varchar_value}, \
-         {char_value}, {bytes})"
+        "CAST({} AS {})",
+        generate_non_null_literal(src, data_type),
+        data_type.sql()
     )
 }
 
-fn insert_sql(src: &mut Source, table: &str, next_row_key: &mut i64) -> String {
+fn generate_table(src: &mut Source, name: String) -> TableSchema {
+    let mut columns = vec![ColumnSchema {
+        name: "key".into(),
+        data_type: SqlType::BigInt,
+        nullable: false,
+        default: None,
+    }];
+    src.repeat_n("columns", 1..=8, |src| {
+        let data_type = generate_type(src);
+        let nullable = src.any("nullable");
+        let default = src.maybe("default", |src| generate_non_null_literal(src, data_type));
+        columns.push(ColumnSchema {
+            name: format!("value_{}", columns.len()),
+            data_type,
+            nullable,
+            default,
+        });
+        Effect::Success
+    });
+    let checked_columns = columns
+        .iter()
+        .enumerate()
+        .skip(1)
+        .filter(|(_, column)| column.data_type.is_numeric())
+        .map(|(index, _)| index)
+        .collect::<Vec<_>>();
+    let checked_column = src
+        .maybe("check", |src| src.choose("column", &checked_columns))
+        .flatten()
+        .map(|(index, _)| *index);
+    let unique_column = src
+        .maybe("unique", |src| src.choose("column", &columns[1..]))
+        .flatten()
+        .map(|(_, index)| index + 1);
+    TableSchema {
+        name,
+        columns,
+        check_key_positive: src.any("check_key_positive"),
+        checked_column,
+        unique_column,
+    }
+}
+
+fn generate_foreign_tables(src: &mut Source, table: &TableSchema) -> ForeignTables {
+    let actions = [
+        "NO ACTION",
+        "RESTRICT",
+        "CASCADE",
+        "SET NULL",
+        "SET DEFAULT",
+    ];
+    let (on_delete, _) = src.choose("on_delete", &actions).unwrap();
+    let (on_update, _) = src.choose("on_update", &actions).unwrap();
+    ForeignTables {
+        parent: format!("{}_foreign_parent", table.name),
+        child: format!("{}_foreign_child", table.name),
+        nullable: src.any("nullable"),
+        default_parent: src.any("default_parent"),
+        inline_reference: src.any("inline_reference"),
+        on_delete,
+        on_update,
+    }
+}
+
+fn generate_foreign_insert(
+    src: &mut Source,
+    tables: &ForeignTables,
+    next_child_key: &mut i64,
+) -> String {
+    let key = *next_child_key;
+    *next_child_key += 1;
+    let mut values = vec!["parent"];
+    if tables.nullable {
+        values.push("null");
+    }
+    if tables.default_parent {
+        values.push("default");
+    }
+    // Generate INSERT ... SELECT here once non-VALUES insert sources are supported.
+    src.select("value", &values, |_src, value, _| match value {
+        "parent" => format!(
+            "INSERT INTO {} (id, parent_id) VALUES ({key}, 1)",
+            tables.child
+        ),
+        "null" => format!(
+            "INSERT INTO {} (id, parent_id) VALUES ({key}, NULL)",
+            tables.child
+        ),
+        "default" => format!("INSERT INTO {} (id) VALUES ({key})", tables.child),
+        _ => unreachable!(),
+    })
+}
+
+fn generate_foreign_select(src: &mut Source, tables: &ForeignTables) -> (String, RowOrder) {
+    let join = if src.any("outer") {
+        "LEFT JOIN"
+    } else {
+        "INNER JOIN"
+    };
+    (
+        format!(
+            "SELECT child.id, parent.id FROM {} AS child {join} {} AS parent \
+             ON child.parent_id = parent.id ORDER BY child.id, parent.id",
+            tables.child, tables.parent
+        ),
+        RowOrder::Ordered,
+    )
+}
+
+fn choose_column<'a>(
+    src: &mut Source,
+    table: &'a TableSchema,
+    predicate: impl Fn(&ColumnSchema) -> bool,
+) -> &'a ColumnSchema {
+    src.choose_where("column", &table.columns, |column| predicate(column))
+        .map(|(column, _)| column)
+        .expect("generated table must have a compatible column")
+}
+
+fn generate_insert(src: &mut Source, table: &TableSchema, next_key: &mut i64) -> String {
+    src.select("shape", &["full", "required", "subset"], |src, shape, _| {
+        let included = table
+            .columns
+            .iter()
+            .enumerate()
+            .filter(|(index, column)| {
+                *index == 0
+                    || shape == "full"
+                    || (!column.nullable && column.default.is_none())
+                    || (shape == "subset" && src.any("include"))
+            })
+            .collect::<Vec<_>>();
+        let mut rows = Vec::new();
+        src.repeat_n("rows", 1..=4, |src| {
+            let values = included
+                .iter()
+                .map(|(index, column)| {
+                    if *index == 0 {
+                        let key = *next_key;
+                        *next_key += 1;
+                        key.to_string()
+                    } else if column.default.is_some() && src.any("use_default") {
+                        "DEFAULT".into()
+                    } else {
+                        generate_literal(src, column)
+                    }
+                })
+                .collect::<Vec<_>>();
+            rows.push(format!("({})", values.join(", ")));
+            Effect::Success
+        });
+        let columns = included
+            .iter()
+            .map(|(_, column)| column.name.as_str())
+            .collect::<Vec<_>>();
+        format!(
+            "INSERT INTO {} ({}) VALUES {}",
+            table.name,
+            columns.join(", "),
+            rows.join(", ")
+        )
+    })
+}
+
+fn generate_predicate(src: &mut Source, table: &TableSchema) -> String {
     src.select(
-        "shape",
-        &["full", "omitted", "defaults"],
-        |src, shape, _| {
-            let mut rows = Vec::new();
-            src.repeat_n("rows", 1..=4, |src| {
-                rows.push(match shape {
-                    "full" => row(src, *next_row_key),
-                    "omitted" => format!("({})", *next_row_key),
-                    "defaults" => format!("({}, DEFAULT, DEFAULT)", *next_row_key),
-                    _ => unreachable!(),
-                });
-                *next_row_key += 1;
-                Effect::Success
-            });
-            match shape {
-                "full" => format!("INSERT INTO {table} VALUES {}", rows.join(", ")),
-                "omitted" => {
-                    format!("INSERT INTO {table} (row_key) VALUES {}", rows.join(", "))
-                }
-                "defaults" => format!(
-                    "INSERT INTO {table} (row_key, int_value, text_value) VALUES {}",
-                    rows.join(", ")
-                ),
-                _ => unreachable!(),
+        "predicate",
+        &["comparison", "boolean", "null", "distinct", "combined"],
+        |src, predicate, _| match predicate {
+            "comparison" => {
+                let column = choose_column(src, table, |column| column.data_type.is_numeric());
+                let operators = ["=", "<>", ">", "<", ">=", "<="];
+                let (operator, _) = src.choose("operator", &operators).unwrap();
+                format!(
+                    "{} {operator} {}",
+                    column.name,
+                    generate_typed_literal(src, column.data_type)
+                )
             }
+            "boolean" => {
+                if let Some((column, _)) =
+                    src.choose_where("boolean_column", &table.columns, |column| {
+                        column.data_type == SqlType::Boolean
+                    })
+                {
+                    let operator = if src.any("expected") {
+                        "IS TRUE"
+                    } else {
+                        "IS FALSE"
+                    };
+                    format!("{} {operator}", column.name)
+                } else {
+                    format!("{} > 0", table.key().name)
+                }
+            }
+            "null" => {
+                let column = choose_column(src, table, |_| true);
+                let operator = if src.any("not") {
+                    "IS NOT NULL"
+                } else {
+                    "IS NULL"
+                };
+                format!("{} {operator}", column.name)
+            }
+            "distinct" => {
+                let column = choose_column(src, table, |_| true);
+                format!(
+                    "{} IS {}DISTINCT FROM {}",
+                    column.name,
+                    if src.any("not") { "NOT " } else { "" },
+                    generate_typed_literal(src, column.data_type)
+                )
+            }
+            "combined" => format!(
+                "({}) {} ({})",
+                generate_predicate_leaf(src, table),
+                if src.any("and") { "AND" } else { "OR" },
+                generate_predicate_leaf(src, table)
+            ),
+            _ => unreachable!(),
         },
     )
 }
 
-fn where_clause(src: &mut Source) -> String {
-    src.maybe("where", |src| {
-        src.select(
-            "predicate",
-            &["comparison", "boolean", "null", "distinct", "combined"],
-            |src, predicate, _| match predicate {
-                "comparison" => format!("int_value >= {}", integer(src, "value")),
-                "boolean" => {
-                    let values = ["flag", "NOT flag", "flag IS TRUE", "flag IS FALSE"];
-                    let (value, _) = src
-                        .choose("value", &values)
-                        .expect("boolean predicate choices must not be empty");
-                    (*value).into()
-                }
-                "null" => {
-                    let columns = ["small_value", "text_value", "bytes"];
-                    let (column, _) = src
-                        .choose("column", &columns)
-                        .expect("nullable columns must not be empty");
-                    let operator = if src.any("not") {
-                        "IS NOT NULL"
-                    } else {
-                        "IS NULL"
-                    };
-                    format!("{column} {operator}")
-                }
-                "distinct" => format!(
-                    "int_value IS {}DISTINCT FROM {}",
-                    if src.any("not") { "NOT " } else { "" },
-                    integer(src, "value")
-                ),
-                "combined" => format!(
-                    "(int_value < {} OR flag IS TRUE) AND text_value IS NOT NULL",
-                    integer(src, "value")
-                ),
-                _ => unreachable!(),
-            },
+fn generate_predicate_leaf(src: &mut Source, table: &TableSchema) -> String {
+    let column = choose_column(src, table, |_| true);
+    if src.any("null_test") {
+        format!(
+            "{} IS {}NULL",
+            column.name,
+            if src.any("not") { "NOT " } else { "" }
         )
-    })
-    .map(|predicate| format!(" WHERE {predicate}"))
-    .unwrap_or_default()
+    } else {
+        format!(
+            "{} IS {}DISTINCT FROM {}",
+            column.name,
+            if src.any("not") { "NOT " } else { "" },
+            generate_typed_literal(src, column.data_type)
+        )
+    }
 }
 
-fn select_expression(src: &mut Source) -> String {
+fn generate_where_clause(src: &mut Source, table: &TableSchema) -> String {
+    src.maybe("where", |src| generate_predicate(src, table))
+        .map(|predicate| format!(" WHERE {predicate}"))
+        .unwrap_or_default()
+}
+
+fn generate_select_expression(src: &mut Source, table: &TableSchema) -> String {
     src.select(
         "expression",
         &[
@@ -402,117 +759,82 @@ fn select_expression(src: &mut Source) -> String {
         ],
         |src, expression, _| match expression {
             "wildcard" => "*".into(),
-            "column" => {
-                let columns = [
-                    "row_key",
-                    "small_value",
-                    "int_value",
-                    "big_value",
-                    "numeric_value",
-                    "real_value",
-                    "double_value",
-                    "flag",
-                    "text_value",
-                    "varchar_value",
-                    "char_value",
-                    "bytes",
-                ];
-                let (column, _) = src
-                    .choose("column", &columns)
-                    .expect("column choices must not be empty");
-                (*column).into()
-            }
+            "column" => choose_column(src, table, |_| true).name.clone(),
             "arithmetic" => {
+                let column = choose_column(src, table, |column| column.data_type.is_numeric());
                 let operators = ["+", "-", "*", "/", "%"];
-                let (operator, _) = src
-                    .choose("operator", &operators)
-                    .expect("arithmetic operators must not be empty");
-                let right = if *operator == "/" || *operator == "%" {
-                    src.any_of("right", int_in_range(1..=5))
+                let operators = if column.data_type.is_integral() {
+                    &operators[..]
                 } else {
-                    integer(src, "right")
+                    &operators[..4]
                 };
-                format!("int_value {operator} {right}")
+                let (operator, _) = src.choose("operator", operators).unwrap();
+                let right = if *operator == "/" || *operator == "%" {
+                    let divisors: &[i32] = if column.data_type == SqlType::Numeric {
+                        &[1, 2, 4, 5]
+                    } else {
+                        &[1, 2, 3, 4, 5]
+                    };
+                    let (right, _) = src.choose("right", divisors).unwrap();
+                    format!("CAST({} AS {})", right, column.data_type.sql())
+                } else {
+                    generate_typed_literal(src, column.data_type)
+                };
+                format!("{} {operator} {right}", column.name)
             }
             "comparison" => {
+                let column = choose_column(src, table, |column| column.data_type.is_numeric());
                 let operators = ["=", "<>", ">", "<", ">=", "<="];
-                let (operator, _) = src
-                    .choose("operator", &operators)
-                    .expect("comparison operators must not be empty");
-                format!("numeric_value {operator} {}", integer(src, "right"))
+                let (operator, _) = src.choose("operator", &operators).unwrap();
+                format!(
+                    "{} {operator} {}",
+                    column.name,
+                    generate_typed_literal(src, column.data_type)
+                )
             }
-            "boolean" => {
-                let values = [
-                    "flag AND TRUE",
-                    "flag OR FALSE",
-                    "NOT flag",
-                    "flag IS TRUE",
-                    "flag IS FALSE",
-                    "flag IS UNKNOWN",
-                ];
-                let (value, _) = src
-                    .choose("value", &values)
-                    .expect("boolean expressions must not be empty");
-                (*value).into()
-            }
-            "null" => {
-                let values = [
-                    "text_value IS NULL",
-                    "text_value IS NOT NULL",
-                    "int_value IS DISTINCT FROM small_value",
-                    "int_value IS NOT DISTINCT FROM small_value",
-                    "int_value + NULL",
-                    "int_value = NULL",
-                ];
-                let (value, _) = src
-                    .choose("value", &values)
-                    .expect("null expressions must not be empty");
-                (*value).into()
-            }
+            "boolean" => generate_predicate(src, table),
+            "null" => generate_predicate_leaf(src, table),
             "case" => {
-                if src.any("simple") {
-                    format!(
-                        "CASE int_value WHEN {} THEN 'match' ELSE text_value END",
-                        integer(src, "value")
-                    )
+                let column = choose_column(src, table, |_| true);
+                format!(
+                    "CASE WHEN {} THEN {} ELSE CAST({} AS {}) END",
+                    generate_predicate_leaf(src, table),
+                    column.name,
+                    generate_non_null_literal(src, column.data_type),
+                    column.data_type.sql()
+                )
+            }
+            "function" => {
+                let column = choose_column(src, table, |_| true);
+                if column.data_type.supports_text_functions() {
+                    let functions = ["lower", "upper", "length"];
+                    let (function, _) = src.choose("text_function", &functions).unwrap();
+                    format!("{function}({})", column.name)
+                } else if column.data_type.is_numeric() {
+                    format!("abs({})", column.name)
                 } else {
                     format!(
-                        "CASE WHEN int_value > {} THEN big_value WHEN flag IS TRUE THEN 0 ELSE small_value END",
-                        integer(src, "value")
+                        "COALESCE({}, {})",
+                        column.name,
+                        generate_typed_literal(src, column.data_type)
                     )
                 }
             }
-            "function" => {
-                let values = [
-                    "COALESCE(text_value, varchar_value, 'fallback')",
-                    "NULLIF(int_value, small_value)",
-                    "GREATEST(int_value, small_value, 0)",
-                    "LEAST(big_value, int_value, 0)",
-                    "length(text_value)",
-                    "lower(varchar_value)",
-                    "upper(text_value)",
-                    "abs(numeric_value)",
-                ];
-                let (value, _) = src
-                    .choose("value", &values)
-                    .expect("function expressions must not be empty");
-                (*value).into()
-            }
             "cast" => {
-                let values = [
-                    "small_value::BIGINT",
-                    "CAST(int_value AS TEXT)",
-                    "CAST(flag AS INTEGER)",
-                    "CAST(int_value AS BOOLEAN)",
-                    "int_value::BYTEA::INTEGER",
-                    "CAST(text_value AS VARCHAR(6))",
-                    "CAST(numeric_value AS INTEGER)",
-                    "CAST(real_value AS DOUBLE PRECISION)",
-                ];
-                let (value, _) = src
-                    .choose("value", &values)
-                    .expect("cast expressions must not be empty");
-                (*value).into()
+                let column = choose_column(src, table, |_| true);
+                let target = match column.data_type {
+                    SqlType::SmallInt => "BIGINT",
+                    SqlType::Integer | SqlType::BigInt => "TEXT",
+                    SqlType::Numeric => "INTEGER",
+                    SqlType::Real => "DOUBLE PRECISION",
+                    SqlType::Double => "REAL",
+                    SqlType::Boolean => "INTEGER",
+                    SqlType::Text => "VARCHAR(12)",
+                    SqlType::Varchar => "TEXT",
+                    SqlType::Char => "CHAR(8)",
+                    SqlType::Bytea => "BYTEA",
+                };
+                format!("CAST({} AS {target})", column.name)
             }
             _ => unreachable!(),
         },
@@ -534,34 +856,30 @@ fn row_count(src: &mut Source, ordered: bool, offset: bool) -> String {
     })
 }
 
-fn select_sql(src: &mut Source, table: &str) -> (String, RowOrder) {
-    let mut projections = vec!["row_key".into()];
+fn generate_select(src: &mut Source, table: &TableSchema) -> (String, RowOrder) {
+    let mut projections = Vec::new();
     src.repeat_n("projections", 1..=4, |src| {
-        projections.push(select_expression(src));
+        projections.push(generate_select_expression(src, table));
         Effect::Success
     });
     let mut sql = format!(
-        "SELECT {} FROM {table}{}",
+        "SELECT {} FROM {}{}",
         projections.join(", "),
-        where_clause(src)
+        table.name,
+        generate_where_clause(src, table)
     );
     let ordered = src.maybe("order", |src| {
-        let keys = [
-            "1",
-            "numeric_value + int_value",
-            "length(text_value)",
-            "flag IS TRUE",
-        ];
-        let (key, _) = src
-            .choose("key", &keys)
-            .expect("order keys must not be empty");
         let direction = if src.any("descending") { "DESC" } else { "ASC" };
         let nulls = if src.any("nulls_first") {
             "NULLS FIRST"
         } else {
             "NULLS LAST"
         };
-        format!(" ORDER BY {key} {direction} {nulls}, row_key + 0")
+        format!(
+            " ORDER BY {}.{} {direction} {nulls}",
+            table.name,
+            table.key().name
+        )
     });
     let row_order = if let Some(order) = ordered {
         sql.push_str(&order);
@@ -591,60 +909,156 @@ fn select_sql(src: &mut Source, table: &str) -> (String, RowOrder) {
     (sql, row_order)
 }
 
-fn update_sql(src: &mut Source, table: &str) -> String {
-    let assignment = src.select(
-        "assignment",
-        &[
-            "multiple", "key", "default", "small", "int", "big", "numeric", "real", "double",
-            "flag", "text", "varchar", "char", "bytes",
-        ],
-        |src, assignment, _| match assignment {
-            "multiple" => "int_value = small_value, small_value = int_value".into(),
-            "key" => "row_key = row_key + 1000000".into(),
-            "default" => {
-                "int_value = DEFAULT, numeric_value = DEFAULT, text_value = DEFAULT".into()
-            }
-            "small" => format!("small_value = {}", integer(src, "value")),
-            "int" => format!("int_value = int_value + {}", integer(src, "value")),
-            "big" => format!(
-                "big_value = COALESCE(big_value, 0) - {}",
-                integer(src, "value")
-            ),
-            "numeric" => format!(
-                "numeric_value = {}",
-                decimal_literal(src.any_of("value", int_in_range(-2000..=2000)))
-            ),
-            "real" => format!("real_value = {}", integer(src, "value")),
-            "double" => format!("double_value = {}", integer(src, "value")),
-            "flag" => "flag = NOT flag".into(),
-            "text" => "text_value = upper(COALESCE(text_value, 'fallback'))".into(),
-            "varchar" => "varchar_value = CAST(COALESCE(text_value, '') AS VARCHAR(12))".into(),
-            "char" => "char_value = CAST(COALESCE(varchar_value, '') AS CHAR(8))".into(),
-            "bytes" => "bytes = int_value::BYTEA".into(),
-            _ => unreachable!(),
-        },
-    );
-    format!("UPDATE {table} SET {assignment}{}", where_clause(src))
+fn generate_assignment(src: &mut Source, column: &ColumnSchema) -> String {
+    let mut variants = vec!["literal", "expression"];
+    if column.nullable {
+        variants.push("null");
+    }
+    if column.default.is_some() {
+        variants.push("default");
+    }
+    src.select("value", &variants, |src, value, _| match value {
+        "literal" => generate_non_null_literal(src, column.data_type),
+        "null" => "NULL".into(),
+        "default" => "DEFAULT".into(),
+        "expression" if column.data_type == SqlType::Boolean => format!("NOT {}", column.name),
+        "expression" if column.data_type.supports_text_functions() => {
+            format!("upper({})", column.name)
+        }
+        "expression" if column.data_type.is_numeric() => format!("-{}", column.name),
+        "expression" => format!(
+            "COALESCE({}, {})",
+            column.name,
+            generate_typed_literal(src, column.data_type)
+        ),
+        _ => unreachable!(),
+    })
 }
 
-fn create_table_sql(table: &str) -> String {
+fn generate_update(src: &mut Source, table: &TableSchema) -> String {
+    let column = choose_column(src, table, |column| column.name != table.key().name);
     format!(
-        "CREATE TABLE {table} (\
-             row_key BIGINT NOT NULL PRIMARY KEY, \
-             small_value SMALLINT CHECK (small_value IS NULL OR small_value >= -10), \
-             int_value INTEGER DEFAULT 0, \
-             big_value BIGINT, \
-             numeric_value NUMERIC(8, 2) DEFAULT 1 + 2, \
-             real_value REAL, \
-             double_value DOUBLE PRECISION, \
-             flag BOOLEAN, \
-             text_value TEXT DEFAULT upper('default'), \
-             varchar_value VARCHAR(12), \
-             char_value CHAR(8), \
-             bytes BYTEA, \
-             UNIQUE (row_key, int_value), \
-             CHECK (int_value IS NULL OR big_value IS NULL OR int_value <= big_value)\
-         )"
+        "UPDATE {} SET {} = {}{}",
+        table.name,
+        column.name,
+        generate_assignment(src, column),
+        generate_where_clause(src, table)
+    )
+}
+
+fn generate_delete(src: &mut Source, table: &TableSchema) -> String {
+    format!(
+        "DELETE FROM {}{}",
+        table.name,
+        generate_where_clause(src, table)
+    )
+}
+
+fn generate_join(src: &mut Source, table: &TableSchema) -> (String, RowOrder) {
+    let offset = src.any_of("offset", int_in_range(-2..=2));
+    src.select(
+        "join",
+        &["inner", "left", "right", "full", "cross"],
+        |_src, join, _| {
+            let key = &table.key().name;
+            let source = match join {
+                "inner" => format!(
+                    "{} AS left_row INNER JOIN {} AS right_row ON left_row.{key} = right_row.{key} + {offset}",
+                    table.name, table.name
+                ),
+                "left" => format!(
+                    "{} AS left_row LEFT JOIN {} AS right_row ON left_row.{key} = right_row.{key} + {offset}",
+                    table.name, table.name
+                ),
+                "right" => format!(
+                    "{} AS left_row RIGHT JOIN {} AS right_row ON left_row.{key} = right_row.{key} + {offset}",
+                    table.name, table.name
+                ),
+                "full" => format!(
+                    "{} AS left_row FULL JOIN {} AS right_row ON left_row.{key} = right_row.{key} + {offset}",
+                    table.name, table.name
+                ),
+                "cross" => format!(
+                    "{} AS left_row CROSS JOIN {} AS right_row",
+                    table.name, table.name
+                ),
+                _ => unreachable!(),
+            };
+            let selection = if join == "cross" {
+                format!(" WHERE left_row.{key} = right_row.{key} + {offset}")
+            } else {
+                String::new()
+            };
+            (
+                format!(
+                    "SELECT left_row.{key}, right_row.{key} FROM {source}{selection} ORDER BY 1, 2"
+                ),
+                RowOrder::Ordered,
+            )
+        },
+    )
+}
+
+fn generate_subquery(src: &mut Source, table: &TableSchema) -> (String, RowOrder) {
+    let key = &table.key().name;
+    src.select(
+        "subquery",
+        &["derived", "scalar", "in", "exists", "quantified", "correlated"],
+        |src, subquery, _| match subquery {
+            "derived" => (
+                format!(
+                    "SELECT source.{key} FROM (SELECT {key} FROM {}{}) AS source ORDER BY source.{key}",
+                    table.name,
+                    generate_where_clause(src, table)
+                ),
+                RowOrder::Ordered,
+            ),
+            "scalar" => (
+                format!(
+                    "SELECT outer_row.{key} FROM {} AS outer_row WHERE outer_row.{key} = \
+                     (SELECT inner_row.{key} FROM {} AS inner_row ORDER BY inner_row.{key} LIMIT 1)",
+                    table.name, table.name
+                ),
+                RowOrder::Unordered,
+            ),
+            "in" => (
+                format!(
+                    "SELECT outer_row.{key} FROM {} AS outer_row WHERE outer_row.{key} IN \
+                     (SELECT inner_row.{key} FROM {} AS inner_row) ORDER BY outer_row.{key}",
+                    table.name, table.name
+                ),
+                RowOrder::Ordered,
+            ),
+            "exists" => (
+                format!(
+                    "SELECT EXISTS (SELECT 1 FROM {}{})",
+                    table.name,
+                    generate_where_clause(src, table)
+                ),
+                RowOrder::Ordered,
+            ),
+            "quantified" => {
+                let operator = if src.any("all") { "ALL" } else { "ANY" };
+                let value = src.any_of("value", int_in_range(1..=20));
+                (
+                    format!(
+                        "SELECT {value} = {operator} (SELECT {key} FROM {})",
+                        table.name
+                    ),
+                    RowOrder::Ordered,
+                )
+            }
+            "correlated" => (
+                format!(
+                    "SELECT outer_row.{key}, EXISTS (SELECT 1 FROM {} AS inner_row \
+                     WHERE inner_row.{key} = outer_row.{key}) FROM {} AS outer_row \
+                     ORDER BY outer_row.{key}",
+                    table.name, table.name
+                ),
+                RowOrder::Ordered,
+            ),
+            _ => unreachable!(),
+        },
     )
 }
 
@@ -693,7 +1107,7 @@ fn generated_sql_matches_postgres() {
             .expect("must connect SQLx to PostgreSQL 18 once"),
     );
     check(|src| {
-        let table = format!(
+        let table_name = format!(
             "pg_fake_property_{}_{}",
             std::process::id(),
             TABLE_NUMBER.fetch_add(1, Ordering::Relaxed)
@@ -702,29 +1116,16 @@ fn generated_sql_matches_postgres() {
         let mut postgres = PostgresCase {
             connection: &mut postgres,
             runtime: &runtime,
-            table: table.clone(),
+            table: table_name.clone(),
         };
         let mut fake = PgFakeConnection::new(Db::new());
-        let mut next_row_key = 1;
+        let table = generate_table(src, table_name);
+        let foreign_tables = generate_foreign_tables(src, &table);
+        let mut next_key = 1;
+        let mut next_child_key = 1;
         let mut in_transaction = false;
-        let foreign_parent = format!("{table}_foreign_parent");
-        let foreign_child = format!("{table}_foreign_child");
-
-        assert_statement(
-            &runtime,
-            postgres.get_connection(),
-            &mut fake,
-            "SET SESSION CHARACTERISTICS AS TRANSACTION ISOLATION LEVEL READ COMMITTED",
-            RowOrder::Unordered,
-        );
-        assert_statement(
-            &runtime,
-            postgres.get_connection(),
-            &mut fake,
-            "SET lock_timeout = 1000",
-            RowOrder::Unordered,
-        );
-        let create = create_table_sql(&table);
+        let create = table.create_sql();
+        src.log_value("sql", &create);
         assert_statement(
             &runtime,
             postgres.get_connection(),
@@ -732,7 +1133,8 @@ fn generated_sql_matches_postgres() {
             &create,
             RowOrder::Unordered,
         );
-        let insert = insert_sql(src, &table, &mut next_row_key);
+        let insert = generate_insert(src, &table, &mut next_key);
+        src.log_value("sql", &insert);
         assert_statement(
             &runtime,
             postgres.get_connection(),
@@ -740,132 +1142,32 @@ fn generated_sql_matches_postgres() {
             &insert,
             RowOrder::Unordered,
         );
-        assert_statement(
-            &runtime,
-            postgres.get_connection(),
-            &mut fake,
-            &format!(
-                "SELECT left_row.row_key, right_row.row_key FROM {table} AS left_row INNER JOIN {table} AS right_row ON left_row.row_key = right_row.row_key ORDER BY left_row.row_key"
-            ),
-            RowOrder::Ordered,
-        );
-        assert_statement(
-            &runtime,
-            postgres.get_connection(),
-            &mut fake,
-            &format!(
-                "SELECT left_row.row_key, right_row.row_key FROM {table} AS left_row CROSS JOIN {table} AS right_row WHERE left_row.row_key = right_row.row_key ORDER BY left_row.row_key"
-            ),
-            RowOrder::Ordered,
-        );
-        assert_statement(
-            &runtime,
-            postgres.get_connection(),
-            &mut fake,
-            &format!(
-                "SELECT left_row.row_key, right_row.row_key FROM {table} AS left_row FULL JOIN {table} AS right_row ON left_row.row_key = right_row.row_key + 1000000 ORDER BY 1, 2"
-            ),
-            RowOrder::Ordered,
-        );
-        assert_statement(
-            &runtime,
-            postgres.get_connection(),
-            &mut fake,
-            &format!(
-                "SELECT source.row_key FROM (SELECT row_key FROM {table}) AS source ORDER BY source.row_key"
-            ),
-            RowOrder::Ordered,
-        );
-        assert_statement(
-            &runtime,
-            postgres.get_connection(),
-            &mut fake,
-            &format!(
-                "SELECT row_key FROM {table} WHERE row_key = (SELECT row_key FROM {table} ORDER BY row_key LIMIT 1)"
-            ),
-            RowOrder::Unordered,
-        );
-        assert_statement(
-            &runtime,
-            postgres.get_connection(),
-            &mut fake,
-            &format!(
-                "SELECT row_key FROM {table} WHERE row_key IN (SELECT row_key FROM {table}) ORDER BY row_key"
-            ),
-            RowOrder::Ordered,
-        );
-        assert_statement(
-            &runtime,
-            postgres.get_connection(),
-            &mut fake,
-            &format!(
-                "SELECT EXISTS (SELECT 1 FROM {table}), 1000000 = ANY (SELECT row_key FROM {table}), 1000000 > ALL (SELECT row_key FROM {table})"
-            ),
-            RowOrder::Ordered,
-        );
-        let correlation_threshold = integer(src, "correlation_threshold");
-        assert_statement(
-            &runtime,
-            postgres.get_connection(),
-            &mut fake,
-            &format!(
-                "SELECT outer_row.row_key, \
-                    EXISTS (SELECT 1 FROM {table} AS inner_row \
-                        WHERE inner_row.row_key = outer_row.row_key \
-                          AND inner_row.int_value IS NOT DISTINCT FROM outer_row.int_value), \
-                    outer_row.row_key IN (SELECT inner_row.row_key FROM {table} AS inner_row \
-                        WHERE inner_row.int_value > outer_row.int_value + {correlation_threshold}), \
-                    EXISTS (SELECT 1 FROM {table} AS middle_row \
-                        WHERE middle_row.row_key = outer_row.row_key \
-                          AND EXISTS (SELECT 1 WHERE middle_row.int_value IS NOT DISTINCT FROM outer_row.int_value)) \
-                 FROM {table} AS outer_row ORDER BY outer_row.row_key"
-            ),
-            RowOrder::Ordered,
-        );
-        assert_statement(
-            &runtime,
-            postgres.get_connection(),
-            &mut fake,
-            &format!("CREATE TABLE {foreign_parent} (id INTEGER PRIMARY KEY)"),
-            RowOrder::Unordered,
-        );
-        assert_statement(
-            &runtime,
-            postgres.get_connection(),
-            &mut fake,
-            &format!(
-                "CREATE TABLE {foreign_child} (id INTEGER PRIMARY KEY, parent_id INTEGER REFERENCES {foreign_parent})"
-            ),
-            RowOrder::Unordered,
-        );
-        assert_statement(
-            &runtime,
-            postgres.get_connection(),
-            &mut fake,
-            &format!("INSERT INTO {foreign_parent} VALUES (1)"),
-            RowOrder::Unordered,
-        );
-        let foreign_key = if src.any("foreign_key_exists") {
-            1
-        } else {
-            integer(src, "foreign_key")
-        };
-        assert_statement(
-            &runtime,
-            postgres.get_connection(),
-            &mut fake,
-            &format!("INSERT INTO {foreign_child} VALUES (1, {foreign_key})"),
-            RowOrder::Unordered,
-        );
+        for sql in [
+            foreign_tables.create_parent_sql(),
+            foreign_tables.create_child_sql(),
+            format!("INSERT INTO {} (id) VALUES (1)", foreign_tables.parent),
+        ] {
+            src.log_value("sql", &sql);
+            assert_statement(
+                &runtime,
+                postgres.get_connection(),
+                &mut fake,
+                &sql,
+                RowOrder::Unordered,
+            );
+        }
 
         src.repeat_n("statements", 3..=14, |src| {
             let actions: &[&'static str] = if in_transaction {
                 &[
                     "insert",
                     "select",
+                    "join",
+                    "subquery",
+                    "foreign_insert",
+                    "foreign_select",
                     "update",
                     "delete",
-                    "set_transaction",
                     "set_lock_timeout",
                     "commit",
                     "rollback",
@@ -874,6 +1176,10 @@ fn generated_sql_matches_postgres() {
                 &[
                     "insert",
                     "select",
+                    "join",
+                    "subquery",
+                    "foreign_insert",
+                    "foreign_select",
                     "update",
                     "delete",
                     "set_session",
@@ -884,15 +1190,19 @@ fn generated_sql_matches_postgres() {
             src.select("action", actions, |src, action, _| {
                 let (sql, order) = match action {
                     "insert" => (
-                        insert_sql(src, &table, &mut next_row_key),
+                        generate_insert(src, &table, &mut next_key),
                         RowOrder::Unordered,
                     ),
-                    "select" => select_sql(src, &table),
-                    "update" => (update_sql(src, &table), RowOrder::Unordered),
-                    "delete" => (
-                        format!("DELETE FROM {table}{}", where_clause(src)),
+                    "select" => generate_select(src, &table),
+                    "join" => generate_join(src, &table),
+                    "subquery" => generate_subquery(src, &table),
+                    "foreign_insert" => (
+                        generate_foreign_insert(src, &foreign_tables, &mut next_child_key),
                         RowOrder::Unordered,
                     ),
+                    "foreign_select" => generate_foreign_select(src, &foreign_tables),
+                    "update" => (generate_update(src, &table), RowOrder::Unordered),
+                    "delete" => (generate_delete(src, &table), RowOrder::Unordered),
                     "begin" => {
                         in_transaction = true;
                         let sql = if src.any("explicit_isolation") {
@@ -902,10 +1212,6 @@ fn generated_sql_matches_postgres() {
                         };
                         (sql, RowOrder::Unordered)
                     }
-                    "set_transaction" => (
-                        format!("SET TRANSACTION ISOLATION LEVEL {}", isolation_level(src)),
-                        RowOrder::Unordered,
-                    ),
                     "set_session" => (
                         format!(
                             "SET SESSION CHARACTERISTICS AS TRANSACTION ISOLATION LEVEL {}",
@@ -931,11 +1237,16 @@ fn generated_sql_matches_postgres() {
         });
 
         if in_transaction {
+            let sql = if src.any("commit_final_transaction") {
+                "COMMIT"
+            } else {
+                "ROLLBACK"
+            };
             assert_statement(
                 &runtime,
                 postgres.get_connection(),
                 &mut fake,
-                "ROLLBACK",
+                sql,
                 RowOrder::Unordered,
             );
         }
