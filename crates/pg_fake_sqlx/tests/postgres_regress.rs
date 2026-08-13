@@ -1,11 +1,14 @@
 use std::{env, fs, path::PathBuf, sync::Mutex};
 
 use pg_fake::parser::{self, Statement};
-use pg_fake_sqlx::{Db, PgFakeConnection};
-use postgres::{Client, NoTls, SimpleQueryMessage};
-use sqlx::{AssertSqlSafe, Row, ValueRef};
+use pg_fake_sqlx::{Db, PgFake, PgFakeConnection};
+use sqlx::{
+    AssertSqlSafe, ColumnIndex, Connection, Database, Decode, Executor, IntoArguments, Row, Type,
+    ValueRef,
+};
+use sqlx_postgres::{PgConnection, Postgres};
 use testcontainers::{Container, ImageExt, runners::SyncRunner};
-use testcontainers_modules::postgres::Postgres;
+use testcontainers_modules::postgres::Postgres as PostgresImage;
 use tokio::runtime::Runtime;
 use url::Url;
 
@@ -21,7 +24,7 @@ enum Outcome {
 
 struct PostgresServer {
     url: String,
-    _container: Option<Container<Postgres>>,
+    _container: Option<Container<PostgresImage>>,
 }
 
 static TEST_LOCK: Mutex<()> = Mutex::new(());
@@ -43,7 +46,7 @@ fn postgres_server() -> PostgresServer {
             unsafe { env::set_var("DOCKER_HOST", format!("unix://{}", socket.display())) };
         }
     }
-    let container = Postgres::default()
+    let container = PostgresImage::default()
         .with_tag("18")
         .start()
         .expect("must start PostgreSQL 18 container");
@@ -62,50 +65,65 @@ fn postgres_server() -> PostgresServer {
     }
 }
 
-fn postgres_outcome(client: &mut Client, statement: &Statement, sql: &str) -> Outcome {
-    match client.simple_query(sql) {
-        Ok(messages) => match statement {
-            Statement::Query(_) => Outcome::Rows(
-                messages
-                    .iter()
-                    .filter_map(|message| match message {
-                        SimpleQueryMessage::Row(row) => Some(
-                            (0..row.len())
-                                .map(|index| row.get(index).map(str::to_owned))
-                                .collect(),
-                        ),
-                        _ => None,
-                    })
-                    .collect(),
-            ),
-            _ => Outcome::Affected(
-                messages
-                    .iter()
-                    .filter_map(|message| match message {
-                        SimpleQueryMessage::CommandComplete(rows) => Some(*rows),
-                        _ => None,
-                    })
-                    .last()
-                    .expect("non-query statements must complete"),
-            ),
-        },
-        Err(error) => Outcome::Error(
-            error
-                .code()
-                .expect("PostgreSQL execution errors must have a SQLSTATE")
-                .code()
-                .into(),
-        ),
+enum TestConnection<'connection> {
+    Fake(&'connection mut PgFakeConnection),
+    Postgres(&'connection mut PgConnection),
+}
+
+#[derive(Clone, Copy)]
+enum ExecutionMode {
+    Prepared,
+    Raw,
+}
+
+impl TestConnection<'_> {
+    fn execute(&mut self, runtime: &Runtime, statement: &Statement, sql: &str) -> Outcome {
+        match self {
+            Self::Fake(connection) => runtime.block_on(execute_sqlx::<PgFake>(
+                connection,
+                statement,
+                sql,
+                ExecutionMode::Prepared,
+                |result| result.rows_affected(),
+            )),
+            Self::Postgres(connection) => runtime.block_on(execute_sqlx::<Postgres>(
+                connection,
+                statement,
+                sql,
+                ExecutionMode::Raw,
+                |result| result.rows_affected(),
+            )),
+        }
     }
 }
 
-async fn fake_outcome(
-    connection: &mut PgFakeConnection,
+async fn execute_sqlx<DB>(
+    connection: &mut DB::Connection,
     statement: &Statement,
     sql: &str,
-) -> Outcome {
+    mode: ExecutionMode,
+    rows_affected: impl FnOnce(DB::QueryResult) -> u64,
+) -> Outcome
+where
+    DB: Database,
+    for<'connection> &'connection mut DB::Connection: Executor<'connection, Database = DB>,
+    for<'row> String: Decode<'row, DB> + Type<DB>,
+    DB::Arguments: IntoArguments<DB>,
+    usize: ColumnIndex<DB::Row>,
+{
     match statement {
-        Statement::Query(_) => match sqlx::query(AssertSqlSafe(sql)).fetch_all(connection).await {
+        Statement::Query(_) => match match mode {
+            ExecutionMode::Prepared => {
+                sqlx::query(AssertSqlSafe(sql))
+                    .fetch_all(&mut *connection)
+                    .await
+            }
+            ExecutionMode::Raw => {
+                sqlx::raw_sql(AssertSqlSafe(sql))
+                    .fetch_all(&mut *connection)
+                    .await
+            }
+        } {
             Ok(rows) => Outcome::Rows(
                 rows.iter()
                     .map(|row| {
@@ -122,25 +140,34 @@ async fn fake_outcome(
                     })
                     .collect(),
             ),
-            Err(error) => Outcome::Error(
-                error
-                    .as_database_error()
-                    .and_then(|error| error.code())
-                    .expect("database execution errors must have a SQLSTATE")
-                    .into_owned(),
-            ),
+            Err(error) => make_error_outcome(error),
         },
-        _ => match sqlx::query(AssertSqlSafe(sql)).execute(connection).await {
-            Ok(result) => Outcome::Affected(result.rows_affected()),
-            Err(error) => Outcome::Error(
-                error
-                    .as_database_error()
-                    .and_then(|error| error.code())
-                    .expect("database execution errors must have a SQLSTATE")
-                    .into_owned(),
-            ),
+        _ => match match mode {
+            ExecutionMode::Prepared => {
+                sqlx::query(AssertSqlSafe(sql))
+                    .execute(&mut *connection)
+                    .await
+            }
+            ExecutionMode::Raw => {
+                sqlx::raw_sql(AssertSqlSafe(sql))
+                    .execute(&mut *connection)
+                    .await
+            }
+        } {
+            Ok(result) => Outcome::Affected(rows_affected(result)),
+            Err(error) => make_error_outcome(error),
         },
     }
+}
+
+fn make_error_outcome(error: sqlx::Error) -> Outcome {
+    Outcome::Error(
+        error
+            .as_database_error()
+            .and_then(|error| error.code())
+            .expect("database execution errors must have a SQLSTATE")
+            .into_owned(),
+    )
 }
 
 fn database_url(url: &str, database: &str) -> String {
@@ -296,7 +323,7 @@ fn statement_is_stateful(sql: &str) -> bool {
 
 fn compare_source_statement(
     runtime: &Runtime,
-    postgres: &mut Client,
+    postgres: &mut PgConnection,
     fake: &mut PgFakeConnection,
     sql: &str,
 ) -> Result<(), String> {
@@ -307,29 +334,37 @@ fn compare_source_statement(
     let mut parsed = match parser::parse(sql) {
         Ok(parsed) if parsed.len() == 1 => parsed,
         Ok(_) => return Err("does not contain exactly one SQL statement".into()),
-        Err(fake_error) => match postgres.simple_query(sql) {
-            Err(postgres_error)
-                if postgres_error
-                    .code()
-                    .is_some_and(|code| code.code() == fake_error.sqlstate.code()) =>
-            {
-                return Ok(());
+        Err(fake_error) => {
+            match runtime.block_on(sqlx::raw_sql(AssertSqlSafe(sql)).execute(&mut *postgres)) {
+                Err(postgres_error)
+                    if postgres_error
+                        .as_database_error()
+                        .and_then(|error| error.code())
+                        .is_some_and(|code| code == fake_error.sqlstate.code()) =>
+                {
+                    return Ok(());
+                }
+                Err(postgres_error) => {
+                    return Err(format!(
+                        "pg_fake cannot parse it ({}) while PostgreSQL returns {}",
+                        fake_error.sqlstate.code(),
+                        postgres_error
+                            .as_database_error()
+                            .and_then(|error| error.code())
+                            .as_deref()
+                            .unwrap_or("no SQLSTATE")
+                    ));
+                }
+                Ok(_) => return Err("pg_fake cannot parse a PostgreSQL-valid statement".into()),
             }
-            Err(postgres_error) => {
-                return Err(format!(
-                    "pg_fake cannot parse it ({}) while PostgreSQL returns {}",
-                    fake_error.sqlstate.code(),
-                    postgres_error
-                        .code()
-                        .map_or("no SQLSTATE", |code| code.code())
-                ));
-            }
-            Ok(_) => return Err("pg_fake cannot parse a PostgreSQL-valid statement".into()),
-        },
+        }
     };
     let statement = parsed.pop().unwrap();
-    let expected = postgres_outcome(postgres, &statement, sql);
-    let actual = runtime.block_on(fake_outcome(fake, &statement, sql));
+    let [expected, actual] = [
+        TestConnection::Postgres(postgres),
+        TestConnection::Fake(fake),
+    ]
+    .map(|mut connection| connection.execute(runtime, &statement, sql));
     if actual == expected {
         Ok(())
     } else {
@@ -339,15 +374,17 @@ fn compare_source_statement(
 
 fn collect_phase2_report(
     runtime: &Runtime,
-    admin: &mut Client,
+    admin: &mut PgConnection,
     server_url: &str,
 ) -> (usize, Vec<String>, Vec<String>) {
     let database = format!("pg_fake_regress_phase2_{}", std::process::id());
-    admin
-        .batch_execute(&format!("CREATE DATABASE {database}"))
+    let sql = format!("CREATE DATABASE {database}");
+    runtime
+        .block_on(sqlx::raw_sql(AssertSqlSafe(sql.as_str())).execute(&mut *admin))
         .expect("must create PostgreSQL Phase 2 regression database");
     let database_url = database_url(server_url, &database);
-    let mut postgres = Client::connect(&database_url, NoTls)
+    let mut postgres = runtime
+        .block_on(PgConnection::connect(&database_url))
         .expect("must connect to PostgreSQL Phase 2 regression database");
     let mut passed = 0;
     let mut blockers = Vec::new();
@@ -386,8 +423,9 @@ fn collect_phase2_report(
     }
 
     drop(postgres);
-    admin
-        .batch_execute(&format!("DROP DATABASE {database} WITH (FORCE)"))
+    let sql = format!("DROP DATABASE {database} WITH (FORCE)");
+    runtime
+        .block_on(sqlx::raw_sql(AssertSqlSafe(sql.as_str())).execute(&mut *admin))
         .expect("must drop PostgreSQL Phase 2 regression database");
     (passed, blockers, regressions)
 }
@@ -413,8 +451,10 @@ fn reports_phase2_regression_progress() {
             .all(|path| path.extension().is_some_and(|extension| extension == "sql"))
     );
     let server = postgres_server();
-    let mut admin = Client::connect(&server.url, NoTls).expect("must connect to PostgreSQL");
     let runtime = Runtime::new().expect("must create tokio runtime");
+    let mut admin = runtime
+        .block_on(PgConnection::connect(&server.url))
+        .expect("must connect SQLx to PostgreSQL");
     let mut passed = 0;
     let mut skipped = Vec::new();
 
@@ -440,11 +480,13 @@ fn reports_phase2_regression_progress() {
         };
 
         let database = format!("pg_fake_regress_source_{}_{}", std::process::id(), index);
-        admin
-            .batch_execute(&format!("CREATE DATABASE {database}"))
+        let sql = format!("CREATE DATABASE {database}");
+        runtime
+            .block_on(sqlx::raw_sql(AssertSqlSafe(sql.as_str())).execute(&mut admin))
             .expect("must create PostgreSQL regression database");
         let database_url = database_url(&server.url, &database);
-        let mut postgres = Client::connect(&database_url, NoTls)
+        let mut postgres = runtime
+            .block_on(PgConnection::connect(&database_url))
             .expect("must connect to PostgreSQL regression database");
         let mut fake = PgFakeConnection::new(Db::new());
         let mut tainted = false;
@@ -467,8 +509,9 @@ fn reports_phase2_regression_progress() {
             }
         }
         drop(postgres);
-        admin
-            .batch_execute(&format!("DROP DATABASE {database} WITH (FORCE)"))
+        let sql = format!("DROP DATABASE {database} WITH (FORCE)");
+        runtime
+            .block_on(sqlx::raw_sql(AssertSqlSafe(sql.as_str())).execute(&mut admin))
             .expect("must drop PostgreSQL regression database");
 
         if let Some(blocker) = first_blocker {

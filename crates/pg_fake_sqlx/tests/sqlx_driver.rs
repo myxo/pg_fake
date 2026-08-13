@@ -3,10 +3,15 @@ use std::{env, path::PathBuf, str::FromStr, time::Duration};
 use bigdecimal::BigDecimal;
 use pg_fake::api::Db;
 use pg_fake_sqlx::{PgFakeConnectOptions, PgFakeConnection, PgFakePoolOptions};
-use postgres::{Client, NoTls};
-use sqlx::{Column, Connection, Executor, Row, SqlStr, Statement, TypeInfo};
-use testcontainers::{ImageExt, runners::SyncRunner};
-use testcontainers_modules::postgres::Postgres;
+use sqlx::{AssertSqlSafe, Column, Connection, Executor, Row, SqlStr, Statement, TypeInfo};
+use sqlx_postgres::PgConnection;
+use testcontainers::{Container, ImageExt, runners::SyncRunner};
+use testcontainers_modules::postgres::Postgres as PostgresImage;
+
+struct PostgresServer {
+    url: String,
+    _container: Option<Container<PostgresImage>>,
+}
 
 #[tokio::test]
 async fn sqlx_queries_map_all_phase_one_types() {
@@ -234,9 +239,25 @@ async fn row_lock_waits_run_on_the_blocking_pool() {
 
 #[tokio::test(flavor = "multi_thread")]
 async fn sqlx_error_category_matches_postgres() {
-    let expected = tokio::task::spawn_blocking(postgres_unique_violation_code)
+    let server = tokio::task::spawn_blocking(start_postgres_server)
         .await
         .unwrap();
+    let mut postgres = PgConnection::connect(&server.url).await.unwrap();
+    sqlx::raw_sql(AssertSqlSafe(
+        "CREATE TEMP TABLE pg_fake_sqlx_unique_values (id integer UNIQUE);
+         INSERT INTO pg_fake_sqlx_unique_values VALUES (1)",
+    ))
+    .execute(&mut postgres)
+    .await
+    .unwrap();
+    let expected = postgres
+        .execute("INSERT INTO pg_fake_sqlx_unique_values VALUES (1)")
+        .await
+        .unwrap_err()
+        .as_database_error()
+        .and_then(|error| error.code())
+        .expect("PostgreSQL unique violations must have a SQLSTATE")
+        .into_owned();
     let mut connection = PgFakeConnection::new(Db::new());
     connection
         .execute("CREATE TABLE unique_values (id integer UNIQUE)")
@@ -253,9 +274,13 @@ async fn sqlx_error_category_matches_postgres() {
     let database_error = error.as_database_error().unwrap();
     assert_eq!(database_error.code().as_deref(), Some(expected.as_str()));
     assert!(database_error.is_unique_violation());
+    drop(postgres);
+    tokio::task::spawn_blocking(move || drop(server))
+        .await
+        .unwrap();
 }
 
-fn postgres_unique_violation_code() -> String {
+fn start_postgres_server() -> PostgresServer {
     let configured_url = env::var("PG_FAKE_DATABASE_URL").ok();
     if configured_url.is_none() && env::var_os("DOCKER_HOST").is_none() {
         let socket = PathBuf::from(env::var_os("HOME").expect("HOME must be set"))
@@ -265,7 +290,7 @@ fn postgres_unique_violation_code() -> String {
         }
     }
     let container = configured_url.is_none().then(|| {
-        Postgres::default()
+        PostgresImage::default()
             .with_tag("18")
             .start()
             .expect("must start PostgreSQL 18 container")
@@ -278,18 +303,8 @@ fn postgres_unique_violation_code() -> String {
             container.get_host_port_ipv4(5432).unwrap()
         )
     });
-    let mut client = Client::connect(&url, NoTls).unwrap();
-    client
-        .batch_execute(
-            "CREATE TEMP TABLE pg_fake_sqlx_unique_values (id integer UNIQUE);
-             INSERT INTO pg_fake_sqlx_unique_values VALUES (1)",
-        )
-        .unwrap();
-    client
-        .execute("INSERT INTO pg_fake_sqlx_unique_values VALUES (1)", &[])
-        .unwrap_err()
-        .code()
-        .unwrap()
-        .code()
-        .to_owned()
+    PostgresServer {
+        url,
+        _container: container,
+    }
 }

@@ -20,7 +20,7 @@ uuid = "1"
 
 [dev-dependencies]
 chaos_theory = "0.3.5"
-postgres = "0.19"
+sqlx-postgres = "0.9"
 testcontainers = { version = "0.27", features = ["blocking"] }
 testcontainers-modules = { version = "0.15", features = ["blocking", "postgres"] }
 tokio = { version = "1", features = ["macros", "rt-multi-thread", "sync", "time"] }

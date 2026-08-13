@@ -12,20 +12,20 @@ use std::{
 use bigdecimal::BigDecimal;
 use chaos_theory::{Effect, Source, check, make::int_in_range};
 use pg_fake::parser::{self, Statement};
-use pg_fake_sqlx::{Db, PgFakeConnection};
-use postgres::{Client, NoTls, SimpleQueryMessage};
-use sqlx::{AssertSqlSafe, Column, Row, ValueRef};
+use pg_fake_sqlx::{Db, PgFake, PgFakeConnection};
+use sqlx::{
+    AssertSqlSafe, Column, ColumnIndex, Connection, Database, Decode, Executor, Row, Type,
+    TypeInfo, ValueRef,
+};
+use sqlx_postgres::{PgConnection, Postgres};
 use testcontainers::{Container, ImageExt, runners::SyncRunner};
-use testcontainers_modules::postgres::Postgres;
+use testcontainers_modules::postgres::Postgres as PostgresImage;
 use tokio::runtime::Runtime;
 
 #[derive(Debug, PartialEq, Eq)]
 enum Outcome {
     Affected(u64),
-    Rows {
-        values: Vec<Vec<Option<String>>>,
-        type_oids: Option<Vec<u32>>,
-    },
+    Rows(Vec<Vec<Option<String>>>),
     Error(String),
 }
 
@@ -40,26 +40,33 @@ static TABLE_NUMBER: AtomicU64 = AtomicU64::new(1);
 
 struct PostgresServer {
     url: String,
-    _container: Option<Container<Postgres>>,
+    _container: Option<Container<PostgresImage>>,
 }
 
-struct PostgresCase<'client> {
-    client: &'client mut Client,
+struct PostgresCase<'connection, 'runtime> {
+    connection: &'connection mut PgConnection,
+    runtime: &'runtime Runtime,
     table: String,
 }
 
-impl PostgresCase<'_> {
-    fn client(&mut self) -> &mut Client {
-        self.client
+impl PostgresCase<'_, '_> {
+    fn get_connection(&mut self) -> &mut PgConnection {
+        self.connection
     }
 }
 
-impl Drop for PostgresCase<'_> {
+impl Drop for PostgresCase<'_, '_> {
     fn drop(&mut self) {
-        let _ = self.client.batch_execute("ROLLBACK");
         let _ = self
-            .client
-            .batch_execute(&format!("DROP TABLE IF EXISTS {}", self.table));
+            .runtime
+            .block_on(sqlx::raw_sql(AssertSqlSafe("ROLLBACK")).execute(&mut *self.connection));
+        let sql = format!(
+            "DROP TABLE IF EXISTS {0}_foreign_child, {0}_foreign_parent, {0}",
+            self.table
+        );
+        let _ = self
+            .runtime
+            .block_on(sqlx::raw_sql(AssertSqlSafe(sql.as_str())).execute(&mut *self.connection));
     }
 }
 
@@ -77,7 +84,7 @@ fn postgres_server() -> PostgresServer {
             unsafe { env::set_var("DOCKER_HOST", format!("unix://{}", socket.display())) };
         }
     }
-    let container = Postgres::default()
+    let container = PostgresImage::default()
         .with_tag("18")
         .start()
         .expect("must start PostgreSQL 18 container");
@@ -96,72 +103,58 @@ fn postgres_server() -> PostgresServer {
     }
 }
 
-fn postgres_outcome(client: &mut Client, statement: &Statement, sql: &str) -> Outcome {
-    let messages = match client.simple_query(sql) {
-        Ok(messages) => messages,
-        Err(error) => {
-            return Outcome::Error(
-                error
-                    .code()
-                    .expect("PostgreSQL execution errors must have a SQLSTATE")
-                    .code()
-                    .into(),
-            );
+enum TestConnection<'connection> {
+    Fake(&'connection mut PgFakeConnection),
+    Postgres(&'connection mut PgConnection),
+}
+
+impl TestConnection<'_> {
+    fn execute(&mut self, runtime: &Runtime, statement: &Statement, sql: &str) -> Outcome {
+        match self {
+            Self::Fake(connection) => runtime.block_on(execute_sqlx::<PgFake>(
+                connection,
+                statement,
+                sql,
+                |result| result.rows_affected(),
+            )),
+            Self::Postgres(connection) => runtime.block_on(execute_sqlx::<Postgres>(
+                connection,
+                statement,
+                sql,
+                |result| result.rows_affected(),
+            )),
         }
-    };
-    match statement {
-        Statement::Query(_) => Outcome::Rows {
-            values: messages
-                .iter()
-                .filter_map(|message| match message {
-                    SimpleQueryMessage::Row(row) => Some(
-                        (0..row.len())
-                            .map(|index| row.get(index).map(str::to_owned))
-                            .collect(),
-                    ),
-                    _ => None,
-                })
-                .collect(),
-            type_oids: None,
-        },
-        _ => Outcome::Affected(
-            messages
-                .iter()
-                .filter_map(|message| match message {
-                    SimpleQueryMessage::CommandComplete(rows) => Some(*rows),
-                    _ => None,
-                })
-                .last()
-                .expect("non-query statements must complete"),
-        ),
     }
 }
 
-async fn fake_outcome(
-    connection: &mut PgFakeConnection,
+async fn execute_sqlx<DB>(
+    connection: &mut DB::Connection,
     statement: &Statement,
     sql: &str,
-) -> Outcome {
+    rows_affected: impl FnOnce(DB::QueryResult) -> u64,
+) -> Outcome
+where
+    DB: Database,
+    for<'connection> &'connection mut DB::Connection: Executor<'connection, Database = DB>,
+    for<'row> String: Decode<'row, DB> + Type<DB>,
+    usize: ColumnIndex<DB::Row>,
+{
     match statement {
-        Statement::Query(_) => match sqlx::query(AssertSqlSafe(sql)).fetch_all(connection).await {
-            Ok(rows) => Outcome::Rows {
-                type_oids: Some(
-                    rows.first()
-                        .map(|row| {
-                            row.columns()
-                                .iter()
-                                .map(|column| {
-                                    column
-                                        .type_info()
-                                        .base
-                                        .expect("query columns must have a Phase-1 type")
-                                        .oid()
-                                })
-                                .collect()
-                        })
-                        .unwrap_or_default(),
-                ),
-                values: rows
+        Statement::Query(_) => match sqlx::raw_sql(AssertSqlSafe(sql))
+            .fetch_all(&mut *connection)
+            .await
+        {
+            Ok(rows) => {
+                let column_types = rows
+                    .first()
+                    .map(|row| {
+                        row.columns()
+                            .iter()
+                            .map(|column| column.type_info().name().to_owned())
+                            .collect::<Vec<_>>()
+                    })
+                    .unwrap_or_default();
+                let mut values = rows
                     .iter()
                     .map(|row| {
                         (0..row.len())
@@ -175,32 +168,35 @@ async fn fake_outcome(
                             })
                             .collect()
                     })
-                    .collect(),
-            },
-            Err(error) => Outcome::Error(
-                error
-                    .as_database_error()
-                    .and_then(|error| error.code())
-                    .expect("database execution errors must have a SQLSTATE")
-                    .into_owned(),
-            ),
+                    .collect::<Vec<_>>();
+                normalize_rows(&mut values, &column_types);
+                Outcome::Rows(values)
+            }
+            Err(error) => make_error_outcome(error),
         },
-        _ => match sqlx::query(AssertSqlSafe(sql)).execute(connection).await {
-            Ok(result) => Outcome::Affected(result.rows_affected()),
-            Err(error) => Outcome::Error(
-                error
-                    .as_database_error()
-                    .and_then(|error| error.code())
-                    .expect("database execution errors must have a SQLSTATE")
-                    .into_owned(),
-            ),
+        _ => match sqlx::raw_sql(AssertSqlSafe(sql))
+            .execute(&mut *connection)
+            .await
+        {
+            Ok(result) => Outcome::Affected(rows_affected(result)),
+            Err(error) => make_error_outcome(error),
         },
     }
 }
 
+fn make_error_outcome(error: sqlx::Error) -> Outcome {
+    Outcome::Error(
+        error
+            .as_database_error()
+            .and_then(|error| error.code())
+            .expect("database execution errors must have a SQLSTATE")
+            .into_owned(),
+    )
+}
+
 fn assert_statement(
     runtime: &Runtime,
-    postgres: &mut Client,
+    postgres: &mut PgConnection,
     fake: &mut PgFakeConnection,
     sql: &str,
     row_order: RowOrder,
@@ -213,21 +209,13 @@ fn assert_statement(
         "generated operation must be one statement"
     );
     let statement = statements.pop().expect("statement count was checked");
-    let expected = postgres_outcome(postgres, &statement, sql);
-    let actual = runtime.block_on(fake_outcome(fake, &statement, sql));
+    let [expected, actual] = [
+        TestConnection::Postgres(postgres),
+        TestConnection::Fake(fake),
+    ]
+    .map(|mut connection| connection.execute(runtime, &statement, sql));
     match (expected, actual) {
-        (
-            Outcome::Rows {
-                values: mut expected,
-                type_oids: None,
-            },
-            Outcome::Rows {
-                values: mut actual,
-                type_oids: Some(type_oids),
-            },
-        ) => {
-            normalize_rows(&mut expected, &type_oids);
-            normalize_rows(&mut actual, &type_oids);
+        (Outcome::Rows(mut expected), Outcome::Rows(mut actual)) => {
             if matches!(row_order, RowOrder::Unordered) {
                 expected.sort();
                 actual.sort();
@@ -238,17 +226,17 @@ fn assert_statement(
     }
 }
 
-fn normalize_rows(rows: &mut [Vec<Option<String>>], type_oids: &[u32]) {
+fn normalize_rows(rows: &mut [Vec<Option<String>>], column_types: &[String]) {
     for row in rows {
-        assert_eq!(row.len(), type_oids.len());
-        for (value, type_oid) in row.iter_mut().zip(type_oids) {
+        assert_eq!(row.len(), column_types.len());
+        for (value, column_type) in row.iter_mut().zip(column_types) {
             let Some(value) = value else {
                 continue;
             };
-            *value = match type_oid {
-                700 => format!("{:08x}", value.parse::<f32>().unwrap().to_bits()),
-                701 => format!("{:016x}", value.parse::<f64>().unwrap().to_bits()),
-                1700 => BigDecimal::from_str(value)
+            *value = match column_type.as_str() {
+                "FLOAT4" => format!("{:08x}", value.parse::<f32>().unwrap().to_bits()),
+                "FLOAT8" => format!("{:016x}", value.parse::<f64>().unwrap().to_bits()),
+                "NUMERIC" => BigDecimal::from_str(value)
                     .unwrap()
                     .normalized()
                     .to_plain_string(),
@@ -695,13 +683,15 @@ fn lock_timeout_sql(src: &mut Source) -> String {
 fn generated_sql_matches_postgres() {
     let _test_lock = TEST_LOCK.lock().expect("test mutex must not be poisoned");
     let server = postgres_server();
-    let postgres = RefCell::new(
-        Client::connect(&server.url, NoTls).expect("must connect to PostgreSQL 18 once"),
-    );
     let runtime = tokio::runtime::Builder::new_multi_thread()
         .enable_all()
         .build()
         .unwrap();
+    let postgres = RefCell::new(
+        runtime
+            .block_on(PgConnection::connect(&server.url))
+            .expect("must connect SQLx to PostgreSQL 18 once"),
+    );
     check(|src| {
         let table = format!(
             "pg_fake_property_{}_{}",
@@ -710,7 +700,8 @@ fn generated_sql_matches_postgres() {
         );
         let mut postgres = postgres.borrow_mut();
         let mut postgres = PostgresCase {
-            client: &mut postgres,
+            connection: &mut postgres,
+            runtime: &runtime,
             table: table.clone(),
         };
         let mut fake = PgFakeConnection::new(Db::new());
@@ -721,14 +712,14 @@ fn generated_sql_matches_postgres() {
 
         assert_statement(
             &runtime,
-            postgres.client(),
+            postgres.get_connection(),
             &mut fake,
             "SET SESSION CHARACTERISTICS AS TRANSACTION ISOLATION LEVEL READ COMMITTED",
             RowOrder::Unordered,
         );
         assert_statement(
             &runtime,
-            postgres.client(),
+            postgres.get_connection(),
             &mut fake,
             "SET lock_timeout = 1000",
             RowOrder::Unordered,
@@ -736,7 +727,7 @@ fn generated_sql_matches_postgres() {
         let create = create_table_sql(&table);
         assert_statement(
             &runtime,
-            postgres.client(),
+            postgres.get_connection(),
             &mut fake,
             &create,
             RowOrder::Unordered,
@@ -744,14 +735,14 @@ fn generated_sql_matches_postgres() {
         let insert = insert_sql(src, &table, &mut next_row_key);
         assert_statement(
             &runtime,
-            postgres.client(),
+            postgres.get_connection(),
             &mut fake,
             &insert,
             RowOrder::Unordered,
         );
         assert_statement(
             &runtime,
-            postgres.client(),
+            postgres.get_connection(),
             &mut fake,
             &format!(
                 "SELECT left_row.row_key, right_row.row_key FROM {table} AS left_row INNER JOIN {table} AS right_row ON left_row.row_key = right_row.row_key ORDER BY left_row.row_key"
@@ -760,7 +751,7 @@ fn generated_sql_matches_postgres() {
         );
         assert_statement(
             &runtime,
-            postgres.client(),
+            postgres.get_connection(),
             &mut fake,
             &format!(
                 "SELECT left_row.row_key, right_row.row_key FROM {table} AS left_row CROSS JOIN {table} AS right_row WHERE left_row.row_key = right_row.row_key ORDER BY left_row.row_key"
@@ -769,7 +760,7 @@ fn generated_sql_matches_postgres() {
         );
         assert_statement(
             &runtime,
-            postgres.client(),
+            postgres.get_connection(),
             &mut fake,
             &format!(
                 "SELECT left_row.row_key, right_row.row_key FROM {table} AS left_row FULL JOIN {table} AS right_row ON left_row.row_key = right_row.row_key + 1000000 ORDER BY 1, 2"
@@ -778,7 +769,7 @@ fn generated_sql_matches_postgres() {
         );
         assert_statement(
             &runtime,
-            postgres.client(),
+            postgres.get_connection(),
             &mut fake,
             &format!(
                 "SELECT source.row_key FROM (SELECT row_key FROM {table}) AS source ORDER BY source.row_key"
@@ -787,7 +778,7 @@ fn generated_sql_matches_postgres() {
         );
         assert_statement(
             &runtime,
-            postgres.client(),
+            postgres.get_connection(),
             &mut fake,
             &format!(
                 "SELECT row_key FROM {table} WHERE row_key = (SELECT row_key FROM {table} ORDER BY row_key LIMIT 1)"
@@ -796,7 +787,7 @@ fn generated_sql_matches_postgres() {
         );
         assert_statement(
             &runtime,
-            postgres.client(),
+            postgres.get_connection(),
             &mut fake,
             &format!(
                 "SELECT row_key FROM {table} WHERE row_key IN (SELECT row_key FROM {table}) ORDER BY row_key"
@@ -805,7 +796,7 @@ fn generated_sql_matches_postgres() {
         );
         assert_statement(
             &runtime,
-            postgres.client(),
+            postgres.get_connection(),
             &mut fake,
             &format!(
                 "SELECT EXISTS (SELECT 1 FROM {table}), 1000000 = ANY (SELECT row_key FROM {table}), 1000000 > ALL (SELECT row_key FROM {table})"
@@ -815,7 +806,7 @@ fn generated_sql_matches_postgres() {
         let correlation_threshold = integer(src, "correlation_threshold");
         assert_statement(
             &runtime,
-            postgres.client(),
+            postgres.get_connection(),
             &mut fake,
             &format!(
                 "SELECT outer_row.row_key, \
@@ -833,14 +824,14 @@ fn generated_sql_matches_postgres() {
         );
         assert_statement(
             &runtime,
-            postgres.client(),
+            postgres.get_connection(),
             &mut fake,
             &format!("CREATE TABLE {foreign_parent} (id INTEGER PRIMARY KEY)"),
             RowOrder::Unordered,
         );
         assert_statement(
             &runtime,
-            postgres.client(),
+            postgres.get_connection(),
             &mut fake,
             &format!(
                 "CREATE TABLE {foreign_child} (id INTEGER PRIMARY KEY, parent_id INTEGER REFERENCES {foreign_parent})"
@@ -849,7 +840,7 @@ fn generated_sql_matches_postgres() {
         );
         assert_statement(
             &runtime,
-            postgres.client(),
+            postgres.get_connection(),
             &mut fake,
             &format!("INSERT INTO {foreign_parent} VALUES (1)"),
             RowOrder::Unordered,
@@ -861,7 +852,7 @@ fn generated_sql_matches_postgres() {
         };
         assert_statement(
             &runtime,
-            postgres.client(),
+            postgres.get_connection(),
             &mut fake,
             &format!("INSERT INTO {foreign_child} VALUES (1, {foreign_key})"),
             RowOrder::Unordered,
@@ -934,7 +925,7 @@ fn generated_sql_matches_postgres() {
                     _ => unreachable!(),
                 };
                 src.log_value("sql", &sql);
-                assert_statement(&runtime, postgres.client(), &mut fake, &sql, order);
+                assert_statement(&runtime, postgres.get_connection(), &mut fake, &sql, order);
                 Effect::Success
             })
         });
@@ -942,17 +933,11 @@ fn generated_sql_matches_postgres() {
         if in_transaction {
             assert_statement(
                 &runtime,
-                postgres.client(),
+                postgres.get_connection(),
                 &mut fake,
                 "ROLLBACK",
                 RowOrder::Unordered,
             );
         }
-        postgres
-            .client()
-            .batch_execute(&format!(
-                "DROP TABLE {foreign_child}; DROP TABLE {foreign_parent}"
-            ))
-            .unwrap();
     });
 }
