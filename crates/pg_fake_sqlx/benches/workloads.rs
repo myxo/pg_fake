@@ -1,10 +1,7 @@
 use std::{
     env,
     path::PathBuf,
-    sync::{
-        Mutex,
-        atomic::{AtomicU64, Ordering},
-    },
+    sync::Mutex,
     time::{Duration, Instant},
 };
 
@@ -21,7 +18,6 @@ use testcontainers::{Container, ImageExt, runners::SyncRunner};
 use testcontainers_modules::postgres::Postgres;
 use tokio::runtime::Runtime;
 
-static TABLE_NUMBER: AtomicU64 = AtomicU64::new(1);
 static ENVIRONMENT_LOCK: Mutex<()> = Mutex::new(());
 
 fn fake_execute(runtime: &Runtime, connection: &mut PgFakeConnection, sql: &str) -> u64 {
@@ -66,98 +62,81 @@ fn postgres_benchmark() -> PostgresBenchmark {
     let _environment_lock = ENVIRONMENT_LOCK
         .lock()
         .expect("environment mutex must not be poisoned");
-    if let Ok(url) = env::var("PG_FAKE_DATABASE_URL") {
+    let mut postgres = if let Ok(url) = env::var("PG_FAKE_DATABASE_URL") {
         println!("connect to manually setup postgres on {url}");
-        return PostgresBenchmark {
+        PostgresBenchmark {
             client: Client::connect(&url, NoTls).expect("must connect to PostgreSQL 18"),
             _container: None,
-        };
-    }
-    if env::var_os("DOCKER_HOST").is_none() {
-        let socket = PathBuf::from(env::var_os("HOME").expect("HOME must be set"))
-            .join(".colima/default/docker.sock");
-        if socket.exists() {
-            unsafe { env::set_var("DOCKER_HOST", format!("unix://{}", socket.display())) };
         }
-    }
-    let container = Postgres::default()
-        .with_tag("18")
-        .start()
-        .expect("PostgreSQL 18 container must start");
-    let url = format!(
-        "postgresql://postgres:postgres@{}:{}/postgres",
-        container
-            .get_host()
-            .expect("container host must be available"),
-        container
-            .get_host_port_ipv4(5432)
-            .expect("PostgreSQL port must be available")
-    );
-    println!("connect to postgres in container on {url}");
-    PostgresBenchmark {
-        client: Client::connect(&url, NoTls).expect("must connect to PostgreSQL 18"),
-        _container: Some(container),
-    }
-}
-
-fn unique_table_name(workload: &str) -> String {
-    format!(
-        "pg_fake_benchmark_{workload}_{}_{}",
-        std::process::id(),
-        TABLE_NUMBER.fetch_add(1, Ordering::Relaxed)
-    )
+    } else {
+        if env::var_os("DOCKER_HOST").is_none() {
+            let socket = PathBuf::from(env::var_os("HOME").expect("HOME must be set"))
+                .join(".colima/default/docker.sock");
+            if socket.exists() {
+                unsafe { env::set_var("DOCKER_HOST", format!("unix://{}", socket.display())) };
+            }
+        }
+        let container = Postgres::default()
+            .with_tag("18")
+            .start()
+            .expect("PostgreSQL 18 container must start");
+        let url = format!(
+            "postgresql://postgres:postgres@{}:{}/postgres",
+            container
+                .get_host()
+                .expect("container host must be available"),
+            container
+                .get_host_port_ipv4(5432)
+                .expect("PostgreSQL port must be available")
+        );
+        println!("connect to postgres in container on {url}");
+        PostgresBenchmark {
+            client: Client::connect(&url, NoTls).expect("must connect to PostgreSQL 18"),
+            _container: Some(container),
+        }
+    };
+    postgres
+        .client
+        .batch_execute(
+            "SELECT pg_advisory_lock(18818, 1);
+             DROP SCHEMA IF EXISTS pgfake_benchmark CASCADE;
+             CREATE SCHEMA pgfake_benchmark;
+             SET search_path TO pgfake_benchmark",
+        )
+        .unwrap();
+    postgres
 }
 
 fn create_table_benchmark(criterion: &mut Criterion, runtime: &Runtime, postgres: &mut Client) {
-    let fake_table = unique_table_name("create_fake");
-    let postgres_table = unique_table_name("create_postgres");
-    let fake_create = format!("CREATE TABLE {fake_table} (id INTEGER, name TEXT)");
-    let fake_drop = format!("DROP TABLE {fake_table}");
-    let postgres_create = format!("CREATE TABLE {postgres_table} (id INTEGER, name TEXT)");
-    let postgres_drop = format!("DROP TABLE {postgres_table}");
+    let create = "CREATE TABLE create_table (id INTEGER, name TEXT)";
+    let drop = "DROP TABLE create_table";
     let mut fake = PgFakeConnection::new(Db::new());
     let mut group = criterion.benchmark_group(benchmarks::find_benchmark("create_table").name);
 
     group.bench_function("pg_fake", |benchmark| {
         benchmark.iter(|| {
-            assert_eq!(fake_execute(runtime, &mut fake, &fake_create), 0);
-            assert_eq!(fake_execute(runtime, &mut fake, &fake_drop), 1);
+            assert_eq!(fake_execute(runtime, &mut fake, create), 0);
+            assert_eq!(fake_execute(runtime, &mut fake, drop), 1);
         });
     });
     group.bench_function("postgres_18", |benchmark| {
         benchmark.iter(|| {
-            assert_eq!(postgres.execute(&postgres_create, &[]).unwrap(), 0);
-            assert_eq!(postgres.execute(&postgres_drop, &[]).unwrap(), 0);
+            assert_eq!(postgres.execute(create, &[]).unwrap(), 0);
+            assert_eq!(postgres.execute(drop, &[]).unwrap(), 0);
         });
     });
     group.finish();
 }
 
 fn insert_benchmark(criterion: &mut Criterion, runtime: &Runtime, postgres: &mut Client) {
-    let fake_table = unique_table_name("insert_fake");
-    let postgres_table = unique_table_name("insert_postgres");
     let mut fake = PgFakeConnection::new(Db::new());
-    assert_eq!(
-        fake_execute(
-            runtime,
-            &mut fake,
-            &format!(
-                "CREATE TABLE {fake_table} (id INTEGER PRIMARY KEY CHECK (id > 0), name TEXT NOT NULL DEFAULT upper('benchmark'), CHECK (length(name) > 0))"
-            )
-        ),
-        0
-    );
-    assert_eq!(
-        postgres
-            .execute(
-                &format!(
-                    "CREATE TABLE {postgres_table} (id INTEGER PRIMARY KEY CHECK (id > 0), name TEXT NOT NULL DEFAULT upper('benchmark'), CHECK (length(name) > 0))"
-                ),
-                &[],
-            )
-            .unwrap(),
-        0
-    );
+    for create in [
+        "CREATE TABLE insert_row (id INTEGER PRIMARY KEY CHECK (id > 0), name TEXT NOT NULL DEFAULT upper('benchmark'), CHECK (length(name) > 0))",
+        "CREATE TABLE insert_row_with_defaults (id INTEGER PRIMARY KEY CHECK (id > 0), name TEXT NOT NULL DEFAULT upper('benchmark'), CHECK (length(name) > 0))",
+    ] {
+        assert_eq!(fake_execute(runtime, &mut fake, create), 0);
+        assert_eq!(postgres.execute(create, &[]).unwrap(), 0);
+    }
     let mut fake_id = 0;
     let mut postgres_id = 0;
     let mut group = criterion.benchmark_group(benchmarks::find_benchmark("insert_row").name);
@@ -169,7 +148,7 @@ fn insert_benchmark(criterion: &mut Criterion, runtime: &Runtime, postgres: &mut
                 fake_execute(
                     runtime,
                     &mut fake,
-                    &format!("INSERT INTO {fake_table} VALUES ({fake_id}, 'benchmark')")
+                    &format!("INSERT INTO insert_row VALUES ({fake_id}, 'benchmark')")
                 ),
                 1
             );
@@ -181,9 +160,7 @@ fn insert_benchmark(criterion: &mut Criterion, runtime: &Runtime, postgres: &mut
             assert_eq!(
                 postgres
                     .execute(
-                        &format!(
-                            "INSERT INTO {postgres_table} VALUES ({postgres_id}, 'benchmark')"
-                        ),
+                        &format!("INSERT INTO insert_row VALUES ({postgres_id}, 'benchmark')"),
                         &[],
                     )
                     .unwrap(),
@@ -203,7 +180,7 @@ fn insert_benchmark(criterion: &mut Criterion, runtime: &Runtime, postgres: &mut
                 fake_execute(
                     runtime,
                     &mut fake,
-                    &format!("INSERT INTO {fake_table} (id) VALUES ({fake_id})"),
+                    &format!("INSERT INTO insert_row_with_defaults (id) VALUES ({fake_id})"),
                 ),
                 1
             );
@@ -215,7 +192,9 @@ fn insert_benchmark(criterion: &mut Criterion, runtime: &Runtime, postgres: &mut
             assert_eq!(
                 postgres
                     .execute(
-                        &format!("INSERT INTO {postgres_table} (id) VALUES ({postgres_id})"),
+                        &format!(
+                            "INSERT INTO insert_row_with_defaults (id) VALUES ({postgres_id})"
+                        ),
                         &[],
                     )
                     .unwrap(),
@@ -225,23 +204,21 @@ fn insert_benchmark(criterion: &mut Criterion, runtime: &Runtime, postgres: &mut
     });
     group.finish();
     postgres
-        .execute(&format!("DROP TABLE {postgres_table}"), &[])
+        .execute("DROP TABLE insert_row, insert_row_with_defaults", &[])
         .unwrap();
 }
 
 fn update_benchmark(criterion: &mut Criterion, runtime: &Runtime, postgres: &mut Client) {
-    let fake_table = unique_table_name("update_fake");
-    let postgres_table = unique_table_name("update_postgres");
-    let fake_create = format!("CREATE TABLE {fake_table} (id BIGINT PRIMARY KEY, amount INTEGER)");
-    let fake_insert = format!("INSERT INTO {fake_table} VALUES (1, 0)");
-    let fake_update = format!("UPDATE {fake_table} SET amount = amount + 1 WHERE id = 1");
-    let postgres_insert = format!("INSERT INTO {postgres_table} VALUES ($1, 0)");
-    let postgres_update = format!("UPDATE {postgres_table} SET amount = amount + 1 WHERE id = $1");
-    let postgres_delete = format!("DELETE FROM {postgres_table} WHERE id = $1");
+    let fake_create = "CREATE TABLE update_row (id BIGINT PRIMARY KEY, amount INTEGER)";
+    let fake_insert = "INSERT INTO update_row VALUES (1, 0)";
+    let fake_update = "UPDATE update_row SET amount = amount + 1 WHERE id = 1";
+    let postgres_insert = "INSERT INTO update_row VALUES ($1, 0)";
+    let postgres_update = "UPDATE update_row SET amount = amount + 1 WHERE id = $1";
+    let postgres_delete = "DELETE FROM update_row WHERE id = $1";
     assert_eq!(
         postgres
             .execute(
-                &format!("CREATE TABLE {postgres_table} (id BIGINT PRIMARY KEY, amount INTEGER)"),
+                "CREATE TABLE update_row (id BIGINT PRIMARY KEY, amount INTEGER)",
                 &[],
             )
             .unwrap(),
@@ -254,10 +231,10 @@ fn update_benchmark(criterion: &mut Criterion, runtime: &Runtime, postgres: &mut
             let mut elapsed = Duration::ZERO;
             for _ in 0..iterations {
                 let mut fake = PgFakeConnection::new(Db::new());
-                fake_execute(runtime, &mut fake, &fake_create);
-                fake_execute(runtime, &mut fake, &fake_insert);
+                fake_execute(runtime, &mut fake, fake_create);
+                fake_execute(runtime, &mut fake, fake_insert);
                 let started = Instant::now();
-                assert_eq!(fake_execute(runtime, &mut fake, &fake_update), 1);
+                assert_eq!(fake_execute(runtime, &mut fake, fake_update), 1);
                 elapsed += started.elapsed();
             }
             elapsed
@@ -267,29 +244,25 @@ fn update_benchmark(criterion: &mut Criterion, runtime: &Runtime, postgres: &mut
         benchmark.iter_custom(|iterations| {
             let mut elapsed = Duration::ZERO;
             for id in 0..iterations {
-                postgres.execute(&postgres_insert, &[&(id as i64)]).unwrap();
+                postgres.execute(postgres_insert, &[&(id as i64)]).unwrap();
                 let started = Instant::now();
                 assert_eq!(
-                    postgres.execute(&postgres_update, &[&(id as i64)]).unwrap(),
+                    postgres.execute(postgres_update, &[&(id as i64)]).unwrap(),
                     1
                 );
                 elapsed += started.elapsed();
-                postgres.execute(&postgres_delete, &[&(id as i64)]).unwrap();
+                postgres.execute(postgres_delete, &[&(id as i64)]).unwrap();
             }
             elapsed
         });
     });
     group.finish();
-    postgres
-        .execute(&format!("DROP TABLE {postgres_table}"), &[])
-        .unwrap();
+    postgres.execute("DROP TABLE update_row", &[]).unwrap();
 }
 
 fn delete_benchmark(criterion: &mut Criterion, runtime: &Runtime, postgres: &mut Client) {
-    let fake_table = unique_table_name("delete_fake");
-    let postgres_table = unique_table_name("delete_postgres");
     postgres
-        .execute(&format!("CREATE TABLE {postgres_table} (id INTEGER)"), &[])
+        .execute("CREATE TABLE delete_row (id INTEGER)", &[])
         .unwrap();
     let mut group = criterion.benchmark_group(benchmarks::find_benchmark("delete_row").name);
 
@@ -298,17 +271,13 @@ fn delete_benchmark(criterion: &mut Criterion, runtime: &Runtime, postgres: &mut
             let mut elapsed = Duration::ZERO;
             for id in 0..iterations {
                 let mut fake = PgFakeConnection::new(Db::new());
+                fake_execute(runtime, &mut fake, "CREATE TABLE delete_row (id INTEGER)");
                 fake_execute(
                     runtime,
                     &mut fake,
-                    &format!("CREATE TABLE {fake_table} (id INTEGER)"),
+                    &format!("INSERT INTO delete_row VALUES ({id})"),
                 );
-                fake_execute(
-                    runtime,
-                    &mut fake,
-                    &format!("INSERT INTO {fake_table} VALUES ({id})"),
-                );
-                let delete = format!("DELETE FROM {fake_table} WHERE id = {id}");
+                let delete = format!("DELETE FROM delete_row WHERE id = {id}");
                 let started = Instant::now();
                 assert_eq!(fake_execute(runtime, &mut fake, &delete), 1);
                 elapsed += started.elapsed();
@@ -321,9 +290,9 @@ fn delete_benchmark(criterion: &mut Criterion, runtime: &Runtime, postgres: &mut
             let mut elapsed = Duration::ZERO;
             for id in 0..iterations {
                 postgres
-                    .execute(&format!("INSERT INTO {postgres_table} VALUES ({id})"), &[])
+                    .execute(&format!("INSERT INTO delete_row VALUES ({id})"), &[])
                     .unwrap();
-                let delete = format!("DELETE FROM {postgres_table} WHERE id = {id}");
+                let delete = format!("DELETE FROM delete_row WHERE id = {id}");
                 let started = Instant::now();
                 assert_eq!(postgres.execute(&delete, &[]).unwrap(), 1);
                 elapsed += started.elapsed();
@@ -332,26 +301,22 @@ fn delete_benchmark(criterion: &mut Criterion, runtime: &Runtime, postgres: &mut
         });
     });
     group.finish();
-    postgres
-        .execute(&format!("DROP TABLE {postgres_table}"), &[])
-        .unwrap();
+    postgres.execute("DROP TABLE delete_row", &[]).unwrap();
 }
 
 fn transaction_benchmark(criterion: &mut Criterion, runtime: &Runtime, postgres: &mut Client) {
-    let fake_table = unique_table_name("transaction_fake");
-    let postgres_table = unique_table_name("transaction_postgres");
     let mut fake = PgFakeConnection::new(Db::new());
     assert_eq!(
         fake_execute(
             runtime,
             &mut fake,
-            &format!("CREATE TABLE {fake_table} (id INTEGER)"),
+            "CREATE TABLE transaction_insert (id INTEGER)",
         ),
         0
     );
     assert_eq!(
         postgres
-            .execute(&format!("CREATE TABLE {postgres_table} (id INTEGER)"), &[])
+            .execute("CREATE TABLE transaction_insert (id INTEGER)", &[])
             .unwrap(),
         0
     );
@@ -367,7 +332,7 @@ fn transaction_benchmark(criterion: &mut Criterion, runtime: &Runtime, postgres:
                 let mut transaction = fake.begin().await.unwrap();
                 assert_eq!(
                     sqlx::query(AssertSqlSafe(format!(
-                        "INSERT INTO {fake_table} VALUES ({fake_id})"
+                        "INSERT INTO transaction_insert VALUES ({fake_id})"
                     )))
                     .execute(&mut *transaction)
                     .await
@@ -386,7 +351,7 @@ fn transaction_benchmark(criterion: &mut Criterion, runtime: &Runtime, postgres:
             assert_eq!(
                 postgres
                     .execute(
-                        &format!("INSERT INTO {postgres_table} VALUES ({postgres_id})"),
+                        &format!("INSERT INTO transaction_insert VALUES ({postgres_id})"),
                         &[],
                     )
                     .unwrap(),
@@ -397,32 +362,35 @@ fn transaction_benchmark(criterion: &mut Criterion, runtime: &Runtime, postgres:
     });
     group.finish();
     postgres
-        .execute(&format!("DROP TABLE {postgres_table}"), &[])
+        .execute("DROP TABLE transaction_insert", &[])
         .unwrap();
 }
 
 fn repeatable_read_benchmark(criterion: &mut Criterion, runtime: &Runtime, postgres: &mut Client) {
-    let fake_table = unique_table_name("repeatable_read_fake");
-    let postgres_table = unique_table_name("repeatable_read_postgres");
     let mut fake = PgFakeConnection::new(Db::new());
     fake_execute(
         runtime,
         &mut fake,
-        &format!("CREATE TABLE {fake_table} (id INTEGER)"),
+        "CREATE TABLE transaction_repeatable_read_select_for_update (id INTEGER)",
     );
     fake_execute(
         runtime,
         &mut fake,
-        &format!("INSERT INTO {fake_table} VALUES (1)"),
+        "INSERT INTO transaction_repeatable_read_select_for_update VALUES (1)",
     );
     postgres
-        .execute(&format!("CREATE TABLE {postgres_table} (id INTEGER)"), &[])
+        .execute(
+            "CREATE TABLE transaction_repeatable_read_select_for_update (id INTEGER)",
+            &[],
+        )
         .unwrap();
     postgres
-        .execute(&format!("INSERT INTO {postgres_table} VALUES (1)"), &[])
+        .execute(
+            "INSERT INTO transaction_repeatable_read_select_for_update VALUES (1)",
+            &[],
+        )
         .unwrap();
-    let fake_select = format!("SELECT * FROM {fake_table} FOR UPDATE");
-    let postgres_select = format!("SELECT * FROM {postgres_table} FOR UPDATE");
+    let select = "SELECT * FROM transaction_repeatable_read_select_for_update FOR UPDATE";
     let mut group = criterion.benchmark_group(
         benchmarks::find_benchmark("transaction_repeatable_read_select_for_update").name,
     );
@@ -434,7 +402,7 @@ fn repeatable_read_benchmark(criterion: &mut Criterion, runtime: &Runtime, postg
                     .begin_with("BEGIN ISOLATION LEVEL REPEATABLE READ")
                     .await
                     .unwrap();
-                let result = sqlx::query(AssertSqlSafe(fake_select.as_str()))
+                let result = sqlx::query(AssertSqlSafe(select))
                     .fetch_all(&mut *transaction)
                     .await
                     .unwrap();
@@ -450,7 +418,7 @@ fn repeatable_read_benchmark(criterion: &mut Criterion, runtime: &Runtime, postg
             postgres
                 .execute("BEGIN ISOLATION LEVEL REPEATABLE READ", &[])
                 .unwrap();
-            let result = postgres.simple_query(&postgres_select).unwrap();
+            let result = postgres.simple_query(select).unwrap();
             assert_eq!(
                 result
                     .iter()
@@ -464,64 +432,36 @@ fn repeatable_read_benchmark(criterion: &mut Criterion, runtime: &Runtime, postg
     });
     group.finish();
     postgres
-        .execute(&format!("DROP TABLE {postgres_table}"), &[])
+        .execute(
+            "DROP TABLE transaction_repeatable_read_select_for_update",
+            &[],
+        )
         .unwrap();
 }
 
 fn select_benchmark(criterion: &mut Criterion, runtime: &Runtime, postgres: &mut Client) {
-    let fake_table = unique_table_name("select_fake");
-    let postgres_table = unique_table_name("select_postgres");
     let mut fake = PgFakeConnection::new(Db::new());
-    assert_eq!(
-        fake_execute(
-            runtime,
-            &mut fake,
-            &format!("CREATE TABLE {fake_table} (id INTEGER, name TEXT)"),
-        ),
-        0
-    );
-    assert_eq!(
-        postgres
-            .execute(
-                &format!("CREATE TABLE {postgres_table} (id INTEGER, name TEXT)"),
-                &[],
-            )
-            .unwrap(),
-        0
-    );
-    for id in 1..=100 {
-        assert_eq!(
-            fake_execute(
-                runtime,
-                &mut fake,
-                &format!("INSERT INTO {fake_table} VALUES ({id}, 'benchmark')"),
-            ),
-            1
-        );
-        assert_eq!(
-            postgres
-                .execute(
-                    &format!("INSERT INTO {postgres_table} VALUES ({id}, 'benchmark')"),
-                    &[],
-                )
-                .unwrap(),
-            1
-        );
+    for table in ["select_100_rows", "limit_offset_ordered_100_rows"] {
+        let create = format!("CREATE TABLE {table} (id INTEGER, name TEXT)");
+        let insert = insert_values_sql(table, 100);
+        assert_eq!(fake_execute(runtime, &mut fake, &create), 0);
+        assert_eq!(fake_execute(runtime, &mut fake, &insert), 100);
+        assert_eq!(postgres.execute(&create, &[]).unwrap(), 0);
+        assert_eq!(postgres.execute(&insert, &[]).unwrap(), 100);
     }
-    let fake_select = format!("SELECT * FROM {fake_table}");
-    let postgres_select = format!("SELECT * FROM {postgres_table}");
+    let select = "SELECT * FROM select_100_rows";
     let mut group = criterion.benchmark_group(benchmarks::find_benchmark("select_100_rows").name);
 
     group.bench_function("pg_fake", |benchmark| {
         benchmark.iter(|| {
-            let result = fake_query(runtime, &mut fake, &fake_select);
+            let result = fake_query(runtime, &mut fake, select);
             assert_eq!(result.len(), 100);
             black_box(result);
         });
     });
     group.bench_function("postgres_18", |benchmark| {
         benchmark.iter(|| {
-            let result = postgres.simple_query(&postgres_select).unwrap();
+            let result = postgres.simple_query(select).unwrap();
             assert_eq!(
                 result
                     .iter()
@@ -534,23 +474,21 @@ fn select_benchmark(criterion: &mut Criterion, runtime: &Runtime, postgres: &mut
     });
     group.finish();
 
-    let fake_select =
-        format!("SELECT id, name FROM {fake_table} ORDER BY id DESC LIMIT 10 OFFSET 40");
-    let postgres_select =
-        format!("SELECT id, name FROM {postgres_table} ORDER BY id DESC LIMIT 10 OFFSET 40");
+    let select =
+        "SELECT id, name FROM limit_offset_ordered_100_rows ORDER BY id DESC LIMIT 10 OFFSET 40";
     let mut group =
         criterion.benchmark_group(benchmarks::find_benchmark("limit_offset_ordered_100_rows").name);
 
     group.bench_function("pg_fake", |benchmark| {
         benchmark.iter(|| {
-            let result = fake_query(runtime, &mut fake, &fake_select);
+            let result = fake_query(runtime, &mut fake, select);
             assert_eq!(result.len(), 10);
             black_box(result);
         });
     });
     group.bench_function("postgres_18", |benchmark| {
         benchmark.iter(|| {
-            let result = postgres.simple_query(&postgres_select).unwrap();
+            let result = postgres.simple_query(select).unwrap();
             assert_eq!(
                 result
                     .iter()
@@ -563,27 +501,28 @@ fn select_benchmark(criterion: &mut Criterion, runtime: &Runtime, postgres: &mut
     });
     group.finish();
     postgres
-        .execute(&format!("DROP TABLE {postgres_table}"), &[])
+        .execute(
+            "DROP TABLE select_100_rows, limit_offset_ordered_100_rows",
+            &[],
+        )
         .unwrap();
 }
 
 fn order_by_benchmark(criterion: &mut Criterion, runtime: &Runtime, postgres: &mut Client) {
-    let fake_table = unique_table_name("order_by_fake");
-    let postgres_table = unique_table_name("order_by_postgres");
     let mut fake = PgFakeConnection::new(Db::new());
     assert_eq!(
         fake_execute(
             runtime,
             &mut fake,
-            &format!("CREATE TABLE {fake_table} (id INTEGER, bucket INTEGER)"),
+            "CREATE TABLE order_by_100_rows (id INTEGER, bucket INTEGER)",
         ),
         0
     );
     assert_eq!(
         postgres
             .execute(
-                &format!("CREATE TABLE {postgres_table} (id INTEGER, bucket INTEGER)"),
-                &[],
+                "CREATE TABLE order_by_100_rows (id INTEGER, bucket INTEGER)",
+                &[]
             )
             .unwrap(),
         0
@@ -598,36 +537,33 @@ fn order_by_benchmark(criterion: &mut Criterion, runtime: &Runtime, postgres: &m
             fake_execute(
                 runtime,
                 &mut fake,
-                &format!("INSERT INTO {fake_table} VALUES ({id}, {bucket})"),
+                &format!("INSERT INTO order_by_100_rows VALUES ({id}, {bucket})"),
             ),
             1
         );
         assert_eq!(
             postgres
                 .execute(
-                    &format!("INSERT INTO {postgres_table} VALUES ({id}, {bucket})"),
+                    &format!("INSERT INTO order_by_100_rows VALUES ({id}, {bucket})"),
                     &[],
                 )
                 .unwrap(),
             1
         );
     }
-    let fake_select =
-        format!("SELECT id, bucket FROM {fake_table} ORDER BY bucket DESC NULLS LAST, id ASC");
-    let postgres_select =
-        format!("SELECT id, bucket FROM {postgres_table} ORDER BY bucket DESC NULLS LAST, id ASC");
+    let select = "SELECT id, bucket FROM order_by_100_rows ORDER BY bucket DESC NULLS LAST, id ASC";
     let mut group = criterion.benchmark_group(benchmarks::find_benchmark("order_by_100_rows").name);
 
     group.bench_function("pg_fake", |benchmark| {
         benchmark.iter(|| {
-            let result = fake_query(runtime, &mut fake, &fake_select);
+            let result = fake_query(runtime, &mut fake, select);
             assert_eq!(result.len(), 100);
             black_box(result);
         });
     });
     group.bench_function("postgres_18", |benchmark| {
         benchmark.iter(|| {
-            let result = postgres.simple_query(&postgres_select).unwrap();
+            let result = postgres.simple_query(select).unwrap();
             assert_eq!(
                 result
                     .iter()
@@ -640,45 +576,49 @@ fn order_by_benchmark(criterion: &mut Criterion, runtime: &Runtime, postgres: &m
     });
     group.finish();
     postgres
-        .execute(&format!("DROP TABLE {postgres_table}"), &[])
+        .execute("DROP TABLE order_by_100_rows", &[])
         .unwrap();
 }
 
 fn core_vs_sqlx_benchmark(criterion: &mut Criterion, runtime: &Runtime) {
-    let core_table = unique_table_name("adapter_core");
     let mut core = Db::new().session();
     core_execute(
         &mut core,
-        &format!("CREATE TABLE {core_table} (id INTEGER, name TEXT)"),
+        "CREATE TABLE adapter_overhead_select_100_rows (id INTEGER, name TEXT)",
     );
-    core_execute(&mut core, &insert_values_sql(&core_table, 100));
+    core_execute(
+        &mut core,
+        &insert_values_sql("adapter_overhead_select_100_rows", 100),
+    );
     core_execute(&mut core, "BEGIN");
-    let core_query = format!("SELECT id, name FROM {core_table} ORDER BY id");
+    let query = "SELECT id, name FROM adapter_overhead_select_100_rows ORDER BY id";
 
-    let sqlx_table = unique_table_name("adapter_sqlx");
     let mut sqlx = PgFakeConnection::new(Db::new());
     fake_execute(
         runtime,
         &mut sqlx,
-        &format!("CREATE TABLE {sqlx_table} (id INTEGER, name TEXT)"),
+        "CREATE TABLE adapter_overhead_select_100_rows (id INTEGER, name TEXT)",
     );
-    fake_execute(runtime, &mut sqlx, &insert_values_sql(&sqlx_table, 100));
+    fake_execute(
+        runtime,
+        &mut sqlx,
+        &insert_values_sql("adapter_overhead_select_100_rows", 100),
+    );
     fake_execute(runtime, &mut sqlx, "BEGIN");
-    let sqlx_query = format!("SELECT id, name FROM {sqlx_table} ORDER BY id");
 
     let mut group = criterion
         .benchmark_group(benchmarks::find_benchmark("adapter_overhead_select_100_rows").name);
     group.throughput(Throughput::Elements(100));
     group.bench_function("core", |benchmark| {
         benchmark.iter(|| {
-            let result = core.query(&core_query, &[]).unwrap();
+            let result = core.query(query, &[]).unwrap();
             assert_eq!(result.rows.len(), 100);
             black_box(result);
         });
     });
     group.bench_function("sqlx", |benchmark| {
         benchmark.iter(|| {
-            let result = fake_query(runtime, &mut sqlx, &sqlx_query);
+            let result = fake_query(runtime, &mut sqlx, query);
             assert_eq!(result.len(), 100);
             black_box(result);
         });
@@ -690,15 +630,17 @@ fn core_vs_sqlx_benchmark(criterion: &mut Criterion, runtime: &Runtime) {
 }
 
 fn parsed_vs_prepared_benchmark(criterion: &mut Criterion) {
-    let table = unique_table_name("prepared_core");
     let mut session = Db::new().session();
     core_execute(
         &mut session,
-        &format!("CREATE TABLE {table} (id INTEGER PRIMARY KEY, name TEXT)"),
+        "CREATE TABLE core_parsed_vs_prepared_point_select (id INTEGER PRIMARY KEY, name TEXT)",
     );
-    core_execute(&mut session, &insert_values_sql(&table, 100));
-    let query = format!("SELECT name FROM {table} WHERE id = $1");
-    let prepared = session.prepare(&query).unwrap();
+    core_execute(
+        &mut session,
+        &insert_values_sql("core_parsed_vs_prepared_point_select", 100),
+    );
+    let query = "SELECT name FROM core_parsed_vs_prepared_point_select WHERE id = $1";
+    let prepared = session.prepare(query).unwrap();
     core_execute(&mut session, "BEGIN");
     let parameters = [Value::Int4(50)];
 
@@ -706,7 +648,7 @@ fn parsed_vs_prepared_benchmark(criterion: &mut Criterion) {
         .benchmark_group(benchmarks::find_benchmark("core_parsed_vs_prepared_point_select").name);
     group.bench_function("parse_and_analyze", |benchmark| {
         benchmark.iter(|| {
-            let result = session.query(&query, &parameters).unwrap();
+            let result = session.query(query, &parameters).unwrap();
             assert_eq!(result.rows.len(), 1);
             black_box(result);
         });
@@ -988,30 +930,29 @@ fn foreign_key_insert_benchmark(
     runtime: &Runtime,
     postgres: &mut Client,
 ) {
-    let fake_parent = unique_table_name("foreign_key_parent_fake");
-    let fake_child = unique_table_name("foreign_key_child_fake");
-    let postgres_parent = unique_table_name("foreign_key_parent_postgres");
-    let postgres_child = unique_table_name("foreign_key_child_postgres");
     let mut fake = PgFakeConnection::new(Db::new());
     fake_execute(
         runtime,
         &mut fake,
-        &format!("CREATE TABLE {fake_parent} (id INTEGER PRIMARY KEY)"),
+        "CREATE TABLE foreign_key_insert_parent (id INTEGER PRIMARY KEY)",
     );
     fake_execute(
         runtime,
         &mut fake,
-        &format!(
-            "CREATE TABLE {fake_child} (id INTEGER PRIMARY KEY, parent_id INTEGER REFERENCES {fake_parent})"
-        ),
+        "CREATE TABLE foreign_key_insert (id INTEGER PRIMARY KEY, parent_id INTEGER REFERENCES foreign_key_insert_parent)",
     );
     postgres
         .execute(
-            &format!("CREATE TABLE {postgres_parent} (id INTEGER PRIMARY KEY)"),
+            "CREATE TABLE foreign_key_insert_parent (id INTEGER PRIMARY KEY)",
             &[],
         )
         .unwrap();
-    postgres.execute(&format!("CREATE TABLE {postgres_child} (id INTEGER PRIMARY KEY, parent_id INTEGER REFERENCES {postgres_parent})"), &[]).unwrap();
+    postgres
+        .execute(
+            "CREATE TABLE foreign_key_insert (id INTEGER PRIMARY KEY, parent_id INTEGER REFERENCES foreign_key_insert_parent)",
+            &[],
+        )
+        .unwrap();
     let mut fake_id = 0_i32;
     let mut postgres_id = 0_i32;
     let mut group =
@@ -1022,13 +963,13 @@ fn foreign_key_insert_benchmark(
             fake_execute(
                 runtime,
                 &mut fake,
-                &format!("INSERT INTO {fake_parent} VALUES ({fake_id})"),
+                &format!("INSERT INTO foreign_key_insert_parent VALUES ({fake_id})"),
             );
             assert_eq!(
                 fake_execute(
                     runtime,
                     &mut fake,
-                    &format!("INSERT INTO {fake_child} VALUES ({fake_id}, {fake_id})")
+                    &format!("INSERT INTO foreign_key_insert VALUES ({fake_id}, {fake_id})")
                 ),
                 1
             );
@@ -1039,7 +980,7 @@ fn foreign_key_insert_benchmark(
             postgres_id += 1;
             postgres
                 .execute(
-                    &format!("INSERT INTO {postgres_parent} VALUES ({postgres_id})"),
+                    &format!("INSERT INTO foreign_key_insert_parent VALUES ({postgres_id})"),
                     &[],
                 )
                 .unwrap();
@@ -1047,7 +988,7 @@ fn foreign_key_insert_benchmark(
                 postgres
                     .execute(
                         &format!(
-                            "INSERT INTO {postgres_child} VALUES ({postgres_id}, {postgres_id})"
+                            "INSERT INTO foreign_key_insert VALUES ({postgres_id}, {postgres_id})"
                         ),
                         &[]
                     )
@@ -1058,10 +999,10 @@ fn foreign_key_insert_benchmark(
     });
     group.finish();
     postgres
-        .execute(&format!("DROP TABLE {postgres_child}"), &[])
-        .unwrap();
-    postgres
-        .execute(&format!("DROP TABLE {postgres_parent}"), &[])
+        .execute(
+            "DROP TABLE foreign_key_insert, foreign_key_insert_parent",
+            &[],
+        )
         .unwrap();
 }
 
@@ -1089,6 +1030,10 @@ fn benchmarks(criterion: &mut Criterion) {
     foreign_key_insert_benchmark(criterion, &runtime, &mut postgres.client);
     inner_join_benchmark(criterion, &runtime, &mut postgres.client);
     derived_and_scalar_subquery_benchmark(criterion, &runtime, &mut postgres.client);
+    postgres
+        .client
+        .batch_execute("DROP SCHEMA pgfake_benchmark CASCADE")
+        .unwrap();
 }
 
 fn derived_and_scalar_subquery_benchmark(
@@ -1096,51 +1041,36 @@ fn derived_and_scalar_subquery_benchmark(
     runtime: &Runtime,
     postgres: &mut Client,
 ) {
-    let fake_table = unique_table_name("derived_scalar_fake");
-    let postgres_table = unique_table_name("derived_scalar_postgres");
     let values = (1..=100)
         .map(|id| format!("({id})"))
         .collect::<Vec<_>>()
         .join(",");
     let mut fake = PgFakeConnection::new(Db::new());
-    fake_execute(
-        runtime,
-        &mut fake,
-        &format!("CREATE TABLE {fake_table} (id INTEGER)"),
-    );
-    fake_execute(
-        runtime,
-        &mut fake,
-        &format!("INSERT INTO {fake_table} VALUES {values}"),
-    );
-    postgres
-        .execute(&format!("CREATE TABLE {postgres_table} (id INTEGER)"), &[])
-        .unwrap();
-    postgres
-        .execute(
-            &format!("INSERT INTO {postgres_table} VALUES {values}"),
-            &[],
-        )
-        .unwrap();
-    let fake_query_sql = format!(
-        "SELECT source.id FROM (SELECT id FROM {fake_table} WHERE id <= (SELECT 100)) AS source WHERE source.id = ANY (SELECT id FROM {fake_table}) ORDER BY source.id"
-    );
-    let postgres_query_sql = format!(
-        "SELECT source.id FROM (SELECT id FROM {postgres_table} WHERE id <= (SELECT 100)) AS source WHERE source.id = ANY (SELECT id FROM {postgres_table}) ORDER BY source.id"
-    );
+    for table in [
+        "derived_and_scalar_subquery_100_rows",
+        "correlated_exists_100_rows",
+    ] {
+        let create = format!("CREATE TABLE {table} (id INTEGER)");
+        let insert = format!("INSERT INTO {table} VALUES {values}");
+        fake_execute(runtime, &mut fake, &create);
+        fake_execute(runtime, &mut fake, &insert);
+        postgres.execute(&create, &[]).unwrap();
+        postgres.execute(&insert, &[]).unwrap();
+    }
+    let query = "SELECT source.id FROM (SELECT id FROM derived_and_scalar_subquery_100_rows WHERE id <= (SELECT 100)) AS source WHERE source.id = ANY (SELECT id FROM derived_and_scalar_subquery_100_rows) ORDER BY source.id";
     let mut group = criterion
         .benchmark_group(benchmarks::find_benchmark("derived_and_scalar_subquery_100_rows").name);
     group.throughput(Throughput::Elements(100));
     group.bench_function("pg_fake", |benchmark| {
         benchmark.iter(|| {
-            let result = fake_query(runtime, &mut fake, &fake_query_sql);
+            let result = fake_query(runtime, &mut fake, query);
             assert_eq!(result.len(), 100);
             black_box(result);
         });
     });
     group.bench_function("postgres_18", |benchmark| {
         benchmark.iter(|| {
-            let result = postgres.simple_query(&postgres_query_sql).unwrap();
+            let result = postgres.simple_query(query).unwrap();
             assert_eq!(
                 result
                     .iter()
@@ -1153,25 +1083,20 @@ fn derived_and_scalar_subquery_benchmark(
     });
     group.finish();
 
-    let fake_query_sql = format!(
-        "SELECT outer_row.id FROM {fake_table} AS outer_row WHERE EXISTS (SELECT 1 FROM {fake_table} AS inner_row WHERE inner_row.id = outer_row.id)"
-    );
-    let postgres_query_sql = format!(
-        "SELECT outer_row.id FROM {postgres_table} AS outer_row WHERE EXISTS (SELECT 1 FROM {postgres_table} AS inner_row WHERE inner_row.id = outer_row.id)"
-    );
+    let query = "SELECT outer_row.id FROM correlated_exists_100_rows AS outer_row WHERE EXISTS (SELECT 1 FROM correlated_exists_100_rows AS inner_row WHERE inner_row.id = outer_row.id)";
     let mut group =
         criterion.benchmark_group(benchmarks::find_benchmark("correlated_exists_100_rows").name);
     group.throughput(Throughput::Elements(100));
     group.bench_function("pg_fake", |benchmark| {
         benchmark.iter(|| {
-            let result = fake_query(runtime, &mut fake, &fake_query_sql);
+            let result = fake_query(runtime, &mut fake, query);
             assert_eq!(result.len(), 100);
             black_box(result);
         });
     });
     group.bench_function("postgres_18", |benchmark| {
         benchmark.iter(|| {
-            let result = postgres.simple_query(&postgres_query_sql).unwrap();
+            let result = postgres.simple_query(query).unwrap();
             assert_eq!(
                 result
                     .iter()
@@ -1184,69 +1109,41 @@ fn derived_and_scalar_subquery_benchmark(
     });
     group.finish();
     postgres
-        .execute(&format!("DROP TABLE {postgres_table}"), &[])
+        .execute(
+            "DROP TABLE derived_and_scalar_subquery_100_rows, correlated_exists_100_rows",
+            &[],
+        )
         .unwrap();
 }
 
 fn inner_join_benchmark(criterion: &mut Criterion, runtime: &Runtime, postgres: &mut Client) {
-    let fake_left = unique_table_name("join_left_fake");
-    let fake_right = unique_table_name("join_right_fake");
-    let postgres_left = unique_table_name("join_left_postgres");
-    let postgres_right = unique_table_name("join_right_postgres");
     let mut fake = PgFakeConnection::new(Db::new());
     let values = (1..=100)
         .map(|id| format!("({id}, {})", id % 10))
         .collect::<Vec<_>>()
         .join(",");
-    for (left, right, postgres_target) in [
-        (&fake_left, &fake_right, false),
-        (&postgres_left, &postgres_right, true),
+    for table in [
+        "selective_inner_join_left",
+        "selective_inner_join_right",
+        "many_match_inner_join_left",
+        "many_match_inner_join_right",
     ] {
-        let create_left = format!("CREATE TABLE {left} (id INTEGER, bucket INTEGER)");
-        let create_right = format!("CREATE TABLE {right} (id INTEGER, bucket INTEGER)");
-        if postgres_target {
-            postgres.execute(&create_left, &[]).unwrap();
-            postgres.execute(&create_right, &[]).unwrap();
-            postgres
-                .execute(&format!("INSERT INTO {left} VALUES {values}"), &[])
-                .unwrap();
-            postgres
-                .execute(&format!("INSERT INTO {right} VALUES {values}"), &[])
-                .unwrap();
-        } else {
-            fake_execute(runtime, &mut fake, &create_left);
-            fake_execute(runtime, &mut fake, &create_right);
-            fake_execute(
-                runtime,
-                &mut fake,
-                &format!("INSERT INTO {left} VALUES {values}"),
-            );
-            fake_execute(
-                runtime,
-                &mut fake,
-                &format!("INSERT INTO {right} VALUES {values}"),
-            );
-        }
+        let create = format!("CREATE TABLE {table} (id INTEGER, bucket INTEGER)");
+        let insert = format!("INSERT INTO {table} VALUES {values}");
+        fake_execute(runtime, &mut fake, &create);
+        fake_execute(runtime, &mut fake, &insert);
+        postgres.execute(&create, &[]).unwrap();
+        postgres.execute(&insert, &[]).unwrap();
     }
-    for (name, fake_query_sql, postgres_query_sql, expected) in [
+    for (name, query, expected) in [
         (
             "selective_inner_join",
-            format!(
-                "SELECT left_row.id FROM {fake_left} left_row INNER JOIN {fake_right} right_row ON left_row.id = right_row.id WHERE left_row.id = 50"
-            ),
-            format!(
-                "SELECT left_row.id FROM {postgres_left} left_row INNER JOIN {postgres_right} right_row ON left_row.id = right_row.id WHERE left_row.id = 50"
-            ),
+            "SELECT left_row.id FROM selective_inner_join_left left_row INNER JOIN selective_inner_join_right right_row ON left_row.id = right_row.id WHERE left_row.id = 50",
             1,
         ),
         (
             "many_match_inner_join",
-            format!(
-                "SELECT left_row.id FROM {fake_left} left_row INNER JOIN {fake_right} right_row ON left_row.bucket = right_row.bucket WHERE left_row.bucket = 0"
-            ),
-            format!(
-                "SELECT left_row.id FROM {postgres_left} left_row INNER JOIN {postgres_right} right_row ON left_row.bucket = right_row.bucket WHERE left_row.bucket = 0"
-            ),
+            "SELECT left_row.id FROM many_match_inner_join_left left_row INNER JOIN many_match_inner_join_right right_row ON left_row.bucket = right_row.bucket WHERE left_row.bucket = 0",
             100,
         ),
     ] {
@@ -1254,14 +1151,14 @@ fn inner_join_benchmark(criterion: &mut Criterion, runtime: &Runtime, postgres: 
         group.throughput(Throughput::Elements(expected));
         group.bench_function("pg_fake", |benchmark| {
             benchmark.iter(|| {
-                let result = fake_query(runtime, &mut fake, &fake_query_sql);
+                let result = fake_query(runtime, &mut fake, query);
                 assert_eq!(result.len(), expected as usize);
                 black_box(result);
             });
         });
         group.bench_function("postgres_18", |benchmark| {
             benchmark.iter(|| {
-                let result = postgres.simple_query(&postgres_query_sql).unwrap();
+                let result = postgres.simple_query(query).unwrap();
                 assert_eq!(
                     result
                         .iter()
@@ -1275,10 +1172,10 @@ fn inner_join_benchmark(criterion: &mut Criterion, runtime: &Runtime, postgres: 
         group.finish();
     }
     postgres
-        .execute(&format!("DROP TABLE {postgres_left}"), &[])
-        .unwrap();
-    postgres
-        .execute(&format!("DROP TABLE {postgres_right}"), &[])
+        .execute(
+            "DROP TABLE selective_inner_join_left, selective_inner_join_right, many_match_inner_join_left, many_match_inner_join_right",
+            &[],
+        )
         .unwrap();
 }
 

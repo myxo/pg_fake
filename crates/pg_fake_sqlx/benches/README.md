@@ -34,8 +34,13 @@ By default, it starts a PostgreSQL 18 Testcontainers container. It detects the
 default Colima socket (`~/.colima/default/docker.sock`); set `DOCKER_HOST` for
 another Docker socket or profile.
 
+PostgreSQL workloads use ordinary tables with stable names inside the
+`pgfake_benchmark` schema. The suite takes a database-scoped advisory lock,
+recreates that schema before benchmarking, and drops it afterward.
+
 To benchmark an existing PostgreSQL 18 instance instead, set
-`PG_FAKE_DATABASE_URL`:
+`PG_FAKE_DATABASE_URL`. The connected role must be able to create and drop the
+`pgfake_benchmark` schema, which is reserved for this suite:
 
 ```sh
 PG_FAKE_DATABASE_URL=postgresql://postgres:password@localhost:5432/postgres \
