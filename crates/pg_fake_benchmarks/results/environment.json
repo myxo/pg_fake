@@ -1,0 +1,13 @@
+{
+  "architecture": "aarch64",
+  "cpu": "Apple M2",
+  "criterion": "0.5",
+  "logical_cpus": "8",
+  "os": "macos",
+  "os_version": "Darwin 23.6.0",
+  "performance_levels": "level 0: 4 physical / 4 logical; level 1: 4 physical / 4 logical",
+  "physical_cores": "8",
+  "postgres_target": "18",
+  "recorded_at": "2026-08-13T03:12:04Z",
+  "rust": "rustc 1.96.0 (ac68faa20 2026-05-25)"
+}

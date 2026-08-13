@@ -1,0 +1,1 @@
+{"group_id":"point_lookup_index_vs_scan","function_id":"heap_scan","value_str":"10000","throughput":{"Elements":10000},"full_id":"point_lookup_index_vs_scan/heap_scan/10000","directory_name":"point_lookup_index_vs_scan/heap_scan/10000","title":"point_lookup_index_vs_scan/heap_scan/10000"}

@@ -52,6 +52,21 @@ Otherwise run:
 cargo x bench
 ```
 
-The command runs Criterion and prints every benchmark's average latency, then
-prints the relative timing for every comparison declared by the shared benchmark
-catalog. Criterion writes latency and throughput reports under `target/criterion`.
+The command restores the baseline committed under `results/`, runs Criterion,
+and prints Criterion's statistical changes. It also prints the current CPU and
+system information, every benchmark's average latency, and the relative timing
+for every comparison declared by the shared benchmark catalog. It does not
+modify the committed results.
+
+After making an intentional performance change, replace the committed baseline:
+
+```sh
+cargo x bench record
+```
+
+This stores Criterion's compact raw JSON baseline, `environment.json`, and a
+readable `report.md` under `results/`. Transient comparison data remains under
+`target/criterion`; the wrapper disables HTML and plot generation.
+
+Direct `cargo bench -p pg_fake_benchmarks --bench workloads` remains an ordinary
+Criterion run and does not read or write the committed results.
