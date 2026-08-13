@@ -3,9 +3,10 @@
 use std::ops::ControlFlow;
 
 use sqlparser::ast::{
-    AssignmentTarget, BinaryOperator, CastKind, DataType, Expr, FromTable, FunctionArg,
-    FunctionArgExpr, FunctionArguments, LimitClause, OrderByKind, SelectItem, SetExpr, Statement,
-    TableFactor, Value as AstValue, VisitMut, VisitorMut, visit_expressions, visit_expressions_mut,
+    AssignmentTarget, BinaryOperator, CastKind, CharacterLength, DataType, Expr, FromTable,
+    FunctionArg, FunctionArgExpr, FunctionArguments, Ident, LimitClause, OrderByKind, SelectItem,
+    SetExpr, Statement, TableFactor, Value as AstValue, VisitMut, VisitorMut, visit_expressions,
+    visit_expressions_mut,
 };
 
 use crate::{
@@ -186,10 +187,13 @@ pub(crate) fn describe_subqueries(statement: &Statement, catalog: &Catalog) -> R
                             "subquery must return only one column",
                         ));
                     }
-                    Ok(typed_literal(Value::Null, columns[0].1.base))
+                    Ok(typed_literal(Value::Null, columns[0].1))
                 })
             }
-            Expr::Exists { .. } => Ok(typed_literal(Value::Bool(false), BaseType::Bool)),
+            Expr::Exists { .. } => Ok(typed_literal(
+                Value::Bool(false),
+                PgType::new(BaseType::Bool),
+            )),
             Expr::InSubquery {
                 expr,
                 subquery,
@@ -207,7 +211,7 @@ pub(crate) fn describe_subqueries(statement: &Statement, catalog: &Catalog) -> R
                 }
                 let fields = columns
                     .into_iter()
-                    .map(|(_, data_type)| typed_literal(Value::Null, data_type.base))
+                    .map(|(_, data_type)| typed_literal(Value::Null, data_type))
                     .collect::<Vec<_>>();
                 Ok(Expr::InList {
                     expr: expr.clone(),
@@ -297,7 +301,7 @@ pub(crate) fn bind(
         };
         let target = parameter_types[index];
         match coerce_parameter(values[index].clone(), target) {
-            Ok(value) => *expression = typed_literal(value, target),
+            Ok(value) => *expression = typed_literal(value, PgType::new(target)),
             Err(bind_error) => {
                 error = Some(bind_error);
                 return ControlFlow::Break(());
@@ -720,7 +724,7 @@ fn coerce_parameter(value: Value, target: BaseType) -> Result<Value> {
     coercion::coerce(value, source, PgType::new(target), CastContext::Implicit)
 }
 
-pub(crate) fn typed_literal(value: Value, data_type: BaseType) -> Expr {
+pub(crate) fn typed_literal(value: Value, data_type: PgType) -> Expr {
     let literal = match value {
         Value::Null => AstValue::Null,
         Value::Bool(value) => AstValue::Boolean(value),
@@ -744,14 +748,14 @@ pub(crate) fn typed_literal(value: Value, data_type: BaseType) -> Expr {
     Expr::Cast {
         kind: CastKind::Cast,
         expr: Box::new(Expr::Value(literal.into())),
-        data_type: ast_data_type(data_type),
+        data_type: make_ast_data_type(data_type),
         array: false,
         format: None,
     }
 }
 
-fn ast_data_type(data_type: BaseType) -> DataType {
-    match data_type {
+fn make_ast_data_type(data_type: PgType) -> DataType {
+    match data_type.base {
         BaseType::Bool => DataType::Boolean,
         BaseType::Int2 => DataType::SmallInt(None),
         BaseType::Int4 => DataType::Integer(None),
@@ -761,7 +765,13 @@ fn ast_data_type(data_type: BaseType) -> DataType {
         BaseType::Numeric => DataType::Numeric(sqlparser::ast::ExactNumberInfo::None),
         BaseType::Text => DataType::Text,
         BaseType::Varchar => DataType::Varchar(None),
-        BaseType::Bpchar => DataType::Char(None),
+        BaseType::Bpchar if data_type.typmod == PgType::NO_TYPEMOD => {
+            DataType::Custom(Ident::new("bpchar").into(), Vec::new())
+        }
+        BaseType::Bpchar => DataType::Char(Some(CharacterLength::IntegerLength {
+            length: u64::try_from(data_type.typmod - 4).expect("valid character typmod"),
+            unit: None,
+        })),
         BaseType::Bytea => DataType::Bytea,
         BaseType::Uuid => DataType::Uuid,
         BaseType::Date => DataType::Date,

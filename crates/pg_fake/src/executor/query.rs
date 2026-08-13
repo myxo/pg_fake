@@ -80,8 +80,11 @@ impl VisitorMut for SubqueryMaterializer<'_> {
                         "subquery has too many columns",
                     ));
                 }
-                let data_type = BaseType::from_oid(result.columns[0].type_oid)
-                    .expect("query result type OID is supported");
+                let data_type = PgType::with_typmod(
+                    BaseType::from_oid(result.columns[0].type_oid)
+                        .expect("query result type OID is supported"),
+                    result.columns[0].typmod,
+                );
                 Ok(Some(Expr::AnyOp {
                     left,
                     compare_op,
@@ -110,8 +113,11 @@ impl VisitorMut for SubqueryMaterializer<'_> {
                         "subquery has too many columns",
                     ));
                 }
-                let data_type = BaseType::from_oid(result.columns[0].type_oid)
-                    .expect("query result type OID is supported");
+                let data_type = PgType::with_typmod(
+                    BaseType::from_oid(result.columns[0].type_oid)
+                        .expect("query result type OID is supported"),
+                    result.columns[0].typmod,
+                );
                 Ok(Some(Expr::AllOp {
                     left,
                     compare_op,
@@ -138,8 +144,11 @@ impl VisitorMut for SubqueryMaterializer<'_> {
                         "more than one row returned by a subquery used as an expression",
                     ));
                 }
-                let data_type = BaseType::from_oid(result.columns[0].type_oid)
-                    .expect("query result type OID is supported");
+                let data_type = PgType::with_typmod(
+                    BaseType::from_oid(result.columns[0].type_oid)
+                        .expect("query result type OID is supported"),
+                    result.columns[0].typmod,
+                );
                 Ok(Some(crate::analyzer::typed_literal(
                     result
                         .rows
@@ -152,7 +161,7 @@ impl VisitorMut for SubqueryMaterializer<'_> {
             }
             Expr::Exists { subquery, negated } => Ok(Some(crate::analyzer::typed_literal(
                 Value::Bool(self.execute(&subquery)?.rows.is_empty() == negated),
-                BaseType::Bool,
+                PgType::new(BaseType::Bool),
             ))),
             Expr::InSubquery {
                 expr,
@@ -174,8 +183,11 @@ impl VisitorMut for SubqueryMaterializer<'_> {
                     .columns
                     .iter()
                     .map(|column| {
-                        BaseType::from_oid(column.type_oid)
-                            .expect("query result type OID is supported")
+                        PgType::with_typmod(
+                            BaseType::from_oid(column.type_oid)
+                                .expect("query result type OID is supported"),
+                            column.typmod,
+                        )
                     })
                     .collect::<Vec<_>>();
                 Ok(Some(Expr::InList {
@@ -334,7 +346,7 @@ impl VisitorMut for OuterReferenceSubstituter<'_> {
             Ok((_, data_type)) => {
                 match RowScope::Bound(self.outer_scope).column_value(identifiers, self.outer_row) {
                     Ok(value) => {
-                        *expression = crate::analyzer::typed_literal(value, data_type.base);
+                        *expression = crate::analyzer::typed_literal(value, data_type);
                         self.substituted = true;
                     }
                     Err(error) => {

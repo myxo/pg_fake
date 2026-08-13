@@ -615,13 +615,13 @@ impl VisitorMut for SubqueryTypeDescriber<'_> {
                     }
                     Ok(crate::analyzer::typed_literal(
                         crate::value::Value::Null,
-                        columns[0].data_type.base,
+                        columns[0].data_type,
                     ))
                 })
             }
             Expr::Exists { .. } => Ok(crate::analyzer::typed_literal(
                 crate::value::Value::Bool(false),
-                BaseType::Bool,
+                PgType::new(BaseType::Bool),
             )),
             Expr::InSubquery {
                 expr,
@@ -639,7 +639,7 @@ impl VisitorMut for SubqueryTypeDescriber<'_> {
                     ));
                 }
                 let mut fields = columns.into_iter().map(|column| {
-                    crate::analyzer::typed_literal(crate::value::Value::Null, column.data_type.base)
+                    crate::analyzer::typed_literal(crate::value::Value::Null, column.data_type)
                 });
                 let candidate = if left_width == 1 {
                     fields.next().expect("subquery has one column")
@@ -673,7 +673,7 @@ impl VisitorMut for SubqueryTypeDescriber<'_> {
                         compare_op: compare_op.clone(),
                         right: Box::new(Expr::Tuple(vec![crate::analyzer::typed_literal(
                             crate::value::Value::Null,
-                            columns[0].data_type.base,
+                            columns[0].data_type,
                         )])),
                         is_some: *is_some,
                     })
@@ -699,7 +699,7 @@ impl VisitorMut for SubqueryTypeDescriber<'_> {
                         compare_op: compare_op.clone(),
                         right: Box::new(Expr::Tuple(vec![crate::analyzer::typed_literal(
                             crate::value::Value::Null,
-                            columns[0].data_type.base,
+                            columns[0].data_type,
                         )])),
                     })
                 })
