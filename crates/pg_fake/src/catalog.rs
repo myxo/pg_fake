@@ -3,7 +3,7 @@ use std::collections::BTreeMap;
 use sqlparser::ast::{ConstraintReferenceMatchKind, Expr};
 
 use crate::{
-    error::{PgError, Result, SqlState},
+    error::{PgError, Result, SqlState, not_supported},
     value::PgType,
 };
 
@@ -139,11 +139,8 @@ impl Catalog {
                     _ => None,
                 })
         }) {
-            return Err(PgError::new(
-                SqlState::FeatureNotSupported,
-                format!(
-                    "cannot drop table {name:?} because constraint {constraint:?} on table {table:?} depends on it"
-                ),
+            return not_supported(format!(
+                "cannot drop table {name:?} because constraint {constraint:?} on table {table:?} depends on it"
             ));
         }
         self.public.tables.remove(name).ok_or_else(|| {

@@ -12,7 +12,7 @@ use sqlparser::ast::{
 use crate::{
     catalog::{Catalog, TableSchema},
     coercion::{self, CastContext},
-    error::{PgError, Result, SqlState},
+    error::{PgError, Result, SqlState, not_supported},
     executor,
     value::{BaseType, PgType, Value},
 };
@@ -353,10 +353,7 @@ fn table_schema<'a>(factor: &TableFactor, catalog: &'a Catalog) -> Result<&'a Ta
         name, args: None, ..
     } = factor
     else {
-        return Err(PgError::new(
-            SqlState::FeatureNotSupported,
-            "table source is not implemented",
-        ));
+        return not_supported("table source is not implemented");
     };
     catalog.table(&executor::name(name)?)
 }

@@ -12,10 +12,7 @@ pub(super) fn insert_rows(
     let table_name = insert_table_name(&insert.table)?;
     let schema = state.catalog.table(&table_name)?.clone();
     if insert.returning.is_some() {
-        return Err(PgError::new(
-            SqlState::FeatureNotSupported,
-            "INSERT RETURNING is not implemented",
-        ));
+        return not_supported("INSERT RETURNING is not implemented");
     }
     let column_indexes = if insert.columns.is_empty() {
         (0..schema.columns.len()).collect::<Vec<_>>()
@@ -72,10 +69,7 @@ pub(super) fn insert_rows(
     };
     let rows = if let Some(source) = &insert.source {
         let SetExpr::Values(values) = source.body.as_ref() else {
-            return Err(PgError::new(
-                SqlState::FeatureNotSupported,
-                "INSERT source is not implemented",
-            ));
+            return not_supported("INSERT source is not implemented");
         };
         values
             .rows
@@ -141,10 +135,7 @@ pub(super) fn update_rows(
     context: &ExecutionContext,
 ) -> Result<StatementResult> {
     if !update_table.joins.is_empty() {
-        return Err(PgError::new(
-            SqlState::FeatureNotSupported,
-            "UPDATE joins are not implemented",
-        ));
+        return not_supported("UPDATE joins are not implemented");
     }
     let TableFactor::Table {
         name: table_name,
@@ -152,16 +143,10 @@ pub(super) fn update_rows(
         ..
     } = &update_table.relation
     else {
-        return Err(PgError::new(
-            SqlState::FeatureNotSupported,
-            "UPDATE target is not implemented",
-        ));
+        return not_supported("UPDATE target is not implemented");
     };
     if args.is_some() {
-        return Err(PgError::new(
-            SqlState::FeatureNotSupported,
-            "UPDATE table functions are not implemented",
-        ));
+        return not_supported("UPDATE table functions are not implemented");
     }
     let schema = state.catalog.table(&name(table_name)?)?.clone();
     if let Some(selection) = selection {
@@ -178,10 +163,7 @@ pub(super) fn update_rows(
         .iter()
         .map(|assignment| {
             let AssignmentTarget::ColumnName(column) = &assignment.target else {
-                return Err(PgError::new(
-                    SqlState::FeatureNotSupported,
-                    "UPDATE tuple assignment is not implemented",
-                ));
+                return not_supported("UPDATE tuple assignment is not implemented");
             };
             let column_name = name(column)?;
             let index = schema
@@ -308,22 +290,13 @@ pub(super) fn delete_rows(
         || !delete.order_by.is_empty()
         || delete.limit.is_some()
     {
-        return Err(PgError::new(
-            SqlState::FeatureNotSupported,
-            "DELETE feature is not implemented",
-        ));
+        return not_supported("DELETE feature is not implemented");
     }
     let FromTable::WithFromKeyword(from) = &delete.from else {
-        return Err(PgError::new(
-            SqlState::FeatureNotSupported,
-            "DELETE without FROM is not implemented",
-        ));
+        return not_supported("DELETE without FROM is not implemented");
     };
     if from.len() != 1 || !from[0].joins.is_empty() {
-        return Err(PgError::new(
-            SqlState::FeatureNotSupported,
-            "DELETE joins are not implemented",
-        ));
+        return not_supported("DELETE joins are not implemented");
     }
     let TableFactor::Table {
         name: table_name,
@@ -331,16 +304,10 @@ pub(super) fn delete_rows(
         ..
     } = &from[0].relation
     else {
-        return Err(PgError::new(
-            SqlState::FeatureNotSupported,
-            "DELETE target is not implemented",
-        ));
+        return not_supported("DELETE target is not implemented");
     };
     if args.is_some() {
-        return Err(PgError::new(
-            SqlState::FeatureNotSupported,
-            "DELETE table functions are not implemented",
-        ));
+        return not_supported("DELETE table functions are not implemented");
     }
     let schema = state.catalog.table(&name(table_name)?)?.clone();
     if let Some(selection) = &delete.selection {

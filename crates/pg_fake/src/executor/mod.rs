@@ -5,7 +5,7 @@ use crate::{
     api::{ColumnMeta, QueryResult, StatementResult},
     catalog::{Catalog, ColumnDef, ForeignKey, ForeignKeyAction, TableId, TableSchema},
     coercion::{self, CastContext},
-    error::{PgError, Result, SqlState},
+    error::{PgError, Result, SqlState, not_supported},
     storage::{RowId, Table},
     txn::{
         RowLockKey, RowLockManager, RowLockMode, Snapshot, TransactionManager, TransactionStatus,
@@ -156,9 +156,8 @@ pub(crate) fn dispatch(
                             }))
                         }
                         option => {
-                            return Err(PgError::new(
-                                SqlState::FeatureNotSupported,
-                                format!("column option is not implemented: {option}"),
+                            return not_supported(format!(
+                                "column option is not implemented: {option}"
                             ));
                         }
                     }
@@ -226,9 +225,8 @@ pub(crate) fn dispatch(
                         }))
                     }
                     constraint => {
-                        return Err(PgError::new(
-                            SqlState::FeatureNotSupported,
-                            format!("table constraint is not implemented: {constraint}"),
+                        return not_supported(format!(
+                            "table constraint is not implemented: {constraint}"
                         ));
                     }
                 }
@@ -309,10 +307,7 @@ pub(crate) fn dispatch(
         ),
         Statement::Update(update) => {
             if update.from.is_some() || update.returning.is_some() || update.or.is_some() {
-                return Err(PgError::new(
-                    SqlState::FeatureNotSupported,
-                    "UPDATE feature is not implemented",
-                ));
+                return not_supported("UPDATE feature is not implemented");
             }
             update_rows(
                 state,
@@ -336,34 +331,22 @@ pub(crate) fn dispatch(
             context,
         ),
         Statement::Query(query) => query::select_rows(state, query, xid, snapshot, context),
-        _ => Err(PgError::new(
-            SqlState::FeatureNotSupported,
-            "statement is not implemented",
-        )),
+        _ => not_supported("statement is not implemented"),
     }
 }
 pub(crate) fn name(name: &sqlparser::ast::ObjectName) -> Result<String> {
     if name.0.len() != 1 {
-        return Err(PgError::new(
-            SqlState::FeatureNotSupported,
-            "schemas are not implemented",
-        ));
+        return not_supported("schemas are not implemented");
     }
     let Some(identifier) = name.0[0].as_ident() else {
-        return Err(PgError::new(
-            SqlState::FeatureNotSupported,
-            "dynamic object names are not implemented",
-        ));
+        return not_supported("dynamic object names are not implemented");
     };
     Ok(identifier_name(identifier))
 }
 
 pub(crate) fn insert_table_name(table: &TableObject) -> Result<String> {
     let TableObject::TableName(table_name) = table else {
-        return Err(PgError::new(
-            SqlState::FeatureNotSupported,
-            "insert target is not a table",
-        ));
+        return not_supported("insert target is not a table");
     };
     name(table_name)
 }
@@ -378,10 +361,7 @@ pub(crate) fn identifier_name(identifier: &Ident) -> String {
 
 fn index_column_name(column: &IndexColumn) -> Result<String> {
     let Expr::Identifier(identifier) = &column.column.expr else {
-        return Err(PgError::new(
-            SqlState::FeatureNotSupported,
-            "index expressions are not implemented",
-        ));
+        return not_supported("index expressions are not implemented");
     };
     Ok(identifier_name(identifier))
 }

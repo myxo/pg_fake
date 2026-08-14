@@ -137,3 +137,7 @@ impl PgError {
 
 /// Crate-wide result alias.
 pub type Result<T> = std::result::Result<T, PgError>;
+
+pub(crate) fn not_supported<T>(message: impl Into<String>) -> Result<T> {
+    Err(PgError::new(SqlState::FeatureNotSupported, message))
+}

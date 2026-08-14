@@ -13,7 +13,7 @@ use sqlparser::ast::{
 use crate::{
     analyzer,
     catalog::TableSchema,
-    error::{PgError, Result, SqlState},
+    error::{PgError, Result, SqlState, not_supported},
     executor::{self, DatabaseState},
     parser,
     storage::Table,
@@ -245,22 +245,13 @@ fn isolation_from_modes(modes: &[TransactionMode]) -> Result<Option<IsolationLev
                 IsolationLevel::RepeatableRead
             }
             TransactionMode::IsolationLevel(AstIsolationLevel::Serializable) => {
-                return Err(PgError::new(
-                    SqlState::FeatureNotSupported,
-                    "SERIALIZABLE isolation is not implemented",
-                ));
+                return not_supported("SERIALIZABLE isolation is not implemented");
             }
             TransactionMode::IsolationLevel(AstIsolationLevel::Snapshot) => {
-                return Err(PgError::new(
-                    SqlState::FeatureNotSupported,
-                    "SNAPSHOT isolation is not implemented",
-                ));
+                return not_supported("SNAPSHOT isolation is not implemented");
             }
             TransactionMode::AccessMode(_) => {
-                return Err(PgError::new(
-                    SqlState::FeatureNotSupported,
-                    "transaction access modes are not implemented",
-                ));
+                return not_supported("transaction access modes are not implemented");
             }
         };
         if isolation.replace(level).is_some() {
@@ -671,10 +662,7 @@ impl Session {
     pub fn execute_prepared(&mut self, statement: &Statement, params: &[Value]) -> Result<u64> {
         match self.run_prepared(statement, params)? {
             StatementResult::Affected(rows) => Ok(rows),
-            StatementResult::Query(_) => Err(PgError::new(
-                SqlState::FeatureNotSupported,
-                "use query_prepared for SELECT statements",
-            )),
+            StatementResult::Query(_) => not_supported("use query_prepared for SELECT statements"),
         }
     }
     pub fn query_prepared(
@@ -684,10 +672,9 @@ impl Session {
     ) -> Result<QueryResult> {
         match self.run_prepared(statement, params)? {
             StatementResult::Query(result) => Ok(result),
-            StatementResult::Affected(_) => Err(PgError::new(
-                SqlState::FeatureNotSupported,
-                "query_prepared requires a SELECT statement",
-            )),
+            StatementResult::Affected(_) => {
+                not_supported("query_prepared requires a SELECT statement")
+            }
         }
     }
     pub fn run_prepared(

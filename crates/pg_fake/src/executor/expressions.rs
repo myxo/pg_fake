@@ -165,10 +165,7 @@ fn literal_value(expr: &Expr) -> Result<Value> {
             expr,
         } if number_literal(expr).is_some() => unary(UnaryOperator::Minus, literal_value(expr)?),
         Expr::Nested(expr) => literal_value(expr),
-        _ => Err(PgError::new(
-            SqlState::FeatureNotSupported,
-            "expression is not implemented",
-        )),
+        _ => not_supported("expression is not implemented"),
     }
 }
 
@@ -203,10 +200,7 @@ pub(crate) fn expression_type(expr: &Expr, schema: RowScope<'_>) -> Result<BaseT
             AstValue::Number(value, _) => Ok(integer_literal(value)?
                 .base_type()
                 .expect("numeric literal is not null")),
-            _ => Err(PgError::new(
-                SqlState::FeatureNotSupported,
-                "literal is not implemented",
-            )),
+            _ => not_supported("literal is not implemented"),
         };
     }
     match expr {
@@ -357,10 +351,7 @@ pub(crate) fn expression_type(expr: &Expr, schema: RowScope<'_>) -> Result<BaseT
             ..
         } => {
             if !matches!(kind, CastKind::Cast | CastKind::DoubleColon) || format.is_some() {
-                return Err(PgError::new(
-                    SqlState::FeatureNotSupported,
-                    "cast variant is not implemented",
-                ));
+                return not_supported("cast variant is not implemented");
             }
             let target = coercion::type_from_ast(data_type)?;
             if unknown_string(expr).is_none()
@@ -390,10 +381,7 @@ pub(crate) fn expression_type(expr: &Expr, schema: RowScope<'_>) -> Result<BaseT
                 ))
             }
         }
-        _ => Err(PgError::new(
-            SqlState::FeatureNotSupported,
-            "expression is not implemented",
-        )),
+        _ => not_supported("expression is not implemented"),
     }
 }
 
@@ -498,10 +486,7 @@ fn function_arguments(function: &Function) -> Result<Vec<&Expr>> {
         || function.over.is_some()
         || !function.within_group.is_empty()
     {
-        return Err(PgError::new(
-            SqlState::FeatureNotSupported,
-            "function feature is not implemented",
-        ));
+        return not_supported("function feature is not implemented");
     }
     let FunctionArguments::List(arguments) = &function.args else {
         return Err(PgError::new(
@@ -510,20 +495,14 @@ fn function_arguments(function: &Function) -> Result<Vec<&Expr>> {
         ));
     };
     if arguments.duplicate_treatment.is_some() || !arguments.clauses.is_empty() {
-        return Err(PgError::new(
-            SqlState::FeatureNotSupported,
-            "function argument feature is not implemented",
-        ));
+        return not_supported("function argument feature is not implemented");
     }
     arguments
         .args
         .iter()
         .map(|argument| match argument {
             FunctionArg::Unnamed(FunctionArgExpr::Expr(expression)) => Ok(expression),
-            _ => Err(PgError::new(
-                SqlState::FeatureNotSupported,
-                "function argument is not implemented",
-            )),
+            _ => not_supported("function argument is not implemented"),
         })
         .collect()
 }
@@ -655,10 +634,7 @@ pub(super) fn evaluate(
                     }
                 }
                 BinaryOperator::And | BinaryOperator::Or => boolean_binary(op, left, right),
-                _ => Err(PgError::new(
-                    SqlState::FeatureNotSupported,
-                    "operator is not implemented",
-                )),
+                _ => not_supported("operator is not implemented"),
             }
         }
         Expr::IsNull(expr) => Ok(Value::Bool(evaluate(expr, schema, row, context)?.is_null())),
@@ -797,10 +773,7 @@ pub(super) fn evaluate(
             ..
         } => {
             if !matches!(kind, CastKind::Cast | CastKind::DoubleColon) || format.is_some() {
-                return Err(PgError::new(
-                    SqlState::FeatureNotSupported,
-                    "cast variant is not implemented",
-                ));
+                return not_supported("cast variant is not implemented");
             }
             let target = coercion::type_from_ast(data_type)?;
             if let Some(text) = unknown_string(expr) {
@@ -817,10 +790,7 @@ pub(super) fn evaluate(
         Expr::Extract { field, expr, .. } => {
             extract_value(field.clone(), evaluate(expr, schema, row, context)?)
         }
-        _ => Err(PgError::new(
-            SqlState::FeatureNotSupported,
-            "expression is not implemented",
-        )),
+        _ => not_supported("expression is not implemented"),
     }
 }
 
@@ -1150,10 +1120,7 @@ fn extract_value(field: DateTimeField, value: Value) -> Result<Value> {
             DateTimeField::Doy => i64::from(value.ordinal()),
             DateTimeField::Epoch => i64::from(value.num_days_from_ce()) * 86_400,
             _ => {
-                return Err(PgError::new(
-                    SqlState::FeatureNotSupported,
-                    "date part is not implemented",
-                ));
+                return not_supported("date part is not implemented");
             }
         },
         Value::Time(crate::value::PgTime(value)) => match field {
@@ -1163,10 +1130,7 @@ fn extract_value(field: DateTimeField, value: Value) -> Result<Value> {
             DateTimeField::Microsecond | DateTimeField::Microseconds => value % 1_000_000,
             DateTimeField::Epoch => value / 1_000_000,
             _ => {
-                return Err(PgError::new(
-                    SqlState::FeatureNotSupported,
-                    "date part is not implemented",
-                ));
+                return not_supported("date part is not implemented");
             }
         },
         Value::Date(crate::value::PgDate::Infinity | crate::value::PgDate::NegInfinity) => {
@@ -1187,10 +1151,7 @@ fn extract_value(field: DateTimeField, value: Value) -> Result<Value> {
             }
             DateTimeField::Epoch => value.and_utc().timestamp(),
             _ => {
-                return Err(PgError::new(
-                    SqlState::FeatureNotSupported,
-                    "date part is not implemented",
-                ));
+                return not_supported("date part is not implemented");
             }
         },
         Value::TimestampTz(crate::value::PgTimestampTz::Finite(value)) => match field {
@@ -1205,10 +1166,7 @@ fn extract_value(field: DateTimeField, value: Value) -> Result<Value> {
             }
             DateTimeField::Epoch => value.timestamp(),
             _ => {
-                return Err(PgError::new(
-                    SqlState::FeatureNotSupported,
-                    "date part is not implemented",
-                ));
+                return not_supported("date part is not implemented");
             }
         },
         Value::Timestamp(

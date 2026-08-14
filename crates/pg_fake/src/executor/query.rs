@@ -473,19 +473,13 @@ enum JoinKey {
 }
 pub(super) fn select_lock_mode(query: &sqlparser::ast::Query) -> Result<Option<RowLockMode>> {
     if query.locks.len() > 1 {
-        return Err(PgError::new(
-            SqlState::FeatureNotSupported,
-            "multiple row-lock clauses are not implemented",
-        ));
+        return not_supported("multiple row-lock clauses are not implemented");
     }
     let Some(lock) = query.locks.first() else {
         return Ok(None);
     };
     if lock.of.is_some() || lock.nonblock.is_some() {
-        return Err(PgError::new(
-            SqlState::FeatureNotSupported,
-            "row-lock clause variant is not implemented",
-        ));
+        return not_supported("row-lock clause variant is not implemented");
     }
     Ok(Some(match lock.lock_type {
         LockType::Share => RowLockMode::Share,
@@ -578,10 +572,7 @@ fn values_rows(
         .collect::<Result<Vec<_>>>()?;
     if let Some(order_by) = &query.order_by {
         let sqlparser::ast::OrderByKind::Expressions(orders) = &order_by.kind else {
-            return Err(PgError::new(
-                SqlState::FeatureNotSupported,
-                "ORDER BY ALL is not implemented",
-            ));
+            return not_supported("ORDER BY ALL is not implemented");
         };
         let orders = orders
             .iter()
@@ -676,10 +667,7 @@ fn values_rows(
                 .unwrap_or(0),
         ),
         _ => {
-            return Err(PgError::new(
-                SqlState::FeatureNotSupported,
-                "LIMIT clause is not implemented",
-            ));
+            return not_supported("LIMIT clause is not implemented");
         }
     };
     Ok(StatementResult::Query(QueryResult {
@@ -700,26 +688,17 @@ pub(super) fn select_rows(
     context: &ExecutionContext,
 ) -> Result<StatementResult> {
     if query.with.is_some() || query.fetch.is_some() {
-        return Err(PgError::new(
-            SqlState::FeatureNotSupported,
-            "query clause is not implemented",
-        ));
+        return not_supported("query clause is not implemented");
     }
     select_lock_mode(query)?;
     let SetExpr::Select(select) = query.body.as_ref() else {
         if let SetExpr::Values(values) = query.body.as_ref() {
             return values_rows(query, values, context);
         }
-        return Err(PgError::new(
-            SqlState::FeatureNotSupported,
-            "query source is not implemented",
-        ));
+        return not_supported("query source is not implemented");
     };
     let GroupByExpr::Expressions(group_by, modifiers) = &select.group_by else {
-        return Err(PgError::new(
-            SqlState::FeatureNotSupported,
-            "GROUP BY is not implemented",
-        ));
+        return not_supported("GROUP BY is not implemented");
     };
     if select.distinct.is_some()
         || select.into.is_some()
@@ -727,10 +706,7 @@ pub(super) fn select_rows(
         || !modifiers.is_empty()
         || select.having.is_some()
     {
-        return Err(PgError::new(
-            SqlState::FeatureNotSupported,
-            "SELECT feature is not implemented",
-        ));
+        return not_supported("SELECT feature is not implemented");
     }
     let scope = bind_select_scope(state, select)?;
     let (limit, offset) = match &query.limit_clause {
@@ -741,10 +717,7 @@ pub(super) fn select_rows(
             limit_by,
         }) => {
             if !limit_by.is_empty() {
-                return Err(PgError::new(
-                    SqlState::FeatureNotSupported,
-                    "LIMIT BY is not implemented",
-                ));
+                return not_supported("LIMIT BY is not implemented");
             }
             let limit = limit
                 .as_ref()
@@ -760,10 +733,7 @@ pub(super) fn select_rows(
             (limit, offset)
         }
         Some(sqlparser::ast::LimitClause::OffsetCommaLimit { .. }) => {
-            return Err(PgError::new(
-                SqlState::FeatureNotSupported,
-                "LIMIT clause is not implemented",
-            ));
+            return not_supported("LIMIT clause is not implemented");
         }
     };
     if let Some(selection) = &select.selection {
@@ -781,25 +751,16 @@ pub(super) fn select_rows(
         .as_ref()
         .map(|order_by| {
             if order_by.interpolate.is_some() {
-                return Err(PgError::new(
-                    SqlState::FeatureNotSupported,
-                    "ORDER BY INTERPOLATE is not implemented",
-                ));
+                return not_supported("ORDER BY INTERPOLATE is not implemented");
             }
             let sqlparser::ast::OrderByKind::Expressions(orders) = &order_by.kind else {
-                return Err(PgError::new(
-                    SqlState::FeatureNotSupported,
-                    "ORDER BY ALL is not implemented",
-                ));
+                return not_supported("ORDER BY ALL is not implemented");
             };
             orders
                 .iter()
                 .map(|order| {
                     if order.with_fill.is_some() {
-                        return Err(PgError::new(
-                            SqlState::FeatureNotSupported,
-                            "ORDER BY WITH FILL is not implemented",
-                        ));
+                        return not_supported("ORDER BY WITH FILL is not implemented");
                     }
                     let key = if let Some(position) = number_literal(&order.expr)
                         && !position.contains(['.', 'e', 'E'])
@@ -1056,10 +1017,7 @@ fn projections_and_columns<'a>(
                 });
             }
             _ => {
-                return Err(PgError::new(
-                    SqlState::FeatureNotSupported,
-                    "SELECT projection is not implemented",
-                ));
+                return not_supported("SELECT projection is not implemented");
             }
         }
     }
@@ -1425,10 +1383,7 @@ fn visit_factor_rows(
         unreachable!("streamable source is a table");
     };
     if args.is_some() {
-        return Err(PgError::new(
-            SqlState::FeatureNotSupported,
-            "table functions are not implemented",
-        ));
+        return not_supported("table functions are not implemented");
     }
     let schema = state.catalog.table(&name(table_name)?)?;
     let mut filters = Vec::new();
@@ -1595,10 +1550,7 @@ fn factor_rows(
     } = factor
     {
         if *lateral {
-            return Err(PgError::new(
-                SqlState::FeatureNotSupported,
-                "LATERAL derived tables are not implemented",
-            ));
+            return not_supported("LATERAL derived tables are not implemented");
         }
         let StatementResult::Query(result) = select_rows(state, subquery, xid, snapshot, context)?
         else {
@@ -1622,16 +1574,10 @@ fn factor_rows(
         ..
     } = factor
     else {
-        return Err(PgError::new(
-            SqlState::FeatureNotSupported,
-            "FROM source is not implemented",
-        ));
+        return not_supported("FROM source is not implemented");
     };
     if args.is_some() {
-        return Err(PgError::new(
-            SqlState::FeatureNotSupported,
-            "table functions are not implemented",
-        ));
+        return not_supported("table functions are not implemented");
     }
     let schema = state.catalog.table(&name(table_name)?)?;
     let start = *next_slot;
@@ -1733,10 +1679,7 @@ fn join_matches(
         | sqlparser::ast::JoinOperator::RightOuter(constraint)
         | sqlparser::ast::JoinOperator::FullOuter(constraint) => constraint,
         _ => {
-            return Err(PgError::new(
-                SqlState::FeatureNotSupported,
-                "join type is not implemented",
-            ));
+            return not_supported("join type is not implemented");
         }
     };
     match constraint {

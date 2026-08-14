@@ -1,7 +1,7 @@
 use super::{DatabaseState, identifier_name, name};
 use crate::{
     catalog::{Catalog, TableSchema},
-    error::{PgError, Result, SqlState},
+    error::{PgError, Result, SqlState, not_supported},
     value::{BaseType, PgType},
 };
 use sqlparser::ast::{
@@ -258,10 +258,7 @@ fn bind_table_with_joins(
             | JoinOperator::RightOuter(constraint)
             | JoinOperator::FullOuter(constraint) => constraint,
             _ => {
-                return Err(PgError::new(
-                    SqlState::FeatureNotSupported,
-                    "join type is not implemented",
-                ));
+                return not_supported("join type is not implemented");
             }
         };
         bind_join_constraint(catalog, scope, join, constraint, left_start, right_start)?;
@@ -316,10 +313,7 @@ fn bind_table_factor(
     } = factor
     {
         if *lateral {
-            return Err(PgError::new(
-                SqlState::FeatureNotSupported,
-                "LATERAL derived tables are not implemented",
-            ));
+            return not_supported("LATERAL derived tables are not implemented");
         }
         let alias = alias.as_ref().ok_or_else(|| {
             PgError::new(SqlState::SyntaxError, "subquery in FROM must have an alias")
@@ -360,16 +354,10 @@ fn bind_table_factor(
         ..
     } = factor
     else {
-        return Err(PgError::new(
-            SqlState::FeatureNotSupported,
-            "FROM source is not implemented",
-        ));
+        return not_supported("FROM source is not implemented");
     };
     if args.is_some() {
-        return Err(PgError::new(
-            SqlState::FeatureNotSupported,
-            "table functions are not implemented",
-        ));
+        return not_supported("table functions are not implemented");
     }
     let table = BoundScope::bind_table(
         catalog.table(&name(table_name)?)?,
@@ -468,10 +456,7 @@ fn query_columns(
                         expression_data_type(catalog, expr, &scope)
                             .map(|data_type| ("?column?".into(), data_type)),
                     ],
-                    _ => vec![Err(PgError::new(
-                        SqlState::FeatureNotSupported,
-                        "SELECT projection is not implemented",
-                    ))],
+                    _ => vec![not_supported("SELECT projection is not implemented")],
                 })
                 .collect::<Result<Vec<_>>>()
                 .map(|columns| {
@@ -538,10 +523,7 @@ fn query_columns(
                 })
                 .collect()
         }
-        _ => Err(PgError::new(
-            SqlState::FeatureNotSupported,
-            "query source is not implemented",
-        )),
+        _ => not_supported("query source is not implemented"),
     }
 }
 
