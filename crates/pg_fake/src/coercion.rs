@@ -214,22 +214,28 @@ pub(crate) fn coerce(
     if !can_cast(source, target.base, context) {
         return Err(cannot_cast(source, target.base));
     }
-    let value = if source == target.base || string(source) && string(target.base) {
-        value
-    } else if string(target.base) {
-        Value::Text(match value {
-            Value::Bool(true) => "true".into(),
-            Value::Bool(false) => "false".into(),
-            value => value.to_text(),
-        })
-    } else if string(source) {
-        let Value::Text(text) = value else {
-            unreachable!("string values use Value::Text")
+    let value =
+        if source == BaseType::Bpchar && target.base != BaseType::Bpchar && string(target.base) {
+            let Value::Text(value) = value else {
+                unreachable!("string values use Value::Text")
+            };
+            Value::Text(value.trim_end_matches(' ').into())
+        } else if source == target.base || string(source) && string(target.base) {
+            value
+        } else if string(target.base) {
+            Value::Text(match value {
+                Value::Bool(true) => "true".into(),
+                Value::Bool(false) => "false".into(),
+                value => value.to_text(),
+            })
+        } else if string(source) {
+            let Value::Text(text) = value else {
+                unreachable!("string values use Value::Text")
+            };
+            Value::parse(target.base, &text)?
+        } else {
+            convert_non_string(value, target.base)?
         };
-        Value::parse(target.base, &text)?
-    } else {
-        convert_non_string(value, target.base)?
-    };
     apply_typmod(value, target, context)
 }
 

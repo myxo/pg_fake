@@ -705,7 +705,7 @@ fn generate_predicate(src: &mut Source, table: &TableSchema) -> String {
                     "{} IS {}DISTINCT FROM {}",
                     column.name,
                     if src.any("not") { "NOT " } else { "" },
-                    generate_typed_literal(src, column.data_type)
+                    generate_non_null_literal(src, column.data_type)
                 )
             }
             "combined" => format!(
@@ -732,7 +732,7 @@ fn generate_predicate_leaf(src: &mut Source, table: &TableSchema) -> String {
             "{} IS {}DISTINCT FROM {}",
             column.name,
             if src.any("not") { "NOT " } else { "" },
-            generate_typed_literal(src, column.data_type)
+            generate_non_null_literal(src, column.data_type)
         )
     }
 }
@@ -769,13 +769,15 @@ fn generate_select_expression(src: &mut Source, table: &TableSchema) -> String {
                     &operators[..4]
                 };
                 let (operator, _) = src.choose("operator", operators).unwrap();
-                let right = if *operator == "/" || *operator == "%" {
-                    let divisors: &[i32] = if column.data_type == SqlType::Numeric {
-                        &[1, 2, 4, 5]
+                let right = if column.data_type == SqlType::Real {
+                    if *operator == "/" {
+                        src.any_of("right", int_in_range(1..=5)).to_string()
                     } else {
-                        &[1, 2, 3, 4, 5]
-                    };
-                    let (right, _) = src.choose("right", divisors).unwrap();
+                        integer(src, "right").to_string()
+                    }
+                } else if *operator == "/" || *operator == "%" {
+                    let divisors = [1, 2, 3, 4, 5];
+                    let (right, _) = src.choose("right", &divisors).unwrap();
                     format!("CAST({} AS {})", right, column.data_type.sql())
                 } else {
                     generate_typed_literal(src, column.data_type)
@@ -826,12 +828,12 @@ fn generate_select_expression(src: &mut Source, table: &TableSchema) -> String {
                     SqlType::SmallInt => "BIGINT",
                     SqlType::Integer | SqlType::BigInt => "TEXT",
                     SqlType::Numeric => "INTEGER",
-                    SqlType::Real => "DOUBLE PRECISION",
+                    SqlType::Real => "TEXT",
                     SqlType::Double => "REAL",
                     SqlType::Boolean => "INTEGER",
                     SqlType::Text => "VARCHAR(12)",
                     SqlType::Varchar => "TEXT",
-                    SqlType::Char => "CHAR(8)",
+                    SqlType::Char => "VARCHAR(12)",
                     SqlType::Bytea => "BYTEA",
                 };
                 format!("CAST({} AS {target})", column.name)

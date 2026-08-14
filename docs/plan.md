@@ -31,7 +31,7 @@ scope boundaries. The completed Phase 1 plan is archived in
   completion handoff must explain why.
 - Before a task can be marked complete, the property suite must pass at least
   10,000 `chaos_theory` iterations with
-  `CHAOS_THEORY_CHECK_ITERS=10000 cargo test -p pg_fake_sqlx --test property_tests`.
+  `CHAOS_THEORY_CHECK_ITERS=10000 CHAOS_THEORY_CHECK_TIME=600s cargo test -p pg_fake_sqlx --test property_tests`.
 - After implementing a task, update its progress but do not mark it complete
   until the user approves the result, as required by `AGENTS.md`.
 - Features not listed here retain the unsupported-feature behavior from

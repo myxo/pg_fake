@@ -250,7 +250,7 @@ pub(crate) fn expression_type(expr: &Expr, schema: RowScope<'_>) -> Result<BaseT
                 {
                     return interval_arithmetic_type(op, left_type, right_type);
                 }
-                let base = expression_common_type(left, right, schema)?;
+                let base = resolve_operator_type(left, right, schema)?;
                 if numeric(base) {
                     Ok(base)
                 } else {
@@ -266,7 +266,7 @@ pub(crate) fn expression_type(expr: &Expr, schema: RowScope<'_>) -> Result<BaseT
             | BinaryOperator::Lt
             | BinaryOperator::GtEq
             | BinaryOperator::LtEq => {
-                expression_common_type(left, right, schema)?;
+                resolve_operator_type(left, right, schema)?;
                 Ok(BaseType::Bool)
             }
             BinaryOperator::And | BinaryOperator::Or => {
@@ -312,17 +312,8 @@ pub(crate) fn expression_type(expr: &Expr, schema: RowScope<'_>) -> Result<BaseT
             }
         }
         Expr::IsDistinctFrom(left, right) | Expr::IsNotDistinctFrom(left, right) => {
-            let left_base = expression_type(left, schema)?;
-            let right_base = expression_type(right, schema)?;
-            if comparable(left_base, right_base) || null_expression(left) || null_expression(right)
-            {
-                Ok(BaseType::Bool)
-            } else {
-                Err(PgError::new(
-                    SqlState::DatatypeMismatch,
-                    "operator has incompatible types",
-                ))
-            }
+            resolve_operator_type(left, right, schema)?;
+            Ok(BaseType::Bool)
         }
         Expr::Case {
             operand,
@@ -426,10 +417,6 @@ fn numeric(base: BaseType) -> bool {
     )
 }
 
-fn comparable(left: BaseType, right: BaseType) -> bool {
-    coercion::common_type(left, right).is_some()
-}
-
 fn expression_common_type(left: &Expr, right: &Expr, schema: RowScope<'_>) -> Result<BaseType> {
     if null_expression(left) && null_expression(right)
         || unknown_string(left).is_some() && unknown_string(right).is_some()
@@ -452,6 +439,31 @@ fn expression_common_type(left: &Expr, right: &Expr, schema: RowScope<'_>) -> Re
             "expressions have incompatible types",
         )
     })
+}
+
+fn resolve_operator_type(left: &Expr, right: &Expr, schema: RowScope<'_>) -> Result<BaseType> {
+    let left_type = expression_type(left, schema)?;
+    let right_type = expression_type(right, schema)?;
+    let string = |data_type| {
+        matches!(
+            data_type,
+            BaseType::Text | BaseType::Varchar | BaseType::Bpchar
+        )
+    };
+    if string(left_type)
+        && string(right_type)
+        && (left_type == BaseType::Bpchar || right_type == BaseType::Bpchar)
+    {
+        Ok(BaseType::Text)
+    } else if numeric(left_type)
+        && numeric(right_type)
+        && (left_type == BaseType::Float4 && right_type != BaseType::Float4
+            || right_type == BaseType::Float4 && left_type != BaseType::Float4)
+    {
+        Ok(BaseType::Float8)
+    } else {
+        expression_common_type(left, right, schema)
+    }
 }
 
 fn common_expression_type(expressions: &[&Expr], schema: RowScope<'_>) -> Result<BaseType> {
@@ -607,10 +619,14 @@ pub(super) fn evaluate(
                 }
                 return temporal_arithmetic(op, left, right);
             }
-            let target = if matches!(op, BinaryOperator::And | BinaryOperator::Or) {
-                BaseType::Bool
-            } else {
-                expression_common_type(left, right, schema)?
+            let target = match op {
+                BinaryOperator::And | BinaryOperator::Or => BaseType::Bool,
+                BinaryOperator::Plus
+                | BinaryOperator::Minus
+                | BinaryOperator::Multiply
+                | BinaryOperator::Divide
+                | BinaryOperator::Modulo => resolve_operator_type(left, right, schema)?,
+                _ => resolve_operator_type(left, right, schema)?,
             };
             let left = evaluate_as(left, target, CastContext::Implicit, schema, row, context)?;
             let right = evaluate_as(right, target, CastContext::Implicit, schema, row, context)?;
@@ -699,7 +715,7 @@ pub(super) fn evaluate(
             .is_null(),
         )),
         Expr::IsDistinctFrom(left, right) | Expr::IsNotDistinctFrom(left, right) => {
-            let target = expression_common_type(left, right, schema)?;
+            let target = resolve_operator_type(left, right, schema)?;
             distinct(
                 evaluate_as(left, target, CastContext::Implicit, schema, row, context)?,
                 evaluate_as(right, target, CastContext::Implicit, schema, row, context)?,
@@ -724,7 +740,7 @@ pub(super) fn evaluate(
             let operand = operand.as_deref();
             for condition in conditions {
                 let matches = if let Some(operand) = &operand {
-                    let target = expression_common_type(operand, &condition.condition, schema)?;
+                    let target = resolve_operator_type(operand, &condition.condition, schema)?;
                     let operand =
                         evaluate_as(operand, target, CastContext::Implicit, schema, row, context)?;
                     let condition = evaluate_as(
@@ -905,7 +921,7 @@ fn evaluate_row_comparison(
     }
     let mut result = Value::Bool(true);
     for (left, right) in left.iter().zip(right) {
-        let target = expression_common_type(left, right, schema)?;
+        let target = resolve_operator_type(left, right, schema)?;
         let left = evaluate_as(left, target, CastContext::Implicit, schema, row, context)?;
         let right = evaluate_as(right, target, CastContext::Implicit, schema, row, context)?;
         let comparison = if left.is_null() || right.is_null() {

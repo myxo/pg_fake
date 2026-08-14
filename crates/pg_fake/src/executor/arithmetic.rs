@@ -1,4 +1,5 @@
 use super::*;
+use bigdecimal::{BigDecimal, Signed};
 
 pub(super) fn unary(operator: UnaryOperator, value: Value) -> Result<Value> {
     if value.is_null() {
@@ -147,7 +148,7 @@ pub(super) fn arithmetic(operator: &BinaryOperator, left: Value, right: Value) -
                 BinaryOperator::Plus => left + right,
                 BinaryOperator::Minus => left - right,
                 BinaryOperator::Multiply => left * right,
-                BinaryOperator::Divide => left / right,
+                BinaryOperator::Divide => divide_numeric(&left, &right),
                 BinaryOperator::Modulo => left % right,
                 _ => unreachable!("arithmetic operator was checked by caller"),
             }))
@@ -157,6 +158,82 @@ pub(super) fn arithmetic(operator: &BinaryOperator, left: Value, right: Value) -
             "operator has incompatible types",
         )),
     }
+}
+
+// BigDecimal division chooses its own fixed precision. PostgreSQL instead derives
+// NUMERIC division scale from normalized base-10000 weights, keeps at least 16
+// significant decimal digits and both input scales, clamps it to 0..=1000, and
+// rounds ties away from zero.
+fn divide_numeric(left: &BigDecimal, right: &BigDecimal) -> BigDecimal {
+    let (left_weight, left_first_digit) = describe_numeric_division_operand(left);
+    let (right_weight, right_first_digit) = describe_numeric_division_operand(right);
+    let mut quotient_weight = left_weight - right_weight;
+    if left_first_digit <= right_first_digit {
+        quotient_weight -= 1;
+    }
+    let result_scale = (16 - quotient_weight * 4)
+        .max(left.fractional_digit_count())
+        .max(right.fractional_digit_count())
+        .clamp(0, 1000);
+
+    let (left_integer, left_scale) = left.as_bigint_and_exponent();
+    let (right_integer, right_scale) = right.as_bigint_and_exponent();
+    let negative = left_integer.sign() != right_integer.sign();
+    let mut numerator = left_integer.abs();
+    let mut denominator = right_integer.abs();
+    let exponent = right_scale + result_scale - left_scale;
+    let power = |exponent: i64| {
+        bigdecimal::num_bigint::BigInt::from(10_u8)
+            .pow(u32::try_from(exponent).expect("numeric scale difference must fit u32"))
+    };
+    if exponent >= 0 {
+        numerator *= power(exponent);
+    } else {
+        denominator *= power(-exponent);
+    }
+    let mut quotient = &numerator / &denominator;
+    let remainder = numerator % &denominator;
+    if remainder * 2 >= denominator {
+        quotient += 1;
+    }
+    if negative {
+        quotient = -quotient;
+    }
+    BigDecimal::new(quotient, result_scale)
+}
+
+fn describe_numeric_division_operand(value: &BigDecimal) -> (i64, u16) {
+    if value == &BigDecimal::from(0) {
+        return (0, 0);
+    }
+    let plain = value.normalized().abs().to_plain_string();
+    let (integer, fraction) = plain.split_once('.').unwrap_or((&plain, ""));
+    let integer = integer.trim_start_matches('0');
+    if !integer.is_empty() {
+        let weight = i64::try_from(integer.len() - 1).expect("numeric length fits i64") / 4;
+        let first_length = integer.len() - usize::try_from(weight * 4).expect("weight is positive");
+        return (
+            weight,
+            integer[..first_length]
+                .parse()
+                .expect("numeric digits are a base-10000 digit"),
+        );
+    }
+
+    let first_nonzero = fraction
+        .find(|character| character != '0')
+        .expect("nonzero numeric has a nonzero digit");
+    let group = first_nonzero / 4;
+    let start = group * 4;
+    let end = (start + 4).min(fraction.len());
+    let mut first_digit = fraction[start..end].to_owned();
+    first_digit.extend(std::iter::repeat_n('0', 4 - first_digit.len()));
+    (
+        -i64::try_from(group).expect("numeric group fits i64") - 1,
+        first_digit
+            .parse()
+            .expect("numeric digits are a base-10000 digit"),
+    )
 }
 
 pub(super) fn interval_arithmetic_type(

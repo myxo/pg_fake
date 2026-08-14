@@ -269,7 +269,15 @@ impl Value {
             Value::Int2(n) => n.to_string(),
             Value::Int4(n) => n.to_string(),
             Value::Int8(n) => n.to_string(),
-            Value::Float4(f) => format_float(*f as f64),
+            Value::Float4(f) if f.is_nan() => "NaN".into(),
+            Value::Float4(f) if f.is_infinite() => {
+                if *f > 0.0 {
+                    "Infinity".into()
+                } else {
+                    "-Infinity".into()
+                }
+            }
+            Value::Float4(f) => f.to_string(),
             Value::Float8(f) => format_float(*f),
             Value::Numeric(d) => d.to_plain_string(),
             Value::Text(s) => s.clone(),
