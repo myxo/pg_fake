@@ -1,22 +1,23 @@
 use super::*;
+use sqlparser::ast;
 
 pub(crate) fn collect_required_row_locks(
     state: &DatabaseState,
-    statement: &Statement,
+    statement: &ast::Statement,
     xid: Xid,
     snapshot: &Snapshot,
     context: &StatementExecutionContext,
 ) -> Result<Vec<RequiredRowLock>> {
-    if let Statement::Insert(insert) = statement {
+    if let ast::Statement::Insert(insert) = statement {
         return collect_insert_foreign_key_locks(state, insert, xid, snapshot, context);
     }
     let (schema, selection, mode) = match statement {
-        Statement::Update(update) => {
+        ast::Statement::Update(update) => {
             let table = &update.table;
             if !table.joins.is_empty() {
                 return Ok(Vec::new());
             }
-            let TableFactor::Table {
+            let ast::TableFactor::Table {
                 name: table_name,
                 args: None,
                 ..
@@ -32,14 +33,14 @@ pub(crate) fn collect_required_row_locks(
                 RowLockMode::Update,
             )
         }
-        Statement::Delete(delete) => {
-            let FromTable::WithFromKeyword(from) = &delete.from else {
+        ast::Statement::Delete(delete) => {
+            let ast::FromTable::WithFromKeyword(from) = &delete.from else {
                 return Ok(Vec::new());
             };
             if from.len() != 1 || !from[0].joins.is_empty() {
                 return Ok(Vec::new());
             }
-            let TableFactor::Table {
+            let ast::TableFactor::Table {
                 name: table_name,
                 args: None,
                 ..
@@ -55,17 +56,17 @@ pub(crate) fn collect_required_row_locks(
                 RowLockMode::Update,
             )
         }
-        Statement::Query(query) => {
+        ast::Statement::Query(query) => {
             let Some(mode) = query::resolve_select_lock_mode(query)? else {
                 return Ok(Vec::new());
             };
-            let SetExpr::Select(select) = query.body.as_ref() else {
+            let ast::SetExpr::Select(select) = query.body.as_ref() else {
                 return Ok(Vec::new());
             };
             if select.from.len() != 1 || !select.from[0].joins.is_empty() {
                 return Ok(Vec::new());
             }
-            let TableFactor::Table {
+            let ast::TableFactor::Table {
                 name: table_name,
                 args: None,
                 ..
@@ -132,7 +133,7 @@ pub(crate) fn collect_required_row_locks(
 
 fn collect_insert_foreign_key_locks(
     state: &DatabaseState,
-    insert: &sqlparser::ast::Insert,
+    insert: &ast::Insert,
     xid: Xid,
     snapshot: &Snapshot,
     context: &StatementExecutionContext,
@@ -143,7 +144,7 @@ fn collect_insert_foreign_key_locks(
     let Some(source) = &insert.source else {
         return Ok(Vec::new());
     };
-    let SetExpr::Values(values) = source.body.as_ref() else {
+    let ast::SetExpr::Values(values) = source.body.as_ref() else {
         return Ok(Vec::new());
     };
     let column_indexes = if insert.columns.is_empty() {

@@ -1,37 +1,38 @@
 use super::*;
 use bigdecimal::{BigDecimal, Signed};
+use sqlparser::ast;
 
-pub(super) fn evaluate_unary_operator(operator: UnaryOperator, value: Value) -> Result<Value> {
+pub(super) fn evaluate_unary_operator(operator: ast::UnaryOperator, value: Value) -> Result<Value> {
     if value.is_null() {
         return Ok(Value::Null);
     }
     match (operator, value) {
-        (UnaryOperator::Plus, value @ (Value::Int2(_) | Value::Int4(_) | Value::Int8(_))) => {
+        (ast::UnaryOperator::Plus, value @ (Value::Int2(_) | Value::Int4(_) | Value::Int8(_))) => {
             Ok(value)
         }
         (
-            UnaryOperator::Plus,
+            ast::UnaryOperator::Plus,
             value @ (Value::Float4(_) | Value::Float8(_) | Value::Numeric(_)),
         ) => Ok(value),
-        (UnaryOperator::Minus, Value::Int2(value)) => {
+        (ast::UnaryOperator::Minus, Value::Int2(value)) => {
             value.checked_neg().map(Value::Int2).ok_or_else(|| {
                 PgError::create(SqlState::NumericValueOutOfRange, "smallint out of range")
             })
         }
-        (UnaryOperator::Minus, Value::Int4(value)) => {
+        (ast::UnaryOperator::Minus, Value::Int4(value)) => {
             value.checked_neg().map(Value::Int4).ok_or_else(|| {
                 PgError::create(SqlState::NumericValueOutOfRange, "integer out of range")
             })
         }
-        (UnaryOperator::Minus, Value::Int8(value)) => {
+        (ast::UnaryOperator::Minus, Value::Int8(value)) => {
             value.checked_neg().map(Value::Int8).ok_or_else(|| {
                 PgError::create(SqlState::NumericValueOutOfRange, "bigint out of range")
             })
         }
-        (UnaryOperator::Minus, Value::Float4(value)) => Ok(Value::Float4(-value)),
-        (UnaryOperator::Minus, Value::Float8(value)) => Ok(Value::Float8(-value)),
-        (UnaryOperator::Minus, Value::Numeric(value)) => Ok(Value::Numeric(-value)),
-        (UnaryOperator::Not, Value::Bool(value)) => Ok(Value::Bool(!value)),
+        (ast::UnaryOperator::Minus, Value::Float4(value)) => Ok(Value::Float4(-value)),
+        (ast::UnaryOperator::Minus, Value::Float8(value)) => Ok(Value::Float8(-value)),
+        (ast::UnaryOperator::Minus, Value::Numeric(value)) => Ok(Value::Numeric(-value)),
+        (ast::UnaryOperator::Not, Value::Bool(value)) => Ok(Value::Bool(!value)),
         _ => Err(PgError::create(
             SqlState::DatatypeMismatch,
             "operator has incompatible type",
@@ -40,22 +41,21 @@ pub(super) fn evaluate_unary_operator(operator: UnaryOperator, value: Value) -> 
 }
 
 pub(super) fn evaluate_boolean_operator(
-    operator: &BinaryOperator,
+    operator: &ast::BinaryOperator,
     left: Value,
     right: Value,
 ) -> Result<Value> {
     match (operator, left, right) {
-        (BinaryOperator::And, Value::Bool(false), _)
-        | (BinaryOperator::And, _, Value::Bool(false)) => Ok(Value::Bool(false)),
-        (BinaryOperator::And, Value::Bool(true), value)
-        | (BinaryOperator::And, value, Value::Bool(true)) => Ok(value),
-        (BinaryOperator::And, Value::Null, Value::Null) => Ok(Value::Null),
-        (BinaryOperator::Or, Value::Bool(true), _) | (BinaryOperator::Or, _, Value::Bool(true)) => {
-            Ok(Value::Bool(true))
-        }
-        (BinaryOperator::Or, Value::Bool(false), value)
-        | (BinaryOperator::Or, value, Value::Bool(false)) => Ok(value),
-        (BinaryOperator::Or, Value::Null, Value::Null) => Ok(Value::Null),
+        (ast::BinaryOperator::And, Value::Bool(false), _)
+        | (ast::BinaryOperator::And, _, Value::Bool(false)) => Ok(Value::Bool(false)),
+        (ast::BinaryOperator::And, Value::Bool(true), value)
+        | (ast::BinaryOperator::And, value, Value::Bool(true)) => Ok(value),
+        (ast::BinaryOperator::And, Value::Null, Value::Null) => Ok(Value::Null),
+        (ast::BinaryOperator::Or, Value::Bool(true), _)
+        | (ast::BinaryOperator::Or, _, Value::Bool(true)) => Ok(Value::Bool(true)),
+        (ast::BinaryOperator::Or, Value::Bool(false), value)
+        | (ast::BinaryOperator::Or, value, Value::Bool(false)) => Ok(value),
+        (ast::BinaryOperator::Or, Value::Null, Value::Null) => Ok(Value::Null),
         _ => Err(PgError::create(
             SqlState::DatatypeMismatch,
             "operator has incompatible types",
@@ -67,7 +67,7 @@ pub(super) fn evaluate_distinctness(left: Value, right: Value, equal: bool) -> R
     match (&left, &right) {
         (Value::Null, Value::Null) => Ok(Value::Bool(equal)),
         (Value::Null, _) | (_, Value::Null) => Ok(Value::Bool(!equal)),
-        _ => match evaluate_comparison(&BinaryOperator::Eq, &left, &right)? {
+        _ => match evaluate_comparison(&ast::BinaryOperator::Eq, &left, &right)? {
             Value::Bool(value) => Ok(Value::Bool(value == equal)),
             _ => unreachable!("evaluate_comparison always returns a boolean"),
         },
@@ -75,24 +75,28 @@ pub(super) fn evaluate_distinctness(left: Value, right: Value, equal: bool) -> R
 }
 
 pub(super) fn evaluate_numeric_operator(
-    operator: &BinaryOperator,
+    operator: &ast::BinaryOperator,
     left: Value,
     right: Value,
 ) -> Result<Value> {
     macro_rules! integer {
         ($left:expr, $right:expr, $variant:ident, $name:literal) => {{
-            if matches!(operator, BinaryOperator::Divide | BinaryOperator::Modulo) && $right == 0 {
+            if matches!(
+                operator,
+                ast::BinaryOperator::Divide | ast::BinaryOperator::Modulo
+            ) && $right == 0
+            {
                 return Err(PgError::create(
                     SqlState::DivisionByZero,
                     "division by zero",
                 ));
             }
             let value = match operator {
-                BinaryOperator::Plus => $left.checked_add($right),
-                BinaryOperator::Minus => $left.checked_sub($right),
-                BinaryOperator::Multiply => $left.checked_mul($right),
-                BinaryOperator::Divide => $left.checked_div($right),
-                BinaryOperator::Modulo => $left.checked_rem($right),
+                ast::BinaryOperator::Plus => $left.checked_add($right),
+                ast::BinaryOperator::Minus => $left.checked_sub($right),
+                ast::BinaryOperator::Multiply => $left.checked_mul($right),
+                ast::BinaryOperator::Divide => $left.checked_div($right),
+                ast::BinaryOperator::Modulo => $left.checked_rem($right),
                 _ => unreachable!("arithmetic operator was checked by caller"),
             };
             value.map(Value::$variant).ok_or_else(|| {
@@ -109,18 +113,22 @@ pub(super) fn evaluate_numeric_operator(
         (Value::Int4(left), Value::Int4(right)) => integer!(left, right, Int4, "integer"),
         (Value::Int8(left), Value::Int8(right)) => integer!(left, right, Int8, "bigint"),
         (Value::Float4(left), Value::Float4(right)) => {
-            if matches!(operator, BinaryOperator::Divide | BinaryOperator::Modulo) && right == 0.0 {
+            if matches!(
+                operator,
+                ast::BinaryOperator::Divide | ast::BinaryOperator::Modulo
+            ) && right == 0.0
+            {
                 return Err(PgError::create(
                     SqlState::DivisionByZero,
                     "division by zero",
                 ));
             }
             let value = match operator {
-                BinaryOperator::Plus => left + right,
-                BinaryOperator::Minus => left - right,
-                BinaryOperator::Multiply => left * right,
-                BinaryOperator::Divide => left / right,
-                BinaryOperator::Modulo => left % right,
+                ast::BinaryOperator::Plus => left + right,
+                ast::BinaryOperator::Minus => left - right,
+                ast::BinaryOperator::Multiply => left * right,
+                ast::BinaryOperator::Divide => left / right,
+                ast::BinaryOperator::Modulo => left % right,
                 _ => unreachable!("arithmetic operator was checked by caller"),
             };
             if value.is_infinite() && left.is_finite() && right.is_finite() {
@@ -133,18 +141,22 @@ pub(super) fn evaluate_numeric_operator(
             }
         }
         (Value::Float8(left), Value::Float8(right)) => {
-            if matches!(operator, BinaryOperator::Divide | BinaryOperator::Modulo) && right == 0.0 {
+            if matches!(
+                operator,
+                ast::BinaryOperator::Divide | ast::BinaryOperator::Modulo
+            ) && right == 0.0
+            {
                 return Err(PgError::create(
                     SqlState::DivisionByZero,
                     "division by zero",
                 ));
             }
             let value = match operator {
-                BinaryOperator::Plus => left + right,
-                BinaryOperator::Minus => left - right,
-                BinaryOperator::Multiply => left * right,
-                BinaryOperator::Divide => left / right,
-                BinaryOperator::Modulo => left % right,
+                ast::BinaryOperator::Plus => left + right,
+                ast::BinaryOperator::Minus => left - right,
+                ast::BinaryOperator::Multiply => left * right,
+                ast::BinaryOperator::Divide => left / right,
+                ast::BinaryOperator::Modulo => left % right,
                 _ => unreachable!("arithmetic operator was checked by caller"),
             };
             if value.is_infinite() && left.is_finite() && right.is_finite() {
@@ -157,18 +169,22 @@ pub(super) fn evaluate_numeric_operator(
             }
         }
         (Value::Numeric(left), Value::Numeric(right)) => {
-            if matches!(operator, BinaryOperator::Divide | BinaryOperator::Modulo) && right == 0 {
+            if matches!(
+                operator,
+                ast::BinaryOperator::Divide | ast::BinaryOperator::Modulo
+            ) && right == 0
+            {
                 return Err(PgError::create(
                     SqlState::DivisionByZero,
                     "division by zero",
                 ));
             }
             Ok(Value::Numeric(match operator {
-                BinaryOperator::Plus => left + right,
-                BinaryOperator::Minus => left - right,
-                BinaryOperator::Multiply => left * right,
-                BinaryOperator::Divide => divide_numeric(&left, &right),
-                BinaryOperator::Modulo => left % right,
+                ast::BinaryOperator::Plus => left + right,
+                ast::BinaryOperator::Minus => left - right,
+                ast::BinaryOperator::Multiply => left * right,
+                ast::BinaryOperator::Divide => divide_numeric(&left, &right),
+                ast::BinaryOperator::Modulo => left % right,
                 _ => unreachable!("arithmetic operator was checked by caller"),
             }))
         }
@@ -256,7 +272,7 @@ fn describe_numeric_division_operand(value: &BigDecimal) -> (i64, u16) {
 }
 
 pub(super) fn infer_interval_arithmetic_type(
-    operator: &BinaryOperator,
+    operator: &ast::BinaryOperator,
     left: BaseType,
     right: BaseType,
 ) -> Result<BaseType> {
@@ -272,21 +288,23 @@ pub(super) fn infer_interval_arithmetic_type(
         )
     };
     match (operator, left, right) {
-        (BinaryOperator::Plus | BinaryOperator::Minus, BaseType::Interval, BaseType::Interval) => {
-            Ok(BaseType::Interval)
-        }
         (
-            BinaryOperator::Plus,
+            ast::BinaryOperator::Plus | ast::BinaryOperator::Minus,
+            BaseType::Interval,
+            BaseType::Interval,
+        ) => Ok(BaseType::Interval),
+        (
+            ast::BinaryOperator::Plus,
             BaseType::Date | BaseType::Timestamp | BaseType::TimestampTz,
             BaseType::Interval,
         )
         | (
-            BinaryOperator::Plus,
+            ast::BinaryOperator::Plus,
             BaseType::Interval,
             BaseType::Date | BaseType::Timestamp | BaseType::TimestampTz,
         )
         | (
-            BinaryOperator::Minus,
+            ast::BinaryOperator::Minus,
             BaseType::Date | BaseType::Timestamp | BaseType::TimestampTz,
             BaseType::Interval,
         ) => Ok(if left == BaseType::Interval {
@@ -294,13 +312,13 @@ pub(super) fn infer_interval_arithmetic_type(
         } else {
             left
         }),
-        (BinaryOperator::Multiply, BaseType::Interval, right) if numeric(right) => {
+        (ast::BinaryOperator::Multiply, BaseType::Interval, right) if numeric(right) => {
             Ok(BaseType::Interval)
         }
-        (BinaryOperator::Multiply, left, BaseType::Interval) if numeric(left) => {
+        (ast::BinaryOperator::Multiply, left, BaseType::Interval) if numeric(left) => {
             Ok(BaseType::Interval)
         }
-        (BinaryOperator::Divide, BaseType::Interval, right) if numeric(right) => {
+        (ast::BinaryOperator::Divide, BaseType::Interval, right) if numeric(right) => {
             Ok(BaseType::Interval)
         }
         _ => Err(PgError::create(
@@ -311,7 +329,7 @@ pub(super) fn infer_interval_arithmetic_type(
 }
 
 pub(super) fn evaluate_temporal_arithmetic(
-    operator: &BinaryOperator,
+    operator: &ast::BinaryOperator,
     left: Value,
     right: Value,
 ) -> Result<Value> {
@@ -375,11 +393,11 @@ pub(super) fn evaluate_temporal_arithmetic(
     }
     match (operator, left, right) {
         (
-            BinaryOperator::Plus | BinaryOperator::Minus,
+            ast::BinaryOperator::Plus | ast::BinaryOperator::Minus,
             Value::Interval(left),
             Value::Interval(right),
         ) => {
-            let right = negate_interval_if(right, matches!(operator, BinaryOperator::Minus));
+            let right = negate_interval_if(right, matches!(operator, ast::BinaryOperator::Minus));
             Ok(Value::Interval(crate::value::PgInterval {
                 months: left.months.checked_add(right.months).ok_or_else(|| {
                     PgError::create(SqlState::NumericValueOutOfRange, "interval out of range")
@@ -392,7 +410,11 @@ pub(super) fn evaluate_temporal_arithmetic(
                 })?,
             }))
         }
-        (BinaryOperator::Multiply | BinaryOperator::Divide, Value::Interval(value), number) => {
+        (
+            ast::BinaryOperator::Multiply | ast::BinaryOperator::Divide,
+            Value::Interval(value),
+            number,
+        ) => {
             let factor = match number {
                 Value::Int2(v) => f64::from(v),
                 Value::Int4(v) => f64::from(v),
@@ -409,7 +431,7 @@ pub(super) fn evaluate_temporal_arithmetic(
                     ));
                 }
             };
-            if matches!(operator, BinaryOperator::Divide) && factor == 0.0 {
+            if matches!(operator, ast::BinaryOperator::Divide) && factor == 0.0 {
                 return Err(PgError::create(
                     SqlState::DivisionByZero,
                     "division by zero",
@@ -417,7 +439,7 @@ pub(super) fn evaluate_temporal_arithmetic(
             }
             scale_interval(
                 value,
-                if matches!(operator, BinaryOperator::Divide) {
+                if matches!(operator, ast::BinaryOperator::Divide) {
                     1.0 / factor
                 } else {
                     factor
@@ -425,46 +447,46 @@ pub(super) fn evaluate_temporal_arithmetic(
             )
             .map(Value::Interval)
         }
-        (BinaryOperator::Multiply, number, Value::Interval(value)) => {
+        (ast::BinaryOperator::Multiply, number, Value::Interval(value)) => {
             evaluate_temporal_arithmetic(operator, Value::Interval(value), number)
         }
         (
-            BinaryOperator::Plus | BinaryOperator::Minus,
+            ast::BinaryOperator::Plus | ast::BinaryOperator::Minus,
             Value::Date(crate::value::PgDate::Finite(date)),
             Value::Interval(interval),
         ) => {
             let value = add_interval_to_timestamp(
                 date.and_hms_opt(0, 0, 0).expect("midnight is valid"),
-                negate_interval_if(interval, matches!(operator, BinaryOperator::Minus)),
+                negate_interval_if(interval, matches!(operator, ast::BinaryOperator::Minus)),
             )?;
             Ok(Value::Timestamp(crate::value::PgTimestamp::Finite(value)))
         }
-        (BinaryOperator::Plus, Value::Interval(interval), value @ Value::Date(_)) => {
+        (ast::BinaryOperator::Plus, Value::Interval(interval), value @ Value::Date(_)) => {
             evaluate_temporal_arithmetic(operator, value, Value::Interval(interval))
         }
         (
-            BinaryOperator::Plus | BinaryOperator::Minus,
+            ast::BinaryOperator::Plus | ast::BinaryOperator::Minus,
             Value::Timestamp(crate::value::PgTimestamp::Finite(value)),
             Value::Interval(interval),
         ) => Ok(Value::Timestamp(crate::value::PgTimestamp::Finite(
             add_interval_to_timestamp(
                 value,
-                negate_interval_if(interval, matches!(operator, BinaryOperator::Minus)),
+                negate_interval_if(interval, matches!(operator, ast::BinaryOperator::Minus)),
             )?,
         ))),
         (
-            BinaryOperator::Plus | BinaryOperator::Minus,
+            ast::BinaryOperator::Plus | ast::BinaryOperator::Minus,
             Value::TimestampTz(crate::value::PgTimestampTz::Finite(value)),
             Value::Interval(interval),
         ) => Ok(Value::TimestampTz(crate::value::PgTimestampTz::Finite(
             add_interval_to_timestamp(
                 value.naive_utc(),
-                negate_interval_if(interval, matches!(operator, BinaryOperator::Minus)),
+                negate_interval_if(interval, matches!(operator, ast::BinaryOperator::Minus)),
             )?
             .and_utc(),
         ))),
-        (BinaryOperator::Plus, Value::Interval(interval), value @ Value::Timestamp(_))
-        | (BinaryOperator::Plus, Value::Interval(interval), value @ Value::TimestampTz(_)) => {
+        (ast::BinaryOperator::Plus, Value::Interval(interval), value @ Value::Timestamp(_))
+        | (ast::BinaryOperator::Plus, Value::Interval(interval), value @ Value::TimestampTz(_)) => {
             evaluate_temporal_arithmetic(operator, value, Value::Interval(interval))
         }
         _ => Err(PgError::create(

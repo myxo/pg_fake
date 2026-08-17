@@ -1,16 +1,19 @@
 use super::*;
+use sqlparser::ast;
 
-pub(super) fn convert_referential_action(action: Option<ReferentialAction>) -> ForeignKeyAction {
-    match action.unwrap_or(ReferentialAction::NoAction) {
-        ReferentialAction::NoAction => ForeignKeyAction::NoAction,
-        ReferentialAction::Restrict => ForeignKeyAction::Restrict,
-        ReferentialAction::Cascade => ForeignKeyAction::Cascade,
-        ReferentialAction::SetNull => ForeignKeyAction::SetNull,
-        ReferentialAction::SetDefault => ForeignKeyAction::SetDefault,
+pub(super) fn convert_referential_action(
+    action: Option<ast::ReferentialAction>,
+) -> ForeignKeyAction {
+    match action.unwrap_or(ast::ReferentialAction::NoAction) {
+        ast::ReferentialAction::NoAction => ForeignKeyAction::NoAction,
+        ast::ReferentialAction::Restrict => ForeignKeyAction::Restrict,
+        ast::ReferentialAction::Cascade => ForeignKeyAction::Cascade,
+        ast::ReferentialAction::SetNull => ForeignKeyAction::SetNull,
+        ast::ReferentialAction::SetDefault => ForeignKeyAction::SetDefault,
     }
 }
 
-pub(super) fn resolve_foreign_key_name(name: Option<&Ident>, default: String) -> String {
+pub(super) fn resolve_foreign_key_name(name: Option<&ast::Ident>, default: String) -> String {
     let name = name.map(normalize_identifier).unwrap_or_default();
     if name.is_empty() { default } else { name }
 }
@@ -70,7 +73,7 @@ fn compare_foreign_key_keys(left: &[Value], right: &[Value]) -> Result<bool> {
                 return Ok(false);
             }
             Ok(matches!(
-                evaluate_comparison(&BinaryOperator::Eq, left, right)?,
+                evaluate_comparison(&ast::BinaryOperator::Eq, left, right)?,
                 Value::Bool(true)
             ))
         })
@@ -161,7 +164,7 @@ pub(super) fn validate_row_foreign_keys(
             .map(|index| row[*index].clone())
             .collect::<Vec<_>>();
         if key.iter().any(Value::is_null) {
-            if foreign_key.match_kind == Some(ConstraintReferenceMatchKind::Full)
+            if foreign_key.match_kind == Some(ast::ConstraintReferenceMatchKind::Full)
                 && !key.iter().all(Value::is_null)
             {
                 return Err(PgError::create(

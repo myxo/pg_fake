@@ -1,5 +1,6 @@
 use super::*;
-use sqlparser::ast::{VisitMut, VisitorMut};
+use ast::VisitMut as _;
+use sqlparser::ast;
 
 struct SubqueryMaterializer<'a> {
     state: &'a DatabaseState,
@@ -12,15 +13,15 @@ struct SubqueryMaterializer<'a> {
 }
 
 impl SubqueryMaterializer<'_> {
-    fn execute(&self, query: &sqlparser::ast::Query) -> Result<QueryResult> {
+    fn execute(&self, query: &ast::Query) -> Result<QueryResult> {
         let query = materialize_uncorrelated_subqueries(
             self.state,
-            &Statement::Query(Box::new(query.clone())),
+            &ast::Statement::Query(Box::new(query.clone())),
             self.xid,
             self.snapshot,
             self.context,
         )?;
-        let Statement::Query(query) = query else {
+        let ast::Statement::Query(query) = query else {
             unreachable!("subquery statement remains a query");
         };
         let StatementResult::Query(result) =
@@ -32,15 +33,12 @@ impl SubqueryMaterializer<'_> {
     }
 }
 
-impl VisitorMut for SubqueryMaterializer<'_> {
+impl ast::VisitorMut for SubqueryMaterializer<'_> {
     type Break = ();
 
-    fn pre_visit_query(
-        &mut self,
-        query: &mut sqlparser::ast::Query,
-    ) -> std::ops::ControlFlow<Self::Break> {
+    fn pre_visit_query(&mut self, query: &mut ast::Query) -> std::ops::ControlFlow<Self::Break> {
         let scope = match query.body.as_ref() {
-            SetExpr::Select(select) => bind_query_scope(&self.state.catalog, select),
+            ast::SetExpr::Select(select) => bind_query_scope(&self.state.catalog, select),
             _ => Ok(BoundScope {
                 columns: Vec::new(),
             }),
@@ -52,25 +50,22 @@ impl VisitorMut for SubqueryMaterializer<'_> {
         std::ops::ControlFlow::Continue(())
     }
 
-    fn post_visit_query(
-        &mut self,
-        _query: &mut sqlparser::ast::Query,
-    ) -> std::ops::ControlFlow<Self::Break> {
+    fn post_visit_query(&mut self, _query: &mut ast::Query) -> std::ops::ControlFlow<Self::Break> {
         self.scopes.pop().expect("visited query pushed a scope");
         std::ops::ControlFlow::Continue(())
     }
 
-    fn pre_visit_expr(&mut self, expr: &mut Expr) -> std::ops::ControlFlow<Self::Break> {
+    fn pre_visit_expr(&mut self, expr: &mut ast::Expr) -> std::ops::ControlFlow<Self::Break> {
         let original = expr.clone();
         let correlation_candidate = original.clone();
         let result = (|| match original {
-            Expr::AnyOp {
+            ast::Expr::AnyOp {
                 left,
                 compare_op,
                 right,
                 is_some,
             } => {
-                let Expr::Subquery(subquery) = right.as_ref() else {
+                let ast::Expr::Subquery(subquery) = right.as_ref() else {
                     return Ok(None);
                 };
                 let result = self.execute(subquery)?;
@@ -85,10 +80,10 @@ impl VisitorMut for SubqueryMaterializer<'_> {
                         .expect("query result type OID is supported"),
                     result.columns[0].typmod,
                 );
-                Ok(Some(Expr::AnyOp {
+                Ok(Some(ast::Expr::AnyOp {
                     left,
                     compare_op,
-                    right: Box::new(Expr::Tuple(
+                    right: Box::new(ast::Expr::Tuple(
                         result
                             .rows
                             .into_iter()
@@ -100,12 +95,12 @@ impl VisitorMut for SubqueryMaterializer<'_> {
                     is_some,
                 }))
             }
-            Expr::AllOp {
+            ast::Expr::AllOp {
                 left,
                 compare_op,
                 right,
             } => {
-                let Expr::Subquery(subquery) = right.as_ref() else {
+                let ast::Expr::Subquery(subquery) = right.as_ref() else {
                     return Ok(None);
                 };
                 let result = self.execute(subquery)?;
@@ -120,10 +115,10 @@ impl VisitorMut for SubqueryMaterializer<'_> {
                         .expect("query result type OID is supported"),
                     result.columns[0].typmod,
                 );
-                Ok(Some(Expr::AllOp {
+                Ok(Some(ast::Expr::AllOp {
                     left,
                     compare_op,
-                    right: Box::new(Expr::Tuple(
+                    right: Box::new(ast::Expr::Tuple(
                         result
                             .rows
                             .into_iter()
@@ -134,7 +129,7 @@ impl VisitorMut for SubqueryMaterializer<'_> {
                     )),
                 }))
             }
-            Expr::Subquery(query) => {
+            ast::Expr::Subquery(query) => {
                 let result = self.execute(&query)?;
                 if result.columns.len() != 1 {
                     return Err(PgError::create(
@@ -163,18 +158,20 @@ impl VisitorMut for SubqueryMaterializer<'_> {
                     data_type,
                 )))
             }
-            Expr::Exists { subquery, negated } => Ok(Some(crate::analyzer::create_typed_literal(
-                Value::Bool(self.execute(&subquery)?.rows.is_empty() == negated),
-                PgType::create(BaseType::Bool),
-            ))),
-            Expr::InSubquery {
+            ast::Expr::Exists { subquery, negated } => {
+                Ok(Some(crate::analyzer::create_typed_literal(
+                    Value::Bool(self.execute(&subquery)?.rows.is_empty() == negated),
+                    PgType::create(BaseType::Bool),
+                )))
+            }
+            ast::Expr::InSubquery {
                 expr,
                 subquery,
                 negated,
             } => {
                 let result = self.execute(&subquery)?;
                 let left_width = match expr.as_ref() {
-                    Expr::Tuple(fields) => fields.len(),
+                    ast::Expr::Tuple(fields) => fields.len(),
                     _ => 1,
                 };
                 if result.columns.len() != left_width {
@@ -194,7 +191,7 @@ impl VisitorMut for SubqueryMaterializer<'_> {
                         )
                     })
                     .collect::<Vec<_>>();
-                Ok(Some(Expr::InList {
+                Ok(Some(ast::Expr::InList {
                     expr,
                     list: result
                         .rows
@@ -210,7 +207,7 @@ impl VisitorMut for SubqueryMaterializer<'_> {
                             if fields.len() == 1 {
                                 fields.into_iter().next().expect("row has one field")
                             } else {
-                                Expr::Tuple(fields)
+                                ast::Expr::Tuple(fields)
                             }
                         })
                         .collect(),
@@ -245,17 +242,17 @@ impl VisitorMut for SubqueryMaterializer<'_> {
 
 pub(crate) fn materialize_uncorrelated_subqueries(
     state: &DatabaseState,
-    statement: &Statement,
+    statement: &ast::Statement,
     xid: Xid,
     snapshot: &Snapshot,
     context: &StatementExecutionContext,
-) -> Result<Statement> {
+) -> Result<ast::Statement> {
     let mut statement = statement.clone();
     materialize_subqueries(state, &mut statement, xid, snapshot, context, true)?;
     Ok(statement)
 }
 
-fn materialize_subqueries<V: VisitMut>(
+fn materialize_subqueries<V: ast::VisitMut>(
     state: &DatabaseState,
     value: &mut V,
     xid: Xid,
@@ -288,14 +285,11 @@ struct OuterReferenceSubstituter<'a> {
     substituted: bool,
 }
 
-impl VisitorMut for OuterReferenceSubstituter<'_> {
+impl ast::VisitorMut for OuterReferenceSubstituter<'_> {
     type Break = ();
 
-    fn pre_visit_query(
-        &mut self,
-        query: &mut sqlparser::ast::Query,
-    ) -> std::ops::ControlFlow<Self::Break> {
-        let SetExpr::Select(select) = query.body.as_ref() else {
+    fn pre_visit_query(&mut self, query: &mut ast::Query) -> std::ops::ControlFlow<Self::Break> {
+        let ast::SetExpr::Select(select) = query.body.as_ref() else {
             self.scopes.push(BoundScope {
                 columns: Vec::new(),
             });
@@ -311,18 +305,15 @@ impl VisitorMut for OuterReferenceSubstituter<'_> {
         std::ops::ControlFlow::Continue(())
     }
 
-    fn post_visit_query(
-        &mut self,
-        _query: &mut sqlparser::ast::Query,
-    ) -> std::ops::ControlFlow<Self::Break> {
+    fn post_visit_query(&mut self, _query: &mut ast::Query) -> std::ops::ControlFlow<Self::Break> {
         self.scopes.pop().expect("visited query pushed a scope");
         std::ops::ControlFlow::Continue(())
     }
 
-    fn pre_visit_expr(&mut self, expression: &mut Expr) -> std::ops::ControlFlow<Self::Break> {
+    fn pre_visit_expr(&mut self, expression: &mut ast::Expr) -> std::ops::ControlFlow<Self::Break> {
         let identifiers = match expression {
-            Expr::Identifier(identifier) => std::slice::from_ref(identifier),
-            Expr::CompoundIdentifier(identifiers) => identifiers.as_slice(),
+            ast::Expr::Identifier(identifier) => std::slice::from_ref(identifier),
+            ast::Expr::CompoundIdentifier(identifiers) => identifiers.as_slice(),
             _ => return std::ops::ControlFlow::Continue(()),
         };
         for scope in self.scopes.iter().rev() {
@@ -377,7 +368,7 @@ impl VisitorMut for OuterReferenceSubstituter<'_> {
 
 fn references_outer_scope(
     catalog: &Catalog,
-    expression: &Expr,
+    expression: &ast::Expr,
     outer_scope: &BoundScope,
 ) -> Result<bool> {
     let mut expression = expression.clone();
@@ -396,7 +387,7 @@ fn references_outer_scope(
 
 fn evaluate_query_expression(
     state: &DatabaseState,
-    expression: &Expr,
+    expression: &ast::Expr,
     scope: &BoundScope,
     row: &[Value],
     xid: Xid,
@@ -422,16 +413,16 @@ fn evaluate_query_expression(
 
 pub(crate) fn describe_query_result_columns(
     state: &DatabaseState,
-    statement: &Statement,
+    statement: &ast::Statement,
 ) -> Result<Vec<ColumnMeta>> {
-    let Statement::Query(query) = statement else {
+    let ast::Statement::Query(query) = statement else {
         return Ok(Vec::new());
     };
     match query.body.as_ref() {
-        SetExpr::Select(select) => bind_select_scope(state, select).and_then(|scope| {
+        ast::SetExpr::Select(select) => bind_select_scope(state, select).and_then(|scope| {
             build_projection_plan(state, &select.projection, &scope).map(|(_, columns)| columns)
         }),
-        SetExpr::Values(values) => bind_values_scope(values).map(|scope| {
+        ast::SetExpr::Values(values) => bind_values_scope(values).map(|scope| {
             scope
                 .columns
                 .iter()
@@ -448,11 +439,11 @@ pub(crate) fn describe_query_result_columns(
 enum ProjectionSource<'a> {
     Column(usize),
     Merged(usize, usize, PgType),
-    Expression(&'a Expr),
+    Expression(&'a ast::Expr),
 }
 enum OrderKey<'a> {
     Output(usize),
-    Expression(&'a Expr),
+    Expression(&'a ast::Expr),
 }
 enum RowCountClause {
     Limit,
@@ -477,9 +468,7 @@ enum JoinKey {
     Bytea(Vec<u8>),
     Uuid(uuid::Uuid),
 }
-pub(super) fn resolve_select_lock_mode(
-    query: &sqlparser::ast::Query,
-) -> Result<Option<RowLockMode>> {
+pub(super) fn resolve_select_lock_mode(query: &ast::Query) -> Result<Option<RowLockMode>> {
     if query.locks.len() > 1 {
         return reject_unsupported("multiple row-lock clauses are not implemented");
     }
@@ -490,12 +479,12 @@ pub(super) fn resolve_select_lock_mode(
         return reject_unsupported("row-lock clause variant is not implemented");
     }
     Ok(Some(match lock.lock_type {
-        LockType::Share => RowLockMode::Share,
-        LockType::Update => RowLockMode::Update,
+        ast::LockType::Share => RowLockMode::Share,
+        ast::LockType::Update => RowLockMode::Update,
     }))
 }
 
-fn bind_values_scope(values: &sqlparser::ast::Values) -> Result<BoundScope> {
+fn bind_values_scope(values: &ast::Values) -> Result<BoundScope> {
     let width = values.rows.first().map(|row| row.len()).unwrap_or(0);
     if values.rows.iter().any(|row| row.len() != width) {
         return Err(PgError::create(
@@ -544,8 +533,8 @@ fn bind_values_scope(values: &sqlparser::ast::Values) -> Result<BoundScope> {
 }
 
 fn execute_values_query(
-    query: &sqlparser::ast::Query,
-    values: &sqlparser::ast::Values,
+    query: &ast::Query,
+    values: &ast::Values,
     context: &StatementExecutionContext,
 ) -> Result<StatementResult> {
     let scope = bind_values_scope(values)?;
@@ -579,7 +568,7 @@ fn execute_values_query(
         })
         .collect::<Result<Vec<_>>>()?;
     if let Some(order_by) = &query.order_by {
-        let sqlparser::ast::OrderByKind::Expressions(orders) = &order_by.kind else {
+        let ast::OrderByKind::Expressions(orders) = &order_by.kind else {
             return reject_unsupported("ORDER BY ALL is not implemented");
         };
         let orders = orders
@@ -592,7 +581,7 @@ fn execute_values_query(
                         .parse::<usize>()
                         .ok()
                         .and_then(|position| position.checked_sub(1))
-                } else if let Expr::Identifier(identifier) = &order.expr {
+                } else if let ast::Expr::Identifier(identifier) = &order.expr {
                     scope
                         .resolve_column(std::slice::from_ref(identifier))
                         .ok()
@@ -657,7 +646,7 @@ fn execute_values_query(
     }
     let (limit, offset) = match &query.limit_clause {
         None => (None, 0),
-        Some(sqlparser::ast::LimitClause::LimitOffset {
+        Some(ast::LimitClause::LimitOffset {
             limit,
             offset,
             limit_by,
@@ -690,7 +679,7 @@ fn execute_values_query(
 
 pub(super) fn execute_query(
     state: &DatabaseState,
-    query: &sqlparser::ast::Query,
+    query: &ast::Query,
     xid: Xid,
     snapshot: &Snapshot,
     context: &StatementExecutionContext,
@@ -699,13 +688,13 @@ pub(super) fn execute_query(
         return reject_unsupported("query clause is not implemented");
     }
     resolve_select_lock_mode(query)?;
-    let SetExpr::Select(select) = query.body.as_ref() else {
-        if let SetExpr::Values(values) = query.body.as_ref() {
+    let ast::SetExpr::Select(select) = query.body.as_ref() else {
+        if let ast::SetExpr::Values(values) = query.body.as_ref() {
             return execute_values_query(query, values, context);
         }
         return reject_unsupported("query source is not implemented");
     };
-    let GroupByExpr::Expressions(group_by, modifiers) = &select.group_by else {
+    let ast::GroupByExpr::Expressions(group_by, modifiers) = &select.group_by else {
         return reject_unsupported("GROUP BY is not implemented");
     };
     if select.distinct.is_some()
@@ -719,7 +708,7 @@ pub(super) fn execute_query(
     let scope = bind_select_scope(state, select)?;
     let (limit, offset) = match &query.limit_clause {
         None => (None, 0),
-        Some(sqlparser::ast::LimitClause::LimitOffset {
+        Some(ast::LimitClause::LimitOffset {
             limit,
             offset,
             limit_by,
@@ -740,7 +729,7 @@ pub(super) fn execute_query(
                 .unwrap_or(0);
             (limit, offset)
         }
-        Some(sqlparser::ast::LimitClause::OffsetCommaLimit { .. }) => {
+        Some(ast::LimitClause::OffsetCommaLimit { .. }) => {
             return reject_unsupported("LIMIT clause is not implemented");
         }
     };
@@ -761,7 +750,7 @@ pub(super) fn execute_query(
             if order_by.interpolate.is_some() {
                 return reject_unsupported("ORDER BY INTERPOLATE is not implemented");
             }
-            let sqlparser::ast::OrderByKind::Expressions(orders) = &order_by.kind else {
+            let ast::OrderByKind::Expressions(orders) = &order_by.kind else {
                 return reject_unsupported("ORDER BY ALL is not implemented");
             };
             orders
@@ -786,7 +775,7 @@ pub(super) fn execute_query(
                             ));
                         }
                         OrderKey::Output(position - 1)
-                    } else if let Expr::Identifier(identifier) = &order.expr
+                    } else if let ast::Expr::Identifier(identifier) = &order.expr
                         && let Some(index) = columns
                             .iter()
                             .position(|column| column.name == normalize_identifier(identifier))
@@ -915,14 +904,14 @@ pub(super) fn execute_query(
 
 fn build_projection_plan<'a>(
     state: &DatabaseState,
-    projection: &'a [SelectItem],
+    projection: &'a [ast::SelectItem],
     scope: &BoundScope,
 ) -> Result<(Vec<ProjectionSource<'a>>, Vec<ColumnMeta>)> {
     let mut projections = Vec::new();
     let mut columns = Vec::new();
     for item in projection {
         match item {
-            SelectItem::Wildcard(_) => {
+            ast::SelectItem::Wildcard(_) => {
                 for column in &scope.columns {
                     if column.wildcard {
                         projections.push(match column.merged {
@@ -939,8 +928,8 @@ fn build_projection_plan<'a>(
                     }
                 }
             }
-            SelectItem::QualifiedWildcard(
-                SelectItemQualifiedWildcardKind::ObjectName(object_name),
+            ast::SelectItem::QualifiedWildcard(
+                ast::SelectItemQualifiedWildcardKind::ObjectName(object_name),
                 _,
             ) => {
                 let qualifier = normalize_unqualified_object_name(object_name)?;
@@ -969,7 +958,7 @@ fn build_projection_plan<'a>(
                     });
                 }
             }
-            SelectItem::UnnamedExpr(expression @ Expr::Identifier(column)) => {
+            ast::SelectItem::UnnamedExpr(expression @ ast::Expr::Identifier(column)) => {
                 let (_, data_type) = scope.resolve_column(std::slice::from_ref(column))?;
                 projections.push(ProjectionSource::Expression(expression));
                 columns.push(ColumnMeta {
@@ -978,7 +967,9 @@ fn build_projection_plan<'a>(
                     typmod: data_type.typmod,
                 });
             }
-            SelectItem::UnnamedExpr(expression @ Expr::CompoundIdentifier(identifiers)) => {
+            ast::SelectItem::UnnamedExpr(
+                expression @ ast::Expr::CompoundIdentifier(identifiers),
+            ) => {
                 let (_, data_type) = scope.resolve_column(identifiers)?;
                 projections.push(ProjectionSource::Expression(expression));
                 columns.push(ColumnMeta {
@@ -991,7 +982,7 @@ fn build_projection_plan<'a>(
                     typmod: data_type.typmod,
                 });
             }
-            SelectItem::UnnamedExpr(expr) => {
+            ast::SelectItem::UnnamedExpr(expr) => {
                 let data_type = infer_query_expression_type(state, expr, scope)?;
                 projections.push(ProjectionSource::Expression(expr));
                 columns.push(ColumnMeta {
@@ -1000,12 +991,12 @@ fn build_projection_plan<'a>(
                     typmod: PgType::NO_TYPEMOD,
                 });
             }
-            SelectItem::ExprWithAlias { expr, alias } => {
+            ast::SelectItem::ExprWithAlias { expr, alias } => {
                 let resolved = match expr {
-                    Expr::Identifier(column) => {
+                    ast::Expr::Identifier(column) => {
                         Some(scope.resolve_column(std::slice::from_ref(column))?)
                     }
-                    Expr::CompoundIdentifier(identifiers) => {
+                    ast::Expr::CompoundIdentifier(identifiers) => {
                         Some(scope.resolve_column(identifiers)?)
                     }
                     _ => None,
@@ -1042,7 +1033,7 @@ fn build_projection_plan<'a>(
 
 fn infer_query_expression_type(
     state: &DatabaseState,
-    expr: &Expr,
+    expr: &ast::Expr,
     scope: &BoundScope,
 ) -> Result<PgType> {
     super::scope::infer_expression_data_type(&state.catalog, expr, scope)
@@ -1050,12 +1041,12 @@ fn infer_query_expression_type(
 
 fn materialize_source_rows(
     state: &DatabaseState,
-    select: &sqlparser::ast::Select,
+    select: &ast::Select,
     scope: &BoundScope,
     xid: Xid,
     snapshot: &Snapshot,
     context: &StatementExecutionContext,
-    selection: Option<&Expr>,
+    selection: Option<&ast::Expr>,
 ) -> Result<Vec<Vec<Value>>> {
     if select.from.is_empty() {
         return Ok(vec![Vec::new()]);
@@ -1096,12 +1087,12 @@ fn materialize_source_rows(
 
 fn visit_query_source_rows(
     state: &DatabaseState,
-    select: &sqlparser::ast::Select,
+    select: &ast::Select,
     scope: &BoundScope,
     xid: Xid,
     snapshot: &Snapshot,
     context: &StatementExecutionContext,
-    selection: Option<&Expr>,
+    selection: Option<&ast::Expr>,
     visit: &mut dyn FnMut(&[Value]) -> Result<()>,
 ) -> Result<()> {
     if let [table] = select.from.as_slice()
@@ -1117,27 +1108,27 @@ fn visit_query_source_rows(
     Ok(())
 }
 
-fn can_stream_inner_join(table: &sqlparser::ast::TableWithJoins) -> bool {
-    matches!(table.relation, TableFactor::Table { .. })
+fn can_stream_inner_join(table: &ast::TableWithJoins) -> bool {
+    matches!(table.relation, ast::TableFactor::Table { .. })
         && table.joins.iter().all(|join| {
-            matches!(join.relation, TableFactor::Table { .. })
+            matches!(join.relation, ast::TableFactor::Table { .. })
                 && matches!(
                     join.join_operator,
-                    sqlparser::ast::JoinOperator::Join(_)
-                        | sqlparser::ast::JoinOperator::Inner(_)
-                        | sqlparser::ast::JoinOperator::CrossJoin(_)
+                    ast::JoinOperator::Join(_)
+                        | ast::JoinOperator::Inner(_)
+                        | ast::JoinOperator::CrossJoin(_)
                 )
         })
 }
 
 fn visit_streamed_inner_join_rows(
     state: &DatabaseState,
-    table: &sqlparser::ast::TableWithJoins,
+    table: &ast::TableWithJoins,
     scope: &BoundScope,
     xid: Xid,
     snapshot: &Snapshot,
     context: &StatementExecutionContext,
-    selection: Option<&Expr>,
+    selection: Option<&ast::Expr>,
     visit: &mut dyn FnMut(&[Value]) -> Result<()>,
 ) -> Result<()> {
     let mut starts = Vec::with_capacity(table.joins.len() + 1);
@@ -1145,7 +1136,7 @@ fn visit_streamed_inner_join_rows(
     for factor in
         std::iter::once(&table.relation).chain(table.joins.iter().map(|join| &join.relation))
     {
-        let TableFactor::Table {
+        let ast::TableFactor::Table {
             name: table_name, ..
         } = factor
         else {
@@ -1185,20 +1176,19 @@ fn visit_streamed_inner_join_rows(
 }
 
 fn resolve_hash_join_slots(
-    operator: &sqlparser::ast::JoinOperator,
+    operator: &ast::JoinOperator,
     scope: &BoundScope,
     left_start: usize,
     right_start: usize,
 ) -> Option<(usize, usize)> {
-    let (sqlparser::ast::JoinOperator::Join(sqlparser::ast::JoinConstraint::On(expression))
-    | sqlparser::ast::JoinOperator::Inner(sqlparser::ast::JoinConstraint::On(expression))) =
-        operator
+    let (ast::JoinOperator::Join(ast::JoinConstraint::On(expression))
+    | ast::JoinOperator::Inner(ast::JoinConstraint::On(expression))) = operator
     else {
         return None;
     };
-    let Expr::BinaryOp {
+    let ast::Expr::BinaryOp {
         left,
-        op: BinaryOperator::Eq,
+        op: ast::BinaryOperator::Eq,
         right,
     } = expression
     else {
@@ -1232,22 +1222,27 @@ fn resolve_hash_join_slots(
     .then_some((left_slot, right_slot))
 }
 
-fn resolve_hash_expression_slot(expression: &Expr, scope: &BoundScope) -> Option<(usize, PgType)> {
+fn resolve_hash_expression_slot(
+    expression: &ast::Expr,
+    scope: &BoundScope,
+) -> Option<(usize, PgType)> {
     match expression {
-        Expr::Identifier(identifier) => scope.resolve_column(std::slice::from_ref(identifier)).ok(),
-        Expr::CompoundIdentifier(identifiers) => scope.resolve_column(identifiers).ok(),
+        ast::Expr::Identifier(identifier) => {
+            scope.resolve_column(std::slice::from_ref(identifier)).ok()
+        }
+        ast::Expr::CompoundIdentifier(identifiers) => scope.resolve_column(identifiers).ok(),
         _ => None,
     }
 }
 
 fn visit_hash_join_rows(
     state: &DatabaseState,
-    table: &sqlparser::ast::TableWithJoins,
+    table: &ast::TableWithJoins,
     scope: &BoundScope,
     xid: Xid,
     snapshot: &Snapshot,
     context: &StatementExecutionContext,
-    selection: Option<&Expr>,
+    selection: Option<&ast::Expr>,
     left_start: usize,
     right_start: usize,
     left_slot: usize,
@@ -1322,12 +1317,12 @@ fn create_hash_join_key(value: &Value) -> Option<JoinKey> {
 
 fn visit_nested_loop_join_rows(
     state: &DatabaseState,
-    table: &sqlparser::ast::TableWithJoins,
+    table: &ast::TableWithJoins,
     scope: &BoundScope,
     xid: Xid,
     snapshot: &Snapshot,
     context: &StatementExecutionContext,
-    selection: Option<&Expr>,
+    selection: Option<&ast::Expr>,
     starts: &[usize],
     index: usize,
     left: &[Value],
@@ -1389,16 +1384,16 @@ fn visit_nested_loop_join_rows(
 
 fn visit_table_factor_rows(
     state: &DatabaseState,
-    factor: &TableFactor,
+    factor: &ast::TableFactor,
     scope: &BoundScope,
     xid: Xid,
     snapshot: &Snapshot,
     context: &StatementExecutionContext,
-    selection: Option<&Expr>,
+    selection: Option<&ast::Expr>,
     start: usize,
     visit: &mut dyn FnMut(&[Value]) -> Result<()>,
 ) -> Result<()> {
-    let TableFactor::Table {
+    let ast::TableFactor::Table {
         name: table_name,
         args,
         ..
@@ -1451,12 +1446,12 @@ fn visit_table_factor_rows(
 
 fn materialize_table_with_joins_rows(
     state: &DatabaseState,
-    table: &sqlparser::ast::TableWithJoins,
+    table: &ast::TableWithJoins,
     scope: &BoundScope,
     xid: Xid,
     snapshot: &Snapshot,
     context: &StatementExecutionContext,
-    selection: Option<&Expr>,
+    selection: Option<&ast::Expr>,
     next_slot: &mut usize,
 ) -> Result<Vec<Vec<Value>>> {
     let left_start = *next_slot;
@@ -1517,9 +1512,9 @@ fn materialize_table_with_joins_rows(
             if !matched_left
                 && matches!(
                     join.join_operator,
-                    sqlparser::ast::JoinOperator::Left(_)
-                        | sqlparser::ast::JoinOperator::LeftOuter(_)
-                        | sqlparser::ast::JoinOperator::FullOuter(_)
+                    ast::JoinOperator::Left(_)
+                        | ast::JoinOperator::LeftOuter(_)
+                        | ast::JoinOperator::FullOuter(_)
                 )
             {
                 joined.push(left.clone());
@@ -1527,9 +1522,9 @@ fn materialize_table_with_joins_rows(
         }
         if matches!(
             join.join_operator,
-            sqlparser::ast::JoinOperator::Right(_)
-                | sqlparser::ast::JoinOperator::RightOuter(_)
-                | sqlparser::ast::JoinOperator::FullOuter(_)
+            ast::JoinOperator::Right(_)
+                | ast::JoinOperator::RightOuter(_)
+                | ast::JoinOperator::FullOuter(_)
         ) {
             joined.extend(
                 right_rows
@@ -1545,15 +1540,15 @@ fn materialize_table_with_joins_rows(
 
 fn materialize_table_factor_rows(
     state: &DatabaseState,
-    factor: &TableFactor,
+    factor: &ast::TableFactor,
     scope: &BoundScope,
     xid: Xid,
     snapshot: &Snapshot,
     context: &StatementExecutionContext,
-    selection: Option<&Expr>,
+    selection: Option<&ast::Expr>,
     next_slot: &mut usize,
 ) -> Result<Vec<Vec<Value>>> {
-    if let TableFactor::NestedJoin {
+    if let ast::TableFactor::NestedJoin {
         table_with_joins, ..
     } = factor
     {
@@ -1568,7 +1563,7 @@ fn materialize_table_factor_rows(
             next_slot,
         );
     }
-    if let TableFactor::Derived {
+    if let ast::TableFactor::Derived {
         lateral,
         subquery,
         alias: Some(_),
@@ -1595,7 +1590,7 @@ fn materialize_table_factor_rows(
             })
             .collect());
     }
-    let TableFactor::Table {
+    let ast::TableFactor::Table {
         name: table_name,
         args,
         ..
@@ -1646,15 +1641,15 @@ fn materialize_table_factor_rows(
 }
 
 fn collect_pushdown_filters<'a>(
-    expr: &'a Expr,
+    expr: &'a ast::Expr,
     scope: &BoundScope,
     start: usize,
     end: usize,
-    filters: &mut Vec<&'a Expr>,
+    filters: &mut Vec<&'a ast::Expr>,
 ) {
-    if let Expr::BinaryOp {
+    if let ast::Expr::BinaryOp {
         left,
-        op: BinaryOperator::And,
+        op: ast::BinaryOperator::And,
         right,
     } = expr
     {
@@ -1662,22 +1657,22 @@ fn collect_pushdown_filters<'a>(
         collect_pushdown_filters(right, scope, start, end, filters);
         return;
     }
-    let Expr::BinaryOp { left, right, .. } = expr else {
+    let ast::Expr::BinaryOp { left, right, .. } = expr else {
         return;
     };
     let column = match (left.as_ref(), right.as_ref()) {
-        (Expr::Identifier(column), Expr::Value(_)) => scope
+        (ast::Expr::Identifier(column), ast::Expr::Value(_)) => scope
             .resolve_column(std::slice::from_ref(column))
             .ok()
             .map(|(slot, _)| slot),
-        (Expr::CompoundIdentifier(columns), Expr::Value(_)) => {
+        (ast::Expr::CompoundIdentifier(columns), ast::Expr::Value(_)) => {
             scope.resolve_column(columns).ok().map(|(slot, _)| slot)
         }
-        (Expr::Value(_), Expr::Identifier(column)) => scope
+        (ast::Expr::Value(_), ast::Expr::Identifier(column)) => scope
             .resolve_column(std::slice::from_ref(column))
             .ok()
             .map(|(slot, _)| slot),
-        (Expr::Value(_), Expr::CompoundIdentifier(columns)) => {
+        (ast::Expr::Value(_), ast::Expr::CompoundIdentifier(columns)) => {
             scope.resolve_column(columns).ok().map(|(slot, _)| slot)
         }
         _ => None,
@@ -1689,7 +1684,7 @@ fn collect_pushdown_filters<'a>(
 
 fn evaluate_join_condition(
     state: &DatabaseState,
-    operator: &sqlparser::ast::JoinOperator,
+    operator: &ast::JoinOperator,
     row: &[Value],
     scope: &BoundScope,
     left_start: usize,
@@ -1699,28 +1694,25 @@ fn evaluate_join_condition(
     context: &StatementExecutionContext,
 ) -> Result<bool> {
     let constraint = match operator {
-        sqlparser::ast::JoinOperator::Join(constraint)
-        | sqlparser::ast::JoinOperator::Inner(constraint)
-        | sqlparser::ast::JoinOperator::CrossJoin(constraint)
-        | sqlparser::ast::JoinOperator::Left(constraint)
-        | sqlparser::ast::JoinOperator::LeftOuter(constraint)
-        | sqlparser::ast::JoinOperator::Right(constraint)
-        | sqlparser::ast::JoinOperator::RightOuter(constraint)
-        | sqlparser::ast::JoinOperator::FullOuter(constraint) => constraint,
+        ast::JoinOperator::Join(constraint)
+        | ast::JoinOperator::Inner(constraint)
+        | ast::JoinOperator::CrossJoin(constraint)
+        | ast::JoinOperator::Left(constraint)
+        | ast::JoinOperator::LeftOuter(constraint)
+        | ast::JoinOperator::Right(constraint)
+        | ast::JoinOperator::RightOuter(constraint)
+        | ast::JoinOperator::FullOuter(constraint) => constraint,
         _ => {
             return reject_unsupported("join type is not implemented");
         }
     };
     match constraint {
-        sqlparser::ast::JoinConstraint::None => Ok(matches!(
-            operator,
-            sqlparser::ast::JoinOperator::CrossJoin(_)
-        )),
-        sqlparser::ast::JoinConstraint::On(expression) => Ok(matches!(
+        ast::JoinConstraint::None => Ok(matches!(operator, ast::JoinOperator::CrossJoin(_))),
+        ast::JoinConstraint::On(expression) => Ok(matches!(
             evaluate_query_expression(state, expression, scope, row, xid, snapshot, context,)?,
             Value::Bool(true)
         )),
-        sqlparser::ast::JoinConstraint::Using(names) => evaluate_using_join_condition(
+        ast::JoinConstraint::Using(names) => evaluate_using_join_condition(
             names
                 .iter()
                 .map(normalize_unqualified_object_name)
@@ -1731,7 +1723,7 @@ fn evaluate_join_condition(
             left_start,
             right_start,
         ),
-        sqlparser::ast::JoinConstraint::Natural => {
+        ast::JoinConstraint::Natural => {
             let names = scope.columns[left_start..right_start]
                 .iter()
                 .filter(|left| {
@@ -1784,12 +1776,12 @@ fn evaluate_using_join_condition(
 }
 
 fn evaluate_row_count(
-    expr: &Expr,
+    expr: &ast::Expr,
     clause: RowCountClause,
     context: &StatementExecutionContext,
 ) -> Result<Option<usize>> {
     if matches!(clause, RowCountClause::Limit)
-        && matches!(expr, Expr::Identifier(identifier) if identifier.quote_style.is_none() && identifier.value.eq_ignore_ascii_case("all"))
+        && matches!(expr, ast::Expr::Identifier(identifier) if identifier.quote_style.is_none() && identifier.value.eq_ignore_ascii_case("all"))
     {
         return Ok(None);
     }

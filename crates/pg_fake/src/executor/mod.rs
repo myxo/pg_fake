@@ -13,13 +13,7 @@ use crate::{
     },
     value::{BaseType, PgType, Value},
 };
-use sqlparser::ast::{
-    AssignmentTarget, BinaryOperator, CastKind, ColumnOption, ConstraintReferenceMatchKind,
-    DateTimeField, Delete, Expr, FromTable, Function, FunctionArg, FunctionArgExpr,
-    FunctionArguments, GroupByExpr, Ident, IndexColumn, LockType, ObjectType, ReferentialAction,
-    SelectItem, SelectItemQualifiedWildcardKind, SetExpr, Statement, TableConstraint, TableFactor,
-    TableObject, TableWithJoins, UnaryOperator, Value as AstValue,
-};
+use sqlparser::ast;
 use std::{
     cmp::Ordering,
     collections::{BTreeMap, BTreeSet},
@@ -96,7 +90,7 @@ impl DatabaseState {
 
 pub(crate) fn execute_statement(
     state: &mut DatabaseState,
-    statement: &Statement,
+    statement: &ast::Statement,
     xid: Xid,
     snapshot: &Snapshot,
     deferred_constraints: &BTreeSet<String>,
@@ -106,7 +100,7 @@ pub(crate) fn execute_statement(
     let statement =
         query::materialize_uncorrelated_subqueries(state, statement, xid, snapshot, context)?;
     match &statement {
-        Statement::CreateTable(create) => {
+        ast::Statement::CreateTable(create) => {
             let table_name = normalize_unqualified_object_name(&create.name)?;
             if create.if_not_exists && state.catalog.require_table(&table_name).is_ok() {
                 return Ok(StatementResult::Affected(0));
@@ -119,21 +113,21 @@ pub(crate) fn execute_statement(
                 let mut default = None;
                 for option in &column.options {
                     match &option.option {
-                        ColumnOption::Null => nullable = true,
-                        ColumnOption::NotNull => nullable = false,
-                        ColumnOption::Default(expr) => default = Some(expr.clone()),
-                        ColumnOption::PrimaryKey(_) => {
+                        ast::ColumnOption::Null => nullable = true,
+                        ast::ColumnOption::NotNull => nullable = false,
+                        ast::ColumnOption::Default(expr) => default = Some(expr.clone()),
+                        ast::ColumnOption::PrimaryKey(_) => {
                             let columns = vec![normalize_identifier(&column.name)];
                             constraints.push(crate::catalog::Constraint::PrimaryKey(columns));
                         }
-                        ColumnOption::Unique(_) => {
+                        ast::ColumnOption::Unique(_) => {
                             let columns = vec![normalize_identifier(&column.name)];
                             constraints.push(crate::catalog::Constraint::Unique(columns));
                         }
-                        ColumnOption::Check(check) => {
+                        ast::ColumnOption::Check(check) => {
                             constraints.push(crate::catalog::Constraint::Check(check.expr.clone()))
                         }
-                        ColumnOption::ForeignKey(foreign_key) => {
+                        ast::ColumnOption::ForeignKey(foreign_key) => {
                             let name = resolve_foreign_key_name(
                                 option.name.as_ref(),
                                 format!(
@@ -161,7 +155,7 @@ pub(crate) fn execute_statement(
                                 initially_deferred: foreign_key.characteristics.is_some_and(
                                     |characteristics| {
                                         characteristics.initially
-                                            == Some(sqlparser::ast::DeferrableInitial::Deferred)
+                                            == Some(ast::DeferrableInitial::Deferred)
                                     },
                                 ),
                                 match_kind: foreign_key.match_kind,
@@ -187,7 +181,7 @@ pub(crate) fn execute_statement(
             }
             for constraint in &create.constraints {
                 match constraint {
-                    TableConstraint::PrimaryKey(primary_key) => {
+                    ast::TableConstraint::PrimaryKey(primary_key) => {
                         constraints.push(crate::catalog::Constraint::PrimaryKey(
                             primary_key
                                 .columns
@@ -196,7 +190,7 @@ pub(crate) fn execute_statement(
                                 .collect::<Result<Vec<_>>>()?,
                         ))
                     }
-                    TableConstraint::Unique(unique) => {
+                    ast::TableConstraint::Unique(unique) => {
                         constraints.push(crate::catalog::Constraint::Unique(
                             unique
                                 .columns
@@ -205,10 +199,10 @@ pub(crate) fn execute_statement(
                                 .collect::<Result<Vec<_>>>()?,
                         ))
                     }
-                    TableConstraint::Check(check) => {
+                    ast::TableConstraint::Check(check) => {
                         constraints.push(crate::catalog::Constraint::Check(check.expr.clone()))
                     }
-                    TableConstraint::ForeignKey(foreign_key) => {
+                    ast::TableConstraint::ForeignKey(foreign_key) => {
                         let name = resolve_foreign_key_name(
                             foreign_key.name.as_ref(),
                             format!("{}_fkey", table_name),
@@ -236,7 +230,7 @@ pub(crate) fn execute_statement(
                             initially_deferred: foreign_key.characteristics.is_some_and(
                                 |characteristics| {
                                     characteristics.initially
-                                        == Some(sqlparser::ast::DeferrableInitial::Deferred)
+                                        == Some(ast::DeferrableInitial::Deferred)
                                 },
                             ),
                             match_kind: foreign_key.match_kind,
@@ -294,8 +288,8 @@ pub(crate) fn execute_statement(
             state.tables.insert(id, Table::create(table.clone()));
             Ok(StatementResult::Affected(0))
         }
-        Statement::Drop {
-            object_type: ObjectType::Table,
+        ast::Statement::Drop {
+            object_type: ast::ObjectType::Table,
             names,
             if_exists,
             ..
@@ -314,7 +308,7 @@ pub(crate) fn execute_statement(
             }
             Ok(StatementResult::Affected(affected))
         }
-        Statement::Insert(insert) => execute_insert(
+        ast::Statement::Insert(insert) => execute_insert(
             state,
             insert,
             xid,
@@ -323,7 +317,7 @@ pub(crate) fn execute_statement(
             defer_all,
             context,
         ),
-        Statement::Update(update) => {
+        ast::Statement::Update(update) => {
             if update.from.is_some() || update.returning.is_some() || update.or.is_some() {
                 return reject_unsupported("UPDATE feature is not implemented");
             }
@@ -339,7 +333,7 @@ pub(crate) fn execute_statement(
                 context,
             )
         }
-        Statement::Delete(delete) => execute_delete(
+        ast::Statement::Delete(delete) => execute_delete(
             state,
             delete,
             xid,
@@ -348,13 +342,11 @@ pub(crate) fn execute_statement(
             defer_all,
             context,
         ),
-        Statement::Query(query) => query::execute_query(state, query, xid, snapshot, context),
+        ast::Statement::Query(query) => query::execute_query(state, query, xid, snapshot, context),
         _ => reject_unsupported("statement is not implemented"),
     }
 }
-pub(crate) fn normalize_unqualified_object_name(
-    name: &sqlparser::ast::ObjectName,
-) -> Result<String> {
+pub(crate) fn normalize_unqualified_object_name(name: &ast::ObjectName) -> Result<String> {
     if name.0.len() != 1 {
         return reject_unsupported("schemas are not implemented");
     }
@@ -364,14 +356,14 @@ pub(crate) fn normalize_unqualified_object_name(
     Ok(normalize_identifier(identifier))
 }
 
-pub(crate) fn resolve_insert_table_name(table: &TableObject) -> Result<String> {
-    let TableObject::TableName(table_name) = table else {
+pub(crate) fn resolve_insert_table_name(table: &ast::TableObject) -> Result<String> {
+    let ast::TableObject::TableName(table_name) = table else {
         return reject_unsupported("insert target is not a table");
     };
     normalize_unqualified_object_name(table_name)
 }
 
-pub(crate) fn normalize_identifier(identifier: &Ident) -> String {
+pub(crate) fn normalize_identifier(identifier: &ast::Ident) -> String {
     if identifier.quote_style.is_some() {
         identifier.value.clone()
     } else {
@@ -379,8 +371,8 @@ pub(crate) fn normalize_identifier(identifier: &Ident) -> String {
     }
 }
 
-fn resolve_index_column_name(column: &IndexColumn) -> Result<String> {
-    let Expr::Identifier(identifier) = &column.column.expr else {
+fn resolve_index_column_name(column: &ast::IndexColumn) -> Result<String> {
+    let ast::Expr::Identifier(identifier) = &column.column.expr else {
         return reject_unsupported("index expressions are not implemented");
     };
     Ok(normalize_identifier(identifier))

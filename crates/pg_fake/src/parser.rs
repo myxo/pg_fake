@@ -1,12 +1,13 @@
 //! SQL parser.
 
-pub use sqlparser::ast::Statement;
+pub use ast::Statement;
+use sqlparser::ast;
 use sqlparser::{dialect::PostgreSqlDialect, parser::Parser};
 
 use crate::error::{PgError, Result, SqlState};
 
 /// Parses one or more PostgreSQL statements into owned syntax trees.
-pub fn parse(sql: &str) -> Result<Vec<Statement>> {
+pub fn parse(sql: &str) -> Result<Vec<ast::Statement>> {
     Parser::parse_sql(&PostgreSqlDialect {}, sql)
         .map_err(|error| PgError::create(SqlState::SyntaxError, error.to_string()))
 }
@@ -21,24 +22,26 @@ pub(crate) enum StatementKind {
     Unsupported,
 }
 
-pub(crate) fn classify(statement: &Statement) -> StatementKind {
+pub(crate) fn classify(statement: &ast::Statement) -> StatementKind {
     match statement {
-        Statement::CreateTable(_)
-        | Statement::CreateIndex(_)
-        | Statement::CreateSchema { .. }
-        | Statement::CreateView { .. }
-        | Statement::AlterTable { .. }
-        | Statement::AlterIndex { .. }
-        | Statement::AlterView { .. }
-        | Statement::Drop { .. } => StatementKind::Ddl,
-        Statement::Insert(_) | Statement::Update(_) | Statement::Delete(_) => StatementKind::Dml,
-        Statement::Query(_) => StatementKind::Query,
-        Statement::StartTransaction { .. }
-        | Statement::Commit { .. }
-        | Statement::Rollback { .. }
-        | Statement::Savepoint { .. }
-        | Statement::ReleaseSavepoint { .. } => StatementKind::TransactionControl,
-        Statement::Set(_) => StatementKind::Set,
+        ast::Statement::CreateTable(_)
+        | ast::Statement::CreateIndex(_)
+        | ast::Statement::CreateSchema { .. }
+        | ast::Statement::CreateView { .. }
+        | ast::Statement::AlterTable { .. }
+        | ast::Statement::AlterIndex { .. }
+        | ast::Statement::AlterView { .. }
+        | ast::Statement::Drop { .. } => StatementKind::Ddl,
+        ast::Statement::Insert(_) | ast::Statement::Update(_) | ast::Statement::Delete(_) => {
+            StatementKind::Dml
+        }
+        ast::Statement::Query(_) => StatementKind::Query,
+        ast::Statement::StartTransaction { .. }
+        | ast::Statement::Commit { .. }
+        | ast::Statement::Rollback { .. }
+        | ast::Statement::Savepoint { .. }
+        | ast::Statement::ReleaseSavepoint { .. } => StatementKind::TransactionControl,
+        ast::Statement::Set(_) => StatementKind::Set,
         _ => StatementKind::Unsupported,
     }
 }
@@ -52,8 +55,8 @@ mod tests {
         let statements = parse("CREATE TABLE users (id INTEGER); SELECT * FROM users").unwrap();
 
         assert_eq!(statements.len(), 2);
-        assert!(matches!(statements[0], Statement::CreateTable(_)));
-        assert!(matches!(statements[1], Statement::Query(_)));
+        assert!(matches!(statements[0], ast::Statement::CreateTable(_)));
+        assert!(matches!(statements[1], ast::Statement::Query(_)));
     }
 
     #[test]
@@ -69,17 +72,16 @@ mod tests {
             "CREATE TABLE child (parent_id INTEGER, CONSTRAINT child_parent_fkey FOREIGN KEY (parent_id) REFERENCES parent (id) MATCH FULL)",
         )
         .unwrap();
-        let Statement::CreateTable(create) = &statements[0] else {
+        let ast::Statement::CreateTable(create) = &statements[0] else {
             panic!("statement should be CREATE TABLE");
         };
-        let sqlparser::ast::TableConstraint::ForeignKey(foreign_key) = &create.constraints[0]
-        else {
+        let ast::TableConstraint::ForeignKey(foreign_key) = &create.constraints[0] else {
             panic!("constraint should be FOREIGN KEY");
         };
 
         assert_eq!(
             foreign_key.match_kind,
-            Some(sqlparser::ast::ConstraintReferenceMatchKind::Full)
+            Some(ast::ConstraintReferenceMatchKind::Full)
         );
         assert_eq!(
             foreign_key.name.as_ref().map(|name| name.value.as_str()),

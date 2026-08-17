@@ -1,6 +1,6 @@
 use bigdecimal::{BigDecimal, FromPrimitive, RoundingMode, ToPrimitive};
 use chrono::Timelike;
-use sqlparser::ast::{CharacterLength, DataType, ExactNumberInfo, TimezoneInfo};
+use sqlparser::ast;
 
 use crate::{
     error::{PgError, Result, SqlState},
@@ -14,45 +14,54 @@ pub(crate) enum CastContext {
     Explicit,
 }
 
-pub(crate) fn convert_ast_data_type(data_type: &DataType) -> Result<PgType> {
+pub(crate) fn convert_ast_data_type(data_type: &ast::DataType) -> Result<PgType> {
     let (base, typmod) = match data_type {
-        DataType::Bool | DataType::Boolean => (BaseType::Bool, PgType::NO_TYPEMOD),
-        DataType::Int2(None) | DataType::SmallInt(None) => (BaseType::Int2, PgType::NO_TYPEMOD),
-        DataType::Int(None) | DataType::Int4(None) | DataType::Integer(None) => {
+        ast::DataType::Bool | ast::DataType::Boolean => (BaseType::Bool, PgType::NO_TYPEMOD),
+        ast::DataType::Int2(None) | ast::DataType::SmallInt(None) => {
+            (BaseType::Int2, PgType::NO_TYPEMOD)
+        }
+        ast::DataType::Int(None) | ast::DataType::Int4(None) | ast::DataType::Integer(None) => {
             (BaseType::Int4, PgType::NO_TYPEMOD)
         }
-        DataType::Int8(None) | DataType::BigInt(None) => (BaseType::Int8, PgType::NO_TYPEMOD),
-        DataType::Real | DataType::Float4 => (BaseType::Float4, PgType::NO_TYPEMOD),
-        DataType::Double(_)
-        | DataType::DoublePrecision
-        | DataType::Float8
-        | DataType::Float(ExactNumberInfo::None) => (BaseType::Float8, PgType::NO_TYPEMOD),
-        DataType::Numeric(info) | DataType::Decimal(info) => {
+        ast::DataType::Int8(None) | ast::DataType::BigInt(None) => {
+            (BaseType::Int8, PgType::NO_TYPEMOD)
+        }
+        ast::DataType::Real | ast::DataType::Float4 => (BaseType::Float4, PgType::NO_TYPEMOD),
+        ast::DataType::Double(_)
+        | ast::DataType::DoublePrecision
+        | ast::DataType::Float8
+        | ast::DataType::Float(ast::ExactNumberInfo::None) => {
+            (BaseType::Float8, PgType::NO_TYPEMOD)
+        }
+        ast::DataType::Numeric(info) | ast::DataType::Decimal(info) => {
             (BaseType::Numeric, encode_numeric_typmod(*info)?)
         }
-        DataType::Text => (BaseType::Text, PgType::NO_TYPEMOD),
-        DataType::Varchar(length)
-        | DataType::CharacterVarying(length)
-        | DataType::CharVarying(length) => {
+        ast::DataType::Text => (BaseType::Text, PgType::NO_TYPEMOD),
+        ast::DataType::Varchar(length)
+        | ast::DataType::CharacterVarying(length)
+        | ast::DataType::CharVarying(length) => {
             (BaseType::Varchar, encode_character_typmod(*length, false)?)
         }
-        DataType::Char(length) | DataType::Character(length) => {
+        ast::DataType::Char(length) | ast::DataType::Character(length) => {
             (BaseType::Bpchar, encode_character_typmod(*length, true)?)
         }
-        DataType::Bytea => (BaseType::Bytea, PgType::NO_TYPEMOD),
-        DataType::Uuid => (BaseType::Uuid, PgType::NO_TYPEMOD),
-        DataType::Date => (BaseType::Date, PgType::NO_TYPEMOD),
-        DataType::Time(precision, TimezoneInfo::None | TimezoneInfo::WithoutTimeZone) => {
-            (BaseType::Time, encode_time_typmod(*precision)?)
-        }
-        DataType::Timestamp(precision, TimezoneInfo::None | TimezoneInfo::WithoutTimeZone) => {
-            (BaseType::Timestamp, encode_time_typmod(*precision)?)
-        }
-        DataType::Timestamp(precision, TimezoneInfo::WithTimeZone | TimezoneInfo::Tz) => {
-            (BaseType::TimestampTz, encode_time_typmod(*precision)?)
-        }
-        DataType::Interval { .. } => (BaseType::Interval, PgType::NO_TYPEMOD),
-        DataType::Custom(_, _) => {
+        ast::DataType::Bytea => (BaseType::Bytea, PgType::NO_TYPEMOD),
+        ast::DataType::Uuid => (BaseType::Uuid, PgType::NO_TYPEMOD),
+        ast::DataType::Date => (BaseType::Date, PgType::NO_TYPEMOD),
+        ast::DataType::Time(
+            precision,
+            ast::TimezoneInfo::None | ast::TimezoneInfo::WithoutTimeZone,
+        ) => (BaseType::Time, encode_time_typmod(*precision)?),
+        ast::DataType::Timestamp(
+            precision,
+            ast::TimezoneInfo::None | ast::TimezoneInfo::WithoutTimeZone,
+        ) => (BaseType::Timestamp, encode_time_typmod(*precision)?),
+        ast::DataType::Timestamp(
+            precision,
+            ast::TimezoneInfo::WithTimeZone | ast::TimezoneInfo::Tz,
+        ) => (BaseType::TimestampTz, encode_time_typmod(*precision)?),
+        ast::DataType::Interval { .. } => (BaseType::Interval, PgType::NO_TYPEMOD),
+        ast::DataType::Custom(_, _) => {
             let Some(base) = BaseType::parse_sql_name(&data_type.to_string()) else {
                 return Err(PgError::create(
                     SqlState::UndefinedObject,
@@ -71,9 +80,9 @@ pub(crate) fn convert_ast_data_type(data_type: &DataType) -> Result<PgType> {
     Ok(PgType::create_with_typmod(base, typmod))
 }
 
-fn encode_character_typmod(length: Option<CharacterLength>, default_one: bool) -> Result<i32> {
+fn encode_character_typmod(length: Option<ast::CharacterLength>, default_one: bool) -> Result<i32> {
     let length = match length {
-        Some(CharacterLength::IntegerLength { length, unit: None }) => Some(length),
+        Some(ast::CharacterLength::IntegerLength { length, unit: None }) => Some(length),
         None if default_one => Some(1),
         None => None,
         _ => {
@@ -96,11 +105,11 @@ fn encode_character_typmod(length: Option<CharacterLength>, default_one: bool) -
         .map(|typmod| typmod.unwrap_or(PgType::NO_TYPEMOD))
 }
 
-fn encode_numeric_typmod(info: ExactNumberInfo) -> Result<i32> {
+fn encode_numeric_typmod(info: ast::ExactNumberInfo) -> Result<i32> {
     let (precision, scale) = match info {
-        ExactNumberInfo::None => return Ok(PgType::NO_TYPEMOD),
-        ExactNumberInfo::Precision(precision) => (precision, 0),
-        ExactNumberInfo::PrecisionAndScale(precision, scale) => (precision, scale),
+        ast::ExactNumberInfo::None => return Ok(PgType::NO_TYPEMOD),
+        ast::ExactNumberInfo::Precision(precision) => (precision, 0),
+        ast::ExactNumberInfo::PrecisionAndScale(precision, scale) => (precision, scale),
     };
     if precision == 0 || precision > 1000 || scale < 0 || scale as u64 > precision {
         return Err(PgError::create(

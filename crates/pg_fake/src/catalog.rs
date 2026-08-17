@@ -1,6 +1,6 @@
 use std::collections::BTreeMap;
 
-use sqlparser::ast::{ConstraintReferenceMatchKind, Expr};
+use sqlparser::ast;
 
 use crate::{
     error::{PgError, Result, SqlState, reject_unsupported},
@@ -17,14 +17,14 @@ pub(crate) struct ColumnDef {
     pub(crate) name: String,
     pub(crate) data_type: PgType,
     pub(crate) nullable: bool,
-    pub(crate) default: Option<Expr>,
+    pub(crate) default: Option<ast::Expr>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum Constraint {
     PrimaryKey(Vec<String>),
     Unique(Vec<String>),
-    Check(Box<Expr>),
+    Check(Box<ast::Expr>),
     ForeignKey(ForeignKey),
 }
 
@@ -47,7 +47,7 @@ pub(crate) struct ForeignKey {
     pub(crate) on_update: ForeignKeyAction,
     pub(crate) deferrable: bool,
     pub(crate) initially_deferred: bool,
-    pub(crate) match_kind: Option<ConstraintReferenceMatchKind>,
+    pub(crate) match_kind: Option<ast::ConstraintReferenceMatchKind>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]

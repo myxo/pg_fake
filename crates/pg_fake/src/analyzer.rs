@@ -2,12 +2,8 @@
 
 use std::ops::ControlFlow;
 
-use sqlparser::ast::{
-    AssignmentTarget, BinaryOperator, CastKind, CharacterLength, DataType, Expr, FromTable,
-    FunctionArg, FunctionArgExpr, FunctionArguments, Ident, LimitClause, OrderByKind, SelectItem,
-    SetExpr, Statement, TableFactor, Value as AstValue, VisitMut, VisitorMut, visit_expressions,
-    visit_expressions_mut,
-};
+use ast::VisitMut as _;
+use sqlparser::ast;
 
 use crate::{
     catalog::{Catalog, TableSchema},
@@ -18,12 +14,12 @@ use crate::{
 };
 
 pub(crate) fn infer_parameter_types(
-    statement: &Statement,
+    statement: &ast::Statement,
     catalog: &Catalog,
 ) -> Result<Vec<BaseType>> {
     let mut types = vec![None; count_parameters(statement)?];
     match statement {
-        Statement::Insert(insert) => {
+        ast::Statement::Insert(insert) => {
             let schema =
                 catalog.require_table(&executor::resolve_insert_table_name(&insert.table)?)?;
             let columns = if insert.columns.is_empty() {
@@ -48,7 +44,7 @@ pub(crate) fn infer_parameter_types(
                     .collect::<Result<Vec<_>>>()?
             };
             if let Some(source) = &insert.source
-                && let SetExpr::Values(values) = source.body.as_ref()
+                && let ast::SetExpr::Values(values) = source.body.as_ref()
             {
                 for row in &values.rows {
                     if row.len() != columns.len() {
@@ -70,10 +66,10 @@ pub(crate) fn infer_parameter_types(
                 }
             }
         }
-        Statement::Update(update) => {
+        ast::Statement::Update(update) => {
             let schema = resolve_table_schema(&update.table.relation, catalog)?;
             for assignment in &update.assignments {
-                let AssignmentTarget::ColumnName(name) = &assignment.target else {
+                let ast::AssignmentTarget::ColumnName(name) = &assignment.target else {
                     continue;
                 };
                 let name = executor::normalize_unqualified_object_name(name)?;
@@ -103,8 +99,8 @@ pub(crate) fn infer_parameter_types(
                 )?;
             }
         }
-        Statement::Delete(delete) => {
-            let FromTable::WithFromKeyword(from) = &delete.from else {
+        ast::Statement::Delete(delete) => {
+            let ast::FromTable::WithFromKeyword(from) = &delete.from else {
                 return Ok(finalize_parameter_types(types));
             };
             if let Some(first) = from.first() {
@@ -119,8 +115,8 @@ pub(crate) fn infer_parameter_types(
                 }
             }
         }
-        Statement::Query(query) => {
-            let SetExpr::Select(select) = query.body.as_ref() else {
+        ast::Statement::Query(query) => {
+            let ast::SetExpr::Select(select) = query.body.as_ref() else {
                 return Ok(finalize_parameter_types(types));
             };
             let bound = executor::bind_query_scope(catalog, select)?;
@@ -130,8 +126,8 @@ pub(crate) fn infer_parameter_types(
             }
             for item in &select.projection {
                 match item {
-                    SelectItem::UnnamedExpr(expression)
-                    | SelectItem::ExprWithAlias {
+                    ast::SelectItem::UnnamedExpr(expression)
+                    | ast::SelectItem::ExprWithAlias {
                         expr: expression, ..
                     } => {
                         infer_expression_parameters(expression, schema, None, &mut types)?;
@@ -140,7 +136,7 @@ pub(crate) fn infer_parameter_types(
                 }
             }
             if let Some(order_by) = &query.order_by
-                && let OrderByKind::Expressions(orders) = &order_by.kind
+                && let ast::OrderByKind::Expressions(orders) = &order_by.kind
             {
                 for order in orders {
                     if !is_projection_alias(&order.expr, &select.projection) {
@@ -148,7 +144,7 @@ pub(crate) fn infer_parameter_types(
                     }
                 }
             }
-            if let Some(LimitClause::LimitOffset { limit, offset, .. }) = &query.limit_clause {
+            if let Some(ast::LimitClause::LimitOffset { limit, offset, .. }) = &query.limit_clause {
                 if let Some(limit) = limit {
                     infer_expression_parameters(limit, schema, Some(BaseType::Int8), &mut types)?;
                 }
@@ -171,12 +167,12 @@ pub(crate) fn infer_parameter_types(
 }
 
 pub(crate) fn substitute_typed_subqueries(
-    statement: &Statement,
+    statement: &ast::Statement,
     catalog: &Catalog,
-) -> Result<Statement> {
+) -> Result<ast::Statement> {
     let mut statement = statement.clone();
-    if let Statement::Query(query) = &statement
-        && let SetExpr::Select(select) = query.body.as_ref()
+    if let ast::Statement::Query(query) = &statement
+        && let ast::SetExpr::Select(select) = query.body.as_ref()
     {
         let outer = executor::bind_query_scope(catalog, select)?;
         let mut describer = TypedSubquerySubstituter {
@@ -188,13 +184,13 @@ pub(crate) fn substitute_typed_subqueries(
         return describer.error.map_or(Ok(statement), Err);
     }
     let mut error = None;
-    let _ = visit_expressions_mut(&mut statement, |expression| {
+    let _ = ast::visit_expressions_mut(&mut statement, |expression| {
         if error.is_some() {
             return ControlFlow::Break(());
         }
         let result = match expression {
-            Expr::Subquery(query) => {
-                executor::infer_query_output_columns(catalog, query).and_then(|columns| {
+            ast::Expr::Subquery(query) => executor::infer_query_output_columns(catalog, query)
+                .and_then(|columns| {
                     if columns.len() != 1 {
                         return Err(PgError::create(
                             SqlState::SyntaxError,
@@ -202,19 +198,18 @@ pub(crate) fn substitute_typed_subqueries(
                         ));
                     }
                     Ok(create_typed_literal(Value::Null, columns[0].1))
-                })
-            }
-            Expr::Exists { .. } => Ok(create_typed_literal(
+                }),
+            ast::Expr::Exists { .. } => Ok(create_typed_literal(
                 Value::Bool(false),
                 PgType::create(BaseType::Bool),
             )),
-            Expr::InSubquery {
+            ast::Expr::InSubquery {
                 expr,
                 subquery,
                 negated,
             } => executor::infer_query_output_columns(catalog, subquery).and_then(|columns| {
                 let left_width = match expr.as_ref() {
-                    Expr::Tuple(fields) => fields.len(),
+                    ast::Expr::Tuple(fields) => fields.len(),
                     _ => 1,
                 };
                 if columns.len() != left_width {
@@ -227,12 +222,12 @@ pub(crate) fn substitute_typed_subqueries(
                     .into_iter()
                     .map(|(_, data_type)| create_typed_literal(Value::Null, data_type))
                     .collect::<Vec<_>>();
-                Ok(Expr::InList {
+                Ok(ast::Expr::InList {
                     expr: expr.clone(),
                     list: vec![if fields.len() == 1 {
                         fields.into_iter().next().expect("subquery has one column")
                     } else {
-                        Expr::Tuple(fields)
+                        ast::Expr::Tuple(fields)
                     }],
                     negated: *negated,
                 })
@@ -254,20 +249,20 @@ struct TypedSubquerySubstituter<'a> {
     error: Option<PgError>,
 }
 
-impl VisitorMut for TypedSubquerySubstituter<'_> {
+impl ast::VisitorMut for TypedSubquerySubstituter<'_> {
     type Break = ();
 
-    fn pre_visit_expr(&mut self, expression: &mut Expr) -> ControlFlow<Self::Break> {
+    fn pre_visit_expr(&mut self, expression: &mut ast::Expr) -> ControlFlow<Self::Break> {
         if self.error.is_some() {
             return ControlFlow::Break(());
         }
         if !matches!(
             expression,
-            Expr::Subquery(_)
-                | Expr::Exists { .. }
-                | Expr::InSubquery { .. }
-                | Expr::AnyOp { .. }
-                | Expr::AllOp { .. }
+            ast::Expr::Subquery(_)
+                | ast::Expr::Exists { .. }
+                | ast::Expr::InSubquery { .. }
+                | ast::Expr::AnyOp { .. }
+                | ast::Expr::AllOp { .. }
         ) {
             return ControlFlow::Continue(());
         }
@@ -283,10 +278,10 @@ impl VisitorMut for TypedSubquerySubstituter<'_> {
 }
 
 pub(crate) fn bind_parameters(
-    statement: &Statement,
+    statement: &ast::Statement,
     infer_parameter_types: &[BaseType],
     values: &[Value],
-) -> Result<Statement> {
+) -> Result<ast::Statement> {
     if values.len() != infer_parameter_types.len() {
         return Err(PgError::create(
             SqlState::ProtocolViolation,
@@ -299,11 +294,11 @@ pub(crate) fn bind_parameters(
     }
     let mut statement = statement.clone();
     let mut error = None;
-    let _ = visit_expressions_mut(&mut statement, |expression| {
-        let Expr::Value(value) = expression else {
+    let _ = ast::visit_expressions_mut(&mut statement, |expression| {
+        let ast::Expr::Value(value) = expression else {
             return ControlFlow::Continue(());
         };
-        let AstValue::Placeholder(placeholder) = &value.value else {
+        let ast::Value::Placeholder(placeholder) = &value.value else {
             return ControlFlow::Continue(());
         };
         let index = match parse_placeholder_index(placeholder) {
@@ -326,14 +321,14 @@ pub(crate) fn bind_parameters(
     error.map_or(Ok(statement), Err)
 }
 
-fn count_parameters(statement: &Statement) -> Result<usize> {
+fn count_parameters(statement: &ast::Statement) -> Result<usize> {
     let mut maximum = 0;
     let mut error = None;
-    let _ = visit_expressions(statement, |expression| {
-        let Expr::Value(value) = expression else {
+    let _ = ast::visit_expressions(statement, |expression| {
+        let ast::Expr::Value(value) = expression else {
             return ControlFlow::Continue(());
         };
-        let AstValue::Placeholder(placeholder) = &value.value else {
+        let ast::Value::Placeholder(placeholder) = &value.value else {
             return ControlFlow::Continue(());
         };
         match parse_placeholder_index(placeholder) {
@@ -362,8 +357,11 @@ fn parse_placeholder_index(placeholder: &str) -> Result<usize> {
     Ok(index - 1)
 }
 
-fn resolve_table_schema<'a>(factor: &TableFactor, catalog: &'a Catalog) -> Result<&'a TableSchema> {
-    let TableFactor::Table {
+fn resolve_table_schema<'a>(
+    factor: &ast::TableFactor,
+    catalog: &'a Catalog,
+) -> Result<&'a TableSchema> {
+    let ast::TableFactor::Table {
         name, args: None, ..
     } = factor
     else {
@@ -373,34 +371,36 @@ fn resolve_table_schema<'a>(factor: &TableFactor, catalog: &'a Catalog) -> Resul
 }
 
 fn infer_expression_parameters(
-    expression: &Expr,
+    expression: &ast::Expr,
     schema: executor::RowScope<'_>,
     expected: Option<BaseType>,
     types: &mut [Option<BaseType>],
 ) -> Result<()> {
     constrain_parameter_type(expression, expected, types)?;
     let mut error = None;
-    let _ = visit_expressions(expression, |expression| {
+    let _ = ast::visit_expressions(expression, |expression| {
         let result = match expression {
-            Expr::Identifier(identifier)
+            ast::Expr::Identifier(identifier)
                 if identifier.quote_style.is_none()
                     && identifier.value.eq_ignore_ascii_case("default") =>
             {
                 Ok(())
             }
-            Expr::Identifier(_) => executor::infer_expression_type(expression, schema).map(|_| ()),
-            Expr::Nested(inner) => constrain_parameter_type(inner, expected, types),
-            Expr::Cast {
+            ast::Expr::Identifier(_) => {
+                executor::infer_expression_type(expression, schema).map(|_| ())
+            }
+            ast::Expr::Nested(inner) => constrain_parameter_type(inner, expected, types),
+            ast::Expr::Cast {
                 expr, data_type, ..
             } => coercion::convert_ast_data_type(data_type)
                 .and_then(|target| constrain_parameter_type(expr, Some(target.base), types)),
-            Expr::UnaryOp { op, expr } => constrain_parameter_type(
+            ast::Expr::UnaryOp { op, expr } => constrain_parameter_type(
                 expr,
-                matches!(op, sqlparser::ast::UnaryOperator::Not).then_some(BaseType::Bool),
+                matches!(op, ast::UnaryOperator::Not).then_some(BaseType::Bool),
                 types,
             ),
-            Expr::BinaryOp { left, op, right } => {
-                let boolean = matches!(op, BinaryOperator::And | BinaryOperator::Or);
+            ast::Expr::BinaryOp { left, op, right } => {
+                let boolean = matches!(op, ast::BinaryOperator::And | ast::BinaryOperator::Or);
                 let left_expected = if boolean {
                     Some(BaseType::Bool)
                 } else {
@@ -414,14 +414,14 @@ fn infer_expression_parameters(
                 constrain_parameter_type(left, left_expected, types)
                     .and_then(|()| constrain_parameter_type(right, right_expected, types))
             }
-            Expr::InList { expr, list, .. } => (|| {
+            ast::Expr::InList { expr, list, .. } => (|| {
                 let left = match expr.as_ref() {
-                    Expr::Tuple(fields) => fields.as_slice(),
+                    ast::Expr::Tuple(fields) => fields.as_slice(),
                     expr => std::slice::from_ref(expr),
                 };
                 for candidate in list {
                     let right = match candidate {
-                        Expr::Tuple(fields) => fields.as_slice(),
+                        ast::Expr::Tuple(fields) => fields.as_slice(),
                         candidate => std::slice::from_ref(candidate),
                     };
                     if left.len() != right.len() {
@@ -445,7 +445,7 @@ fn infer_expression_parameters(
                 }
                 Ok(())
             })(),
-            Expr::AnyOp { left, right, .. } | Expr::AllOp { left, right, .. } => {
+            ast::Expr::AnyOp { left, right, .. } | ast::Expr::AllOp { left, right, .. } => {
                 constrain_parameter_type(
                     left,
                     executor::infer_expression_type(right, schema).ok(),
@@ -459,15 +459,15 @@ fn infer_expression_parameters(
                     )
                 })
             }
-            Expr::IsTrue(inner)
-            | Expr::IsFalse(inner)
-            | Expr::IsUnknown(inner)
-            | Expr::IsNotTrue(inner)
-            | Expr::IsNotFalse(inner)
-            | Expr::IsNotUnknown(inner) => {
+            ast::Expr::IsTrue(inner)
+            | ast::Expr::IsFalse(inner)
+            | ast::Expr::IsUnknown(inner)
+            | ast::Expr::IsNotTrue(inner)
+            | ast::Expr::IsNotFalse(inner)
+            | ast::Expr::IsNotUnknown(inner) => {
                 constrain_parameter_type(inner, Some(BaseType::Bool), types)
             }
-            Expr::Function(function) => infer_function_parameters(function, schema, types),
+            ast::Expr::Function(function) => infer_function_parameters(function, schema, types),
             _ => Ok(()),
         };
         if let Err(infer_error) = result {
@@ -481,18 +481,18 @@ fn infer_expression_parameters(
 }
 
 fn infer_function_parameters(
-    function: &sqlparser::ast::Function,
+    function: &ast::Function,
     schema: executor::RowScope<'_>,
     types: &mut [Option<BaseType>],
 ) -> Result<()> {
-    let FunctionArguments::List(list) = &function.args else {
+    let ast::FunctionArguments::List(list) = &function.args else {
         return Ok(());
     };
     let arguments = list
         .args
         .iter()
         .filter_map(|argument| match argument {
-            FunctionArg::Unnamed(FunctionArgExpr::Expr(expression)) => Some(expression),
+            ast::FunctionArg::Unnamed(ast::FunctionArgExpr::Expr(expression)) => Some(expression),
             _ => None,
         })
         .collect::<Vec<_>>();
@@ -510,7 +510,7 @@ fn infer_function_parameters(
 }
 
 fn constrain_parameter_type(
-    expression: &Expr,
+    expression: &ast::Expr,
     expected: Option<BaseType>,
     types: &mut [Option<BaseType>],
 ) -> Result<()> {
@@ -518,13 +518,13 @@ fn constrain_parameter_type(
         return Ok(());
     };
     let expression = match expression {
-        Expr::Nested(inner) => inner.as_ref(),
+        ast::Expr::Nested(inner) => inner.as_ref(),
         expression => expression,
     };
-    let Expr::Value(value) = expression else {
+    let ast::Expr::Value(value) = expression else {
         return Ok(());
     };
-    let AstValue::Placeholder(placeholder) = &value.value else {
+    let ast::Value::Placeholder(placeholder) = &value.value else {
         return Ok(());
     };
     let index = parse_placeholder_index(placeholder)?;
@@ -552,9 +552,9 @@ fn finalize_parameter_types(types: Vec<Option<BaseType>>) -> Vec<BaseType> {
         .collect()
 }
 
-fn validate_statement(statement: &Statement, catalog: &Catalog) -> Result<()> {
+fn validate_statement(statement: &ast::Statement, catalog: &Catalog) -> Result<()> {
     match statement {
-        Statement::Insert(insert) => {
+        ast::Statement::Insert(insert) => {
             let schema =
                 catalog.require_table(&executor::resolve_insert_table_name(&insert.table)?)?;
             let columns = if insert.columns.is_empty() {
@@ -579,7 +579,7 @@ fn validate_statement(statement: &Statement, catalog: &Catalog) -> Result<()> {
                     .collect::<Result<Vec<_>>>()?
             };
             if let Some(source) = &insert.source
-                && let SetExpr::Values(values) = source.body.as_ref()
+                && let ast::SetExpr::Values(values) = source.body.as_ref()
             {
                 for row in &values.rows {
                     for (expression, column) in row.iter().zip(&columns) {
@@ -594,7 +594,7 @@ fn validate_statement(statement: &Statement, catalog: &Catalog) -> Result<()> {
                 }
             }
         }
-        Statement::Update(update) => {
+        ast::Statement::Update(update) => {
             let schema = resolve_table_schema(&update.table.relation, catalog)?;
             if let Some(selection) = &update.selection {
                 validate_boolean(
@@ -604,7 +604,7 @@ fn validate_statement(statement: &Statement, catalog: &Catalog) -> Result<()> {
                 )?;
             }
             for assignment in &update.assignments {
-                let AssignmentTarget::ColumnName(name) = &assignment.target else {
+                let ast::AssignmentTarget::ColumnName(name) = &assignment.target else {
                     continue;
                 };
                 let name = executor::normalize_unqualified_object_name(name)?;
@@ -625,8 +625,8 @@ fn validate_statement(statement: &Statement, catalog: &Catalog) -> Result<()> {
                 )?;
             }
         }
-        Statement::Delete(delete) => {
-            let FromTable::WithFromKeyword(from) = &delete.from else {
+        ast::Statement::Delete(delete) => {
+            let ast::FromTable::WithFromKeyword(from) = &delete.from else {
                 return Ok(());
             };
             if let Some(first) = from.first()
@@ -639,8 +639,8 @@ fn validate_statement(statement: &Statement, catalog: &Catalog) -> Result<()> {
                 )?;
             }
         }
-        Statement::Query(query) => {
-            let SetExpr::Select(select) = query.body.as_ref() else {
+        ast::Statement::Query(query) => {
+            let ast::SetExpr::Select(select) = query.body.as_ref() else {
                 return Ok(());
             };
             let bound = executor::bind_query_scope(catalog, select)?;
@@ -650,8 +650,8 @@ fn validate_statement(statement: &Statement, catalog: &Catalog) -> Result<()> {
             }
             for item in &select.projection {
                 match item {
-                    SelectItem::UnnamedExpr(expression)
-                    | SelectItem::ExprWithAlias {
+                    ast::SelectItem::UnnamedExpr(expression)
+                    | ast::SelectItem::ExprWithAlias {
                         expr: expression, ..
                     } => {
                         executor::infer_expression_type(expression, schema)?;
@@ -660,7 +660,7 @@ fn validate_statement(statement: &Statement, catalog: &Catalog) -> Result<()> {
                 }
             }
             if let Some(order_by) = &query.order_by
-                && let OrderByKind::Expressions(orders) = &order_by.kind
+                && let ast::OrderByKind::Expressions(orders) = &order_by.kind
             {
                 for order in orders {
                     if !is_projection_alias(&order.expr, &select.projection) {
@@ -668,9 +668,9 @@ fn validate_statement(statement: &Statement, catalog: &Catalog) -> Result<()> {
                     }
                 }
             }
-            if let Some(LimitClause::LimitOffset { limit, offset, .. }) = &query.limit_clause {
+            if let Some(ast::LimitClause::LimitOffset { limit, offset, .. }) = &query.limit_clause {
                 if let Some(limit) = limit
-                    && !matches!(limit, Expr::Identifier(name) if name.value.eq_ignore_ascii_case("all"))
+                    && !matches!(limit, ast::Expr::Identifier(name) if name.value.eq_ignore_ascii_case("all"))
                 {
                     validate_implicit_type(limit, BaseType::Int8, schema)?;
                 }
@@ -684,18 +684,18 @@ fn validate_statement(statement: &Statement, catalog: &Catalog) -> Result<()> {
     Ok(())
 }
 
-fn is_projection_alias(expression: &Expr, projection: &[SelectItem]) -> bool {
-    let Expr::Identifier(identifier) = expression else {
+fn is_projection_alias(expression: &ast::Expr, projection: &[ast::SelectItem]) -> bool {
+    let ast::Expr::Identifier(identifier) = expression else {
         return false;
     };
     projection.iter().any(|item| {
-        matches!(item, SelectItem::ExprWithAlias { alias, .. }
+        matches!(item, ast::SelectItem::ExprWithAlias { alias, .. }
             if executor::normalize_identifier(alias) == executor::normalize_identifier(identifier))
     })
 }
 
 fn validate_boolean(
-    expression: &Expr,
+    expression: &ast::Expr,
     schema: executor::RowScope<'_>,
     message: &str,
 ) -> Result<()> {
@@ -708,12 +708,12 @@ fn validate_boolean(
 }
 
 fn validate_assignment(
-    expression: &Expr,
+    expression: &ast::Expr,
     target: PgType,
     schema: executor::RowScope<'_>,
 ) -> Result<()> {
-    if matches!(expression, Expr::Identifier(name) if name.value.eq_ignore_ascii_case("default"))
-        || matches!(expression, Expr::Value(value) if matches!(&value.value, AstValue::SingleQuotedString(_)))
+    if matches!(expression, ast::Expr::Identifier(name) if name.value.eq_ignore_ascii_case("default"))
+        || matches!(expression, ast::Expr::Value(value) if matches!(&value.value, ast::Value::SingleQuotedString(_)))
         || executor::is_null_literal(expression)
     {
         return Ok(());
@@ -730,12 +730,12 @@ fn validate_assignment(
 }
 
 fn validate_implicit_type(
-    expression: &Expr,
+    expression: &ast::Expr,
     target: BaseType,
     schema: executor::RowScope<'_>,
 ) -> Result<()> {
     if executor::is_null_literal(expression)
-        || matches!(expression, Expr::Value(value) if matches!(&value.value, AstValue::SingleQuotedString(_)))
+        || matches!(expression, ast::Expr::Value(value) if matches!(&value.value, ast::Value::SingleQuotedString(_)))
     {
         return Ok(());
     }
@@ -757,79 +757,75 @@ fn coerce_parameter(value: Value, target: BaseType) -> Result<Value> {
     coercion::coerce(value, source, PgType::create(target), CastContext::Implicit)
 }
 
-pub(crate) fn create_typed_literal(value: Value, data_type: PgType) -> Expr {
+pub(crate) fn create_typed_literal(value: Value, data_type: PgType) -> ast::Expr {
     let literal = match value {
-        Value::Null => AstValue::Null,
-        Value::Bool(value) => AstValue::Boolean(value),
-        Value::Int2(value) => AstValue::Number(value.to_string(), false),
-        Value::Int4(value) => AstValue::Number(value.to_string(), false),
-        Value::Int8(value) => AstValue::Number(value.to_string(), false),
+        Value::Null => ast::Value::Null,
+        Value::Bool(value) => ast::Value::Boolean(value),
+        Value::Int2(value) => ast::Value::Number(value.to_string(), false),
+        Value::Int4(value) => ast::Value::Number(value.to_string(), false),
+        Value::Int8(value) => ast::Value::Number(value.to_string(), false),
         Value::Float4(value) => {
-            AstValue::SingleQuotedString(Value::Float4(value).format_postgres_text())
+            ast::Value::SingleQuotedString(Value::Float4(value).format_postgres_text())
         }
         Value::Float8(value) => {
-            AstValue::SingleQuotedString(Value::Float8(value).format_postgres_text())
+            ast::Value::SingleQuotedString(Value::Float8(value).format_postgres_text())
         }
-        Value::Numeric(value) => AstValue::Number(value.to_plain_string(), false),
-        Value::Text(value) => AstValue::SingleQuotedString(value),
+        Value::Numeric(value) => ast::Value::Number(value.to_plain_string(), false),
+        Value::Text(value) => ast::Value::SingleQuotedString(value),
         Value::Bytea(value) => {
-            AstValue::SingleQuotedString(Value::Bytea(value).format_postgres_text())
+            ast::Value::SingleQuotedString(Value::Bytea(value).format_postgres_text())
         }
-        Value::Uuid(value) => AstValue::SingleQuotedString(value.to_string()),
+        Value::Uuid(value) => ast::Value::SingleQuotedString(value.to_string()),
         Value::Date(value) => {
-            AstValue::SingleQuotedString(Value::Date(value).format_postgres_text())
+            ast::Value::SingleQuotedString(Value::Date(value).format_postgres_text())
         }
         Value::Time(value) => {
-            AstValue::SingleQuotedString(Value::Time(value).format_postgres_text())
+            ast::Value::SingleQuotedString(Value::Time(value).format_postgres_text())
         }
         Value::Timestamp(value) => {
-            AstValue::SingleQuotedString(Value::Timestamp(value).format_postgres_text())
+            ast::Value::SingleQuotedString(Value::Timestamp(value).format_postgres_text())
         }
         Value::TimestampTz(value) => {
-            AstValue::SingleQuotedString(Value::TimestampTz(value).format_postgres_text())
+            ast::Value::SingleQuotedString(Value::TimestampTz(value).format_postgres_text())
         }
         Value::Interval(value) => {
-            AstValue::SingleQuotedString(Value::Interval(value).format_postgres_text())
+            ast::Value::SingleQuotedString(Value::Interval(value).format_postgres_text())
         }
     };
-    Expr::Cast {
-        kind: CastKind::Cast,
-        expr: Box::new(Expr::Value(literal.into())),
+    ast::Expr::Cast {
+        kind: ast::CastKind::Cast,
+        expr: Box::new(ast::Expr::Value(literal.into())),
         data_type: convert_to_ast_data_type(data_type),
         array: false,
         format: None,
     }
 }
 
-fn convert_to_ast_data_type(data_type: PgType) -> DataType {
+fn convert_to_ast_data_type(data_type: PgType) -> ast::DataType {
     match data_type.base {
-        BaseType::Bool => DataType::Boolean,
-        BaseType::Int2 => DataType::SmallInt(None),
-        BaseType::Int4 => DataType::Integer(None),
-        BaseType::Int8 => DataType::BigInt(None),
-        BaseType::Float4 => DataType::Real,
-        BaseType::Float8 => DataType::DoublePrecision,
-        BaseType::Numeric => DataType::Numeric(sqlparser::ast::ExactNumberInfo::None),
-        BaseType::Text => DataType::Text,
-        BaseType::Varchar => DataType::Varchar(None),
+        BaseType::Bool => ast::DataType::Boolean,
+        BaseType::Int2 => ast::DataType::SmallInt(None),
+        BaseType::Int4 => ast::DataType::Integer(None),
+        BaseType::Int8 => ast::DataType::BigInt(None),
+        BaseType::Float4 => ast::DataType::Real,
+        BaseType::Float8 => ast::DataType::DoublePrecision,
+        BaseType::Numeric => ast::DataType::Numeric(ast::ExactNumberInfo::None),
+        BaseType::Text => ast::DataType::Text,
+        BaseType::Varchar => ast::DataType::Varchar(None),
         BaseType::Bpchar if data_type.typmod == PgType::NO_TYPEMOD => {
-            DataType::Custom(Ident::new("bpchar").into(), Vec::new())
+            ast::DataType::Custom(ast::Ident::new("bpchar").into(), Vec::new())
         }
-        BaseType::Bpchar => DataType::Char(Some(CharacterLength::IntegerLength {
+        BaseType::Bpchar => ast::DataType::Char(Some(ast::CharacterLength::IntegerLength {
             length: u64::try_from(data_type.typmod - 4).expect("valid character typmod"),
             unit: None,
         })),
-        BaseType::Bytea => DataType::Bytea,
-        BaseType::Uuid => DataType::Uuid,
-        BaseType::Date => DataType::Date,
-        BaseType::Time => DataType::Time(None, sqlparser::ast::TimezoneInfo::WithoutTimeZone),
-        BaseType::Timestamp => {
-            DataType::Timestamp(None, sqlparser::ast::TimezoneInfo::WithoutTimeZone)
-        }
-        BaseType::TimestampTz => {
-            DataType::Timestamp(None, sqlparser::ast::TimezoneInfo::WithTimeZone)
-        }
-        BaseType::Interval => DataType::Interval {
+        BaseType::Bytea => ast::DataType::Bytea,
+        BaseType::Uuid => ast::DataType::Uuid,
+        BaseType::Date => ast::DataType::Date,
+        BaseType::Time => ast::DataType::Time(None, ast::TimezoneInfo::WithoutTimeZone),
+        BaseType::Timestamp => ast::DataType::Timestamp(None, ast::TimezoneInfo::WithoutTimeZone),
+        BaseType::TimestampTz => ast::DataType::Timestamp(None, ast::TimezoneInfo::WithTimeZone),
+        BaseType::Interval => ast::DataType::Interval {
             fields: None,
             precision: None,
         },

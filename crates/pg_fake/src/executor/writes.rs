@@ -1,8 +1,9 @@
 use super::*;
+use sqlparser::ast;
 
 pub(super) fn execute_insert(
     state: &mut DatabaseState,
-    insert: &sqlparser::ast::Insert,
+    insert: &ast::Insert,
     xid: Xid,
     snapshot: &Snapshot,
     deferred_constraints: &BTreeSet<String>,
@@ -36,7 +37,7 @@ pub(super) fn execute_insert(
             .collect::<Result<Vec<_>>>()?
     };
     let provided = column_indexes.iter().copied().collect::<BTreeSet<_>>();
-    let build_row = |expressions: &[Expr]| -> Result<Vec<Value>> {
+    let build_row = |expressions: &[ast::Expr]| -> Result<Vec<Value>> {
         if expressions.len() != column_indexes.len() {
             return Err(PgError::create(
                 SqlState::SyntaxError,
@@ -68,7 +69,7 @@ pub(super) fn execute_insert(
         Ok(row)
     };
     let rows = if let Some(source) = &insert.source {
-        let SetExpr::Values(values) = source.body.as_ref() else {
+        let ast::SetExpr::Values(values) = source.body.as_ref() else {
             return reject_unsupported("INSERT source is not implemented");
         };
         values
@@ -125,9 +126,9 @@ pub(super) fn execute_insert(
 
 pub(super) fn execute_update(
     state: &mut DatabaseState,
-    update_table: &TableWithJoins,
-    assignments: &[sqlparser::ast::Assignment],
-    selection: Option<&Expr>,
+    update_table: &ast::TableWithJoins,
+    assignments: &[ast::Assignment],
+    selection: Option<&ast::Expr>,
     xid: Xid,
     snapshot: &Snapshot,
     deferred_constraints: &BTreeSet<String>,
@@ -137,7 +138,7 @@ pub(super) fn execute_update(
     if !update_table.joins.is_empty() {
         return reject_unsupported("UPDATE joins are not implemented");
     }
-    let TableFactor::Table {
+    let ast::TableFactor::Table {
         name: table_name,
         args,
         ..
@@ -165,7 +166,7 @@ pub(super) fn execute_update(
     let assignments = assignments
         .iter()
         .map(|assignment| {
-            let AssignmentTarget::ColumnName(column) = &assignment.target else {
+            let ast::AssignmentTarget::ColumnName(column) = &assignment.target else {
                 return reject_unsupported("UPDATE tuple assignment is not implemented");
             };
             let column_name = normalize_unqualified_object_name(column)?;
@@ -281,7 +282,7 @@ pub(super) fn execute_update(
 
 pub(super) fn execute_delete(
     state: &mut DatabaseState,
-    delete: &Delete,
+    delete: &ast::Delete,
     xid: Xid,
     snapshot: &Snapshot,
     deferred_constraints: &BTreeSet<String>,
@@ -296,13 +297,13 @@ pub(super) fn execute_delete(
     {
         return reject_unsupported("DELETE feature is not implemented");
     }
-    let FromTable::WithFromKeyword(from) = &delete.from else {
+    let ast::FromTable::WithFromKeyword(from) = &delete.from else {
         return reject_unsupported("DELETE without FROM is not implemented");
     };
     if from.len() != 1 || !from[0].joins.is_empty() {
         return reject_unsupported("DELETE joins are not implemented");
     }
-    let TableFactor::Table {
+    let ast::TableFactor::Table {
         name: table_name,
         args,
         ..

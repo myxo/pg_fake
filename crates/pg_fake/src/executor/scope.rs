@@ -4,10 +4,8 @@ use crate::{
     error::{PgError, Result, SqlState, reject_unsupported},
     value::{BaseType, PgType},
 };
-use sqlparser::ast::{
-    Expr, Ident, Join, JoinConstraint, JoinOperator, SelectItem, SetExpr, TableFactor,
-    TableWithJoins, VisitMut, VisitorMut,
-};
+use ast::VisitMut as _;
+use sqlparser::ast;
 use std::ops::ControlFlow;
 
 #[derive(Clone)]
@@ -34,7 +32,7 @@ pub(crate) enum RowScope<'a> {
 }
 
 impl RowScope<'_> {
-    pub(super) fn resolve_column(self, identifiers: &[Ident]) -> Result<(usize, PgType)> {
+    pub(super) fn resolve_column(self, identifiers: &[ast::Ident]) -> Result<(usize, PgType)> {
         match self {
             RowScope::Table(schema) => {
                 if identifiers.len() != 1 {
@@ -122,7 +120,7 @@ impl RowScope<'_> {
 
     pub(super) fn resolve_column_value(
         self,
-        identifiers: &[Ident],
+        identifiers: &[ast::Ident],
         row: &[crate::value::Value],
     ) -> Result<crate::value::Value> {
         match self {
@@ -169,13 +167,13 @@ impl RowScope<'_> {
 }
 
 impl BoundScope {
-    pub(super) fn resolve_column(&self, identifiers: &[Ident]) -> Result<(usize, PgType)> {
+    pub(super) fn resolve_column(&self, identifiers: &[ast::Ident]) -> Result<(usize, PgType)> {
         RowScope::Bound(self).resolve_column(identifiers)
     }
 
     fn bind_table(
         schema: &TableSchema,
-        alias: Option<&sqlparser::ast::TableAlias>,
+        alias: Option<&ast::TableAlias>,
         slot: usize,
     ) -> Result<Self> {
         let qualifier = alias
@@ -210,10 +208,7 @@ impl BoundScope {
     }
 }
 
-pub(crate) fn bind_query_scope(
-    catalog: &Catalog,
-    select: &sqlparser::ast::Select,
-) -> Result<BoundScope> {
+pub(crate) fn bind_query_scope(catalog: &Catalog, select: &ast::Select) -> Result<BoundScope> {
     if select.from.is_empty() {
         return Ok(BoundScope {
             columns: Vec::new(),
@@ -230,7 +225,7 @@ pub(crate) fn bind_query_scope(
 
 pub(crate) fn bind_query_scope_with_outer(
     catalog: &Catalog,
-    select: &sqlparser::ast::Select,
+    select: &ast::Select,
     outer: &BoundScope,
 ) -> Result<BoundScope> {
     let mut scope = bind_query_scope(catalog, select)?;
@@ -248,7 +243,7 @@ pub(crate) fn bind_query_scope_with_outer(
 
 fn bind_table_with_joins(
     catalog: &Catalog,
-    table: &TableWithJoins,
+    table: &ast::TableWithJoins,
     scope: &mut BoundScope,
 ) -> Result<()> {
     let left_start = scope.columns.len();
@@ -257,14 +252,14 @@ fn bind_table_with_joins(
         let right_start = scope.columns.len();
         bind_table_factor(catalog, &join.relation, scope)?;
         let constraint = match &join.join_operator {
-            JoinOperator::Join(constraint)
-            | JoinOperator::Inner(constraint)
-            | JoinOperator::CrossJoin(constraint)
-            | JoinOperator::Left(constraint)
-            | JoinOperator::LeftOuter(constraint)
-            | JoinOperator::Right(constraint)
-            | JoinOperator::RightOuter(constraint)
-            | JoinOperator::FullOuter(constraint) => constraint,
+            ast::JoinOperator::Join(constraint)
+            | ast::JoinOperator::Inner(constraint)
+            | ast::JoinOperator::CrossJoin(constraint)
+            | ast::JoinOperator::Left(constraint)
+            | ast::JoinOperator::LeftOuter(constraint)
+            | ast::JoinOperator::Right(constraint)
+            | ast::JoinOperator::RightOuter(constraint)
+            | ast::JoinOperator::FullOuter(constraint) => constraint,
             _ => {
                 return reject_unsupported("join type is not implemented");
             }
@@ -276,10 +271,10 @@ fn bind_table_with_joins(
 
 fn bind_table_factor(
     catalog: &Catalog,
-    factor: &TableFactor,
+    factor: &ast::TableFactor,
     scope: &mut BoundScope,
 ) -> Result<()> {
-    if let TableFactor::NestedJoin {
+    if let ast::TableFactor::NestedJoin {
         table_with_joins,
         alias,
     } = factor
@@ -313,7 +308,7 @@ fn bind_table_factor(
         }
         return Ok(());
     }
-    if let TableFactor::Derived {
+    if let ast::TableFactor::Derived {
         lateral,
         subquery,
         alias,
@@ -355,7 +350,7 @@ fn bind_table_factor(
             }));
         return Ok(());
     }
-    let TableFactor::Table {
+    let ast::TableFactor::Table {
         name: table_name,
         alias,
         args,
@@ -378,7 +373,7 @@ fn bind_table_factor(
 
 pub(crate) fn infer_query_output_columns(
     catalog: &Catalog,
-    query: &sqlparser::ast::Query,
+    query: &ast::Query,
 ) -> Result<Vec<(String, PgType)>> {
     describe_bound_query_columns(catalog, query, None).map(|columns| {
         columns
@@ -390,11 +385,11 @@ pub(crate) fn infer_query_output_columns(
 
 fn describe_bound_query_columns(
     catalog: &Catalog,
-    query: &sqlparser::ast::Query,
+    query: &ast::Query,
     outer: Option<&BoundScope>,
 ) -> Result<Vec<BoundColumn>> {
     match query.body.as_ref() {
-        SetExpr::Select(select) => {
+        ast::SetExpr::Select(select) => {
             let scope = match outer {
                 Some(outer) => bind_query_scope_with_outer(catalog, select, outer)?,
                 None => bind_query_scope(catalog, select)?,
@@ -403,14 +398,14 @@ fn describe_bound_query_columns(
                 .projection
                 .iter()
                 .flat_map(|item| match item {
-                    SelectItem::Wildcard(_) => scope
+                    ast::SelectItem::Wildcard(_) => scope
                         .columns
                         .iter()
                         .filter(|column| column.wildcard)
                         .map(|column| Ok((column.name.clone(), column.data_type)))
                         .collect::<Vec<_>>(),
-                    SelectItem::QualifiedWildcard(
-                        sqlparser::ast::SelectItemQualifiedWildcardKind::ObjectName(name),
+                    ast::SelectItem::QualifiedWildcard(
+                        ast::SelectItemQualifiedWildcardKind::ObjectName(name),
                         _,
                     ) => {
                         let qualifier = match super::normalize_unqualified_object_name(name) {
@@ -437,14 +432,14 @@ fn describe_bound_query_columns(
                             columns
                         }
                     }
-                    SelectItem::UnnamedExpr(Expr::Identifier(identifier)) => {
+                    ast::SelectItem::UnnamedExpr(ast::Expr::Identifier(identifier)) => {
                         vec![
                             scope.resolve_column(std::slice::from_ref(identifier)).map(
                                 |(_, data_type)| (normalize_identifier(identifier), data_type),
                             ),
                         ]
                     }
-                    SelectItem::UnnamedExpr(Expr::CompoundIdentifier(identifiers)) => {
+                    ast::SelectItem::UnnamedExpr(ast::Expr::CompoundIdentifier(identifiers)) => {
                         vec![scope.resolve_column(identifiers).map(|(_, data_type)| {
                             (
                                 normalize_identifier(
@@ -456,11 +451,11 @@ fn describe_bound_query_columns(
                             )
                         })]
                     }
-                    SelectItem::ExprWithAlias { expr, alias } => vec![
+                    ast::SelectItem::ExprWithAlias { expr, alias } => vec![
                         infer_expression_data_type(catalog, expr, &scope)
                             .map(|data_type| (normalize_identifier(alias), data_type)),
                     ],
-                    SelectItem::UnnamedExpr(expr) => vec![
+                    ast::SelectItem::UnnamedExpr(expr) => vec![
                         infer_expression_data_type(catalog, expr, &scope)
                             .map(|data_type| ("?column?".into(), data_type)),
                     ],
@@ -484,7 +479,7 @@ fn describe_bound_query_columns(
                         .collect()
                 })
         }
-        SetExpr::Values(values) => {
+        ast::SetExpr::Values(values) => {
             let width = values.rows.first().map(|row| row.len()).unwrap_or(0);
             if values.rows.iter().any(|row| row.len() != width) {
                 return Err(PgError::create(
@@ -540,10 +535,10 @@ fn describe_bound_query_columns(
 
 pub(super) fn infer_expression_data_type(
     catalog: &Catalog,
-    expr: &Expr,
+    expr: &ast::Expr,
     scope: &BoundScope,
 ) -> Result<PgType> {
-    if let Expr::Subquery(query) = expr {
+    if let ast::Expr::Subquery(query) = expr {
         let columns = describe_bound_query_columns(catalog, query, Some(scope))?;
         if columns.len() != 1 {
             return Err(PgError::create(
@@ -571,9 +566,9 @@ pub(super) fn infer_expression_data_type(
 
 pub(crate) fn substitute_typed_subqueries(
     catalog: &Catalog,
-    expression: &Expr,
+    expression: &ast::Expr,
     outer: &BoundScope,
-) -> Result<Expr> {
+) -> Result<ast::Expr> {
     let mut expression = expression.clone();
     let mut describer = TypedSubquerySubstituter {
         catalog,
@@ -590,15 +585,15 @@ struct TypedSubquerySubstituter<'a> {
     error: Option<PgError>,
 }
 
-impl VisitorMut for TypedSubquerySubstituter<'_> {
+impl ast::VisitorMut for TypedSubquerySubstituter<'_> {
     type Break = ();
 
-    fn pre_visit_expr(&mut self, expression: &mut Expr) -> ControlFlow<Self::Break> {
+    fn pre_visit_expr(&mut self, expression: &mut ast::Expr) -> ControlFlow<Self::Break> {
         if self.error.is_some() {
             return ControlFlow::Break(());
         }
         let result = match expression {
-            Expr::Subquery(query) => {
+            ast::Expr::Subquery(query) => {
                 describe_bound_query_columns(self.catalog, query, Some(self.outer)).and_then(
                     |columns| {
                         if columns.len() != 1 {
@@ -614,18 +609,18 @@ impl VisitorMut for TypedSubquerySubstituter<'_> {
                     },
                 )
             }
-            Expr::Exists { .. } => Ok(crate::analyzer::create_typed_literal(
+            ast::Expr::Exists { .. } => Ok(crate::analyzer::create_typed_literal(
                 crate::value::Value::Bool(false),
                 PgType::create(BaseType::Bool),
             )),
-            Expr::InSubquery {
+            ast::Expr::InSubquery {
                 expr,
                 subquery,
                 negated,
             } => describe_bound_query_columns(self.catalog, subquery, Some(self.outer)).and_then(
                 |columns| {
                     let left_width = match expr.as_ref() {
-                        Expr::Tuple(fields) => fields.len(),
+                        ast::Expr::Tuple(fields) => fields.len(),
                         _ => 1,
                     };
                     if columns.len() != left_width {
@@ -643,22 +638,22 @@ impl VisitorMut for TypedSubquerySubstituter<'_> {
                     let candidate = if left_width == 1 {
                         fields.next().expect("subquery has one column")
                     } else {
-                        Expr::Tuple(fields.collect())
+                        ast::Expr::Tuple(fields.collect())
                     };
-                    Ok(Expr::InList {
+                    Ok(ast::Expr::InList {
                         expr: expr.clone(),
                         list: vec![candidate],
                         negated: *negated,
                     })
                 },
             ),
-            Expr::AnyOp {
+            ast::Expr::AnyOp {
                 left,
                 compare_op,
                 right,
                 is_some,
-            } if matches!(right.as_ref(), Expr::Subquery(_)) => {
-                let Expr::Subquery(query) = right.as_ref() else {
+            } if matches!(right.as_ref(), ast::Expr::Subquery(_)) => {
+                let ast::Expr::Subquery(query) = right.as_ref() else {
                     unreachable!("quantified right side was checked")
                 };
                 describe_bound_query_columns(self.catalog, query, Some(self.outer)).and_then(
@@ -669,10 +664,10 @@ impl VisitorMut for TypedSubquerySubstituter<'_> {
                                 "subquery has too many columns",
                             ));
                         }
-                        Ok(Expr::AnyOp {
+                        Ok(ast::Expr::AnyOp {
                             left: left.clone(),
                             compare_op: compare_op.clone(),
-                            right: Box::new(Expr::Tuple(vec![
+                            right: Box::new(ast::Expr::Tuple(vec![
                                 crate::analyzer::create_typed_literal(
                                     crate::value::Value::Null,
                                     columns[0].data_type,
@@ -683,12 +678,12 @@ impl VisitorMut for TypedSubquerySubstituter<'_> {
                     },
                 )
             }
-            Expr::AllOp {
+            ast::Expr::AllOp {
                 left,
                 compare_op,
                 right,
-            } if matches!(right.as_ref(), Expr::Subquery(_)) => {
-                let Expr::Subquery(query) = right.as_ref() else {
+            } if matches!(right.as_ref(), ast::Expr::Subquery(_)) => {
+                let ast::Expr::Subquery(query) = right.as_ref() else {
                     unreachable!("quantified right side was checked")
                 };
                 describe_bound_query_columns(self.catalog, query, Some(self.outer)).and_then(
@@ -699,10 +694,10 @@ impl VisitorMut for TypedSubquerySubstituter<'_> {
                                 "subquery has too many columns",
                             ));
                         }
-                        Ok(Expr::AllOp {
+                        Ok(ast::Expr::AllOp {
                             left: left.clone(),
                             compare_op: compare_op.clone(),
-                            right: Box::new(Expr::Tuple(vec![
+                            right: Box::new(ast::Expr::Tuple(vec![
                                 crate::analyzer::create_typed_literal(
                                     crate::value::Value::Null,
                                     columns[0].data_type,
@@ -725,13 +720,13 @@ impl VisitorMut for TypedSubquerySubstituter<'_> {
 fn bind_join_constraint(
     catalog: &Catalog,
     scope: &mut BoundScope,
-    join: &Join,
-    constraint: &JoinConstraint,
+    join: &ast::Join,
+    constraint: &ast::JoinConstraint,
     left_start: usize,
     right_start: usize,
 ) -> Result<()> {
     match constraint {
-        JoinConstraint::On(expression) => {
+        ast::JoinConstraint::On(expression) => {
             let data_type = infer_expression_data_type(catalog, expression, scope)?;
             if data_type != PgType::create(crate::value::BaseType::Bool)
                 && !super::is_null_literal(expression)
@@ -742,14 +737,14 @@ fn bind_join_constraint(
                 ));
             }
         }
-        JoinConstraint::Using(columns) => {
+        ast::JoinConstraint::Using(columns) => {
             let columns = columns
                 .iter()
                 .map(normalize_unqualified_object_name)
                 .collect::<Result<Vec<_>>>()?;
             bind_join_columns(scope, &columns, left_start, right_start)?;
         }
-        JoinConstraint::Natural => {
+        ast::JoinConstraint::Natural => {
             let columns = scope.columns[left_start..right_start]
                 .iter()
                 .filter(|left| {
@@ -761,8 +756,9 @@ fn bind_join_constraint(
                 .collect::<Vec<_>>();
             bind_join_columns(scope, &columns, left_start, right_start)?;
         }
-        JoinConstraint::None if matches!(join.join_operator, JoinOperator::CrossJoin(_)) => {}
-        JoinConstraint::None => {
+        ast::JoinConstraint::None
+            if matches!(join.join_operator, ast::JoinOperator::CrossJoin(_)) => {}
+        ast::JoinConstraint::None => {
             return Err(PgError::create(
                 SqlState::SyntaxError,
                 "INNER JOIN requires a join condition",
@@ -818,9 +814,6 @@ fn bind_join_columns(
     Ok(())
 }
 
-pub(super) fn bind_select_scope(
-    state: &DatabaseState,
-    select: &sqlparser::ast::Select,
-) -> Result<BoundScope> {
+pub(super) fn bind_select_scope(state: &DatabaseState, select: &ast::Select) -> Result<BoundScope> {
     bind_query_scope(&state.catalog, select)
 }

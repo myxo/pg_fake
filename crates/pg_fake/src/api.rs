@@ -5,10 +5,7 @@ use std::{
 };
 
 use rand_chacha::{ChaCha12Rng, rand_core::SeedableRng};
-use sqlparser::ast::{
-    ContextModifier, Expr, Set, TransactionIsolationLevel as AstIsolationLevel, TransactionMode,
-    Value as AstValue,
-};
+use sqlparser::ast;
 
 use crate::{
     analyzer,
@@ -39,7 +36,7 @@ pub enum StatementResult {
 }
 #[derive(Debug, Clone)]
 pub struct PreparedStatement {
-    statement: parser::Statement,
+    statement: ast::Statement,
     parameter_types: Vec<crate::value::BaseType>,
     columns: Vec<ColumnMeta>,
 }
@@ -122,10 +119,10 @@ fn prune_database_versions(state: &mut DatabaseState) {
 
 fn collect_ddl_undo_for_statement(
     state: &DatabaseState,
-    statement: &parser::Statement,
+    statement: &ast::Statement,
 ) -> Result<Vec<DdlUndo>> {
     match statement {
-        parser::Statement::CreateTable(create) => {
+        ast::Statement::CreateTable(create) => {
             let name = executor::normalize_unqualified_object_name(&create.name)?;
             Ok(state
                 .catalog
@@ -135,8 +132,8 @@ fn collect_ddl_undo_for_statement(
                 .into_iter()
                 .collect())
         }
-        parser::Statement::Drop {
-            object_type: sqlparser::ast::ObjectType::Table,
+        ast::Statement::Drop {
+            object_type: ast::ObjectType::Table,
             names,
             ..
         } => names
@@ -169,11 +166,11 @@ fn create_invalid_lock_timeout_error() -> PgError {
     )
 }
 
-fn parse_lock_timeout(expression: &Expr) -> Result<Duration> {
+fn parse_lock_timeout(expression: &ast::Expr) -> Result<Duration> {
     let text = match expression {
-        Expr::Value(value) => match &value.value {
-            AstValue::Number(value, _) => value.as_str(),
-            AstValue::SingleQuotedString(value) => value.trim(),
+        ast::Expr::Value(value) => match &value.value {
+            ast::Value::Number(value, _) => value.as_str(),
+            ast::Value::SingleQuotedString(value) => value.trim(),
             _ => return Err(create_invalid_lock_timeout_error()),
         },
         _ => return Err(create_invalid_lock_timeout_error()),
@@ -200,10 +197,10 @@ fn parse_lock_timeout(expression: &Expr) -> Result<Duration> {
         .map_err(|_| create_invalid_lock_timeout_error())
 }
 
-fn parse_timezone(expression: &Expr) -> Result<String> {
+fn parse_timezone(expression: &ast::Expr) -> Result<String> {
     let value = match expression {
-        Expr::Value(value) => {
-            let AstValue::SingleQuotedString(value) = &value.value else {
+        ast::Expr::Value(value) => {
+            let ast::Value::SingleQuotedString(value) = &value.value else {
                 return Err(PgError::create(
                     SqlState::InvalidParameterValue,
                     "invalid value for parameter TimeZone",
@@ -211,7 +208,7 @@ fn parse_timezone(expression: &Expr) -> Result<String> {
             };
             value
         }
-        Expr::Identifier(sqlparser::ast::Ident { value, .. }) => value,
+        ast::Expr::Identifier(ast::Ident { value, .. }) => value,
         _ => {
             return Err(PgError::create(
                 SqlState::InvalidParameterValue,
@@ -242,23 +239,24 @@ fn create_deadlock_error() -> PgError {
     PgError::create(SqlState::DeadlockDetected, "deadlock detected")
 }
 
-fn parse_isolation_level(modes: &[TransactionMode]) -> Result<Option<IsolationLevel>> {
+fn parse_isolation_level(modes: &[ast::TransactionMode]) -> Result<Option<IsolationLevel>> {
     let mut isolation = None;
     for mode in modes {
         let level = match mode {
-            TransactionMode::IsolationLevel(
-                AstIsolationLevel::ReadUncommitted | AstIsolationLevel::ReadCommitted,
+            ast::TransactionMode::IsolationLevel(
+                ast::TransactionIsolationLevel::ReadUncommitted
+                | ast::TransactionIsolationLevel::ReadCommitted,
             ) => IsolationLevel::ReadCommitted,
-            TransactionMode::IsolationLevel(AstIsolationLevel::RepeatableRead) => {
-                IsolationLevel::RepeatableRead
-            }
-            TransactionMode::IsolationLevel(AstIsolationLevel::Serializable) => {
+            ast::TransactionMode::IsolationLevel(
+                ast::TransactionIsolationLevel::RepeatableRead,
+            ) => IsolationLevel::RepeatableRead,
+            ast::TransactionMode::IsolationLevel(ast::TransactionIsolationLevel::Serializable) => {
                 return reject_unsupported("SERIALIZABLE isolation is not implemented");
             }
-            TransactionMode::IsolationLevel(AstIsolationLevel::Snapshot) => {
+            ast::TransactionMode::IsolationLevel(ast::TransactionIsolationLevel::Snapshot) => {
                 return reject_unsupported("SNAPSHOT isolation is not implemented");
             }
-            TransactionMode::AccessMode(_) => {
+            ast::TransactionMode::AccessMode(_) => {
                 return reject_unsupported("transaction access modes are not implemented");
             }
         };
@@ -276,7 +274,7 @@ fn acquire_row_locks<'a>(
     condvar: &Condvar,
     timeout: Duration,
     mut state: MutexGuard<'a, DatabaseState>,
-    statement: &parser::Statement,
+    statement: &ast::Statement,
     xid: Xid,
     isolation: IsolationLevel,
     mut snapshot: Snapshot,
@@ -443,7 +441,7 @@ impl Db {
         }
     }
 
-    /// Set the frozen mock clock. Real-clock databases reject the operation.
+    /// ast::Set the frozen mock clock. Real-clock databases reject the operation.
     pub fn set_time(&self, time: chrono::DateTime<chrono::Utc>) -> Result<()> {
         let mut clock = self.clock.lock().expect("clock mutex is poisoned");
         match &mut *clock {
@@ -649,7 +647,7 @@ impl Session {
             Some(SessionTransactionState::Aborted { .. })
         ) && !matches!(
             &statement,
-            parser::Statement::Commit { .. } | parser::Statement::Rollback { .. }
+            ast::Statement::Commit { .. } | ast::Statement::Rollback { .. }
         ) {
             return Err(PgError::create(
                 SqlState::InFailedSqlTransaction,
@@ -883,21 +881,21 @@ impl Session {
         Err(error)
     }
 
-    fn execute_statement(&mut self, statement: parser::Statement) -> Result<StatementResult> {
+    fn execute_statement(&mut self, statement: ast::Statement) -> Result<StatementResult> {
         match &statement {
-            parser::Statement::Analyze(_) if !self.db.strict => {
+            ast::Statement::Analyze(_) if !self.db.strict => {
                 return Ok(StatementResult::Affected(0));
             }
-            parser::Statement::Reset(reset)
+            ast::Statement::Reset(reset)
                 if !self.db.strict && is_tolerated_planner_reset(&reset.reset) =>
             {
                 return Ok(StatementResult::Affected(0));
             }
-            parser::Statement::Set(Set::SetTimeZone { local: _, value }) => {
+            ast::Statement::Set(ast::Set::SetTimeZone { local: _, value }) => {
                 self.timezone = parse_timezone(value)?;
                 return Ok(StatementResult::Affected(0));
             }
-            parser::Statement::ShowVariable { variable }
+            ast::Statement::ShowVariable { variable }
                 if variable.len() == 1 && variable[0].value.eq_ignore_ascii_case("timezone") =>
             {
                 return Ok(StatementResult::Query(QueryResult {
@@ -909,7 +907,7 @@ impl Session {
                     rows: vec![vec![Value::Text(self.timezone.clone())]],
                 }));
             }
-            parser::Statement::StartTransaction { modes, .. } => {
+            ast::Statement::StartTransaction { modes, .. } => {
                 return match self.transaction {
                     None => {
                         let isolation =
@@ -940,7 +938,7 @@ impl Session {
                     )),
                 };
             }
-            parser::Statement::Set(Set::SetTransaction {
+            ast::Statement::Set(ast::Set::SetTransaction {
                 modes,
                 snapshot,
                 session,
@@ -988,7 +986,7 @@ impl Session {
                 self.transaction = Some(SessionTransactionState::Active(transaction));
                 return Ok(StatementResult::Affected(0));
             }
-            parser::Statement::Set(Set::SingleAssignment {
+            ast::Statement::Set(ast::Set::SingleAssignment {
                 scope,
                 hivevar,
                 variable,
@@ -1014,7 +1012,8 @@ impl Session {
                             "current transaction is aborted",
                         ));
                     }
-                    if *scope == Some(ContextModifier::Local) || *hivevar || values.len() != 1 {
+                    if *scope == Some(ast::ContextModifier::Local) || *hivevar || values.len() != 1
+                    {
                         return self.abort_with_error(PgError::create(
                             SqlState::FeatureNotSupported,
                             "lock_timeout setting variant is not implemented",
@@ -1030,7 +1029,7 @@ impl Session {
                     return Ok(StatementResult::Affected(0));
                 }
             }
-            parser::Statement::Commit { chain, .. } => {
+            ast::Statement::Commit { chain, .. } => {
                 if *chain {
                     return self.abort_with_error(PgError::create(
                         SqlState::FeatureNotSupported,
@@ -1040,7 +1039,7 @@ impl Session {
                 self.commit_transaction()?;
                 return Ok(StatementResult::Affected(0));
             }
-            parser::Statement::Rollback { chain, savepoint } => {
+            ast::Statement::Rollback { chain, savepoint } => {
                 if *chain || savepoint.is_some() {
                     return self.abort_with_error(PgError::create(
                         SqlState::FeatureNotSupported,
@@ -1157,14 +1156,14 @@ impl Session {
     }
 }
 
-fn contains_dml(statement: &parser::Statement) -> bool {
+fn contains_dml(statement: &ast::Statement) -> bool {
     matches!(
         statement,
-        parser::Statement::Insert(_) | parser::Statement::Update(_) | parser::Statement::Delete(_)
+        ast::Statement::Insert(_) | ast::Statement::Update(_) | ast::Statement::Delete(_)
     )
 }
 
-fn is_tolerated_planner_setting(variable: &sqlparser::ast::ObjectName) -> bool {
+fn is_tolerated_planner_setting(variable: &ast::ObjectName) -> bool {
     let variable = variable.to_string().to_ascii_lowercase();
     matches!(
         variable.as_str(),
@@ -1187,12 +1186,10 @@ fn is_tolerated_planner_setting(variable: &sqlparser::ast::ObjectName) -> bool {
         || variable.starts_with("jit_")
 }
 
-fn is_tolerated_planner_reset(reset: &sqlparser::ast::Reset) -> bool {
+fn is_tolerated_planner_reset(reset: &ast::Reset) -> bool {
     match reset {
-        sqlparser::ast::Reset::ALL => false,
-        sqlparser::ast::Reset::ConfigurationParameter(variable) => {
-            is_tolerated_planner_setting(variable)
-        }
+        ast::Reset::ALL => false,
+        ast::Reset::ConfigurationParameter(variable) => is_tolerated_planner_setting(variable),
     }
 }
 

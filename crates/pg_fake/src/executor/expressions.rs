@@ -1,7 +1,8 @@
 use super::*;
+use sqlparser::ast;
 
 pub(super) fn evaluate_assignment_expression(
-    expr: &Expr,
+    expr: &ast::Expr,
     target: PgType,
     schema: &TableSchema,
     row: &[Value],
@@ -115,8 +116,8 @@ pub(super) fn validate_check_constraints(
     Ok(())
 }
 
-pub(super) fn is_default_expression(expr: &Expr) -> bool {
-    matches!(expr, Expr::Identifier(identifier) if identifier.quote_style.is_none() && identifier.value.eq_ignore_ascii_case("default"))
+pub(super) fn is_default_expression(expr: &ast::Expr) -> bool {
+    matches!(expr, ast::Expr::Identifier(identifier) if identifier.quote_style.is_none() && identifier.value.eq_ignore_ascii_case("default"))
 }
 
 pub(crate) fn create_constant_expression_schema() -> TableSchema {
@@ -128,30 +129,30 @@ pub(crate) fn create_constant_expression_schema() -> TableSchema {
     }
 }
 
-fn extract_ast_value(expr: &Expr) -> Option<&AstValue> {
-    let Expr::Value(value) = expr else {
+fn extract_ast_value(expr: &ast::Expr) -> Option<&ast::Value> {
+    let ast::Expr::Value(value) = expr else {
         return None;
     };
     Some(&value.value)
 }
 
-pub(super) fn extract_number_literal(expr: &Expr) -> Option<&str> {
-    let AstValue::Number(value, _) = extract_ast_value(expr)? else {
+pub(super) fn extract_number_literal(expr: &ast::Expr) -> Option<&str> {
+    let ast::Value::Number(value, _) = extract_ast_value(expr)? else {
         return None;
     };
     Some(value)
 }
 
-fn evaluate_literal(expr: &Expr) -> Result<Value> {
+fn evaluate_literal(expr: &ast::Expr) -> Result<Value> {
     if let Some(value) = extract_ast_value(expr) {
         return match value {
-            AstValue::Null => Ok(Value::Null),
-            AstValue::Boolean(value) => Ok(Value::Bool(*value)),
-            AstValue::SingleQuotedString(value) => Ok(Value::Text(value.clone())),
-            AstValue::Number(value, _) if value.contains(['.', 'e', 'E']) => {
+            ast::Value::Null => Ok(Value::Null),
+            ast::Value::Boolean(value) => Ok(Value::Bool(*value)),
+            ast::Value::SingleQuotedString(value) => Ok(Value::Text(value.clone())),
+            ast::Value::Number(value, _) if value.contains(['.', 'e', 'E']) => {
                 Value::parse(BaseType::Numeric, value)
             }
-            AstValue::Number(value, _) => parse_integer_literal(value),
+            ast::Value::Number(value, _) => parse_integer_literal(value),
             _ => Err(PgError::create(
                 SqlState::CannotCoerce,
                 "literal has incompatible type",
@@ -159,24 +160,24 @@ fn evaluate_literal(expr: &Expr) -> Result<Value> {
         };
     }
     match expr {
-        Expr::UnaryOp {
-            op: UnaryOperator::Plus,
+        ast::Expr::UnaryOp {
+            op: ast::UnaryOperator::Plus,
             expr,
         } => evaluate_literal(expr),
-        Expr::UnaryOp {
-            op: UnaryOperator::Minus,
+        ast::Expr::UnaryOp {
+            op: ast::UnaryOperator::Minus,
             expr,
         } if extract_number_literal(expr).is_some_and(|value| !value.contains(['.', 'e', 'E'])) => {
             let value = extract_number_literal(expr).expect("integer literal pattern was checked");
             parse_integer_literal(&format!("-{value}"))
         }
-        Expr::UnaryOp {
-            op: UnaryOperator::Minus,
+        ast::Expr::UnaryOp {
+            op: ast::UnaryOperator::Minus,
             expr,
         } if extract_number_literal(expr).is_some() => {
-            evaluate_unary_operator(UnaryOperator::Minus, evaluate_literal(expr)?)
+            evaluate_unary_operator(ast::UnaryOperator::Minus, evaluate_literal(expr)?)
         }
-        Expr::Nested(expr) => evaluate_literal(expr),
+        ast::Expr::Nested(expr) => evaluate_literal(expr),
         _ => reject_unsupported("expression is not implemented"),
     }
 }
@@ -191,36 +192,40 @@ fn parse_integer_literal(value: &str) -> Result<Value> {
     Value::parse(BaseType::Numeric, value)
 }
 
-pub(super) fn extract_unknown_string_literal(expr: &Expr) -> Option<&str> {
+pub(super) fn extract_unknown_string_literal(expr: &ast::Expr) -> Option<&str> {
     match expr {
-        Expr::Value(value) => match &value.value {
-            AstValue::SingleQuotedString(value) => Some(value),
+        ast::Expr::Value(value) => match &value.value {
+            ast::Value::SingleQuotedString(value) => Some(value),
             _ => None,
         },
-        Expr::Nested(expr) => extract_unknown_string_literal(expr),
+        ast::Expr::Nested(expr) => extract_unknown_string_literal(expr),
         _ => None,
     }
 }
 
-pub(crate) fn infer_expression_type(expr: &Expr, schema: RowScope<'_>) -> Result<BaseType> {
+pub(crate) fn infer_expression_type(expr: &ast::Expr, schema: RowScope<'_>) -> Result<BaseType> {
     if let Some(value) = extract_ast_value(expr) {
         return match value {
-            AstValue::Null => Ok(BaseType::Text),
-            AstValue::Boolean(_) => Ok(BaseType::Bool),
-            AstValue::SingleQuotedString(_) => Ok(BaseType::Text),
-            AstValue::Number(value, _) if value.contains(['.', 'e', 'E']) => Ok(BaseType::Numeric),
-            AstValue::Number(value, _) => Ok(parse_integer_literal(value)?
+            ast::Value::Null => Ok(BaseType::Text),
+            ast::Value::Boolean(_) => Ok(BaseType::Bool),
+            ast::Value::SingleQuotedString(_) => Ok(BaseType::Text),
+            ast::Value::Number(value, _) if value.contains(['.', 'e', 'E']) => {
+                Ok(BaseType::Numeric)
+            }
+            ast::Value::Number(value, _) => Ok(parse_integer_literal(value)?
                 .get_base_type()
                 .expect("numeric literal is not null")),
             _ => reject_unsupported("literal is not implemented"),
         };
     }
     match expr {
-        Expr::Identifier(column) => Ok(schema.resolve_column(std::slice::from_ref(column))?.1.base),
-        Expr::CompoundIdentifier(columns) => Ok(schema.resolve_column(columns)?.1.base),
-        Expr::Nested(expr) => infer_expression_type(expr, schema),
-        Expr::UnaryOp {
-            op: UnaryOperator::Minus,
+        ast::Expr::Identifier(column) => {
+            Ok(schema.resolve_column(std::slice::from_ref(column))?.1.base)
+        }
+        ast::Expr::CompoundIdentifier(columns) => Ok(schema.resolve_column(columns)?.1.base),
+        ast::Expr::Nested(expr) => infer_expression_type(expr, schema),
+        ast::Expr::UnaryOp {
+            op: ast::UnaryOperator::Minus,
             expr,
         } if extract_number_literal(expr).is_some_and(|value| !value.contains(['.', 'e', 'E'])) => {
             let value = extract_number_literal(expr).expect("integer literal pattern was checked");
@@ -228,11 +233,13 @@ pub(crate) fn infer_expression_type(expr: &Expr, schema: RowScope<'_>) -> Result
                 .get_base_type()
                 .expect("integer literal is not null"))
         }
-        Expr::UnaryOp { op, expr } => {
+        ast::Expr::UnaryOp { op, expr } => {
             let base = infer_expression_type(expr, schema)?;
-            if matches!(op, UnaryOperator::Plus | UnaryOperator::Minus) && is_numeric_type(base) {
+            if matches!(op, ast::UnaryOperator::Plus | ast::UnaryOperator::Minus)
+                && is_numeric_type(base)
+            {
                 Ok(base)
-            } else if matches!(op, UnaryOperator::Not)
+            } else if matches!(op, ast::UnaryOperator::Not)
                 && (base == BaseType::Bool || is_null_literal(expr))
             {
                 Ok(BaseType::Bool)
@@ -243,12 +250,12 @@ pub(crate) fn infer_expression_type(expr: &Expr, schema: RowScope<'_>) -> Result
                 ))
             }
         }
-        Expr::BinaryOp { left, op, right } => match op {
-            BinaryOperator::Plus
-            | BinaryOperator::Minus
-            | BinaryOperator::Multiply
-            | BinaryOperator::Divide
-            | BinaryOperator::Modulo => {
+        ast::Expr::BinaryOp { left, op, right } => match op {
+            ast::BinaryOperator::Plus
+            | ast::BinaryOperator::Minus
+            | ast::BinaryOperator::Multiply
+            | ast::BinaryOperator::Divide
+            | ast::BinaryOperator::Modulo => {
                 let left_type = infer_expression_type(left, schema)?;
                 let right_type = infer_expression_type(right, schema)?;
                 if matches!(left_type, BaseType::Interval)
@@ -266,16 +273,16 @@ pub(crate) fn infer_expression_type(expr: &Expr, schema: RowScope<'_>) -> Result
                     ))
                 }
             }
-            BinaryOperator::Eq
-            | BinaryOperator::NotEq
-            | BinaryOperator::Gt
-            | BinaryOperator::Lt
-            | BinaryOperator::GtEq
-            | BinaryOperator::LtEq => {
+            ast::BinaryOperator::Eq
+            | ast::BinaryOperator::NotEq
+            | ast::BinaryOperator::Gt
+            | ast::BinaryOperator::Lt
+            | ast::BinaryOperator::GtEq
+            | ast::BinaryOperator::LtEq => {
                 resolve_operator_type(left, right, schema)?;
                 Ok(BaseType::Bool)
             }
-            BinaryOperator::And | BinaryOperator::Or => {
+            ast::BinaryOperator::And | ast::BinaryOperator::Or => {
                 let left_base = infer_expression_type(left, schema)?;
                 let right_base = infer_expression_type(right, schema)?;
                 if (left_base == BaseType::Bool
@@ -298,15 +305,16 @@ pub(crate) fn infer_expression_type(expr: &Expr, schema: RowScope<'_>) -> Result
                 "operator has incompatible types",
             )),
         },
-        Expr::IsNull(_) | Expr::IsNotNull(_) => Ok(BaseType::Bool),
-        Expr::InList { expr, list, .. } => {
+        ast::Expr::IsNull(_) | ast::Expr::IsNotNull(_) => Ok(BaseType::Bool),
+        ast::Expr::InList { expr, list, .. } => {
             validate_membership_types(expr, list, schema)?;
             Ok(BaseType::Bool)
         }
-        Expr::InSubquery { .. } | Expr::Exists { .. } | Expr::AnyOp { .. } | Expr::AllOp { .. } => {
-            Ok(BaseType::Bool)
-        }
-        Expr::IsTrue(expr) | Expr::IsFalse(expr) | Expr::IsUnknown(expr) => {
+        ast::Expr::InSubquery { .. }
+        | ast::Expr::Exists { .. }
+        | ast::Expr::AnyOp { .. }
+        | ast::Expr::AllOp { .. } => Ok(BaseType::Bool),
+        ast::Expr::IsTrue(expr) | ast::Expr::IsFalse(expr) | ast::Expr::IsUnknown(expr) => {
             let base = infer_expression_type(expr, schema)?;
             if base == BaseType::Bool
                 || is_null_literal(expr)
@@ -320,11 +328,11 @@ pub(crate) fn infer_expression_type(expr: &Expr, schema: RowScope<'_>) -> Result
                 ))
             }
         }
-        Expr::IsDistinctFrom(left, right) | Expr::IsNotDistinctFrom(left, right) => {
+        ast::Expr::IsDistinctFrom(left, right) | ast::Expr::IsNotDistinctFrom(left, right) => {
             resolve_operator_type(left, right, schema)?;
             Ok(BaseType::Bool)
         }
-        Expr::Case {
+        ast::Expr::Case {
             operand,
             conditions,
             else_result,
@@ -362,15 +370,16 @@ pub(crate) fn infer_expression_type(expr: &Expr, schema: RowScope<'_>) -> Result
                 schema,
             )
         }
-        Expr::Function(function) => infer_function_return_type(function, schema),
-        Expr::Cast {
+        ast::Expr::Function(function) => infer_function_return_type(function, schema),
+        ast::Expr::Cast {
             kind,
             expr,
             data_type,
             format,
             ..
         } => {
-            if !matches!(kind, CastKind::Cast | CastKind::DoubleColon) || format.is_some() {
+            if !matches!(kind, ast::CastKind::Cast | ast::CastKind::DoubleColon) || format.is_some()
+            {
                 return reject_unsupported("cast variant is not implemented");
             }
             let target = coercion::convert_ast_data_type(data_type)?;
@@ -389,7 +398,7 @@ pub(crate) fn infer_expression_type(expr: &Expr, schema: RowScope<'_>) -> Result
             }
             Ok(target.base)
         }
-        Expr::Extract { expr, .. } => {
+        ast::Expr::Extract { expr, .. } => {
             let base = infer_expression_type(expr, schema)?;
             if matches!(
                 base,
@@ -408,10 +417,10 @@ pub(crate) fn infer_expression_type(expr: &Expr, schema: RowScope<'_>) -> Result
     }
 }
 
-pub(crate) fn is_null_literal(expr: &Expr) -> bool {
+pub(crate) fn is_null_literal(expr: &ast::Expr) -> bool {
     match expr {
-        Expr::Value(value) if matches!(&value.value, AstValue::Null) => true,
-        Expr::Nested(expr) => is_null_literal(expr),
+        ast::Expr::Value(value) if matches!(&value.value, ast::Value::Null) => true,
+        ast::Expr::Nested(expr) => is_null_literal(expr),
         _ => false,
     }
 }
@@ -429,8 +438,8 @@ fn is_numeric_type(base: BaseType) -> bool {
 }
 
 fn resolve_expression_pair_type(
-    left: &Expr,
-    right: &Expr,
+    left: &ast::Expr,
+    right: &ast::Expr,
     schema: RowScope<'_>,
 ) -> Result<BaseType> {
     if is_null_literal(left) && is_null_literal(right)
@@ -457,7 +466,11 @@ fn resolve_expression_pair_type(
     })
 }
 
-fn resolve_operator_type(left: &Expr, right: &Expr, schema: RowScope<'_>) -> Result<BaseType> {
+fn resolve_operator_type(
+    left: &ast::Expr,
+    right: &ast::Expr,
+    schema: RowScope<'_>,
+) -> Result<BaseType> {
     let left_type = infer_expression_type(left, schema)?;
     let right_type = infer_expression_type(right, schema)?;
     if left_type != right_type
@@ -483,7 +496,10 @@ fn resolve_operator_type(left: &Expr, right: &Expr, schema: RowScope<'_>) -> Res
     }
 }
 
-fn resolve_expression_list_type(expressions: &[&Expr], schema: RowScope<'_>) -> Result<BaseType> {
+fn resolve_expression_list_type(
+    expressions: &[&ast::Expr],
+    schema: RowScope<'_>,
+) -> Result<BaseType> {
     let mut result = None;
     for expression in expressions {
         if is_null_literal(expression) || extract_unknown_string_literal(expression).is_some() {
@@ -507,9 +523,9 @@ fn resolve_expression_list_type(expressions: &[&Expr], schema: RowScope<'_>) -> 
     Ok(result.unwrap_or(BaseType::Text))
 }
 
-fn extract_function_arguments(function: &Function) -> Result<Vec<&Expr>> {
+fn extract_function_arguments(function: &ast::Function) -> Result<Vec<&ast::Expr>> {
     if function.uses_odbc_syntax
-        || !matches!(function.parameters, FunctionArguments::None)
+        || !matches!(function.parameters, ast::FunctionArguments::None)
         || function.filter.is_some()
         || function.null_treatment.is_some()
         || function.over.is_some()
@@ -517,7 +533,7 @@ fn extract_function_arguments(function: &Function) -> Result<Vec<&Expr>> {
     {
         return reject_unsupported("function feature is not implemented");
     }
-    let FunctionArguments::List(arguments) = &function.args else {
+    let ast::FunctionArguments::List(arguments) = &function.args else {
         return Err(PgError::create(
             SqlState::UndefinedFunction,
             "function signature does not exist",
@@ -530,13 +546,13 @@ fn extract_function_arguments(function: &Function) -> Result<Vec<&Expr>> {
         .args
         .iter()
         .map(|argument| match argument {
-            FunctionArg::Unnamed(FunctionArgExpr::Expr(expression)) => Ok(expression),
+            ast::FunctionArg::Unnamed(ast::FunctionArgExpr::Expr(expression)) => Ok(expression),
             _ => reject_unsupported("function argument is not implemented"),
         })
         .collect()
 }
 
-fn infer_function_return_type(function: &Function, schema: RowScope<'_>) -> Result<BaseType> {
+fn infer_function_return_type(function: &ast::Function, schema: RowScope<'_>) -> Result<BaseType> {
     let function_name = normalize_unqualified_object_name(&function.name)?;
     let arguments = extract_function_arguments(function)?;
     let signature_error = || {
@@ -590,18 +606,20 @@ fn infer_function_return_type(function: &Function, schema: RowScope<'_>) -> Resu
 }
 
 pub(super) fn evaluate(
-    expr: &Expr,
+    expr: &ast::Expr,
     schema: RowScope<'_>,
     row: &[Value],
     context: &StatementExecutionContext,
 ) -> Result<Value> {
     match expr {
-        Expr::Identifier(column) => schema.resolve_column_value(std::slice::from_ref(column), row),
-        Expr::CompoundIdentifier(columns) => schema.resolve_column_value(columns, row),
-        Expr::Value(_) => evaluate_literal(expr),
-        Expr::Nested(expr) => evaluate(expr, schema, row, context),
-        Expr::UnaryOp { op, expr } => {
-            if matches!(op, UnaryOperator::Minus)
+        ast::Expr::Identifier(column) => {
+            schema.resolve_column_value(std::slice::from_ref(column), row)
+        }
+        ast::Expr::CompoundIdentifier(columns) => schema.resolve_column_value(columns, row),
+        ast::Expr::Value(_) => evaluate_literal(expr),
+        ast::Expr::Nested(expr) => evaluate(expr, schema, row, context),
+        ast::Expr::UnaryOp { op, expr } => {
+            if matches!(op, ast::UnaryOperator::Minus)
                 && let Some(value) = extract_number_literal(expr)
                 && !value.contains(['.', 'e', 'E'])
             {
@@ -609,15 +627,15 @@ pub(super) fn evaluate(
             }
             evaluate_unary_operator(*op, evaluate(expr, schema, row, context)?)
         }
-        Expr::BinaryOp { left, op, right } => {
+        ast::Expr::BinaryOp { left, op, right } => {
             let left_type = infer_expression_type(left, schema)?;
             let right_type = infer_expression_type(right, schema)?;
             if matches!(
                 op,
-                BinaryOperator::Plus
-                    | BinaryOperator::Minus
-                    | BinaryOperator::Multiply
-                    | BinaryOperator::Divide
+                ast::BinaryOperator::Plus
+                    | ast::BinaryOperator::Minus
+                    | ast::BinaryOperator::Multiply
+                    | ast::BinaryOperator::Divide
             ) && (left_type == BaseType::Interval || right_type == BaseType::Interval)
             {
                 let left = evaluate(left, schema, row, context)?;
@@ -628,12 +646,12 @@ pub(super) fn evaluate(
                 return evaluate_temporal_arithmetic(op, left, right);
             }
             let target = match op {
-                BinaryOperator::And | BinaryOperator::Or => BaseType::Bool,
-                BinaryOperator::Plus
-                | BinaryOperator::Minus
-                | BinaryOperator::Multiply
-                | BinaryOperator::Divide
-                | BinaryOperator::Modulo => resolve_operator_type(left, right, schema)?,
+                ast::BinaryOperator::And | ast::BinaryOperator::Or => BaseType::Bool,
+                ast::BinaryOperator::Plus
+                | ast::BinaryOperator::Minus
+                | ast::BinaryOperator::Multiply
+                | ast::BinaryOperator::Divide
+                | ast::BinaryOperator::Modulo => resolve_operator_type(left, right, schema)?,
                 _ => resolve_operator_type(left, right, schema)?,
             };
             let left =
@@ -641,56 +659,56 @@ pub(super) fn evaluate(
             let right =
                 evaluate_and_coerce(right, target, CastContext::Implicit, schema, row, context)?;
             match op {
-                BinaryOperator::Plus
-                | BinaryOperator::Minus
-                | BinaryOperator::Multiply
-                | BinaryOperator::Divide
-                | BinaryOperator::Modulo => {
+                ast::BinaryOperator::Plus
+                | ast::BinaryOperator::Minus
+                | ast::BinaryOperator::Multiply
+                | ast::BinaryOperator::Divide
+                | ast::BinaryOperator::Modulo => {
                     if left.is_null() || right.is_null() {
                         Ok(Value::Null)
                     } else {
                         evaluate_numeric_operator(op, left, right)
                     }
                 }
-                BinaryOperator::Eq
-                | BinaryOperator::NotEq
-                | BinaryOperator::Gt
-                | BinaryOperator::Lt
-                | BinaryOperator::GtEq
-                | BinaryOperator::LtEq => {
+                ast::BinaryOperator::Eq
+                | ast::BinaryOperator::NotEq
+                | ast::BinaryOperator::Gt
+                | ast::BinaryOperator::Lt
+                | ast::BinaryOperator::GtEq
+                | ast::BinaryOperator::LtEq => {
                     if left.is_null() || right.is_null() {
                         Ok(Value::Null)
                     } else {
                         evaluate_comparison(op, &left, &right)
                     }
                 }
-                BinaryOperator::And | BinaryOperator::Or => {
+                ast::BinaryOperator::And | ast::BinaryOperator::Or => {
                     evaluate_boolean_operator(op, left, right)
                 }
                 _ => reject_unsupported("operator is not implemented"),
             }
         }
-        Expr::IsNull(expr) => Ok(Value::Bool(evaluate(expr, schema, row, context)?.is_null())),
-        Expr::IsNotNull(expr) => Ok(Value::Bool(
+        ast::Expr::IsNull(expr) => Ok(Value::Bool(evaluate(expr, schema, row, context)?.is_null())),
+        ast::Expr::IsNotNull(expr) => Ok(Value::Bool(
             !evaluate(expr, schema, row, context)?.is_null(),
         )),
-        Expr::InList {
+        ast::Expr::InList {
             expr,
             list,
             negated,
         } => evaluate_membership(expr, list, *negated, schema, row, context),
-        Expr::AnyOp {
+        ast::Expr::AnyOp {
             left,
             compare_op,
             right,
             ..
         } => evaluate_quantified(left, compare_op, right, false, schema, row, context),
-        Expr::AllOp {
+        ast::Expr::AllOp {
             left,
             compare_op,
             right,
         } => evaluate_quantified(left, compare_op, right, true, schema, row, context),
-        Expr::IsTrue(expr) => Ok(Value::Bool(matches!(
+        ast::Expr::IsTrue(expr) => Ok(Value::Bool(matches!(
             evaluate_and_coerce(
                 expr,
                 BaseType::Bool,
@@ -701,7 +719,7 @@ pub(super) fn evaluate(
             )?,
             Value::Bool(true)
         ))),
-        Expr::IsFalse(expr) => Ok(Value::Bool(matches!(
+        ast::Expr::IsFalse(expr) => Ok(Value::Bool(matches!(
             evaluate_and_coerce(
                 expr,
                 BaseType::Bool,
@@ -712,7 +730,7 @@ pub(super) fn evaluate(
             )?,
             Value::Bool(false)
         ))),
-        Expr::IsUnknown(expr) => Ok(Value::Bool(
+        ast::Expr::IsUnknown(expr) => Ok(Value::Bool(
             evaluate_and_coerce(
                 expr,
                 BaseType::Bool,
@@ -723,15 +741,15 @@ pub(super) fn evaluate(
             )?
             .is_null(),
         )),
-        Expr::IsDistinctFrom(left, right) | Expr::IsNotDistinctFrom(left, right) => {
+        ast::Expr::IsDistinctFrom(left, right) | ast::Expr::IsNotDistinctFrom(left, right) => {
             let target = resolve_operator_type(left, right, schema)?;
             evaluate_distinctness(
                 evaluate_and_coerce(left, target, CastContext::Implicit, schema, row, context)?,
                 evaluate_and_coerce(right, target, CastContext::Implicit, schema, row, context)?,
-                matches!(expr, Expr::IsNotDistinctFrom(_, _)),
+                matches!(expr, ast::Expr::IsNotDistinctFrom(_, _)),
             )
         }
-        Expr::Case {
+        ast::Expr::Case {
             operand,
             conditions,
             else_result,
@@ -770,7 +788,7 @@ pub(super) fn evaluate(
                         false
                     } else {
                         matches!(
-                            evaluate_comparison(&BinaryOperator::Eq, &operand, &condition)?,
+                            evaluate_comparison(&ast::BinaryOperator::Eq, &operand, &condition)?,
                             Value::Bool(true)
                         )
                     }
@@ -803,15 +821,16 @@ pub(super) fn evaluate(
                 None => Ok(Value::Null),
             }
         }
-        Expr::Function(function) => evaluate_function(function, schema, row, context),
-        Expr::Cast {
+        ast::Expr::Function(function) => evaluate_function(function, schema, row, context),
+        ast::Expr::Cast {
             kind,
             expr,
             data_type,
             format,
             ..
         } => {
-            if !matches!(kind, CastKind::Cast | CastKind::DoubleColon) || format.is_some() {
+            if !matches!(kind, ast::CastKind::Cast | ast::CastKind::DoubleColon) || format.is_some()
+            {
                 return reject_unsupported("cast variant is not implemented");
             }
             let target = coercion::convert_ast_data_type(data_type)?;
@@ -826,14 +845,18 @@ pub(super) fn evaluate(
                 )
             }
         }
-        Expr::Extract { field, expr, .. } => {
+        ast::Expr::Extract { field, expr, .. } => {
             extract_datetime_field(field.clone(), evaluate(expr, schema, row, context)?)
         }
         _ => reject_unsupported("expression is not implemented"),
     }
 }
 
-fn validate_membership_types(expr: &Expr, list: &[Expr], schema: RowScope<'_>) -> Result<()> {
+fn validate_membership_types(
+    expr: &ast::Expr,
+    list: &[ast::Expr],
+    schema: RowScope<'_>,
+) -> Result<()> {
     let left = extract_row_fields(expr);
     for candidate in list {
         let right = extract_row_fields(candidate);
@@ -850,16 +873,16 @@ fn validate_membership_types(expr: &Expr, list: &[Expr], schema: RowScope<'_>) -
     Ok(())
 }
 
-fn extract_row_fields(expr: &Expr) -> &[Expr] {
+fn extract_row_fields(expr: &ast::Expr) -> &[ast::Expr] {
     match expr {
-        Expr::Tuple(fields) => fields,
+        ast::Expr::Tuple(fields) => fields,
         expr => std::slice::from_ref(expr),
     }
 }
 
 fn evaluate_membership(
-    expr: &Expr,
-    list: &[Expr],
+    expr: &ast::Expr,
+    list: &[ast::Expr],
     negated: bool,
     schema: RowScope<'_>,
     row: &[Value],
@@ -869,25 +892,32 @@ fn evaluate_membership(
     let mut result = Value::Bool(false);
     for candidate in list {
         result = evaluate_boolean_operator(
-            &BinaryOperator::Or,
+            &ast::BinaryOperator::Or,
             result,
-            evaluate_row_comparison(expr, candidate, &BinaryOperator::Eq, schema, row, context)?,
+            evaluate_row_comparison(
+                expr,
+                candidate,
+                &ast::BinaryOperator::Eq,
+                schema,
+                row,
+                context,
+            )?,
         )?;
         if result == Value::Bool(true) {
             break;
         }
     }
     if negated {
-        evaluate_unary_operator(UnaryOperator::Not, result)
+        evaluate_unary_operator(ast::UnaryOperator::Not, result)
     } else {
         Ok(result)
     }
 }
 
 fn evaluate_quantified(
-    left: &Expr,
-    compare_op: &BinaryOperator,
-    right: &Expr,
+    left: &ast::Expr,
+    compare_op: &ast::BinaryOperator,
+    right: &ast::Expr,
     all: bool,
     schema: RowScope<'_>,
     row: &[Value],
@@ -898,9 +928,9 @@ fn evaluate_quantified(
     for candidate in candidates {
         result = evaluate_boolean_operator(
             if all {
-                &BinaryOperator::And
+                &ast::BinaryOperator::And
             } else {
-                &BinaryOperator::Or
+                &ast::BinaryOperator::Or
             },
             result,
             evaluate_row_comparison(left, candidate, compare_op, schema, row, context)?,
@@ -913,9 +943,9 @@ fn evaluate_quantified(
 }
 
 fn evaluate_row_comparison(
-    left: &Expr,
-    right: &Expr,
-    operator: &BinaryOperator,
+    left: &ast::Expr,
+    right: &ast::Expr,
+    operator: &ast::BinaryOperator,
     schema: RowScope<'_>,
     row: &[Value],
     context: &StatementExecutionContext,
@@ -939,7 +969,7 @@ fn evaluate_row_comparison(
         } else {
             evaluate_comparison(operator, &left, &right)?
         };
-        result = evaluate_boolean_operator(&BinaryOperator::And, result, evaluate_comparison)?;
+        result = evaluate_boolean_operator(&ast::BinaryOperator::And, result, evaluate_comparison)?;
         if result == Value::Bool(false) {
             break;
         }
@@ -948,7 +978,7 @@ fn evaluate_row_comparison(
 }
 
 pub(super) fn evaluate_and_coerce(
-    expression: &Expr,
+    expression: &ast::Expr,
     target: BaseType,
     context: CastContext,
     schema: RowScope<'_>,
@@ -969,7 +999,7 @@ pub(super) fn evaluate_and_coerce(
 }
 
 fn evaluate_function(
-    function: &Function,
+    function: &ast::Function,
     schema: RowScope<'_>,
     row: &[Value],
     context: &StatementExecutionContext,
@@ -1057,7 +1087,7 @@ fn evaluate_function(
             )?;
             if !right.is_null()
                 && matches!(
-                    evaluate_comparison(&BinaryOperator::Eq, &left, &right)?,
+                    evaluate_comparison(&ast::BinaryOperator::Eq, &left, &right)?,
                     Value::Bool(true)
                 )
             {
@@ -1084,9 +1114,9 @@ fn evaluate_function(
                     None => value,
                     Some(current) => {
                         let operator = if function_name == "greatest" {
-                            BinaryOperator::Gt
+                            ast::BinaryOperator::Gt
                         } else {
-                            BinaryOperator::Lt
+                            ast::BinaryOperator::Lt
                         };
                         if matches!(
                             evaluate_comparison(&operator, &value, &current)?,
@@ -1139,43 +1169,43 @@ fn evaluate_function(
 }
 
 pub(super) fn evaluate_comparison(
-    operator: &BinaryOperator,
+    operator: &ast::BinaryOperator,
     left: &Value,
     right: &Value,
 ) -> Result<Value> {
     let ordering = compare_values(left, right)?;
     Ok(Value::Bool(match operator {
-        BinaryOperator::Eq => ordering == Ordering::Equal,
-        BinaryOperator::NotEq => ordering != Ordering::Equal,
-        BinaryOperator::Gt => ordering == Ordering::Greater,
-        BinaryOperator::Lt => ordering == Ordering::Less,
-        BinaryOperator::GtEq => ordering != Ordering::Less,
-        BinaryOperator::LtEq => ordering != Ordering::Greater,
+        ast::BinaryOperator::Eq => ordering == Ordering::Equal,
+        ast::BinaryOperator::NotEq => ordering != Ordering::Equal,
+        ast::BinaryOperator::Gt => ordering == Ordering::Greater,
+        ast::BinaryOperator::Lt => ordering == Ordering::Less,
+        ast::BinaryOperator::GtEq => ordering != Ordering::Less,
+        ast::BinaryOperator::LtEq => ordering != Ordering::Greater,
         _ => unreachable!("evaluate_comparison operator was checked by caller"),
     }))
 }
 
-fn extract_datetime_field(field: DateTimeField, value: Value) -> Result<Value> {
+fn extract_datetime_field(field: ast::DateTimeField, value: Value) -> Result<Value> {
     use chrono::{Datelike, Timelike};
     let value = match value {
         Value::Null => return Ok(Value::Null),
         Value::Date(crate::value::PgDate::Finite(value)) => match field {
-            DateTimeField::Year => value.year() as i64,
-            DateTimeField::Month => i64::from(value.month()),
-            DateTimeField::Day => i64::from(value.day()),
-            DateTimeField::Dow => i64::from(value.weekday().num_days_from_sunday()),
-            DateTimeField::Doy => i64::from(value.ordinal()),
-            DateTimeField::Epoch => i64::from(value.num_days_from_ce()) * 86_400,
+            ast::DateTimeField::Year => value.year() as i64,
+            ast::DateTimeField::Month => i64::from(value.month()),
+            ast::DateTimeField::Day => i64::from(value.day()),
+            ast::DateTimeField::Dow => i64::from(value.weekday().num_days_from_sunday()),
+            ast::DateTimeField::Doy => i64::from(value.ordinal()),
+            ast::DateTimeField::Epoch => i64::from(value.num_days_from_ce()) * 86_400,
             _ => {
                 return reject_unsupported("date part is not implemented");
             }
         },
         Value::Time(crate::value::PgTime(value)) => match field {
-            DateTimeField::Hour => value / 3_600_000_000,
-            DateTimeField::Minute => value / 60_000_000 % 60,
-            DateTimeField::Second => value / 1_000_000 % 60,
-            DateTimeField::Microsecond | DateTimeField::Microseconds => value % 1_000_000,
-            DateTimeField::Epoch => value / 1_000_000,
+            ast::DateTimeField::Hour => value / 3_600_000_000,
+            ast::DateTimeField::Minute => value / 60_000_000 % 60,
+            ast::DateTimeField::Second => value / 1_000_000 % 60,
+            ast::DateTimeField::Microsecond | ast::DateTimeField::Microseconds => value % 1_000_000,
+            ast::DateTimeField::Epoch => value / 1_000_000,
             _ => {
                 return reject_unsupported("date part is not implemented");
             }
@@ -1187,31 +1217,31 @@ fn extract_datetime_field(field: DateTimeField, value: Value) -> Result<Value> {
             ));
         }
         Value::Timestamp(crate::value::PgTimestamp::Finite(value)) => match field {
-            DateTimeField::Year => value.year() as i64,
-            DateTimeField::Month => i64::from(value.month()),
-            DateTimeField::Day => i64::from(value.day()),
-            DateTimeField::Hour => i64::from(value.hour()),
-            DateTimeField::Minute => i64::from(value.minute()),
-            DateTimeField::Second => i64::from(value.second()),
-            DateTimeField::Microsecond | DateTimeField::Microseconds => {
+            ast::DateTimeField::Year => value.year() as i64,
+            ast::DateTimeField::Month => i64::from(value.month()),
+            ast::DateTimeField::Day => i64::from(value.day()),
+            ast::DateTimeField::Hour => i64::from(value.hour()),
+            ast::DateTimeField::Minute => i64::from(value.minute()),
+            ast::DateTimeField::Second => i64::from(value.second()),
+            ast::DateTimeField::Microsecond | ast::DateTimeField::Microseconds => {
                 i64::from(value.nanosecond() / 1_000)
             }
-            DateTimeField::Epoch => value.and_utc().timestamp(),
+            ast::DateTimeField::Epoch => value.and_utc().timestamp(),
             _ => {
                 return reject_unsupported("date part is not implemented");
             }
         },
         Value::TimestampTz(crate::value::PgTimestampTz::Finite(value)) => match field {
-            DateTimeField::Year => value.year() as i64,
-            DateTimeField::Month => i64::from(value.month()),
-            DateTimeField::Day => i64::from(value.day()),
-            DateTimeField::Hour => i64::from(value.hour()),
-            DateTimeField::Minute => i64::from(value.minute()),
-            DateTimeField::Second => i64::from(value.second()),
-            DateTimeField::Microsecond | DateTimeField::Microseconds => {
+            ast::DateTimeField::Year => value.year() as i64,
+            ast::DateTimeField::Month => i64::from(value.month()),
+            ast::DateTimeField::Day => i64::from(value.day()),
+            ast::DateTimeField::Hour => i64::from(value.hour()),
+            ast::DateTimeField::Minute => i64::from(value.minute()),
+            ast::DateTimeField::Second => i64::from(value.second()),
+            ast::DateTimeField::Microsecond | ast::DateTimeField::Microseconds => {
                 i64::from(value.nanosecond() / 1_000)
             }
-            DateTimeField::Epoch => value.timestamp(),
+            ast::DateTimeField::Epoch => value.timestamp(),
             _ => {
                 return reject_unsupported("date part is not implemented");
             }
