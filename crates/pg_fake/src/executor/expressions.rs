@@ -471,12 +471,6 @@ fn resolve_operator_type(left: &Expr, right: &Expr, schema: RowScope<'_>) -> Res
         && (left_type == BaseType::Bpchar || right_type == BaseType::Bpchar)
     {
         Ok(BaseType::Text)
-    } else if is_numeric_type(left_type)
-        && is_numeric_type(right_type)
-        && (left_type == BaseType::Float4 && right_type != BaseType::Float4
-            || right_type == BaseType::Float4 && left_type != BaseType::Float4)
-    {
-        Ok(BaseType::Float8)
     } else {
         resolve_expression_pair_type(left, right, schema)
     }
