@@ -460,6 +460,13 @@ fn resolve_expression_pair_type(
 fn resolve_operator_type(left: &Expr, right: &Expr, schema: RowScope<'_>) -> Result<BaseType> {
     let left_type = infer_expression_type(left, schema)?;
     let right_type = infer_expression_type(right, schema)?;
+    if left_type != right_type
+        && (left_type == BaseType::Float4 || right_type == BaseType::Float4)
+        && is_numeric_type(left_type)
+        && is_numeric_type(right_type)
+    {
+        return Ok(BaseType::Float8);
+    }
     let string = |data_type| {
         matches!(
             data_type,

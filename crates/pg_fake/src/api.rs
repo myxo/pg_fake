@@ -715,7 +715,24 @@ impl Session {
             Ok(statement) => statement,
             Err(error) => return self.abort_with_error(error),
         };
-        self.execute_statement(statement)
+        let started_implicit_transaction = self.transaction.is_none();
+        if started_implicit_transaction {
+            self.start_transaction(self.default_isolation, true);
+        }
+        match self.execute_statement(statement) {
+            Ok(result) => {
+                if started_implicit_transaction && self.is_transaction_implicit_batch() {
+                    self.commit_transaction()?;
+                }
+                Ok(result)
+            }
+            Err(error) => {
+                if started_implicit_transaction && self.is_transaction_implicit_batch() {
+                    let _ = self.rollback_transaction();
+                }
+                Err(error)
+            }
+        }
     }
     pub fn begin(&mut self) -> Result<Transaction<'_>> {
         self.begin_with(self.default_isolation)
@@ -848,10 +865,12 @@ impl Session {
             }
         }
     }
+
     fn abort_with_error<T>(&mut self, error: PgError) -> Result<T> {
         self.mark_transaction_aborted();
         Err(error)
     }
+
     fn execute_statement(&mut self, statement: parser::Statement) -> Result<StatementResult> {
         match &statement {
             parser::Statement::Analyze(_) if !self.db.strict => {
@@ -1040,125 +1059,62 @@ impl Session {
                 "DDL in an explicit transaction is not implemented",
             ));
         }
-        if let Some(SessionTransactionState::Active(mut transaction)) = self.transaction {
-            let state_lock = self.db.state.clone();
-            let condvar = self.db.condvar.clone();
-            let state = state_lock.lock().expect("database mutex is poisoned");
-            let snapshot = match transaction.isolation {
-                IsolationLevel::ReadCommitted => Snapshot::create(&state.transactions),
-                IsolationLevel::RepeatableRead => *transaction
-                    .snapshot
-                    .get_or_insert_with(|| Snapshot::create(&state.transactions)),
-            };
-            transaction.statement_started = true;
-            self.transaction = Some(SessionTransactionState::Active(transaction));
-            let context = executor::StatementExecutionContext {
-                transaction_timestamp: transaction.transaction_timestamp,
-                statement_timestamp: self.db.read_clock(),
-                clock_timestamp: self.db.read_clock(),
-                rng: self.db.rng.clone(),
-            };
-            let statement = match executor::materialize_uncorrelated_subqueries(
-                &state,
-                &statement,
-                transaction.xid,
-                &snapshot,
-                &context,
-            ) {
-                Ok(statement) => statement,
-                Err(error) => return self.abort_with_error(error),
-            };
-            if transaction.implicit_batch
-                && matches!(parser::classify(&statement), parser::StatementKind::Ddl)
-            {
-                let undo = match collect_ddl_undo_for_statement(&state, &statement) {
-                    Ok(undo) => undo,
-                    Err(error) => return self.abort_with_error(error),
-                };
-                self.ddl_undo.extend(undo);
-            }
-            let (mut state, snapshot) = match acquire_row_locks(
-                &condvar,
-                self.lock_timeout,
-                state,
-                &statement,
-                transaction.xid,
-                transaction.isolation,
-                snapshot,
-                &context,
-            ) {
-                Ok(acquired) => acquired,
-                Err(error) => return self.abort_with_error(error),
-            };
-            return match executor::execute_statement(
-                &mut state,
-                &statement,
-                transaction.xid,
-                &snapshot,
-                &self.deferred_constraints,
-                self.defer_all_constraints,
-                &context,
-            ) {
-                Ok(result) => {
-                    if contains_dml(&statement)
-                        && executor::contains_deferred_foreign_keys(
-                            &state,
-                            &self.deferred_constraints,
-                            self.defer_all_constraints,
-                        )
-                    {
-                        self.deferred_foreign_keys_dirty = true;
-                    }
-                    Ok(result)
-                }
-                Err(error) => {
-                    drop(state);
-                    self.abort_with_error(error)
-                }
-            };
-        }
-        let mut state = self.db.state.lock().expect("database mutex is poisoned");
-        let xid = state.transactions.begin();
-        let snapshot = Snapshot::create(&state.transactions);
-        let now = self.db.read_clock();
+        let Some(SessionTransactionState::Active(mut transaction)) = self.transaction else {
+            unreachable!("transaction must be active while executing a statement")
+        };
+        let state_lock = self.db.state.clone();
+        let condvar = self.db.condvar.clone();
+        let state = state_lock.lock().expect("database mutex is poisoned");
+        let snapshot = match transaction.isolation {
+            IsolationLevel::ReadCommitted => Snapshot::create(&state.transactions),
+            IsolationLevel::RepeatableRead => *transaction
+                .snapshot
+                .get_or_insert_with(|| Snapshot::create(&state.transactions)),
+        };
+        transaction.statement_started = true;
+        self.transaction = Some(SessionTransactionState::Active(transaction));
         let context = executor::StatementExecutionContext {
-            transaction_timestamp: now,
-            statement_timestamp: now,
-            clock_timestamp: now,
+            transaction_timestamp: transaction.transaction_timestamp,
+            statement_timestamp: self.db.read_clock(),
+            clock_timestamp: self.db.read_clock(),
             rng: self.db.rng.clone(),
         };
         let statement = match executor::materialize_uncorrelated_subqueries(
-            &state, &statement, xid, &snapshot, &context,
+            &state,
+            &statement,
+            transaction.xid,
+            &snapshot,
+            &context,
         ) {
             Ok(statement) => statement,
-            Err(error) => {
-                abort_database_transaction(&mut state, xid);
-                self.db.condvar.notify_all();
-                return Err(error);
-            }
+            Err(error) => return self.abort_with_error(error),
         };
+        if transaction.implicit_batch
+            && matches!(parser::classify(&statement), parser::StatementKind::Ddl)
+        {
+            let undo = match collect_ddl_undo_for_statement(&state, &statement) {
+                Ok(undo) => undo,
+                Err(error) => return self.abort_with_error(error),
+            };
+            self.ddl_undo.extend(undo);
+        }
         let (mut state, snapshot) = match acquire_row_locks(
-            &self.db.condvar,
+            &condvar,
             self.lock_timeout,
             state,
             &statement,
-            xid,
-            self.default_isolation,
+            transaction.xid,
+            transaction.isolation,
             snapshot,
             &context,
         ) {
             Ok(acquired) => acquired,
-            Err(error) => {
-                let mut state = self.db.state.lock().expect("database mutex is poisoned");
-                abort_database_transaction(&mut state, xid);
-                self.db.condvar.notify_all();
-                return Err(error);
-            }
+            Err(error) => return self.abort_with_error(error),
         };
         match executor::execute_statement(
             &mut state,
             &statement,
-            xid,
+            transaction.xid,
             &snapshot,
             &self.deferred_constraints,
             self.defer_all_constraints,
@@ -1171,22 +1127,14 @@ impl Session {
                         &self.deferred_constraints,
                         self.defer_all_constraints,
                     )
-                    && let Err(error) = executor::validate_deferred_foreign_keys(&state, xid)
                 {
-                    abort_database_transaction(&mut state, xid);
-                    self.db.condvar.notify_all();
-                    return Err(error);
+                    self.deferred_foreign_keys_dirty = true;
                 }
-                state.transactions.commit(xid);
-                state.row_locks.release_transaction_locks(xid);
-                state.wait_for.remove_transaction(xid);
-                self.db.condvar.notify_all();
                 Ok(result)
             }
             Err(error) => {
-                abort_database_transaction(&mut state, xid);
-                self.db.condvar.notify_all();
-                Err(error)
+                drop(state);
+                self.abort_with_error(error)
             }
         }
     }
@@ -1825,6 +1773,28 @@ mod tests {
                 .rows
                 .is_empty()
         );
+    }
+
+    #[test]
+    fn finishes_implicit_prepared_transactions() {
+        let db = Db::create();
+        let mut session = db.create_session();
+        session
+            .execute("CREATE TABLE items (id INTEGER PRIMARY KEY)")
+            .unwrap();
+        let insert = session.prepare("INSERT INTO items VALUES ($1)").unwrap();
+
+        assert_eq!(session.execute_prepared(&insert, &[Value::Int4(1)]), Ok(1));
+        assert!(session.transaction.is_none());
+        assert_eq!(
+            session
+                .execute_prepared(&insert, &[Value::Int4(1)])
+                .unwrap_err()
+                .sqlstate,
+            SqlState::UniqueViolation
+        );
+        assert!(session.transaction.is_none());
+        assert_eq!(session.execute_prepared(&insert, &[Value::Int4(2)]), Ok(1));
     }
 
     #[test]
@@ -2494,6 +2464,7 @@ mod tests {
                         int_value + big_value,
                         big_value + numeric_value,
                         numeric_value + real_value,
+                        real_value + int_value,
                         real_value + double_value,
                         int_value = '2',
                         CASE WHEN TRUE THEN int_value ELSE numeric_value END,
@@ -2507,7 +2478,8 @@ mod tests {
                 Value::Int4(3),
                 Value::Int8(5),
                 Value::Numeric("7".parse().unwrap()),
-                Value::Float4(9.0),
+                Value::Float8(9.0),
+                Value::Float8(7.0),
                 Value::Float8(11.0),
                 Value::Bool(true),
                 Value::Numeric("2".parse().unwrap()),
@@ -2559,6 +2531,17 @@ mod tests {
                 .unwrap()
                 .rows,
             vec![vec![Value::Int2(2), Value::Int4(7)]]
+        );
+
+        session
+            .execute("UPDATE types SET real_value = -0.02")
+            .unwrap();
+        assert_eq!(
+            session
+                .query("SELECT real_value IS DISTINCT FROM -0.02 FROM types", &[])
+                .unwrap()
+                .rows,
+            vec![vec![Value::Bool(true)]]
         );
     }
 

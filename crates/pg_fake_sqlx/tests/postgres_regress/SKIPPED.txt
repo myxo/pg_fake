@@ -133,7 +133,7 @@ union:1
 updatable_views:1
 update:8
 uuid:3
-varchar:13
+varchar:17
 window:3
 with:1
 without_overlaps:1
