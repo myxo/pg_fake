@@ -54,6 +54,7 @@ pub enum SqlState {
     CannotCoerce,           // 42846
     DatatypeMismatch,       // 42804
     InvalidColumnReference, // 42P10
+    GroupingError,          // 42803
 
     // 55 — Object Not In Prerequisite State
     LockNotAvailable, // 55P03
@@ -97,6 +98,7 @@ impl SqlState {
             SqlState::CannotCoerce => "42846",
             SqlState::DatatypeMismatch => "42804",
             SqlState::InvalidColumnReference => "42P10",
+            SqlState::GroupingError => "42803",
             SqlState::LockNotAvailable => "55P03",
             SqlState::InternalError => "XX000",
         }

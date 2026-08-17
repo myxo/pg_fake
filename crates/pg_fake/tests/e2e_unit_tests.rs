@@ -593,6 +593,134 @@ fn matches_case_boundaries_and_function_errors() {
 }
 
 #[test]
+fn matches_global_aggregate_results() {
+    assert_differential(
+        "CREATE TABLE __TABLE__ (
+             small_value SMALLINT, int_value INTEGER, big_value BIGINT,
+             numeric_value NUMERIC(8, 2), real_value REAL,
+             double_value DOUBLE PRECISION, flag BOOLEAN, label TEXT,
+             bytes BYTEA, happened_on DATE, elapsed INTERVAL
+         ); \
+         INSERT INTO __TABLE__ VALUES
+             (1, 2, 3, 4.50, 1.25, 2.5, TRUE, 'b', '\\x02', '2024-01-02', '1 day'),
+             (2, 3, 4, 5.50, 2.25, 3.5, FALSE, 'a', '\\x01', '2024-01-01', '2 days'),
+             (NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL); \
+         SELECT count(*), count(int_value), sum(small_value), sum(int_value),
+                sum(big_value), sum(numeric_value), sum(real_value), sum(double_value)
+         FROM __TABLE__; \
+         SELECT avg(small_value), avg(int_value), avg(big_value), avg(numeric_value),
+                avg(real_value), avg(double_value), sum(elapsed), avg(elapsed)
+         FROM __TABLE__; \
+         SELECT min(int_value), max(int_value), min(label), max(label),
+                min(bytes), max(bytes), min(happened_on), max(happened_on),
+                bool_and(flag), bool_or(flag)
+         FROM __TABLE__; \
+         SELECT count(*) + count(int_value), coalesce(sum(int_value), 0),
+                max(int_value) - min(int_value)
+         FROM __TABLE__ ORDER BY count(*)",
+        RowOrder::Ordered,
+    );
+}
+
+#[test]
+fn matches_empty_and_filtered_global_aggregates() {
+    assert_differential(
+        "CREATE TABLE __TABLE__ (id INTEGER, flag BOOLEAN); \
+         SELECT count(*), count(id), sum(id), avg(id), min(id), max(id),
+                bool_and(flag), bool_or(flag) FROM __TABLE__; \
+         INSERT INTO __TABLE__ VALUES (1, TRUE), (NULL, NULL); \
+         SELECT count(*), count(id), sum(id), avg(id), min(id), max(id),
+                bool_and(flag), bool_or(flag) FROM __TABLE__ WHERE id > 10; \
+         SELECT count(*) FROM __TABLE__ LIMIT 0; \
+         SELECT count(*) FROM __TABLE__ OFFSET 1",
+        RowOrder::Ordered,
+    );
+}
+
+#[test]
+fn matches_aggregates_with_scalar_subqueries() {
+    assert_differential(
+        "CREATE TABLE __TABLE__ (id INTEGER); \
+         INSERT INTO __TABLE__ VALUES (1), (2), (3); \
+         SELECT (SELECT sum(inner_row.id) FROM __TABLE__ AS inner_row
+                 WHERE inner_row.id <= outer_row.id)
+         FROM __TABLE__ AS outer_row ORDER BY outer_row.id; \
+         SELECT sum((SELECT inner_row.id FROM __TABLE__ AS inner_row
+                     WHERE inner_row.id = outer_row.id))
+         FROM __TABLE__ AS outer_row",
+        RowOrder::Ordered,
+    );
+}
+
+#[test]
+fn matches_aggregate_errors() {
+    assert_differential(
+        "CREATE TABLE __TABLE__ (id INTEGER, flag BOOLEAN); \
+         INSERT INTO __TABLE__ VALUES (1, TRUE), (2, FALSE); \
+         SELECT id, count(*) FROM __TABLE__; \
+         SELECT sum(count(*)) FROM __TABLE__; \
+         SELECT id FROM __TABLE__ WHERE count(*) > 0; \
+         SELECT sum(id) FROM __TABLE__ ORDER BY id; \
+         SELECT count(*) FROM __TABLE__ FOR UPDATE; \
+         SELECT sum(flag), bool_and(id), min(flag), max(flag) FROM __TABLE__",
+        RowOrder::Unordered,
+    );
+}
+
+#[test]
+fn matches_aggregate_overflow_errors() {
+    assert_differential(
+        "CREATE TABLE __TABLE__ (real_value REAL, double_value DOUBLE PRECISION); \
+         INSERT INTO __TABLE__ VALUES (3e38, 1e308), (3e38, 1e308); \
+         SELECT sum(real_value) FROM __TABLE__; \
+         SELECT sum(double_value) FROM __TABLE__",
+        RowOrder::Unordered,
+    );
+}
+
+#[test]
+fn reports_aggregate_result_metadata() {
+    let db = Db::create();
+    let mut session = db.create_session();
+    session
+        .execute(
+            "CREATE TABLE aggregate_metadata (
+                 small_value SMALLINT, int_value INTEGER, big_value BIGINT,
+                 real_value REAL, label VARCHAR(10), flag BOOLEAN
+             )",
+        )
+        .unwrap();
+
+    let result = session
+        .query(
+            "SELECT count(*), sum(small_value), sum(int_value), sum(big_value),
+                    sum(real_value), avg(int_value), avg(real_value), min(label), bool_and(flag)
+             FROM aggregate_metadata",
+            &[],
+        )
+        .unwrap();
+
+    assert_eq!(
+        result
+            .columns
+            .iter()
+            .map(|column| (column.name.as_str(), column.type_oid, column.typmod))
+            .collect::<Vec<_>>(),
+        vec![
+            ("count", 20, -1),
+            ("sum", 20, -1),
+            ("sum", 20, -1),
+            ("sum", 1700, -1),
+            ("sum", 700, -1),
+            ("avg", 1700, -1),
+            ("avg", 701, -1),
+            ("min", 25, -1),
+            ("bool_and", 16, -1),
+        ]
+    );
+}
+
+#[test]
 fn matches_coercion_errors() {
     assert_differential(
         "CREATE TABLE __TABLE__ (

@@ -9,6 +9,9 @@ If there is anything uncomplete in task description, you must ask user question 
 After finishing task of plan, give brief summary of what you did, give examples of sql queries that now
 processed by pg_fake (if applicable) and wait for user approval. Only then mark task as complete.
 
+If user ask for commit, make concise explanatory commit message. If feature include new supported sql
+features, add query examples to commit
+
 General rules:
 - do not change code if I asked the question without asking for action
 - do not run git commands unless I specifically told you to

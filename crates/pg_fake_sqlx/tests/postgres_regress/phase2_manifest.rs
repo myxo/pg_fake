@@ -173,7 +173,7 @@ pub const FEATURES: &[Feature] = &[
                 "INSERT INTO aggregate_rows VALUES (1), (2)",
             ],
             sql: "SELECT count(*) FROM aggregate_rows",
-            baseline: Baseline::Pending,
+            baseline: Baseline::MustPass,
         }],
     },
     Feature {

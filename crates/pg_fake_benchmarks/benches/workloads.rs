@@ -897,12 +897,49 @@ fn benchmarks(criterion: &mut Criterion) {
         foreign_key_insert_benchmark(criterion, &runtime, &mut connections);
         inner_join_benchmark(criterion, &runtime, &mut connections);
         derived_and_scalar_subquery_benchmark(criterion, &runtime, &mut connections);
+        global_aggregate_benchmark(criterion, &runtime, &mut connections);
     }
     runtime
         .block_on(
             sqlx::query("DROP SCHEMA pgfake_benchmark CASCADE").execute(&mut postgres.connection),
         )
         .unwrap();
+}
+
+fn global_aggregate_benchmark(
+    criterion: &mut Criterion,
+    runtime: &Runtime,
+    connections: &mut [NamedBenchmarkConnection<'_>],
+) {
+    let values = (1..=100)
+        .map(|id| format!("({id}, {})", id % 10))
+        .collect::<Vec<_>>()
+        .join(",");
+    for (_, connection) in connections.iter_mut() {
+        connection.execute(
+            runtime,
+            "CREATE TABLE global_aggregate_100_rows (id INTEGER, bucket INTEGER)",
+        );
+        connection.execute(
+            runtime,
+            &format!("INSERT INTO global_aggregate_100_rows VALUES {values}"),
+        );
+    }
+    let query = "SELECT count(*), sum(id), avg(id), min(bucket), max(bucket) FROM global_aggregate_100_rows";
+    let mut group =
+        criterion.benchmark_group(benchmarks::find_benchmark("global_aggregate_100_rows").name);
+    group.throughput(Throughput::Elements(100));
+    for (name, connection) in connections.iter_mut() {
+        group.bench_function(*name, |benchmark| {
+            benchmark.iter(|| {
+                connection.fetch(runtime, query);
+            });
+        });
+    }
+    group.finish();
+    for (_, connection) in connections.iter_mut() {
+        connection.execute(runtime, "DROP TABLE global_aggregate_100_rows");
+    }
 }
 
 fn derived_and_scalar_subquery_benchmark(

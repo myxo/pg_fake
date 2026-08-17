@@ -246,7 +246,7 @@ semantics.
 
 ## Milestone C — Aggregation and duplicate elimination
 
-### Task 9 — Aggregate execution and core aggregate functions
+### Task 9 — Aggregate execution and core aggregate functions [COMPLETE]
 
 **Goal:** Add the aggregate execution stage and the common PostgreSQL aggregate
 set.
@@ -268,6 +268,29 @@ set.
 
 **Notes:** Statistical, ordered-set, hypothetical-set, and user-defined
 aggregates are outside Phase 2.
+
+**Completed:**
+
+- Global aggregation now reduces filtered source rows into one result row,
+  including empty inputs and aggregate queries without `FROM`.
+- `count(*)`, `count(expr)`, `sum`, `avg`, `min`, `max`, `bool_and`, and
+  `bool_or` implement PostgreSQL-compatible signatures, NULL behavior,
+  accumulator/result types, metadata OIDs, and numeric/float/interval overflow
+  paths for the supported types.
+- Aggregate calls compose with scalar expressions, ordering, aliases, limits,
+  and scalar subqueries in both directions. Bare columns, nested aggregates,
+  aggregates in `WHERE`, and row locking on aggregate queries return the
+  PostgreSQL error category.
+- Focused native and PostgreSQL differential coverage includes mixed and
+  all-NULL inputs, empty filters, overflow, metadata, illegal placement, and
+  correlated scalar subqueries. The generated differential suite now emits
+  aggregate workloads, and the benchmark registry includes a 100-row global
+  aggregate scan.
+- The Phase 2 manifest promotes the aggregate case to `MustPass`; the current
+  report records 417 matching corpus statements, 141 skipped scripts, and 23
+  passing Phase 2 conformance cases with no aggregate blocker.
+- `cargo test --workspace`, `cargo check --workspace --all-targets`, and the
+  10,000-iteration property suite pass.
 
 ### Task 10 — `GROUP BY`, aggregate modifiers, and `HAVING`
 

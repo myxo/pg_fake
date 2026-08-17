@@ -553,6 +553,9 @@ fn extract_function_arguments(function: &ast::Function) -> Result<Vec<&ast::Expr
 }
 
 fn infer_function_return_type(function: &ast::Function, schema: RowScope<'_>) -> Result<BaseType> {
+    if let Some(result) = infer_aggregate_return_type(function, schema)? {
+        return Ok(result);
+    }
     let function_name = normalize_unqualified_object_name(&function.name)?;
     let arguments = extract_function_arguments(function)?;
     let signature_error = || {
@@ -1004,6 +1007,13 @@ fn evaluate_function(
     row: &[Value],
     context: &StatementExecutionContext,
 ) -> Result<Value> {
+    if is_aggregate_function(function) {
+        infer_aggregate_return_type(function, schema)?;
+        return Err(PgError::create(
+            SqlState::GroupingError,
+            "aggregate function is not allowed in this context",
+        ));
+    }
     infer_function_return_type(function, schema)?;
     let function_name = normalize_unqualified_object_name(&function.name)?;
     let arguments = extract_function_arguments(function)?;
@@ -1283,7 +1293,19 @@ pub(super) fn compare_values(left: &Value, right: &Value) -> Result<Ordering> {
         (Value::Time(left), Value::Time(right)) => left.cmp(right),
         (Value::Timestamp(left), Value::Timestamp(right)) => left.cmp(right),
         (Value::TimestampTz(left), Value::TimestampTz(right)) => left.cmp(right),
-        (Value::Interval(left), Value::Interval(right)) => left.cmp(right),
+        (Value::Interval(left), Value::Interval(right)) => {
+            let left = i128::from(left.months)
+                * i128::from(DAYS_PER_MONTH)
+                * i128::from(MICROSECONDS_PER_DAY)
+                + i128::from(left.days) * i128::from(MICROSECONDS_PER_DAY)
+                + i128::from(left.micros);
+            let right = i128::from(right.months)
+                * i128::from(DAYS_PER_MONTH)
+                * i128::from(MICROSECONDS_PER_DAY)
+                + i128::from(right.days) * i128::from(MICROSECONDS_PER_DAY)
+                + i128::from(right.micros);
+            left.cmp(&right)
+        }
         _ => {
             return Err(PgError::create(
                 SqlState::DatatypeMismatch,

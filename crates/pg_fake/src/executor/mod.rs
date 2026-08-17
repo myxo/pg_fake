@@ -11,7 +11,7 @@ use crate::{
         RowLockKey, RowLockManager, RowLockMode, Snapshot, TransactionRegistry, TransactionStatus,
         WaitForGraph, Xid, find_visible_version,
     },
-    value::{BaseType, PgType, Value},
+    value::{BaseType, DAYS_PER_MONTH, MICROSECONDS_PER_DAY, PgType, Value},
 };
 use sqlparser::ast;
 use std::{
@@ -20,6 +20,7 @@ use std::{
     sync::{Arc, Mutex},
 };
 
+mod aggregates;
 mod arithmetic;
 mod expressions;
 mod foreign_keys;
@@ -28,6 +29,7 @@ mod query;
 mod scope;
 mod writes;
 
+use aggregates::{evaluate_aggregate_function, infer_aggregate_return_type, is_aggregate_function};
 use arithmetic::{
     evaluate_boolean_operator, evaluate_distinctness, evaluate_numeric_operator,
     evaluate_temporal_arithmetic, evaluate_unary_operator, infer_interval_arithmetic_type,

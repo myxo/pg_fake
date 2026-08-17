@@ -344,10 +344,29 @@ pub(super) fn evaluate_temporal_arithmetic(
                 "interval out of range",
             ));
         }
+        let scaled_months = f64::from(value.months) * factor;
+        let months = scaled_months.trunc();
+        let scaled_days =
+            f64::from(value.days) * factor + (scaled_months - months) * f64::from(DAYS_PER_MONTH);
+        let days = scaled_days.trunc();
+        let scaled_micros =
+            value.micros as f64 * factor + (scaled_days - days) * MICROSECONDS_PER_DAY as f64;
+        if months < f64::from(i32::MIN)
+            || months > f64::from(i32::MAX)
+            || days < f64::from(i32::MIN)
+            || days > f64::from(i32::MAX)
+            || scaled_micros < i64::MIN as f64
+            || scaled_micros > i64::MAX as f64
+        {
+            return Err(PgError::create(
+                SqlState::NumericValueOutOfRange,
+                "interval out of range",
+            ));
+        }
         Ok(crate::value::PgInterval {
-            months: (f64::from(value.months) * factor).round() as i32,
-            days: (f64::from(value.days) * factor).round() as i32,
-            micros: (value.micros as f64 * factor).round() as i64,
+            months: months as i32,
+            days: days as i32,
+            micros: scaled_micros.round() as i64,
         })
     }
     fn negate_interval_if(

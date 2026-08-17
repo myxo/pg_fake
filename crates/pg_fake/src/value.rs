@@ -7,6 +7,9 @@ use crate::error::{PgError, Result, SqlState};
 /// A PostgreSQL type OID (unsigned 32-bit, matching `pg_type.oid`).
 pub type Oid = u32;
 
+pub(crate) const DAYS_PER_MONTH: i32 = 30;
+pub(crate) const MICROSECONDS_PER_DAY: i64 = 86_400_000_000;
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 pub enum PgDate {
     NegInfinity,
@@ -293,7 +296,7 @@ impl Value {
             Value::Date(PgDate::NegInfinity) => "-infinity".into(),
             Value::Date(PgDate::Infinity) => "infinity".into(),
             Value::Date(PgDate::Finite(value)) => value.format("%Y-%m-%d").to_string(),
-            Value::Time(PgTime(value)) if *value == 86_400_000_000 => "24:00:00".into(),
+            Value::Time(PgTime(value)) if *value == MICROSECONDS_PER_DAY => "24:00:00".into(),
             Value::Time(PgTime(value)) => {
                 let hours = value / 3_600_000_000;
                 let minutes = value / 60_000_000 % 60;
@@ -559,7 +562,7 @@ fn parse_date(input: &str) -> Result<PgDate> {
 fn parse_time(input: &str) -> Result<PgTime> {
     let input = input.trim();
     if input == "24:00" || input == "24:00:00" || input == "24:00:00.0" {
-        return Ok(PgTime(86_400_000_000));
+        return Ok(PgTime(MICROSECONDS_PER_DAY));
     }
     let value = chrono::NaiveTime::parse_from_str(input, "%H:%M:%S%.f")
         .or_else(|_| chrono::NaiveTime::parse_from_str(input, "%H:%M"))

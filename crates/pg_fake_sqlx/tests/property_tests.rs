@@ -911,6 +911,61 @@ fn generate_select(src: &mut Source, table: &TableSchema) -> (String, RowOrder) 
     (sql, row_order)
 }
 
+fn generate_aggregate(src: &mut Source, table: &TableSchema) -> (String, RowOrder) {
+    src.select(
+        "aggregate",
+        &["count", "sum", "average", "minimum_maximum", "boolean"],
+        |src, aggregate, _| {
+            let projections = match aggregate {
+                "count" => {
+                    let column = choose_column(src, table, |_| true);
+                    format!(
+                        "count(*), count({}), count(*) + count({})",
+                        column.name, column.name
+                    )
+                }
+                "sum" => {
+                    let column = choose_column(src, table, |column| column.data_type.is_numeric());
+                    format!("sum({0}), coalesce(sum({0}), 0)", column.name)
+                }
+                "average" => {
+                    let column = choose_column(src, table, |column| column.data_type.is_numeric());
+                    format!("avg({0}), coalesce(avg({0}), 0)", column.name)
+                }
+                "minimum_maximum" => {
+                    let column =
+                        choose_column(src, table, |column| column.data_type != SqlType::Boolean);
+                    format!("min({0}), max({0})", column.name)
+                }
+                "boolean" => {
+                    let booleans = table
+                        .columns
+                        .iter()
+                        .filter(|column| column.data_type == SqlType::Boolean)
+                        .collect::<Vec<_>>();
+                    if booleans.is_empty() {
+                        "bool_and(TRUE), bool_or(FALSE)".into()
+                    } else {
+                        let (column, _) = src
+                            .choose("column", &booleans)
+                            .expect("boolean columns must not be empty");
+                        format!("bool_and({0}), bool_or({0})", column.name)
+                    }
+                }
+                _ => unreachable!(),
+            };
+            (
+                format!(
+                    "SELECT {projections} FROM {}{}",
+                    table.name,
+                    generate_where_clause(src, table)
+                ),
+                RowOrder::Ordered,
+            )
+        },
+    )
+}
+
 fn generate_assignment(src: &mut Source, column: &ColumnSchema) -> String {
     let mut variants = vec!["literal", "expression"];
     if column.nullable {
@@ -1164,6 +1219,7 @@ fn generated_sql_matches_postgres() {
                 &[
                     "insert",
                     "select",
+                    "aggregate",
                     "join",
                     "subquery",
                     "foreign_insert",
@@ -1178,6 +1234,7 @@ fn generated_sql_matches_postgres() {
                 &[
                     "insert",
                     "select",
+                    "aggregate",
                     "join",
                     "subquery",
                     "foreign_insert",
@@ -1196,6 +1253,7 @@ fn generated_sql_matches_postgres() {
                         RowOrder::Unordered,
                     ),
                     "select" => generate_select(src, &table),
+                    "aggregate" => generate_aggregate(src, &table),
                     "join" => generate_join(src, &table),
                     "subquery" => generate_subquery(src, &table),
                     "foreign_insert" => (

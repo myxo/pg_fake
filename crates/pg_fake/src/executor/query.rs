@@ -458,6 +458,28 @@ struct OrderedRow {
     values: Vec<Value>,
     keys: Vec<Value>,
 }
+#[derive(Default)]
+struct AggregateUsage {
+    found: bool,
+    outside_column: bool,
+}
+struct AggregateValidator<'a> {
+    scope: &'a BoundScope,
+    query_depth: usize,
+    aggregate_depth: usize,
+    usage: AggregateUsage,
+    error: Option<PgError>,
+}
+struct AggregateMaterializer<'a> {
+    state: &'a DatabaseState,
+    scope: &'a BoundScope,
+    rows: &'a [Vec<Value>],
+    xid: Xid,
+    snapshot: &'a Snapshot,
+    context: &'a StatementExecutionContext,
+    query_depth: usize,
+    error: Option<PgError>,
+}
 #[derive(Eq, Hash, PartialEq)]
 enum JoinKey {
     Bool(bool),
@@ -467,6 +489,178 @@ enum JoinKey {
     Text(String),
     Bytea(Vec<u8>),
     Uuid(uuid::Uuid),
+}
+
+impl ast::VisitorMut for AggregateValidator<'_> {
+    type Break = ();
+
+    fn pre_visit_query(&mut self, _query: &mut ast::Query) -> std::ops::ControlFlow<Self::Break> {
+        self.query_depth += 1;
+        std::ops::ControlFlow::Continue(())
+    }
+
+    fn post_visit_query(&mut self, _query: &mut ast::Query) -> std::ops::ControlFlow<Self::Break> {
+        self.query_depth -= 1;
+        std::ops::ControlFlow::Continue(())
+    }
+
+    fn pre_visit_expr(&mut self, expression: &mut ast::Expr) -> std::ops::ControlFlow<Self::Break> {
+        if self.query_depth != 0 {
+            return std::ops::ControlFlow::Continue(());
+        }
+        if let ast::Expr::Function(function) = expression
+            && is_aggregate_function(function)
+        {
+            if self.aggregate_depth != 0 {
+                self.error = Some(PgError::create(
+                    SqlState::GroupingError,
+                    "aggregate function calls cannot be nested",
+                ));
+                return std::ops::ControlFlow::Break(());
+            }
+            if let Err(error) = infer_aggregate_return_type(function, RowScope::Bound(self.scope)) {
+                self.error = Some(error);
+                return std::ops::ControlFlow::Break(());
+            }
+            self.usage.found = true;
+            self.aggregate_depth += 1;
+        } else if self.aggregate_depth == 0
+            && matches!(
+                expression,
+                ast::Expr::Identifier(_) | ast::Expr::CompoundIdentifier(_)
+            )
+        {
+            self.usage.outside_column = true;
+        }
+        std::ops::ControlFlow::Continue(())
+    }
+
+    fn post_visit_expr(
+        &mut self,
+        expression: &mut ast::Expr,
+    ) -> std::ops::ControlFlow<Self::Break> {
+        if self.query_depth == 0
+            && matches!(expression, ast::Expr::Function(function) if is_aggregate_function(function))
+        {
+            self.aggregate_depth -= 1;
+        }
+        std::ops::ControlFlow::Continue(())
+    }
+}
+
+impl ast::VisitorMut for AggregateMaterializer<'_> {
+    type Break = ();
+
+    fn pre_visit_query(&mut self, _query: &mut ast::Query) -> std::ops::ControlFlow<Self::Break> {
+        self.query_depth += 1;
+        std::ops::ControlFlow::Continue(())
+    }
+
+    fn post_visit_query(&mut self, _query: &mut ast::Query) -> std::ops::ControlFlow<Self::Break> {
+        self.query_depth -= 1;
+        std::ops::ControlFlow::Continue(())
+    }
+
+    fn pre_visit_expr(&mut self, expression: &mut ast::Expr) -> std::ops::ControlFlow<Self::Break> {
+        if self.query_depth != 0 {
+            return std::ops::ControlFlow::Continue(());
+        }
+        let ast::Expr::Function(function) = expression else {
+            return std::ops::ControlFlow::Continue(());
+        };
+        if !is_aggregate_function(function) {
+            return std::ops::ControlFlow::Continue(());
+        }
+        let original_argument = match &function.args {
+            ast::FunctionArguments::List(arguments) => match arguments.args.as_slice() {
+                [ast::FunctionArg::Unnamed(ast::FunctionArgExpr::Expr(argument))] => Some(argument),
+                _ => None,
+            },
+            _ => None,
+        };
+        let typed_expression = match super::scope::substitute_typed_subqueries(
+            &self.state.catalog,
+            &ast::Expr::Function(function.clone()),
+            self.scope,
+        ) {
+            Ok(expression) => expression,
+            Err(error) => {
+                self.error = Some(error);
+                return std::ops::ControlFlow::Break(());
+            }
+        };
+        let ast::Expr::Function(typed_function) = typed_expression else {
+            unreachable!("typed aggregate expression remains a function")
+        };
+        match evaluate_aggregate_function(
+            &typed_function,
+            RowScope::Bound(self.scope),
+            self.rows,
+            |row| {
+                evaluate_query_expression(
+                    self.state,
+                    original_argument.expect("aggregate expression argument was validated"),
+                    self.scope,
+                    row,
+                    self.xid,
+                    self.snapshot,
+                    self.context,
+                )
+            },
+        ) {
+            Ok((value, data_type)) => {
+                *expression =
+                    crate::analyzer::create_typed_literal(value, PgType::create(data_type));
+                std::ops::ControlFlow::Continue(())
+            }
+            Err(error) => {
+                self.error = Some(error);
+                std::ops::ControlFlow::Break(())
+            }
+        }
+    }
+}
+
+fn inspect_aggregate_usage(
+    state: &DatabaseState,
+    expression: &ast::Expr,
+    scope: &BoundScope,
+) -> Result<AggregateUsage> {
+    let mut expression =
+        super::scope::substitute_typed_subqueries(&state.catalog, expression, scope)?;
+    let mut validator = AggregateValidator {
+        scope,
+        query_depth: 0,
+        aggregate_depth: 0,
+        usage: AggregateUsage::default(),
+        error: None,
+    };
+    let _ = expression.visit(&mut validator);
+    validator.error.map_or(Ok(validator.usage), Err)
+}
+
+fn materialize_aggregate_expression(
+    state: &DatabaseState,
+    expression: &ast::Expr,
+    scope: &BoundScope,
+    rows: &[Vec<Value>],
+    xid: Xid,
+    snapshot: &Snapshot,
+    context: &StatementExecutionContext,
+) -> Result<ast::Expr> {
+    let mut expression = expression.clone();
+    let mut materializer = AggregateMaterializer {
+        state,
+        scope,
+        rows,
+        xid,
+        snapshot,
+        context,
+        query_depth: 0,
+        error: None,
+    };
+    let _ = expression.visit(&mut materializer);
+    materializer.error.map_or(Ok(expression), Err)
 }
 pub(super) fn resolve_select_lock_mode(query: &ast::Query) -> Result<Option<RowLockMode>> {
     if query.locks.len() > 1 {
@@ -687,7 +881,7 @@ pub(super) fn execute_query(
     if query.with.is_some() || query.fetch.is_some() {
         return reject_unsupported("query clause is not implemented");
     }
-    resolve_select_lock_mode(query)?;
+    let lock_mode = resolve_select_lock_mode(query)?;
     let ast::SetExpr::Select(select) = query.body.as_ref() else {
         if let ast::SetExpr::Values(values) = query.body.as_ref() {
             return execute_values_query(query, values, context);
@@ -706,6 +900,14 @@ pub(super) fn execute_query(
         return reject_unsupported("SELECT feature is not implemented");
     }
     let scope = bind_select_scope(state, select)?;
+    if let Some(selection) = &select.selection
+        && inspect_aggregate_usage(state, selection, &scope)?.found
+    {
+        return Err(PgError::create(
+            SqlState::GroupingError,
+            "aggregate functions are not allowed in WHERE",
+        ));
+    }
     let (limit, offset) = match &query.limit_clause {
         None => (None, 0),
         Some(ast::LimitClause::LimitOffset {
@@ -743,6 +945,24 @@ pub(super) fn execute_query(
         }
     }
     let (projections, columns) = build_projection_plan(state, &select.projection, &scope)?;
+    let mut aggregate_query = false;
+    let mut outside_aggregate_column = false;
+    for item in &select.projection {
+        match item {
+            ast::SelectItem::UnnamedExpr(expression)
+            | ast::SelectItem::ExprWithAlias {
+                expr: expression, ..
+            } => {
+                let usage = inspect_aggregate_usage(state, expression, &scope)?;
+                aggregate_query |= usage.found;
+                outside_aggregate_column |= usage.outside_column;
+            }
+            ast::SelectItem::Wildcard(_) | ast::SelectItem::QualifiedWildcard(_, _) => {
+                outside_aggregate_column = true;
+            }
+            _ => {}
+        }
+    }
     let order_specs = query
         .order_by
         .as_ref()
@@ -796,66 +1016,164 @@ pub(super) fn execute_query(
         })
         .transpose()?
         .unwrap_or_default();
+    for order in &order_specs {
+        if let OrderKey::Expression(expression) = order.key {
+            let usage = inspect_aggregate_usage(state, expression, &scope)?;
+            aggregate_query |= usage.found;
+            outside_aggregate_column |= usage.outside_column;
+        }
+    }
+    if aggregate_query && outside_aggregate_column {
+        return Err(PgError::create(
+            SqlState::GroupingError,
+            "column must appear in the GROUP BY clause or be used in an aggregate function",
+        ));
+    }
+    if aggregate_query && lock_mode.is_some() {
+        return reject_unsupported("FOR UPDATE is not allowed with aggregate functions");
+    }
     let mut rows = Vec::new();
-    visit_query_source_rows(
-        state,
-        select,
-        &scope,
-        xid,
-        snapshot,
-        context,
-        select.selection.as_ref(),
-        &mut |row| {
-            if let Some(selection) = &select.selection {
-                match evaluate_query_expression(
-                    state, selection, &scope, row, xid, snapshot, context,
-                )? {
-                    Value::Bool(true) => {}
-                    Value::Bool(false) | Value::Null => return Ok(()),
-                    _ => unreachable!("WHERE expression was type-checked"),
+    if aggregate_query {
+        let mut source_rows = Vec::new();
+        visit_query_source_rows(
+            state,
+            select,
+            &scope,
+            xid,
+            snapshot,
+            context,
+            select.selection.as_ref(),
+            &mut |row| {
+                if let Some(selection) = &select.selection {
+                    match evaluate_query_expression(
+                        state, selection, &scope, row, xid, snapshot, context,
+                    )? {
+                        Value::Bool(true) => {}
+                        Value::Bool(false) | Value::Null => return Ok(()),
+                        _ => unreachable!("WHERE expression was type-checked"),
+                    }
                 }
-            }
-            let values = projections
-                .iter()
-                .map(|projection| match projection {
-                    ProjectionSource::Column(index) => Ok(row[*index].clone()),
-                    ProjectionSource::Merged(left, right, data_type) => {
-                        let value = if row[*left].is_null() {
-                            row[*right].clone()
-                        } else {
-                            row[*left].clone()
-                        };
-                        if value.is_null() {
-                            Ok(value)
-                        } else {
-                            coercion::coerce(
-                                value.clone(),
-                                value
-                                    .get_base_type()
-                                    .expect("non-null value has a base type"),
-                                *data_type,
-                                CastContext::Implicit,
-                            )
+                source_rows.push(row.to_vec());
+                Ok(())
+            },
+        )?;
+        let row = vec![Value::Null; scope.columns.len()];
+        let values = projections
+            .iter()
+            .map(|projection| match projection {
+                ProjectionSource::Expression(expression) => {
+                    let expression = materialize_aggregate_expression(
+                        state,
+                        expression,
+                        &scope,
+                        &source_rows,
+                        xid,
+                        snapshot,
+                        context,
+                    )?;
+                    evaluate_query_expression(
+                        state,
+                        &expression,
+                        &scope,
+                        &row,
+                        xid,
+                        snapshot,
+                        context,
+                    )
+                }
+                ProjectionSource::Column(_) | ProjectionSource::Merged(_, _, _) => {
+                    unreachable!("global aggregate projection contains no bare columns")
+                }
+            })
+            .collect::<Result<Vec<_>>>()?;
+        let keys = order_specs
+            .iter()
+            .map(|order| match order.key {
+                OrderKey::Output(index) => Ok(values[index].clone()),
+                OrderKey::Expression(expression) => {
+                    let expression = materialize_aggregate_expression(
+                        state,
+                        expression,
+                        &scope,
+                        &source_rows,
+                        xid,
+                        snapshot,
+                        context,
+                    )?;
+                    evaluate_query_expression(
+                        state,
+                        &expression,
+                        &scope,
+                        &row,
+                        xid,
+                        snapshot,
+                        context,
+                    )
+                }
+            })
+            .collect::<Result<Vec<_>>>()?;
+        rows.push(OrderedRow { values, keys });
+    } else {
+        visit_query_source_rows(
+            state,
+            select,
+            &scope,
+            xid,
+            snapshot,
+            context,
+            select.selection.as_ref(),
+            &mut |row| {
+                if let Some(selection) = &select.selection {
+                    match evaluate_query_expression(
+                        state, selection, &scope, row, xid, snapshot, context,
+                    )? {
+                        Value::Bool(true) => {}
+                        Value::Bool(false) | Value::Null => return Ok(()),
+                        _ => unreachable!("WHERE expression was type-checked"),
+                    }
+                }
+                let values = projections
+                    .iter()
+                    .map(|projection| match projection {
+                        ProjectionSource::Column(index) => Ok(row[*index].clone()),
+                        ProjectionSource::Merged(left, right, data_type) => {
+                            let value = if row[*left].is_null() {
+                                row[*right].clone()
+                            } else {
+                                row[*left].clone()
+                            };
+                            if value.is_null() {
+                                Ok(value)
+                            } else {
+                                coercion::coerce(
+                                    value.clone(),
+                                    value
+                                        .get_base_type()
+                                        .expect("non-null value has a base type"),
+                                    *data_type,
+                                    CastContext::Implicit,
+                                )
+                            }
                         }
-                    }
-                    ProjectionSource::Expression(expr) => {
-                        evaluate_query_expression(state, expr, &scope, row, xid, snapshot, context)
-                    }
-                })
-                .collect::<Result<Vec<_>>>()?;
-            let keys = order_specs
-                .iter()
-                .map(|order| match order.key {
-                    OrderKey::Output(index) => Ok(values[index].clone()),
-                    OrderKey::Expression(expression) => evaluate_query_expression(
-                        state, expression, &scope, row, xid, snapshot, context,
-                    ),
-                })
-                .collect::<Result<Vec<_>>>()?;
-            rows.push(OrderedRow { values, keys });
-            Ok(())
-        },
-    )?;
+                        ProjectionSource::Expression(expr) => evaluate_query_expression(
+                            state, expr, &scope, row, xid, snapshot, context,
+                        ),
+                    })
+                    .collect::<Result<Vec<_>>>()?;
+                let keys = order_specs
+                    .iter()
+                    .map(|order| match order.key {
+                        OrderKey::Output(index) => Ok(values[index].clone()),
+                        OrderKey::Expression(expression) => evaluate_query_expression(
+                            state, expression, &scope, row, xid, snapshot, context,
+                        ),
+                    })
+                    .collect::<Result<Vec<_>>>()?;
+                rows.push(OrderedRow { values, keys });
+                Ok(())
+            },
+        )?;
+    }
     if !order_specs.is_empty() {
         rows.sort_by(|left, right| {
             order_specs
@@ -986,7 +1304,12 @@ fn build_projection_plan<'a>(
                 let data_type = infer_query_expression_type(state, expr, scope)?;
                 projections.push(ProjectionSource::Expression(expr));
                 columns.push(ColumnMeta {
-                    name: "?column?".into(),
+                    name: match expr {
+                        ast::Expr::Function(function) if is_aggregate_function(function) => {
+                            normalize_unqualified_object_name(&function.name)?
+                        }
+                        _ => "?column?".into(),
+                    },
                     type_oid: data_type.map_to_oid(),
                     typmod: PgType::NO_TYPEMOD,
                 });

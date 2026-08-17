@@ -4,7 +4,7 @@ use sqlparser::ast;
 
 use crate::{
     error::{PgError, Result, SqlState},
-    value::{BaseType, PgType, Value},
+    value::{BaseType, MICROSECONDS_PER_DAY, PgType, Value},
 };
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
@@ -494,7 +494,7 @@ fn apply_typmod(value: Value, target: PgType, context: CastContext) -> Result<Va
             let precision = u32::try_from(target.typmod).expect("time typmod is non-negative");
             let unit = 10_i64.pow(6 - precision);
             Ok(Value::Time(crate::value::PgTime(
-                ((value.0 + unit / 2) / unit * unit).min(86_400_000_000),
+                ((value.0 + unit / 2) / unit * unit).min(MICROSECONDS_PER_DAY),
             )))
         }
         (Value::Timestamp(value), BaseType::Timestamp) => {
