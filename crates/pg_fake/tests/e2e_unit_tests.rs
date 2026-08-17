@@ -712,6 +712,59 @@ fn matches_grouping_errors_and_correlated_having() {
 }
 
 #[test]
+fn matches_select_distinct_results_ordering_and_limits() {
+    assert_differential(
+        "CREATE TABLE __TABLE__ (category INTEGER, label TEXT); \
+         INSERT INTO __TABLE__ VALUES \
+             (1, 'a'), (1, 'a'), (1, 'b'), (2, 'a'), (NULL, 'n'), (NULL, 'n'); \
+         SELECT DISTINCT category, label FROM __TABLE__ \
+         ORDER BY category NULLS FIRST, label LIMIT 4 OFFSET 1; \
+         SELECT DISTINCT category + 1 AS shifted FROM __TABLE__ \
+         ORDER BY shifted NULLS FIRST; \
+         SELECT DISTINCT category + 1 FROM __TABLE__ \
+         ORDER BY category + 1 NULLS LAST; \
+         SELECT DISTINCT category + 1 FROM __TABLE__ AS rows \
+         ORDER BY rows.category + 1 NULLS LAST; \
+         SELECT DISTINCT count(*) FROM __TABLE__ GROUP BY category ORDER BY count(*); \
+         SELECT ALL category FROM __TABLE__ ORDER BY category NULLS FIRST, label",
+        RowOrder::Ordered,
+    );
+}
+
+#[test]
+fn matches_select_distinct_on_results() {
+    assert_differential(
+        "CREATE TABLE __TABLE__ (category INTEGER, kind INTEGER, score INTEGER, label TEXT); \
+         INSERT INTO __TABLE__ VALUES \
+             (1, 1, 10, 'low'), (1, 1, 20, 'high'), (1, 2, 15, 'other'), \
+             (2, 1, 30, 'two'), (NULL, 1, 5, 'null-low'), (NULL, 1, 8, 'null-high'); \
+         SELECT DISTINCT ON (category) category, score, label FROM __TABLE__ \
+         ORDER BY category NULLS FIRST, score DESC; \
+         SELECT DISTINCT ON (category) label FROM __TABLE__ \
+         ORDER BY category NULLS LAST, score DESC LIMIT 2; \
+         SELECT DISTINCT ON (category, kind) category, kind, score FROM __TABLE__ \
+         ORDER BY kind, category NULLS FIRST, score DESC; \
+         SELECT DISTINCT ON (count(*)) count(*), category FROM __TABLE__ \
+         GROUP BY category ORDER BY count(*), category NULLS FIRST",
+        RowOrder::Ordered,
+    );
+}
+
+#[test]
+fn matches_select_distinct_errors() {
+    assert_differential(
+        "CREATE TABLE __TABLE__ (category INTEGER, score INTEGER); \
+         INSERT INTO __TABLE__ VALUES (1, 10), (1, 20), (2, 30); \
+         SELECT DISTINCT category FROM __TABLE__ ORDER BY score; \
+         SELECT DISTINCT ON (category) category, score FROM __TABLE__ \
+         ORDER BY score, category; \
+         SELECT DISTINCT category FROM __TABLE__ FOR UPDATE; \
+         SELECT DISTINCT ON (category) category FROM __TABLE__ FOR UPDATE",
+        RowOrder::Ordered,
+    );
+}
+
+#[test]
 fn matches_aggregate_errors() {
     assert_differential(
         "CREATE TABLE __TABLE__ (id INTEGER, flag BOOLEAN); \
@@ -776,6 +829,31 @@ fn reports_aggregate_result_metadata() {
             ("min", 25, -1),
             ("bool_and", 16, -1),
         ]
+    );
+}
+
+#[test]
+fn reports_distinct_result_metadata() {
+    let db = Db::create();
+    let mut session = db.create_session();
+    session
+        .execute("CREATE TABLE distinct_metadata (id INTEGER, label VARCHAR(10))")
+        .unwrap();
+
+    let result = session
+        .query(
+            "SELECT DISTINCT label, id FROM distinct_metadata ORDER BY label, id",
+            &[],
+        )
+        .unwrap();
+
+    assert_eq!(
+        result
+            .columns
+            .iter()
+            .map(|column| (column.name.as_str(), column.type_oid, column.typmod))
+            .collect::<Vec<_>>(),
+        vec![("label", 1043, 14), ("id", 23, -1)]
     );
 }
 

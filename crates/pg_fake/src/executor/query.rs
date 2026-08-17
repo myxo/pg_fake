@@ -445,6 +445,19 @@ enum OrderKey<'a> {
     Output(usize),
     Expression(&'a ast::Expr),
 }
+enum DistinctPlan<'a> {
+    None,
+    Rows,
+    On {
+        expressions: &'a [ast::Expr],
+        keys: Vec<DistinctKey<'a>>,
+    },
+}
+enum DistinctKey<'a> {
+    Output(usize),
+    Order(usize),
+    Expression(&'a ast::Expr),
+}
 enum RowCountClause {
     Limit,
     Offset,
@@ -461,6 +474,7 @@ struct GroupingPlan {
 struct OrderedRow {
     values: Vec<Value>,
     keys: Vec<Value>,
+    distinct_keys: Vec<Value>,
 }
 #[derive(Default)]
 struct AggregateUsage {
@@ -492,6 +506,11 @@ struct GroupedExpressionSubstituter<'a> {
     scopes: Vec<BoundScope>,
     query_depth: usize,
     aggregate_depth: usize,
+    error: Option<PgError>,
+}
+struct BoundExpressionNormalizer<'a> {
+    scope: &'a BoundScope,
+    query_depth: usize,
     error: Option<PgError>,
 }
 #[derive(Eq, Hash, PartialEq)]
@@ -774,6 +793,64 @@ impl ast::VisitorMut for GroupedExpressionSubstituter<'_> {
         }
         std::ops::ControlFlow::Continue(())
     }
+}
+
+impl ast::VisitorMut for BoundExpressionNormalizer<'_> {
+    type Break = ();
+
+    fn pre_visit_query(&mut self, _query: &mut ast::Query) -> std::ops::ControlFlow<Self::Break> {
+        self.query_depth += 1;
+        std::ops::ControlFlow::Continue(())
+    }
+
+    fn post_visit_query(&mut self, _query: &mut ast::Query) -> std::ops::ControlFlow<Self::Break> {
+        self.query_depth -= 1;
+        std::ops::ControlFlow::Continue(())
+    }
+
+    fn pre_visit_expr(&mut self, expression: &mut ast::Expr) -> std::ops::ControlFlow<Self::Break> {
+        if self.query_depth != 0 {
+            return std::ops::ControlFlow::Continue(());
+        }
+        let identifiers = match expression {
+            ast::Expr::Identifier(identifier) => Some(std::slice::from_ref(identifier)),
+            ast::Expr::CompoundIdentifier(identifiers) => Some(identifiers.as_slice()),
+            _ => None,
+        };
+        let Some(identifiers) = identifiers else {
+            return std::ops::ControlFlow::Continue(());
+        };
+        match self.scope.resolve_column(identifiers) {
+            Ok((slot, _)) => {
+                *expression =
+                    ast::Expr::Identifier(ast::Ident::new(format!("__pg_fake_bound_{slot}")));
+            }
+            Err(error) => {
+                self.error = Some(error);
+                return std::ops::ControlFlow::Break(());
+            }
+        }
+        std::ops::ControlFlow::Continue(())
+    }
+}
+
+fn normalize_bound_expression(expression: &ast::Expr, scope: &BoundScope) -> Result<ast::Expr> {
+    let mut expression = expression.clone();
+    let mut normalizer = BoundExpressionNormalizer {
+        scope,
+        query_depth: 0,
+        error: None,
+    };
+    let _ = expression.visit(&mut normalizer);
+    normalizer.error.map_or(Ok(expression), Err)
+}
+
+fn compare_bound_expressions(
+    left: &ast::Expr,
+    right: &ast::Expr,
+    scope: &BoundScope,
+) -> Result<bool> {
+    Ok(normalize_bound_expression(left, scope)? == normalize_bound_expression(right, scope)?)
 }
 
 fn inspect_aggregate_usage(
@@ -1272,8 +1349,24 @@ fn resolve_order_specs<'a>(
                     {
                         OrderKey::Output(index)
                     } else {
-                        infer_query_expression_type(state, &order.expr, scope)?;
-                        OrderKey::Expression(&order.expr)
+                        let mut output = None;
+                        for (index, projection) in projections.iter().enumerate() {
+                            if compare_bound_expressions(
+                                &order.expr,
+                                &create_projection_expression(projection, scope),
+                                scope,
+                            )? {
+                                output = Some(index);
+                                break;
+                            }
+                        }
+                        match output {
+                            Some(index) => OrderKey::Output(index),
+                            None => {
+                                infer_query_expression_type(state, &order.expr, scope)?;
+                                OrderKey::Expression(&order.expr)
+                            }
+                        }
                     };
                     let ascending = order.options.asc.unwrap_or(true);
                     Ok(RowOrderSpec {
@@ -1286,6 +1379,119 @@ fn resolve_order_specs<'a>(
         })
         .transpose()
         .map(|orders| orders.unwrap_or_default())
+}
+
+fn create_order_expression(
+    order: &RowOrderSpec<'_>,
+    projections: &[ProjectionSource<'_>],
+    scope: &BoundScope,
+) -> ast::Expr {
+    match order.key {
+        OrderKey::Output(index) => create_projection_expression(&projections[index], scope),
+        OrderKey::Expression(expression) => expression.clone(),
+    }
+}
+
+fn resolve_distinct_plan<'a>(
+    state: &DatabaseState,
+    select: &'a ast::Select,
+    projections: &[ProjectionSource<'_>],
+    order_specs: &[RowOrderSpec<'_>],
+    scope: &BoundScope,
+) -> Result<DistinctPlan<'a>> {
+    let Some(distinct) = &select.distinct else {
+        return Ok(DistinctPlan::None);
+    };
+    match distinct {
+        ast::Distinct::All => Ok(DistinctPlan::None),
+        ast::Distinct::Distinct => {
+            for order in order_specs {
+                let OrderKey::Expression(order_expression) = order.key else {
+                    continue;
+                };
+                let mut selected = false;
+                for projection in projections {
+                    if compare_bound_expressions(
+                        order_expression,
+                        &create_projection_expression(projection, scope),
+                        scope,
+                    )? {
+                        selected = true;
+                        break;
+                    }
+                }
+                if !selected {
+                    return Err(PgError::create(
+                        SqlState::InvalidColumnReference,
+                        "for SELECT DISTINCT, ORDER BY expressions must appear in select list",
+                    ));
+                }
+            }
+            Ok(DistinctPlan::Rows)
+        }
+        ast::Distinct::On(expressions) => {
+            if expressions.is_empty() {
+                return Err(PgError::create(
+                    SqlState::SyntaxError,
+                    "DISTINCT ON requires at least one expression",
+                ));
+            }
+            for expression in expressions {
+                infer_query_expression_type(state, expression, scope)?;
+            }
+            let mut matched = vec![false; expressions.len()];
+            for order in order_specs {
+                let order_expression = create_order_expression(order, projections, scope);
+                let mut found = None;
+                for (index, expression) in expressions.iter().enumerate() {
+                    if !matched[index]
+                        && compare_bound_expressions(&order_expression, expression, scope)?
+                    {
+                        found = Some(index);
+                        break;
+                    }
+                }
+                match found {
+                    Some(index) => matched[index] = true,
+                    None if matched.iter().all(|matched| *matched) => break,
+                    None => {
+                        return Err(PgError::create(
+                            SqlState::InvalidColumnReference,
+                            "SELECT DISTINCT ON expressions must match initial ORDER BY expressions",
+                        ));
+                    }
+                }
+            }
+            let mut keys = Vec::with_capacity(expressions.len());
+            for expression in expressions {
+                let mut key = None;
+                for (index, projection) in projections.iter().enumerate() {
+                    if compare_bound_expressions(
+                        expression,
+                        &create_projection_expression(projection, scope),
+                        scope,
+                    )? {
+                        key = Some(DistinctKey::Output(index));
+                        break;
+                    }
+                }
+                if key.is_none() {
+                    for (index, order) in order_specs.iter().enumerate() {
+                        if compare_bound_expressions(
+                            expression,
+                            &create_order_expression(order, projections, scope),
+                            scope,
+                        )? {
+                            key = Some(DistinctKey::Order(index));
+                            break;
+                        }
+                    }
+                }
+                keys.push(key.unwrap_or(DistinctKey::Expression(expression)));
+            }
+            Ok(DistinctPlan::On { expressions, keys })
+        }
+    }
 }
 
 fn extend_grouped_columns_with_primary_keys(
@@ -1354,6 +1560,7 @@ fn resolve_grouping_plan(
     projections: &[ProjectionSource<'_>],
     columns: &[ColumnMeta],
     order_specs: &[RowOrderSpec<'_>],
+    distinct: &DistinctPlan<'_>,
     scope: &BoundScope,
 ) -> Result<GroupingPlan> {
     let expressions = resolve_grouping_expressions(state, group_by, projections, columns, scope)?;
@@ -1387,6 +1594,15 @@ fn resolve_grouping_plan(
             aggregate_query |= inspect_aggregate_usage(state, expression, scope)?.found;
         }
     }
+    if let DistinctPlan::On {
+        expressions: distinct_expressions,
+        ..
+    } = distinct
+    {
+        for expression in *distinct_expressions {
+            aggregate_query |= inspect_aggregate_usage(state, expression, scope)?.found;
+        }
+    }
     let enabled = aggregate_query || !expressions.is_empty() || select.having.is_some();
     if enabled {
         for projection in projections {
@@ -1403,6 +1619,21 @@ fn resolve_grouping_plan(
         }
         for order in order_specs {
             if let OrderKey::Expression(expression) = order.key {
+                validate_grouped_expression(
+                    state,
+                    expression,
+                    scope,
+                    &expressions,
+                    &grouped_columns,
+                )?;
+            }
+        }
+        if let DistinctPlan::On {
+            expressions: distinct_expressions,
+            ..
+        } = distinct
+        {
+            for expression in *distinct_expressions {
                 validate_grouped_expression(
                     state,
                     expression,
@@ -1440,6 +1671,28 @@ fn evaluate_where_clause(
     )
 }
 
+fn evaluate_select_expression(
+    state: &DatabaseState,
+    expression: &ast::Expr,
+    scope: &BoundScope,
+    row: &[Value],
+    aggregate_rows: Option<&[Vec<Value>]>,
+    xid: Xid,
+    snapshot: &Snapshot,
+    context: &StatementExecutionContext,
+) -> Result<Value> {
+    let materialized;
+    let expression = if let Some(rows) = aggregate_rows {
+        materialized = materialize_aggregate_expression(
+            state, expression, scope, rows, xid, snapshot, context,
+        )?;
+        &materialized
+    } else {
+        expression
+    };
+    evaluate_query_expression(state, expression, scope, row, xid, snapshot, context)
+}
+
 fn evaluate_projection_value(
     state: &DatabaseState,
     projection: &ProjectionSource<'_>,
@@ -1471,18 +1724,16 @@ fn evaluate_projection_value(
                 )
             }
         }
-        ProjectionSource::Expression(expression) => {
-            let materialized;
-            let expression = if let Some(rows) = aggregate_rows {
-                materialized = materialize_aggregate_expression(
-                    state, expression, scope, rows, xid, snapshot, context,
-                )?;
-                &materialized
-            } else {
-                expression
-            };
-            evaluate_query_expression(state, expression, scope, row, xid, snapshot, context)
-        }
+        ProjectionSource::Expression(expression) => evaluate_select_expression(
+            state,
+            expression,
+            scope,
+            row,
+            aggregate_rows,
+            xid,
+            snapshot,
+            context,
+        ),
     }
 }
 
@@ -1501,18 +1752,49 @@ fn evaluate_order_keys(
         .iter()
         .map(|order| match order.key {
             OrderKey::Output(index) => Ok(values[index].clone()),
-            OrderKey::Expression(expression) => {
-                let materialized;
-                let expression = if let Some(rows) = aggregate_rows {
-                    materialized = materialize_aggregate_expression(
-                        state, expression, scope, rows, xid, snapshot, context,
-                    )?;
-                    &materialized
-                } else {
-                    expression
-                };
-                evaluate_query_expression(state, expression, scope, row, xid, snapshot, context)
-            }
+            OrderKey::Expression(expression) => evaluate_select_expression(
+                state,
+                expression,
+                scope,
+                row,
+                aggregate_rows,
+                xid,
+                snapshot,
+                context,
+            ),
+        })
+        .collect()
+}
+
+fn evaluate_distinct_keys(
+    state: &DatabaseState,
+    distinct: &DistinctPlan<'_>,
+    values: &[Value],
+    order_keys: &[Value],
+    scope: &BoundScope,
+    row: &[Value],
+    aggregate_rows: Option<&[Vec<Value>]>,
+    xid: Xid,
+    snapshot: &Snapshot,
+    context: &StatementExecutionContext,
+) -> Result<Vec<Value>> {
+    let DistinctPlan::On { keys, .. } = distinct else {
+        return Ok(Vec::new());
+    };
+    keys.iter()
+        .map(|key| match key {
+            DistinctKey::Output(index) => Ok(values[*index].clone()),
+            DistinctKey::Order(index) => Ok(order_keys[*index].clone()),
+            DistinctKey::Expression(expression) => evaluate_select_expression(
+                state,
+                expression,
+                scope,
+                row,
+                aggregate_rows,
+                xid,
+                snapshot,
+                context,
+            ),
         })
         .collect()
 }
@@ -1523,6 +1805,7 @@ fn execute_plain_select_rows(
     scope: &BoundScope,
     projections: &[ProjectionSource<'_>],
     order_specs: &[RowOrderSpec<'_>],
+    distinct: &DistinctPlan<'_>,
     xid: Xid,
     snapshot: &Snapshot,
     context: &StatementExecutionContext,
@@ -1567,7 +1850,14 @@ fn execute_plain_select_rows(
                 snapshot,
                 context,
             )?;
-            rows.push(OrderedRow { values, keys });
+            let distinct_keys = evaluate_distinct_keys(
+                state, distinct, &values, &keys, scope, row, None, xid, snapshot, context,
+            )?;
+            rows.push(OrderedRow {
+                values,
+                keys,
+                distinct_keys,
+            });
             Ok(())
         },
     )?;
@@ -1580,6 +1870,7 @@ fn execute_grouped_select_rows(
     scope: &BoundScope,
     projections: &[ProjectionSource<'_>],
     order_specs: &[RowOrderSpec<'_>],
+    distinct: &DistinctPlan<'_>,
     grouped_expressions: &[(ast::Expr, PgType)],
     xid: Xid,
     snapshot: &Snapshot,
@@ -1678,17 +1969,28 @@ fn execute_grouped_select_rows(
             snapshot,
             context,
         )?;
-        rows.push(OrderedRow { values, keys });
+        let distinct_keys = evaluate_distinct_keys(
+            state,
+            distinct,
+            &values,
+            &keys,
+            scope,
+            row,
+            Some(&group_rows),
+            xid,
+            snapshot,
+            context,
+        )?;
+        rows.push(OrderedRow {
+            values,
+            keys,
+            distinct_keys,
+        });
     }
     Ok(rows)
 }
 
-fn sort_and_limit_rows(
-    mut rows: Vec<OrderedRow>,
-    order_specs: &[RowOrderSpec<'_>],
-    limit: Option<usize>,
-    offset: usize,
-) -> Vec<Vec<Value>> {
+fn sort_ordered_rows(rows: &mut [OrderedRow], order_specs: &[RowOrderSpec<'_>]) {
     if !order_specs.is_empty() {
         rows.sort_by(|left, right| {
             order_specs
@@ -1726,11 +2028,61 @@ fn sort_and_limit_rows(
                 .unwrap_or(Ordering::Equal)
         });
     }
-    rows.into_iter()
+}
+
+fn remove_duplicate_rows(
+    rows: Vec<OrderedRow>,
+    distinct: &DistinctPlan<'_>,
+) -> Result<Vec<OrderedRow>> {
+    let mut selected: Vec<OrderedRow> = Vec::new();
+    for row in rows {
+        let key = match distinct {
+            DistinctPlan::None => {
+                selected.push(row);
+                continue;
+            }
+            DistinctPlan::Rows => &row.values,
+            DistinctPlan::On { .. } => &row.distinct_keys,
+        };
+        let mut duplicate = false;
+        for existing in &selected {
+            let existing_key = match distinct {
+                DistinctPlan::Rows => &existing.values,
+                DistinctPlan::On { .. } => &existing.distinct_keys,
+                DistinctPlan::None => unreachable!("non-distinct rows returned before comparison"),
+            };
+            if compare_group_keys(existing_key, key)? {
+                duplicate = true;
+                break;
+            }
+        }
+        if !duplicate {
+            selected.push(row);
+        }
+    }
+    Ok(selected)
+}
+
+fn finalize_select_rows(
+    mut rows: Vec<OrderedRow>,
+    order_specs: &[RowOrderSpec<'_>],
+    distinct: &DistinctPlan<'_>,
+    limit: Option<usize>,
+    offset: usize,
+) -> Result<Vec<Vec<Value>>> {
+    if matches!(distinct, DistinctPlan::Rows) {
+        rows = remove_duplicate_rows(rows, distinct)?;
+    }
+    sort_ordered_rows(&mut rows, order_specs);
+    if matches!(distinct, DistinctPlan::On { .. }) {
+        rows = remove_duplicate_rows(rows, distinct)?;
+    }
+    Ok(rows
+        .into_iter()
         .skip(offset)
         .take(limit.unwrap_or(usize::MAX))
         .map(|row| row.values)
-        .collect()
+        .collect())
 }
 
 pub(super) fn execute_query(
@@ -1753,7 +2105,7 @@ pub(super) fn execute_query(
     let ast::GroupByExpr::Expressions(group_by, modifiers) = &select.group_by else {
         return reject_unsupported("GROUP BY is not implemented");
     };
-    if select.distinct.is_some() || select.into.is_some() || !modifiers.is_empty() {
+    if select.into.is_some() || !modifiers.is_empty() {
         return reject_unsupported("SELECT feature is not implemented");
     }
 
@@ -1771,6 +2123,7 @@ pub(super) fn execute_query(
 
     let (projections, columns) = build_projection_plan(state, &select.projection, &scope)?;
     let order_specs = resolve_order_specs(state, query, &projections, &columns, &scope)?;
+    let distinct = resolve_distinct_plan(state, select, &projections, &order_specs, &scope)?;
     let grouping = resolve_grouping_plan(
         state,
         select,
@@ -1778,10 +2131,14 @@ pub(super) fn execute_query(
         &projections,
         &columns,
         &order_specs,
+        &distinct,
         &scope,
     )?;
     if grouping.enabled && lock_mode.is_some() {
         return reject_unsupported("FOR UPDATE is not allowed with aggregate functions");
+    }
+    if !matches!(distinct, DistinctPlan::None) && lock_mode.is_some() {
+        return reject_unsupported("FOR UPDATE is not allowed with DISTINCT clause");
     }
 
     let rows = if grouping.enabled {
@@ -1791,6 +2148,7 @@ pub(super) fn execute_query(
             &scope,
             &projections,
             &order_specs,
+            &distinct,
             &grouping.expressions,
             xid,
             snapshot,
@@ -1803,12 +2161,13 @@ pub(super) fn execute_query(
             &scope,
             &projections,
             &order_specs,
+            &distinct,
             xid,
             snapshot,
             context,
         )?
     };
-    let rows = sort_and_limit_rows(rows, &order_specs, limit, offset);
+    let rows = finalize_select_rows(rows, &order_specs, &distinct, limit, offset)?;
     Ok(StatementResult::Query(QueryResult { columns, rows }))
 }
 

@@ -911,6 +911,44 @@ fn generate_select(src: &mut Source, table: &TableSchema) -> (String, RowOrder) 
     (sql, row_order)
 }
 
+fn generate_distinct(src: &mut Source, table: &TableSchema) -> (String, RowOrder) {
+    src.select(
+        "kind",
+        &["rows", "on"],
+        |src, distinct, _| match distinct {
+            "rows" => {
+                let first = choose_column(src, table, |_| true);
+                let second = choose_column(src, table, |_| true);
+                (
+                    format!(
+                        "SELECT DISTINCT {0}, {1} FROM {2}{3} ORDER BY 1 NULLS FIRST, 2 NULLS LAST",
+                        first.name,
+                        second.name,
+                        table.name,
+                        generate_where_clause(src, table),
+                    ),
+                    RowOrder::Ordered,
+                )
+            }
+            "on" => {
+                let key = choose_column(src, table, |_| true);
+                let value = choose_column(src, table, |_| true);
+                (
+                    format!(
+                        "SELECT DISTINCT ON ({0}) {0}, {1} FROM {2}{3} ORDER BY {0} NULLS FIRST, {1} DESC NULLS LAST",
+                        key.name,
+                        value.name,
+                        table.name,
+                        generate_where_clause(src, table),
+                    ),
+                    RowOrder::Ordered,
+                )
+            }
+            _ => unreachable!(),
+        },
+    )
+}
+
 fn generate_aggregate(src: &mut Source, table: &TableSchema) -> (String, RowOrder) {
     src.select(
         "aggregate",
@@ -1253,6 +1291,7 @@ fn generated_sql_matches_postgres() {
                 &[
                     "insert",
                     "select",
+                    "distinct",
                     "aggregate",
                     "join",
                     "subquery",
@@ -1268,6 +1307,7 @@ fn generated_sql_matches_postgres() {
                 &[
                     "insert",
                     "select",
+                    "distinct",
                     "aggregate",
                     "join",
                     "subquery",
@@ -1287,6 +1327,7 @@ fn generated_sql_matches_postgres() {
                         RowOrder::Unordered,
                     ),
                     "select" => generate_select(src, &table),
+                    "distinct" => generate_distinct(src, &table),
                     "aggregate" => generate_aggregate(src, &table),
                     "join" => generate_join(src, &table),
                     "subquery" => generate_subquery(src, &table),

@@ -153,6 +153,11 @@ pub fn list_benchmarks() -> Vec<Benchmark> {
             postgres_values(),
             postgres_comparisons(),
         ),
+        build_benchmark(
+            "select_distinct_100_rows",
+            postgres_values(),
+            postgres_comparisons(),
+        ),
     ]
 }
 

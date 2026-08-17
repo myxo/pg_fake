@@ -334,7 +334,7 @@ aggregates are outside Phase 2.
 - `cargo test --workspace`, `cargo check --workspace --all-targets`, and the
   10,000-iteration property suite pass.
 
-### Task 11 — `SELECT DISTINCT` and `DISTINCT ON`
+### Task 11 — `SELECT DISTINCT` and `DISTINCT ON` [COMPLETE]
 
 **Goal:** Eliminate duplicate result rows with PostgreSQL ordering semantics.
 
@@ -353,6 +353,25 @@ aggregates are outside Phase 2.
 
 **Notes:** `DISTINCT ON` is the only deliberate query-surface addition beyond
 the Phase 2 list in `spec.md`.
+
+**Completed:**
+
+- `SELECT DISTINCT` removes projected duplicates with PostgreSQL NULL and type
+  equality before final ordering, offset, and limit processing.
+- `DISTINCT ON` validates its leading order keys, evaluates reusable projected
+  and ordered values once, and retains the first row in requested order.
+- PostgreSQL-compatible validation covers non-selected `ORDER BY` expressions,
+  mismatched `DISTINCT ON` order keys, and row-lock incompatibility with matching
+  SQLSTATE categories.
+- Focused differential tests cover duplicate and NULL rows, mixed output types,
+  aliases and expression ordering, grouped aggregates, limits, errors, and
+  result metadata. The generated differential suite and benchmark registry now
+  include distinct workloads.
+- The Phase 2 manifest promotes distinct queries to `MustPass`; the reviewed
+  report records 442 matching corpus statements, 141 skipped scripts, and 25
+  passing Phase 2 conformance cases with no distinct blocker.
+- `cargo test --workspace`, `cargo check --workspace --all-targets`, and the
+  10,000-iteration property suite pass.
 
 ---
 

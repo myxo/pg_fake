@@ -199,7 +199,7 @@ pub const FEATURES: &[Feature] = &[
                 "INSERT INTO distinct_rows VALUES (1), (1), (2)",
             ],
             sql: "SELECT DISTINCT id FROM distinct_rows ORDER BY id",
-            baseline: Baseline::Pending,
+            baseline: Baseline::MustPass,
         }],
     },
     Feature {
