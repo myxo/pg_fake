@@ -13,11 +13,11 @@ use sqlparser::ast::{
 use crate::{
     analyzer,
     catalog::TableSchema,
-    error::{PgError, Result, SqlState, not_supported},
+    error::{PgError, Result, SqlState, reject_unsupported},
     executor::{self, DatabaseState},
     parser,
     storage::Table,
-    txn::{LockAttempt, Snapshot, TransactionStatus, Xid},
+    txn::{RowLockAttempt, Snapshot, TransactionStatus, Xid},
     value::{Oid, Value},
 };
 
@@ -38,7 +38,7 @@ pub enum StatementResult {
     Query(QueryResult),
 }
 #[derive(Debug, Clone)]
-pub struct Statement {
+pub struct PreparedStatement {
     statement: parser::Statement,
     parameter_types: Vec<crate::value::BaseType>,
     columns: Vec<ColumnMeta>,
@@ -53,7 +53,7 @@ pub struct Db {
     state: Arc<Mutex<DatabaseState>>,
     condvar: Arc<Condvar>,
     default_lock_timeout: Duration,
-    clock: Arc<Mutex<Clock>>,
+    clock: Arc<Mutex<DatabaseClock>>,
     rng: Arc<Mutex<ChaCha12Rng>>,
     strict: bool,
 }
@@ -64,13 +64,13 @@ pub struct DbBuilder {
     strict: bool,
 }
 #[derive(Clone, Copy)]
-enum Clock {
+enum DatabaseClock {
     Real,
     Mock(chrono::DateTime<chrono::Utc>),
 }
 pub struct Session {
     db: Db,
-    transaction: Option<SessionTransaction>,
+    transaction: Option<SessionTransactionState>,
     default_isolation: IsolationLevel,
     lock_timeout: Duration,
     timezone: String,
@@ -81,7 +81,7 @@ pub struct Session {
     deferred_foreign_keys_dirty: bool,
 }
 #[derive(Clone, Copy)]
-enum SessionTransaction {
+enum SessionTransactionState {
     Active(ActiveTransaction),
     Aborted { xid: Xid, implicit_batch: bool },
 }
@@ -103,25 +103,25 @@ pub struct Transaction<'session> {
     finished: bool,
 }
 
-fn abort(state: &mut DatabaseState, xid: Xid) {
+fn abort_database_transaction(state: &mut DatabaseState, xid: Xid) {
     state.transactions.abort(xid);
     for table in state.tables.values_mut() {
-        table.abort(xid);
+        table.discard_transaction_versions(xid);
     }
-    state.row_locks.release(xid);
+    state.row_locks.release_transaction_locks(xid);
     state.wait_for.remove_transaction(xid);
 }
 
-fn ddl_undo_for_statement(
+fn collect_ddl_undo_for_statement(
     state: &DatabaseState,
     statement: &parser::Statement,
 ) -> Result<Vec<DdlUndo>> {
     match statement {
         parser::Statement::CreateTable(create) => {
-            let name = executor::name(&create.name)?;
+            let name = executor::normalize_unqualified_object_name(&create.name)?;
             Ok(state
                 .catalog
-                .table(&name)
+                .require_table(&name)
                 .is_err()
                 .then_some(DdlUndo::DropCreated(name))
                 .into_iter()
@@ -134,11 +134,11 @@ fn ddl_undo_for_statement(
         } => names
             .iter()
             .filter_map(|name| {
-                let name = match executor::name(name) {
+                let name = match executor::normalize_unqualified_object_name(name) {
                     Ok(name) => name,
                     Err(error) => return Some(Err(error)),
                 };
-                let schema = match state.catalog.table(&name) {
+                let schema = match state.catalog.require_table(&name) {
                     Ok(schema) => schema.clone(),
                     Err(_) => return None,
                 };
@@ -154,8 +154,8 @@ fn ddl_undo_for_statement(
     }
 }
 
-fn invalid_lock_timeout() -> PgError {
-    PgError::new(
+fn create_invalid_lock_timeout_error() -> PgError {
+    PgError::create(
         SqlState::InvalidParameterValue,
         "invalid value for parameter lock_timeout",
     )
@@ -166,9 +166,9 @@ fn parse_lock_timeout(expression: &Expr) -> Result<Duration> {
         Expr::Value(value) => match &value.value {
             AstValue::Number(value, _) => value.as_str(),
             AstValue::SingleQuotedString(value) => value.trim(),
-            _ => return Err(invalid_lock_timeout()),
+            _ => return Err(create_invalid_lock_timeout_error()),
         },
-        _ => return Err(invalid_lock_timeout()),
+        _ => return Err(create_invalid_lock_timeout_error()),
     };
     let lower = text.to_ascii_lowercase();
     if let Some(milliseconds) = lower.strip_suffix("ms") {
@@ -176,27 +176,27 @@ fn parse_lock_timeout(expression: &Expr) -> Result<Duration> {
             .trim()
             .parse::<u64>()
             .map(Duration::from_millis)
-            .map_err(|_| invalid_lock_timeout());
+            .map_err(|_| create_invalid_lock_timeout_error());
     }
     if let Some(seconds) = lower.strip_suffix('s') {
         return seconds
             .trim()
             .parse::<u64>()
             .map(Duration::from_secs)
-            .map_err(|_| invalid_lock_timeout());
+            .map_err(|_| create_invalid_lock_timeout_error());
     }
     lower
         .trim()
         .parse::<u64>()
         .map(Duration::from_millis)
-        .map_err(|_| invalid_lock_timeout())
+        .map_err(|_| create_invalid_lock_timeout_error())
 }
 
 fn parse_timezone(expression: &Expr) -> Result<String> {
     let value = match expression {
         Expr::Value(value) => {
             let AstValue::SingleQuotedString(value) = &value.value else {
-                return Err(PgError::new(
+                return Err(PgError::create(
                     SqlState::InvalidParameterValue,
                     "invalid value for parameter TimeZone",
                 ));
@@ -205,7 +205,7 @@ fn parse_timezone(expression: &Expr) -> Result<String> {
         }
         Expr::Identifier(sqlparser::ast::Ident { value, .. }) => value,
         _ => {
-            return Err(PgError::new(
+            return Err(PgError::create(
                 SqlState::InvalidParameterValue,
                 "invalid value for parameter TimeZone",
             ));
@@ -216,25 +216,25 @@ fn parse_timezone(expression: &Expr) -> Result<String> {
     if value.eq_ignore_ascii_case("utc") || value.parse::<chrono::FixedOffset>().is_ok() {
         Ok(value.to_string())
     } else {
-        Err(PgError::new(
+        Err(PgError::create(
             SqlState::InvalidParameterValue,
             "invalid value for parameter TimeZone",
         ))
     }
 }
 
-fn lock_timeout_error() -> PgError {
-    PgError::new(
+fn create_lock_timeout_error() -> PgError {
+    PgError::create(
         SqlState::LockNotAvailable,
         "canceling statement due to lock timeout",
     )
 }
 
-fn deadlock_error() -> PgError {
-    PgError::new(SqlState::DeadlockDetected, "deadlock detected")
+fn create_deadlock_error() -> PgError {
+    PgError::create(SqlState::DeadlockDetected, "deadlock detected")
 }
 
-fn isolation_from_modes(modes: &[TransactionMode]) -> Result<Option<IsolationLevel>> {
+fn parse_isolation_level(modes: &[TransactionMode]) -> Result<Option<IsolationLevel>> {
     let mut isolation = None;
     for mode in modes {
         let level = match mode {
@@ -245,17 +245,17 @@ fn isolation_from_modes(modes: &[TransactionMode]) -> Result<Option<IsolationLev
                 IsolationLevel::RepeatableRead
             }
             TransactionMode::IsolationLevel(AstIsolationLevel::Serializable) => {
-                return not_supported("SERIALIZABLE isolation is not implemented");
+                return reject_unsupported("SERIALIZABLE isolation is not implemented");
             }
             TransactionMode::IsolationLevel(AstIsolationLevel::Snapshot) => {
-                return not_supported("SNAPSHOT isolation is not implemented");
+                return reject_unsupported("SNAPSHOT isolation is not implemented");
             }
             TransactionMode::AccessMode(_) => {
-                return not_supported("transaction access modes are not implemented");
+                return reject_unsupported("transaction access modes are not implemented");
             }
         };
         if isolation.replace(level).is_some() {
-            return Err(PgError::new(
+            return Err(PgError::create(
                 SqlState::SyntaxError,
                 "isolation level specified more than once",
             ));
@@ -272,20 +272,25 @@ fn acquire_row_locks<'a>(
     xid: Xid,
     isolation: IsolationLevel,
     mut snapshot: Snapshot,
-    context: &executor::ExecutionContext,
+    context: &executor::StatementExecutionContext,
 ) -> Result<(MutexGuard<'a, DatabaseState>, Snapshot)> {
     let deadline = (timeout != Duration::ZERO).then(|| Instant::now() + timeout);
     loop {
-        let required = executor::required_row_locks(&state, statement, xid, &snapshot, context)?;
+        let required =
+            executor::collect_required_row_locks(&state, statement, xid, &snapshot, context)?;
         let mut blocked = None;
         for required_lock in required {
             match state
                 .row_locks
                 .acquire(required_lock.key, xid, required_lock.mode)
             {
-                LockAttempt::Acquired => condvar.notify_all(),
-                LockAttempt::Blocked(conflicts) => {
-                    if state.wait_for.wait_for(xid, &conflicts).is_some() {
+                RowLockAttempt::Acquired => condvar.notify_all(),
+                RowLockAttempt::Blocked(conflicts) => {
+                    if state
+                        .wait_for
+                        .register_wait_dependencies(xid, &conflicts)
+                        .is_some()
+                    {
                         condvar.notify_all();
                     }
                     blocked = Some((required_lock.key, conflicts));
@@ -300,7 +305,7 @@ fn acquire_row_locks<'a>(
         if state.wait_for.take_victim(xid) {
             state.row_locks.cancel_wait(key, xid);
             state.wait_for.clear_wait(xid);
-            return Err(deadlock_error());
+            return Err(create_deadlock_error());
         }
         let mut timed_out = false;
         state = if let Some(deadline) = deadline {
@@ -308,7 +313,7 @@ fn acquire_row_locks<'a>(
             if remaining.is_zero() {
                 state.row_locks.cancel_wait(key, xid);
                 state.wait_for.clear_wait(xid);
-                return Err(lock_timeout_error());
+                return Err(create_lock_timeout_error());
             }
             let (state, wait_result) = condvar
                 .wait_timeout(state, remaining)
@@ -321,20 +326,20 @@ fn acquire_row_locks<'a>(
         state.row_locks.cancel_wait(key, xid);
         state.wait_for.clear_wait(xid);
         if state.wait_for.take_victim(xid) {
-            return Err(deadlock_error());
+            return Err(create_deadlock_error());
         }
         if timed_out {
-            return Err(lock_timeout_error());
+            return Err(create_lock_timeout_error());
         }
         if isolation == IsolationLevel::RepeatableRead
             && conflicts.iter().any(|holder| {
                 matches!(
-                    state.transactions.status(*holder),
+                    state.transactions.get_status(*holder),
                     Some(TransactionStatus::Committed(_))
                 )
             })
         {
-            return Err(PgError::new(
+            return Err(PgError::create(
                 SqlState::SerializationFailure,
                 "could not serialize access due to concurrent update",
             ));
@@ -342,21 +347,21 @@ fn acquire_row_locks<'a>(
         if isolation == IsolationLevel::ReadCommitted
             && conflicts.iter().any(|holder| {
                 !matches!(
-                    state.transactions.status(*holder),
+                    state.transactions.get_status(*holder),
                     Some(TransactionStatus::InFlight)
                 )
             })
         {
-            snapshot = Snapshot::new(&state.transactions);
+            snapshot = Snapshot::create(&state.transactions);
         }
     }
 }
 
 impl Db {
-    pub fn new() -> Self {
-        Db::builder().build()
+    pub fn create() -> Self {
+        Db::create_builder().build()
     }
-    pub fn builder() -> DbBuilder {
+    pub fn create_builder() -> DbBuilder {
         DbBuilder {
             lock_timeout: Duration::from_secs(1),
             mock_time: false,
@@ -364,7 +369,7 @@ impl Db {
             strict: false,
         }
     }
-    pub fn session(&self) -> Session {
+    pub fn create_session(&self) -> Session {
         Session {
             db: self.clone(),
             transaction: None,
@@ -380,34 +385,34 @@ impl Db {
     }
 }
 impl DbBuilder {
-    pub fn lock_timeout(mut self, timeout: Duration) -> Self {
+    pub fn set_lock_timeout(mut self, timeout: Duration) -> Self {
         self.lock_timeout = timeout;
         self
     }
     /// Enable a frozen, deterministic database clock. It begins at the Unix
     /// epoch and can subsequently be controlled through `Db::set_time` and
     /// `Db::advance_time`.
-    pub fn mock_time(mut self, enabled: bool) -> Self {
+    pub fn set_mock_time_enabled(mut self, enabled: bool) -> Self {
         self.mock_time = enabled;
         self
     }
-    pub fn seed(mut self, seed: u64) -> Self {
+    pub fn set_random_seed(mut self, seed: u64) -> Self {
         self.seed = Some(seed);
         self
     }
-    pub fn strict(mut self, enabled: bool) -> Self {
+    pub fn set_strict_mode_enabled(mut self, enabled: bool) -> Self {
         self.strict = enabled;
         self
     }
     pub fn build(self) -> Db {
         Db {
-            state: Arc::new(Mutex::new(DatabaseState::new())),
+            state: Arc::new(Mutex::new(DatabaseState::create())),
             condvar: Arc::new(Condvar::new()),
             default_lock_timeout: self.lock_timeout,
             clock: Arc::new(Mutex::new(if self.mock_time {
-                Clock::Mock(chrono::DateTime::<chrono::Utc>::UNIX_EPOCH)
+                DatabaseClock::Mock(chrono::DateTime::<chrono::Utc>::UNIX_EPOCH)
             } else {
-                Clock::Real
+                DatabaseClock::Real
             })),
             rng: Arc::new(Mutex::new(match self.seed {
                 Some(seed) => ChaCha12Rng::seed_from_u64(seed),
@@ -419,14 +424,14 @@ impl DbBuilder {
 }
 impl Default for Db {
     fn default() -> Self {
-        Self::new()
+        Self::create()
     }
 }
 impl Db {
-    fn now(&self) -> chrono::DateTime<chrono::Utc> {
+    fn read_clock(&self) -> chrono::DateTime<chrono::Utc> {
         match *self.clock.lock().expect("clock mutex is poisoned") {
-            Clock::Real => chrono::Utc::now(),
-            Clock::Mock(value) => value,
+            DatabaseClock::Real => chrono::Utc::now(),
+            DatabaseClock::Mock(value) => value,
         }
     }
 
@@ -434,11 +439,11 @@ impl Db {
     pub fn set_time(&self, time: chrono::DateTime<chrono::Utc>) -> Result<()> {
         let mut clock = self.clock.lock().expect("clock mutex is poisoned");
         match &mut *clock {
-            Clock::Mock(value) => {
+            DatabaseClock::Mock(value) => {
                 *value = time;
                 Ok(())
             }
-            Clock::Real => Err(PgError::new(
+            DatabaseClock::Real => Err(PgError::create(
                 SqlState::InvalidParameterValue,
                 "mock time is disabled",
             )),
@@ -450,13 +455,13 @@ impl Db {
     pub fn advance_time(&self, duration: chrono::Duration) -> Result<()> {
         let mut clock = self.clock.lock().expect("clock mutex is poisoned");
         match &mut *clock {
-            Clock::Mock(value) => {
+            DatabaseClock::Mock(value) => {
                 *value = value.checked_add_signed(duration).ok_or_else(|| {
-                    PgError::new(SqlState::NumericValueOutOfRange, "clock time out of range")
+                    PgError::create(SqlState::NumericValueOutOfRange, "clock time out of range")
                 })?;
                 Ok(())
             }
-            Clock::Real => Err(PgError::new(
+            DatabaseClock::Real => Err(PgError::create(
                 SqlState::InvalidParameterValue,
                 "mock time is disabled",
             )),
@@ -465,34 +470,34 @@ impl Db {
 }
 impl Session {
     pub fn execute(&mut self, sql: &str) -> Result<Vec<StatementResult>> {
-        if let Some(result) = self.set_constraints(sql) {
+        if let Some(result) = self.try_execute_set_constraints(sql) {
             return result.map(|result| vec![result]);
         }
         let statements = match parser::parse(sql) {
             Ok(statements) => statements,
-            Err(error) => return self.failed(error),
+            Err(error) => return self.abort_with_error(error),
         };
         let mut results = Vec::with_capacity(statements.len());
         for statement in statements {
             if self.transaction.is_none() {
                 self.start_transaction(self.default_isolation, true);
             }
-            match self.run_statement(statement) {
+            match self.execute_statement(statement) {
                 Ok(result) => results.push(result),
                 Err(error) => {
-                    if self.transaction_is_implicit_batch() {
-                        let _ = self.finish_transaction(false);
+                    if self.is_transaction_implicit_batch() {
+                        let _ = self.rollback_transaction();
                     }
                     return Err(error);
                 }
             }
         }
-        if self.transaction_is_implicit_batch() {
-            self.finish_transaction(true)?;
+        if self.is_transaction_implicit_batch() {
+            self.commit_transaction()?;
         }
         Ok(results)
     }
-    fn set_constraints(&mut self, sql: &str) -> Option<Result<StatementResult>> {
+    fn try_execute_set_constraints(&mut self, sql: &str) -> Option<Result<StatementResult>> {
         let sql = sql.trim().trim_end_matches(';').trim();
         let upper = sql.to_ascii_uppercase();
         let rest = upper.strip_prefix("SET CONSTRAINTS ")?;
@@ -501,7 +506,7 @@ impl Session {
         } else if rest.strip_suffix(" IMMEDIATE").is_some() {
             false
         } else {
-            return Some(Err(PgError::new(
+            return Some(Err(PgError::create(
                 SqlState::SyntaxError,
                 "SET CONSTRAINTS requires DEFERRED or IMMEDIATE",
             )));
@@ -512,8 +517,11 @@ impl Session {
         if self.transaction.is_none() {
             self.start_transaction(self.default_isolation, true);
         }
-        if matches!(self.transaction, Some(SessionTransaction::Aborted { .. })) {
-            return Some(Err(PgError::new(
+        if matches!(
+            self.transaction,
+            Some(SessionTransactionState::Aborted { .. })
+        ) {
+            return Some(Err(PgError::create(
                 SqlState::InFailedSqlTransaction,
                 "current transaction is aborted",
             )));
@@ -531,7 +539,7 @@ impl Session {
         let state = self.db.state.lock().expect("database mutex is poisoned");
         let constraints = state
             .catalog
-            .tables()
+            .iterate_tables()
             .flat_map(|schema| schema.constraints.iter())
             .filter_map(|constraint| match constraint {
                 crate::catalog::Constraint::ForeignKey(foreign_key) => Some(foreign_key),
@@ -550,7 +558,7 @@ impl Session {
                             .find(|foreign_key| foreign_key.name == *name)
                             .map(|foreign_key| (*foreign_key).clone())
                             .ok_or_else(|| {
-                                PgError::new(
+                                PgError::create(
                                     SqlState::UndefinedObject,
                                     format!("constraint {name:?} does not exist"),
                                 )
@@ -561,14 +569,14 @@ impl Session {
                     Ok(selected) => selected,
                     Err(error) => {
                         drop(state);
-                        return Some(self.failed(error));
+                        return Some(self.abort_with_error(error));
                     }
                 }
             }
         };
         if selected.iter().any(|foreign_key| !foreign_key.deferrable) {
             drop(state);
-            return Some(self.failed(PgError::new(
+            return Some(self.abort_with_error(PgError::create(
                 SqlState::FeatureNotSupported,
                 "constraint is not deferrable",
             )));
@@ -589,112 +597,132 @@ impl Session {
         if !deferred && self.deferred_foreign_keys_dirty {
             let state = self.db.state.lock().expect("database mutex is poisoned");
             let xid = match self.transaction {
-                Some(SessionTransaction::Active(transaction)) => transaction.xid,
+                Some(SessionTransactionState::Active(transaction)) => transaction.xid,
                 _ => unreachable!(),
             };
             if let Err(error) = executor::validate_deferred_foreign_keys(&state, xid) {
                 drop(state);
-                return Some(self.failed(error));
+                return Some(self.abort_with_error(error));
             }
         }
-        if self.transaction_is_implicit_batch() {
+        if self.is_transaction_implicit_batch() {
             return Some(
-                self.finish_transaction(true)
+                self.commit_transaction()
                     .map(|()| StatementResult::Affected(0)),
             );
         }
         Some(Ok(StatementResult::Affected(0)))
     }
+
     pub fn execute_params(&mut self, sql: &str, params: &[Value]) -> Result<u64> {
         let statement = self.prepare(sql)?;
         self.execute_prepared(&statement, params)
     }
+
     pub fn query(&mut self, sql: &str, params: &[Value]) -> Result<QueryResult> {
         let statement = self.prepare(sql)?;
         self.query_prepared(&statement, params)
     }
-    pub fn prepare(&mut self, sql: &str) -> Result<Statement> {
+
+    pub fn prepare(&mut self, sql: &str) -> Result<PreparedStatement> {
         let mut statements = match parser::parse(sql) {
             Ok(statements) => statements,
-            Err(error) => return self.failed(error),
+            Err(error) => return self.abort_with_error(error),
         };
         if statements.len() != 1 {
-            return self.failed(PgError::new(
+            return self.abort_with_error(PgError::create(
                 SqlState::SyntaxError,
                 "prepared statements require exactly one statement",
             ));
         }
         let statement = statements.pop().expect("statement count was checked");
-        if matches!(self.transaction, Some(SessionTransaction::Aborted { .. }))
-            && !matches!(
-                &statement,
-                parser::Statement::Commit { .. } | parser::Statement::Rollback { .. }
-            )
-        {
-            return Err(PgError::new(
+        if matches!(
+            self.transaction,
+            Some(SessionTransactionState::Aborted { .. })
+        ) && !matches!(
+            &statement,
+            parser::Statement::Commit { .. } | parser::Statement::Rollback { .. }
+        ) {
+            return Err(PgError::create(
                 SqlState::InFailedSqlTransaction,
                 "current transaction is aborted",
             ));
         }
         let prepared = {
             let state = self.db.state.lock().expect("database mutex is poisoned");
-            analyzer::describe_subqueries(&statement, &state.catalog).and_then(|described| {
-                analyzer::parameter_types(&described, &state.catalog).and_then(|parameter_types| {
-                    let described = analyzer::bind(
-                        &described,
-                        &parameter_types,
-                        &vec![Value::Null; parameter_types.len()],
-                    )?;
-                    let columns = executor::query_columns(&state, &described)?;
-                    Ok((parameter_types, columns))
-                })
-            })
+            analyzer::substitute_typed_subqueries(&statement, &state.catalog).and_then(
+                |described| {
+                    analyzer::infer_parameter_types(&described, &state.catalog).and_then(
+                        |parameter_types| {
+                            let described = analyzer::bind_parameters(
+                                &described,
+                                &parameter_types,
+                                &vec![Value::Null; parameter_types.len()],
+                            )?;
+                            let columns =
+                                executor::describe_query_result_columns(&state, &described)?;
+                            Ok((parameter_types, columns))
+                        },
+                    )
+                },
+            )
         };
         match prepared {
-            Ok((parameter_types, columns)) => Ok(Statement {
+            Ok((parameter_types, columns)) => Ok(PreparedStatement {
                 statement,
                 parameter_types,
                 columns,
             }),
-            Err(error) => self.failed(error),
+            Err(error) => self.abort_with_error(error),
         }
     }
-    pub fn execute_prepared(&mut self, statement: &Statement, params: &[Value]) -> Result<u64> {
-        match self.run_prepared(statement, params)? {
-            StatementResult::Affected(rows) => Ok(rows),
-            StatementResult::Query(_) => not_supported("use query_prepared for SELECT statements"),
-        }
-    }
-    pub fn query_prepared(
+
+    pub fn execute_prepared(
         &mut self,
-        statement: &Statement,
+        statement: &PreparedStatement,
         params: &[Value],
-    ) -> Result<QueryResult> {
-        match self.run_prepared(statement, params)? {
-            StatementResult::Query(result) => Ok(result),
-            StatementResult::Affected(_) => {
-                not_supported("query_prepared requires a SELECT statement")
+    ) -> Result<u64> {
+        match self.execute_prepared_statement(statement, params)? {
+            StatementResult::Affected(rows) => Ok(rows),
+            StatementResult::Query(_) => {
+                reject_unsupported("use query_prepared for SELECT statements")
             }
         }
     }
-    pub fn run_prepared(
+
+    pub fn query_prepared(
         &mut self,
-        statement: &Statement,
+        statement: &PreparedStatement,
+        params: &[Value],
+    ) -> Result<QueryResult> {
+        match self.execute_prepared_statement(statement, params)? {
+            StatementResult::Query(result) => Ok(result),
+            StatementResult::Affected(_) => {
+                reject_unsupported("query_prepared requires a SELECT statement")
+            }
+        }
+    }
+    pub fn execute_prepared_statement(
+        &mut self,
+        statement: &PreparedStatement,
         params: &[Value],
     ) -> Result<StatementResult> {
-        let statement =
-            match analyzer::bind(&statement.statement, &statement.parameter_types, params) {
-                Ok(statement) => statement,
-                Err(error) => return self.failed(error),
-            };
-        self.run_statement(statement)
+        let statement = match analyzer::bind_parameters(
+            &statement.statement,
+            &statement.parameter_types,
+            params,
+        ) {
+            Ok(statement) => statement,
+            Err(error) => return self.abort_with_error(error),
+        };
+        self.execute_statement(statement)
     }
     pub fn begin(&mut self) -> Result<Transaction<'_>> {
         self.begin_with(self.default_isolation)
     }
     pub fn begin_with(&mut self, isolation: IsolationLevel) -> Result<Transaction<'_>> {
         if self.transaction.is_some() {
-            return Err(PgError::new(
+            return Err(PgError::create(
                 SqlState::ActiveSqlTransaction,
                 "transaction already in progress",
             ));
@@ -717,55 +745,63 @@ impl Session {
             self.timezone.clone(),
         ));
         let mut state = self.db.state.lock().expect("database mutex is poisoned");
-        self.transaction = Some(SessionTransaction::Active(ActiveTransaction {
+        self.transaction = Some(SessionTransactionState::Active(ActiveTransaction {
             xid: state.transactions.begin(),
             isolation,
             snapshot: None,
             statement_started: false,
             implicit_batch,
-            transaction_timestamp: self.db.now(),
+            transaction_timestamp: self.db.read_clock(),
         }));
     }
-    fn finish_transaction(&mut self, commit: bool) -> Result<()> {
+    fn commit_transaction(&mut self) -> Result<()> {
         let Some(transaction) = self.transaction.take() else {
             return Ok(());
         };
-        let xid = match transaction {
-            SessionTransaction::Active(transaction) if commit => {
-                let state_lock = self.db.state.clone();
-                let mut state = state_lock.lock().expect("database mutex is poisoned");
-                if self.deferred_foreign_keys_dirty
-                    && let Err(error) =
-                        executor::validate_deferred_foreign_keys(&state, transaction.xid)
-                {
-                    self.rollback_ddl(&mut state);
-                    if let Some((default_isolation, lock_timeout, timezone)) =
-                        self.settings_undo.take()
-                    {
-                        self.default_isolation = default_isolation;
-                        self.lock_timeout = lock_timeout;
-                        self.timezone = timezone;
-                    }
-                    self.deferred_constraints.clear();
-                    self.defer_all_constraints = false;
-                    self.deferred_foreign_keys_dirty = false;
-                    abort(&mut state, transaction.xid);
-                    self.db.condvar.notify_all();
-                    return Err(error);
-                }
-                state.transactions.commit(transaction.xid);
-                state.row_locks.release(transaction.xid);
-                state.wait_for.remove_transaction(transaction.xid);
-                self.ddl_undo.clear();
-                self.settings_undo = None;
-                self.deferred_constraints.clear();
-                self.defer_all_constraints = false;
-                self.deferred_foreign_keys_dirty = false;
-                self.db.condvar.notify_all();
-                return Ok(());
+        let SessionTransactionState::Active(transaction) = transaction else {
+            return self.rollback_transaction_state(transaction);
+        };
+        let state_lock = self.db.state.clone();
+        let mut state = state_lock.lock().expect("database mutex is poisoned");
+        if self.deferred_foreign_keys_dirty
+            && let Err(error) = executor::validate_deferred_foreign_keys(&state, transaction.xid)
+        {
+            self.rollback_ddl(&mut state);
+            if let Some((default_isolation, lock_timeout, timezone)) = self.settings_undo.take() {
+                self.default_isolation = default_isolation;
+                self.lock_timeout = lock_timeout;
+                self.timezone = timezone;
             }
-            SessionTransaction::Active(transaction) => transaction.xid,
-            SessionTransaction::Aborted { xid, .. } => xid,
+            self.deferred_constraints.clear();
+            self.defer_all_constraints = false;
+            self.deferred_foreign_keys_dirty = false;
+            abort_database_transaction(&mut state, transaction.xid);
+            self.db.condvar.notify_all();
+            return Err(error);
+        }
+        state.transactions.commit(transaction.xid);
+        state.row_locks.release_transaction_locks(transaction.xid);
+        state.wait_for.remove_transaction(transaction.xid);
+        self.ddl_undo.clear();
+        self.settings_undo = None;
+        self.deferred_constraints.clear();
+        self.defer_all_constraints = false;
+        self.deferred_foreign_keys_dirty = false;
+        self.db.condvar.notify_all();
+        Ok(())
+    }
+
+    fn rollback_transaction(&mut self) -> Result<()> {
+        let Some(transaction) = self.transaction.take() else {
+            return Ok(());
+        };
+        self.rollback_transaction_state(transaction)
+    }
+
+    fn rollback_transaction_state(&mut self, transaction: SessionTransactionState) -> Result<()> {
+        let xid = match transaction {
+            SessionTransactionState::Active(transaction) => transaction.xid,
+            SessionTransactionState::Aborted { xid, .. } => xid,
         };
         let state_lock = self.db.state.clone();
         let mut state = state_lock.lock().expect("database mutex is poisoned");
@@ -778,22 +814,22 @@ impl Session {
         self.deferred_constraints.clear();
         self.defer_all_constraints = false;
         self.deferred_foreign_keys_dirty = false;
-        abort(&mut state, xid);
+        abort_database_transaction(&mut state, xid);
         self.db.condvar.notify_all();
         Ok(())
     }
-    fn abort_transaction(&mut self) {
-        if let Some(SessionTransaction::Active(transaction)) = self.transaction {
-            self.transaction = Some(SessionTransaction::Aborted {
+    fn mark_transaction_aborted(&mut self) {
+        if let Some(SessionTransactionState::Active(transaction)) = self.transaction {
+            self.transaction = Some(SessionTransactionState::Aborted {
                 xid: transaction.xid,
                 implicit_batch: transaction.implicit_batch,
             });
         }
     }
-    fn transaction_is_implicit_batch(&self) -> bool {
+    fn is_transaction_implicit_batch(&self) -> bool {
         match self.transaction {
-            Some(SessionTransaction::Active(transaction)) => transaction.implicit_batch,
-            Some(SessionTransaction::Aborted { implicit_batch, .. }) => implicit_batch,
+            Some(SessionTransactionState::Active(transaction)) => transaction.implicit_batch,
+            Some(SessionTransactionState::Aborted { implicit_batch, .. }) => implicit_batch,
             None => false,
         }
     }
@@ -812,16 +848,18 @@ impl Session {
             }
         }
     }
-    fn failed<T>(&mut self, error: PgError) -> Result<T> {
-        self.abort_transaction();
+    fn abort_with_error<T>(&mut self, error: PgError) -> Result<T> {
+        self.mark_transaction_aborted();
         Err(error)
     }
-    fn run_statement(&mut self, statement: parser::Statement) -> Result<StatementResult> {
+    fn execute_statement(&mut self, statement: parser::Statement) -> Result<StatementResult> {
         match &statement {
             parser::Statement::Analyze(_) if !self.db.strict => {
                 return Ok(StatementResult::Affected(0));
             }
-            parser::Statement::Reset(reset) if !self.db.strict && planner_reset(&reset.reset) => {
+            parser::Statement::Reset(reset)
+                if !self.db.strict && is_tolerated_planner_reset(&reset.reset) =>
+            {
                 return Ok(StatementResult::Affected(0));
             }
             parser::Statement::Set(Set::SetTimeZone { local: _, value }) => {
@@ -834,7 +872,7 @@ impl Session {
                 return Ok(StatementResult::Query(QueryResult {
                     columns: vec![ColumnMeta {
                         name: "TimeZone".into(),
-                        type_oid: crate::value::BaseType::Text.oid(),
+                        type_oid: crate::value::BaseType::Text.map_to_oid(),
                         typmod: -1,
                     }],
                     rows: vec![vec![Value::Text(self.timezone.clone())]],
@@ -844,16 +882,16 @@ impl Session {
                 return match self.transaction {
                     None => {
                         let isolation =
-                            isolation_from_modes(modes)?.unwrap_or(self.default_isolation);
+                            parse_isolation_level(modes)?.unwrap_or(self.default_isolation);
                         self.start_transaction(isolation, false);
                         Ok(StatementResult::Affected(0))
                     }
-                    Some(SessionTransaction::Active(mut transaction))
+                    Some(SessionTransactionState::Active(mut transaction))
                         if transaction.implicit_batch =>
                     {
-                        if let Some(isolation) = isolation_from_modes(modes)? {
+                        if let Some(isolation) = parse_isolation_level(modes)? {
                             if transaction.statement_started && isolation != transaction.isolation {
-                                return self.failed(PgError::new(
+                                return self.abort_with_error(PgError::create(
                                     SqlState::ActiveSqlTransaction,
                                     "transaction isolation level must be set before any query",
                                 ));
@@ -861,11 +899,11 @@ impl Session {
                             transaction.isolation = isolation;
                         }
                         transaction.implicit_batch = false;
-                        self.transaction = Some(SessionTransaction::Active(transaction));
+                        self.transaction = Some(SessionTransactionState::Active(transaction));
                         Ok(StatementResult::Affected(0))
                     }
-                    Some(SessionTransaction::Active(_)) => Ok(StatementResult::Affected(0)),
-                    Some(SessionTransaction::Aborted { .. }) => Err(PgError::new(
+                    Some(SessionTransactionState::Active(_)) => Ok(StatementResult::Affected(0)),
+                    Some(SessionTransactionState::Aborted { .. }) => Err(PgError::create(
                         SqlState::InFailedSqlTransaction,
                         "current transaction is aborted",
                     )),
@@ -876,24 +914,27 @@ impl Session {
                 snapshot,
                 session,
             }) => {
-                if matches!(self.transaction, Some(SessionTransaction::Aborted { .. })) {
-                    return Err(PgError::new(
+                if matches!(
+                    self.transaction,
+                    Some(SessionTransactionState::Aborted { .. })
+                ) {
+                    return Err(PgError::create(
                         SqlState::InFailedSqlTransaction,
                         "current transaction is aborted",
                     ));
                 }
                 if snapshot.is_some() {
-                    return self.failed(PgError::new(
+                    return self.abort_with_error(PgError::create(
                         SqlState::FeatureNotSupported,
                         "transaction snapshots are not implemented",
                     ));
                 }
-                let isolation = match isolation_from_modes(modes) {
+                let isolation = match parse_isolation_level(modes) {
                     Ok(isolation) => isolation,
-                    Err(error) => return self.failed(error),
+                    Err(error) => return self.abort_with_error(error),
                 };
                 let Some(isolation) = isolation else {
-                    return self.failed(PgError::new(
+                    return self.abort_with_error(PgError::create(
                         SqlState::SyntaxError,
                         "transaction isolation level is required",
                     ));
@@ -902,17 +943,18 @@ impl Session {
                     self.default_isolation = isolation;
                     return Ok(StatementResult::Affected(0));
                 }
-                let Some(SessionTransaction::Active(mut transaction)) = self.transaction else {
+                let Some(SessionTransactionState::Active(mut transaction)) = self.transaction
+                else {
                     return Ok(StatementResult::Affected(0));
                 };
                 if transaction.statement_started && isolation != transaction.isolation {
-                    return self.failed(PgError::new(
+                    return self.abort_with_error(PgError::create(
                         SqlState::ActiveSqlTransaction,
                         "transaction isolation level must be set before any query",
                     ));
                 }
                 transaction.isolation = isolation;
-                self.transaction = Some(SessionTransaction::Active(transaction));
+                self.transaction = Some(SessionTransactionState::Active(transaction));
                 return Ok(StatementResult::Affected(0));
             }
             parser::Statement::Set(Set::SingleAssignment {
@@ -923,7 +965,7 @@ impl Session {
             }) => {
                 if variable.to_string().eq_ignore_ascii_case("timezone") {
                     if *hivevar || values.len() != 1 {
-                        return self.failed(PgError::new(
+                        return self.abort_with_error(PgError::create(
                             SqlState::FeatureNotSupported,
                             "TimeZone setting variant is not implemented",
                         ));
@@ -932,85 +974,91 @@ impl Session {
                     return Ok(StatementResult::Affected(0));
                 }
                 if variable.to_string().eq_ignore_ascii_case("lock_timeout") {
-                    if matches!(self.transaction, Some(SessionTransaction::Aborted { .. })) {
-                        return Err(PgError::new(
+                    if matches!(
+                        self.transaction,
+                        Some(SessionTransactionState::Aborted { .. })
+                    ) {
+                        return Err(PgError::create(
                             SqlState::InFailedSqlTransaction,
                             "current transaction is aborted",
                         ));
                     }
                     if *scope == Some(ContextModifier::Local) || *hivevar || values.len() != 1 {
-                        return self.failed(PgError::new(
+                        return self.abort_with_error(PgError::create(
                             SqlState::FeatureNotSupported,
                             "lock_timeout setting variant is not implemented",
                         ));
                     }
                     self.lock_timeout = match parse_lock_timeout(&values[0]) {
                         Ok(timeout) => timeout,
-                        Err(error) => return self.failed(error),
+                        Err(error) => return self.abort_with_error(error),
                     };
                     return Ok(StatementResult::Affected(0));
                 }
-                if !self.db.strict && planner_setting(variable) {
+                if !self.db.strict && is_tolerated_planner_setting(variable) {
                     return Ok(StatementResult::Affected(0));
                 }
             }
             parser::Statement::Commit { chain, .. } => {
                 if *chain {
-                    return self.failed(PgError::new(
+                    return self.abort_with_error(PgError::create(
                         SqlState::FeatureNotSupported,
                         "COMMIT AND CHAIN is not implemented",
                     ));
                 }
-                self.finish_transaction(true)?;
+                self.commit_transaction()?;
                 return Ok(StatementResult::Affected(0));
             }
             parser::Statement::Rollback { chain, savepoint } => {
                 if *chain || savepoint.is_some() {
-                    return self.failed(PgError::new(
+                    return self.abort_with_error(PgError::create(
                         SqlState::FeatureNotSupported,
                         "ROLLBACK variant is not implemented",
                     ));
                 }
-                self.finish_transaction(false)?;
+                self.rollback_transaction()?;
                 return Ok(StatementResult::Affected(0));
             }
             _ => {}
         }
-        if matches!(self.transaction, Some(SessionTransaction::Aborted { .. })) {
-            return Err(PgError::new(
+        if matches!(
+            self.transaction,
+            Some(SessionTransactionState::Aborted { .. })
+        ) {
+            return Err(PgError::create(
                 SqlState::InFailedSqlTransaction,
                 "current transaction is aborted",
             ));
         }
         if matches!(
             self.transaction,
-            Some(SessionTransaction::Active(transaction)) if !transaction.implicit_batch
+            Some(SessionTransactionState::Active(transaction)) if !transaction.implicit_batch
         ) && matches!(parser::classify(&statement), parser::StatementKind::Ddl)
         {
-            return self.failed(PgError::new(
+            return self.abort_with_error(PgError::create(
                 SqlState::FeatureNotSupported,
                 "DDL in an explicit transaction is not implemented",
             ));
         }
-        if let Some(SessionTransaction::Active(mut transaction)) = self.transaction {
+        if let Some(SessionTransactionState::Active(mut transaction)) = self.transaction {
             let state_lock = self.db.state.clone();
             let condvar = self.db.condvar.clone();
             let state = state_lock.lock().expect("database mutex is poisoned");
             let snapshot = match transaction.isolation {
-                IsolationLevel::ReadCommitted => Snapshot::new(&state.transactions),
+                IsolationLevel::ReadCommitted => Snapshot::create(&state.transactions),
                 IsolationLevel::RepeatableRead => *transaction
                     .snapshot
-                    .get_or_insert_with(|| Snapshot::new(&state.transactions)),
+                    .get_or_insert_with(|| Snapshot::create(&state.transactions)),
             };
             transaction.statement_started = true;
-            self.transaction = Some(SessionTransaction::Active(transaction));
-            let context = executor::ExecutionContext {
+            self.transaction = Some(SessionTransactionState::Active(transaction));
+            let context = executor::StatementExecutionContext {
                 transaction_timestamp: transaction.transaction_timestamp,
-                statement_timestamp: self.db.now(),
-                clock_timestamp: self.db.now(),
+                statement_timestamp: self.db.read_clock(),
+                clock_timestamp: self.db.read_clock(),
                 rng: self.db.rng.clone(),
             };
-            let statement = match executor::materialize_scalar_subqueries(
+            let statement = match executor::materialize_uncorrelated_subqueries(
                 &state,
                 &statement,
                 transaction.xid,
@@ -1018,14 +1066,14 @@ impl Session {
                 &context,
             ) {
                 Ok(statement) => statement,
-                Err(error) => return self.failed(error),
+                Err(error) => return self.abort_with_error(error),
             };
             if transaction.implicit_batch
                 && matches!(parser::classify(&statement), parser::StatementKind::Ddl)
             {
-                let undo = match ddl_undo_for_statement(&state, &statement) {
+                let undo = match collect_ddl_undo_for_statement(&state, &statement) {
                     Ok(undo) => undo,
-                    Err(error) => return self.failed(error),
+                    Err(error) => return self.abort_with_error(error),
                 };
                 self.ddl_undo.extend(undo);
             }
@@ -1040,9 +1088,9 @@ impl Session {
                 &context,
             ) {
                 Ok(acquired) => acquired,
-                Err(error) => return self.failed(error),
+                Err(error) => return self.abort_with_error(error),
             };
-            return match executor::dispatch(
+            return match executor::execute_statement(
                 &mut state,
                 &statement,
                 transaction.xid,
@@ -1065,26 +1113,26 @@ impl Session {
                 }
                 Err(error) => {
                     drop(state);
-                    self.failed(error)
+                    self.abort_with_error(error)
                 }
             };
         }
         let mut state = self.db.state.lock().expect("database mutex is poisoned");
         let xid = state.transactions.begin();
-        let snapshot = Snapshot::new(&state.transactions);
-        let now = self.db.now();
-        let context = executor::ExecutionContext {
+        let snapshot = Snapshot::create(&state.transactions);
+        let now = self.db.read_clock();
+        let context = executor::StatementExecutionContext {
             transaction_timestamp: now,
             statement_timestamp: now,
             clock_timestamp: now,
             rng: self.db.rng.clone(),
         };
-        let statement = match executor::materialize_scalar_subqueries(
+        let statement = match executor::materialize_uncorrelated_subqueries(
             &state, &statement, xid, &snapshot, &context,
         ) {
             Ok(statement) => statement,
             Err(error) => {
-                abort(&mut state, xid);
+                abort_database_transaction(&mut state, xid);
                 self.db.condvar.notify_all();
                 return Err(error);
             }
@@ -1102,12 +1150,12 @@ impl Session {
             Ok(acquired) => acquired,
             Err(error) => {
                 let mut state = self.db.state.lock().expect("database mutex is poisoned");
-                abort(&mut state, xid);
+                abort_database_transaction(&mut state, xid);
                 self.db.condvar.notify_all();
                 return Err(error);
             }
         };
-        match executor::dispatch(
+        match executor::execute_statement(
             &mut state,
             &statement,
             xid,
@@ -1125,18 +1173,18 @@ impl Session {
                     )
                     && let Err(error) = executor::validate_deferred_foreign_keys(&state, xid)
                 {
-                    abort(&mut state, xid);
+                    abort_database_transaction(&mut state, xid);
                     self.db.condvar.notify_all();
                     return Err(error);
                 }
                 state.transactions.commit(xid);
-                state.row_locks.release(xid);
+                state.row_locks.release_transaction_locks(xid);
                 state.wait_for.remove_transaction(xid);
                 self.db.condvar.notify_all();
                 Ok(result)
             }
             Err(error) => {
-                abort(&mut state, xid);
+                abort_database_transaction(&mut state, xid);
                 self.db.condvar.notify_all();
                 Err(error)
             }
@@ -1151,7 +1199,7 @@ fn contains_dml(statement: &parser::Statement) -> bool {
     )
 }
 
-fn planner_setting(variable: &sqlparser::ast::ObjectName) -> bool {
+fn is_tolerated_planner_setting(variable: &sqlparser::ast::ObjectName) -> bool {
     let variable = variable.to_string().to_ascii_lowercase();
     matches!(
         variable.as_str(),
@@ -1174,19 +1222,21 @@ fn planner_setting(variable: &sqlparser::ast::ObjectName) -> bool {
         || variable.starts_with("jit_")
 }
 
-fn planner_reset(reset: &sqlparser::ast::Reset) -> bool {
+fn is_tolerated_planner_reset(reset: &sqlparser::ast::Reset) -> bool {
     match reset {
         sqlparser::ast::Reset::ALL => false,
-        sqlparser::ast::Reset::ConfigurationParameter(variable) => planner_setting(variable),
+        sqlparser::ast::Reset::ConfigurationParameter(variable) => {
+            is_tolerated_planner_setting(variable)
+        }
     }
 }
 
-impl Statement {
-    pub fn parameter_types(&self) -> &[crate::value::BaseType] {
+impl PreparedStatement {
+    pub fn get_parameter_types(&self) -> &[crate::value::BaseType] {
         &self.parameter_types
     }
 
-    pub fn columns(&self) -> &[ColumnMeta] {
+    pub fn get_result_columns(&self) -> &[ColumnMeta] {
         &self.columns
     }
 }
@@ -1201,26 +1251,30 @@ impl Transaction<'_> {
     pub fn query(&mut self, sql: &str, params: &[Value]) -> Result<QueryResult> {
         self.session.query(sql, params)
     }
-    pub fn prepare(&mut self, sql: &str) -> Result<Statement> {
+    pub fn prepare(&mut self, sql: &str) -> Result<PreparedStatement> {
         self.session.prepare(sql)
     }
-    pub fn execute_prepared(&mut self, statement: &Statement, params: &[Value]) -> Result<u64> {
+    pub fn execute_prepared(
+        &mut self,
+        statement: &PreparedStatement,
+        params: &[Value],
+    ) -> Result<u64> {
         self.session.execute_prepared(statement, params)
     }
     pub fn query_prepared(
         &mut self,
-        statement: &Statement,
+        statement: &PreparedStatement,
         params: &[Value],
     ) -> Result<QueryResult> {
         self.session.query_prepared(statement, params)
     }
     pub fn commit(mut self) -> Result<()> {
-        self.session.finish_transaction(true)?;
+        self.session.commit_transaction()?;
         self.finished = true;
         Ok(())
     }
     pub fn rollback(mut self) -> Result<()> {
-        self.session.finish_transaction(false)?;
+        self.session.rollback_transaction()?;
         self.finished = true;
         Ok(())
     }
@@ -1229,7 +1283,7 @@ impl Transaction<'_> {
 impl Drop for Transaction<'_> {
     fn drop(&mut self) {
         if !self.finished {
-            let _ = self.session.finish_transaction(false);
+            let _ = self.session.rollback_transaction();
         }
     }
 }
@@ -1239,7 +1293,7 @@ mod tests {
     use std::{sync::mpsc, thread};
 
     use crate::{
-        txn::{Snapshot, visible_version},
+        txn::{Snapshot, find_visible_version},
         value::BaseType,
     };
 
@@ -1256,14 +1310,14 @@ mod tests {
         }
     }
 
-    fn affected(rows: u64) -> Vec<StatementResult> {
+    fn create_affected_results(rows: u64) -> Vec<StatementResult> {
         vec![StatementResult::Affected(rows)]
     }
 
     #[test]
-    fn foreign_keys_enforce_keys_and_keep_failed_multi_row_writes_atomic() {
-        let db = Db::new();
-        let mut session = db.session();
+    fn enforces_foreign_keys_and_keeps_failed_multi_row_writes_atomic() {
+        let db = Db::create();
+        let mut session = db.create_session();
         session
             .execute("CREATE TABLE parents (id INTEGER PRIMARY KEY)")
             .unwrap();
@@ -1293,9 +1347,9 @@ mod tests {
     }
 
     #[test]
-    fn foreign_key_actions_apply_to_updates_and_deletes() {
-        let db = Db::new();
-        let mut session = db.session();
+    fn applies_foreign_key_actions_to_updates_and_deletes() {
+        let db = Db::create();
+        let mut session = db.create_session();
         session
             .execute("CREATE TABLE parents (id INTEGER PRIMARY KEY, replacement INTEGER)")
             .unwrap();
@@ -1349,9 +1403,9 @@ mod tests {
     }
 
     #[test]
-    fn deferred_foreign_keys_validate_at_commit_and_can_be_repaired() {
-        let db = Db::new();
-        let mut session = db.session();
+    fn validates_deferred_foreign_keys_at_commit_and_allows_repairs() {
+        let db = Db::create();
+        let mut session = db.create_session();
         session
             .execute("CREATE TABLE parents (id INTEGER PRIMARY KEY)")
             .unwrap();
@@ -1376,8 +1430,8 @@ mod tests {
 
     #[test]
     fn set_constraints_changes_deferrable_foreign_key_timing() {
-        let db = Db::new();
-        let mut session = db.session();
+        let db = Db::create();
+        let mut session = db.create_session();
         session
             .execute("CREATE TABLE parents (id INTEGER PRIMARY KEY)")
             .unwrap();
@@ -1395,9 +1449,9 @@ mod tests {
     }
 
     #[test]
-    fn self_references_and_match_simple_nulls_are_valid() {
-        let db = Db::new();
-        let mut session = db.session();
+    fn accepts_self_references_and_match_simple_nulls() {
+        let db = Db::create();
+        let mut session = db.create_session();
         session
             .execute(
                 "CREATE TABLE nodes (id INTEGER PRIMARY KEY, parent_id INTEGER REFERENCES nodes)",
@@ -1416,9 +1470,9 @@ mod tests {
     }
 
     #[test]
-    fn uuid_values_parse_compare_and_generate() {
-        let db = Db::new();
-        let mut session = db.session();
+    fn parses_compares_and_generates_uuid_values() {
+        let db = Db::create();
+        let mut session = db.create_session();
         session
             .execute("CREATE TABLE items (id UUID PRIMARY KEY)")
             .unwrap();
@@ -1445,13 +1499,13 @@ mod tests {
     }
 
     #[test]
-    fn seeded_uuid_generation_is_reproducible_and_supports_v7() {
+    fn reproduces_seeded_uuid_generation_and_supports_v7() {
         let initial = chrono::DateTime::parse_from_rfc3339("2024-02-29T12:34:56Z")
             .unwrap()
             .with_timezone(&chrono::Utc);
         let generate = |db: &Db| {
             db.set_time(initial).unwrap();
-            let mut session = db.session();
+            let mut session = db.create_session();
             session.execute("CREATE TABLE source (id INTEGER)").unwrap();
             session.execute("INSERT INTO source VALUES (1)").unwrap();
             session
@@ -1462,8 +1516,18 @@ mod tests {
                 .unwrap()
                 .rows
         };
-        let first = generate(&Db::builder().mock_time(true).seed(42).build());
-        let second = generate(&Db::builder().mock_time(true).seed(42).build());
+        let first = generate(
+            &Db::create_builder()
+                .set_mock_time_enabled(true)
+                .set_random_seed(42)
+                .build(),
+        );
+        let second = generate(
+            &Db::create_builder()
+                .set_mock_time_enabled(true)
+                .set_random_seed(42)
+                .build(),
+        );
         assert_eq!(first, second);
         let Value::Uuid(v4) = first[0][0] else {
             panic!("uuid generator must return uuid")
@@ -1476,9 +1540,9 @@ mod tests {
     }
 
     #[test]
-    fn timestamp_values_and_timezone_setting_work() {
-        let db = Db::new();
-        let mut session = db.session();
+    fn processes_timestamp_values_and_timezone_setting() {
+        let db = Db::create();
+        let mut session = db.create_session();
         session
             .execute("CREATE TABLE events (plain TIMESTAMP(3), instant TIMESTAMPTZ)")
             .unwrap();
@@ -1490,14 +1554,20 @@ mod tests {
             .unwrap();
         assert_eq!(
             result.columns[0].type_oid,
-            crate::value::BaseType::Timestamp.oid()
+            crate::value::BaseType::Timestamp.map_to_oid()
         );
         assert_eq!(
             result.columns[1].type_oid,
-            crate::value::BaseType::TimestampTz.oid()
+            crate::value::BaseType::TimestampTz.map_to_oid()
         );
-        assert_eq!(result.rows[0][0].to_text(), "2024-02-29 12:34:56.789");
-        assert_eq!(result.rows[0][1].to_text(), "2024-02-29 09:34:56+00");
+        assert_eq!(
+            result.rows[0][0].format_postgres_text(),
+            "2024-02-29 12:34:56.789"
+        );
+        assert_eq!(
+            result.rows[0][1].format_postgres_text(),
+            "2024-02-29 09:34:56+00"
+        );
         session.execute("SET TIME ZONE 'UTC'").unwrap();
         assert_eq!(
             session.query("SHOW TimeZone", &[]).unwrap().rows,
@@ -1506,9 +1576,9 @@ mod tests {
     }
 
     #[test]
-    fn intervals_preserve_calendar_and_clock_parts() {
-        let db = Db::new();
-        let mut session = db.session();
+    fn preserves_interval_calendar_and_clock_parts() {
+        let db = Db::create();
+        let mut session = db.create_session();
         session
             .execute("CREATE TABLE events (started TIMESTAMP, duration INTERVAL)")
             .unwrap();
@@ -1520,42 +1590,48 @@ mod tests {
             .unwrap();
         assert_eq!(
             result.columns[0].type_oid,
-            crate::value::BaseType::Timestamp.oid()
+            crate::value::BaseType::Timestamp.map_to_oid()
         );
         assert_eq!(
             result.columns[1].type_oid,
-            crate::value::BaseType::Interval.oid()
+            crate::value::BaseType::Interval.map_to_oid()
         );
-        assert_eq!(result.rows[0][0].to_text(), "2024-03-02 15:04:05");
-        assert_eq!(result.rows[0][1].to_text(), "2 mons 4 days 06:08:10");
+        assert_eq!(
+            result.rows[0][0].format_postgres_text(),
+            "2024-03-02 15:04:05"
+        );
+        assert_eq!(
+            result.rows[0][1].format_postgres_text(),
+            "2 mons 4 days 06:08:10"
+        );
     }
 
     #[test]
-    fn mock_clock_is_frozen_and_publicly_controllable() {
-        let db = Db::builder().mock_time(true).build();
+    fn freezes_and_controls_mock_clock() {
+        let db = Db::create_builder().set_mock_time_enabled(true).build();
         let initial = chrono::DateTime::parse_from_rfc3339("2024-01-01T00:00:00Z")
             .unwrap()
             .with_timezone(&chrono::Utc);
         db.set_time(initial).unwrap();
-        assert_eq!(db.now(), initial);
+        assert_eq!(db.read_clock(), initial);
         db.advance_time(chrono::Duration::minutes(90)).unwrap();
-        assert_eq!(db.now(), initial + chrono::Duration::minutes(90));
-        assert!(Db::new().set_time(initial).is_err());
+        assert_eq!(db.read_clock(), initial + chrono::Duration::minutes(90));
+        assert!(Db::create().set_time(initial).is_err());
         assert!(
-            Db::new()
+            Db::create()
                 .advance_time(chrono::Duration::seconds(1))
                 .is_err()
         );
     }
 
     #[test]
-    fn timestamp_functions_observe_transaction_statement_and_clock_boundaries() {
-        let db = Db::builder().mock_time(true).build();
+    fn observes_timestamp_function_boundaries() {
+        let db = Db::create_builder().set_mock_time_enabled(true).build();
         let initial = chrono::DateTime::parse_from_rfc3339("2024-01-01T00:00:00Z")
             .unwrap()
             .with_timezone(&chrono::Utc);
         db.set_time(initial).unwrap();
-        let mut session = db.session();
+        let mut session = db.create_session();
         session
             .execute("CREATE TABLE clock_source (id INTEGER)")
             .unwrap();
@@ -1583,9 +1659,9 @@ mod tests {
     }
 
     #[test]
-    fn date_and_time_values_preserve_postgres_special_forms() {
-        let db = Db::new();
-        let mut session = db.session();
+    fn preserves_postgres_date_and_time_special_forms() {
+        let db = Db::create();
+        let mut session = db.create_session();
         session
             .execute("CREATE TABLE values_table (day DATE, moment TIME(6))")
             .unwrap();
@@ -1595,16 +1671,16 @@ mod tests {
         let result = session
             .query("SELECT day, moment FROM values_table", &[])
             .unwrap();
-        assert_eq!(result.rows[0][0].to_text(), "infinity");
-        assert_eq!(result.rows[0][1].to_text(), "24:00:00");
-        assert_eq!(result.columns[0].type_oid, BaseType::Date.oid());
-        assert_eq!(result.columns[1].type_oid, BaseType::Time.oid());
+        assert_eq!(result.rows[0][0].format_postgres_text(), "infinity");
+        assert_eq!(result.rows[0][1].format_postgres_text(), "24:00:00");
+        assert_eq!(result.columns[0].type_oid, BaseType::Date.map_to_oid());
+        assert_eq!(result.columns[1].type_oid, BaseType::Time.map_to_oid());
     }
 
     #[test]
-    fn match_full_rejects_partially_null_composite_keys() {
-        let db = Db::new();
-        let mut session = db.session();
+    fn rejects_partially_null_match_full_keys() {
+        let db = Db::create();
+        let mut session = db.create_session();
         session
             .execute("CREATE TABLE parents (first_id INTEGER, second_id INTEGER, PRIMARY KEY (first_id, second_id))")
             .unwrap();
@@ -1624,23 +1700,26 @@ mod tests {
     }
 
     #[test]
-    fn autocommit_creates_and_drops_tables() {
-        let db = Db::new();
-        let mut session = db.session();
-        assert_eq!(session.execute("CREATE TABLE items (id INTEGER NOT NULL, name VARCHAR(12), amount NUMERIC(8, 2))").unwrap(), affected(0));
+    fn creates_and_drops_tables_in_autocommit() {
+        let db = Db::create();
+        let mut session = db.create_session();
+        assert_eq!(session.execute("CREATE TABLE items (id INTEGER NOT NULL, name VARCHAR(12), amount NUMERIC(8, 2))").unwrap(), create_affected_results(0));
         let state = db.state.lock().unwrap();
-        let table = state.catalog.table("items").unwrap();
+        let table = state.catalog.require_table("items").unwrap();
         assert_eq!(table.columns[0].data_type.base, BaseType::Int4);
         assert_eq!(table.columns[1].data_type.typmod, 16);
         assert_eq!(table.columns[2].data_type.typmod, (8 << 16) + 2 + 4);
         drop(state);
-        assert_eq!(session.execute("DROP TABLE items").unwrap(), affected(1));
+        assert_eq!(
+            session.execute("DROP TABLE items").unwrap(),
+            create_affected_results(1)
+        );
     }
 
     #[test]
     fn selects_projections_with_metadata_in_row_id_order() {
-        let db = Db::new();
-        let mut session = db.session();
+        let db = Db::create();
+        let mut session = db.create_session();
         session
             .execute("CREATE TABLE items (id INTEGER, name TEXT)")
             .unwrap();
@@ -1655,12 +1734,12 @@ mod tests {
             vec![
                 ColumnMeta {
                     name: "name".into(),
-                    type_oid: BaseType::Text.oid(),
+                    type_oid: BaseType::Text.map_to_oid(),
                     typmod: -1,
                 },
                 ColumnMeta {
                     name: "id".into(),
-                    type_oid: BaseType::Int4.oid(),
+                    type_oid: BaseType::Int4.map_to_oid(),
                     typmod: -1,
                 },
             ]
@@ -1683,9 +1762,9 @@ mod tests {
     }
 
     #[test]
-    fn parameters_and_prepared_statements_bind_typed_values() {
-        let db = Db::new();
-        let mut session = db.session();
+    fn binds_typed_parameters_and_prepared_statements() {
+        let db = Db::create();
+        let mut session = db.create_session();
         session
             .execute("CREATE TABLE items (id INTEGER, name TEXT, amount SMALLINT)")
             .unwrap();
@@ -1749,9 +1828,9 @@ mod tests {
     }
 
     #[test]
-    fn parameter_validation_matches_prepared_statement_contract() {
-        let db = Db::new();
-        let mut session = db.session();
+    fn matches_prepared_statement_parameter_contract() {
+        let db = Db::create();
+        let mut session = db.create_session();
         session.execute("CREATE TABLE items (id INTEGER)").unwrap();
         session.execute("INSERT INTO items VALUES (1)").unwrap();
         let skipped = session
@@ -1843,8 +1922,8 @@ mod tests {
 
     #[test]
     fn execute_returns_each_multi_statement_result() {
-        let db = Db::new();
-        let mut session = db.session();
+        let db = Db::create();
+        let mut session = db.create_session();
 
         let results = session
             .execute(
@@ -1865,12 +1944,12 @@ mod tests {
                     columns: vec![
                         ColumnMeta {
                             name: "id".into(),
-                            type_oid: BaseType::Int4.oid(),
+                            type_oid: BaseType::Int4.map_to_oid(),
                             typmod: -1,
                         },
                         ColumnMeta {
                             name: "name".into(),
-                            type_oid: BaseType::Text.oid(),
+                            type_oid: BaseType::Text.map_to_oid(),
                             typmod: -1,
                         },
                     ],
@@ -1885,9 +1964,9 @@ mod tests {
     }
 
     #[test]
-    fn implicit_batches_roll_back_and_stop_at_first_error() {
-        let db = Db::new();
-        let mut session = db.session();
+    fn rolls_back_implicit_batches_at_first_error() {
+        let db = Db::create();
+        let mut session = db.create_session();
         let original_timeout = session.lock_timeout;
         assert_eq!(
             session
@@ -1933,9 +2012,9 @@ mod tests {
     }
 
     #[test]
-    fn explicit_controls_split_simple_query_transactions_like_postgres() {
-        let db = Db::new();
-        let mut session = db.session();
+    fn splits_simple_query_transactions_at_explicit_controls() {
+        let db = Db::create();
+        let mut session = db.create_session();
         session.execute("CREATE TABLE items (id INTEGER)").unwrap();
 
         assert_eq!(
@@ -2005,9 +2084,9 @@ mod tests {
     }
 
     #[test]
-    fn query_metadata_covers_every_phase_one_type() {
-        let db = Db::new();
-        let mut session = db.session();
+    fn reports_metadata_for_every_phase_one_type() {
+        let db = Db::create();
+        let mut session = db.create_session();
         session
             .execute(
                 "CREATE TABLE types (
@@ -2033,29 +2112,29 @@ mod tests {
                 .map(|column| (column.type_oid, column.typmod))
                 .collect::<Vec<_>>(),
             vec![
-                (BaseType::Bool.oid(), -1),
-                (BaseType::Int2.oid(), -1),
-                (BaseType::Int4.oid(), -1),
-                (BaseType::Int8.oid(), -1),
-                (BaseType::Float4.oid(), -1),
-                (BaseType::Float8.oid(), -1),
-                (BaseType::Numeric.oid(), (5 << 16) + 2 + 4),
-                (BaseType::Text.oid(), -1),
-                (BaseType::Varchar.oid(), 3 + 4),
-                (BaseType::Bpchar.oid(), 2 + 4),
-                (BaseType::Bytea.oid(), -1),
+                (BaseType::Bool.map_to_oid(), -1),
+                (BaseType::Int2.map_to_oid(), -1),
+                (BaseType::Int4.map_to_oid(), -1),
+                (BaseType::Int8.map_to_oid(), -1),
+                (BaseType::Float4.map_to_oid(), -1),
+                (BaseType::Float8.map_to_oid(), -1),
+                (BaseType::Numeric.map_to_oid(), (5 << 16) + 2 + 4),
+                (BaseType::Text.map_to_oid(), -1),
+                (BaseType::Varchar.map_to_oid(), 3 + 4),
+                (BaseType::Bpchar.map_to_oid(), 2 + 4),
+                (BaseType::Bytea.map_to_oid(), -1),
             ]
         );
     }
 
     #[test]
-    fn select_excludes_uncommitted_rows_from_another_transaction() {
-        let db = Db::new();
-        let mut session = db.session();
+    fn excludes_other_transactions_uncommitted_rows_from_selects() {
+        let db = Db::create();
+        let mut session = db.create_session();
         session.execute("CREATE TABLE items (id INTEGER)").unwrap();
         let mut state = db.state.lock().unwrap();
         let writer = state.transactions.begin();
-        let table_id = state.catalog.table("items").unwrap().id;
+        let table_id = state.catalog.require_table("items").unwrap().id;
         state
             .tables
             .get_mut(&table_id)
@@ -2076,9 +2155,9 @@ mod tests {
     }
 
     #[test]
-    fn select_reports_unknown_tables_and_columns() {
-        let db = Db::new();
-        let mut session = db.session();
+    fn reports_unknown_tables_and_columns_in_selects() {
+        let db = Db::create();
+        let mut session = db.create_session();
 
         assert_eq!(
             session
@@ -2099,8 +2178,8 @@ mod tests {
 
     #[test]
     fn evaluates_arithmetic_and_comparison_projections() {
-        let db = Db::new();
-        let mut session = db.session();
+        let db = Db::create();
+        let mut session = db.create_session();
         session
             .execute("CREATE TABLE items (id INTEGER, amount INTEGER, name TEXT, price NUMERIC)")
             .unwrap();
@@ -2143,14 +2222,14 @@ mod tests {
                 .map(|column| (column.type_oid, column.typmod))
                 .collect::<Vec<_>>(),
             vec![
-                (BaseType::Int4.oid(), -1),
-                (BaseType::Int4.oid(), -1),
-                (BaseType::Int4.oid(), -1),
-                (BaseType::Int4.oid(), -1),
-                (BaseType::Int4.oid(), -1),
-                (BaseType::Bool.oid(), -1),
-                (BaseType::Bool.oid(), -1),
-                (BaseType::Numeric.oid(), -1),
+                (BaseType::Int4.map_to_oid(), -1),
+                (BaseType::Int4.map_to_oid(), -1),
+                (BaseType::Int4.map_to_oid(), -1),
+                (BaseType::Int4.map_to_oid(), -1),
+                (BaseType::Int4.map_to_oid(), -1),
+                (BaseType::Bool.map_to_oid(), -1),
+                (BaseType::Bool.map_to_oid(), -1),
+                (BaseType::Numeric.map_to_oid(), -1),
             ]
         );
         assert_eq!(
@@ -2174,8 +2253,8 @@ mod tests {
 
     #[test]
     fn evaluates_case_and_common_scalar_functions() {
-        let db = Db::new();
-        let mut session = db.session();
+        let db = Db::create();
+        let mut session = db.create_session();
         session
             .execute(
                 "CREATE TABLE items (
@@ -2283,9 +2362,9 @@ mod tests {
     }
 
     #[test]
-    fn simple_case_accepts_minimum_int4_literal() {
-        let db = Db::new();
-        let mut session = db.session();
+    fn accepts_minimum_int4_literal_in_simple_case() {
+        let db = Db::create();
+        let mut session = db.create_session();
         session.execute("CREATE TABLE items (id INTEGER)").unwrap();
         session.execute("INSERT INTO items VALUES (0)").unwrap();
 
@@ -2302,9 +2381,9 @@ mod tests {
     }
 
     #[test]
-    fn abs_supports_all_phase_one_numeric_types() {
-        let db = Db::new();
-        let mut session = db.session();
+    fn supports_all_phase_one_numeric_types_in_abs() {
+        let db = Db::create();
+        let mut session = db.create_session();
         session
             .execute(
                 "CREATE TABLE numbers (
@@ -2319,7 +2398,7 @@ mod tests {
             .unwrap();
         let mut state = db.state.lock().unwrap();
         let xid = state.transactions.begin();
-        let table_id = state.catalog.table("numbers").unwrap().id;
+        let table_id = state.catalog.require_table("numbers").unwrap().id;
         state.tables.get_mut(&table_id).unwrap().insert(
             xid,
             vec![
@@ -2361,9 +2440,9 @@ mod tests {
     }
 
     #[test]
-    fn case_and_functions_report_type_and_name_errors() {
-        let db = Db::new();
-        let mut session = db.session();
+    fn reports_case_and_function_type_errors() {
+        let db = Db::create();
+        let mut session = db.create_session();
         session.execute("CREATE TABLE items (id INTEGER)").unwrap();
         session.execute("INSERT INTO items VALUES (1)").unwrap();
 
@@ -2388,8 +2467,8 @@ mod tests {
 
     #[test]
     fn coerces_phase_one_types_in_all_cast_contexts() {
-        let db = Db::new();
-        let mut session = db.session();
+        let db = Db::create();
+        let mut session = db.create_session();
         session
             .execute(
                 "CREATE TABLE types (
@@ -2484,9 +2563,9 @@ mod tests {
     }
 
     #[test]
-    fn coercion_reports_postgres_error_categories() {
-        let db = Db::new();
-        let mut session = db.session();
+    fn reports_postgres_coercion_error_categories() {
+        let db = Db::create();
+        let mut session = db.create_session();
         session
             .execute(
                 "CREATE TABLE assignments (
@@ -2536,8 +2615,8 @@ mod tests {
 
     #[test]
     fn orders_rows_by_columns_expressions_and_output_positions() {
-        let db = Db::new();
-        let mut session = db.session();
+        let db = Db::create();
+        let mut session = db.create_session();
         session
             .execute(
                 "CREATE TABLE items (
@@ -2626,9 +2705,9 @@ mod tests {
     }
 
     #[test]
-    fn order_by_uses_postgres_null_defaults_and_validates_positions() {
-        let db = Db::new();
-        let mut session = db.session();
+    fn applies_postgres_order_by_null_defaults_and_validates_positions() {
+        let db = Db::create();
+        let mut session = db.create_session();
         session
             .execute("CREATE TABLE items (id INTEGER, optional INTEGER)")
             .unwrap();
@@ -2683,9 +2762,9 @@ mod tests {
     }
 
     #[test]
-    fn limits_and_offsets_rows_after_ordering() {
-        let db = Db::new();
-        let mut session = db.session();
+    fn applies_limits_and_offsets_after_ordering() {
+        let db = Db::create();
+        let mut session = db.create_session();
         session.execute("CREATE TABLE items (id INTEGER)").unwrap();
         session
             .execute("INSERT INTO items VALUES (4), (1), (5), (2), (3)")
@@ -2739,8 +2818,8 @@ mod tests {
 
     #[test]
     fn rejects_negative_limit_and_offset() {
-        let db = Db::new();
-        let mut session = db.session();
+        let db = Db::create();
+        let mut session = db.create_session();
         session.execute("CREATE TABLE items (id INTEGER)").unwrap();
 
         assert_eq!(
@@ -2762,8 +2841,8 @@ mod tests {
 
     #[test]
     fn applies_defaults_to_inserted_and_updated_rows() {
-        let db = Db::new();
-        let mut session = db.session();
+        let db = Db::create();
+        let mut session = db.create_session();
         session
             .execute(
                 "CREATE TABLE items (
@@ -2825,8 +2904,8 @@ mod tests {
 
     #[test]
     fn enforces_not_null_after_defaults_and_assignments() {
-        let db = Db::new();
-        let mut session = db.session();
+        let db = Db::create();
+        let mut session = db.create_session();
         session
             .execute("CREATE TABLE items (id INTEGER NOT NULL, optional INTEGER)")
             .unwrap();
@@ -2859,8 +2938,8 @@ mod tests {
 
     #[test]
     fn enforces_check_constraints_on_insert_and_update() {
-        let db = Db::new();
-        let mut session = db.session();
+        let db = Db::create();
+        let mut session = db.create_session();
         session
             .execute(
                 "CREATE TABLE ranges (
@@ -2910,8 +2989,8 @@ mod tests {
 
     #[test]
     fn enforces_primary_and_multi_column_unique_constraints() {
-        let db = Db::new();
-        let mut session = db.session();
+        let db = Db::create();
+        let mut session = db.create_session();
         session
             .execute(
                 "CREATE TABLE accounts (
@@ -2971,8 +3050,8 @@ mod tests {
 
     #[test]
     fn rebuilds_unique_indexes_after_rollback() {
-        let db = Db::new();
-        let mut session = db.session();
+        let db = Db::create();
+        let mut session = db.create_session();
         session
             .execute("CREATE TABLE items (id INTEGER PRIMARY KEY)")
             .unwrap();
@@ -2992,10 +3071,10 @@ mod tests {
     }
 
     #[test]
-    fn explicit_transactions_control_insert_and_update_visibility() {
-        let db = Db::new();
-        let mut first = db.session();
-        let mut second = db.session();
+    fn controls_insert_and_update_visibility_with_explicit_transactions() {
+        let db = Db::create();
+        let mut first = db.create_session();
+        let mut second = db.create_session();
         first
             .execute("CREATE TABLE items (id INTEGER, amount INTEGER)")
             .unwrap();
@@ -3048,10 +3127,10 @@ mod tests {
     }
 
     #[test]
-    fn isolation_levels_control_snapshot_lifetime() {
-        let db = Db::new();
-        let mut first = db.session();
-        let mut second = db.session();
+    fn controls_snapshot_lifetime_by_isolation_level() {
+        let db = Db::create();
+        let mut first = db.create_session();
+        let mut second = db.create_session();
         first.execute("CREATE TABLE items (id INTEGER)").unwrap();
         first.execute("INSERT INTO items VALUES (1)").unwrap();
 
@@ -3083,10 +3162,10 @@ mod tests {
     }
 
     #[test]
-    fn isolation_level_selection_follows_postgres_order() {
-        let db = Db::new();
-        let mut first = db.session();
-        let mut second = db.session();
+    fn follows_postgres_isolation_selection_order() {
+        let db = Db::create();
+        let mut first = db.create_session();
+        let mut second = db.create_session();
         first.execute("CREATE TABLE items (id INTEGER)").unwrap();
         first.execute("INSERT INTO items VALUES (1)").unwrap();
         first
@@ -3153,10 +3232,12 @@ mod tests {
     }
 
     #[test]
-    fn read_committed_writer_blocks_then_rechecks_after_commit() {
-        let db = Db::builder().lock_timeout(Duration::from_secs(2)).build();
-        let mut first = db.session();
-        let mut second = db.session();
+    fn blocks_and_rechecks_read_committed_writer_after_commit() {
+        let db = Db::create_builder()
+            .set_lock_timeout(Duration::from_secs(2))
+            .build();
+        let mut first = db.create_session();
+        let mut second = db.create_session();
         first
             .execute("CREATE TABLE items (id INTEGER, amount INTEGER)")
             .unwrap();
@@ -3177,7 +3258,7 @@ mod tests {
             result_receiver
                 .recv_timeout(Duration::from_secs(1))
                 .unwrap(),
-            Ok(affected(1))
+            Ok(create_affected_results(1))
         );
         handle.join().unwrap();
         assert_eq!(
@@ -3187,10 +3268,12 @@ mod tests {
     }
 
     #[test]
-    fn blocked_writer_proceeds_after_holder_rollback() {
-        let db = Db::builder().lock_timeout(Duration::from_secs(2)).build();
-        let mut first = db.session();
-        let mut second = db.session();
+    fn allows_blocked_writer_after_holder_rollback() {
+        let db = Db::create_builder()
+            .set_lock_timeout(Duration::from_secs(2))
+            .build();
+        let mut first = db.create_session();
+        let mut second = db.create_session();
         first
             .execute("CREATE TABLE items (id INTEGER, amount INTEGER)")
             .unwrap();
@@ -3211,7 +3294,7 @@ mod tests {
             result_receiver
                 .recv_timeout(Duration::from_secs(1))
                 .unwrap(),
-            Ok(affected(1))
+            Ok(create_affected_results(1))
         );
         handle.join().unwrap();
         assert_eq!(
@@ -3221,11 +3304,13 @@ mod tests {
     }
 
     #[test]
-    fn deadlock_aborts_newest_transaction_and_survivor_proceeds() {
-        let db = Db::builder().lock_timeout(Duration::from_secs(2)).build();
-        let mut setup = db.session();
-        let mut first = db.session();
-        let mut second = db.session();
+    fn aborts_newest_deadlocked_transaction_and_allows_survivor() {
+        let db = Db::create_builder()
+            .set_lock_timeout(Duration::from_secs(2))
+            .build();
+        let mut setup = db.create_session();
+        let mut first = db.create_session();
+        let mut second = db.create_session();
         setup
             .execute("CREATE TABLE items (id INTEGER, amount INTEGER)")
             .unwrap();
@@ -3247,17 +3332,17 @@ mod tests {
             let error = second
                 .execute("UPDATE items SET amount = 11 WHERE id = 1")
                 .unwrap_err();
-            let failed = second.query("SELECT * FROM items", &[]).unwrap_err();
+            let abort_with_error = second.query("SELECT * FROM items", &[]).unwrap_err();
             second.execute("ROLLBACK").unwrap();
             victim_sender
-                .send((error.sqlstate, failed.sqlstate))
+                .send((error.sqlstate, abort_with_error.sqlstate))
                 .unwrap();
         });
         wait_until_blocked(&db);
 
         assert_eq!(
             first.execute("UPDATE items SET amount = 1 WHERE id = 2"),
-            Ok(affected(1))
+            Ok(create_affected_results(1))
         );
         assert_eq!(
             victim_receiver
@@ -3277,10 +3362,12 @@ mod tests {
     }
 
     #[test]
-    fn repeatable_read_writer_fails_after_concurrent_commit() {
-        let db = Db::builder().lock_timeout(Duration::from_secs(2)).build();
-        let mut first = db.session();
-        let mut second = db.session();
+    fn fails_repeatable_read_writer_after_concurrent_commit() {
+        let db = Db::create_builder()
+            .set_lock_timeout(Duration::from_secs(2))
+            .build();
+        let mut first = db.create_session();
+        let mut second = db.create_session();
         first
             .execute("CREATE TABLE items (id INTEGER, amount INTEGER)")
             .unwrap();
@@ -3313,11 +3400,13 @@ mod tests {
     }
 
     #[test]
-    fn row_lock_clauses_use_update_and_share_compatibility() {
-        let db = Db::builder().lock_timeout(Duration::from_secs(2)).build();
-        let mut first = db.session();
-        let mut second = db.session();
-        let mut third = db.session();
+    fn applies_update_and_share_row_lock_compatibility() {
+        let db = Db::create_builder()
+            .set_lock_timeout(Duration::from_secs(2))
+            .build();
+        let mut first = db.create_session();
+        let mut second = db.create_session();
+        let mut third = db.create_session();
         first.execute("CREATE TABLE items (id INTEGER)").unwrap();
         first.execute("INSERT INTO items VALUES (1)").unwrap();
         first.execute("BEGIN").unwrap();
@@ -3342,7 +3431,7 @@ mod tests {
             result_receiver
                 .recv_timeout(Duration::from_secs(1))
                 .unwrap(),
-            Ok(affected(1))
+            Ok(create_affected_results(1))
         );
         handle.join().unwrap();
 
@@ -3351,7 +3440,7 @@ mod tests {
         first
             .query("SELECT * FROM items WHERE id = 2 FOR UPDATE", &[])
             .unwrap();
-        let mut writer = db.session();
+        let mut writer = db.create_session();
         let (result_sender, result_receiver) = mpsc::channel();
         let handle = thread::spawn(move || {
             result_sender
@@ -3364,18 +3453,18 @@ mod tests {
             result_receiver
                 .recv_timeout(Duration::from_secs(1))
                 .unwrap(),
-            Ok(affected(1))
+            Ok(create_affected_results(1))
         );
         handle.join().unwrap();
     }
 
     #[test]
-    fn lock_timeout_builder_and_session_setting_control_waits() {
-        let db = Db::builder()
-            .lock_timeout(Duration::from_millis(40))
+    fn controls_waits_with_builder_and_session_lock_timeouts() {
+        let db = Db::create_builder()
+            .set_lock_timeout(Duration::from_millis(40))
             .build();
-        let mut first = db.session();
-        let mut second = db.session();
+        let mut first = db.create_session();
+        let mut second = db.create_session();
         assert_eq!(second.lock_timeout, Duration::from_millis(40));
         second.execute("SET lock_timeout = 250").unwrap();
         assert_eq!(second.lock_timeout, Duration::from_millis(250));
@@ -3403,9 +3492,9 @@ mod tests {
     }
 
     #[test]
-    fn rolled_back_update_restores_row_for_later_delete() {
-        let db = Db::new();
-        let mut session = db.session();
+    fn restores_row_after_rolled_back_update() {
+        let db = Db::create();
+        let mut session = db.create_session();
         session
             .execute("CREATE TABLE items (id INTEGER, amount INTEGER)")
             .unwrap();
@@ -3419,13 +3508,16 @@ mod tests {
             session.query("SELECT * FROM items", &[]).unwrap().rows,
             vec![vec![Value::Int4(1), Value::Int4(1)]]
         );
-        assert_eq!(session.execute("DELETE FROM items").unwrap(), affected(1));
+        assert_eq!(
+            session.execute("DELETE FROM items").unwrap(),
+            create_affected_results(1)
+        );
     }
 
     #[test]
     fn deletes_matching_rows_and_all_rows() {
-        let db = Db::new();
-        let mut session = db.session();
+        let db = Db::create();
+        let mut session = db.create_session();
         session
             .execute("CREATE TABLE items (id INTEGER, amount INTEGER)")
             .unwrap();
@@ -3437,7 +3529,7 @@ mod tests {
             session
                 .execute("DELETE FROM items WHERE amount > 2")
                 .unwrap(),
-            affected(1)
+            create_affected_results(1)
         );
         assert_eq!(
             session.query("SELECT * FROM items", &[]).unwrap().rows,
@@ -3446,7 +3538,10 @@ mod tests {
                 vec![Value::Int4(2), Value::Null],
             ]
         );
-        assert_eq!(session.execute("DELETE FROM items").unwrap(), affected(2));
+        assert_eq!(
+            session.execute("DELETE FROM items").unwrap(),
+            create_affected_results(2)
+        );
         assert!(
             session
                 .query("SELECT * FROM items", &[])
@@ -3457,10 +3552,10 @@ mod tests {
     }
 
     #[test]
-    fn explicit_delete_visibility_matches_transaction_outcome() {
-        let db = Db::new();
-        let mut writer = db.session();
-        let mut reader = db.session();
+    fn matches_delete_visibility_to_transaction_outcome() {
+        let db = Db::create();
+        let mut writer = db.create_session();
+        let mut reader = db.create_session();
         writer.execute("CREATE TABLE items (id INTEGER)").unwrap();
         writer
             .execute("INSERT INTO items VALUES (1), (2), (3)")
@@ -3469,7 +3564,7 @@ mod tests {
         writer.execute("BEGIN").unwrap();
         assert_eq!(
             writer.execute("DELETE FROM items WHERE id = 1").unwrap(),
-            affected(1)
+            create_affected_results(1)
         );
         assert_eq!(
             writer.query("SELECT * FROM items", &[]).unwrap().rows,
@@ -3504,8 +3599,8 @@ mod tests {
 
     #[test]
     fn delete_requires_a_boolean_where_expression() {
-        let db = Db::new();
-        let mut session = db.session();
+        let db = Db::create();
+        let mut session = db.create_session();
         session.execute("CREATE TABLE items (id INTEGER)").unwrap();
         session.execute("INSERT INTO items VALUES (1)").unwrap();
 
@@ -3524,10 +3619,10 @@ mod tests {
     }
 
     #[test]
-    fn explicit_transactions_abort_after_errors_and_raii_rolls_back() {
-        let db = Db::new();
-        let mut session = db.session();
-        let mut reader = db.session();
+    fn aborts_explicit_transactions_after_errors_and_rolls_back_on_drop() {
+        let db = Db::create();
+        let mut session = db.create_session();
+        let mut reader = db.create_session();
         session.execute("CREATE TABLE items (id INTEGER)").unwrap();
 
         session.execute("BEGIN").unwrap();
@@ -3567,8 +3662,8 @@ mod tests {
 
     #[test]
     fn rejects_ddl_inside_explicit_transactions() {
-        let db = Db::new();
-        let mut session = db.session();
+        let db = Db::create();
+        let mut session = db.create_session();
 
         session.execute("BEGIN").unwrap();
         assert_eq!(
@@ -3590,8 +3685,8 @@ mod tests {
 
     #[test]
     fn insert_uses_exact_literal_types_and_commits() {
-        let db = Db::new();
-        let mut session = db.session();
+        let db = Db::create();
+        let mut session = db.create_session();
         session
             .execute("CREATE TABLE items (id INTEGER, name TEXT)")
             .unwrap();
@@ -3599,17 +3694,17 @@ mod tests {
             session
                 .execute("INSERT INTO items (name, id) VALUES ('one', 1), ('two', 2)")
                 .unwrap(),
-            affected(2)
+            create_affected_results(2)
         );
         let mut state = db.state.lock().unwrap();
         let reader = state.transactions.begin();
-        let snapshot = Snapshot::new(&state.transactions);
-        let schema = state.catalog.table("items").unwrap();
+        let snapshot = Snapshot::create(&state.transactions);
+        let schema = state.catalog.require_table("items").unwrap();
         let table = state.tables.get(&schema.id).unwrap();
         let rows = table
-            .rows()
+            .iterate_version_chains()
             .map(|(_, chain)| {
-                visible_version(chain, &snapshot, reader, &state.transactions)
+                find_visible_version(chain, &snapshot, reader, &state.transactions)
                     .unwrap()
                     .row
                     .clone()
@@ -3632,8 +3727,8 @@ mod tests {
 
     #[test]
     fn executes_constant_select_values_and_default_rows() {
-        let db = Db::new();
-        let mut session = db.session();
+        let db = Db::create();
+        let mut session = db.create_session();
 
         assert_eq!(
             session
@@ -3664,8 +3759,8 @@ mod tests {
 
     #[test]
     fn binds_single_table_aliases_and_qualified_columns() {
-        let db = Db::new();
-        let mut session = db.session();
+        let db = Db::create();
+        let mut session = db.create_session();
 
         session
             .execute("CREATE TABLE items (id INTEGER, value TEXT)")
@@ -3676,7 +3771,7 @@ mod tests {
         let statement = session
             .prepare("SELECT item.value AS label, item.* FROM items AS item WHERE item.id = $1 ORDER BY label")
             .unwrap();
-        assert_eq!(statement.parameter_types(), &[BaseType::Int4]);
+        assert_eq!(statement.get_parameter_types(), &[BaseType::Int4]);
         let result = session
             .query_prepared(&statement, &[Value::Int4(1)])
             .unwrap();
@@ -3699,9 +3794,9 @@ mod tests {
     }
 
     #[test]
-    fn scopes_apply_quoted_aliases_and_report_column_errors() {
-        let db = Db::new();
-        let mut session = db.session();
+    fn applies_quoted_aliases_and_reports_scope_errors() {
+        let db = Db::create();
+        let mut session = db.create_session();
 
         session
             .execute("CREATE TABLE \"Items\" (\"Value\" VARCHAR(5), other INTEGER)")
@@ -3757,8 +3852,8 @@ mod tests {
 
     #[test]
     fn joins_sources_and_merges_using_columns() {
-        let db = Db::new();
-        let mut session = db.session();
+        let db = Db::create();
+        let mut session = db.create_session();
 
         session
             .execute(
@@ -3867,10 +3962,10 @@ mod tests {
     }
 
     #[test]
-    fn single_table_alias_scope_property() {
+    fn preserves_single_table_alias_scope_property() {
         for index in 0..32 {
-            let db = Db::new();
-            let mut session = db.session();
+            let db = Db::create();
+            let mut session = db.create_session();
             let alias = format!("item_{index}");
             let output = format!("value_{index}");
             session
@@ -3886,7 +3981,7 @@ mod tests {
                     "SELECT {alias}.value AS {output}, {alias}.* FROM items AS {alias} WHERE {alias}.id = $1 ORDER BY {output}"
                 ))
                 .unwrap();
-            assert_eq!(statement.parameter_types(), &[BaseType::Int4]);
+            assert_eq!(statement.get_parameter_types(), &[BaseType::Int4]);
             let result = session
                 .query_prepared(&statement, &[Value::Int4(index)])
                 .unwrap();
@@ -3911,8 +4006,8 @@ mod tests {
 
     #[test]
     fn materializes_derived_tables_and_uncorrelated_scalar_subqueries() {
-        let db = Db::new();
-        let mut session = db.session();
+        let db = Db::create();
+        let mut session = db.create_session();
         session
             .execute("CREATE TABLE items (id INTEGER, value INTEGER)")
             .unwrap();
@@ -3971,7 +4066,10 @@ mod tests {
         );
         session.execute("ROLLBACK").unwrap();
         let prepared = session.prepare("SELECT (SELECT 7)").unwrap();
-        assert_eq!(prepared.columns()[0].type_oid, BaseType::Int4.oid());
+        assert_eq!(
+            prepared.get_result_columns()[0].type_oid,
+            BaseType::Int4.map_to_oid()
+        );
         assert_eq!(
             session.query_prepared(&prepared, &[]).unwrap().rows,
             vec![vec![Value::Int4(7)]]
@@ -3980,8 +4078,8 @@ mod tests {
 
     #[test]
     fn materializes_uncorrelated_subquery_predicates() {
-        let db = Db::new();
-        let mut session = db.session();
+        let db = Db::create();
+        let mut session = db.create_session();
         session
             .execute("CREATE TABLE items (id INTEGER, pair INTEGER)")
             .unwrap();
@@ -3994,7 +4092,7 @@ mod tests {
                 "SELECT id FROM items WHERE id = $1 AND id IN (SELECT id FROM items) ORDER BY id",
             )
             .unwrap();
-        assert_eq!(statement.parameter_types(), &[BaseType::Int4]);
+        assert_eq!(statement.get_parameter_types(), &[BaseType::Int4]);
         assert_eq!(
             session
                 .query_prepared(&statement, &[Value::Int4(2)])
@@ -4023,8 +4121,8 @@ mod tests {
 
     #[test]
     fn executes_correlated_subqueries_with_lexical_scopes() {
-        let db = Db::new();
-        let mut session = db.session();
+        let db = Db::create();
+        let mut session = db.create_session();
         session
             .execute("CREATE TABLE parents (id INTEGER, threshold INTEGER)")
             .unwrap();
@@ -4140,21 +4238,28 @@ mod tests {
 
     #[test]
     fn tolerates_only_planner_settings_outside_strict_mode() {
-        let db = Db::new();
-        let mut session = db.session();
+        let db = Db::create();
+        let mut session = db.create_session();
 
-        assert_eq!(session.execute("ANALYZE").unwrap(), affected(0));
+        assert_eq!(
+            session.execute("ANALYZE").unwrap(),
+            create_affected_results(0)
+        );
         assert_eq!(
             session.execute("SET enable_hashjoin = off").unwrap(),
-            affected(0)
+            create_affected_results(0)
         );
         assert_eq!(
             session.execute("RESET enable_hashjoin").unwrap(),
-            affected(0)
+            create_affected_results(0)
         );
-        let strict = Db::builder().strict(true).build();
+        let strict = Db::create_builder().set_strict_mode_enabled(true).build();
         assert_eq!(
-            strict.session().execute("ANALYZE").unwrap_err().sqlstate,
+            strict
+                .create_session()
+                .execute("ANALYZE")
+                .unwrap_err()
+                .sqlstate,
             SqlState::FeatureNotSupported
         );
     }

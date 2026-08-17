@@ -5,7 +5,7 @@ struct SubqueryMaterializer<'a> {
     state: &'a DatabaseState,
     xid: Xid,
     snapshot: &'a Snapshot,
-    context: &'a ExecutionContext,
+    context: &'a StatementExecutionContext,
     error: Option<PgError>,
     defer_unresolved: bool,
     scopes: Vec<BoundScope>,
@@ -13,7 +13,7 @@ struct SubqueryMaterializer<'a> {
 
 impl SubqueryMaterializer<'_> {
     fn execute(&self, query: &sqlparser::ast::Query) -> Result<QueryResult> {
-        let query = materialize_scalar_subqueries(
+        let query = materialize_uncorrelated_subqueries(
             self.state,
             &Statement::Query(Box::new(query.clone())),
             self.xid,
@@ -24,7 +24,7 @@ impl SubqueryMaterializer<'_> {
             unreachable!("subquery statement remains a query");
         };
         let StatementResult::Query(result) =
-            select_rows(self.state, &query, self.xid, self.snapshot, self.context)?
+            execute_query(self.state, &query, self.xid, self.snapshot, self.context)?
         else {
             unreachable!("subquery execution returns query rows");
         };
@@ -75,13 +75,13 @@ impl VisitorMut for SubqueryMaterializer<'_> {
                 };
                 let result = self.execute(subquery)?;
                 if result.columns.len() != 1 {
-                    return Err(PgError::new(
+                    return Err(PgError::create(
                         SqlState::SyntaxError,
                         "subquery has too many columns",
                     ));
                 }
-                let data_type = PgType::with_typmod(
-                    BaseType::from_oid(result.columns[0].type_oid)
+                let data_type = PgType::create_with_typmod(
+                    BaseType::resolve_oid(result.columns[0].type_oid)
                         .expect("query result type OID is supported"),
                     result.columns[0].typmod,
                 );
@@ -92,7 +92,9 @@ impl VisitorMut for SubqueryMaterializer<'_> {
                         result
                             .rows
                             .into_iter()
-                            .map(|row| crate::analyzer::typed_literal(row[0].clone(), data_type))
+                            .map(|row| {
+                                crate::analyzer::create_typed_literal(row[0].clone(), data_type)
+                            })
                             .collect(),
                     )),
                     is_some,
@@ -108,13 +110,13 @@ impl VisitorMut for SubqueryMaterializer<'_> {
                 };
                 let result = self.execute(subquery)?;
                 if result.columns.len() != 1 {
-                    return Err(PgError::new(
+                    return Err(PgError::create(
                         SqlState::SyntaxError,
                         "subquery has too many columns",
                     ));
                 }
-                let data_type = PgType::with_typmod(
-                    BaseType::from_oid(result.columns[0].type_oid)
+                let data_type = PgType::create_with_typmod(
+                    BaseType::resolve_oid(result.columns[0].type_oid)
                         .expect("query result type OID is supported"),
                     result.columns[0].typmod,
                 );
@@ -125,7 +127,9 @@ impl VisitorMut for SubqueryMaterializer<'_> {
                         result
                             .rows
                             .into_iter()
-                            .map(|row| crate::analyzer::typed_literal(row[0].clone(), data_type))
+                            .map(|row| {
+                                crate::analyzer::create_typed_literal(row[0].clone(), data_type)
+                            })
                             .collect(),
                     )),
                 }))
@@ -133,23 +137,23 @@ impl VisitorMut for SubqueryMaterializer<'_> {
             Expr::Subquery(query) => {
                 let result = self.execute(&query)?;
                 if result.columns.len() != 1 {
-                    return Err(PgError::new(
+                    return Err(PgError::create(
                         SqlState::SyntaxError,
                         "subquery must return only one column",
                     ));
                 }
                 if result.rows.len() > 1 {
-                    return Err(PgError::new(
+                    return Err(PgError::create(
                         SqlState::CardinalityViolation,
                         "more than one row returned by a subquery used as an expression",
                     ));
                 }
-                let data_type = PgType::with_typmod(
-                    BaseType::from_oid(result.columns[0].type_oid)
+                let data_type = PgType::create_with_typmod(
+                    BaseType::resolve_oid(result.columns[0].type_oid)
                         .expect("query result type OID is supported"),
                     result.columns[0].typmod,
                 );
-                Ok(Some(crate::analyzer::typed_literal(
+                Ok(Some(crate::analyzer::create_typed_literal(
                     result
                         .rows
                         .into_iter()
@@ -159,9 +163,9 @@ impl VisitorMut for SubqueryMaterializer<'_> {
                     data_type,
                 )))
             }
-            Expr::Exists { subquery, negated } => Ok(Some(crate::analyzer::typed_literal(
+            Expr::Exists { subquery, negated } => Ok(Some(crate::analyzer::create_typed_literal(
                 Value::Bool(self.execute(&subquery)?.rows.is_empty() == negated),
-                PgType::new(BaseType::Bool),
+                PgType::create(BaseType::Bool),
             ))),
             Expr::InSubquery {
                 expr,
@@ -174,7 +178,7 @@ impl VisitorMut for SubqueryMaterializer<'_> {
                     _ => 1,
                 };
                 if result.columns.len() != left_width {
-                    return Err(PgError::new(
+                    return Err(PgError::create(
                         SqlState::SyntaxError,
                         "subquery has too many columns",
                     ));
@@ -183,8 +187,8 @@ impl VisitorMut for SubqueryMaterializer<'_> {
                     .columns
                     .iter()
                     .map(|column| {
-                        PgType::with_typmod(
-                            BaseType::from_oid(column.type_oid)
+                        PgType::create_with_typmod(
+                            BaseType::resolve_oid(column.type_oid)
                                 .expect("query result type OID is supported"),
                             column.typmod,
                         )
@@ -200,7 +204,7 @@ impl VisitorMut for SubqueryMaterializer<'_> {
                                 .into_iter()
                                 .zip(&types)
                                 .map(|(value, data_type)| {
-                                    crate::analyzer::typed_literal(value, *data_type)
+                                    crate::analyzer::create_typed_literal(value, *data_type)
                                 })
                                 .collect::<Vec<_>>();
                             if fields.len() == 1 {
@@ -226,7 +230,7 @@ impl VisitorMut for SubqueryMaterializer<'_> {
                     ) =>
             {
                 match self.scopes.last().map(|outer| {
-                    expression_references_outer(&self.state.catalog, &correlation_candidate, outer)
+                    references_outer_scope(&self.state.catalog, &correlation_candidate, outer)
                 }) {
                     Some(Ok(true)) => {}
                     Some(Err(scope_error)) => self.error = Some(scope_error),
@@ -239,12 +243,12 @@ impl VisitorMut for SubqueryMaterializer<'_> {
     }
 }
 
-pub(crate) fn materialize_scalar_subqueries(
+pub(crate) fn materialize_uncorrelated_subqueries(
     state: &DatabaseState,
     statement: &Statement,
     xid: Xid,
     snapshot: &Snapshot,
-    context: &ExecutionContext,
+    context: &StatementExecutionContext,
 ) -> Result<Statement> {
     let mut statement = statement.clone();
     materialize_subqueries(state, &mut statement, xid, snapshot, context, true)?;
@@ -256,7 +260,7 @@ fn materialize_subqueries<V: VisitMut>(
     value: &mut V,
     xid: Xid,
     snapshot: &Snapshot,
-    context: &ExecutionContext,
+    context: &StatementExecutionContext,
     defer_unresolved: bool,
 ) -> Result<()> {
     let mut materializer = SubqueryMaterializer {
@@ -323,7 +327,7 @@ impl VisitorMut for OuterReferenceSubstituter<'_> {
         };
         for scope in self.scopes.iter().rev() {
             if identifiers.len() == 2 {
-                let qualifier = identifier_name(&identifiers[0]);
+                let qualifier = normalize_identifier(&identifiers[0]);
                 if !scope
                     .columns
                     .iter()
@@ -344,9 +348,11 @@ impl VisitorMut for OuterReferenceSubstituter<'_> {
         }
         match self.outer_scope.resolve_column(identifiers) {
             Ok((_, data_type)) => {
-                match RowScope::Bound(self.outer_scope).column_value(identifiers, self.outer_row) {
+                match RowScope::Bound(self.outer_scope)
+                    .resolve_column_value(identifiers, self.outer_row)
+                {
                     Ok(value) => {
-                        *expression = crate::analyzer::typed_literal(value, data_type);
+                        *expression = crate::analyzer::create_typed_literal(value, data_type);
                         self.substituted = true;
                     }
                     Err(error) => {
@@ -369,7 +375,7 @@ impl VisitorMut for OuterReferenceSubstituter<'_> {
     }
 }
 
-fn expression_references_outer(
+fn references_outer_scope(
     catalog: &Catalog,
     expression: &Expr,
     outer_scope: &BoundScope,
@@ -395,7 +401,7 @@ fn evaluate_query_expression(
     row: &[Value],
     xid: Xid,
     snapshot: &Snapshot,
-    context: &ExecutionContext,
+    context: &StatementExecutionContext,
 ) -> Result<Value> {
     let mut expression = expression.clone();
     let mut substituter = OuterReferenceSubstituter {
@@ -414,7 +420,7 @@ fn evaluate_query_expression(
     evaluate(&expression, RowScope::Bound(scope), row, context)
 }
 
-pub(crate) fn query_columns(
+pub(crate) fn describe_query_result_columns(
     state: &DatabaseState,
     statement: &Statement,
 ) -> Result<Vec<ColumnMeta>> {
@@ -423,7 +429,7 @@ pub(crate) fn query_columns(
     };
     match query.body.as_ref() {
         SetExpr::Select(select) => bind_select_scope(state, select).and_then(|scope| {
-            projections_and_columns(state, &select.projection, &scope).map(|(_, columns)| columns)
+            build_projection_plan(state, &select.projection, &scope).map(|(_, columns)| columns)
         }),
         SetExpr::Values(values) => bind_values_scope(values).map(|scope| {
             scope
@@ -431,7 +437,7 @@ pub(crate) fn query_columns(
                 .iter()
                 .map(|column| ColumnMeta {
                     name: column.name.clone(),
-                    type_oid: column.data_type.oid(),
+                    type_oid: column.data_type.map_to_oid(),
                     typmod: column.data_type.typmod,
                 })
                 .collect()
@@ -439,7 +445,7 @@ pub(crate) fn query_columns(
         _ => Ok(Vec::new()),
     }
 }
-enum Projection<'a> {
+enum ProjectionSource<'a> {
     Column(usize),
     Merged(usize, usize, PgType),
     Expression(&'a Expr),
@@ -452,7 +458,7 @@ enum RowCountClause {
     Limit,
     Offset,
 }
-struct OrderSpec<'a> {
+struct RowOrderSpec<'a> {
     key: OrderKey<'a>,
     ascending: bool,
     nulls_first: bool,
@@ -471,15 +477,17 @@ enum JoinKey {
     Bytea(Vec<u8>),
     Uuid(uuid::Uuid),
 }
-pub(super) fn select_lock_mode(query: &sqlparser::ast::Query) -> Result<Option<RowLockMode>> {
+pub(super) fn resolve_select_lock_mode(
+    query: &sqlparser::ast::Query,
+) -> Result<Option<RowLockMode>> {
     if query.locks.len() > 1 {
-        return not_supported("multiple row-lock clauses are not implemented");
+        return reject_unsupported("multiple row-lock clauses are not implemented");
     }
     let Some(lock) = query.locks.first() else {
         return Ok(None);
     };
     if lock.of.is_some() || lock.nonblock.is_some() {
-        return not_supported("row-lock clause variant is not implemented");
+        return reject_unsupported("row-lock clause variant is not implemented");
     }
     Ok(Some(match lock.lock_type {
         LockType::Share => RowLockMode::Share,
@@ -490,12 +498,12 @@ pub(super) fn select_lock_mode(query: &sqlparser::ast::Query) -> Result<Option<R
 fn bind_values_scope(values: &sqlparser::ast::Values) -> Result<BoundScope> {
     let width = values.rows.first().map(|row| row.len()).unwrap_or(0);
     if values.rows.iter().any(|row| row.len() != width) {
-        return Err(PgError::new(
+        return Err(PgError::create(
             SqlState::SyntaxError,
             "VALUES lists must all be the same length",
         ));
     }
-    let constants = constant_schema();
+    let constants = create_constant_expression_schema();
     let columns = (0..width)
         .map(|slot| {
             let data_type = values
@@ -503,26 +511,26 @@ fn bind_values_scope(values: &sqlparser::ast::Values) -> Result<BoundScope> {
                 .iter()
                 .map(|row| &row[slot])
                 .filter(|expression| {
-                    !null_expression(expression) && unknown_string(expression).is_none()
+                    !is_null_literal(expression)
+                        && extract_unknown_string_literal(expression).is_none()
                 })
                 .try_fold(None, |common, expression| {
-                    let data_type = expression_type(expression, RowScope::Table(&constants))?;
+                    let data_type = infer_expression_type(expression, RowScope::Table(&constants))?;
                     Ok(Some(match common {
-                        Some(common) => {
-                            coercion::common_type(common, data_type).ok_or_else(|| {
-                                PgError::new(
+                        Some(common) => coercion::resolve_common_type(common, data_type)
+                            .ok_or_else(|| {
+                                PgError::create(
                                     SqlState::DatatypeMismatch,
                                     "VALUES types cannot be matched",
                                 )
-                            })?
-                        }
+                            })?,
                         None => data_type,
                     }))
                 })?
                 .unwrap_or(BaseType::Text);
             Ok(BoundColumn {
                 name: format!("column{}", slot + 1),
-                data_type: PgType::new(data_type),
+                data_type: PgType::create(data_type),
                 qualifier: String::new(),
                 slot,
                 merged: None,
@@ -535,10 +543,10 @@ fn bind_values_scope(values: &sqlparser::ast::Values) -> Result<BoundScope> {
     Ok(BoundScope { columns })
 }
 
-fn values_rows(
+fn execute_values_query(
     query: &sqlparser::ast::Query,
     values: &sqlparser::ast::Values,
-    context: &ExecutionContext,
+    context: &StatementExecutionContext,
 ) -> Result<StatementResult> {
     let scope = bind_values_scope(values)?;
     let columns = scope
@@ -546,11 +554,11 @@ fn values_rows(
         .iter()
         .map(|column| ColumnMeta {
             name: column.name.clone(),
-            type_oid: column.data_type.oid(),
+            type_oid: column.data_type.map_to_oid(),
             typmod: column.data_type.typmod,
         })
         .collect::<Vec<_>>();
-    let constants = constant_schema();
+    let constants = create_constant_expression_schema();
     let mut rows = values
         .rows
         .iter()
@@ -558,7 +566,7 @@ fn values_rows(
             row.iter()
                 .zip(&scope.columns)
                 .map(|(expression, column)| {
-                    evaluate_as(
+                    evaluate_and_coerce(
                         expression,
                         column.data_type.base,
                         CastContext::Implicit,
@@ -572,12 +580,12 @@ fn values_rows(
         .collect::<Result<Vec<_>>>()?;
     if let Some(order_by) = &query.order_by {
         let sqlparser::ast::OrderByKind::Expressions(orders) = &order_by.kind else {
-            return not_supported("ORDER BY ALL is not implemented");
+            return reject_unsupported("ORDER BY ALL is not implemented");
         };
         let orders = orders
             .iter()
             .map(|order| {
-                let index = if let Some(position) = number_literal(&order.expr)
+                let index = if let Some(position) = extract_number_literal(&order.expr)
                     && !position.contains(['.', 'e', 'E'])
                 {
                     position
@@ -593,13 +601,13 @@ fn values_rows(
                     None
                 }
                 .ok_or_else(|| {
-                    PgError::new(
+                    PgError::create(
                         SqlState::InvalidColumnReference,
                         "ORDER BY position is not in select list",
                     )
                 })?;
                 if index >= columns.len() {
-                    return Err(PgError::new(
+                    return Err(PgError::create(
                         SqlState::InvalidColumnReference,
                         "ORDER BY position is not in select list",
                     ));
@@ -633,7 +641,7 @@ fn values_rows(
                             }
                         }
                         (left, right) => {
-                            let ordering = value_ordering(left, right)
+                            let ordering = compare_values(left, right)
                                 .expect("VALUES columns have one common type");
                             if *ascending {
                                 ordering
@@ -656,18 +664,18 @@ fn values_rows(
         }) if limit_by.is_empty() => (
             limit
                 .as_ref()
-                .map(|limit| row_count(limit, RowCountClause::Limit, context))
+                .map(|limit| evaluate_row_count(limit, RowCountClause::Limit, context))
                 .transpose()?
                 .flatten(),
             offset
                 .as_ref()
-                .map(|offset| row_count(&offset.value, RowCountClause::Offset, context))
+                .map(|offset| evaluate_row_count(&offset.value, RowCountClause::Offset, context))
                 .transpose()?
                 .flatten()
                 .unwrap_or(0),
         ),
         _ => {
-            return not_supported("LIMIT clause is not implemented");
+            return reject_unsupported("LIMIT clause is not implemented");
         }
     };
     Ok(StatementResult::Query(QueryResult {
@@ -680,25 +688,25 @@ fn values_rows(
     }))
 }
 
-pub(super) fn select_rows(
+pub(super) fn execute_query(
     state: &DatabaseState,
     query: &sqlparser::ast::Query,
     xid: Xid,
     snapshot: &Snapshot,
-    context: &ExecutionContext,
+    context: &StatementExecutionContext,
 ) -> Result<StatementResult> {
     if query.with.is_some() || query.fetch.is_some() {
-        return not_supported("query clause is not implemented");
+        return reject_unsupported("query clause is not implemented");
     }
-    select_lock_mode(query)?;
+    resolve_select_lock_mode(query)?;
     let SetExpr::Select(select) = query.body.as_ref() else {
         if let SetExpr::Values(values) = query.body.as_ref() {
-            return values_rows(query, values, context);
+            return execute_values_query(query, values, context);
         }
-        return not_supported("query source is not implemented");
+        return reject_unsupported("query source is not implemented");
     };
     let GroupByExpr::Expressions(group_by, modifiers) = &select.group_by else {
-        return not_supported("GROUP BY is not implemented");
+        return reject_unsupported("GROUP BY is not implemented");
     };
     if select.distinct.is_some()
         || select.into.is_some()
@@ -706,7 +714,7 @@ pub(super) fn select_rows(
         || !modifiers.is_empty()
         || select.having.is_some()
     {
-        return not_supported("SELECT feature is not implemented");
+        return reject_unsupported("SELECT feature is not implemented");
     }
     let scope = bind_select_scope(state, select)?;
     let (limit, offset) = match &query.limit_clause {
@@ -717,62 +725,62 @@ pub(super) fn select_rows(
             limit_by,
         }) => {
             if !limit_by.is_empty() {
-                return not_supported("LIMIT BY is not implemented");
+                return reject_unsupported("LIMIT BY is not implemented");
             }
             let limit = limit
                 .as_ref()
-                .map(|limit| row_count(limit, RowCountClause::Limit, context))
+                .map(|limit| evaluate_row_count(limit, RowCountClause::Limit, context))
                 .transpose()?
                 .flatten();
             let offset = offset
                 .as_ref()
-                .map(|offset| row_count(&offset.value, RowCountClause::Offset, context))
+                .map(|offset| evaluate_row_count(&offset.value, RowCountClause::Offset, context))
                 .transpose()?
                 .flatten()
                 .unwrap_or(0);
             (limit, offset)
         }
         Some(sqlparser::ast::LimitClause::OffsetCommaLimit { .. }) => {
-            return not_supported("LIMIT clause is not implemented");
+            return reject_unsupported("LIMIT clause is not implemented");
         }
     };
     if let Some(selection) = &select.selection {
-        let base = expression_data_type(state, selection, &scope)?.base;
-        if base != BaseType::Bool && !null_expression(selection) {
-            return Err(PgError::new(
+        let base = infer_query_expression_type(state, selection, &scope)?.base;
+        if base != BaseType::Bool && !is_null_literal(selection) {
+            return Err(PgError::create(
                 SqlState::DatatypeMismatch,
                 "WHERE requires a boolean expression",
             ));
         }
     }
-    let (projections, columns) = projections_and_columns(state, &select.projection, &scope)?;
+    let (projections, columns) = build_projection_plan(state, &select.projection, &scope)?;
     let order_specs = query
         .order_by
         .as_ref()
         .map(|order_by| {
             if order_by.interpolate.is_some() {
-                return not_supported("ORDER BY INTERPOLATE is not implemented");
+                return reject_unsupported("ORDER BY INTERPOLATE is not implemented");
             }
             let sqlparser::ast::OrderByKind::Expressions(orders) = &order_by.kind else {
-                return not_supported("ORDER BY ALL is not implemented");
+                return reject_unsupported("ORDER BY ALL is not implemented");
             };
             orders
                 .iter()
                 .map(|order| {
                     if order.with_fill.is_some() {
-                        return not_supported("ORDER BY WITH FILL is not implemented");
+                        return reject_unsupported("ORDER BY WITH FILL is not implemented");
                     }
-                    let key = if let Some(position) = number_literal(&order.expr)
+                    let key = if let Some(position) = extract_number_literal(&order.expr)
                         && !position.contains(['.', 'e', 'E'])
                     {
                         let position = position.parse::<usize>().map_err(|_| {
-                            PgError::new(
+                            PgError::create(
                                 SqlState::InvalidColumnReference,
                                 "ORDER BY position is not in select list",
                             )
                         })?;
                         if position == 0 || position > projections.len() {
-                            return Err(PgError::new(
+                            return Err(PgError::create(
                                 SqlState::InvalidColumnReference,
                                 "ORDER BY position is not in select list",
                             ));
@@ -781,15 +789,15 @@ pub(super) fn select_rows(
                     } else if let Expr::Identifier(identifier) = &order.expr
                         && let Some(index) = columns
                             .iter()
-                            .position(|column| column.name == identifier_name(identifier))
+                            .position(|column| column.name == normalize_identifier(identifier))
                     {
                         OrderKey::Output(index)
                     } else {
-                        expression_data_type(state, &order.expr, &scope)?;
+                        infer_query_expression_type(state, &order.expr, &scope)?;
                         OrderKey::Expression(&order.expr)
                     };
                     let ascending = order.options.asc.unwrap_or(true);
-                    Ok(OrderSpec {
+                    Ok(RowOrderSpec {
                         key,
                         ascending,
                         nulls_first: order.options.nulls_first.unwrap_or(!ascending),
@@ -800,7 +808,7 @@ pub(super) fn select_rows(
         .transpose()?
         .unwrap_or_default();
     let mut rows = Vec::new();
-    visit_source_rows(
+    visit_query_source_rows(
         state,
         select,
         &scope,
@@ -821,8 +829,8 @@ pub(super) fn select_rows(
             let values = projections
                 .iter()
                 .map(|projection| match projection {
-                    Projection::Column(index) => Ok(row[*index].clone()),
-                    Projection::Merged(left, right, data_type) => {
+                    ProjectionSource::Column(index) => Ok(row[*index].clone()),
+                    ProjectionSource::Merged(left, right, data_type) => {
                         let value = if row[*left].is_null() {
                             row[*right].clone()
                         } else {
@@ -833,13 +841,15 @@ pub(super) fn select_rows(
                         } else {
                             coercion::coerce(
                                 value.clone(),
-                                value.base_type().expect("non-null value has a base type"),
+                                value
+                                    .get_base_type()
+                                    .expect("non-null value has a base type"),
                                 *data_type,
                                 CastContext::Implicit,
                             )
                         }
                     }
-                    Projection::Expression(expr) => {
+                    ProjectionSource::Expression(expr) => {
                         evaluate_query_expression(state, expr, &scope, row, xid, snapshot, context)
                     }
                 })
@@ -880,7 +890,7 @@ pub(super) fn select_rows(
                             }
                         }
                         _ => {
-                            let ordering = value_ordering(left, right)
+                            let ordering = compare_values(left, right)
                                 .expect("ORDER BY expression type was checked");
                             if spec.ascending {
                                 ordering
@@ -903,11 +913,11 @@ pub(super) fn select_rows(
     Ok(StatementResult::Query(QueryResult { columns, rows }))
 }
 
-fn projections_and_columns<'a>(
+fn build_projection_plan<'a>(
     state: &DatabaseState,
     projection: &'a [SelectItem],
     scope: &BoundScope,
-) -> Result<(Vec<Projection<'a>>, Vec<ColumnMeta>)> {
+) -> Result<(Vec<ProjectionSource<'a>>, Vec<ColumnMeta>)> {
     let mut projections = Vec::new();
     let mut columns = Vec::new();
     for item in projection {
@@ -917,13 +927,13 @@ fn projections_and_columns<'a>(
                     if column.wildcard {
                         projections.push(match column.merged {
                             Some((left, right)) => {
-                                Projection::Merged(left, right, column.data_type)
+                                ProjectionSource::Merged(left, right, column.data_type)
                             }
-                            None => Projection::Column(column.slot),
+                            None => ProjectionSource::Column(column.slot),
                         });
                         columns.push(ColumnMeta {
                             name: column.name.clone(),
-                            type_oid: column.data_type.oid(),
+                            type_oid: column.data_type.map_to_oid(),
                             typmod: column.data_type.typmod,
                         });
                     }
@@ -933,7 +943,7 @@ fn projections_and_columns<'a>(
                 SelectItemQualifiedWildcardKind::ObjectName(object_name),
                 _,
             ) => {
-                let qualifier = name(object_name)?;
+                let qualifier = normalize_unqualified_object_name(object_name)?;
                 let matching = scope
                     .columns
                     .iter()
@@ -945,48 +955,48 @@ fn projections_and_columns<'a>(
                         .iter()
                         .any(|column| column.qualifier == qualifier)
                 {
-                    return Err(PgError::new(
+                    return Err(PgError::create(
                         SqlState::UndefinedTable,
                         format!("missing FROM-clause entry for table {qualifier:?}"),
                     ));
                 }
                 for column in matching {
-                    projections.push(Projection::Column(column.slot));
+                    projections.push(ProjectionSource::Column(column.slot));
                     columns.push(ColumnMeta {
                         name: column.name.clone(),
-                        type_oid: column.data_type.oid(),
+                        type_oid: column.data_type.map_to_oid(),
                         typmod: column.data_type.typmod,
                     });
                 }
             }
             SelectItem::UnnamedExpr(expression @ Expr::Identifier(column)) => {
                 let (_, data_type) = scope.resolve_column(std::slice::from_ref(column))?;
-                projections.push(Projection::Expression(expression));
+                projections.push(ProjectionSource::Expression(expression));
                 columns.push(ColumnMeta {
                     name: column.value.clone(),
-                    type_oid: data_type.oid(),
+                    type_oid: data_type.map_to_oid(),
                     typmod: data_type.typmod,
                 });
             }
             SelectItem::UnnamedExpr(expression @ Expr::CompoundIdentifier(identifiers)) => {
                 let (_, data_type) = scope.resolve_column(identifiers)?;
-                projections.push(Projection::Expression(expression));
+                projections.push(ProjectionSource::Expression(expression));
                 columns.push(ColumnMeta {
                     name: identifiers
                         .last()
                         .expect("compound identifier is non-empty")
                         .value
                         .clone(),
-                    type_oid: data_type.oid(),
+                    type_oid: data_type.map_to_oid(),
                     typmod: data_type.typmod,
                 });
             }
             SelectItem::UnnamedExpr(expr) => {
-                let data_type = expression_data_type(state, expr, scope)?;
-                projections.push(Projection::Expression(expr));
+                let data_type = infer_query_expression_type(state, expr, scope)?;
+                projections.push(ProjectionSource::Expression(expr));
                 columns.push(ColumnMeta {
                     name: "?column?".into(),
-                    type_oid: data_type.oid(),
+                    type_oid: data_type.map_to_oid(),
                     typmod: PgType::NO_TYPEMOD,
                 });
             }
@@ -1001,40 +1011,50 @@ fn projections_and_columns<'a>(
                     _ => None,
                 };
                 let (projection, data_type, typmod) = match resolved {
-                    Some((_, data_type)) => {
-                        (Projection::Expression(expr), data_type, data_type.typmod)
-                    }
+                    Some((_, data_type)) => (
+                        ProjectionSource::Expression(expr),
+                        data_type,
+                        data_type.typmod,
+                    ),
                     None => {
-                        let data_type = expression_data_type(state, expr, scope)?;
-                        (Projection::Expression(expr), data_type, PgType::NO_TYPEMOD)
+                        let data_type = infer_query_expression_type(state, expr, scope)?;
+                        (
+                            ProjectionSource::Expression(expr),
+                            data_type,
+                            PgType::NO_TYPEMOD,
+                        )
                     }
                 };
                 projections.push(projection);
                 columns.push(ColumnMeta {
-                    name: identifier_name(alias),
-                    type_oid: data_type.oid(),
+                    name: normalize_identifier(alias),
+                    type_oid: data_type.map_to_oid(),
                     typmod,
                 });
             }
             _ => {
-                return not_supported("SELECT projection is not implemented");
+                return reject_unsupported("SELECT projection is not implemented");
             }
         }
     }
     Ok((projections, columns))
 }
 
-fn expression_data_type(state: &DatabaseState, expr: &Expr, scope: &BoundScope) -> Result<PgType> {
-    super::scope::expression_data_type(&state.catalog, expr, scope)
+fn infer_query_expression_type(
+    state: &DatabaseState,
+    expr: &Expr,
+    scope: &BoundScope,
+) -> Result<PgType> {
+    super::scope::infer_expression_data_type(&state.catalog, expr, scope)
 }
 
-fn source_rows(
+fn materialize_source_rows(
     state: &DatabaseState,
     select: &sqlparser::ast::Select,
     scope: &BoundScope,
     xid: Xid,
     snapshot: &Snapshot,
-    context: &ExecutionContext,
+    context: &StatementExecutionContext,
     selection: Option<&Expr>,
 ) -> Result<Vec<Vec<Value>>> {
     if select.from.is_empty() {
@@ -1043,7 +1063,7 @@ fn source_rows(
     let mut next_slot = 0;
     let mut rows = vec![vec![Value::Null; scope.columns.len()]];
     for table in &select.from {
-        let source = table_rows(
+        let source = materialize_table_with_joins_rows(
             state,
             table,
             scope,
@@ -1074,30 +1094,30 @@ fn source_rows(
     Ok(rows)
 }
 
-fn visit_source_rows(
+fn visit_query_source_rows(
     state: &DatabaseState,
     select: &sqlparser::ast::Select,
     scope: &BoundScope,
     xid: Xid,
     snapshot: &Snapshot,
-    context: &ExecutionContext,
+    context: &StatementExecutionContext,
     selection: Option<&Expr>,
     visit: &mut dyn FnMut(&[Value]) -> Result<()>,
 ) -> Result<()> {
     if let [table] = select.from.as_slice()
-        && streams_inner_rows(table)
+        && can_stream_inner_join(table)
     {
-        return visit_inner_rows(
+        return visit_streamed_inner_join_rows(
             state, table, scope, xid, snapshot, context, selection, visit,
         );
     }
-    for row in source_rows(state, select, scope, xid, snapshot, context, selection)? {
+    for row in materialize_source_rows(state, select, scope, xid, snapshot, context, selection)? {
         visit(&row)?;
     }
     Ok(())
 }
 
-fn streams_inner_rows(table: &sqlparser::ast::TableWithJoins) -> bool {
+fn can_stream_inner_join(table: &sqlparser::ast::TableWithJoins) -> bool {
     matches!(table.relation, TableFactor::Table { .. })
         && table.joins.iter().all(|join| {
             matches!(join.relation, TableFactor::Table { .. })
@@ -1110,13 +1130,13 @@ fn streams_inner_rows(table: &sqlparser::ast::TableWithJoins) -> bool {
         })
 }
 
-fn visit_inner_rows(
+fn visit_streamed_inner_join_rows(
     state: &DatabaseState,
     table: &sqlparser::ast::TableWithJoins,
     scope: &BoundScope,
     xid: Xid,
     snapshot: &Snapshot,
-    context: &ExecutionContext,
+    context: &StatementExecutionContext,
     selection: Option<&Expr>,
     visit: &mut dyn FnMut(&[Value]) -> Result<()>,
 ) -> Result<()> {
@@ -1132,18 +1152,22 @@ fn visit_inner_rows(
             unreachable!("streamable sources are tables");
         };
         starts.push(next_slot);
-        next_slot += state.catalog.table(&name(table_name)?)?.columns.len();
+        next_slot += state
+            .catalog
+            .require_table(&normalize_unqualified_object_name(table_name)?)?
+            .columns
+            .len();
     }
     if table.joins.len() == 1
         && let Some((left_slot, right_slot)) =
-            hash_join_slots(&table.joins[0].join_operator, scope, starts[0], starts[1])
+            resolve_hash_join_slots(&table.joins[0].join_operator, scope, starts[0], starts[1])
     {
-        return visit_hash_inner_rows(
+        return visit_hash_join_rows(
             state, table, scope, xid, snapshot, context, selection, starts[0], starts[1],
             left_slot, right_slot, visit,
         );
     }
-    visit_factor_rows(
+    visit_table_factor_rows(
         state,
         &table.relation,
         scope,
@@ -1153,14 +1177,14 @@ fn visit_inner_rows(
         selection,
         starts[0],
         &mut |row| {
-            visit_inner_join_rows(
+            visit_nested_loop_join_rows(
                 state, table, scope, xid, snapshot, context, selection, &starts, 0, row, visit,
             )
         },
     )
 }
 
-fn hash_join_slots(
+fn resolve_hash_join_slots(
     operator: &sqlparser::ast::JoinOperator,
     scope: &BoundScope,
     left_start: usize,
@@ -1180,8 +1204,8 @@ fn hash_join_slots(
     else {
         return None;
     };
-    let (left_slot, left_type) = hash_expression_slot(left, scope)?;
-    let (right_slot, right_type) = hash_expression_slot(right, scope)?;
+    let (left_slot, left_type) = resolve_hash_expression_slot(left, scope)?;
+    let (right_slot, right_type) = resolve_hash_expression_slot(right, scope)?;
     if left_type.base != right_type.base
         || !matches!(
             left_type.base,
@@ -1208,7 +1232,7 @@ fn hash_join_slots(
     .then_some((left_slot, right_slot))
 }
 
-fn hash_expression_slot(expression: &Expr, scope: &BoundScope) -> Option<(usize, PgType)> {
+fn resolve_hash_expression_slot(expression: &Expr, scope: &BoundScope) -> Option<(usize, PgType)> {
     match expression {
         Expr::Identifier(identifier) => scope.resolve_column(std::slice::from_ref(identifier)).ok(),
         Expr::CompoundIdentifier(identifiers) => scope.resolve_column(identifiers).ok(),
@@ -1216,13 +1240,13 @@ fn hash_expression_slot(expression: &Expr, scope: &BoundScope) -> Option<(usize,
     }
 }
 
-fn visit_hash_inner_rows(
+fn visit_hash_join_rows(
     state: &DatabaseState,
     table: &sqlparser::ast::TableWithJoins,
     scope: &BoundScope,
     xid: Xid,
     snapshot: &Snapshot,
-    context: &ExecutionContext,
+    context: &StatementExecutionContext,
     selection: Option<&Expr>,
     left_start: usize,
     right_start: usize,
@@ -1231,7 +1255,7 @@ fn visit_hash_inner_rows(
     visit: &mut dyn FnMut(&[Value]) -> Result<()>,
 ) -> Result<()> {
     let mut right_rows = std::collections::HashMap::<JoinKey, Vec<Vec<Value>>>::new();
-    visit_factor_rows(
+    visit_table_factor_rows(
         state,
         &table.joins[0].relation,
         scope,
@@ -1241,13 +1265,13 @@ fn visit_hash_inner_rows(
         selection,
         right_start,
         &mut |row| {
-            if let Some(key) = hash_key(&row[right_slot]) {
+            if let Some(key) = create_hash_join_key(&row[right_slot]) {
                 right_rows.entry(key).or_default().push(row.to_vec());
             }
             Ok(())
         },
     )?;
-    visit_factor_rows(
+    visit_table_factor_rows(
         state,
         &table.relation,
         scope,
@@ -1257,7 +1281,7 @@ fn visit_hash_inner_rows(
         selection,
         left_start,
         &mut |left| {
-            let Some(key) = hash_key(&left[left_slot]) else {
+            let Some(key) = create_hash_join_key(&left[left_slot]) else {
                 return Ok(());
             };
             let Some(matches) = right_rows.get(&key) else {
@@ -1282,7 +1306,7 @@ fn visit_hash_inner_rows(
     )
 }
 
-fn hash_key(value: &Value) -> Option<JoinKey> {
+fn create_hash_join_key(value: &Value) -> Option<JoinKey> {
     match value {
         Value::Null => None,
         Value::Bool(value) => Some(JoinKey::Bool(*value)),
@@ -1296,13 +1320,13 @@ fn hash_key(value: &Value) -> Option<JoinKey> {
     }
 }
 
-fn visit_inner_join_rows(
+fn visit_nested_loop_join_rows(
     state: &DatabaseState,
     table: &sqlparser::ast::TableWithJoins,
     scope: &BoundScope,
     xid: Xid,
     snapshot: &Snapshot,
-    context: &ExecutionContext,
+    context: &StatementExecutionContext,
     selection: Option<&Expr>,
     starts: &[usize],
     index: usize,
@@ -1312,7 +1336,7 @@ fn visit_inner_join_rows(
     let Some(join) = table.joins.get(index) else {
         return visit(left);
     };
-    visit_factor_rows(
+    visit_table_factor_rows(
         state,
         &join.relation,
         scope,
@@ -1333,7 +1357,7 @@ fn visit_inner_join_rows(
                     }
                 })
                 .collect::<Vec<_>>();
-            if join_matches(
+            if evaluate_join_condition(
                 state,
                 &join.join_operator,
                 &row,
@@ -1344,7 +1368,7 @@ fn visit_inner_join_rows(
                 snapshot,
                 context,
             )? {
-                visit_inner_join_rows(
+                visit_nested_loop_join_rows(
                     state,
                     table,
                     scope,
@@ -1363,13 +1387,13 @@ fn visit_inner_join_rows(
     )
 }
 
-fn visit_factor_rows(
+fn visit_table_factor_rows(
     state: &DatabaseState,
     factor: &TableFactor,
     scope: &BoundScope,
     xid: Xid,
     snapshot: &Snapshot,
-    context: &ExecutionContext,
+    context: &StatementExecutionContext,
     selection: Option<&Expr>,
     start: usize,
     visit: &mut dyn FnMut(&[Value]) -> Result<()>,
@@ -1383,12 +1407,14 @@ fn visit_factor_rows(
         unreachable!("streamable source is a table");
     };
     if args.is_some() {
-        return not_supported("table functions are not implemented");
+        return reject_unsupported("table functions are not implemented");
     }
-    let schema = state.catalog.table(&name(table_name)?)?;
+    let schema = state
+        .catalog
+        .require_table(&normalize_unqualified_object_name(table_name)?)?;
     let mut filters = Vec::new();
     if let Some(selection) = selection {
-        push_filters(
+        collect_pushdown_filters(
             selection,
             scope,
             start,
@@ -1400,9 +1426,9 @@ fn visit_factor_rows(
         .tables
         .get(&schema.id)
         .expect("catalog table must have storage")
-        .rows()
+        .iterate_version_chains()
     {
-        let Some(version) = visible_version(chain, snapshot, xid, &state.transactions) else {
+        let Some(version) = find_visible_version(chain, snapshot, xid, &state.transactions) else {
             continue;
         };
         let mut row = vec![Value::Null; scope.columns.len()];
@@ -1423,18 +1449,18 @@ fn visit_factor_rows(
     Ok(())
 }
 
-fn table_rows(
+fn materialize_table_with_joins_rows(
     state: &DatabaseState,
     table: &sqlparser::ast::TableWithJoins,
     scope: &BoundScope,
     xid: Xid,
     snapshot: &Snapshot,
-    context: &ExecutionContext,
+    context: &StatementExecutionContext,
     selection: Option<&Expr>,
     next_slot: &mut usize,
 ) -> Result<Vec<Vec<Value>>> {
     let left_start = *next_slot;
-    let mut rows = factor_rows(
+    let mut rows = materialize_table_factor_rows(
         state,
         &table.relation,
         scope,
@@ -1446,7 +1472,7 @@ fn table_rows(
     )?;
     for join in &table.joins {
         let right_start = *next_slot;
-        let right_rows = factor_rows(
+        let right_rows = materialize_table_factor_rows(
             state,
             &join.relation,
             scope,
@@ -1472,7 +1498,7 @@ fn table_rows(
                         }
                     })
                     .collect::<Vec<_>>();
-                if join_matches(
+                if evaluate_join_condition(
                     state,
                     &join.join_operator,
                     &row,
@@ -1517,13 +1543,13 @@ fn table_rows(
     Ok(rows)
 }
 
-fn factor_rows(
+fn materialize_table_factor_rows(
     state: &DatabaseState,
     factor: &TableFactor,
     scope: &BoundScope,
     xid: Xid,
     snapshot: &Snapshot,
-    context: &ExecutionContext,
+    context: &StatementExecutionContext,
     selection: Option<&Expr>,
     next_slot: &mut usize,
 ) -> Result<Vec<Vec<Value>>> {
@@ -1531,7 +1557,7 @@ fn factor_rows(
         table_with_joins, ..
     } = factor
     {
-        return table_rows(
+        return materialize_table_with_joins_rows(
             state,
             table_with_joins,
             scope,
@@ -1550,9 +1576,10 @@ fn factor_rows(
     } = factor
     {
         if *lateral {
-            return not_supported("LATERAL derived tables are not implemented");
+            return reject_unsupported("LATERAL derived tables are not implemented");
         }
-        let StatementResult::Query(result) = select_rows(state, subquery, xid, snapshot, context)?
+        let StatementResult::Query(result) =
+            execute_query(state, subquery, xid, snapshot, context)?
         else {
             unreachable!("derived query execution returns query rows");
         };
@@ -1574,17 +1601,19 @@ fn factor_rows(
         ..
     } = factor
     else {
-        return not_supported("FROM source is not implemented");
+        return reject_unsupported("FROM source is not implemented");
     };
     if args.is_some() {
-        return not_supported("table functions are not implemented");
+        return reject_unsupported("table functions are not implemented");
     }
-    let schema = state.catalog.table(&name(table_name)?)?;
+    let schema = state
+        .catalog
+        .require_table(&normalize_unqualified_object_name(table_name)?)?;
     let start = *next_slot;
     *next_slot += schema.columns.len();
     let mut filters = Vec::new();
     if let Some(selection) = selection {
-        push_filters(
+        collect_pushdown_filters(
             selection,
             scope,
             start,
@@ -1596,8 +1625,8 @@ fn factor_rows(
         .tables
         .get(&schema.id)
         .expect("catalog table must have storage")
-        .rows()
-        .filter_map(|(_, chain)| visible_version(chain, snapshot, xid, &state.transactions))
+        .iterate_version_chains()
+        .filter_map(|(_, chain)| find_visible_version(chain, snapshot, xid, &state.transactions))
         .map(|version| {
             let mut row = vec![Value::Null; scope.columns.len()];
             row[start..start + version.row.len()].clone_from_slice(&version.row);
@@ -1616,7 +1645,7 @@ fn factor_rows(
         .map(|rows| rows.into_iter().flatten().collect())
 }
 
-fn push_filters<'a>(
+fn collect_pushdown_filters<'a>(
     expr: &'a Expr,
     scope: &BoundScope,
     start: usize,
@@ -1629,8 +1658,8 @@ fn push_filters<'a>(
         right,
     } = expr
     {
-        push_filters(left, scope, start, end, filters);
-        push_filters(right, scope, start, end, filters);
+        collect_pushdown_filters(left, scope, start, end, filters);
+        collect_pushdown_filters(right, scope, start, end, filters);
         return;
     }
     let Expr::BinaryOp { left, right, .. } = expr else {
@@ -1658,7 +1687,7 @@ fn push_filters<'a>(
     }
 }
 
-fn join_matches(
+fn evaluate_join_condition(
     state: &DatabaseState,
     operator: &sqlparser::ast::JoinOperator,
     row: &[Value],
@@ -1667,7 +1696,7 @@ fn join_matches(
     right_start: usize,
     xid: Xid,
     snapshot: &Snapshot,
-    context: &ExecutionContext,
+    context: &StatementExecutionContext,
 ) -> Result<bool> {
     let constraint = match operator {
         sqlparser::ast::JoinOperator::Join(constraint)
@@ -1679,7 +1708,7 @@ fn join_matches(
         | sqlparser::ast::JoinOperator::RightOuter(constraint)
         | sqlparser::ast::JoinOperator::FullOuter(constraint) => constraint,
         _ => {
-            return not_supported("join type is not implemented");
+            return reject_unsupported("join type is not implemented");
         }
     };
     match constraint {
@@ -1691,10 +1720,10 @@ fn join_matches(
             evaluate_query_expression(state, expression, scope, row, xid, snapshot, context,)?,
             Value::Bool(true)
         )),
-        sqlparser::ast::JoinConstraint::Using(names) => join_using_matches(
+        sqlparser::ast::JoinConstraint::Using(names) => evaluate_using_join_condition(
             names
                 .iter()
-                .map(name)
+                .map(normalize_unqualified_object_name)
                 .collect::<Result<Vec<_>>>()?
                 .as_slice(),
             row,
@@ -1712,12 +1741,12 @@ fn join_matches(
                 })
                 .map(|column| column.name.clone())
                 .collect::<Vec<_>>();
-            join_using_matches(&names, row, scope, left_start, right_start)
+            evaluate_using_join_condition(&names, row, scope, left_start, right_start)
         }
     }
 }
 
-fn join_using_matches(
+fn evaluate_using_join_condition(
     names: &[String],
     row: &[Value],
     scope: &BoundScope,
@@ -1733,18 +1762,18 @@ fn join_using_matches(
             .iter()
             .find(|column| !column.unqualified && column.name == *name)
             .expect("bound USING column must exist in right source");
-        let data_type = coercion::common_type(left.data_type.base, right.data_type.base)
+        let data_type = coercion::resolve_common_type(left.data_type.base, right.data_type.base)
             .expect("bound USING columns must have a common type");
         let left = coercion::coerce(
             row[left.slot].clone(),
             left.data_type.base,
-            PgType::new(data_type),
+            PgType::create(data_type),
             CastContext::Implicit,
         )?;
         let right = coercion::coerce(
             row[right.slot].clone(),
             right.data_type.base,
-            PgType::new(data_type),
+            PgType::create(data_type),
             CastContext::Implicit,
         )?;
         if left.is_null() || right.is_null() || left != right {
@@ -1754,18 +1783,18 @@ fn join_using_matches(
     Ok(true)
 }
 
-fn row_count(
+fn evaluate_row_count(
     expr: &Expr,
     clause: RowCountClause,
-    context: &ExecutionContext,
+    context: &StatementExecutionContext,
 ) -> Result<Option<usize>> {
     if matches!(clause, RowCountClause::Limit)
         && matches!(expr, Expr::Identifier(identifier) if identifier.quote_style.is_none() && identifier.value.eq_ignore_ascii_case("all"))
     {
         return Ok(None);
     }
-    let schema = constant_schema();
-    let value = evaluate_as(
+    let schema = create_constant_expression_schema();
+    let value = evaluate_and_coerce(
         expr,
         BaseType::Int8,
         CastContext::Implicit,
@@ -1775,7 +1804,7 @@ fn row_count(
     )
     .map_err(|error| {
         if error.sqlstate == SqlState::CannotCoerce {
-            PgError::new(
+            PgError::create(
                 SqlState::DatatypeMismatch,
                 match clause {
                     RowCountClause::Limit => "argument of LIMIT must be type bigint",
@@ -1789,7 +1818,7 @@ fn row_count(
     match value {
         Value::Null => Ok(None),
         Value::Int8(value) if value >= 0 => Ok(Some(usize::try_from(value).unwrap_or(usize::MAX))),
-        Value::Int8(_) => Err(PgError::new(
+        Value::Int8(_) => Err(PgError::create(
             match clause {
                 RowCountClause::Limit => SqlState::InvalidRowCountInLimitClause,
                 RowCountClause::Offset => SqlState::InvalidRowCountInResultOffsetClause,

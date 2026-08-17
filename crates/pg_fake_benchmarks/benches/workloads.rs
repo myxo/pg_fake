@@ -488,7 +488,7 @@ fn order_by_benchmark(
 }
 
 fn core_vs_sqlx_benchmark(criterion: &mut Criterion, runtime: &Runtime) {
-    let mut core = Db::new().session();
+    let mut core = Db::create().create_session();
     core_execute(
         &mut core,
         "CREATE TABLE adapter_overhead_select_100_rows (id INTEGER, name TEXT)",
@@ -500,7 +500,7 @@ fn core_vs_sqlx_benchmark(criterion: &mut Criterion, runtime: &Runtime) {
     core_execute(&mut core, "BEGIN");
     let query = "SELECT id, name FROM adapter_overhead_select_100_rows ORDER BY id";
 
-    let mut sqlx = PgFakeConnection::new(Db::new());
+    let mut sqlx = PgFakeConnection::new(Db::create());
     fake_execute(
         runtime,
         &mut sqlx,
@@ -534,7 +534,7 @@ fn core_vs_sqlx_benchmark(criterion: &mut Criterion, runtime: &Runtime) {
 }
 
 fn parsed_vs_prepared_benchmark(criterion: &mut Criterion) {
-    let mut session = Db::new().session();
+    let mut session = Db::create().create_session();
     core_execute(
         &mut session,
         "CREATE TABLE core_parsed_vs_prepared_point_select (id INTEGER PRIMARY KEY, name TEXT)",
@@ -571,7 +571,7 @@ fn transaction_history_benchmark(criterion: &mut Criterion) {
     let mut group = criterion
         .benchmark_group(benchmarks::find_benchmark("transaction_history_point_select").name);
     for completed in [1_u64, 100, 10_000, 100_000] {
-        let mut session = Db::new().session();
+        let mut session = Db::create().create_session();
         core_execute(
             &mut session,
             "CREATE TABLE transaction_history_probe (id INTEGER)",
@@ -606,21 +606,21 @@ fn mvcc_version_chain_benchmark(criterion: &mut Criterion) {
     let mut group =
         criterion.benchmark_group(benchmarks::find_benchmark("mvcc_old_snapshot_read").name);
     for updates in [1_u64, 100, 10_000] {
-        let db = Db::new();
-        let mut setup = db.session();
+        let db = Db::create();
+        let mut setup = db.create_session();
         core_execute(
             &mut setup,
             "CREATE TABLE mvcc_chain_probe (id INTEGER PRIMARY KEY, amount INTEGER)",
         );
         core_execute(&mut setup, "INSERT INTO mvcc_chain_probe VALUES (1, 0)");
-        let mut reader = db.session();
+        let mut reader = db.create_session();
         let statement = reader
             .prepare("SELECT amount FROM mvcc_chain_probe WHERE id = 1")
             .unwrap();
         let mut reader = reader.begin_with(IsolationLevel::RepeatableRead).unwrap();
         black_box(reader.query_prepared(&statement, &[]).unwrap());
 
-        let mut updater = db.session();
+        let mut updater = db.create_session();
         let update = updater
             .prepare("UPDATE mvcc_chain_probe SET amount = amount + 1 WHERE id = 1")
             .unwrap();
@@ -649,7 +649,7 @@ fn indexed_vs_scan_benchmark(criterion: &mut Criterion) {
     for rows in [100_usize, 10_000] {
         group.throughput(Throughput::Elements(rows as u64));
 
-        let mut indexed = Db::new().session();
+        let mut indexed = Db::create().create_session();
         core_execute(
             &mut indexed,
             "CREATE TABLE indexed_lookup (id INTEGER PRIMARY KEY, name TEXT)",
@@ -674,7 +674,7 @@ fn indexed_vs_scan_benchmark(criterion: &mut Criterion) {
         );
         indexed.rollback().unwrap();
 
-        let mut scanned = Db::new().session();
+        let mut scanned = Db::create().create_session();
         core_execute(
             &mut scanned,
             "CREATE TABLE scanned_lookup (id INTEGER, name TEXT)",
@@ -703,7 +703,7 @@ fn indexed_vs_scan_benchmark(criterion: &mut Criterion) {
 }
 
 fn concurrency_benchmark(criterion: &mut Criterion, runtime: &Runtime) {
-    let db = Db::new();
+    let db = Db::create();
     let mut setup = PgFakeConnection::new(db.clone());
     fake_execute(
         runtime,
@@ -775,7 +775,9 @@ fn concurrency_benchmark(criterion: &mut Criterion, runtime: &Runtime) {
         fake_execute(runtime, connection, "ROLLBACK");
     }
 
-    let db = Db::builder().lock_timeout(Duration::from_secs(2)).build();
+    let db = Db::create_builder()
+        .set_lock_timeout(Duration::from_secs(2))
+        .build();
     let mut setup = PgFakeConnection::new(db.clone());
     fake_execute(
         runtime,
@@ -869,7 +871,7 @@ fn benchmarks(criterion: &mut Criterion) {
         .unwrap();
     let mut postgres = postgres_benchmark(&runtime);
     {
-        let mut fake = PgFakeConnection::new(Db::new());
+        let mut fake = PgFakeConnection::new(Db::create());
         let mut connections = [
             ("pg_fake", BenchmarkConnection::PgFake(&mut fake)),
             (

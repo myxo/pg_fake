@@ -177,7 +177,7 @@ hand-built chains and snapshots before it is used by the executor.
 implicit autocommit transaction (§8).
 
 **DoD:**
-- `Db::new()`, `db.session() -> Session`.
+- `Db::create()`, `db.session() -> Session`.
 - `Session::execute(sql) -> Result<Vec<StatementResult>>` (initially an affected
   row count, expanded in task 32) and
   `Session::query(sql, params) -> Result<QueryResult>` — params accepted but may

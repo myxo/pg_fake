@@ -3,7 +3,7 @@ use std::collections::BTreeMap;
 use sqlparser::ast::{ConstraintReferenceMatchKind, Expr};
 
 use crate::{
-    error::{PgError, Result, SqlState, not_supported},
+    error::{PgError, Result, SqlState, reject_unsupported},
     value::PgType,
 };
 
@@ -72,12 +72,12 @@ pub(crate) struct Catalog {
 
 impl Default for Catalog {
     fn default() -> Self {
-        Self::new()
+        Self::create()
     }
 }
 
 impl Catalog {
-    pub(crate) fn new() -> Self {
+    pub(crate) fn create() -> Self {
         Catalog {
             public: Schema {
                 name: DEFAULT_SCHEMA.into(),
@@ -94,7 +94,7 @@ impl Catalog {
         constraints: Vec<Constraint>,
     ) -> Result<TableId> {
         if self.public.tables.contains_key(&name) {
-            return Err(PgError::new(
+            return Err(PgError::create(
                 SqlState::DuplicateTable,
                 format!("relation {name:?} already exists"),
             ));
@@ -114,16 +114,16 @@ impl Catalog {
         Ok(id)
     }
 
-    pub(crate) fn table(&self, name: &str) -> Result<&TableSchema> {
+    pub(crate) fn require_table(&self, name: &str) -> Result<&TableSchema> {
         self.public.tables.get(name).ok_or_else(|| {
-            PgError::new(
+            PgError::create(
                 SqlState::UndefinedTable,
                 format!("relation {name:?} does not exist"),
             )
         })
     }
 
-    pub(crate) fn tables(&self) -> impl Iterator<Item = &TableSchema> {
+    pub(crate) fn iterate_tables(&self) -> impl Iterator<Item = &TableSchema> {
         self.public.tables.values()
     }
 
@@ -139,12 +139,12 @@ impl Catalog {
                     _ => None,
                 })
         }) {
-            return not_supported(format!(
+            return reject_unsupported(format!(
                 "cannot drop table {name:?} because constraint {constraint:?} on table {table:?} depends on it"
             ));
         }
         self.public.tables.remove(name).ok_or_else(|| {
-            PgError::new(
+            PgError::create(
                 SqlState::UndefinedTable,
                 format!("table {name:?} does not exist"),
             )
@@ -162,10 +162,10 @@ mod tests {
     use super::*;
     use crate::value::BaseType;
 
-    fn column(name: &str, nullable: bool) -> ColumnDef {
+    fn create_column(name: &str, nullable: bool) -> ColumnDef {
         ColumnDef {
             name: name.into(),
-            data_type: PgType::new(BaseType::Int4),
+            data_type: PgType::create(BaseType::Int4),
             nullable,
             default: None,
         }
@@ -173,56 +173,56 @@ mod tests {
 
     #[test]
     fn creates_looks_up_and_drops_tables() {
-        let mut catalog = Catalog::new();
+        let mut catalog = Catalog::create();
         let users = catalog
             .create_table(
                 "users".into(),
-                vec![column("id", false), column("age", true)],
+                vec![create_column("id", false), create_column("age", true)],
                 vec![],
             )
             .unwrap();
         let posts = catalog
-            .create_table("posts".into(), vec![column("id", false)], vec![])
+            .create_table("posts".into(), vec![create_column("id", false)], vec![])
             .unwrap();
 
         assert_eq!(catalog.public.name, DEFAULT_SCHEMA);
         assert_eq!(users, TableId(1));
         assert_eq!(posts, TableId(2));
-        assert_eq!(catalog.table("users").unwrap().id, users);
+        assert_eq!(catalog.require_table("users").unwrap().id, users);
         assert_eq!(
-            catalog.table("users").unwrap().columns,
-            vec![column("id", false), column("age", true)]
+            catalog.require_table("users").unwrap().columns,
+            vec![create_column("id", false), create_column("age", true)]
         );
 
         let dropped = catalog.drop_table("users").unwrap();
         assert_eq!(dropped.id, users);
         assert_eq!(
-            catalog.table("users").unwrap_err().sqlstate,
+            catalog.require_table("users").unwrap_err().sqlstate,
             SqlState::UndefinedTable
         );
-        assert_eq!(catalog.table("posts").unwrap().id, posts);
+        assert_eq!(catalog.require_table("posts").unwrap().id, posts);
     }
 
     #[test]
-    fn duplicate_table_is_42p07() {
-        let mut catalog = Catalog::new();
+    fn reports_42p07_for_duplicate_table() {
+        let mut catalog = Catalog::create();
         catalog
-            .create_table("users".into(), vec![column("id", false)], vec![])
+            .create_table("users".into(), vec![create_column("id", false)], vec![])
             .unwrap();
 
         let error = catalog
-            .create_table("users".into(), vec![column("id", false)], vec![])
+            .create_table("users".into(), vec![create_column("id", false)], vec![])
             .unwrap_err();
 
         assert_eq!(error.sqlstate, SqlState::DuplicateTable);
     }
 
     #[test]
-    fn missing_table_is_42p01() {
-        let mut catalog = Catalog::new();
+    fn reports_42p01_for_missing_table() {
+        let mut catalog = Catalog::create();
 
         assert_eq!(
-            catalog.table("missing").unwrap_err().sqlstate,
+            catalog.require_table("missing").unwrap_err().sqlstate,
             SqlState::UndefinedTable
         );
         assert_eq!(

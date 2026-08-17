@@ -14,7 +14,7 @@ pub(crate) enum CastContext {
     Explicit,
 }
 
-pub(crate) fn type_from_ast(data_type: &DataType) -> Result<PgType> {
+pub(crate) fn convert_ast_data_type(data_type: &DataType) -> Result<PgType> {
     let (base, typmod) = match data_type {
         DataType::Bool | DataType::Boolean => (BaseType::Bool, PgType::NO_TYPEMOD),
         DataType::Int2(None) | DataType::SmallInt(None) => (BaseType::Int2, PgType::NO_TYPEMOD),
@@ -28,31 +28,33 @@ pub(crate) fn type_from_ast(data_type: &DataType) -> Result<PgType> {
         | DataType::Float8
         | DataType::Float(ExactNumberInfo::None) => (BaseType::Float8, PgType::NO_TYPEMOD),
         DataType::Numeric(info) | DataType::Decimal(info) => {
-            (BaseType::Numeric, numeric_typmod(*info)?)
+            (BaseType::Numeric, encode_numeric_typmod(*info)?)
         }
         DataType::Text => (BaseType::Text, PgType::NO_TYPEMOD),
         DataType::Varchar(length)
         | DataType::CharacterVarying(length)
-        | DataType::CharVarying(length) => (BaseType::Varchar, character_typmod(*length, false)?),
+        | DataType::CharVarying(length) => {
+            (BaseType::Varchar, encode_character_typmod(*length, false)?)
+        }
         DataType::Char(length) | DataType::Character(length) => {
-            (BaseType::Bpchar, character_typmod(*length, true)?)
+            (BaseType::Bpchar, encode_character_typmod(*length, true)?)
         }
         DataType::Bytea => (BaseType::Bytea, PgType::NO_TYPEMOD),
         DataType::Uuid => (BaseType::Uuid, PgType::NO_TYPEMOD),
         DataType::Date => (BaseType::Date, PgType::NO_TYPEMOD),
         DataType::Time(precision, TimezoneInfo::None | TimezoneInfo::WithoutTimeZone) => {
-            (BaseType::Time, time_typmod(*precision)?)
+            (BaseType::Time, encode_time_typmod(*precision)?)
         }
         DataType::Timestamp(precision, TimezoneInfo::None | TimezoneInfo::WithoutTimeZone) => {
-            (BaseType::Timestamp, time_typmod(*precision)?)
+            (BaseType::Timestamp, encode_time_typmod(*precision)?)
         }
         DataType::Timestamp(precision, TimezoneInfo::WithTimeZone | TimezoneInfo::Tz) => {
-            (BaseType::TimestampTz, time_typmod(*precision)?)
+            (BaseType::TimestampTz, encode_time_typmod(*precision)?)
         }
         DataType::Interval { .. } => (BaseType::Interval, PgType::NO_TYPEMOD),
         DataType::Custom(_, _) => {
-            let Some(base) = BaseType::from_name(&data_type.to_string()) else {
-                return Err(PgError::new(
+            let Some(base) = BaseType::parse_sql_name(&data_type.to_string()) else {
+                return Err(PgError::create(
                     SqlState::UndefinedObject,
                     format!("type {data_type} does not exist"),
                 ));
@@ -60,22 +62,22 @@ pub(crate) fn type_from_ast(data_type: &DataType) -> Result<PgType> {
             (base, PgType::NO_TYPEMOD)
         }
         _ => {
-            return Err(PgError::new(
+            return Err(PgError::create(
                 SqlState::UndefinedObject,
                 format!("type {data_type} does not exist"),
             ));
         }
     };
-    Ok(PgType::with_typmod(base, typmod))
+    Ok(PgType::create_with_typmod(base, typmod))
 }
 
-fn character_typmod(length: Option<CharacterLength>, default_one: bool) -> Result<i32> {
+fn encode_character_typmod(length: Option<CharacterLength>, default_one: bool) -> Result<i32> {
     let length = match length {
         Some(CharacterLength::IntegerLength { length, unit: None }) => Some(length),
         None if default_one => Some(1),
         None => None,
         _ => {
-            return Err(PgError::new(
+            return Err(PgError::create(
                 SqlState::UndefinedObject,
                 "character length is not supported",
             ));
@@ -87,21 +89,21 @@ fn character_typmod(length: Option<CharacterLength>, default_one: bool) -> Resul
                 .ok()
                 .and_then(|length| length.checked_add(4))
                 .ok_or_else(|| {
-                    PgError::new(SqlState::NumericValueOutOfRange, "length is out of range")
+                    PgError::create(SqlState::NumericValueOutOfRange, "length is out of range")
                 })
         })
         .transpose()
         .map(|typmod| typmod.unwrap_or(PgType::NO_TYPEMOD))
 }
 
-fn numeric_typmod(info: ExactNumberInfo) -> Result<i32> {
+fn encode_numeric_typmod(info: ExactNumberInfo) -> Result<i32> {
     let (precision, scale) = match info {
         ExactNumberInfo::None => return Ok(PgType::NO_TYPEMOD),
         ExactNumberInfo::Precision(precision) => (precision, 0),
         ExactNumberInfo::PrecisionAndScale(precision, scale) => (precision, scale),
     };
     if precision == 0 || precision > 1000 || scale < 0 || scale as u64 > precision {
-        return Err(PgError::new(
+        return Err(PgError::create(
             SqlState::NumericValueOutOfRange,
             "numeric precision or scale is out of range",
         ));
@@ -109,48 +111,48 @@ fn numeric_typmod(info: ExactNumberInfo) -> Result<i32> {
     Ok(((precision as i32) << 16) + scale as i32 + 4)
 }
 
-fn time_typmod(precision: Option<u64>) -> Result<i32> {
+fn encode_time_typmod(precision: Option<u64>) -> Result<i32> {
     match precision {
         None => Ok(PgType::NO_TYPEMOD),
         Some(precision) if precision <= 6 => Ok(precision as i32),
-        Some(_) => Err(PgError::new(
+        Some(_) => Err(PgError::create(
             SqlState::InvalidParameterValue,
             "time precision must be between 0 and 6",
         )),
     }
 }
 
-pub(crate) fn common_type(left: BaseType, right: BaseType) -> Option<BaseType> {
+pub(crate) fn resolve_common_type(left: BaseType, right: BaseType) -> Option<BaseType> {
     if left == right {
         return Some(left);
     }
-    if string(left) && string(right) {
+    if is_string_type(left) && is_string_type(right) {
         return Some(BaseType::Text);
     }
-    let left_rank = numeric_rank(left)?;
-    let right_rank = numeric_rank(right)?;
+    let left_rank = get_numeric_rank(left)?;
+    let right_rank = get_numeric_rank(right)?;
     Some(if left_rank > right_rank { left } else { right })
 }
 
 pub(crate) fn can_cast(source: BaseType, target: BaseType, context: CastContext) -> bool {
-    required_context(source, target).is_some_and(|required| context >= required)
+    resolve_required_cast_context(source, target).is_some_and(|required| context >= required)
 }
 
-fn required_context(source: BaseType, target: BaseType) -> Option<CastContext> {
-    if source == target || string(source) && string(target) {
+fn resolve_required_cast_context(source: BaseType, target: BaseType) -> Option<CastContext> {
+    if source == target || is_string_type(source) && is_string_type(target) {
         return Some(CastContext::Implicit);
     }
-    if numeric_rank(source).is_some() && numeric_rank(target).is_some() {
-        return Some(if numeric_rank(source) <= numeric_rank(target) {
+    if get_numeric_rank(source).is_some() && get_numeric_rank(target).is_some() {
+        return Some(if get_numeric_rank(source) <= get_numeric_rank(target) {
             CastContext::Implicit
         } else {
             CastContext::Assignment
         });
     }
-    if string(target) {
+    if is_string_type(target) {
         return Some(CastContext::Assignment);
     }
-    if string(source) {
+    if is_string_type(source) {
         if matches!(
             target,
             BaseType::Uuid
@@ -172,7 +174,7 @@ fn required_context(source: BaseType, target: BaseType) -> Option<CastContext> {
             | BaseType::Timestamp
             | BaseType::TimestampTz
             | BaseType::Interval
-    ) && string(target)
+    ) && is_string_type(target)
     {
         return Some(CastContext::Assignment);
     }
@@ -212,35 +214,37 @@ pub(crate) fn coerce(
         return Ok(Value::Null);
     }
     if !can_cast(source, target.base, context) {
-        return Err(cannot_cast(source, target.base));
+        return Err(create_cannot_cast_error(source, target.base));
     }
-    let value =
-        if source == BaseType::Bpchar && target.base != BaseType::Bpchar && string(target.base) {
-            let Value::Text(value) = value else {
-                unreachable!("string values use Value::Text")
-            };
-            Value::Text(value.trim_end_matches(' ').into())
-        } else if source == target.base || string(source) && string(target.base) {
-            value
-        } else if string(target.base) {
-            Value::Text(match value {
-                Value::Bool(true) => "true".into(),
-                Value::Bool(false) => "false".into(),
-                value => value.to_text(),
-            })
-        } else if string(source) {
-            let Value::Text(text) = value else {
-                unreachable!("string values use Value::Text")
-            };
-            Value::parse(target.base, &text)?
-        } else {
-            convert_non_string(value, target.base)?
+    let value = if source == BaseType::Bpchar
+        && target.base != BaseType::Bpchar
+        && is_string_type(target.base)
+    {
+        let Value::Text(value) = value else {
+            unreachable!("string values use Value::Text")
         };
+        Value::Text(value.trim_end_matches(' ').into())
+    } else if source == target.base || is_string_type(source) && is_string_type(target.base) {
+        value
+    } else if is_string_type(target.base) {
+        Value::Text(match value {
+            Value::Bool(true) => "true".into(),
+            Value::Bool(false) => "false".into(),
+            value => value.format_postgres_text(),
+        })
+    } else if is_string_type(source) {
+        let Value::Text(text) = value else {
+            unreachable!("string values use Value::Text")
+        };
+        Value::parse(target.base, &text)?
+    } else {
+        convert_non_string_value(value, target.base)?
+    };
     apply_typmod(value, target, context)
 }
 
 pub(crate) fn coerce_unknown(text: &str, target: PgType, context: CastContext) -> Result<Value> {
-    let value = if string(target.base) {
+    let value = if is_string_type(target.base) {
         Value::Text(text.into())
     } else {
         Value::parse(target.base, text)?
@@ -248,7 +252,7 @@ pub(crate) fn coerce_unknown(text: &str, target: PgType, context: CastContext) -
     apply_typmod(value, target, context)
 }
 
-fn convert_non_string(value: Value, target: BaseType) -> Result<Value> {
+fn convert_non_string_value(value: Value, target: BaseType) -> Result<Value> {
     match (value, target) {
         (Value::Date(crate::value::PgDate::Finite(value)), BaseType::Timestamp) => {
             Ok(Value::Timestamp(crate::value::PgTimestamp::Finite(
@@ -314,112 +318,121 @@ fn convert_non_string(value: Value, target: BaseType) -> Result<Value> {
         (Value::Int2(value), BaseType::Numeric) => Ok(Value::Numeric(value.into())),
         (Value::Int4(value), BaseType::Int2) => i16::try_from(value)
             .map(Value::Int2)
-            .map_err(|_| out_of_range(BaseType::Int2)),
+            .map_err(|_| create_out_of_range_error(BaseType::Int2)),
         (Value::Int4(value), BaseType::Int8) => Ok(Value::Int8(value.into())),
         (Value::Int4(value), BaseType::Float4) => Ok(Value::Float4(value as f32)),
         (Value::Int4(value), BaseType::Float8) => Ok(Value::Float8(value.into())),
         (Value::Int4(value), BaseType::Numeric) => Ok(Value::Numeric(value.into())),
         (Value::Int8(value), BaseType::Int2) => i16::try_from(value)
             .map(Value::Int2)
-            .map_err(|_| out_of_range(BaseType::Int2)),
+            .map_err(|_| create_out_of_range_error(BaseType::Int2)),
         (Value::Int8(value), BaseType::Int4) => i32::try_from(value)
             .map(Value::Int4)
-            .map_err(|_| out_of_range(BaseType::Int4)),
+            .map_err(|_| create_out_of_range_error(BaseType::Int4)),
         (Value::Int8(value), BaseType::Float4) => Ok(Value::Float4(value as f32)),
         (Value::Int8(value), BaseType::Float8) => Ok(Value::Float8(value as f64)),
         (Value::Int8(value), BaseType::Numeric) => Ok(Value::Numeric(value.into())),
-        (Value::Float4(value), BaseType::Int2) => float_to_int(value as f64, BaseType::Int2),
-        (Value::Float4(value), BaseType::Int4) => float_to_int(value as f64, BaseType::Int4),
-        (Value::Float4(value), BaseType::Int8) => float_to_int(value as f64, BaseType::Int8),
+        (Value::Float4(value), BaseType::Int2) => {
+            convert_float_to_int(value as f64, BaseType::Int2)
+        }
+        (Value::Float4(value), BaseType::Int4) => {
+            convert_float_to_int(value as f64, BaseType::Int4)
+        }
+        (Value::Float4(value), BaseType::Int8) => {
+            convert_float_to_int(value as f64, BaseType::Int8)
+        }
         (Value::Float4(value), BaseType::Float8) => Ok(Value::Float8(value.into())),
         (Value::Float4(value), BaseType::Numeric) => BigDecimal::from_f32(value)
             .map(Value::Numeric)
-            .ok_or_else(|| out_of_range(BaseType::Numeric)),
-        (Value::Float8(value), BaseType::Int2) => float_to_int(value, BaseType::Int2),
-        (Value::Float8(value), BaseType::Int4) => float_to_int(value, BaseType::Int4),
-        (Value::Float8(value), BaseType::Int8) => float_to_int(value, BaseType::Int8),
+            .ok_or_else(|| create_out_of_range_error(BaseType::Numeric)),
+        (Value::Float8(value), BaseType::Int2) => convert_float_to_int(value, BaseType::Int2),
+        (Value::Float8(value), BaseType::Int4) => convert_float_to_int(value, BaseType::Int4),
+        (Value::Float8(value), BaseType::Int8) => convert_float_to_int(value, BaseType::Int8),
         (Value::Float8(value), BaseType::Float4) => {
             let converted = value as f32;
             if converted.is_infinite() && value.is_finite() {
-                Err(out_of_range(BaseType::Float4))
+                Err(create_out_of_range_error(BaseType::Float4))
             } else {
                 Ok(Value::Float4(converted))
             }
         }
         (Value::Float8(value), BaseType::Numeric) => BigDecimal::from_f64(value)
             .map(Value::Numeric)
-            .ok_or_else(|| out_of_range(BaseType::Numeric)),
-        (Value::Numeric(value), BaseType::Int2) => numeric_to_int(value, BaseType::Int2),
-        (Value::Numeric(value), BaseType::Int4) => numeric_to_int(value, BaseType::Int4),
-        (Value::Numeric(value), BaseType::Int8) => numeric_to_int(value, BaseType::Int8),
+            .ok_or_else(|| create_out_of_range_error(BaseType::Numeric)),
+        (Value::Numeric(value), BaseType::Int2) => convert_numeric_to_int(value, BaseType::Int2),
+        (Value::Numeric(value), BaseType::Int4) => convert_numeric_to_int(value, BaseType::Int4),
+        (Value::Numeric(value), BaseType::Int8) => convert_numeric_to_int(value, BaseType::Int8),
         (Value::Numeric(value), BaseType::Float4) => value
             .to_f32()
             .filter(|value| value.is_finite())
             .map(Value::Float4)
-            .ok_or_else(|| out_of_range(BaseType::Float4)),
+            .ok_or_else(|| create_out_of_range_error(BaseType::Float4)),
         (Value::Numeric(value), BaseType::Float8) => value
             .to_f64()
             .filter(|value| value.is_finite())
             .map(Value::Float8)
-            .ok_or_else(|| out_of_range(BaseType::Float8)),
+            .ok_or_else(|| create_out_of_range_error(BaseType::Float8)),
         (Value::Int4(value), BaseType::Bool) => Ok(Value::Bool(value != 0)),
         (Value::Bool(value), BaseType::Int4) => Ok(Value::Int4(i32::from(value))),
         (Value::Int2(value), BaseType::Bytea) => Ok(Value::Bytea(value.to_be_bytes().into())),
         (Value::Int4(value), BaseType::Bytea) => Ok(Value::Bytea(value.to_be_bytes().into())),
         (Value::Int8(value), BaseType::Bytea) => Ok(Value::Bytea(value.to_be_bytes().into())),
         (Value::Bytea(value), BaseType::Int2) => {
-            let bytes = <[u8; 2]>::try_from(value).map_err(|_| out_of_range(BaseType::Int2))?;
+            let bytes = <[u8; 2]>::try_from(value)
+                .map_err(|_| create_out_of_range_error(BaseType::Int2))?;
             Ok(Value::Int2(i16::from_be_bytes(bytes)))
         }
         (Value::Bytea(value), BaseType::Int4) => {
-            let bytes = <[u8; 4]>::try_from(value).map_err(|_| out_of_range(BaseType::Int4))?;
+            let bytes = <[u8; 4]>::try_from(value)
+                .map_err(|_| create_out_of_range_error(BaseType::Int4))?;
             Ok(Value::Int4(i32::from_be_bytes(bytes)))
         }
         (Value::Bytea(value), BaseType::Int8) => {
-            let bytes = <[u8; 8]>::try_from(value).map_err(|_| out_of_range(BaseType::Int8))?;
+            let bytes = <[u8; 8]>::try_from(value)
+                .map_err(|_| create_out_of_range_error(BaseType::Int8))?;
             Ok(Value::Int8(i64::from_be_bytes(bytes)))
         }
         _ => unreachable!("cast matrix and conversion implementation must agree"),
     }
 }
 
-fn float_to_int(value: f64, target: BaseType) -> Result<Value> {
+fn convert_float_to_int(value: f64, target: BaseType) -> Result<Value> {
     if !value.is_finite() {
-        return Err(out_of_range(target));
+        return Err(create_out_of_range_error(target));
     }
     let rounded = value.round();
     match target {
         BaseType::Int2 => rounded
             .to_i16()
             .map(Value::Int2)
-            .ok_or_else(|| out_of_range(target)),
+            .ok_or_else(|| create_out_of_range_error(target)),
         BaseType::Int4 => rounded
             .to_i32()
             .map(Value::Int4)
-            .ok_or_else(|| out_of_range(target)),
+            .ok_or_else(|| create_out_of_range_error(target)),
         BaseType::Int8 => rounded
             .to_i64()
             .map(Value::Int8)
-            .ok_or_else(|| out_of_range(target)),
+            .ok_or_else(|| create_out_of_range_error(target)),
         _ => unreachable!("float target must be an integer"),
     }
 }
 
-fn numeric_to_int(value: BigDecimal, target: BaseType) -> Result<Value> {
+fn convert_numeric_to_int(value: BigDecimal, target: BaseType) -> Result<Value> {
     let rounded = value.with_scale_round(0, RoundingMode::HalfUp);
     match target {
         BaseType::Int2 => rounded
             .to_i16()
             .map(Value::Int2)
-            .ok_or_else(|| out_of_range(target)),
+            .ok_or_else(|| create_out_of_range_error(target)),
         BaseType::Int4 => rounded
             .to_i32()
             .map(Value::Int4)
-            .ok_or_else(|| out_of_range(target)),
+            .ok_or_else(|| create_out_of_range_error(target)),
         BaseType::Int8 => rounded
             .to_i64()
             .map(Value::Int8)
-            .ok_or_else(|| out_of_range(target)),
+            .ok_or_else(|| create_out_of_range_error(target)),
         _ => unreachable!("numeric target must be an integer"),
     }
 }
@@ -440,7 +453,7 @@ fn apply_typmod(value: Value, target: PgType, context: CastContext) -> Result<Va
                 {
                     characters.truncate(maximum);
                 } else {
-                    return Err(PgError::new(
+                    return Err(PgError::create(
                         SqlState::StringDataRightTruncation,
                         "value too long for character type",
                     ));
@@ -464,7 +477,7 @@ fn apply_typmod(value: Value, target: PgType, context: CastContext) -> Result<Va
                 .trim_start_matches('0')
                 .len() as i32;
             if integer_digits > precision - scale {
-                return Err(out_of_range(BaseType::Numeric));
+                return Err(create_out_of_range_error(BaseType::Numeric));
             }
             Ok(Value::Numeric(value))
         }
@@ -489,7 +502,8 @@ fn round_timestamp(
     value: crate::value::PgTimestamp,
     typmod: i32,
 ) -> Result<crate::value::PgTimestamp> {
-    let precision = u32::try_from(typmod).map_err(|_| out_of_range(BaseType::Timestamp))?;
+    let precision =
+        u32::try_from(typmod).map_err(|_| create_out_of_range_error(BaseType::Timestamp))?;
     let unit = 10_u32.pow(6 - precision);
     Ok(match value {
         crate::value::PgTimestamp::Finite(value) => crate::value::PgTimestamp::Finite(
@@ -505,7 +519,8 @@ fn round_timestamptz(
     value: crate::value::PgTimestampTz,
     typmod: i32,
 ) -> Result<crate::value::PgTimestampTz> {
-    let precision = u32::try_from(typmod).map_err(|_| out_of_range(BaseType::TimestampTz))?;
+    let precision =
+        u32::try_from(typmod).map_err(|_| create_out_of_range_error(BaseType::TimestampTz))?;
     let unit = 10_u32.pow(6 - precision);
     Ok(match value {
         crate::value::PgTimestampTz::Finite(value) => crate::value::PgTimestampTz::Finite(
@@ -517,7 +532,7 @@ fn round_timestamptz(
     })
 }
 
-fn numeric_rank(base: BaseType) -> Option<u8> {
+fn get_numeric_rank(base: BaseType) -> Option<u8> {
     match base {
         BaseType::Int2 => Some(0),
         BaseType::Int4 => Some(1),
@@ -529,21 +544,25 @@ fn numeric_rank(base: BaseType) -> Option<u8> {
     }
 }
 
-fn string(base: BaseType) -> bool {
+fn is_string_type(base: BaseType) -> bool {
     matches!(base, BaseType::Text | BaseType::Varchar | BaseType::Bpchar)
 }
 
-fn cannot_cast(source: BaseType, target: BaseType) -> PgError {
-    PgError::new(
+fn create_cannot_cast_error(source: BaseType, target: BaseType) -> PgError {
+    PgError::create(
         SqlState::CannotCoerce,
-        format!("cannot cast type {} to {}", source.name(), target.name()),
+        format!(
+            "cannot cast type {} to {}",
+            source.get_postgres_name(),
+            target.get_postgres_name()
+        ),
     )
 }
 
-fn out_of_range(target: BaseType) -> PgError {
-    PgError::new(
+fn create_out_of_range_error(target: BaseType) -> PgError {
+    PgError::create(
         SqlState::NumericValueOutOfRange,
-        format!("{} out of range", target.name()),
+        format!("{} out of range", target.get_postgres_name()),
     )
 }
 
@@ -552,7 +571,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn numeric_cast_contexts_follow_postgres_direction() {
+    fn follows_postgres_numeric_cast_directions() {
         assert!(can_cast(
             BaseType::Int2,
             BaseType::Float8,
@@ -571,12 +590,12 @@ mod tests {
     }
 
     #[test]
-    fn numeric_assignment_rounds_and_checks_ranges() {
+    fn rounds_numeric_assignments_and_checks_ranges() {
         assert_eq!(
             coerce(
                 Value::Numeric("2.5".parse().unwrap()),
                 BaseType::Numeric,
-                PgType::new(BaseType::Int4),
+                PgType::create(BaseType::Int4),
                 CastContext::Assignment,
             )
             .unwrap(),
@@ -586,7 +605,7 @@ mod tests {
             coerce(
                 Value::Int4(32768),
                 BaseType::Int4,
-                PgType::new(BaseType::Int2),
+                PgType::create(BaseType::Int2),
                 CastContext::Assignment,
             )
             .unwrap_err()
@@ -596,7 +615,7 @@ mod tests {
     }
 
     #[test]
-    fn every_numeric_pair_has_an_assignment_conversion() {
+    fn provides_assignment_conversion_for_every_numeric_pair() {
         let values = [
             (BaseType::Int2, Value::Int2(2)),
             (BaseType::Int4, Value::Int4(2)),
@@ -619,12 +638,12 @@ mod tests {
                 let converted = coerce(
                     value.clone(),
                     source,
-                    PgType::new(target),
+                    PgType::create(target),
                     CastContext::Assignment,
                 )
                 .unwrap();
                 assert_eq!(
-                    converted.base_type(),
+                    converted.get_base_type(),
                     Some(target),
                     "{source:?} -> {target:?}"
                 );

@@ -1,18 +1,18 @@
 use super::*;
 
-pub(super) fn insert_rows(
+pub(super) fn execute_insert(
     state: &mut DatabaseState,
     insert: &sqlparser::ast::Insert,
     xid: Xid,
     snapshot: &Snapshot,
     deferred_constraints: &BTreeSet<String>,
     defer_all: bool,
-    context: &ExecutionContext,
+    context: &StatementExecutionContext,
 ) -> Result<StatementResult> {
-    let table_name = insert_table_name(&insert.table)?;
-    let schema = state.catalog.table(&table_name)?.clone();
+    let table_name = resolve_insert_table_name(&insert.table)?;
+    let schema = state.catalog.require_table(&table_name)?.clone();
     if insert.returning.is_some() {
-        return not_supported("INSERT RETURNING is not implemented");
+        return reject_unsupported("INSERT RETURNING is not implemented");
     }
     let column_indexes = if insert.columns.is_empty() {
         (0..schema.columns.len()).collect::<Vec<_>>()
@@ -21,13 +21,13 @@ pub(super) fn insert_rows(
             .columns
             .iter()
             .map(|name| {
-                let name = crate::executor::name(name)?;
+                let name = crate::executor::normalize_unqualified_object_name(name)?;
                 schema
                     .columns
                     .iter()
                     .position(|column| column.name == name)
                     .ok_or_else(|| {
-                        PgError::new(
+                        PgError::create(
                             SqlState::UndefinedColumn,
                             format!("column {:?} does not exist", name),
                         )
@@ -38,7 +38,7 @@ pub(super) fn insert_rows(
     let provided = column_indexes.iter().copied().collect::<BTreeSet<_>>();
     let build_row = |expressions: &[Expr]| -> Result<Vec<Value>> {
         if expressions.len() != column_indexes.len() {
-            return Err(PgError::new(
+            return Err(PgError::create(
                 SqlState::SyntaxError,
                 "INSERT has wrong number of values",
             ));
@@ -46,15 +46,15 @@ pub(super) fn insert_rows(
         let mut row = vec![Value::Null; schema.columns.len()];
         for (index, column) in schema.columns.iter().enumerate() {
             if !provided.contains(&index) {
-                row[index] = column_default(column, context)?;
+                row[index] = evaluate_column_default(column, context)?;
             }
         }
-        let constants = constant_schema();
+        let constants = create_constant_expression_schema();
         for (expr, index) in expressions.iter().zip(&column_indexes) {
-            row[*index] = if default_expression(expr) {
-                column_default(&schema.columns[*index], context)?
+            row[*index] = if is_default_expression(expr) {
+                evaluate_column_default(&schema.columns[*index], context)?
             } else {
-                expression_value(
+                evaluate_assignment_expression(
                     expr,
                     schema.columns[*index].data_type,
                     &constants,
@@ -69,7 +69,7 @@ pub(super) fn insert_rows(
     };
     let rows = if let Some(source) = &insert.source {
         let SetExpr::Values(values) = source.body.as_ref() else {
-            return not_supported("INSERT source is not implemented");
+            return reject_unsupported("INSERT source is not implemented");
         };
         values
             .rows
@@ -81,7 +81,7 @@ pub(super) fn insert_rows(
         schema
             .columns
             .iter()
-            .map(|column| column_default(column, context))
+            .map(|column| evaluate_column_default(column, context))
             .collect::<Result<Vec<_>>>()
             .and_then(|row| {
                 validate_not_null(&schema, &row)?;
@@ -95,9 +95,9 @@ pub(super) fn insert_rows(
             .tables
             .get(&schema.id)
             .expect("catalog table must have storage")
-            .unique_conflict(&row, snapshot, xid, &state.transactions, None)
+            .has_visible_unique_conflict(&row, snapshot, xid, &state.transactions, None)
         {
-            return Err(PgError::new(
+            return Err(PgError::create(
                 SqlState::UniqueViolation,
                 format!(
                     "duplicate key value violates unique constraint on {:?}",
@@ -123,7 +123,7 @@ pub(super) fn insert_rows(
     Ok(StatementResult::Affected(affected))
 }
 
-pub(super) fn update_rows(
+pub(super) fn execute_update(
     state: &mut DatabaseState,
     update_table: &TableWithJoins,
     assignments: &[sqlparser::ast::Assignment],
@@ -132,10 +132,10 @@ pub(super) fn update_rows(
     snapshot: &Snapshot,
     deferred_constraints: &BTreeSet<String>,
     defer_all: bool,
-    context: &ExecutionContext,
+    context: &StatementExecutionContext,
 ) -> Result<StatementResult> {
     if !update_table.joins.is_empty() {
-        return not_supported("UPDATE joins are not implemented");
+        return reject_unsupported("UPDATE joins are not implemented");
     }
     let TableFactor::Table {
         name: table_name,
@@ -143,16 +143,19 @@ pub(super) fn update_rows(
         ..
     } = &update_table.relation
     else {
-        return not_supported("UPDATE target is not implemented");
+        return reject_unsupported("UPDATE target is not implemented");
     };
     if args.is_some() {
-        return not_supported("UPDATE table functions are not implemented");
+        return reject_unsupported("UPDATE table functions are not implemented");
     }
-    let schema = state.catalog.table(&name(table_name)?)?.clone();
+    let schema = state
+        .catalog
+        .require_table(&normalize_unqualified_object_name(table_name)?)?
+        .clone();
     if let Some(selection) = selection {
-        let base = expression_type(selection, RowScope::Table(&schema))?;
-        if base != BaseType::Bool && !null_expression(selection) {
-            return Err(PgError::new(
+        let base = infer_expression_type(selection, RowScope::Table(&schema))?;
+        if base != BaseType::Bool && !is_null_literal(selection) {
+            return Err(PgError::create(
                 SqlState::DatatypeMismatch,
                 "WHERE requires a boolean expression",
             ));
@@ -163,35 +166,35 @@ pub(super) fn update_rows(
         .iter()
         .map(|assignment| {
             let AssignmentTarget::ColumnName(column) = &assignment.target else {
-                return not_supported("UPDATE tuple assignment is not implemented");
+                return reject_unsupported("UPDATE tuple assignment is not implemented");
             };
-            let column_name = name(column)?;
+            let column_name = normalize_unqualified_object_name(column)?;
             let index = schema
                 .columns
                 .iter()
                 .position(|definition| definition.name == column_name)
                 .ok_or_else(|| {
-                    PgError::new(
+                    PgError::create(
                         SqlState::UndefinedColumn,
                         format!("column {column_name:?} does not exist"),
                     )
                 })?;
             if !assigned.insert(index) {
-                return Err(PgError::new(
+                return Err(PgError::create(
                     SqlState::SyntaxError,
                     "multiple assignments to the same column",
                 ));
             }
-            if !default_expression(&assignment.value)
-                && !null_expression(&assignment.value)
-                && unknown_string(&assignment.value).is_none()
+            if !is_default_expression(&assignment.value)
+                && !is_null_literal(&assignment.value)
+                && extract_unknown_string_literal(&assignment.value).is_none()
                 && !coercion::can_cast(
-                    expression_type(&assignment.value, RowScope::Table(&schema))?,
+                    infer_expression_type(&assignment.value, RowScope::Table(&schema))?,
                     schema.columns[index].data_type.base,
                     CastContext::Assignment,
                 )
             {
-                return Err(PgError::new(
+                return Err(PgError::create(
                     SqlState::DatatypeMismatch,
                     "column has incompatible type",
                 ));
@@ -203,9 +206,10 @@ pub(super) fn update_rows(
         .tables
         .get(&schema.id)
         .expect("catalog table must have storage")
-        .rows()
+        .iterate_version_chains()
         .try_fold(Vec::new(), |mut targets, (row_id, chain)| {
-            let Some(version) = visible_version(chain, snapshot, xid, &state.transactions) else {
+            let Some(version) = find_visible_version(chain, snapshot, xid, &state.transactions)
+            else {
                 return Ok(targets);
             };
             if let Some(selection) = selection {
@@ -223,10 +227,10 @@ pub(super) fn update_rows(
         let mut updated = row.clone();
         for (index, expression) in &assignments {
             let target = schema.columns[*index].data_type;
-            updated[*index] = if default_expression(expression) {
-                column_default(&schema.columns[*index], context)?
+            updated[*index] = if is_default_expression(expression) {
+                evaluate_column_default(&schema.columns[*index], context)?
             } else {
-                expression_value(expression, target, &schema, &row, context)?
+                evaluate_assignment_expression(expression, target, &schema, &row, context)?
             };
         }
         validate_not_null(&schema, &updated)?;
@@ -235,9 +239,9 @@ pub(super) fn update_rows(
             .tables
             .get(&schema.id)
             .expect("catalog table must have storage")
-            .unique_conflict(&updated, snapshot, xid, &state.transactions, Some(row_id))
+            .has_visible_unique_conflict(&updated, snapshot, xid, &state.transactions, Some(row_id))
         {
-            return Err(PgError::new(
+            return Err(PgError::create(
                 SqlState::UniqueViolation,
                 format!(
                     "duplicate key value violates unique constraint on {:?}",
@@ -249,7 +253,7 @@ pub(super) fn update_rows(
             .tables
             .get_mut(&schema.id)
             .expect("catalog table must have storage")
-            .update(row_id, version_xmin, xid, updated.clone());
+            .append_updated_version(row_id, version_xmin, xid, updated.clone());
         validate_row_foreign_keys(
             state,
             &schema,
@@ -259,7 +263,7 @@ pub(super) fn update_rows(
             deferred_constraints,
             defer_all,
         )?;
-        apply_parent_actions(
+        apply_referencing_foreign_key_actions(
             state,
             &schema,
             &row,
@@ -275,14 +279,14 @@ pub(super) fn update_rows(
     Ok(StatementResult::Affected(affected))
 }
 
-pub(super) fn delete_rows(
+pub(super) fn execute_delete(
     state: &mut DatabaseState,
     delete: &Delete,
     xid: Xid,
     snapshot: &Snapshot,
     deferred_constraints: &BTreeSet<String>,
     defer_all: bool,
-    context: &ExecutionContext,
+    context: &StatementExecutionContext,
 ) -> Result<StatementResult> {
     if !delete.tables.is_empty()
         || delete.using.is_some()
@@ -290,13 +294,13 @@ pub(super) fn delete_rows(
         || !delete.order_by.is_empty()
         || delete.limit.is_some()
     {
-        return not_supported("DELETE feature is not implemented");
+        return reject_unsupported("DELETE feature is not implemented");
     }
     let FromTable::WithFromKeyword(from) = &delete.from else {
-        return not_supported("DELETE without FROM is not implemented");
+        return reject_unsupported("DELETE without FROM is not implemented");
     };
     if from.len() != 1 || !from[0].joins.is_empty() {
-        return not_supported("DELETE joins are not implemented");
+        return reject_unsupported("DELETE joins are not implemented");
     }
     let TableFactor::Table {
         name: table_name,
@@ -304,16 +308,19 @@ pub(super) fn delete_rows(
         ..
     } = &from[0].relation
     else {
-        return not_supported("DELETE target is not implemented");
+        return reject_unsupported("DELETE target is not implemented");
     };
     if args.is_some() {
-        return not_supported("DELETE table functions are not implemented");
+        return reject_unsupported("DELETE table functions are not implemented");
     }
-    let schema = state.catalog.table(&name(table_name)?)?.clone();
+    let schema = state
+        .catalog
+        .require_table(&normalize_unqualified_object_name(table_name)?)?
+        .clone();
     if let Some(selection) = &delete.selection {
-        let base = expression_type(selection, RowScope::Table(&schema))?;
-        if base != BaseType::Bool && !null_expression(selection) {
-            return Err(PgError::new(
+        let base = infer_expression_type(selection, RowScope::Table(&schema))?;
+        if base != BaseType::Bool && !is_null_literal(selection) {
+            return Err(PgError::create(
                 SqlState::DatatypeMismatch,
                 "WHERE requires a boolean expression",
             ));
@@ -323,9 +330,10 @@ pub(super) fn delete_rows(
         .tables
         .get(&schema.id)
         .expect("catalog table must have storage")
-        .rows()
+        .iterate_version_chains()
         .try_fold(Vec::new(), |mut targets, (row_id, chain)| {
-            let Some(version) = visible_version(chain, snapshot, xid, &state.transactions) else {
+            let Some(version) = find_visible_version(chain, snapshot, xid, &state.transactions)
+            else {
                 return Ok(targets);
             };
             if let Some(selection) = &delete.selection {
@@ -344,16 +352,16 @@ pub(super) fn delete_rows(
             .tables
             .get(&schema.id)
             .expect("catalog table must have storage")
-            .rows()
+            .iterate_version_chains()
             .find_map(|(candidate, chain)| {
                 (candidate == row_id).then(|| {
-                    visible_version(chain, snapshot, xid, &state.transactions)
+                    find_visible_version(chain, snapshot, xid, &state.transactions)
                         .map(|version| version.row.clone())
                 })
             })
             .flatten()
             .expect("target row must remain visible");
-        apply_parent_actions(
+        apply_referencing_foreign_key_actions(
             state,
             &schema,
             &row,
@@ -369,7 +377,7 @@ pub(super) fn delete_rows(
             .tables
             .get_mut(&schema.id)
             .expect("catalog table must have storage")
-            .tombstone(row_id, version_xmin, xid);
+            .mark_version_deleted(row_id, version_xmin, xid);
     }
     Ok(StatementResult::Affected(affected))
 }

@@ -1,9 +1,9 @@
 use pg_fake::{api::Db, error::SqlState, value::Value};
 
 #[test]
-fn deferrable_foreign_keys_are_checked_at_commit() {
-    let db = Db::new();
-    let mut session = db.session();
+fn checks_deferrable_foreign_keys_at_commit() {
+    let db = Db::create();
+    let mut session = db.create_session();
     session
         .execute("CREATE TABLE parents (id INTEGER PRIMARY KEY)")
         .unwrap();
@@ -29,9 +29,9 @@ fn deferrable_foreign_keys_are_checked_at_commit() {
 }
 
 #[test]
-fn prepared_autocommit_checks_initially_deferred_foreign_keys() {
-    let db = Db::new();
-    let mut session = db.session();
+fn checks_initially_deferred_foreign_keys_in_prepared_autocommit() {
+    let db = Db::create();
+    let mut session = db.create_session();
     session
         .execute("CREATE TABLE parents (id INTEGER PRIMARY KEY)")
         .unwrap();

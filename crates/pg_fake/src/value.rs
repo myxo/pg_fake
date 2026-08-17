@@ -72,7 +72,7 @@ pub enum BaseType {
 
 impl BaseType {
     /// The `pg_type` OID for this base type.
-    pub fn oid(self) -> Oid {
+    pub fn map_to_oid(self) -> Oid {
         match self {
             BaseType::Bool => 16,
             BaseType::Bytea => 17,
@@ -95,7 +95,7 @@ impl BaseType {
     }
 
     /// The canonical (internal) PostgreSQL type name, e.g. `int4`, `bpchar`.
-    pub fn name(self) -> &'static str {
+    pub fn get_postgres_name(self) -> &'static str {
         match self {
             BaseType::Bool => "bool",
             BaseType::Int2 => "int2",
@@ -118,7 +118,7 @@ impl BaseType {
     }
 
     /// Look up a base type by OID.
-    pub fn from_oid(oid: Oid) -> Option<BaseType> {
+    pub fn resolve_oid(oid: Oid) -> Option<BaseType> {
         match oid {
             16 => Some(BaseType::Bool),
             17 => Some(BaseType::Bytea),
@@ -143,7 +143,7 @@ impl BaseType {
 
     /// Look up a base type by SQL type name, accepting common aliases.
     /// Matching is case-insensitive.
-    pub(crate) fn from_name(name: &str) -> Option<BaseType> {
+    pub(crate) fn parse_sql_name(name: &str) -> Option<BaseType> {
         match name.trim().to_ascii_lowercase().as_str() {
             "bool" | "boolean" => Some(BaseType::Bool),
             "int2" | "smallint" => Some(BaseType::Int2),
@@ -181,19 +181,19 @@ pub(crate) struct PgType {
 impl PgType {
     pub(crate) const NO_TYPEMOD: i32 = -1;
 
-    pub(crate) fn new(base: BaseType) -> Self {
+    pub(crate) fn create(base: BaseType) -> Self {
         PgType {
             base,
             typmod: Self::NO_TYPEMOD,
         }
     }
 
-    pub(crate) fn with_typmod(base: BaseType, typmod: i32) -> Self {
+    pub(crate) fn create_with_typmod(base: BaseType, typmod: i32) -> Self {
         PgType { base, typmod }
     }
 
-    pub(crate) fn oid(self) -> Oid {
-        self.base.oid()
+    pub(crate) fn map_to_oid(self) -> Oid {
+        self.base.map_to_oid()
     }
 }
 
@@ -231,7 +231,7 @@ impl Value {
     ///
     /// For `Text` values the result is `BaseType::Text`; the catalog
     /// disambiguates `varchar`/`bpchar`.
-    pub fn base_type(&self) -> Option<BaseType> {
+    pub fn get_base_type(&self) -> Option<BaseType> {
         match self {
             Value::Null => None,
             Value::Bool(_) => Some(BaseType::Bool),
@@ -256,7 +256,7 @@ impl Value {
     ///
     /// For `Null` returns an empty string; callers that need to distinguish
     /// NULL should check `is_null()` first.
-    pub fn to_text(&self) -> String {
+    pub fn format_postgres_text(&self) -> String {
         match self {
             Value::Null => String::new(),
             Value::Bool(b) => {
@@ -278,7 +278,7 @@ impl Value {
                 }
             }
             Value::Float4(f) => f.to_string(),
-            Value::Float8(f) => format_float(*f),
+            Value::Float8(f) => format_float8(*f),
             Value::Numeric(d) => d.to_plain_string(),
             Value::Text(s) => s.clone(),
             Value::Bytea(bytes) => {
@@ -332,14 +332,14 @@ impl Value {
             BaseType::Float8 => parse_float::<f64>(input).map(Value::Float8),
             BaseType::Numeric => BigDecimal::from_str(input)
                 .map(Value::Numeric)
-                .map_err(|_| invalid_text(input, "numeric")),
+                .map_err(|_| create_invalid_text_error(input, "numeric")),
             BaseType::Text | BaseType::Varchar | BaseType::Bpchar => {
                 Ok(Value::Text(input.to_string()))
             }
             BaseType::Bytea => parse_bytea(input).map(Value::Bytea),
             BaseType::Uuid => uuid::Uuid::parse_str(input)
                 .map(Value::Uuid)
-                .map_err(|_| invalid_text(input, "uuid")),
+                .map_err(|_| create_invalid_text_error(input, "uuid")),
             BaseType::Date => parse_date(input).map(Value::Date),
             BaseType::Time => parse_time(input).map(Value::Time),
             BaseType::Timestamp => parse_timestamp(input).map(Value::Timestamp),
@@ -396,7 +396,7 @@ fn format_interval(value: PgInterval) -> String {
 fn parse_interval(input: &str) -> Result<PgInterval> {
     let input = input.trim();
     if input.is_empty() {
-        return Err(invalid_text(input, "interval"));
+        return Err(create_invalid_text_error(input, "interval"));
     }
     let mut value = PgInterval {
         months: 0,
@@ -415,17 +415,17 @@ fn parse_interval(input: &str) -> Result<PgInterval> {
             let time = parts[index].trim_start_matches(['+', '-']);
             let fields: Vec<_> = time.split(':').collect();
             if fields.len() != 3 {
-                return Err(invalid_text(input, "interval"));
+                return Err(create_invalid_text_error(input, "interval"));
             }
             let hour = fields[0]
                 .parse::<i64>()
-                .map_err(|_| invalid_text(input, "interval"))?;
+                .map_err(|_| create_invalid_text_error(input, "interval"))?;
             let minute = fields[1]
                 .parse::<i64>()
-                .map_err(|_| invalid_text(input, "interval"))?;
+                .map_err(|_| create_invalid_text_error(input, "interval"))?;
             let second = fields[2]
                 .parse::<f64>()
-                .map_err(|_| invalid_text(input, "interval"))?;
+                .map_err(|_| create_invalid_text_error(input, "interval"))?;
             value.micros = value
                 .micros
                 .checked_add(
@@ -434,84 +434,90 @@ fn parse_interval(input: &str) -> Result<PgInterval> {
                         + (second * 1_000_000.0).round() as i64),
                 )
                 .ok_or_else(|| {
-                    PgError::new(SqlState::NumericValueOutOfRange, "interval out of range")
+                    PgError::create(SqlState::NumericValueOutOfRange, "interval out of range")
                 })?;
             index += 1;
             continue;
         }
         if index + 1 >= parts.len() {
-            return Err(invalid_text(input, "interval"));
+            return Err(create_invalid_text_error(input, "interval"));
         }
         let number = parts[index]
             .parse::<i64>()
-            .map_err(|_| invalid_text(input, "interval"))?;
+            .map_err(|_| create_invalid_text_error(input, "interval"))?;
         match parts[index + 1].to_ascii_lowercase().as_str() {
             "year" | "years" => {
                 value.months = value
                     .months
                     .checked_add(
                         i32::try_from(number.checked_mul(12).ok_or_else(|| {
-                            PgError::new(SqlState::NumericValueOutOfRange, "interval out of range")
+                            PgError::create(
+                                SqlState::NumericValueOutOfRange,
+                                "interval out of range",
+                            )
                         })?)
                         .map_err(|_| {
-                            PgError::new(SqlState::NumericValueOutOfRange, "interval out of range")
+                            PgError::create(
+                                SqlState::NumericValueOutOfRange,
+                                "interval out of range",
+                            )
                         })?,
                     )
                     .ok_or_else(|| {
-                        PgError::new(SqlState::NumericValueOutOfRange, "interval out of range")
+                        PgError::create(SqlState::NumericValueOutOfRange, "interval out of range")
                     })?
             }
             "mon" | "mons" | "month" | "months" => {
                 value.months = value
                     .months
                     .checked_add(i32::try_from(number).map_err(|_| {
-                        PgError::new(SqlState::NumericValueOutOfRange, "interval out of range")
+                        PgError::create(SqlState::NumericValueOutOfRange, "interval out of range")
                     })?)
                     .ok_or_else(|| {
-                        PgError::new(SqlState::NumericValueOutOfRange, "interval out of range")
+                        PgError::create(SqlState::NumericValueOutOfRange, "interval out of range")
                     })?
             }
             "day" | "days" => {
                 value.days = value
                     .days
                     .checked_add(i32::try_from(number).map_err(|_| {
-                        PgError::new(SqlState::NumericValueOutOfRange, "interval out of range")
+                        PgError::create(SqlState::NumericValueOutOfRange, "interval out of range")
                     })?)
                     .ok_or_else(|| {
-                        PgError::new(SqlState::NumericValueOutOfRange, "interval out of range")
+                        PgError::create(SqlState::NumericValueOutOfRange, "interval out of range")
                     })?
             }
             "hour" | "hours" => {
                 value.micros = value
                     .micros
                     .checked_add(number.checked_mul(3_600_000_000).ok_or_else(|| {
-                        PgError::new(SqlState::NumericValueOutOfRange, "interval out of range")
+                        PgError::create(SqlState::NumericValueOutOfRange, "interval out of range")
                     })?)
                     .ok_or_else(|| {
-                        PgError::new(SqlState::NumericValueOutOfRange, "interval out of range")
+                        PgError::create(SqlState::NumericValueOutOfRange, "interval out of range")
                     })?
             }
             "minute" | "minutes" | "min" | "mins" => {
                 value.micros = value
                     .micros
                     .checked_add(number.checked_mul(60_000_000).ok_or_else(|| {
-                        PgError::new(SqlState::NumericValueOutOfRange, "interval out of range")
+                        PgError::create(SqlState::NumericValueOutOfRange, "interval out of range")
                     })?)
                     .ok_or_else(|| {
-                        PgError::new(SqlState::NumericValueOutOfRange, "interval out of range")
+                        PgError::create(SqlState::NumericValueOutOfRange, "interval out of range")
                     })?
             }
             "second" | "seconds" | "sec" | "secs" => {
                 value.micros = value
                     .micros
                     .checked_add(number.checked_mul(1_000_000).ok_or_else(|| {
-                        PgError::new(SqlState::NumericValueOutOfRange, "interval out of range")
+                        PgError::create(SqlState::NumericValueOutOfRange, "interval out of range")
                     })?)
                     .ok_or_else(|| {
-                        PgError::new(SqlState::NumericValueOutOfRange, "interval out of range")
+                        PgError::create(SqlState::NumericValueOutOfRange, "interval out of range")
                     })?
             }
-            _ => return Err(invalid_text(input, "interval")),
+            _ => return Err(create_invalid_text_error(input, "interval")),
         }
         index += 2;
     }
@@ -526,7 +532,7 @@ fn format_timestamp(value: NaiveDateTime) -> String {
         .to_string()
 }
 
-fn format_float(f: f64) -> String {
+fn format_float8(f: f64) -> String {
     if f.is_nan() {
         return "NaN".into();
     }
@@ -546,7 +552,7 @@ fn parse_date(input: &str) -> Result<PgDate> {
         "-infinity" => Ok(PgDate::NegInfinity),
         _ => chrono::NaiveDate::parse_from_str(input.trim(), "%Y-%m-%d")
             .map(PgDate::Finite)
-            .map_err(|_| invalid_text(input, "date")),
+            .map_err(|_| create_invalid_text_error(input, "date")),
     }
 }
 
@@ -557,7 +563,7 @@ fn parse_time(input: &str) -> Result<PgTime> {
     }
     let value = chrono::NaiveTime::parse_from_str(input, "%H:%M:%S%.f")
         .or_else(|_| chrono::NaiveTime::parse_from_str(input, "%H:%M"))
-        .map_err(|_| invalid_text(input, "time"))?;
+        .map_err(|_| create_invalid_text_error(input, "time"))?;
     Ok(PgTime(
         i64::from(value.num_seconds_from_midnight()) * 1_000_000
             + i64::from(value.nanosecond() / 1_000),
@@ -573,7 +579,7 @@ fn parse_timestamp(input: &str) -> Result<PgTimestamp> {
     }
     // PostgreSQL accepts a time-zone suffix for timestamp input, validates it,
     // then discards it. RFC3339 covers the unambiguous offset spellings.
-    if let Ok(value) = DateTime::parse_from_rfc3339(&rfc3339_input(input)) {
+    if let Ok(value) = DateTime::parse_from_rfc3339(&normalize_rfc3339_input(input)) {
         return Ok(PgTimestamp::Finite(value.naive_local()));
     }
     [
@@ -584,7 +590,7 @@ fn parse_timestamp(input: &str) -> Result<PgTimestamp> {
     .iter()
     .find_map(|format| NaiveDateTime::parse_from_str(input, format).ok())
     .map(PgTimestamp::Finite)
-    .ok_or_else(|| invalid_text(input, "timestamp"))
+    .ok_or_else(|| create_invalid_text_error(input, "timestamp"))
 }
 
 fn parse_timestamptz(input: &str) -> Result<PgTimestampTz> {
@@ -594,7 +600,7 @@ fn parse_timestamptz(input: &str) -> Result<PgTimestampTz> {
         "-infinity" => return Ok(PgTimestampTz::NegInfinity),
         _ => {}
     }
-    if let Ok(value) = DateTime::parse_from_rfc3339(&rfc3339_input(input)) {
+    if let Ok(value) = DateTime::parse_from_rfc3339(&normalize_rfc3339_input(input)) {
         return Ok(PgTimestampTz::Finite(value.with_timezone(&Utc)));
     }
     [
@@ -605,10 +611,10 @@ fn parse_timestamptz(input: &str) -> Result<PgTimestampTz> {
     .iter()
     .find_map(|format| NaiveDateTime::parse_from_str(input, format).ok())
     .map(|value| PgTimestampTz::Finite(value.and_utc()))
-    .ok_or_else(|| invalid_text(input, "timestamp with time zone"))
+    .ok_or_else(|| create_invalid_text_error(input, "timestamp with time zone"))
 }
 
-fn rfc3339_input(input: &str) -> String {
+fn normalize_rfc3339_input(input: &str) -> String {
     let mut input = input.replacen(' ', "T", 1);
     if input.len() >= 3 {
         let suffix = &input[input.len() - 3..];
@@ -623,17 +629,19 @@ fn parse_bool(input: &str) -> Result<bool> {
     match input.trim().to_ascii_lowercase().as_str() {
         "t" | "true" | "y" | "yes" | "on" | "1" => Ok(true),
         "f" | "false" | "n" | "no" | "off" | "0" => Ok(false),
-        _ => Err(invalid_text(input, "boolean")),
+        _ => Err(create_invalid_text_error(input, "boolean")),
     }
 }
 
 fn parse_int<T: std::str::FromStr<Err = std::num::ParseIntError>>(input: &str) -> Result<T> {
     input.trim().parse::<T>().map_err(|e| match e.kind() {
-        std::num::IntErrorKind::PosOverflow | std::num::IntErrorKind::NegOverflow => PgError::new(
-            SqlState::NumericValueOutOfRange,
-            format!("value out of range for type: {input}"),
-        ),
-        _ => invalid_text(input, "integer"),
+        std::num::IntErrorKind::PosOverflow | std::num::IntErrorKind::NegOverflow => {
+            PgError::create(
+                SqlState::NumericValueOutOfRange,
+                format!("value out of range for type: {input}"),
+            )
+        }
+        _ => create_invalid_text_error(input, "integer"),
     })
 }
 
@@ -648,9 +656,9 @@ fn parse_float<T: FloatExt>(input: &str) -> Result<T> {
         || lower == "inf"
         || lower == "-inf"
         || lower == "+inf";
-    let v = T::from_str(s).map_err(|_| invalid_text(input, "floating point"))?;
+    let v = T::from_str(s).map_err(|_| create_invalid_text_error(input, "floating point"))?;
     if v.is_infinite() && !is_inf_literal {
-        return Err(PgError::new(
+        return Err(PgError::create(
             SqlState::NumericValueOutOfRange,
             format!("value out of range for type: {input}"),
         ));
@@ -675,13 +683,13 @@ impl FloatExt for f64 {
 fn parse_bytea(input: &str) -> Result<Vec<u8>> {
     let s = input.trim();
     if let Some(hex) = s.strip_prefix("\\x") {
-        hex_decode(hex).map_err(|_| invalid_text(input, "bytea"))
+        decode_hex(hex).map_err(|_| create_invalid_text_error(input, "bytea"))
     } else {
-        parse_bytea_escape(s).map_err(|_| invalid_text(input, "bytea"))
+        parse_bytea_escape(s).map_err(|_| create_invalid_text_error(input, "bytea"))
     }
 }
 
-fn hex_decode(hex: &str) -> std::result::Result<Vec<u8>, ()> {
+fn decode_hex(hex: &str) -> std::result::Result<Vec<u8>, ()> {
     if !hex.len().is_multiple_of(2) {
         return Err(());
     }
@@ -728,8 +736,8 @@ fn parse_bytea_escape(s: &str) -> std::result::Result<Vec<u8>, ()> {
     Ok(out)
 }
 
-fn invalid_text(input: &str, type_name: &str) -> PgError {
-    PgError::new(
+fn create_invalid_text_error(input: &str, type_name: &str) -> PgError {
+    PgError::create(
         SqlState::InvalidTextRepresentation,
         format!("invalid input syntax for type {type_name}: {input:?}"),
     )
@@ -740,16 +748,16 @@ mod tests {
     use super::*;
 
     #[test]
-    fn pg_type_typmod_slot() {
-        let t = PgType::new(BaseType::Varchar);
+    fn stores_pg_type_typmod() {
+        let t = PgType::create(BaseType::Varchar);
         assert_eq!(t.typmod, PgType::NO_TYPEMOD);
-        let t = PgType::with_typmod(BaseType::Varchar, 14);
+        let t = PgType::create_with_typmod(BaseType::Varchar, 14);
         assert_ne!(t.typmod, PgType::NO_TYPEMOD);
-        assert_eq!(t.oid(), 1043);
+        assert_eq!(t.map_to_oid(), 1043);
     }
 
     #[test]
-    fn integer_roundtrip() {
+    fn roundtrips_integers() {
         for (base, text) in [
             (BaseType::Int2, "32767"),
             (BaseType::Int2, "-32768"),
@@ -758,13 +766,13 @@ mod tests {
             (BaseType::Int8, "9000000000000000000"),
         ] {
             let v = Value::parse(base, text).unwrap();
-            assert_eq!(v.to_text(), text);
-            assert_eq!(v.base_type(), Some(base));
+            assert_eq!(v.format_postgres_text(), text);
+            assert_eq!(v.get_base_type(), Some(base));
         }
     }
 
     #[test]
-    fn integer_overflow_is_22003() {
+    fn reports_22003_for_integer_overflow() {
         let err = Value::parse(BaseType::Int2, "40000").unwrap_err();
         assert_eq!(err.sqlstate, SqlState::NumericValueOutOfRange);
         let err = Value::parse(BaseType::Int4, "3000000000").unwrap_err();
@@ -772,13 +780,13 @@ mod tests {
     }
 
     #[test]
-    fn integer_invalid_syntax_is_22p02() {
+    fn reports_22p02_for_invalid_integer_syntax() {
         let err = Value::parse(BaseType::Int4, "abc").unwrap_err();
         assert_eq!(err.sqlstate, SqlState::InvalidTextRepresentation);
     }
 
     #[test]
-    fn bool_parsing_accepts_postgres_forms() {
+    fn accepts_postgres_boolean_forms() {
         for t in ["t", "TRUE", "y", "yes", "on", "1"] {
             assert_eq!(Value::parse(BaseType::Bool, t).unwrap(), Value::Bool(true));
         }
@@ -790,29 +798,29 @@ mod tests {
     }
 
     #[test]
-    fn float_roundtrip_and_specials() {
+    fn roundtrips_floats_and_special_values() {
         let v = Value::parse(BaseType::Float8, "1.5").unwrap();
-        assert_eq!(v.to_text(), "1.5");
+        assert_eq!(v.format_postgres_text(), "1.5");
         let v = Value::parse(BaseType::Float8, "Infinity").unwrap();
-        assert_eq!(v.to_text(), "Infinity");
+        assert_eq!(v.format_postgres_text(), "Infinity");
         let v = Value::parse(BaseType::Float8, "-Infinity").unwrap();
-        assert_eq!(v.to_text(), "-Infinity");
+        assert_eq!(v.format_postgres_text(), "-Infinity");
         let v = Value::parse(BaseType::Float8, "NaN").unwrap();
-        assert_eq!(v.to_text(), "NaN");
+        assert_eq!(v.format_postgres_text(), "NaN");
     }
 
     #[test]
-    fn float_overflow_is_22003() {
+    fn reports_22003_for_float_overflow() {
         let err = Value::parse(BaseType::Float4, "1e999").unwrap_err();
         assert_eq!(err.sqlstate, SqlState::NumericValueOutOfRange);
     }
 
     #[test]
-    fn numeric_beyond_i64() {
+    fn parses_numeric_beyond_i64() {
         // 50-digit number: well outside i64/f64 exact range.
         let big = "12345678901234567890123456789012345678901234567890";
         let v = Value::parse(BaseType::Numeric, big).unwrap();
-        assert_eq!(v.to_text(), big);
+        assert_eq!(v.format_postgres_text(), big);
         // precision preserved through arithmetic identity
         match v {
             Value::Numeric(d) => assert_eq!(d.to_plain_string(), big),
@@ -821,40 +829,40 @@ mod tests {
     }
 
     #[test]
-    fn numeric_preserves_scale() {
+    fn preserves_numeric_scale() {
         let v = Value::parse(BaseType::Numeric, "1.10").unwrap();
-        assert_eq!(v.to_text(), "1.10");
+        assert_eq!(v.format_postgres_text(), "1.10");
         let v = Value::parse(BaseType::Numeric, "0.001").unwrap();
-        assert_eq!(v.to_text(), "0.001");
+        assert_eq!(v.format_postgres_text(), "0.001");
     }
 
     #[test]
-    fn numeric_invalid_is_22p02() {
+    fn reports_22p02_for_invalid_numeric() {
         let err = Value::parse(BaseType::Numeric, "1.2.3").unwrap_err();
         assert_eq!(err.sqlstate, SqlState::InvalidTextRepresentation);
     }
 
     #[test]
-    fn text_roundtrip() {
+    fn roundtrips_text() {
         for base in [BaseType::Text, BaseType::Varchar, BaseType::Bpchar] {
             let v = Value::parse(base, "hello world").unwrap();
             assert_eq!(v, Value::Text("hello world".into()));
-            assert_eq!(v.to_text(), "hello world");
+            assert_eq!(v.format_postgres_text(), "hello world");
         }
     }
 
     #[test]
-    fn bytea_hex_roundtrip() {
+    fn roundtrips_hex_bytea() {
         let v = Value::parse(BaseType::Bytea, "\\x414243").unwrap();
         assert_eq!(v, Value::Bytea(vec![0x41, 0x42, 0x43]));
-        assert_eq!(v.to_text(), "\\x414243");
+        assert_eq!(v.format_postgres_text(), "\\x414243");
         // empty
         let v = Value::parse(BaseType::Bytea, "\\x").unwrap();
         assert_eq!(v, Value::Bytea(vec![]));
     }
 
     #[test]
-    fn bytea_escape_roundtrip() {
+    fn roundtrips_escape_bytea() {
         let v = Value::parse(BaseType::Bytea, "ABC").unwrap();
         assert_eq!(v, Value::Bytea(b"ABC".to_vec()));
         // \\ -> single backslash
@@ -866,7 +874,7 @@ mod tests {
     }
 
     #[test]
-    fn bytea_invalid_is_22p02() {
+    fn reports_22p02_for_invalid_bytea() {
         let err = Value::parse(BaseType::Bytea, "\\xZZ").unwrap_err();
         assert_eq!(err.sqlstate, SqlState::InvalidTextRepresentation);
     }

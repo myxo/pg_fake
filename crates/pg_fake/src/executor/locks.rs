@@ -1,14 +1,14 @@
 use super::*;
 
-pub(crate) fn required_row_locks(
+pub(crate) fn collect_required_row_locks(
     state: &DatabaseState,
     statement: &Statement,
     xid: Xid,
     snapshot: &Snapshot,
-    context: &ExecutionContext,
+    context: &StatementExecutionContext,
 ) -> Result<Vec<RequiredRowLock>> {
     if let Statement::Insert(insert) = statement {
-        return required_insert_foreign_key_locks(state, insert, xid, snapshot, context);
+        return collect_insert_foreign_key_locks(state, insert, xid, snapshot, context);
     }
     let (schema, selection, mode) = match statement {
         Statement::Update(update) => {
@@ -25,7 +25,9 @@ pub(crate) fn required_row_locks(
                 return Ok(Vec::new());
             };
             (
-                state.catalog.table(&name(table_name)?)?,
+                state
+                    .catalog
+                    .require_table(&normalize_unqualified_object_name(table_name)?)?,
                 update.selection.as_ref(),
                 RowLockMode::Update,
             )
@@ -46,13 +48,15 @@ pub(crate) fn required_row_locks(
                 return Ok(Vec::new());
             };
             (
-                state.catalog.table(&name(table_name)?)?,
+                state
+                    .catalog
+                    .require_table(&normalize_unqualified_object_name(table_name)?)?,
                 delete.selection.as_ref(),
                 RowLockMode::Update,
             )
         }
         Statement::Query(query) => {
-            let Some(mode) = query::select_lock_mode(query)? else {
+            let Some(mode) = query::resolve_select_lock_mode(query)? else {
                 return Ok(Vec::new());
             };
             let SetExpr::Select(select) = query.body.as_ref() else {
@@ -70,7 +74,9 @@ pub(crate) fn required_row_locks(
                 return Ok(Vec::new());
             };
             (
-                state.catalog.table(&name(table_name)?)?,
+                state
+                    .catalog
+                    .require_table(&normalize_unqualified_object_name(table_name)?)?,
                 select.selection.as_ref(),
                 mode,
             )
@@ -78,8 +84,8 @@ pub(crate) fn required_row_locks(
         _ => return Ok(Vec::new()),
     };
     if let Some(selection) = selection {
-        let base = expression_type(selection, RowScope::Table(schema))?;
-        if base != BaseType::Bool && !null_expression(selection) {
+        let base = infer_expression_type(selection, RowScope::Table(schema))?;
+        if base != BaseType::Bool && !is_null_literal(selection) {
             return Ok(Vec::new());
         }
     }
@@ -87,9 +93,10 @@ pub(crate) fn required_row_locks(
         .tables
         .get(&schema.id)
         .expect("catalog table must have storage")
-        .rows()
+        .iterate_version_chains()
         .try_fold(Vec::new(), |mut locks, (row_id, chain)| {
-            let Some(version) = visible_version(chain, snapshot, xid, &state.transactions) else {
+            let Some(version) = find_visible_version(chain, snapshot, xid, &state.transactions)
+            else {
                 return Ok(locks);
             };
             if let Some(selection) = selection {
@@ -102,12 +109,12 @@ pub(crate) fn required_row_locks(
             if version.xmax.is_some_and(|xmax| {
                 xmax != xid
                     && matches!(
-                        state.transactions.status(xmax),
+                        state.transactions.get_status(xmax),
                         Some(TransactionStatus::Committed(commit_seq))
                             if commit_seq > snapshot.commit_seq
                     )
             }) {
-                return Err(PgError::new(
+                return Err(PgError::create(
                     SqlState::SerializationFailure,
                     "could not serialize access due to concurrent update",
                 ));
@@ -123,14 +130,16 @@ pub(crate) fn required_row_locks(
         })
 }
 
-fn required_insert_foreign_key_locks(
+fn collect_insert_foreign_key_locks(
     state: &DatabaseState,
     insert: &sqlparser::ast::Insert,
     xid: Xid,
     snapshot: &Snapshot,
-    context: &ExecutionContext,
+    context: &StatementExecutionContext,
 ) -> Result<Vec<RequiredRowLock>> {
-    let schema = state.catalog.table(&insert_table_name(&insert.table)?)?;
+    let schema = state
+        .catalog
+        .require_table(&resolve_insert_table_name(&insert.table)?)?;
     let Some(source) = &insert.source else {
         return Ok(Vec::new());
     };
@@ -144,13 +153,13 @@ fn required_insert_foreign_key_locks(
             .columns
             .iter()
             .map(|column| {
-                let column_name = name(column)?;
+                let column_name = normalize_unqualified_object_name(column)?;
                 schema
                     .columns
                     .iter()
                     .position(|definition| definition.name == column_name)
                     .ok_or_else(|| {
-                        PgError::new(
+                        PgError::create(
                             SqlState::UndefinedColumn,
                             format!("column {:?} does not exist", column),
                         )
@@ -166,16 +175,16 @@ fn required_insert_foreign_key_locks(
         let mut row = schema
             .columns
             .iter()
-            .map(|column| column_default(column, context))
+            .map(|column| evaluate_column_default(column, context))
             .collect::<Result<Vec<_>>>()?;
         for (expression, index) in expressions.iter().zip(&column_indexes) {
-            row[*index] = if default_expression(expression) {
-                column_default(&schema.columns[*index], context)?
+            row[*index] = if is_default_expression(expression) {
+                evaluate_column_default(&schema.columns[*index], context)?
             } else {
-                expression_value(
+                evaluate_assignment_expression(
                     expression,
                     schema.columns[*index].data_type,
-                    &constant_schema(),
+                    &create_constant_expression_schema(),
                     &[],
                     context,
                 )?
@@ -185,7 +194,7 @@ fn required_insert_foreign_key_locks(
             let crate::catalog::Constraint::ForeignKey(foreign_key) = constraint else {
                 continue;
             };
-            let local = foreign_key_column_indexes(schema, &foreign_key.columns)?;
+            let local = resolve_foreign_key_column_indexes(schema, &foreign_key.columns)?;
             let key = local
                 .iter()
                 .map(|index| row[*index].clone())
@@ -193,7 +202,7 @@ fn required_insert_foreign_key_locks(
             if key.iter().any(Value::is_null) {
                 continue;
             }
-            let foreign_schema = state.catalog.table(&foreign_key.foreign_table)?;
+            let foreign_schema = state.catalog.require_table(&foreign_key.foreign_table)?;
             let referred = if foreign_key.referred_columns.is_empty() {
                 foreign_schema
                     .constraints
@@ -206,7 +215,7 @@ fn required_insert_foreign_key_locks(
             } else {
                 foreign_key.referred_columns.clone()
             };
-            let referred = foreign_key_column_indexes(foreign_schema, &referred)?;
+            let referred = resolve_foreign_key_column_indexes(foreign_schema, &referred)?;
             let table = state
                 .tables
                 .get(&foreign_schema.id)

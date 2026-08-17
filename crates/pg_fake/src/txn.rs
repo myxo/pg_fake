@@ -2,7 +2,7 @@ use std::collections::{BTreeMap, BTreeSet, VecDeque};
 
 use crate::{
     catalog::TableId,
-    storage::{RowId, Version, VersionChain},
+    storage::{RowId, RowVersion, RowVersionChain},
 };
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
@@ -52,44 +52,49 @@ pub(crate) struct WaitForGraph {
     victims: BTreeSet<Xid>,
 }
 
-pub(crate) enum LockAttempt {
+pub(crate) enum RowLockAttempt {
     Acquired,
     Blocked(Vec<Xid>),
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) struct TransactionManager {
+pub(crate) struct TransactionRegistry {
     next_xid: u64,
     commit_seq: CommitSeq,
     statuses: BTreeMap<Xid, TransactionStatus>,
 }
 
-impl Default for TransactionManager {
+impl Default for TransactionRegistry {
     fn default() -> Self {
-        Self::new()
+        Self::create()
     }
 }
 
 impl Default for RowLockManager {
     fn default() -> Self {
-        Self::new()
+        Self::create()
     }
 }
 
 impl Default for WaitForGraph {
     fn default() -> Self {
-        Self::new()
+        Self::create()
     }
 }
 
 impl RowLockManager {
-    pub(crate) fn new() -> Self {
+    pub(crate) fn create() -> Self {
         RowLockManager {
             locks: BTreeMap::new(),
         }
     }
 
-    pub(crate) fn acquire(&mut self, key: RowLockKey, xid: Xid, mode: RowLockMode) -> LockAttempt {
+    pub(crate) fn acquire(
+        &mut self,
+        key: RowLockKey,
+        xid: Xid,
+        mode: RowLockMode,
+    ) -> RowLockAttempt {
         let lock = self.locks.entry(key).or_insert_with(|| RowLock {
             holders: BTreeMap::new(),
             waiters: VecDeque::new(),
@@ -97,7 +102,7 @@ impl RowLockManager {
         if let Some(held) = lock.holders.get(&xid)
             && (*held == RowLockMode::Update || mode == RowLockMode::Share)
         {
-            return LockAttempt::Acquired;
+            return RowLockAttempt::Acquired;
         }
         let holder_conflicts = lock
             .holders
@@ -113,7 +118,7 @@ impl RowLockManager {
                 lock.waiters.pop_front();
             }
             lock.holders.insert(xid, mode);
-            return LockAttempt::Acquired;
+            return RowLockAttempt::Acquired;
         }
         if !lock.waiters.contains(&xid) {
             lock.waiters.push_back(xid);
@@ -122,7 +127,7 @@ impl RowLockManager {
         if let Some(waiter) = first_waiter.filter(|waiter| *waiter != xid) {
             blockers.insert(waiter);
         }
-        LockAttempt::Blocked(blockers.into_iter().collect())
+        RowLockAttempt::Blocked(blockers.into_iter().collect())
     }
 
     pub(crate) fn cancel_wait(&mut self, key: RowLockKey, xid: Xid) {
@@ -135,7 +140,7 @@ impl RowLockManager {
         }
     }
 
-    pub(crate) fn release(&mut self, xid: Xid) {
+    pub(crate) fn release_transaction_locks(&mut self, xid: Xid) {
         self.locks.retain(|_, lock| {
             lock.holders.remove(&xid);
             lock.waiters.retain(|waiter| *waiter != xid);
@@ -150,14 +155,18 @@ impl RowLockManager {
 }
 
 impl WaitForGraph {
-    pub(crate) fn new() -> Self {
+    pub(crate) fn create() -> Self {
         WaitForGraph {
             edges: BTreeMap::new(),
             victims: BTreeSet::new(),
         }
     }
 
-    pub(crate) fn wait_for(&mut self, waiter: Xid, blockers: &[Xid]) -> Option<Xid> {
+    pub(crate) fn register_wait_dependencies(
+        &mut self,
+        waiter: Xid,
+        blockers: &[Xid],
+    ) -> Option<Xid> {
         let blockers = blockers
             .iter()
             .copied()
@@ -168,7 +177,7 @@ impl WaitForGraph {
             return None;
         }
         self.edges.insert(waiter, blockers);
-        let cycle = self.cycle_containing(waiter)?;
+        let cycle = self.find_cycle_containing(waiter)?;
         let victim = *cycle
             .iter()
             .next_back()
@@ -194,17 +203,17 @@ impl WaitForGraph {
         self.victims.remove(&xid)
     }
 
-    fn cycle_containing(&self, xid: Xid) -> Option<BTreeSet<Xid>> {
-        let reachable = self.reachable(xid, false);
-        let reaches_xid = self.reachable(xid, true);
-        let cycle = reachable
+    fn find_cycle_containing(&self, xid: Xid) -> Option<BTreeSet<Xid>> {
+        let collect_reachable_transactions = self.collect_reachable_transactions(xid, false);
+        let reaches_xid = self.collect_reachable_transactions(xid, true);
+        let cycle = collect_reachable_transactions
             .intersection(&reaches_xid)
             .copied()
             .collect::<BTreeSet<_>>();
         (cycle.len() > 1).then_some(cycle)
     }
 
-    fn reachable(&self, start: Xid, reverse: bool) -> BTreeSet<Xid> {
+    fn collect_reachable_transactions(&self, start: Xid, reverse: bool) -> BTreeSet<Xid> {
         let mut reached = BTreeSet::from([start]);
         let mut pending = vec![start];
         while let Some(xid) = pending.pop() {
@@ -226,9 +235,9 @@ impl WaitForGraph {
     }
 }
 
-impl TransactionManager {
-    pub(crate) fn new() -> Self {
-        TransactionManager {
+impl TransactionRegistry {
+    pub(crate) fn create() -> Self {
+        TransactionRegistry {
             next_xid: 1,
             commit_seq: CommitSeq(0),
             statuses: BTreeMap::new(),
@@ -245,7 +254,7 @@ impl TransactionManager {
 
     pub(crate) fn commit(&mut self, xid: Xid) -> CommitSeq {
         assert!(matches!(
-            self.status(xid),
+            self.get_status(xid),
             Some(TransactionStatus::InFlight)
         ));
         self.commit_seq.0 += 1;
@@ -257,19 +266,19 @@ impl TransactionManager {
 
     pub(crate) fn abort(&mut self, xid: Xid) {
         assert!(matches!(
-            self.status(xid),
+            self.get_status(xid),
             Some(TransactionStatus::InFlight)
         ));
         *self.statuses.get_mut(&xid).expect("transaction must exist") = TransactionStatus::Aborted;
     }
 
-    pub(crate) fn status(&self, xid: Xid) -> Option<TransactionStatus> {
+    pub(crate) fn get_status(&self, xid: Xid) -> Option<TransactionStatus> {
         self.statuses.get(&xid).copied()
     }
 }
 
 impl Snapshot {
-    pub(crate) fn new(manager: &TransactionManager) -> Self {
+    pub(crate) fn create(manager: &TransactionRegistry) -> Self {
         Snapshot {
             commit_seq: manager.commit_seq,
         }
@@ -277,14 +286,14 @@ impl Snapshot {
 }
 
 pub(crate) fn is_visible(
-    version: &Version,
+    version: &RowVersion,
     snapshot: &Snapshot,
     current_xid: Xid,
-    manager: &TransactionManager,
+    manager: &TransactionRegistry,
 ) -> bool {
     let xmin_visible = version.xmin == current_xid
         || matches!(
-            manager.status(version.xmin),
+            manager.get_status(version.xmin),
             Some(TransactionStatus::Committed(commit_seq))
                 if commit_seq <= snapshot.commit_seq
         );
@@ -292,7 +301,7 @@ pub(crate) fn is_visible(
         version.xmax,
         Some(xmax) if xmax == current_xid
             || matches!(
-                manager.status(xmax),
+                manager.get_status(xmax),
                 Some(TransactionStatus::Committed(commit_seq))
                     if commit_seq <= snapshot.commit_seq
             )
@@ -301,12 +310,12 @@ pub(crate) fn is_visible(
     xmin_visible && !xmax_invisible
 }
 
-pub(crate) fn visible_version<'a>(
-    chain: &'a VersionChain,
+pub(crate) fn find_visible_version<'a>(
+    chain: &'a RowVersionChain,
     snapshot: &Snapshot,
     current_xid: Xid,
-    manager: &TransactionManager,
-) -> Option<&'a Version> {
+    manager: &TransactionRegistry,
+) -> Option<&'a RowVersion> {
     chain
         .versions
         .iter()
@@ -319,27 +328,36 @@ mod tests {
     use super::*;
 
     #[test]
-    fn transaction_statuses_transition_from_in_flight_to_final() {
-        let mut manager = TransactionManager::new();
+    fn transitions_transaction_statuses_from_in_flight_to_final() {
+        let mut manager = TransactionRegistry::create();
         let committed = manager.begin();
         let aborted = manager.begin();
 
-        assert_eq!(manager.status(committed), Some(TransactionStatus::InFlight));
-        assert_eq!(manager.status(aborted), Some(TransactionStatus::InFlight));
+        assert_eq!(
+            manager.get_status(committed),
+            Some(TransactionStatus::InFlight)
+        );
+        assert_eq!(
+            manager.get_status(aborted),
+            Some(TransactionStatus::InFlight)
+        );
 
         manager.commit(committed);
         manager.abort(aborted);
 
         assert_eq!(
-            manager.status(committed),
+            manager.get_status(committed),
             Some(TransactionStatus::Committed(CommitSeq(1)))
         );
-        assert_eq!(manager.status(aborted), Some(TransactionStatus::Aborted));
+        assert_eq!(
+            manager.get_status(aborted),
+            Some(TransactionStatus::Aborted)
+        );
     }
 
     #[test]
-    fn xids_and_commit_sequences_are_monotonic() {
-        let mut manager = TransactionManager::new();
+    fn allocates_monotonic_xids_and_commit_sequences() {
+        let mut manager = TransactionRegistry::create();
         let first = manager.begin();
         let second = manager.begin();
 
@@ -350,8 +368,8 @@ mod tests {
         assert_eq!(manager.commit_seq, CommitSeq(2));
     }
 
-    fn version(xmin: Xid, xmax: Option<Xid>) -> Version {
-        Version {
+    fn create_version(xmin: Xid, xmax: Option<Xid>) -> RowVersion {
+        RowVersion {
             xmin,
             xmax,
             row: vec![],
@@ -359,27 +377,27 @@ mod tests {
     }
 
     #[test]
-    fn own_uncommitted_insert_is_visible_only_to_its_transaction() {
-        let mut manager = TransactionManager::new();
+    fn shows_own_uncommitted_insert_only_to_its_transaction() {
+        let mut manager = TransactionRegistry::create();
         let writer = manager.begin();
         let reader = manager.begin();
-        let snapshot = Snapshot::new(&manager);
-        let inserted = version(writer, None);
+        let snapshot = Snapshot::create(&manager);
+        let inserted = create_version(writer, None);
 
         assert!(is_visible(&inserted, &snapshot, writer, &manager));
         assert!(!is_visible(&inserted, &snapshot, reader, &manager));
     }
 
     #[test]
-    fn committed_before_snapshot_is_visible() {
-        let mut manager = TransactionManager::new();
+    fn shows_version_committed_before_snapshot() {
+        let mut manager = TransactionRegistry::create();
         let writer = manager.begin();
         manager.commit(writer);
         let reader = manager.begin();
-        let snapshot = Snapshot::new(&manager);
+        let snapshot = Snapshot::create(&manager);
 
         assert!(is_visible(
-            &version(writer, None),
+            &create_version(writer, None),
             &snapshot,
             reader,
             &manager
@@ -387,15 +405,15 @@ mod tests {
     }
 
     #[test]
-    fn committed_after_snapshot_is_invisible() {
-        let mut manager = TransactionManager::new();
+    fn hides_version_committed_after_snapshot() {
+        let mut manager = TransactionRegistry::create();
         let writer = manager.begin();
         let reader = manager.begin();
-        let snapshot = Snapshot::new(&manager);
+        let snapshot = Snapshot::create(&manager);
         manager.commit(writer);
 
         assert!(!is_visible(
-            &version(writer, None),
+            &create_version(writer, None),
             &snapshot,
             reader,
             &manager
@@ -403,17 +421,17 @@ mod tests {
     }
 
     #[test]
-    fn delete_committed_before_snapshot_hides_the_version() {
-        let mut manager = TransactionManager::new();
+    fn hides_version_deleted_before_snapshot() {
+        let mut manager = TransactionRegistry::create();
         let writer = manager.begin();
         manager.commit(writer);
         let deleter = manager.begin();
         manager.commit(deleter);
         let reader = manager.begin();
-        let snapshot = Snapshot::new(&manager);
+        let snapshot = Snapshot::create(&manager);
 
         assert!(!is_visible(
-            &version(writer, Some(deleter)),
+            &create_version(writer, Some(deleter)),
             &snapshot,
             reader,
             &manager
@@ -421,16 +439,16 @@ mod tests {
     }
 
     #[test]
-    fn in_flight_delete_leaves_the_version_visible() {
-        let mut manager = TransactionManager::new();
+    fn keeps_version_visible_during_in_flight_delete() {
+        let mut manager = TransactionRegistry::create();
         let writer = manager.begin();
         manager.commit(writer);
         let deleter = manager.begin();
         let reader = manager.begin();
-        let snapshot = Snapshot::new(&manager);
+        let snapshot = Snapshot::create(&manager);
 
         assert!(is_visible(
-            &version(writer, Some(deleter)),
+            &create_version(writer, Some(deleter)),
             &snapshot,
             reader,
             &manager
@@ -438,43 +456,52 @@ mod tests {
     }
 
     #[test]
-    fn visible_version_selects_one_version_from_a_chain() {
-        let mut manager = TransactionManager::new();
+    fn finds_one_visible_version_in_a_chain() {
+        let mut manager = TransactionRegistry::create();
         let writer = manager.begin();
         manager.commit(writer);
         let updater = manager.begin();
         let reader = manager.begin();
-        let snapshot = Snapshot::new(&manager);
-        let chain = VersionChain {
-            versions: vec![version(writer, Some(updater)), version(updater, None)],
+        let snapshot = Snapshot::create(&manager);
+        let chain = RowVersionChain {
+            versions: vec![
+                create_version(writer, Some(updater)),
+                create_version(updater, None),
+            ],
         };
 
         assert_eq!(
-            visible_version(&chain, &snapshot, reader, &manager),
+            find_visible_version(&chain, &snapshot, reader, &manager),
             Some(&chain.versions[0])
         );
     }
 
     #[test]
-    fn wait_for_graph_selects_highest_xid_in_cycle() {
-        let mut graph = WaitForGraph::new();
+    fn selects_highest_xid_in_wait_for_cycle() {
+        let mut graph = WaitForGraph::create();
 
-        assert_eq!(graph.wait_for(Xid(1), &[Xid(2)]), None);
-        assert_eq!(graph.wait_for(Xid(2), &[Xid(3)]), None);
-        assert_eq!(graph.wait_for(Xid(3), &[Xid(1)]), Some(Xid(3)));
+        assert_eq!(graph.register_wait_dependencies(Xid(1), &[Xid(2)]), None);
+        assert_eq!(graph.register_wait_dependencies(Xid(2), &[Xid(3)]), None);
+        assert_eq!(
+            graph.register_wait_dependencies(Xid(3), &[Xid(1)]),
+            Some(Xid(3))
+        );
         assert!(graph.take_victim(Xid(3)));
         assert!(!graph.take_victim(Xid(1)));
     }
 
     #[test]
-    fn removing_wait_edge_breaks_cycle() {
-        let mut graph = WaitForGraph::new();
-        graph.wait_for(Xid(4), &[Xid(7)]);
-        assert_eq!(graph.wait_for(Xid(7), &[Xid(4)]), Some(Xid(7)));
+    fn breaks_cycle_when_removing_wait_edge() {
+        let mut graph = WaitForGraph::create();
+        graph.register_wait_dependencies(Xid(4), &[Xid(7)]);
+        assert_eq!(
+            graph.register_wait_dependencies(Xid(7), &[Xid(4)]),
+            Some(Xid(7))
+        );
 
         graph.clear_wait(Xid(7));
-        assert_eq!(graph.wait_for(Xid(8), &[Xid(4)]), None);
+        assert_eq!(graph.register_wait_dependencies(Xid(8), &[Xid(4)]), None);
         graph.remove_transaction(Xid(4));
-        assert_eq!(graph.wait_for(Xid(7), &[Xid(8)]), None);
+        assert_eq!(graph.register_wait_dependencies(Xid(7), &[Xid(8)]), None);
     }
 }

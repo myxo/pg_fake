@@ -2,7 +2,7 @@ use std::collections::{BTreeMap, BTreeSet};
 
 use crate::{
     catalog::{Constraint, TableSchema},
-    txn::{Snapshot, TransactionManager, Xid, visible_version},
+    txn::{Snapshot, TransactionRegistry, Xid, find_visible_version},
     value::{BaseType, Value},
 };
 
@@ -12,24 +12,24 @@ pub(crate) type Row = Vec<Value>;
 pub(crate) struct RowId(pub(crate) u64);
 
 #[derive(Debug, Clone, PartialEq)]
-pub(crate) struct Version {
+pub(crate) struct RowVersion {
     pub(crate) xmin: Xid,
     pub(crate) xmax: Option<Xid>,
     pub(crate) row: Row,
 }
 
 #[derive(Debug, Clone, PartialEq)]
-pub(crate) struct VersionChain {
-    pub(crate) versions: Vec<Version>,
+pub(crate) struct RowVersionChain {
+    pub(crate) versions: Vec<RowVersion>,
 }
 
 #[derive(Debug, Clone, PartialEq)]
-struct RowStore {
-    chains: BTreeMap<RowId, VersionChain>,
+struct VersionChainStore {
+    chains: BTreeMap<RowId, RowVersionChain>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
-enum IndexValue {
+enum NormalizedIndexValue {
     Bool(bool),
     Int2(i16),
     Int4(i32),
@@ -48,24 +48,24 @@ enum IndexValue {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
-struct IndexKey(Vec<IndexValue>);
+struct UniqueIndexKey(Vec<NormalizedIndexValue>);
 
 #[derive(Debug, Clone, PartialEq)]
 struct UniqueIndex {
     columns: Vec<usize>,
-    entries: BTreeMap<IndexKey, BTreeSet<RowId>>,
+    entries: BTreeMap<UniqueIndexKey, BTreeSet<RowId>>,
 }
 
 #[derive(Debug, Clone, PartialEq)]
 pub(crate) struct Table {
     pub(crate) schema: TableSchema,
-    rows: RowStore,
+    version_chains: VersionChainStore,
     indexes: Vec<UniqueIndex>,
     next_rowid: u64,
 }
 
 impl Table {
-    pub(crate) fn new(schema: TableSchema) -> Self {
+    pub(crate) fn create(schema: TableSchema) -> Self {
         let indexes = schema
             .constraints
             .iter()
@@ -90,7 +90,7 @@ impl Table {
             .collect();
         Table {
             schema,
-            rows: RowStore {
+            version_chains: VersionChainStore {
                 chains: BTreeMap::new(),
             },
             indexes,
@@ -102,10 +102,10 @@ impl Table {
         let row_id = RowId(self.next_rowid);
         self.next_rowid += 1;
         let index_row = row.clone();
-        let previous = self.rows.chains.insert(
+        let previous = self.version_chains.chains.insert(
             row_id,
-            VersionChain {
-                versions: vec![Version {
+            RowVersionChain {
+                versions: vec![RowVersion {
                     xmin,
                     xmax: None,
                     row,
@@ -117,8 +117,17 @@ impl Table {
         row_id
     }
 
-    pub(crate) fn tombstone(&mut self, row_id: RowId, version_xmin: Xid, xmax: Xid) -> RowId {
-        let chain = self.rows.chains.get_mut(&row_id).expect("row must exist");
+    pub(crate) fn mark_version_deleted(
+        &mut self,
+        row_id: RowId,
+        version_xmin: Xid,
+        xmax: Xid,
+    ) -> RowId {
+        let chain = self
+            .version_chains
+            .chains
+            .get_mut(&row_id)
+            .expect("row must exist");
         let version = chain
             .versions
             .iter_mut()
@@ -129,21 +138,21 @@ impl Table {
         row_id
     }
 
-    pub(crate) fn update(
+    pub(crate) fn append_updated_version(
         &mut self,
         row_id: RowId,
         version_xmin: Xid,
         xmin: Xid,
         row: Row,
     ) -> RowId {
-        self.tombstone(row_id, version_xmin, xmin);
+        self.mark_version_deleted(row_id, version_xmin, xmin);
         let index_row = row.clone();
-        self.rows
+        self.version_chains
             .chains
             .get_mut(&row_id)
             .expect("row must exist")
             .versions
-            .push(Version {
+            .push(RowVersion {
                 xmin,
                 xmax: None,
                 row,
@@ -152,8 +161,8 @@ impl Table {
         row_id
     }
 
-    pub(crate) fn abort(&mut self, xid: Xid) {
-        self.rows.chains.retain(|_, chain| {
+    pub(crate) fn discard_transaction_versions(&mut self, xid: Xid) {
+        self.version_chains.chains.retain(|_, chain| {
             chain.versions.retain(|version| version.xmin != xid);
             for version in &mut chain.versions {
                 if version.xmax == Some(xid) {
@@ -165,23 +174,23 @@ impl Table {
         self.rebuild_indexes();
     }
 
-    pub(crate) fn rows(&self) -> impl Iterator<Item = (RowId, &VersionChain)> {
-        self.rows
+    pub(crate) fn iterate_version_chains(&self) -> impl Iterator<Item = (RowId, &RowVersionChain)> {
+        self.version_chains
             .chains
             .iter()
             .map(|(row_id, chain)| (*row_id, chain))
     }
 
-    pub(crate) fn unique_conflict(
+    pub(crate) fn has_visible_unique_conflict(
         &self,
         row: &Row,
         snapshot: &Snapshot,
         current_xid: Xid,
-        transactions: &TransactionManager,
+        transactions: &TransactionRegistry,
         excluded_row: Option<RowId>,
     ) -> bool {
         self.indexes.iter().any(|index| {
-            let Some(key) = index_key(&self.schema, index, row) else {
+            let Some(key) = build_row_index_key(&self.schema, index, row) else {
                 return false;
             };
             index.entries.get(&key).is_some_and(|row_ids| {
@@ -189,12 +198,12 @@ impl Table {
                     if Some(*row_id) == excluded_row {
                         return false;
                     }
-                    let Some(version) = self.rows.chains.get(row_id).and_then(|chain| {
-                        visible_version(chain, snapshot, current_xid, transactions)
+                    let Some(version) = self.version_chains.chains.get(row_id).and_then(|chain| {
+                        find_visible_version(chain, snapshot, current_xid, transactions)
                     }) else {
                         return false;
                     };
-                    index_key(&self.schema, index, &version.row).as_ref() == Some(&key)
+                    build_row_index_key(&self.schema, index, &version.row).as_ref() == Some(&key)
                 })
             })
         })
@@ -206,16 +215,16 @@ impl Table {
         values: &[Value],
         snapshot: &Snapshot,
         current_xid: Xid,
-        transactions: &TransactionManager,
+        transactions: &TransactionRegistry,
     ) -> Option<RowId> {
         let index = self.indexes.iter().find(|index| index.columns == columns)?;
         let key = build_index_key(&self.schema, columns, values)?;
         index.entries.get(&key)?.iter().find_map(|row_id| {
-            let version =
-                self.rows.chains.get(row_id).and_then(|chain| {
-                    visible_version(chain, snapshot, current_xid, transactions)
-                })?;
-            (index_key(&self.schema, index, &version.row).as_ref() == Some(&key)).then_some(*row_id)
+            let version = self.version_chains.chains.get(row_id).and_then(|chain| {
+                find_visible_version(chain, snapshot, current_xid, transactions)
+            })?;
+            (build_row_index_key(&self.schema, index, &version.row).as_ref() == Some(&key))
+                .then_some(*row_id)
         })
     }
 
@@ -223,7 +232,7 @@ impl Table {
         let entries = self
             .indexes
             .iter()
-            .map(|index| index_key(&self.schema, index, row))
+            .map(|index| build_row_index_key(&self.schema, index, row))
             .collect::<Vec<_>>();
         for (index, key) in self.indexes.iter_mut().zip(entries) {
             if let Some(key) = key {
@@ -237,7 +246,7 @@ impl Table {
             index.entries.clear();
         }
         let entries = self
-            .rows
+            .version_chains
             .chains
             .iter()
             .flat_map(|(row_id, chain)| {
@@ -246,7 +255,7 @@ impl Table {
                         .iter()
                         .enumerate()
                         .filter_map(|(index, unique)| {
-                            index_key(&self.schema, unique, &version.row)
+                            build_row_index_key(&self.schema, unique, &version.row)
                                 .map(|key| (index, key, *row_id))
                         })
                 })
@@ -262,7 +271,11 @@ impl Table {
     }
 }
 
-fn index_key(schema: &TableSchema, index: &UniqueIndex, row: &Row) -> Option<IndexKey> {
+fn build_row_index_key(
+    schema: &TableSchema,
+    index: &UniqueIndex,
+    row: &Row,
+) -> Option<UniqueIndexKey> {
     let values = index
         .columns
         .iter()
@@ -271,51 +284,67 @@ fn index_key(schema: &TableSchema, index: &UniqueIndex, row: &Row) -> Option<Ind
     build_index_key(schema, &index.columns, &values)
 }
 
-fn build_index_key(schema: &TableSchema, columns: &[usize], values: &[Value]) -> Option<IndexKey> {
+fn build_index_key(
+    schema: &TableSchema,
+    columns: &[usize],
+    values: &[Value],
+) -> Option<UniqueIndexKey> {
     assert_eq!(columns.len(), values.len());
     columns
         .iter()
         .zip(values)
-        .map(|(column, value)| index_value(value, schema.columns[*column].data_type.base))
+        .map(|(column, value)| normalize_index_value(value, schema.columns[*column].data_type.base))
         .collect::<Option<Vec<_>>>()
-        .map(IndexKey)
+        .map(UniqueIndexKey)
 }
 
-fn index_value(value: &Value, base: BaseType) -> Option<IndexValue> {
+fn normalize_index_value(value: &Value, base: BaseType) -> Option<NormalizedIndexValue> {
     match (value, base) {
         (Value::Null, _) => None,
-        (Value::Bool(value), BaseType::Bool) => Some(IndexValue::Bool(*value)),
-        (Value::Int2(value), BaseType::Int2) => Some(IndexValue::Int2(*value)),
-        (Value::Int4(value), BaseType::Int4) => Some(IndexValue::Int4(*value)),
-        (Value::Int8(value), BaseType::Int8) => Some(IndexValue::Int8(*value)),
-        (Value::Float4(value), BaseType::Float4) => Some(IndexValue::Float4(if value.is_nan() {
-            f32::NAN.to_bits()
-        } else if *value == 0.0 {
-            0
-        } else {
-            value.to_bits()
-        })),
-        (Value::Float8(value), BaseType::Float8) => Some(IndexValue::Float8(if value.is_nan() {
-            f64::NAN.to_bits()
-        } else if *value == 0.0 {
-            0
-        } else {
-            value.to_bits()
-        })),
-        (Value::Numeric(value), BaseType::Numeric) => Some(IndexValue::Numeric(value.normalized())),
-        (Value::Text(value), BaseType::Bpchar) => {
-            Some(IndexValue::Text(value.trim_end_matches(' ').into()))
+        (Value::Bool(value), BaseType::Bool) => Some(NormalizedIndexValue::Bool(*value)),
+        (Value::Int2(value), BaseType::Int2) => Some(NormalizedIndexValue::Int2(*value)),
+        (Value::Int4(value), BaseType::Int4) => Some(NormalizedIndexValue::Int4(*value)),
+        (Value::Int8(value), BaseType::Int8) => Some(NormalizedIndexValue::Int8(*value)),
+        (Value::Float4(value), BaseType::Float4) => {
+            Some(NormalizedIndexValue::Float4(if value.is_nan() {
+                f32::NAN.to_bits()
+            } else if *value == 0.0 {
+                0
+            } else {
+                value.to_bits()
+            }))
         }
+        (Value::Float8(value), BaseType::Float8) => {
+            Some(NormalizedIndexValue::Float8(if value.is_nan() {
+                f64::NAN.to_bits()
+            } else if *value == 0.0 {
+                0
+            } else {
+                value.to_bits()
+            }))
+        }
+        (Value::Numeric(value), BaseType::Numeric) => {
+            Some(NormalizedIndexValue::Numeric(value.normalized()))
+        }
+        (Value::Text(value), BaseType::Bpchar) => Some(NormalizedIndexValue::Text(
+            value.trim_end_matches(' ').into(),
+        )),
         (Value::Text(value), BaseType::Text | BaseType::Varchar) => {
-            Some(IndexValue::Text(value.clone()))
+            Some(NormalizedIndexValue::Text(value.clone()))
         }
-        (Value::Bytea(value), BaseType::Bytea) => Some(IndexValue::Bytea(value.clone())),
-        (Value::Uuid(value), BaseType::Uuid) => Some(IndexValue::Uuid(*value)),
-        (Value::Date(value), BaseType::Date) => Some(IndexValue::Date(*value)),
-        (Value::Time(value), BaseType::Time) => Some(IndexValue::Time(*value)),
-        (Value::Timestamp(value), BaseType::Timestamp) => Some(IndexValue::Timestamp(*value)),
-        (Value::TimestampTz(value), BaseType::TimestampTz) => Some(IndexValue::TimestampTz(*value)),
-        (Value::Interval(value), BaseType::Interval) => Some(IndexValue::Interval(*value)),
+        (Value::Bytea(value), BaseType::Bytea) => Some(NormalizedIndexValue::Bytea(value.clone())),
+        (Value::Uuid(value), BaseType::Uuid) => Some(NormalizedIndexValue::Uuid(*value)),
+        (Value::Date(value), BaseType::Date) => Some(NormalizedIndexValue::Date(*value)),
+        (Value::Time(value), BaseType::Time) => Some(NormalizedIndexValue::Time(*value)),
+        (Value::Timestamp(value), BaseType::Timestamp) => {
+            Some(NormalizedIndexValue::Timestamp(*value))
+        }
+        (Value::TimestampTz(value), BaseType::TimestampTz) => {
+            Some(NormalizedIndexValue::TimestampTz(*value))
+        }
+        (Value::Interval(value), BaseType::Interval) => {
+            Some(NormalizedIndexValue::Interval(*value))
+        }
         _ => unreachable!("row values must match declared column types"),
     }
 }
@@ -329,14 +358,14 @@ mod tests {
 
     use super::*;
 
-    fn table() -> Table {
-        let mut catalog = Catalog::new();
+    fn create_table() -> Table {
+        let mut catalog = Catalog::create();
         let table_id = catalog
             .create_table(
                 "items".into(),
                 vec![ColumnDef {
                     name: "value".into(),
-                    data_type: PgType::new(BaseType::Int4),
+                    data_type: PgType::create(BaseType::Int4),
                     nullable: false,
                     default: None,
                 }],
@@ -344,35 +373,35 @@ mod tests {
             )
             .unwrap();
         assert_eq!(table_id.0, 1);
-        Table::new(catalog.table("items").unwrap().clone())
+        Table::create(catalog.require_table("items").unwrap().clone())
     }
 
-    fn indexed_table() -> Table {
-        let mut catalog = Catalog::new();
+    fn create_indexed_table() -> Table {
+        let mut catalog = Catalog::create();
         catalog
             .create_table(
                 "items".into(),
                 vec![ColumnDef {
                     name: "value".into(),
-                    data_type: PgType::new(BaseType::Int4),
+                    data_type: PgType::create(BaseType::Int4),
                     nullable: false,
                     default: None,
                 }],
                 vec![Constraint::PrimaryKey(vec!["value".into()])],
             )
             .unwrap();
-        Table::new(catalog.table("items").unwrap().clone())
+        Table::create(catalog.require_table("items").unwrap().clone())
     }
 
     #[test]
-    fn insert_creates_a_new_version_chain() {
-        let mut table = table();
+    fn creates_new_version_chain_for_insert() {
+        let mut table = create_table();
         let row_id = table.insert(Xid(10), vec![Value::Int4(1)]);
 
         assert_eq!(row_id, RowId(1));
         assert_eq!(
-            table.rows.chains.get(&row_id).unwrap().versions,
-            vec![Version {
+            table.version_chains.chains.get(&row_id).unwrap().versions,
+            vec![RowVersion {
                 xmin: Xid(10),
                 xmax: None,
                 row: vec![Value::Int4(1)],
@@ -382,10 +411,10 @@ mod tests {
 
     #[test]
     fn finds_visible_rows_through_a_unique_index() {
-        let mut table = indexed_table();
-        let mut transactions = TransactionManager::new();
+        let mut table = create_indexed_table();
+        let mut transactions = TransactionRegistry::create();
         let xid = transactions.begin();
-        let snapshot = Snapshot::new(&transactions);
+        let snapshot = Snapshot::create(&transactions);
         let row_id = table.insert(xid, vec![Value::Int4(1)]);
 
         assert_eq!(
@@ -395,23 +424,23 @@ mod tests {
     }
 
     #[test]
-    fn update_retires_the_old_version_and_appends_a_new_one() {
-        let mut table = table();
+    fn retires_old_version_and_appends_new_version_for_update() {
+        let mut table = create_table();
         let row_id = table.insert(Xid(10), vec![Value::Int4(1)]);
 
         assert_eq!(
-            table.update(row_id, Xid(10), Xid(11), vec![Value::Int4(2)]),
+            table.append_updated_version(row_id, Xid(10), Xid(11), vec![Value::Int4(2)]),
             row_id
         );
         assert_eq!(
-            table.rows.chains.get(&row_id).unwrap().versions,
+            table.version_chains.chains.get(&row_id).unwrap().versions,
             vec![
-                Version {
+                RowVersion {
                     xmin: Xid(10),
                     xmax: Some(Xid(11)),
                     row: vec![Value::Int4(1)],
                 },
-                Version {
+                RowVersion {
                     xmin: Xid(11),
                     xmax: None,
                     row: vec![Value::Int4(2)],
@@ -422,40 +451,40 @@ mod tests {
 
     #[test]
     fn abort_removes_created_versions_and_restores_retired_versions() {
-        let mut table = table();
+        let mut table = create_table();
         let existing = table.insert(Xid(10), vec![Value::Int4(1)]);
         let inserted = table.insert(Xid(11), vec![Value::Int4(2)]);
-        table.update(existing, Xid(10), Xid(11), vec![Value::Int4(3)]);
+        table.append_updated_version(existing, Xid(10), Xid(11), vec![Value::Int4(3)]);
 
-        table.abort(Xid(11));
+        table.discard_transaction_versions(Xid(11));
 
         assert_eq!(
-            table.rows.chains.get(&existing).unwrap().versions,
-            vec![Version {
+            table.version_chains.chains.get(&existing).unwrap().versions,
+            vec![RowVersion {
                 xmin: Xid(10),
                 xmax: None,
                 row: vec![Value::Int4(1)],
             }]
         );
-        assert!(!table.rows.chains.contains_key(&inserted));
+        assert!(!table.version_chains.chains.contains_key(&inserted));
     }
 
     #[test]
-    fn tombstone_retires_the_current_version() {
-        let mut table = table();
+    fn marks_current_version_deleted() {
+        let mut table = create_table();
         let row_id = table.insert(Xid(10), vec![Value::Int4(1)]);
-        table.update(row_id, Xid(10), Xid(11), vec![Value::Int4(2)]);
+        table.append_updated_version(row_id, Xid(10), Xid(11), vec![Value::Int4(2)]);
 
-        assert_eq!(table.tombstone(row_id, Xid(11), Xid(12)), row_id);
+        assert_eq!(table.mark_version_deleted(row_id, Xid(11), Xid(12)), row_id);
         assert_eq!(
-            table.rows.chains.get(&row_id).unwrap().versions,
+            table.version_chains.chains.get(&row_id).unwrap().versions,
             vec![
-                Version {
+                RowVersion {
                     xmin: Xid(10),
                     xmax: Some(Xid(11)),
                     row: vec![Value::Int4(1)],
                 },
-                Version {
+                RowVersion {
                     xmin: Xid(11),
                     xmax: Some(Xid(12)),
                     row: vec![Value::Int4(2)],

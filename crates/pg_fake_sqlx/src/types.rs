@@ -335,7 +335,7 @@ impl<'r> Decode<'r, PgFake> for String {
     fn decode(value: PgFakeValueRef<'r>) -> Result<Self, BoxDynError> {
         match value.value {
             Value::Null => Err(Box::new(UnexpectedNullError)),
-            value => Ok(value.to_text()),
+            value => Ok(value.format_postgres_text()),
         }
     }
 }

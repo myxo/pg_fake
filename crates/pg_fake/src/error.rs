@@ -64,7 +64,7 @@ pub enum SqlState {
 
 impl SqlState {
     /// The 5-character Postgres error code string.
-    pub fn code(self) -> &'static str {
+    pub fn get_code(self) -> &'static str {
         match self {
             SqlState::SuccessfulCompletion => "00000",
             SqlState::ProtocolViolation => "08P01",
@@ -105,7 +105,7 @@ impl SqlState {
 
 impl std::fmt::Display for SqlState {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.write_str(self.code())
+        f.write_str(self.get_code())
     }
 }
 
@@ -124,7 +124,7 @@ pub struct PgError {
 }
 
 impl PgError {
-    pub(crate) fn new(sqlstate: SqlState, message: impl Into<String>) -> Self {
+    pub(crate) fn create(sqlstate: SqlState, message: impl Into<String>) -> Self {
         PgError {
             sqlstate,
             message: message.into(),
@@ -138,6 +138,6 @@ impl PgError {
 /// Crate-wide result alias.
 pub type Result<T> = std::result::Result<T, PgError>;
 
-pub(crate) fn not_supported<T>(message: impl Into<String>) -> Result<T> {
-    Err(PgError::new(SqlState::FeatureNotSupported, message))
+pub(crate) fn reject_unsupported<T>(message: impl Into<String>) -> Result<T> {
+    Err(PgError::create(SqlState::FeatureNotSupported, message))
 }

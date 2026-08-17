@@ -11,7 +11,7 @@ use either::Either;
 use futures_core::{future::BoxFuture, stream::BoxStream};
 use futures_util::{TryStreamExt, stream};
 use log::LevelFilter;
-use pg_fake::api::{Db, Session, Statement as CoreStatement, StatementResult};
+use pg_fake::api::{Db, PreparedStatement as CoreStatement, Session, StatementResult};
 use pg_fake::value::BaseType;
 use sqlx::{
     ColumnIndex, ConnectOptions, Connection, Database, Execute, Executor, SqlStr, Statement,
@@ -111,7 +111,7 @@ impl ConnectOptions for PgFakeConnectOptions {
                 format!("expected pg-fake URL, got {}", url.scheme()).into(),
             ));
         }
-        Ok(Self::new(Db::new()))
+        Ok(Self::new(Db::create()))
     }
 
     fn to_url_lossy(&self) -> Url {
@@ -149,7 +149,7 @@ impl PgFakeConnection {
     pub fn new(db: Db) -> Self {
         Self {
             state: Arc::new(Mutex::new(ConnectionState {
-                session: db.session(),
+                session: db.create_session(),
                 statements: HashMap::new(),
             })),
             transaction_depth: 0,
@@ -210,7 +210,7 @@ impl PgFakeConnection {
                     vec![
                         state
                             .session
-                            .run_prepared(&prepared, &arguments.values)
+                            .execute_prepared_statement(&prepared, &arguments.values)
                             .map_err(database_error)?,
                     ]
                 } else {
@@ -251,7 +251,7 @@ fn map_results(results: Vec<StatementResult>) -> Vec<Either<PgFakeQueryResult, P
                             ordinal,
                             name: column.name,
                             type_info: PgFakeTypeInfo::with_typmod(
-                                BaseType::from_oid(column.type_oid)
+                                BaseType::resolve_oid(column.type_oid)
                                     .expect("core returned an unknown Phase-1 type OID"),
                                 column.typmod,
                             ),
@@ -425,20 +425,20 @@ impl<'c> Executor<'c> for &'c mut PgFakeConnection {
                     }
                     let statement = state.session.prepare(&query).map_err(database_error)?;
                     let parameters = statement
-                        .parameter_types()
+                        .get_parameter_types()
                         .iter()
                         .copied()
                         .map(PgFakeTypeInfo::new)
                         .collect::<Vec<_>>();
                     let columns = statement
-                        .columns()
+                        .get_result_columns()
                         .iter()
                         .enumerate()
                         .map(|(ordinal, column)| PgFakeColumn {
                             ordinal,
                             name: column.name.clone(),
                             type_info: PgFakeTypeInfo::with_typmod(
-                                BaseType::from_oid(column.type_oid)
+                                BaseType::resolve_oid(column.type_oid)
                                     .expect("core returned an unknown Phase-1 type OID"),
                                 column.typmod,
                             ),

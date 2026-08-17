@@ -12,16 +12,20 @@ use sqlparser::ast::{
 use crate::{
     catalog::{Catalog, TableSchema},
     coercion::{self, CastContext},
-    error::{PgError, Result, SqlState, not_supported},
+    error::{PgError, Result, SqlState, reject_unsupported},
     executor,
     value::{BaseType, PgType, Value},
 };
 
-pub(crate) fn parameter_types(statement: &Statement, catalog: &Catalog) -> Result<Vec<BaseType>> {
-    let mut types = vec![None; parameter_count(statement)?];
+pub(crate) fn infer_parameter_types(
+    statement: &Statement,
+    catalog: &Catalog,
+) -> Result<Vec<BaseType>> {
+    let mut types = vec![None; count_parameters(statement)?];
     match statement {
         Statement::Insert(insert) => {
-            let schema = catalog.table(&executor::insert_table_name(&insert.table)?)?;
+            let schema =
+                catalog.require_table(&executor::resolve_insert_table_name(&insert.table)?)?;
             let columns = if insert.columns.is_empty() {
                 (0..schema.columns.len()).collect::<Vec<_>>()
             } else {
@@ -29,13 +33,13 @@ pub(crate) fn parameter_types(statement: &Statement, catalog: &Catalog) -> Resul
                     .columns
                     .iter()
                     .map(|name| {
-                        let name = executor::name(name)?;
+                        let name = executor::normalize_unqualified_object_name(name)?;
                         schema
                             .columns
                             .iter()
                             .position(|column| column.name == name)
                             .ok_or_else(|| {
-                                PgError::new(
+                                PgError::create(
                                     SqlState::UndefinedColumn,
                                     format!("column {:?} does not exist", name),
                                 )
@@ -48,15 +52,17 @@ pub(crate) fn parameter_types(statement: &Statement, catalog: &Catalog) -> Resul
             {
                 for row in &values.rows {
                     if row.len() != columns.len() {
-                        return Err(PgError::new(
+                        return Err(PgError::create(
                             SqlState::SyntaxError,
                             "INSERT has wrong number of values",
                         ));
                     }
                     for (expression, column) in row.iter().zip(&columns) {
-                        infer_expr(
+                        infer_expression_parameters(
                             expression,
-                            executor::RowScope::Table(&executor::constant_schema()),
+                            executor::RowScope::Table(
+                                &executor::create_constant_expression_schema(),
+                            ),
                             Some(schema.columns[*column].data_type.base),
                             &mut types,
                         )?;
@@ -65,23 +71,23 @@ pub(crate) fn parameter_types(statement: &Statement, catalog: &Catalog) -> Resul
             }
         }
         Statement::Update(update) => {
-            let schema = table_schema(&update.table.relation, catalog)?;
+            let schema = resolve_table_schema(&update.table.relation, catalog)?;
             for assignment in &update.assignments {
                 let AssignmentTarget::ColumnName(name) = &assignment.target else {
                     continue;
                 };
-                let name = executor::name(name)?;
+                let name = executor::normalize_unqualified_object_name(name)?;
                 let column = schema
                     .columns
                     .iter()
                     .find(|column| column.name == name)
                     .ok_or_else(|| {
-                        PgError::new(
+                        PgError::create(
                             SqlState::UndefinedColumn,
                             format!("column {name:?} does not exist"),
                         )
                     })?;
-                infer_expr(
+                infer_expression_parameters(
                     &assignment.value,
                     executor::RowScope::Table(schema),
                     Some(column.data_type.base),
@@ -89,7 +95,7 @@ pub(crate) fn parameter_types(statement: &Statement, catalog: &Catalog) -> Resul
                 )?;
             }
             if let Some(selection) = &update.selection {
-                infer_expr(
+                infer_expression_parameters(
                     selection,
                     executor::RowScope::Table(schema),
                     Some(BaseType::Bool),
@@ -99,12 +105,12 @@ pub(crate) fn parameter_types(statement: &Statement, catalog: &Catalog) -> Resul
         }
         Statement::Delete(delete) => {
             let FromTable::WithFromKeyword(from) = &delete.from else {
-                return Ok(finalize(types));
+                return Ok(finalize_parameter_types(types));
             };
             if let Some(first) = from.first() {
-                let schema = table_schema(&first.relation, catalog)?;
+                let schema = resolve_table_schema(&first.relation, catalog)?;
                 if let Some(selection) = &delete.selection {
-                    infer_expr(
+                    infer_expression_parameters(
                         selection,
                         executor::RowScope::Table(schema),
                         Some(BaseType::Bool),
@@ -115,12 +121,12 @@ pub(crate) fn parameter_types(statement: &Statement, catalog: &Catalog) -> Resul
         }
         Statement::Query(query) => {
             let SetExpr::Select(select) = query.body.as_ref() else {
-                return Ok(finalize(types));
+                return Ok(finalize_parameter_types(types));
             };
             let bound = executor::bind_query_scope(catalog, select)?;
             let schema = executor::RowScope::Bound(&bound);
             if let Some(selection) = &select.selection {
-                infer_expr(selection, schema, Some(BaseType::Bool), &mut types)?;
+                infer_expression_parameters(selection, schema, Some(BaseType::Bool), &mut types)?;
             }
             for item in &select.projection {
                 match item {
@@ -128,7 +134,7 @@ pub(crate) fn parameter_types(statement: &Statement, catalog: &Catalog) -> Resul
                     | SelectItem::ExprWithAlias {
                         expr: expression, ..
                     } => {
-                        infer_expr(expression, schema, None, &mut types)?;
+                        infer_expression_parameters(expression, schema, None, &mut types)?;
                     }
                     _ => {}
                 }
@@ -137,35 +143,43 @@ pub(crate) fn parameter_types(statement: &Statement, catalog: &Catalog) -> Resul
                 && let OrderByKind::Expressions(orders) = &order_by.kind
             {
                 for order in orders {
-                    if !projection_alias(&order.expr, &select.projection) {
-                        infer_expr(&order.expr, schema, None, &mut types)?;
+                    if !is_projection_alias(&order.expr, &select.projection) {
+                        infer_expression_parameters(&order.expr, schema, None, &mut types)?;
                     }
                 }
             }
             if let Some(LimitClause::LimitOffset { limit, offset, .. }) = &query.limit_clause {
                 if let Some(limit) = limit {
-                    infer_expr(limit, schema, Some(BaseType::Int8), &mut types)?;
+                    infer_expression_parameters(limit, schema, Some(BaseType::Int8), &mut types)?;
                 }
                 if let Some(offset) = offset {
-                    infer_expr(&offset.value, schema, Some(BaseType::Int8), &mut types)?;
+                    infer_expression_parameters(
+                        &offset.value,
+                        schema,
+                        Some(BaseType::Int8),
+                        &mut types,
+                    )?;
                 }
             }
         }
         _ => {}
     }
-    let types = finalize(types);
-    let bound = bind(statement, &types, &vec![Value::Null; types.len()])?;
+    let types = finalize_parameter_types(types);
+    let bound = bind_parameters(statement, &types, &vec![Value::Null; types.len()])?;
     validate_statement(&bound, catalog)?;
     Ok(types)
 }
 
-pub(crate) fn describe_subqueries(statement: &Statement, catalog: &Catalog) -> Result<Statement> {
+pub(crate) fn substitute_typed_subqueries(
+    statement: &Statement,
+    catalog: &Catalog,
+) -> Result<Statement> {
     let mut statement = statement.clone();
     if let Statement::Query(query) = &statement
         && let SetExpr::Select(select) = query.body.as_ref()
     {
         let outer = executor::bind_query_scope(catalog, select)?;
-        let mut describer = ScopedSubqueryDescriber {
+        let mut describer = TypedSubquerySubstituter {
             catalog,
             outer: &outer,
             error: None,
@@ -180,38 +194,38 @@ pub(crate) fn describe_subqueries(statement: &Statement, catalog: &Catalog) -> R
         }
         let result = match expression {
             Expr::Subquery(query) => {
-                executor::query_output_columns(catalog, query).and_then(|columns| {
+                executor::infer_query_output_columns(catalog, query).and_then(|columns| {
                     if columns.len() != 1 {
-                        return Err(PgError::new(
+                        return Err(PgError::create(
                             SqlState::SyntaxError,
                             "subquery must return only one column",
                         ));
                     }
-                    Ok(typed_literal(Value::Null, columns[0].1))
+                    Ok(create_typed_literal(Value::Null, columns[0].1))
                 })
             }
-            Expr::Exists { .. } => Ok(typed_literal(
+            Expr::Exists { .. } => Ok(create_typed_literal(
                 Value::Bool(false),
-                PgType::new(BaseType::Bool),
+                PgType::create(BaseType::Bool),
             )),
             Expr::InSubquery {
                 expr,
                 subquery,
                 negated,
-            } => executor::query_output_columns(catalog, subquery).and_then(|columns| {
+            } => executor::infer_query_output_columns(catalog, subquery).and_then(|columns| {
                 let left_width = match expr.as_ref() {
                     Expr::Tuple(fields) => fields.len(),
                     _ => 1,
                 };
                 if columns.len() != left_width {
-                    return Err(PgError::new(
+                    return Err(PgError::create(
                         SqlState::SyntaxError,
                         "subquery has too many columns",
                     ));
                 }
                 let fields = columns
                     .into_iter()
-                    .map(|(_, data_type)| typed_literal(Value::Null, data_type))
+                    .map(|(_, data_type)| create_typed_literal(Value::Null, data_type))
                     .collect::<Vec<_>>();
                 Ok(Expr::InList {
                     expr: expr.clone(),
@@ -234,13 +248,13 @@ pub(crate) fn describe_subqueries(statement: &Statement, catalog: &Catalog) -> R
     error.map_or(Ok(statement), Err)
 }
 
-struct ScopedSubqueryDescriber<'a> {
+struct TypedSubquerySubstituter<'a> {
     catalog: &'a Catalog,
     outer: &'a executor::BoundScope,
     error: Option<PgError>,
 }
 
-impl VisitorMut for ScopedSubqueryDescriber<'_> {
+impl VisitorMut for TypedSubquerySubstituter<'_> {
     type Break = ();
 
     fn pre_visit_expr(&mut self, expression: &mut Expr) -> ControlFlow<Self::Break> {
@@ -257,7 +271,7 @@ impl VisitorMut for ScopedSubqueryDescriber<'_> {
         ) {
             return ControlFlow::Continue(());
         }
-        match executor::describe_expression_subqueries(self.catalog, expression, self.outer) {
+        match executor::substitute_typed_subqueries(self.catalog, expression, self.outer) {
             Ok(described) => *expression = described,
             Err(error) => {
                 self.error = Some(error);
@@ -268,18 +282,18 @@ impl VisitorMut for ScopedSubqueryDescriber<'_> {
     }
 }
 
-pub(crate) fn bind(
+pub(crate) fn bind_parameters(
     statement: &Statement,
-    parameter_types: &[BaseType],
+    infer_parameter_types: &[BaseType],
     values: &[Value],
 ) -> Result<Statement> {
-    if values.len() != parameter_types.len() {
-        return Err(PgError::new(
+    if values.len() != infer_parameter_types.len() {
+        return Err(PgError::create(
             SqlState::ProtocolViolation,
             format!(
                 "bind message supplies {} parameters, but prepared statement requires {}",
                 values.len(),
-                parameter_types.len()
+                infer_parameter_types.len()
             ),
         ));
     }
@@ -292,16 +306,16 @@ pub(crate) fn bind(
         let AstValue::Placeholder(placeholder) = &value.value else {
             return ControlFlow::Continue(());
         };
-        let index = match placeholder_index(placeholder) {
+        let index = match parse_placeholder_index(placeholder) {
             Ok(index) => index,
             Err(bind_error) => {
                 error = Some(bind_error);
                 return ControlFlow::Break(());
             }
         };
-        let target = parameter_types[index];
+        let target = infer_parameter_types[index];
         match coerce_parameter(values[index].clone(), target) {
-            Ok(value) => *expression = typed_literal(value, PgType::new(target)),
+            Ok(value) => *expression = create_typed_literal(value, PgType::create(target)),
             Err(bind_error) => {
                 error = Some(bind_error);
                 return ControlFlow::Break(());
@@ -312,7 +326,7 @@ pub(crate) fn bind(
     error.map_or(Ok(statement), Err)
 }
 
-fn parameter_count(statement: &Statement) -> Result<usize> {
+fn count_parameters(statement: &Statement) -> Result<usize> {
     let mut maximum = 0;
     let mut error = None;
     let _ = visit_expressions(statement, |expression| {
@@ -322,7 +336,7 @@ fn parameter_count(statement: &Statement) -> Result<usize> {
         let AstValue::Placeholder(placeholder) = &value.value else {
             return ControlFlow::Continue(());
         };
-        match placeholder_index(placeholder) {
+        match parse_placeholder_index(placeholder) {
             Ok(index) => maximum = maximum.max(index + 1),
             Err(parameter_error) => {
                 error = Some(parameter_error);
@@ -334,13 +348,13 @@ fn parameter_count(statement: &Statement) -> Result<usize> {
     error.map_or(Ok(maximum), Err)
 }
 
-fn placeholder_index(placeholder: &str) -> Result<usize> {
+fn parse_placeholder_index(placeholder: &str) -> Result<usize> {
     let index = placeholder
         .strip_prefix('$')
         .and_then(|index| index.parse::<usize>().ok())
         .filter(|index| *index > 0)
         .ok_or_else(|| {
-            PgError::new(
+            PgError::create(
                 SqlState::UndefinedParameter,
                 format!("there is no parameter {placeholder}"),
             )
@@ -348,23 +362,23 @@ fn placeholder_index(placeholder: &str) -> Result<usize> {
     Ok(index - 1)
 }
 
-fn table_schema<'a>(factor: &TableFactor, catalog: &'a Catalog) -> Result<&'a TableSchema> {
+fn resolve_table_schema<'a>(factor: &TableFactor, catalog: &'a Catalog) -> Result<&'a TableSchema> {
     let TableFactor::Table {
         name, args: None, ..
     } = factor
     else {
-        return not_supported("table source is not implemented");
+        return reject_unsupported("table source is not implemented");
     };
-    catalog.table(&executor::name(name)?)
+    catalog.require_table(&executor::normalize_unqualified_object_name(name)?)
 }
 
-fn infer_expr(
+fn infer_expression_parameters(
     expression: &Expr,
     schema: executor::RowScope<'_>,
     expected: Option<BaseType>,
     types: &mut [Option<BaseType>],
 ) -> Result<()> {
-    constrain(expression, expected, types)?;
+    constrain_parameter_type(expression, expected, types)?;
     let mut error = None;
     let _ = visit_expressions(expression, |expression| {
         let result = match expression {
@@ -374,13 +388,13 @@ fn infer_expr(
             {
                 Ok(())
             }
-            Expr::Identifier(_) => executor::expression_type(expression, schema).map(|_| ()),
-            Expr::Nested(inner) => constrain(inner, expected, types),
+            Expr::Identifier(_) => executor::infer_expression_type(expression, schema).map(|_| ()),
+            Expr::Nested(inner) => constrain_parameter_type(inner, expected, types),
             Expr::Cast {
                 expr, data_type, ..
-            } => coercion::type_from_ast(data_type)
-                .and_then(|target| constrain(expr, Some(target.base), types)),
-            Expr::UnaryOp { op, expr } => constrain(
+            } => coercion::convert_ast_data_type(data_type)
+                .and_then(|target| constrain_parameter_type(expr, Some(target.base), types)),
+            Expr::UnaryOp { op, expr } => constrain_parameter_type(
                 expr,
                 matches!(op, sqlparser::ast::UnaryOperator::Not).then_some(BaseType::Bool),
                 types,
@@ -390,15 +404,15 @@ fn infer_expr(
                 let left_expected = if boolean {
                     Some(BaseType::Bool)
                 } else {
-                    executor::expression_type(right, schema).ok()
+                    executor::infer_expression_type(right, schema).ok()
                 };
                 let right_expected = if boolean {
                     Some(BaseType::Bool)
                 } else {
-                    executor::expression_type(left, schema).ok()
+                    executor::infer_expression_type(left, schema).ok()
                 };
-                constrain(left, left_expected, types)
-                    .and_then(|()| constrain(right, right_expected, types))
+                constrain_parameter_type(left, left_expected, types)
+                    .and_then(|()| constrain_parameter_type(right, right_expected, types))
             }
             Expr::InList { expr, list, .. } => (|| {
                 let left = match expr.as_ref() {
@@ -411,30 +425,49 @@ fn infer_expr(
                         candidate => std::slice::from_ref(candidate),
                     };
                     if left.len() != right.len() {
-                        return Err(PgError::new(
+                        return Err(PgError::create(
                             SqlState::SyntaxError,
                             "subquery has too many columns",
                         ));
                     }
                     for (left, right) in left.iter().zip(right) {
-                        constrain(left, executor::expression_type(right, schema).ok(), types)?;
-                        constrain(right, executor::expression_type(left, schema).ok(), types)?;
+                        constrain_parameter_type(
+                            left,
+                            executor::infer_expression_type(right, schema).ok(),
+                            types,
+                        )?;
+                        constrain_parameter_type(
+                            right,
+                            executor::infer_expression_type(left, schema).ok(),
+                            types,
+                        )?;
                     }
                 }
                 Ok(())
             })(),
             Expr::AnyOp { left, right, .. } | Expr::AllOp { left, right, .. } => {
-                constrain(left, executor::expression_type(right, schema).ok(), types).and_then(
-                    |()| constrain(right, executor::expression_type(left, schema).ok(), types),
+                constrain_parameter_type(
+                    left,
+                    executor::infer_expression_type(right, schema).ok(),
+                    types,
                 )
+                .and_then(|()| {
+                    constrain_parameter_type(
+                        right,
+                        executor::infer_expression_type(left, schema).ok(),
+                        types,
+                    )
+                })
             }
             Expr::IsTrue(inner)
             | Expr::IsFalse(inner)
             | Expr::IsUnknown(inner)
             | Expr::IsNotTrue(inner)
             | Expr::IsNotFalse(inner)
-            | Expr::IsNotUnknown(inner) => constrain(inner, Some(BaseType::Bool), types),
-            Expr::Function(function) => infer_function(function, schema, types),
+            | Expr::IsNotUnknown(inner) => {
+                constrain_parameter_type(inner, Some(BaseType::Bool), types)
+            }
+            Expr::Function(function) => infer_function_parameters(function, schema, types),
             _ => Ok(()),
         };
         if let Err(infer_error) = result {
@@ -447,7 +480,7 @@ fn infer_expr(
     error.map_or(Ok(()), Err)
 }
 
-fn infer_function(
+fn infer_function_parameters(
     function: &sqlparser::ast::Function,
     schema: executor::RowScope<'_>,
     types: &mut [Option<BaseType>],
@@ -463,20 +496,20 @@ fn infer_function(
             _ => None,
         })
         .collect::<Vec<_>>();
-    let name = executor::name(&function.name)?;
+    let name = executor::normalize_unqualified_object_name(&function.name)?;
     let expected = match name.as_str() {
         "length" | "lower" | "upper" => Some(BaseType::Text),
         _ => arguments
             .iter()
-            .find_map(|argument| executor::expression_type(argument, schema).ok()),
+            .find_map(|argument| executor::infer_expression_type(argument, schema).ok()),
     };
     for argument in arguments {
-        constrain(argument, expected, types)?;
+        constrain_parameter_type(argument, expected, types)?;
     }
     Ok(())
 }
 
-fn constrain(
+fn constrain_parameter_type(
     expression: &Expr,
     expected: Option<BaseType>,
     types: &mut [Option<BaseType>],
@@ -494,13 +527,13 @@ fn constrain(
     let AstValue::Placeholder(placeholder) = &value.value else {
         return Ok(());
     };
-    let index = placeholder_index(placeholder)?;
+    let index = parse_placeholder_index(placeholder)?;
     let slot = &mut types[index];
     if let Some(previous) = *slot
         && previous != expected
     {
-        let Some(common) = coercion::common_type(previous, expected) else {
-            return Err(PgError::new(
+        let Some(common) = coercion::resolve_common_type(previous, expected) else {
+            return Err(PgError::create(
                 SqlState::AmbiguousParameter,
                 format!("inconsistent types deduced for parameter {placeholder}"),
             ));
@@ -512,7 +545,7 @@ fn constrain(
     Ok(())
 }
 
-fn finalize(types: Vec<Option<BaseType>>) -> Vec<BaseType> {
+fn finalize_parameter_types(types: Vec<Option<BaseType>>) -> Vec<BaseType> {
     types
         .into_iter()
         .map(|data_type| data_type.unwrap_or(BaseType::Text))
@@ -522,7 +555,8 @@ fn finalize(types: Vec<Option<BaseType>>) -> Vec<BaseType> {
 fn validate_statement(statement: &Statement, catalog: &Catalog) -> Result<()> {
     match statement {
         Statement::Insert(insert) => {
-            let schema = catalog.table(&executor::insert_table_name(&insert.table)?)?;
+            let schema =
+                catalog.require_table(&executor::resolve_insert_table_name(&insert.table)?)?;
             let columns = if insert.columns.is_empty() {
                 (0..schema.columns.len()).collect::<Vec<_>>()
             } else {
@@ -530,13 +564,13 @@ fn validate_statement(statement: &Statement, catalog: &Catalog) -> Result<()> {
                     .columns
                     .iter()
                     .map(|name| {
-                        let name = executor::name(name)?;
+                        let name = executor::normalize_unqualified_object_name(name)?;
                         schema
                             .columns
                             .iter()
                             .position(|column| column.name == name)
                             .ok_or_else(|| {
-                                PgError::new(
+                                PgError::create(
                                     SqlState::UndefinedColumn,
                                     format!("column {:?} does not exist", name),
                                 )
@@ -552,14 +586,16 @@ fn validate_statement(statement: &Statement, catalog: &Catalog) -> Result<()> {
                         validate_assignment(
                             expression,
                             schema.columns[*column].data_type,
-                            executor::RowScope::Table(&executor::constant_schema()),
+                            executor::RowScope::Table(
+                                &executor::create_constant_expression_schema(),
+                            ),
                         )?;
                     }
                 }
             }
         }
         Statement::Update(update) => {
-            let schema = table_schema(&update.table.relation, catalog)?;
+            let schema = resolve_table_schema(&update.table.relation, catalog)?;
             if let Some(selection) = &update.selection {
                 validate_boolean(
                     selection,
@@ -571,13 +607,13 @@ fn validate_statement(statement: &Statement, catalog: &Catalog) -> Result<()> {
                 let AssignmentTarget::ColumnName(name) = &assignment.target else {
                     continue;
                 };
-                let name = executor::name(name)?;
+                let name = executor::normalize_unqualified_object_name(name)?;
                 let column = schema
                     .columns
                     .iter()
                     .find(|column| column.name == name)
                     .ok_or_else(|| {
-                        PgError::new(
+                        PgError::create(
                             SqlState::UndefinedColumn,
                             format!("column {name:?} does not exist"),
                         )
@@ -598,7 +634,7 @@ fn validate_statement(statement: &Statement, catalog: &Catalog) -> Result<()> {
             {
                 validate_boolean(
                     selection,
-                    executor::RowScope::Table(table_schema(&first.relation, catalog)?),
+                    executor::RowScope::Table(resolve_table_schema(&first.relation, catalog)?),
                     "WHERE requires a boolean expression",
                 )?;
             }
@@ -618,7 +654,7 @@ fn validate_statement(statement: &Statement, catalog: &Catalog) -> Result<()> {
                     | SelectItem::ExprWithAlias {
                         expr: expression, ..
                     } => {
-                        executor::expression_type(expression, schema)?;
+                        executor::infer_expression_type(expression, schema)?;
                     }
                     _ => {}
                 }
@@ -627,8 +663,8 @@ fn validate_statement(statement: &Statement, catalog: &Catalog) -> Result<()> {
                 && let OrderByKind::Expressions(orders) = &order_by.kind
             {
                 for order in orders {
-                    if !projection_alias(&order.expr, &select.projection) {
-                        executor::expression_type(&order.expr, schema)?;
+                    if !is_projection_alias(&order.expr, &select.projection) {
+                        executor::infer_expression_type(&order.expr, schema)?;
                     }
                 }
             }
@@ -648,13 +684,13 @@ fn validate_statement(statement: &Statement, catalog: &Catalog) -> Result<()> {
     Ok(())
 }
 
-fn projection_alias(expression: &Expr, projection: &[SelectItem]) -> bool {
+fn is_projection_alias(expression: &Expr, projection: &[SelectItem]) -> bool {
     let Expr::Identifier(identifier) = expression else {
         return false;
     };
     projection.iter().any(|item| {
         matches!(item, SelectItem::ExprWithAlias { alias, .. }
-            if executor::identifier_name(alias) == executor::identifier_name(identifier))
+            if executor::normalize_identifier(alias) == executor::normalize_identifier(identifier))
     })
 }
 
@@ -663,11 +699,11 @@ fn validate_boolean(
     schema: executor::RowScope<'_>,
     message: &str,
 ) -> Result<()> {
-    let data_type = executor::expression_type(expression, schema)?;
-    if data_type == BaseType::Bool || executor::null_expression(expression) {
+    let data_type = executor::infer_expression_type(expression, schema)?;
+    if data_type == BaseType::Bool || executor::is_null_literal(expression) {
         Ok(())
     } else {
-        Err(PgError::new(SqlState::DatatypeMismatch, message))
+        Err(PgError::create(SqlState::DatatypeMismatch, message))
     }
 }
 
@@ -678,15 +714,15 @@ fn validate_assignment(
 ) -> Result<()> {
     if matches!(expression, Expr::Identifier(name) if name.value.eq_ignore_ascii_case("default"))
         || matches!(expression, Expr::Value(value) if matches!(&value.value, AstValue::SingleQuotedString(_)))
-        || executor::null_expression(expression)
+        || executor::is_null_literal(expression)
     {
         return Ok(());
     }
-    let source = executor::expression_type(expression, schema)?;
+    let source = executor::infer_expression_type(expression, schema)?;
     if coercion::can_cast(source, target.base, CastContext::Assignment) {
         Ok(())
     } else {
-        Err(PgError::new(
+        Err(PgError::create(
             SqlState::DatatypeMismatch,
             "column has incompatible type",
         ))
@@ -698,16 +734,16 @@ fn validate_implicit_type(
     target: BaseType,
     schema: executor::RowScope<'_>,
 ) -> Result<()> {
-    if executor::null_expression(expression)
+    if executor::is_null_literal(expression)
         || matches!(expression, Expr::Value(value) if matches!(&value.value, AstValue::SingleQuotedString(_)))
     {
         return Ok(());
     }
-    let source = executor::expression_type(expression, schema)?;
+    let source = executor::infer_expression_type(expression, schema)?;
     if coercion::can_cast(source, target, CastContext::Implicit) {
         Ok(())
     } else {
-        Err(PgError::new(
+        Err(PgError::create(
             SqlState::DatatypeMismatch,
             "parameter has incompatible type",
         ))
@@ -715,43 +751,57 @@ fn validate_implicit_type(
 }
 
 fn coerce_parameter(value: Value, target: BaseType) -> Result<Value> {
-    let Some(source) = value.base_type() else {
+    let Some(source) = value.get_base_type() else {
         return Ok(Value::Null);
     };
-    coercion::coerce(value, source, PgType::new(target), CastContext::Implicit)
+    coercion::coerce(value, source, PgType::create(target), CastContext::Implicit)
 }
 
-pub(crate) fn typed_literal(value: Value, data_type: PgType) -> Expr {
+pub(crate) fn create_typed_literal(value: Value, data_type: PgType) -> Expr {
     let literal = match value {
         Value::Null => AstValue::Null,
         Value::Bool(value) => AstValue::Boolean(value),
         Value::Int2(value) => AstValue::Number(value.to_string(), false),
         Value::Int4(value) => AstValue::Number(value.to_string(), false),
         Value::Int8(value) => AstValue::Number(value.to_string(), false),
-        Value::Float4(value) => AstValue::SingleQuotedString(Value::Float4(value).to_text()),
-        Value::Float8(value) => AstValue::SingleQuotedString(Value::Float8(value).to_text()),
+        Value::Float4(value) => {
+            AstValue::SingleQuotedString(Value::Float4(value).format_postgres_text())
+        }
+        Value::Float8(value) => {
+            AstValue::SingleQuotedString(Value::Float8(value).format_postgres_text())
+        }
         Value::Numeric(value) => AstValue::Number(value.to_plain_string(), false),
         Value::Text(value) => AstValue::SingleQuotedString(value),
-        Value::Bytea(value) => AstValue::SingleQuotedString(Value::Bytea(value).to_text()),
-        Value::Uuid(value) => AstValue::SingleQuotedString(value.to_string()),
-        Value::Date(value) => AstValue::SingleQuotedString(Value::Date(value).to_text()),
-        Value::Time(value) => AstValue::SingleQuotedString(Value::Time(value).to_text()),
-        Value::Timestamp(value) => AstValue::SingleQuotedString(Value::Timestamp(value).to_text()),
-        Value::TimestampTz(value) => {
-            AstValue::SingleQuotedString(Value::TimestampTz(value).to_text())
+        Value::Bytea(value) => {
+            AstValue::SingleQuotedString(Value::Bytea(value).format_postgres_text())
         }
-        Value::Interval(value) => AstValue::SingleQuotedString(Value::Interval(value).to_text()),
+        Value::Uuid(value) => AstValue::SingleQuotedString(value.to_string()),
+        Value::Date(value) => {
+            AstValue::SingleQuotedString(Value::Date(value).format_postgres_text())
+        }
+        Value::Time(value) => {
+            AstValue::SingleQuotedString(Value::Time(value).format_postgres_text())
+        }
+        Value::Timestamp(value) => {
+            AstValue::SingleQuotedString(Value::Timestamp(value).format_postgres_text())
+        }
+        Value::TimestampTz(value) => {
+            AstValue::SingleQuotedString(Value::TimestampTz(value).format_postgres_text())
+        }
+        Value::Interval(value) => {
+            AstValue::SingleQuotedString(Value::Interval(value).format_postgres_text())
+        }
     };
     Expr::Cast {
         kind: CastKind::Cast,
         expr: Box::new(Expr::Value(literal.into())),
-        data_type: make_ast_data_type(data_type),
+        data_type: convert_to_ast_data_type(data_type),
         array: false,
         format: None,
     }
 }
 
-fn make_ast_data_type(data_type: PgType) -> DataType {
+fn convert_to_ast_data_type(data_type: PgType) -> DataType {
     match data_type.base {
         BaseType::Bool => DataType::Boolean,
         BaseType::Int2 => DataType::SmallInt(None),

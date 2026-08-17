@@ -340,14 +340,14 @@ fn compare_source_statement(
                     if postgres_error
                         .as_database_error()
                         .and_then(|error| error.code())
-                        .is_some_and(|code| code == fake_error.sqlstate.code()) =>
+                        .is_some_and(|code| code == fake_error.sqlstate.get_code()) =>
                 {
                     return Ok(());
                 }
                 Err(postgres_error) => {
                     return Err(format!(
                         "pg_fake cannot parse it ({}) while PostgreSQL returns {}",
-                        fake_error.sqlstate.code(),
+                        fake_error.sqlstate.get_code(),
                         postgres_error
                             .as_database_error()
                             .and_then(|error| error.code())
@@ -391,7 +391,7 @@ fn collect_phase2_report(
     let mut regressions = Vec::new();
 
     for feature in phase2_manifest::FEATURES {
-        let mut fake = PgFakeConnection::new(Db::new());
+        let mut fake = PgFakeConnection::new(Db::create());
         let mut first_blocker = None;
         for case in feature.cases {
             let mut result = Ok(());
@@ -488,7 +488,7 @@ fn reports_phase2_regression_progress() {
         let mut postgres = runtime
             .block_on(PgConnection::connect(&database_url))
             .expect("must connect to PostgreSQL regression database");
-        let mut fake = PgFakeConnection::new(Db::new());
+        let mut fake = PgFakeConnection::new(Db::create());
         let mut tainted = false;
         let mut first_blocker = None;
         for (statement_number, statement) in statements(&script).into_iter().enumerate() {

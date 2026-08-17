@@ -8,14 +8,14 @@ use crate::error::{PgError, Result, SqlState};
 /// Parses one or more PostgreSQL statements into owned syntax trees.
 pub fn parse(sql: &str) -> Result<Vec<Statement>> {
     Parser::parse_sql(&PostgreSqlDialect {}, sql)
-        .map_err(|error| PgError::new(SqlState::SyntaxError, error.to_string()))
+        .map_err(|error| PgError::create(SqlState::SyntaxError, error.to_string()))
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum StatementKind {
     Ddl,
     Dml,
-    Select,
+    Query,
     TransactionControl,
     Set,
     Unsupported,
@@ -32,7 +32,7 @@ pub(crate) fn classify(statement: &Statement) -> StatementKind {
         | Statement::AlterView { .. }
         | Statement::Drop { .. } => StatementKind::Ddl,
         Statement::Insert(_) | Statement::Update(_) | Statement::Delete(_) => StatementKind::Dml,
-        Statement::Query(_) => StatementKind::Select,
+        Statement::Query(_) => StatementKind::Query,
         Statement::StartTransaction { .. }
         | Statement::Commit { .. }
         | Statement::Rollback { .. }
@@ -92,7 +92,7 @@ mod tests {
         let cases = [
             ("CREATE TABLE t (id INTEGER)", StatementKind::Ddl),
             ("INSERT INTO t VALUES (1)", StatementKind::Dml),
-            ("SELECT * FROM t", StatementKind::Select),
+            ("SELECT * FROM t", StatementKind::Query),
             ("BEGIN", StatementKind::TransactionControl),
             ("SET application_name = 'pg_fake'", StatementKind::Set),
             ("EXPLAIN SELECT * FROM t", StatementKind::Unsupported),

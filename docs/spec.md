@@ -397,11 +397,11 @@ A database can be built once and cheaply forked per test.
 
 ```rust
 // Construction & fixtures
-let db  = Db::new();                        // empty database
+let db  = Db::create();                        // empty database
 let db2 = db.snapshot();                    // independent fork (§7)
 
 // A session ≈ a connection/backend.
-let mut sess = db.session();
+let mut sess = db.create_session();
 
 // One-shot (autocommit):
 let results: Vec<StatementResult> =

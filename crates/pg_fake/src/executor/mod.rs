@@ -5,11 +5,11 @@ use crate::{
     api::{ColumnMeta, QueryResult, StatementResult},
     catalog::{Catalog, ColumnDef, ForeignKey, ForeignKeyAction, TableId, TableSchema},
     coercion::{self, CastContext},
-    error::{PgError, Result, SqlState, not_supported},
+    error::{PgError, Result, SqlState, reject_unsupported},
     storage::{RowId, Table},
     txn::{
-        RowLockKey, RowLockManager, RowLockMode, Snapshot, TransactionManager, TransactionStatus,
-        WaitForGraph, Xid, visible_version,
+        RowLockKey, RowLockManager, RowLockMode, Snapshot, TransactionRegistry, TransactionStatus,
+        WaitForGraph, Xid, find_visible_version,
     },
     value::{BaseType, PgType, Value},
 };
@@ -35,27 +35,32 @@ mod scope;
 mod writes;
 
 use arithmetic::{
-    arithmetic, boolean_binary, distinct, interval_arithmetic_type, temporal_arithmetic, unary,
+    evaluate_boolean_operator, evaluate_distinctness, evaluate_numeric_operator,
+    evaluate_temporal_arithmetic, evaluate_unary_operator, infer_interval_arithmetic_type,
 };
 use expressions::{
-    column_default, comparison, default_expression, evaluate, evaluate_as, expression_value,
-    number_literal, unknown_string, validate_check_constraint_types, validate_check_constraints,
-    validate_not_null, value_ordering,
+    compare_values, evaluate, evaluate_and_coerce, evaluate_assignment_expression,
+    evaluate_column_default, evaluate_comparison, extract_number_literal,
+    extract_unknown_string_literal, is_default_expression, validate_check_constraint_types,
+    validate_check_constraints, validate_not_null,
 };
-pub(crate) use expressions::{constant_schema, expression_type, null_expression};
+pub(crate) use expressions::{
+    create_constant_expression_schema, infer_expression_type, is_null_literal,
+};
 use foreign_keys::{
-    apply_parent_actions, foreign_key_action, foreign_key_column_indexes, foreign_key_name,
-    validate_foreign_key_definitions, validate_row_foreign_keys,
+    apply_referencing_foreign_key_actions, convert_referential_action,
+    resolve_foreign_key_column_indexes, resolve_foreign_key_name, validate_foreign_key_definitions,
+    validate_row_foreign_keys,
 };
 pub(crate) use foreign_keys::{contains_deferred_foreign_keys, validate_deferred_foreign_keys};
-pub(crate) use locks::required_row_locks;
-pub(crate) use scope::query_output_columns;
+pub(crate) use locks::collect_required_row_locks;
+pub(crate) use scope::infer_query_output_columns;
 use scope::{BoundColumn, bind_select_scope};
-pub(crate) use scope::{BoundScope, RowScope, bind_query_scope, describe_expression_subqueries};
-use writes::{delete_rows, insert_rows, update_rows};
+pub(crate) use scope::{BoundScope, RowScope, bind_query_scope, substitute_typed_subqueries};
+use writes::{execute_delete, execute_insert, execute_update};
 
 #[derive(Clone)]
-pub(crate) struct ExecutionContext {
+pub(crate) struct StatementExecutionContext {
     pub(crate) transaction_timestamp: chrono::DateTime<chrono::Utc>,
     pub(crate) statement_timestamp: chrono::DateTime<chrono::Utc>,
     pub(crate) clock_timestamp: chrono::DateTime<chrono::Utc>,
@@ -65,7 +70,7 @@ pub(crate) struct ExecutionContext {
 pub(crate) struct DatabaseState {
     pub(crate) catalog: Catalog,
     pub(crate) tables: BTreeMap<TableId, Table>,
-    pub(crate) transactions: TransactionManager,
+    pub(crate) transactions: TransactionRegistry,
     pub(crate) row_locks: RowLockManager,
     pub(crate) wait_for: WaitForGraph,
 }
@@ -74,41 +79,42 @@ pub(crate) struct RequiredRowLock {
     pub(crate) mode: RowLockMode,
 }
 
-pub(crate) use query::materialize_scalar_subqueries;
-pub(crate) use query::query_columns;
+pub(crate) use query::describe_query_result_columns;
+pub(crate) use query::materialize_uncorrelated_subqueries;
 
 impl DatabaseState {
-    pub(crate) fn new() -> Self {
+    pub(crate) fn create() -> Self {
         DatabaseState {
-            catalog: Catalog::new(),
+            catalog: Catalog::create(),
             tables: BTreeMap::new(),
-            transactions: TransactionManager::new(),
-            row_locks: RowLockManager::new(),
-            wait_for: WaitForGraph::new(),
+            transactions: TransactionRegistry::create(),
+            row_locks: RowLockManager::create(),
+            wait_for: WaitForGraph::create(),
         }
     }
 }
 
-pub(crate) fn dispatch(
+pub(crate) fn execute_statement(
     state: &mut DatabaseState,
     statement: &Statement,
     xid: Xid,
     snapshot: &Snapshot,
     deferred_constraints: &BTreeSet<String>,
     defer_all: bool,
-    context: &ExecutionContext,
+    context: &StatementExecutionContext,
 ) -> Result<StatementResult> {
-    let statement = query::materialize_scalar_subqueries(state, statement, xid, snapshot, context)?;
+    let statement =
+        query::materialize_uncorrelated_subqueries(state, statement, xid, snapshot, context)?;
     match &statement {
         Statement::CreateTable(create) => {
-            let table_name = name(&create.name)?;
-            if create.if_not_exists && state.catalog.table(&table_name).is_ok() {
+            let table_name = normalize_unqualified_object_name(&create.name)?;
+            if create.if_not_exists && state.catalog.require_table(&table_name).is_ok() {
                 return Ok(StatementResult::Affected(0));
             }
             let mut columns = Vec::new();
             let mut constraints = Vec::new();
             for column in &create.columns {
-                let data_type = coercion::type_from_ast(&column.data_type)?;
+                let data_type = coercion::convert_ast_data_type(&column.data_type)?;
                 let mut nullable = true;
                 let mut default = None;
                 for option in &column.options {
@@ -117,32 +123,38 @@ pub(crate) fn dispatch(
                         ColumnOption::NotNull => nullable = false,
                         ColumnOption::Default(expr) => default = Some(expr.clone()),
                         ColumnOption::PrimaryKey(_) => {
-                            let columns = vec![identifier_name(&column.name)];
+                            let columns = vec![normalize_identifier(&column.name)];
                             constraints.push(crate::catalog::Constraint::PrimaryKey(columns));
                         }
                         ColumnOption::Unique(_) => {
-                            let columns = vec![identifier_name(&column.name)];
+                            let columns = vec![normalize_identifier(&column.name)];
                             constraints.push(crate::catalog::Constraint::Unique(columns));
                         }
                         ColumnOption::Check(check) => {
                             constraints.push(crate::catalog::Constraint::Check(check.expr.clone()))
                         }
                         ColumnOption::ForeignKey(foreign_key) => {
-                            let name = foreign_key_name(
+                            let name = resolve_foreign_key_name(
                                 option.name.as_ref(),
-                                format!("{}_{}_fkey", table_name, identifier_name(&column.name)),
+                                format!(
+                                    "{}_{}_fkey",
+                                    table_name,
+                                    normalize_identifier(&column.name)
+                                ),
                             );
                             constraints.push(crate::catalog::Constraint::ForeignKey(ForeignKey {
                                 name,
-                                columns: vec![identifier_name(&column.name)],
-                                foreign_table: crate::executor::name(&foreign_key.foreign_table)?,
+                                columns: vec![normalize_identifier(&column.name)],
+                                foreign_table: crate::executor::normalize_unqualified_object_name(
+                                    &foreign_key.foreign_table,
+                                )?,
                                 referred_columns: foreign_key
                                     .referred_columns
                                     .iter()
-                                    .map(identifier_name)
+                                    .map(normalize_identifier)
                                     .collect(),
-                                on_delete: foreign_key_action(foreign_key.on_delete),
-                                on_update: foreign_key_action(foreign_key.on_update),
+                                on_delete: convert_referential_action(foreign_key.on_delete),
+                                on_update: convert_referential_action(foreign_key.on_update),
                                 deferrable: foreign_key.characteristics.is_some_and(
                                     |characteristics| characteristics.deferrable.unwrap_or(false),
                                 ),
@@ -156,20 +168,20 @@ pub(crate) fn dispatch(
                             }))
                         }
                         option => {
-                            return not_supported(format!(
+                            return reject_unsupported(format!(
                                 "column option is not implemented: {option}"
                             ));
                         }
                     }
                 }
                 let column = ColumnDef {
-                    name: identifier_name(&column.name),
+                    name: normalize_identifier(&column.name),
                     data_type,
                     nullable,
                     default,
                 };
                 if column.default.is_some() {
-                    column_default(&column, context)?;
+                    evaluate_column_default(&column, context)?;
                 }
                 columns.push(column);
             }
@@ -180,7 +192,7 @@ pub(crate) fn dispatch(
                             primary_key
                                 .columns
                                 .iter()
-                                .map(index_column_name)
+                                .map(resolve_index_column_name)
                                 .collect::<Result<Vec<_>>>()?,
                         ))
                     }
@@ -189,7 +201,7 @@ pub(crate) fn dispatch(
                             unique
                                 .columns
                                 .iter()
-                                .map(index_column_name)
+                                .map(resolve_index_column_name)
                                 .collect::<Result<Vec<_>>>()?,
                         ))
                     }
@@ -197,21 +209,27 @@ pub(crate) fn dispatch(
                         constraints.push(crate::catalog::Constraint::Check(check.expr.clone()))
                     }
                     TableConstraint::ForeignKey(foreign_key) => {
-                        let name = foreign_key_name(
+                        let name = resolve_foreign_key_name(
                             foreign_key.name.as_ref(),
                             format!("{}_fkey", table_name),
                         );
                         constraints.push(crate::catalog::Constraint::ForeignKey(ForeignKey {
                             name,
-                            columns: foreign_key.columns.iter().map(identifier_name).collect(),
-                            foreign_table: crate::executor::name(&foreign_key.foreign_table)?,
+                            columns: foreign_key
+                                .columns
+                                .iter()
+                                .map(normalize_identifier)
+                                .collect(),
+                            foreign_table: crate::executor::normalize_unqualified_object_name(
+                                &foreign_key.foreign_table,
+                            )?,
                             referred_columns: foreign_key
                                 .referred_columns
                                 .iter()
-                                .map(identifier_name)
+                                .map(normalize_identifier)
                                 .collect(),
-                            on_delete: foreign_key_action(foreign_key.on_delete),
-                            on_update: foreign_key_action(foreign_key.on_update),
+                            on_delete: convert_referential_action(foreign_key.on_delete),
+                            on_update: convert_referential_action(foreign_key.on_update),
                             deferrable: foreign_key.characteristics.is_some_and(
                                 |characteristics| characteristics.deferrable.unwrap_or(false),
                             ),
@@ -225,7 +243,7 @@ pub(crate) fn dispatch(
                         }))
                     }
                     constraint => {
-                        return not_supported(format!(
+                        return reject_unsupported(format!(
                             "table constraint is not implemented: {constraint}"
                         ));
                     }
@@ -243,7 +261,7 @@ pub(crate) fn dispatch(
                         .iter_mut()
                         .find(|column| column.name == *name)
                         .ok_or_else(|| {
-                            PgError::new(
+                            PgError::create(
                                 SqlState::UndefinedColumn,
                                 format!("column {name:?} does not exist"),
                             )
@@ -271,9 +289,9 @@ pub(crate) fn dispatch(
                 .create_table(table_name.clone(), columns, constraints)?;
             let table = state
                 .catalog
-                .table(&table_name)
+                .require_table(&table_name)
                 .expect("created table must exist");
-            state.tables.insert(id, Table::new(table.clone()));
+            state.tables.insert(id, Table::create(table.clone()));
             Ok(StatementResult::Affected(0))
         }
         Statement::Drop {
@@ -284,7 +302,7 @@ pub(crate) fn dispatch(
         } => {
             let mut affected = 0;
             for object in names {
-                let table_name = name(object)?;
+                let table_name = normalize_unqualified_object_name(object)?;
                 match state.catalog.drop_table(&table_name) {
                     Ok(schema) => {
                         state.tables.remove(&schema.id);
@@ -296,7 +314,7 @@ pub(crate) fn dispatch(
             }
             Ok(StatementResult::Affected(affected))
         }
-        Statement::Insert(insert) => insert_rows(
+        Statement::Insert(insert) => execute_insert(
             state,
             insert,
             xid,
@@ -307,9 +325,9 @@ pub(crate) fn dispatch(
         ),
         Statement::Update(update) => {
             if update.from.is_some() || update.returning.is_some() || update.or.is_some() {
-                return not_supported("UPDATE feature is not implemented");
+                return reject_unsupported("UPDATE feature is not implemented");
             }
-            update_rows(
+            execute_update(
                 state,
                 &update.table,
                 &update.assignments,
@@ -321,7 +339,7 @@ pub(crate) fn dispatch(
                 context,
             )
         }
-        Statement::Delete(delete) => delete_rows(
+        Statement::Delete(delete) => execute_delete(
             state,
             delete,
             xid,
@@ -330,28 +348,30 @@ pub(crate) fn dispatch(
             defer_all,
             context,
         ),
-        Statement::Query(query) => query::select_rows(state, query, xid, snapshot, context),
-        _ => not_supported("statement is not implemented"),
+        Statement::Query(query) => query::execute_query(state, query, xid, snapshot, context),
+        _ => reject_unsupported("statement is not implemented"),
     }
 }
-pub(crate) fn name(name: &sqlparser::ast::ObjectName) -> Result<String> {
+pub(crate) fn normalize_unqualified_object_name(
+    name: &sqlparser::ast::ObjectName,
+) -> Result<String> {
     if name.0.len() != 1 {
-        return not_supported("schemas are not implemented");
+        return reject_unsupported("schemas are not implemented");
     }
     let Some(identifier) = name.0[0].as_ident() else {
-        return not_supported("dynamic object names are not implemented");
+        return reject_unsupported("dynamic object names are not implemented");
     };
-    Ok(identifier_name(identifier))
+    Ok(normalize_identifier(identifier))
 }
 
-pub(crate) fn insert_table_name(table: &TableObject) -> Result<String> {
+pub(crate) fn resolve_insert_table_name(table: &TableObject) -> Result<String> {
     let TableObject::TableName(table_name) = table else {
-        return not_supported("insert target is not a table");
+        return reject_unsupported("insert target is not a table");
     };
-    name(table_name)
+    normalize_unqualified_object_name(table_name)
 }
 
-pub(crate) fn identifier_name(identifier: &Ident) -> String {
+pub(crate) fn normalize_identifier(identifier: &Ident) -> String {
     if identifier.quote_style.is_some() {
         identifier.value.clone()
     } else {
@@ -359,11 +379,11 @@ pub(crate) fn identifier_name(identifier: &Ident) -> String {
     }
 }
 
-fn index_column_name(column: &IndexColumn) -> Result<String> {
+fn resolve_index_column_name(column: &IndexColumn) -> Result<String> {
     let Expr::Identifier(identifier) = &column.column.expr else {
-        return not_supported("index expressions are not implemented");
+        return reject_unsupported("index expressions are not implemented");
     };
-    Ok(identifier_name(identifier))
+    Ok(normalize_identifier(identifier))
 }
 
 #[cfg(test)]
@@ -371,7 +391,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn value_ordering_covers_all_phase_one_types() {
+    fn compares_all_phase_one_value_types() {
         let pairs = [
             (Value::Bool(false), Value::Bool(true)),
             (Value::Int2(1), Value::Int2(2)),
@@ -388,16 +408,16 @@ mod tests {
         ];
 
         for (lower, higher) in pairs {
-            assert_eq!(value_ordering(&lower, &higher).unwrap(), Ordering::Less);
-            assert_eq!(value_ordering(&higher, &lower).unwrap(), Ordering::Greater);
+            assert_eq!(compare_values(&lower, &higher).unwrap(), Ordering::Less);
+            assert_eq!(compare_values(&higher, &lower).unwrap(), Ordering::Greater);
         }
 
         assert_eq!(
-            value_ordering(&Value::Float4(f32::NAN), &Value::Float4(1.0)).unwrap(),
+            compare_values(&Value::Float4(f32::NAN), &Value::Float4(1.0)).unwrap(),
             Ordering::Greater
         );
         assert_eq!(
-            value_ordering(&Value::Float8(f64::NAN), &Value::Float8(1.0)).unwrap(),
+            compare_values(&Value::Float8(f64::NAN), &Value::Float8(1.0)).unwrap(),
             Ordering::Greater
         );
     }

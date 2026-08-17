@@ -1120,7 +1120,7 @@ fn generated_sql_matches_postgres() {
             runtime: &runtime,
             table: table_name.clone(),
         };
-        let mut fake = PgFakeConnection::new(Db::new());
+        let mut fake = PgFakeConnection::new(Db::create());
         let table = generate_table(src, table_name);
         let foreign_tables = generate_foreign_tables(src, &table);
         let mut next_key = 1;

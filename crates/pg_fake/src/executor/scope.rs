@@ -1,7 +1,7 @@
-use super::{DatabaseState, identifier_name, name};
+use super::{DatabaseState, normalize_identifier, normalize_unqualified_object_name};
 use crate::{
     catalog::{Catalog, TableSchema},
-    error::{PgError, Result, SqlState, not_supported},
+    error::{PgError, Result, SqlState, reject_unsupported},
     value::{BaseType, PgType},
 };
 use sqlparser::ast::{
@@ -38,7 +38,7 @@ impl RowScope<'_> {
         match self {
             RowScope::Table(schema) => {
                 if identifiers.len() != 1 {
-                    return Err(PgError::new(
+                    return Err(PgError::create(
                         SqlState::UndefinedColumn,
                         format!("column {:?} does not exist", identifiers),
                     ));
@@ -46,9 +46,9 @@ impl RowScope<'_> {
                 let index = schema
                     .columns
                     .iter()
-                    .position(|column| column.name == identifier_name(&identifiers[0]))
+                    .position(|column| column.name == normalize_identifier(&identifiers[0]))
                     .ok_or_else(|| {
-                        PgError::new(
+                        PgError::create(
                             SqlState::UndefinedColumn,
                             format!("column {:?} does not exist", identifiers[0].value),
                         )
@@ -56,7 +56,10 @@ impl RowScope<'_> {
                 Ok((index, schema.columns[index].data_type))
             }
             RowScope::Bound(scope) => {
-                let names = identifiers.iter().map(identifier_name).collect::<Vec<_>>();
+                let names = identifiers
+                    .iter()
+                    .map(normalize_identifier)
+                    .collect::<Vec<_>>();
                 let depth = match names.as_slice() {
                     [column] => scope
                         .columns
@@ -98,17 +101,17 @@ impl RowScope<'_> {
                             .iter()
                             .any(|column| column.qualifier == names[0]) =>
                     {
-                        Err(PgError::new(
+                        Err(PgError::create(
                             SqlState::UndefinedTable,
                             format!("missing FROM-clause entry for table {:?}", names[0]),
                         ))
                     }
-                    [] => Err(PgError::new(
+                    [] => Err(PgError::create(
                         SqlState::UndefinedColumn,
                         format!("column {:?} does not exist", identifiers),
                     )),
                     [column] => Ok((column.slot, column.data_type)),
-                    _ => Err(PgError::new(
+                    _ => Err(PgError::create(
                         SqlState::AmbiguousColumn,
                         format!("column {:?} is ambiguous", identifiers),
                     )),
@@ -117,7 +120,7 @@ impl RowScope<'_> {
         }
     }
 
-    pub(super) fn column_value(
+    pub(super) fn resolve_column_value(
         self,
         identifiers: &[Ident],
         row: &[crate::value::Value],
@@ -125,7 +128,10 @@ impl RowScope<'_> {
         match self {
             RowScope::Table(_) => Ok(row[self.resolve_column(identifiers)?.0].clone()),
             RowScope::Bound(scope) => {
-                let names = identifiers.iter().map(identifier_name).collect::<Vec<_>>();
+                let names = identifiers
+                    .iter()
+                    .map(normalize_identifier)
+                    .collect::<Vec<_>>();
                 let (_, data_type) = self.resolve_column(identifiers)?;
                 let column = scope
                     .columns
@@ -149,7 +155,9 @@ impl RowScope<'_> {
                     }
                     return crate::coercion::coerce(
                         value.clone(),
-                        value.base_type().expect("non-null value has a base type"),
+                        value
+                            .get_base_type()
+                            .expect("non-null value has a base type"),
                         data_type,
                         crate::coercion::CastContext::Implicit,
                     );
@@ -171,10 +179,10 @@ impl BoundScope {
         slot: usize,
     ) -> Result<Self> {
         let qualifier = alias
-            .map(|alias| identifier_name(&alias.name))
+            .map(|alias| normalize_identifier(&alias.name))
             .unwrap_or_else(|| schema.name.clone());
         if alias.is_some_and(|alias| alias.columns.len() > schema.columns.len()) {
-            return Err(PgError::new(
+            return Err(PgError::create(
                 SqlState::InvalidColumnReference,
                 "table has fewer columns than specified in the column alias list",
             ));
@@ -187,7 +195,7 @@ impl BoundScope {
                 .map(|(index, column)| BoundColumn {
                     name: alias
                         .and_then(|alias| alias.columns.get(index))
-                        .map(|alias| identifier_name(&alias.name))
+                        .map(|alias| normalize_identifier(&alias.name))
                         .unwrap_or_else(|| column.name.clone()),
                     data_type: column.data_type,
                     qualifier: qualifier.clone(),
@@ -258,7 +266,7 @@ fn bind_table_with_joins(
             | JoinOperator::RightOuter(constraint)
             | JoinOperator::FullOuter(constraint) => constraint,
             _ => {
-                return not_supported("join type is not implemented");
+                return reject_unsupported("join type is not implemented");
             }
         };
         bind_join_constraint(catalog, scope, join, constraint, left_start, right_start)?;
@@ -284,17 +292,17 @@ fn bind_table_factor(
                 .filter(|column| column.wildcard)
                 .count();
             if alias.columns.len() > output_count {
-                return Err(PgError::new(
+                return Err(PgError::create(
                     SqlState::InvalidColumnReference,
                     "join has fewer columns than specified in the column alias list",
                 ));
             }
-            let qualifier = identifier_name(&alias.name);
+            let qualifier = normalize_identifier(&alias.name);
             let mut output_index = 0;
             for column in &mut scope.columns[start..] {
                 if column.wildcard {
                     if let Some(alias) = alias.columns.get(output_index) {
-                        column.name = identifier_name(&alias.name);
+                        column.name = normalize_identifier(&alias.name);
                     }
                     column.qualifier = qualifier.clone();
                     output_index += 1;
@@ -313,19 +321,19 @@ fn bind_table_factor(
     } = factor
     {
         if *lateral {
-            return not_supported("LATERAL derived tables are not implemented");
+            return reject_unsupported("LATERAL derived tables are not implemented");
         }
         let alias = alias.as_ref().ok_or_else(|| {
-            PgError::new(SqlState::SyntaxError, "subquery in FROM must have an alias")
+            PgError::create(SqlState::SyntaxError, "subquery in FROM must have an alias")
         })?;
-        let columns = query_columns(catalog, subquery, None)?;
+        let columns = describe_bound_query_columns(catalog, subquery, None)?;
         if alias.columns.len() > columns.len() {
-            return Err(PgError::new(
+            return Err(PgError::create(
                 SqlState::InvalidColumnReference,
                 "derived table has fewer columns than specified in the column alias list",
             ));
         }
-        let qualifier = identifier_name(&alias.name);
+        let qualifier = normalize_identifier(&alias.name);
         let start = scope.columns.len();
         scope
             .columns
@@ -334,7 +342,7 @@ fn bind_table_factor(
                     name: alias
                         .columns
                         .get(index)
-                        .map(|alias| identifier_name(&alias.name))
+                        .map(|alias| normalize_identifier(&alias.name))
                         .unwrap_or(column.name),
                     data_type: column.data_type,
                     qualifier: qualifier.clone(),
@@ -354,13 +362,13 @@ fn bind_table_factor(
         ..
     } = factor
     else {
-        return not_supported("FROM source is not implemented");
+        return reject_unsupported("FROM source is not implemented");
     };
     if args.is_some() {
-        return not_supported("table functions are not implemented");
+        return reject_unsupported("table functions are not implemented");
     }
     let table = BoundScope::bind_table(
-        catalog.table(&name(table_name)?)?,
+        catalog.require_table(&normalize_unqualified_object_name(table_name)?)?,
         alias.as_ref(),
         scope.columns.len(),
     )?;
@@ -368,11 +376,11 @@ fn bind_table_factor(
     Ok(())
 }
 
-pub(crate) fn query_output_columns(
+pub(crate) fn infer_query_output_columns(
     catalog: &Catalog,
     query: &sqlparser::ast::Query,
 ) -> Result<Vec<(String, PgType)>> {
-    query_columns(catalog, query, None).map(|columns| {
+    describe_bound_query_columns(catalog, query, None).map(|columns| {
         columns
             .into_iter()
             .map(|column| (column.name, column.data_type))
@@ -380,7 +388,7 @@ pub(crate) fn query_output_columns(
     })
 }
 
-fn query_columns(
+fn describe_bound_query_columns(
     catalog: &Catalog,
     query: &sqlparser::ast::Query,
     outer: Option<&BoundScope>,
@@ -405,7 +413,7 @@ fn query_columns(
                         sqlparser::ast::SelectItemQualifiedWildcardKind::ObjectName(name),
                         _,
                     ) => {
-                        let qualifier = match super::name(name) {
+                        let qualifier = match super::normalize_unqualified_object_name(name) {
                             Ok(qualifier) => qualifier,
                             Err(error) => return vec![Err(error)],
                         };
@@ -421,7 +429,7 @@ fn query_columns(
                                 .iter()
                                 .any(|column| column.qualifier == qualifier)
                         {
-                            vec![Err(PgError::new(
+                            vec![Err(PgError::create(
                                 SqlState::UndefinedTable,
                                 format!("missing FROM-clause entry for table {qualifier:?}"),
                             ))]
@@ -431,15 +439,15 @@ fn query_columns(
                     }
                     SelectItem::UnnamedExpr(Expr::Identifier(identifier)) => {
                         vec![
-                            scope
-                                .resolve_column(std::slice::from_ref(identifier))
-                                .map(|(_, data_type)| (identifier_name(identifier), data_type)),
+                            scope.resolve_column(std::slice::from_ref(identifier)).map(
+                                |(_, data_type)| (normalize_identifier(identifier), data_type),
+                            ),
                         ]
                     }
                     SelectItem::UnnamedExpr(Expr::CompoundIdentifier(identifiers)) => {
                         vec![scope.resolve_column(identifiers).map(|(_, data_type)| {
                             (
-                                identifier_name(
+                                normalize_identifier(
                                     identifiers
                                         .last()
                                         .expect("compound identifier is non-empty"),
@@ -449,14 +457,14 @@ fn query_columns(
                         })]
                     }
                     SelectItem::ExprWithAlias { expr, alias } => vec![
-                        expression_data_type(catalog, expr, &scope)
-                            .map(|data_type| (identifier_name(alias), data_type)),
+                        infer_expression_data_type(catalog, expr, &scope)
+                            .map(|data_type| (normalize_identifier(alias), data_type)),
                     ],
                     SelectItem::UnnamedExpr(expr) => vec![
-                        expression_data_type(catalog, expr, &scope)
+                        infer_expression_data_type(catalog, expr, &scope)
                             .map(|data_type| ("?column?".into(), data_type)),
                     ],
-                    _ => vec![not_supported("SELECT projection is not implemented")],
+                    _ => vec![reject_unsupported("SELECT projection is not implemented")],
                 })
                 .collect::<Result<Vec<_>>>()
                 .map(|columns| {
@@ -479,7 +487,7 @@ fn query_columns(
         SetExpr::Values(values) => {
             let width = values.rows.first().map(|row| row.len()).unwrap_or(0);
             if values.rows.iter().any(|row| row.len() != width) {
-                return Err(PgError::new(
+                return Err(PgError::create(
                     SqlState::SyntaxError,
                     "VALUES lists must all be the same length",
                 ));
@@ -491,28 +499,31 @@ fn query_columns(
                         .iter()
                         .map(|row| &row[slot])
                         .filter(|expr| {
-                            !super::null_expression(expr) && super::unknown_string(expr).is_none()
+                            !super::is_null_literal(expr)
+                                && super::extract_unknown_string_literal(expr).is_none()
                         })
                         .try_fold(None, |common, expr| {
-                            let data_type = super::expression_type(
+                            let data_type = super::infer_expression_type(
                                 expr,
-                                RowScope::Table(&super::constant_schema()),
+                                RowScope::Table(&super::create_constant_expression_schema()),
                             )?;
                             Ok(Some(match common {
-                                Some(common) => crate::coercion::common_type(common, data_type)
-                                    .ok_or_else(|| {
-                                        PgError::new(
-                                            SqlState::DatatypeMismatch,
-                                            "VALUES types cannot be matched",
-                                        )
-                                    })?,
+                                Some(common) => {
+                                    crate::coercion::resolve_common_type(common, data_type)
+                                        .ok_or_else(|| {
+                                            PgError::create(
+                                                SqlState::DatatypeMismatch,
+                                                "VALUES types cannot be matched",
+                                            )
+                                        })?
+                                }
                                 None => data_type,
                             }))
                         })?
                         .unwrap_or(BaseType::Text);
                     Ok(BoundColumn {
                         name: format!("column{}", slot + 1),
-                        data_type: PgType::new(data_type),
+                        data_type: PgType::create(data_type),
                         qualifier: String::new(),
                         slot,
                         merged: None,
@@ -523,19 +534,19 @@ fn query_columns(
                 })
                 .collect()
         }
-        _ => not_supported("query source is not implemented"),
+        _ => reject_unsupported("query source is not implemented"),
     }
 }
 
-pub(super) fn expression_data_type(
+pub(super) fn infer_expression_data_type(
     catalog: &Catalog,
     expr: &Expr,
     scope: &BoundScope,
 ) -> Result<PgType> {
     if let Expr::Subquery(query) = expr {
-        let columns = query_columns(catalog, query, Some(scope))?;
+        let columns = describe_bound_query_columns(catalog, query, Some(scope))?;
         if columns.len() != 1 {
-            return Err(PgError::new(
+            return Err(PgError::create(
                 SqlState::SyntaxError,
                 "subquery must return only one column",
             ));
@@ -543,7 +554,7 @@ pub(super) fn expression_data_type(
         return Ok(columns[0].data_type);
     }
     let mut expression = expr.clone();
-    let mut describer = SubqueryTypeDescriber {
+    let mut describer = TypedSubquerySubstituter {
         catalog,
         outer: scope,
         error: None,
@@ -552,19 +563,19 @@ pub(super) fn expression_data_type(
     if let Some(error) = describer.error {
         return Err(error);
     }
-    Ok(PgType::new(super::expression_type(
+    Ok(PgType::create(super::infer_expression_type(
         &expression,
         RowScope::Bound(scope),
     )?))
 }
 
-pub(crate) fn describe_expression_subqueries(
+pub(crate) fn substitute_typed_subqueries(
     catalog: &Catalog,
     expression: &Expr,
     outer: &BoundScope,
 ) -> Result<Expr> {
     let mut expression = expression.clone();
-    let mut describer = SubqueryTypeDescriber {
+    let mut describer = TypedSubquerySubstituter {
         catalog,
         outer,
         error: None,
@@ -573,13 +584,13 @@ pub(crate) fn describe_expression_subqueries(
     describer.error.map_or(Ok(expression), Err)
 }
 
-struct SubqueryTypeDescriber<'a> {
+struct TypedSubquerySubstituter<'a> {
     catalog: &'a Catalog,
     outer: &'a BoundScope,
     error: Option<PgError>,
 }
 
-impl VisitorMut for SubqueryTypeDescriber<'_> {
+impl VisitorMut for TypedSubquerySubstituter<'_> {
     type Break = ();
 
     fn pre_visit_expr(&mut self, expression: &mut Expr) -> ControlFlow<Self::Break> {
@@ -588,52 +599,59 @@ impl VisitorMut for SubqueryTypeDescriber<'_> {
         }
         let result = match expression {
             Expr::Subquery(query) => {
-                query_columns(self.catalog, query, Some(self.outer)).and_then(|columns| {
-                    if columns.len() != 1 {
-                        return Err(PgError::new(
-                            SqlState::SyntaxError,
-                            "subquery must return only one column",
-                        ));
-                    }
-                    Ok(crate::analyzer::typed_literal(
-                        crate::value::Value::Null,
-                        columns[0].data_type,
-                    ))
-                })
+                describe_bound_query_columns(self.catalog, query, Some(self.outer)).and_then(
+                    |columns| {
+                        if columns.len() != 1 {
+                            return Err(PgError::create(
+                                SqlState::SyntaxError,
+                                "subquery must return only one column",
+                            ));
+                        }
+                        Ok(crate::analyzer::create_typed_literal(
+                            crate::value::Value::Null,
+                            columns[0].data_type,
+                        ))
+                    },
+                )
             }
-            Expr::Exists { .. } => Ok(crate::analyzer::typed_literal(
+            Expr::Exists { .. } => Ok(crate::analyzer::create_typed_literal(
                 crate::value::Value::Bool(false),
-                PgType::new(BaseType::Bool),
+                PgType::create(BaseType::Bool),
             )),
             Expr::InSubquery {
                 expr,
                 subquery,
                 negated,
-            } => query_columns(self.catalog, subquery, Some(self.outer)).and_then(|columns| {
-                let left_width = match expr.as_ref() {
-                    Expr::Tuple(fields) => fields.len(),
-                    _ => 1,
-                };
-                if columns.len() != left_width {
-                    return Err(PgError::new(
-                        SqlState::SyntaxError,
-                        "subquery has too many columns",
-                    ));
-                }
-                let mut fields = columns.into_iter().map(|column| {
-                    crate::analyzer::typed_literal(crate::value::Value::Null, column.data_type)
-                });
-                let candidate = if left_width == 1 {
-                    fields.next().expect("subquery has one column")
-                } else {
-                    Expr::Tuple(fields.collect())
-                };
-                Ok(Expr::InList {
-                    expr: expr.clone(),
-                    list: vec![candidate],
-                    negated: *negated,
-                })
-            }),
+            } => describe_bound_query_columns(self.catalog, subquery, Some(self.outer)).and_then(
+                |columns| {
+                    let left_width = match expr.as_ref() {
+                        Expr::Tuple(fields) => fields.len(),
+                        _ => 1,
+                    };
+                    if columns.len() != left_width {
+                        return Err(PgError::create(
+                            SqlState::SyntaxError,
+                            "subquery has too many columns",
+                        ));
+                    }
+                    let mut fields = columns.into_iter().map(|column| {
+                        crate::analyzer::create_typed_literal(
+                            crate::value::Value::Null,
+                            column.data_type,
+                        )
+                    });
+                    let candidate = if left_width == 1 {
+                        fields.next().expect("subquery has one column")
+                    } else {
+                        Expr::Tuple(fields.collect())
+                    };
+                    Ok(Expr::InList {
+                        expr: expr.clone(),
+                        list: vec![candidate],
+                        negated: *negated,
+                    })
+                },
+            ),
             Expr::AnyOp {
                 left,
                 compare_op,
@@ -643,23 +661,27 @@ impl VisitorMut for SubqueryTypeDescriber<'_> {
                 let Expr::Subquery(query) = right.as_ref() else {
                     unreachable!("quantified right side was checked")
                 };
-                query_columns(self.catalog, query, Some(self.outer)).and_then(|columns| {
-                    if columns.len() != 1 {
-                        return Err(PgError::new(
-                            SqlState::SyntaxError,
-                            "subquery has too many columns",
-                        ));
-                    }
-                    Ok(Expr::AnyOp {
-                        left: left.clone(),
-                        compare_op: compare_op.clone(),
-                        right: Box::new(Expr::Tuple(vec![crate::analyzer::typed_literal(
-                            crate::value::Value::Null,
-                            columns[0].data_type,
-                        )])),
-                        is_some: *is_some,
-                    })
-                })
+                describe_bound_query_columns(self.catalog, query, Some(self.outer)).and_then(
+                    |columns| {
+                        if columns.len() != 1 {
+                            return Err(PgError::create(
+                                SqlState::SyntaxError,
+                                "subquery has too many columns",
+                            ));
+                        }
+                        Ok(Expr::AnyOp {
+                            left: left.clone(),
+                            compare_op: compare_op.clone(),
+                            right: Box::new(Expr::Tuple(vec![
+                                crate::analyzer::create_typed_literal(
+                                    crate::value::Value::Null,
+                                    columns[0].data_type,
+                                ),
+                            ])),
+                            is_some: *is_some,
+                        })
+                    },
+                )
             }
             Expr::AllOp {
                 left,
@@ -669,22 +691,26 @@ impl VisitorMut for SubqueryTypeDescriber<'_> {
                 let Expr::Subquery(query) = right.as_ref() else {
                     unreachable!("quantified right side was checked")
                 };
-                query_columns(self.catalog, query, Some(self.outer)).and_then(|columns| {
-                    if columns.len() != 1 {
-                        return Err(PgError::new(
-                            SqlState::SyntaxError,
-                            "subquery has too many columns",
-                        ));
-                    }
-                    Ok(Expr::AllOp {
-                        left: left.clone(),
-                        compare_op: compare_op.clone(),
-                        right: Box::new(Expr::Tuple(vec![crate::analyzer::typed_literal(
-                            crate::value::Value::Null,
-                            columns[0].data_type,
-                        )])),
-                    })
-                })
+                describe_bound_query_columns(self.catalog, query, Some(self.outer)).and_then(
+                    |columns| {
+                        if columns.len() != 1 {
+                            return Err(PgError::create(
+                                SqlState::SyntaxError,
+                                "subquery has too many columns",
+                            ));
+                        }
+                        Ok(Expr::AllOp {
+                            left: left.clone(),
+                            compare_op: compare_op.clone(),
+                            right: Box::new(Expr::Tuple(vec![
+                                crate::analyzer::create_typed_literal(
+                                    crate::value::Value::Null,
+                                    columns[0].data_type,
+                                ),
+                            ])),
+                        })
+                    },
+                )
             }
             _ => return ControlFlow::Continue(()),
         };
@@ -706,18 +732,21 @@ fn bind_join_constraint(
 ) -> Result<()> {
     match constraint {
         JoinConstraint::On(expression) => {
-            let data_type = expression_data_type(catalog, expression, scope)?;
-            if data_type != PgType::new(crate::value::BaseType::Bool)
-                && !super::null_expression(expression)
+            let data_type = infer_expression_data_type(catalog, expression, scope)?;
+            if data_type != PgType::create(crate::value::BaseType::Bool)
+                && !super::is_null_literal(expression)
             {
-                return Err(PgError::new(
+                return Err(PgError::create(
                     SqlState::DatatypeMismatch,
                     "JOIN/ON clause must be type boolean",
                 ));
             }
         }
         JoinConstraint::Using(columns) => {
-            let columns = columns.iter().map(name).collect::<Result<Vec<_>>>()?;
+            let columns = columns
+                .iter()
+                .map(normalize_unqualified_object_name)
+                .collect::<Result<Vec<_>>>()?;
             bind_join_columns(scope, &columns, left_start, right_start)?;
         }
         JoinConstraint::Natural => {
@@ -734,7 +763,7 @@ fn bind_join_constraint(
         }
         JoinConstraint::None if matches!(join.join_operator, JoinOperator::CrossJoin(_)) => {}
         JoinConstraint::None => {
-            return Err(PgError::new(
+            return Err(PgError::create(
                 SqlState::SyntaxError,
                 "INNER JOIN requires a join condition",
             ));
@@ -755,7 +784,7 @@ fn bind_join_columns(
             .iter_mut()
             .find(|column| column.unqualified && column.name == *name)
             .ok_or_else(|| {
-                PgError::new(
+                PgError::create(
                     SqlState::UndefinedColumn,
                     format!(
                         "column {name:?} specified in USING clause does not exist in left table"
@@ -766,21 +795,22 @@ fn bind_join_columns(
             .iter_mut()
             .find(|column| column.unqualified && column.name == *name)
             .ok_or_else(|| {
-                PgError::new(
+                PgError::create(
                     SqlState::UndefinedColumn,
                     format!(
                         "column {name:?} specified in USING clause does not exist in right table"
                     ),
                 )
             })?;
-        let data_type = crate::coercion::common_type(left.data_type.base, right.data_type.base)
-            .ok_or_else(|| {
-                PgError::new(
-                    SqlState::DatatypeMismatch,
-                    "JOIN/USING types cannot be matched",
-                )
-            })?;
-        left.data_type = PgType::new(data_type);
+        let data_type =
+            crate::coercion::resolve_common_type(left.data_type.base, right.data_type.base)
+                .ok_or_else(|| {
+                    PgError::create(
+                        SqlState::DatatypeMismatch,
+                        "JOIN/USING types cannot be matched",
+                    )
+                })?;
+        left.data_type = PgType::create(data_type);
         left.merged = Some((left.slot, right.slot));
         right.unqualified = false;
         right.wildcard = false;

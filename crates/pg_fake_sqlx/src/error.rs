@@ -42,7 +42,7 @@ impl DatabaseError for PgFakeDatabaseError {
     }
 
     fn code(&self) -> Option<Cow<'_, str>> {
-        Some(Cow::Borrowed(self.error.sqlstate.code()))
+        Some(Cow::Borrowed(self.error.sqlstate.get_code()))
     }
 
     fn as_error(&self) -> &(dyn StdError + Send + Sync + 'static) {

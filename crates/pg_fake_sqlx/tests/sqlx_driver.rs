@@ -15,7 +15,7 @@ struct PostgresServer {
 
 #[tokio::test]
 async fn sqlx_queries_map_all_phase_one_types() {
-    let mut connection = PgFakeConnection::new(Db::new());
+    let mut connection = PgFakeConnection::new(Db::create());
     connection
         .execute(
             "CREATE TABLE values_table (
@@ -74,7 +74,7 @@ async fn sqlx_queries_map_all_phase_one_types() {
 
 #[tokio::test]
 async fn sqlx_uuid_values_round_trip() {
-    let mut connection = PgFakeConnection::new(Db::new());
+    let mut connection = PgFakeConnection::new(Db::create());
     let value = uuid::Uuid::parse_str("a0eebc99-9c0b-4ef8-bba9-6a6c0f3b0af7").unwrap();
     connection
         .execute("CREATE TABLE uuid_values (id UUID)")
@@ -95,7 +95,7 @@ async fn sqlx_uuid_values_round_trip() {
 
 #[tokio::test]
 async fn sqlx_timestamp_values_round_trip() {
-    let mut connection = PgFakeConnection::new(Db::new());
+    let mut connection = PgFakeConnection::new(Db::create());
     let local = chrono::NaiveDate::from_ymd_opt(2024, 2, 29)
         .unwrap()
         .and_hms_micro_opt(12, 34, 56, 789_000)
@@ -125,7 +125,7 @@ async fn sqlx_timestamp_values_round_trip() {
 
 #[tokio::test]
 async fn sqlx_intervals_round_trip() {
-    let mut connection = PgFakeConnection::new(Db::new());
+    let mut connection = PgFakeConnection::new(Db::create());
     let interval = pg_fake::value::PgInterval {
         months: 1,
         days: 2,
@@ -150,7 +150,7 @@ async fn sqlx_intervals_round_trip() {
 
 #[tokio::test]
 async fn prepared_statements_transactions_and_pools_use_the_sqlx_api() {
-    let db = Db::new();
+    let db = Db::create();
     let pool = PgFakePoolOptions::new()
         .max_connections(2)
         .connect_with(PgFakeConnectOptions::new(db))
@@ -205,7 +205,9 @@ async fn prepared_statements_transactions_and_pools_use_the_sqlx_api() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn row_lock_waits_run_on_the_blocking_pool() {
-    let db = Db::builder().lock_timeout(Duration::from_secs(2)).build();
+    let db = Db::create_builder()
+        .set_lock_timeout(Duration::from_secs(2))
+        .build();
     let mut first = PgFakeConnection::new(db.clone());
     let mut second = PgFakeConnection::new(db);
     first
@@ -258,7 +260,7 @@ async fn sqlx_error_category_matches_postgres() {
         .and_then(|error| error.code())
         .expect("PostgreSQL unique violations must have a SQLSTATE")
         .into_owned();
-    let mut connection = PgFakeConnection::new(Db::new());
+    let mut connection = PgFakeConnection::new(Db::create());
     connection
         .execute("CREATE TABLE unique_values (id integer UNIQUE)")
         .await

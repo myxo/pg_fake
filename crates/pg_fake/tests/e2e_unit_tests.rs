@@ -75,13 +75,13 @@ fn assert_differential(script: &str, row_order: RowOrder) {
         )
     });
     let mut postgres = Client::connect(&url, NoTls).expect("must connect to PostgreSQL");
-    let db = Db::new();
-    let mut fake = db.session();
+    let db = Db::create();
+    let mut fake = db.create_session();
 
     for statement in parser::parse(&script).unwrap() {
         let sql = statement.to_string();
-        let expected = postgres_outcome(&mut postgres, &statement, &sql);
-        let actual = fake_outcome(&mut fake, &statement, &sql);
+        let expected = execute_on_postgres(&mut postgres, &statement, &sql);
+        let actual = execute_on_fake(&mut fake, &statement, &sql);
         match (expected, actual) {
             (Outcome::Rows(mut expected), Outcome::Rows(mut actual)) => {
                 if matches!(row_order, RowOrder::Unordered) {
@@ -140,17 +140,17 @@ fn assert_session_differential(operations: &[(SessionName, &str)], row_order: Ro
     });
     let mut postgres_first = Client::connect(&url, NoTls).expect("must connect to PostgreSQL");
     let mut postgres_second = Client::connect(&url, NoTls).expect("must connect to PostgreSQL");
-    let db = Db::new();
-    let mut fake_first = db.session();
-    let mut fake_second = db.session();
+    let db = Db::create();
+    let mut fake_first = db.create_session();
+    let mut fake_second = db.create_session();
 
     for (session, statement, sql) in operations {
         let (postgres, fake) = match session {
             SessionName::First => (&mut postgres_first, &mut fake_first),
             SessionName::Second => (&mut postgres_second, &mut fake_second),
         };
-        let expected = postgres_outcome(postgres, &statement, &sql);
-        let actual = fake_outcome(fake, &statement, &sql);
+        let expected = execute_on_postgres(postgres, &statement, &sql);
+        let actual = execute_on_fake(fake, &statement, &sql);
         match (expected, actual) {
             (Outcome::Rows(mut expected), Outcome::Rows(mut actual)) => {
                 if matches!(row_order, RowOrder::Unordered) {
@@ -164,7 +164,7 @@ fn assert_session_differential(operations: &[(SessionName, &str)], row_order: Ro
     }
 }
 
-fn postgres_outcome(client: &mut Client, statement: &Statement, sql: &str) -> Outcome {
+fn execute_on_postgres(client: &mut Client, statement: &Statement, sql: &str) -> Outcome {
     match client.simple_query(sql) {
         Ok(messages) => match statement {
             Statement::Query(_) => Outcome::Rows(
@@ -201,7 +201,11 @@ fn postgres_outcome(client: &mut Client, statement: &Statement, sql: &str) -> Ou
     }
 }
 
-fn fake_outcome(session: &mut pg_fake::api::Session, statement: &Statement, sql: &str) -> Outcome {
+fn execute_on_fake(
+    session: &mut pg_fake::api::Session,
+    statement: &Statement,
+    sql: &str,
+) -> Outcome {
     match statement {
         Statement::Query(_) => match session.query(sql, &[]) {
             Ok(result) => Outcome::Rows(
@@ -212,26 +216,26 @@ fn fake_outcome(session: &mut pg_fake::api::Session, statement: &Statement, sql:
                         row.iter()
                             .map(|value| match value {
                                 Value::Null => None,
-                                value => Some(value.to_text()),
+                                value => Some(value.format_postgres_text()),
                             })
                             .collect()
                     })
                     .collect(),
             ),
-            Err(error) => Outcome::Error(error.sqlstate.code().into()),
+            Err(error) => Outcome::Error(error.sqlstate.get_code().into()),
         },
         _ => match session.execute(sql) {
             Ok(results) => match results.as_slice() {
                 [StatementResult::Affected(rows)] => Outcome::Affected(*rows),
                 _ => panic!("single non-query statement must return an affected-row result"),
             },
-            Err(error) => Outcome::Error(error.sqlstate.code().into()),
+            Err(error) => Outcome::Error(error.sqlstate.get_code().into()),
         },
     }
 }
 
 #[test]
-fn explicit_transactions_match_postgres_across_sessions() {
+fn matches_explicit_transactions_across_sessions() {
     assert_session_differential(
         &[
             (
@@ -263,7 +267,7 @@ fn explicit_transactions_match_postgres_across_sessions() {
 }
 
 #[test]
-fn isolation_levels_match_postgres_across_sessions() {
+fn matches_isolation_levels_across_sessions() {
     assert_session_differential(
         &[
             (SessionName::First, "CREATE TABLE __TABLE__ (id INTEGER)"),
@@ -315,7 +319,7 @@ fn isolation_levels_match_postgres_across_sessions() {
 }
 
 #[test]
-fn lock_timeout_and_row_lock_clauses_match_postgres() {
+fn matches_lock_timeout_and_row_lock_clauses() {
     assert_differential(
         "SET lock_timeout = 250; \
          SET lock_timeout = '100ms'; \
@@ -335,7 +339,7 @@ fn lock_timeout_and_row_lock_clauses_match_postgres() {
 }
 
 #[test]
-fn foreign_keys_and_referential_actions_match_postgres() {
+fn matches_foreign_keys_and_referential_actions() {
     assert_differential(
         "CREATE TABLE __TABLE___parents (first_id INTEGER, second_id INTEGER, PRIMARY KEY (first_id, second_id)); \
          CREATE TABLE __TABLE___children (id INTEGER PRIMARY KEY, first_id INTEGER, second_id INTEGER, FOREIGN KEY (first_id, second_id) REFERENCES __TABLE___parents (first_id, second_id) ON DELETE CASCADE ON UPDATE CASCADE); \
@@ -351,7 +355,7 @@ fn foreign_keys_and_referential_actions_match_postgres() {
 }
 
 #[test]
-fn parameters_and_prepared_reuse_match_postgres() {
+fn matches_parameter_and_prepared_reuse() {
     let _test_lock = TEST_LOCK.lock().expect("test mutex must not be poisoned");
     let configured_url = env::var("PG_FAKE_DATABASE_URL").ok();
     if configured_url.is_none() && env::var_os("DOCKER_HOST").is_none() {
@@ -381,8 +385,8 @@ fn parameters_and_prepared_reuse_match_postgres() {
         TABLE_NUMBER.fetch_add(1, Ordering::Relaxed)
     );
     let mut postgres = Client::connect(&url, NoTls).expect("must connect to PostgreSQL");
-    let db = Db::new();
-    let mut fake = db.session();
+    let db = Db::create();
+    let mut fake = db.create_session();
     let create = format!("CREATE TABLE {table} (id INTEGER, name TEXT, amount SMALLINT)");
     postgres.batch_execute(&create).unwrap();
     fake.execute(&create).unwrap();
@@ -457,7 +461,7 @@ fn parameters_and_prepared_reuse_match_postgres() {
 }
 
 #[test]
-fn multi_statement_batch_and_metadata_match_postgres() {
+fn matches_multi_statement_batches_and_metadata() {
     let _test_lock = TEST_LOCK.lock().expect("test mutex must not be poisoned");
     let configured_url = env::var("PG_FAKE_DATABASE_URL").ok();
     if configured_url.is_none() && env::var_os("DOCKER_HOST").is_none() {
@@ -486,8 +490,8 @@ fn multi_statement_batch_and_metadata_match_postgres() {
     let types_table = format!("pg_fake_types_{}_{}", std::process::id(), suffix);
     let failed_table = format!("pg_fake_failed_{}_{}", std::process::id(), suffix);
     let mut postgres = Client::connect(&url, NoTls).expect("must connect to PostgreSQL");
-    let db = Db::new();
-    let mut fake = db.session();
+    let db = Db::create();
+    let mut fake = db.create_session();
 
     let batch = format!(
         "CREATE TABLE {batch_table} (id INTEGER, name TEXT); \
@@ -559,7 +563,7 @@ fn multi_statement_batch_and_metadata_match_postgres() {
     let postgres_error = postgres.simple_query(&failed_batch).unwrap_err();
     let fake_error = fake.execute(&failed_batch).unwrap_err();
     assert_eq!(
-        fake_error.sqlstate.code(),
+        fake_error.sqlstate.get_code(),
         postgres_error.code().unwrap().code()
     );
     let relation: Option<String> = postgres
@@ -571,13 +575,13 @@ fn multi_statement_batch_and_metadata_match_postgres() {
         fake.query(&format!("SELECT * FROM {failed_table}"), &[])
             .unwrap_err()
             .sqlstate
-            .code(),
+            .get_code(),
         "42P01"
     );
 }
 
 #[test]
-fn case_boundaries_and_function_errors_match_postgres() {
+fn matches_case_boundaries_and_function_errors() {
     assert_differential(
         "CREATE TABLE __TABLE__ (id INTEGER); \
          INSERT INTO __TABLE__ VALUES (1); \
@@ -589,7 +593,7 @@ fn case_boundaries_and_function_errors_match_postgres() {
 }
 
 #[test]
-fn coercion_errors_match_postgres() {
+fn matches_coercion_errors() {
     assert_differential(
         "CREATE TABLE __TABLE__ (
              small_value SMALLINT,
@@ -606,7 +610,7 @@ fn coercion_errors_match_postgres() {
 }
 
 #[test]
-fn order_by_position_errors_match_postgres() {
+fn matches_order_by_position_errors() {
     assert_differential(
         "CREATE TABLE __TABLE__ (id INTEGER); \
          INSERT INTO __TABLE__ VALUES (1); \
@@ -617,7 +621,7 @@ fn order_by_position_errors_match_postgres() {
 }
 
 #[test]
-fn limit_and_offset_match_postgres() {
+fn matches_limit_and_offset() {
     assert_differential(
         "CREATE TABLE __TABLE__ (id INTEGER); \
          INSERT INTO __TABLE__ VALUES (4), (1), (5), (2), (3); \
@@ -630,7 +634,7 @@ fn limit_and_offset_match_postgres() {
 }
 
 #[test]
-fn limit_and_offset_without_order_by_match_postgres() {
+fn matches_limit_and_offset_without_order_by() {
     assert_differential(
         "CREATE TABLE __TABLE__ (id INTEGER); \
          INSERT INTO __TABLE__ VALUES (4), (1), (5), (2), (3); \
@@ -641,7 +645,7 @@ fn limit_and_offset_without_order_by_match_postgres() {
 }
 
 #[test]
-fn negative_limit_and_offset_errors_match_postgres() {
+fn matches_negative_limit_and_offset_errors() {
     assert_differential(
         "CREATE TABLE __TABLE__ (id INTEGER); \
          SELECT id FROM __TABLE__ LIMIT -1; \
@@ -651,7 +655,7 @@ fn negative_limit_and_offset_errors_match_postgres() {
 }
 
 #[test]
-fn not_null_and_defaults_match_postgres() {
+fn matches_not_null_and_defaults() {
     assert_differential(
         "CREATE TABLE __TABLE__ (
              id INTEGER NOT NULL DEFAULT 10,
@@ -669,7 +673,7 @@ fn not_null_and_defaults_match_postgres() {
 }
 
 #[test]
-fn not_null_and_default_errors_match_postgres() {
+fn matches_not_null_and_default_errors() {
     assert_differential(
         "CREATE TABLE __TABLE__ (id INTEGER NOT NULL, optional INTEGER); \
          INSERT INTO __TABLE__ (optional) VALUES (1); \
@@ -681,7 +685,7 @@ fn not_null_and_default_errors_match_postgres() {
 }
 
 #[test]
-fn primary_and_unique_constraints_match_postgres() {
+fn matches_primary_and_unique_constraints() {
     assert_differential(
         "CREATE TABLE __TABLE__ (
              id INTEGER PRIMARY KEY,
@@ -704,7 +708,7 @@ fn primary_and_unique_constraints_match_postgres() {
 }
 
 #[test]
-fn check_constraints_match_postgres() {
+fn matches_check_constraints() {
     assert_differential(
         "CREATE TABLE __TABLE__ (
              id INTEGER CHECK (id > 0),
@@ -723,7 +727,7 @@ fn check_constraints_match_postgres() {
 }
 
 #[test]
-fn unique_value_semantics_match_postgres() {
+fn matches_unique_value_semantics() {
     assert_differential(
         "CREATE TABLE __TABLE__ (
              float_value DOUBLE PRECISION UNIQUE,
@@ -741,7 +745,7 @@ fn unique_value_semantics_match_postgres() {
 }
 
 #[test]
-fn delete_visibility_matches_postgres_across_sessions() {
+fn matches_delete_visibility_across_sessions() {
     assert_session_differential(
         &[
             (SessionName::First, "CREATE TABLE __TABLE__ (id INTEGER)"),
@@ -778,7 +782,7 @@ fn compares_sqlstate_errors() {
 }
 
 #[test]
-fn query_foundations_and_single_table_aliases_match_postgres() {
+fn matches_query_foundations_and_single_table_aliases() {
     assert_differential(
         "SELECT 2 + 1 AS result ORDER BY result LIMIT 1; \
          VALUES (2), ('1'), (3) ORDER BY column1 LIMIT 2 OFFSET 1; \
@@ -793,7 +797,7 @@ fn query_foundations_and_single_table_aliases_match_postgres() {
 }
 
 #[test]
-fn derived_tables_and_uncorrelated_scalar_subqueries_match_postgres() {
+fn matches_derived_tables_and_uncorrelated_scalar_subqueries() {
     assert_differential(
         "CREATE TABLE __TABLE__ (id INTEGER, value INTEGER); \
          INSERT INTO __TABLE__ VALUES (1, 10), (2, 20), (3, 30); \
@@ -807,7 +811,7 @@ fn derived_tables_and_uncorrelated_scalar_subqueries_match_postgres() {
 }
 
 #[test]
-fn uncorrelated_subquery_predicates_match_postgres() {
+fn matches_uncorrelated_subquery_predicates() {
     assert_differential(
         "CREATE TABLE __TABLE__ (id INTEGER, pair INTEGER); \
          INSERT INTO __TABLE__ VALUES (1, 1), (2, 2), (NULL, 3); \
@@ -824,7 +828,7 @@ fn uncorrelated_subquery_predicates_match_postgres() {
 }
 
 #[test]
-fn correlated_subqueries_match_postgres() {
+fn matches_correlated_subqueries() {
     assert_differential(
         "CREATE TABLE __TABLE__ (id INTEGER, threshold INTEGER); \
          CREATE TABLE __TABLE___children (id INTEGER, parent_id INTEGER, value INTEGER); \
