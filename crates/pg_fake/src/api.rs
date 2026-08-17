@@ -108,8 +108,16 @@ fn abort_database_transaction(state: &mut DatabaseState, xid: Xid) {
     for table in state.tables.values_mut() {
         table.discard_transaction_versions(xid);
     }
+    prune_database_versions(state);
     state.row_locks.release_transaction_locks(xid);
     state.wait_for.remove_transaction(xid);
+}
+
+fn prune_database_versions(state: &mut DatabaseState) {
+    let horizon = state.transactions.find_reclamation_horizon();
+    for table in state.tables.values_mut() {
+        table.prune_versions(horizon, &state.transactions);
+    }
 }
 
 fn collect_ddl_undo_for_statement(
@@ -796,7 +804,11 @@ impl Session {
             self.db.condvar.notify_all();
             return Err(error);
         }
-        state.transactions.commit(transaction.xid);
+        let commit_seq = state.transactions.commit(transaction.xid);
+        for table in state.tables.values_mut() {
+            table.commit_transaction_versions(transaction.xid, commit_seq);
+        }
+        prune_database_versions(&mut state);
         state.row_locks.release_transaction_locks(transaction.xid);
         state.wait_for.remove_transaction(transaction.xid);
         self.ddl_undo.clear();
@@ -1064,13 +1076,18 @@ impl Session {
         };
         let state_lock = self.db.state.clone();
         let condvar = self.db.condvar.clone();
-        let state = state_lock.lock().expect("database mutex is poisoned");
+        let mut state = state_lock.lock().expect("database mutex is poisoned");
         let snapshot = match transaction.isolation {
             IsolationLevel::ReadCommitted => Snapshot::create(&state.transactions),
             IsolationLevel::RepeatableRead => *transaction
                 .snapshot
                 .get_or_insert_with(|| Snapshot::create(&state.transactions)),
         };
+        if transaction.isolation == IsolationLevel::RepeatableRead {
+            state
+                .transactions
+                .retain_snapshot(transaction.xid, snapshot);
+        }
         transaction.statement_started = true;
         self.transaction = Some(SessionTransactionState::Active(transaction));
         let context = executor::StatementExecutionContext {
@@ -3142,6 +3159,82 @@ mod tests {
             vec![vec![Value::Int4(1)], vec![Value::Int4(2)]]
         );
         first.execute("COMMIT").unwrap();
+    }
+
+    #[test]
+    fn reclaims_deleted_rows_between_autocommit_statements() {
+        let db = Db::create();
+        let mut session = db.create_session();
+        session.execute("CREATE TABLE items (id INTEGER)").unwrap();
+
+        for id in 0..100 {
+            session
+                .execute(&format!("INSERT INTO items VALUES ({id})"))
+                .unwrap();
+            session
+                .execute(&format!("DELETE FROM items WHERE id = {id}"))
+                .unwrap();
+        }
+
+        let state = db.state.lock().unwrap();
+        let table_id = state.catalog.require_table("items").unwrap().id;
+        assert_eq!(
+            state
+                .tables
+                .get(&table_id)
+                .unwrap()
+                .iterate_version_chains()
+                .count(),
+            0
+        );
+    }
+
+    #[test]
+    fn retains_deleted_rows_until_repeatable_read_snapshot_finishes() {
+        let db = Db::create();
+        let mut reader = db.create_session();
+        let mut writer = db.create_session();
+        writer.execute("CREATE TABLE items (id INTEGER)").unwrap();
+        writer.execute("INSERT INTO items VALUES (1)").unwrap();
+        reader
+            .execute("BEGIN ISOLATION LEVEL REPEATABLE READ")
+            .unwrap();
+        assert_eq!(
+            reader.query("SELECT * FROM items", &[]).unwrap().rows,
+            vec![vec![Value::Int4(1)]]
+        );
+
+        writer.execute("DELETE FROM items WHERE id = 1").unwrap();
+        assert_eq!(
+            reader.query("SELECT * FROM items", &[]).unwrap().rows,
+            vec![vec![Value::Int4(1)]]
+        );
+        {
+            let state = db.state.lock().unwrap();
+            let table_id = state.catalog.require_table("items").unwrap().id;
+            assert_eq!(
+                state
+                    .tables
+                    .get(&table_id)
+                    .unwrap()
+                    .iterate_version_chains()
+                    .count(),
+                1
+            );
+        }
+
+        reader.execute("ROLLBACK").unwrap();
+        let state = db.state.lock().unwrap();
+        let table_id = state.catalog.require_table("items").unwrap().id;
+        assert_eq!(
+            state
+                .tables
+                .get(&table_id)
+                .unwrap()
+                .iterate_version_chains()
+                .count(),
+            0
+        );
     }
 
     #[test]

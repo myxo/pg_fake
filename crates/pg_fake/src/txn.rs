@@ -62,6 +62,7 @@ pub(crate) struct TransactionRegistry {
     next_xid: u64,
     commit_seq: CommitSeq,
     statuses: BTreeMap<Xid, TransactionStatus>,
+    retained_snapshots: BTreeMap<Xid, CommitSeq>,
 }
 
 impl Default for TransactionRegistry {
@@ -241,6 +242,7 @@ impl TransactionRegistry {
             next_xid: 1,
             commit_seq: CommitSeq(0),
             statuses: BTreeMap::new(),
+            retained_snapshots: BTreeMap::new(),
         }
     }
 
@@ -261,6 +263,7 @@ impl TransactionRegistry {
         let commit_seq = self.commit_seq;
         *self.statuses.get_mut(&xid).expect("transaction must exist") =
             TransactionStatus::Committed(commit_seq);
+        self.retained_snapshots.remove(&xid);
         commit_seq
     }
 
@@ -270,10 +273,31 @@ impl TransactionRegistry {
             Some(TransactionStatus::InFlight)
         ));
         *self.statuses.get_mut(&xid).expect("transaction must exist") = TransactionStatus::Aborted;
+        self.retained_snapshots.remove(&xid);
     }
 
     pub(crate) fn get_status(&self, xid: Xid) -> Option<TransactionStatus> {
         self.statuses.get(&xid).copied()
+    }
+
+    pub(crate) fn retain_snapshot(&mut self, xid: Xid, snapshot: Snapshot) {
+        assert!(matches!(
+            self.get_status(xid),
+            Some(TransactionStatus::InFlight)
+        ));
+        let retained = self
+            .retained_snapshots
+            .entry(xid)
+            .or_insert(snapshot.commit_seq);
+        assert_eq!(*retained, snapshot.commit_seq);
+    }
+
+    pub(crate) fn find_reclamation_horizon(&self) -> CommitSeq {
+        self.retained_snapshots
+            .values()
+            .copied()
+            .min()
+            .unwrap_or(self.commit_seq)
     }
 }
 

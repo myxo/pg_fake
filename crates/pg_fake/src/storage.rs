@@ -2,7 +2,7 @@ use std::collections::{BTreeMap, BTreeSet};
 
 use crate::{
     catalog::{Constraint, TableSchema},
-    txn::{Snapshot, TransactionRegistry, Xid, find_visible_version},
+    txn::{CommitSeq, Snapshot, TransactionRegistry, TransactionStatus, Xid, find_visible_version},
     value::{BaseType, Value},
 };
 
@@ -26,6 +26,12 @@ pub(crate) struct RowVersionChain {
 #[derive(Debug, Clone, PartialEq)]
 struct VersionChainStore {
     chains: BTreeMap<RowId, RowVersionChain>,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+struct VersionReclamation {
+    pending: BTreeMap<Xid, BTreeSet<RowId>>,
+    committed: BTreeMap<CommitSeq, BTreeSet<RowId>>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
@@ -61,6 +67,7 @@ pub(crate) struct Table {
     pub(crate) schema: TableSchema,
     version_chains: VersionChainStore,
     indexes: Vec<UniqueIndex>,
+    reclamation: Box<VersionReclamation>,
     next_rowid: u64,
 }
 
@@ -94,6 +101,10 @@ impl Table {
                 chains: BTreeMap::new(),
             },
             indexes,
+            reclamation: Box::new(VersionReclamation {
+                pending: BTreeMap::new(),
+                committed: BTreeMap::new(),
+            }),
             next_rowid: 1,
         }
     }
@@ -135,6 +146,11 @@ impl Table {
             .find(|version| version.xmin == version_xmin && version.xmax.is_none())
             .expect("live version with xmin must exist");
         version.xmax = Some(xmax);
+        self.reclamation
+            .pending
+            .entry(xmax)
+            .or_default()
+            .insert(row_id);
         row_id
     }
 
@@ -162,6 +178,7 @@ impl Table {
     }
 
     pub(crate) fn discard_transaction_versions(&mut self, xid: Xid) {
+        self.reclamation.pending.remove(&xid);
         self.version_chains.chains.retain(|_, chain| {
             chain.versions.retain(|version| version.xmin != xid);
             for version in &mut chain.versions {
@@ -172,6 +189,87 @@ impl Table {
             !chain.versions.is_empty()
         });
         self.rebuild_indexes();
+    }
+
+    pub(crate) fn commit_transaction_versions(&mut self, xid: Xid, commit_seq: CommitSeq) {
+        if let Some(row_ids) = self.reclamation.pending.remove(&xid) {
+            self.reclamation
+                .committed
+                .entry(commit_seq)
+                .or_default()
+                .extend(row_ids);
+        }
+    }
+
+    pub(crate) fn prune_versions(
+        &mut self,
+        horizon: CommitSeq,
+        transactions: &TransactionRegistry,
+    ) {
+        let commit_seqs = self
+            .reclamation
+            .committed
+            .range(..=horizon)
+            .map(|(commit_seq, _)| *commit_seq)
+            .collect::<Vec<_>>();
+        if commit_seqs.is_empty() {
+            return;
+        }
+        let mut row_ids = BTreeSet::new();
+        for commit_seq in commit_seqs {
+            row_ids.extend(
+                self.reclamation
+                    .committed
+                    .remove(&commit_seq)
+                    .expect("selected reclamation batch must exist"),
+            );
+        }
+        for row_id in row_ids {
+            let mut chain = self
+                .version_chains
+                .chains
+                .remove(&row_id)
+                .expect("reclamation candidate row must exist");
+            let mut removed = Vec::new();
+            chain.versions.retain(|version| {
+                let reclaim = matches!(
+                    version.xmax.and_then(|xmax| transactions.get_status(xmax)),
+                    Some(TransactionStatus::Committed(commit_seq)) if commit_seq <= horizon
+                );
+                if reclaim {
+                    removed.push(version.row.clone());
+                }
+                !reclaim
+            });
+            for index in &mut self.indexes {
+                let retained_keys = chain
+                    .versions
+                    .iter()
+                    .filter_map(|version| build_row_index_key(&self.schema, index, &version.row))
+                    .collect::<BTreeSet<_>>();
+                let removed_keys = removed
+                    .iter()
+                    .filter_map(|row| build_row_index_key(&self.schema, index, row))
+                    .collect::<BTreeSet<_>>();
+                for key in removed_keys.difference(&retained_keys) {
+                    let remove_key = {
+                        let row_ids = index
+                            .entries
+                            .get_mut(key)
+                            .expect("reclaimed index entry must exist");
+                        assert!(row_ids.remove(&row_id));
+                        row_ids.is_empty()
+                    };
+                    if remove_key {
+                        index.entries.remove(key);
+                    }
+                }
+            }
+            if !chain.versions.is_empty() {
+                let previous = self.version_chains.chains.insert(row_id, chain);
+                assert!(previous.is_none());
+            }
+        }
     }
 
     pub(crate) fn iterate_version_chains(&self) -> impl Iterator<Item = (RowId, &RowVersionChain)> {
