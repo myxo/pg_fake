@@ -221,18 +221,51 @@ pub(crate) fn bind_target_scope(schema: &TableSchema, alias: Option<&ast::Ident>
 }
 
 pub(crate) fn bind_query_scope(catalog: &Catalog, select: &ast::Select) -> Result<BoundScope> {
-    if select.from.is_empty() {
-        return Ok(BoundScope {
-            columns: Vec::new(),
-        });
-    }
+    bind_from_scope(catalog, &select.from)
+}
+
+pub(crate) fn bind_from_scope(
+    catalog: &Catalog,
+    from: &[ast::TableWithJoins],
+) -> Result<BoundScope> {
     let mut scope = BoundScope {
         columns: Vec::new(),
     };
-    for source in &select.from {
+    for source in from {
         bind_table_with_joins(catalog, source, &mut scope)?;
     }
     Ok(scope)
+}
+
+pub(crate) fn combine_bound_scopes(mut target: BoundScope, mut source: BoundScope) -> BoundScope {
+    let start = target.columns.len();
+    for column in &mut source.columns {
+        column.slot += start;
+    }
+    target.columns.extend(source.columns);
+    target
+}
+
+pub(crate) fn identify_unknown_query_columns(query: &ast::Query, columns: usize) -> Vec<bool> {
+    let ast::SetExpr::Select(select) = query.body.as_ref() else {
+        return vec![false; columns];
+    };
+    let unknown = select
+        .projection
+        .iter()
+        .map(|item| match item {
+            ast::SelectItem::UnnamedExpr(expression)
+            | ast::SelectItem::ExprWithAlias {
+                expr: expression, ..
+            } => super::extract_unknown_string_literal(expression).is_some(),
+            _ => false,
+        })
+        .collect::<Vec<_>>();
+    if unknown.len() == columns {
+        unknown
+    } else {
+        vec![false; columns]
+    }
 }
 
 pub(crate) fn bind_query_scope_with_outer(

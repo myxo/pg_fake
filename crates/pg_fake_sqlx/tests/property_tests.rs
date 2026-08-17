@@ -670,6 +670,39 @@ fn generate_insert(src: &mut Source, table: &TableSchema, next_key: &mut i64) ->
     })
 }
 
+fn generate_insert_select(src: &mut Source, table: &TableSchema, next_key: &mut i64) -> String {
+    let key = *next_key;
+    *next_key += 1;
+    let values = table
+        .columns
+        .iter()
+        .enumerate()
+        .map(|(index, column)| {
+            if index == 0 {
+                key.to_string()
+            } else {
+                generate_literal(src, column)
+            }
+        })
+        .collect::<Vec<_>>();
+    let columns = table
+        .columns
+        .iter()
+        .map(|column| column.name.as_str())
+        .collect::<Vec<_>>();
+    format!(
+        "INSERT INTO {} ({}) SELECT {} WHERE {} RETURNING *",
+        table.name,
+        columns.join(", "),
+        values.join(", "),
+        if src.any("source_row") {
+            "TRUE"
+        } else {
+            "FALSE"
+        }
+    )
+}
+
 fn generate_predicate(src: &mut Source, table: &TableSchema) -> String {
     src.select(
         "predicate",
@@ -1094,6 +1127,30 @@ fn generate_delete(src: &mut Source, table: &TableSchema) -> String {
     )
 }
 
+fn generate_update_from(src: &mut Source, table: &TableSchema) -> String {
+    let column = choose_column(src, table, |column| column.name != table.key().name);
+    let cutoff = src.any_of("cutoff", int_in_range(1..=20));
+    format!(
+        "UPDATE {0} AS target SET {1} = source.{1} FROM {0} AS source \
+         WHERE target.{2} = source.{2} AND target.{2} <= {cutoff} \
+         RETURNING target.{2}, source.{1}",
+        table.name,
+        column.name,
+        table.key().name,
+    )
+}
+
+fn generate_delete_using(src: &mut Source, table: &TableSchema) -> String {
+    let cutoff = src.any_of("cutoff", int_in_range(1..=20));
+    format!(
+        "DELETE FROM {0} AS target USING {0} AS source \
+         WHERE target.{1} = source.{1} AND target.{1} <= {cutoff} \
+         RETURNING target.{1}, source.{1}",
+        table.name,
+        table.key().name,
+    )
+}
+
 fn generate_returning_projection(src: &mut Source, table: &TableSchema) -> String {
     src.select(
         "projection",
@@ -1350,6 +1407,7 @@ fn generated_sql_matches_postgres() {
                 &[
                     "insert",
                     "insert_returning",
+                    "insert_select",
                     "select",
                     "distinct",
                     "aggregate",
@@ -1359,8 +1417,10 @@ fn generated_sql_matches_postgres() {
                     "foreign_select",
                     "update",
                     "update_returning",
+                    "update_from",
                     "delete",
                     "delete_returning",
+                    "delete_using",
                     "set_lock_timeout",
                     "commit",
                     "rollback",
@@ -1369,6 +1429,7 @@ fn generated_sql_matches_postgres() {
                 &[
                     "insert",
                     "insert_returning",
+                    "insert_select",
                     "select",
                     "distinct",
                     "aggregate",
@@ -1378,8 +1439,10 @@ fn generated_sql_matches_postgres() {
                     "foreign_select",
                     "update",
                     "update_returning",
+                    "update_from",
                     "delete",
                     "delete_returning",
+                    "delete_using",
                     "set_session",
                     "set_lock_timeout",
                     "begin",
@@ -1393,6 +1456,10 @@ fn generated_sql_matches_postgres() {
                     ),
                     "insert_returning" => (
                         generate_insert_returning(src, &table, &mut next_key),
+                        RowOrder::Unordered,
+                    ),
+                    "insert_select" => (
+                        generate_insert_select(src, &table, &mut next_key),
                         RowOrder::Unordered,
                     ),
                     "select" => generate_select(src, &table),
@@ -1409,10 +1476,12 @@ fn generated_sql_matches_postgres() {
                     "update_returning" => {
                         (generate_update_returning(src, &table), RowOrder::Unordered)
                     }
+                    "update_from" => (generate_update_from(src, &table), RowOrder::Unordered),
                     "delete" => (generate_delete(src, &table), RowOrder::Unordered),
                     "delete_returning" => {
                         (generate_delete_returning(src, &table), RowOrder::Unordered)
                     }
+                    "delete_using" => (generate_delete_using(src, &table), RowOrder::Unordered),
                     "begin" => {
                         in_transaction = true;
                         let sql = if src.any("explicit_isolation") {

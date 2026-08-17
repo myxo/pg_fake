@@ -417,7 +417,7 @@ the Phase 2 list in `spec.md`.
 - `cargo test --workspace`, `cargo check --workspace --all-targets`, and the
   10,000-iteration property suite pass.
 
-### Task 13 — Query-sourced and joined mutations
+### Task 13 — Query-sourced and joined mutations [COMPLETE]
 
 **Goal:** Reuse Phase 2 row sources in common mutation forms that are called out
 by the Phase 1 deferrals and regression corpus.
@@ -437,6 +437,29 @@ by the Phase 1 deferrals and regression corpus.
 
 **Notes:** These forms are adjacent Phase 2 additions enabled by joins and
 subqueries. `MERGE` and `ON CONFLICT` remain outside Phase 2.
+
+**Completed:**
+
+- `INSERT INTO ... SELECT ...` materializes the complete source before writing,
+  applies destination assignment coercion (including contextually typed string
+  literals), fills omitted defaults, and validates row constraints atomically.
+- `UPDATE ... FROM` and `DELETE ... USING` share combined target/source scopes,
+  PostgreSQL alias and ambiguity resolution, source-aware `RETURNING`, and
+  correlated subquery evaluation. Each target selects at most one source match.
+- Prepared analysis and result metadata cover source-qualified expressions and
+  parameters. Mutation locking conservatively protects target rows when source
+  clauses participate.
+- Focused differential tests cover empty and multi-row sources, duplicate
+  matches, aliases, assignment coercion, source/target return values,
+  constraint failures, correlated subqueries, and explicit rollback. Generated
+  property actions cover all three forms.
+- The Phase 2 manifest promotes query-sourced mutations to `MustPass`; the
+  reviewed report records 442 matching corpus statements, 141 skipped scripts,
+  and 29 passing conformance cases with no mutation blocker.
+- The `update_from_row` benchmark measures about 28.0 us for pg_fake and 98.6 us
+  for PostgreSQL 18. `cargo test --workspace`,
+  `cargo check --workspace --all-targets`, and the 10,000-iteration property
+  suite pass.
 
 ---
 

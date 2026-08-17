@@ -9,20 +9,103 @@ struct ReturningPlan<'a> {
 
 fn build_returning_plan<'a>(
     state: &DatabaseState,
-    schema: &TableSchema,
-    alias: Option<&ast::Ident>,
+    scope: BoundScope,
+    target_columns: usize,
     returning: Option<&'a [ast::SelectItem]>,
 ) -> Result<Option<ReturningPlan<'a>>> {
     let Some(returning) = returning else {
         return Ok(None);
     };
-    let scope = bind_target_scope(schema, alias);
-    let (projections, columns) = query::build_projection_plan(state, returning, &scope)?;
+    let (projections, columns) =
+        query::build_mutation_projection_plan(state, returning, &scope, target_columns)?;
     Ok(Some(ReturningPlan {
         scope,
         projections,
         columns,
     }))
+}
+
+fn create_mutation_scope(
+    state: &DatabaseState,
+    schema: &TableSchema,
+    alias: Option<&ast::Ident>,
+    from: &[ast::TableWithJoins],
+) -> Result<BoundScope> {
+    Ok(combine_bound_scopes(
+        bind_target_scope(schema, alias),
+        bind_from_scope(&state.catalog, from)?,
+    ))
+}
+
+fn materialize_mutation_source_rows(
+    state: &DatabaseState,
+    from: &[ast::TableWithJoins],
+    scope: &BoundScope,
+    target_columns: usize,
+    xid: Xid,
+    snapshot: &Snapshot,
+    context: &StatementExecutionContext,
+) -> Result<Vec<Vec<Value>>> {
+    if from.is_empty() {
+        return Ok(vec![vec![Value::Null; scope.columns.len()]]);
+    }
+    query::materialize_from_rows(
+        state,
+        from,
+        scope,
+        target_columns,
+        xid,
+        snapshot,
+        context,
+        None,
+    )
+}
+
+fn evaluate_mutation_assignment(
+    state: &DatabaseState,
+    expression: &ast::Expr,
+    target: PgType,
+    scope: &BoundScope,
+    row: &[Value],
+    xid: Xid,
+    snapshot: &Snapshot,
+    context: &StatementExecutionContext,
+) -> Result<Value> {
+    if let Some(text) = extract_unknown_string_literal(expression) {
+        coercion::coerce_unknown(text, target, CastContext::Assignment)
+    } else {
+        coercion::coerce(
+            query::evaluate_query_expression(
+                state, expression, scope, row, xid, snapshot, context,
+            )?,
+            query::infer_query_expression_type(state, expression, scope)?.base,
+            target,
+            CastContext::Assignment,
+        )
+    }
+}
+
+fn matches_mutation_row(
+    state: &DatabaseState,
+    selection: Option<&ast::Expr>,
+    scope: &BoundScope,
+    row: &[Value],
+    xid: Xid,
+    snapshot: &Snapshot,
+    context: &StatementExecutionContext,
+) -> Result<bool> {
+    let Some(selection) = selection else {
+        return Ok(true);
+    };
+    Ok(
+        match query::evaluate_query_expression(
+            state, selection, scope, row, xid, snapshot, context,
+        )? {
+            Value::Bool(value) => value,
+            Value::Null => false,
+            _ => unreachable!("WHERE expression was type-checked"),
+        },
+    )
 }
 
 fn evaluate_returning_row(
@@ -75,10 +158,14 @@ pub(super) fn execute_insert(
 ) -> Result<StatementResult> {
     let table_name = resolve_insert_table_name(&insert.table)?;
     let schema = state.catalog.require_table(&table_name)?.clone();
-    let returning = build_returning_plan(
-        state,
+    let returning_scope = bind_target_scope(
         &schema,
         insert.table_alias.as_ref().map(|alias| &alias.alias),
+    );
+    let returning = build_returning_plan(
+        state,
+        returning_scope,
+        schema.columns.len(),
         insert.returning.as_deref(),
     )?;
     let column_indexes = if insert.columns.is_empty() {
@@ -135,14 +222,67 @@ pub(super) fn execute_insert(
         Ok(row)
     };
     let rows = if let Some(source) = &insert.source {
-        let ast::SetExpr::Values(values) = source.body.as_ref() else {
-            return reject_unsupported("INSERT source is not implemented");
-        };
-        values
-            .rows
-            .iter()
-            .map(|expressions| build_row(expressions))
-            .collect::<Result<Vec<_>>>()?
+        if let ast::SetExpr::Values(values) = source.body.as_ref() {
+            values
+                .rows
+                .iter()
+                .map(|expressions| build_row(expressions))
+                .collect::<Result<Vec<_>>>()?
+        } else {
+            let unknown_columns = identify_unknown_query_columns(source, column_indexes.len());
+            let StatementResult::Query(source) =
+                query::execute_query(state, source, xid, snapshot, context)?
+            else {
+                unreachable!("query execution returns rows")
+            };
+            if source.columns.len() != column_indexes.len() {
+                return Err(PgError::create(
+                    SqlState::SyntaxError,
+                    "INSERT has wrong number of values",
+                ));
+            }
+            source
+                .rows
+                .into_iter()
+                .map(|values| {
+                    let mut row = vec![Value::Null; schema.columns.len()];
+                    for (index, column) in schema.columns.iter().enumerate() {
+                        if !provided.contains(&index) {
+                            row[index] = evaluate_column_default(column, context)?;
+                        }
+                    }
+                    for (((value, source_column), unknown), index) in values
+                        .into_iter()
+                        .zip(&source.columns)
+                        .zip(&unknown_columns)
+                        .zip(&column_indexes)
+                    {
+                        row[*index] = if *unknown {
+                            let Value::Text(text) = value else {
+                                unreachable!("unknown string literals evaluate to text")
+                            };
+                            coercion::coerce_unknown(
+                                &text,
+                                schema.columns[*index].data_type,
+                                CastContext::Assignment,
+                            )?
+                        } else {
+                            let source_type = BaseType::resolve_oid(source_column.type_oid)
+                                .expect("query columns use supported PostgreSQL types");
+                            coercion::coerce(
+                                value,
+                                source_type,
+                                schema.columns[*index].data_type,
+                                CastContext::Assignment,
+                            )?
+                        };
+                    }
+                    validate_not_null(&schema, &row)?;
+                    validate_check_constraints(&schema, &row, context)?;
+                    Ok(row)
+                })
+                .collect::<Result<Vec<_>>>()?
+        }
     } else {
         assert!(insert.columns.is_empty());
         schema
@@ -204,6 +344,7 @@ pub(super) fn execute_update(
     state: &mut DatabaseState,
     update_table: &ast::TableWithJoins,
     assignments: &[ast::Assignment],
+    from: Option<&ast::UpdateTableFromKind>,
     selection: Option<&ast::Expr>,
     returning_items: Option<&[ast::SelectItem]>,
     xid: Xid,
@@ -231,14 +372,23 @@ pub(super) fn execute_update(
         .catalog
         .require_table(&normalize_unqualified_object_name(table_name)?)?
         .clone();
-    let returning = build_returning_plan(
+    let from = match from {
+        None => &[][..],
+        Some(ast::UpdateTableFromKind::AfterSet(from)) => from.as_slice(),
+        Some(ast::UpdateTableFromKind::BeforeSet(_)) => {
+            return reject_unsupported("UPDATE FROM before SET is not implemented");
+        }
+    };
+    let scope = create_mutation_scope(
         state,
         &schema,
         alias.as_ref().map(|alias| &alias.name),
-        returning_items,
+        from,
     )?;
+    let returning =
+        build_returning_plan(state, scope.clone(), schema.columns.len(), returning_items)?;
     if let Some(selection) = selection {
-        let base = infer_expression_type(selection, RowScope::Table(&schema))?;
+        let base = query::infer_query_expression_type(state, selection, &scope)?.base;
         if base != BaseType::Bool && !is_null_literal(selection) {
             return Err(PgError::create(
                 SqlState::DatatypeMismatch,
@@ -274,7 +424,7 @@ pub(super) fn execute_update(
                 && !is_null_literal(&assignment.value)
                 && extract_unknown_string_literal(&assignment.value).is_none()
                 && !coercion::can_cast(
-                    infer_expression_type(&assignment.value, RowScope::Table(&schema))?,
+                    query::infer_query_expression_type(state, &assignment.value, &scope)?.base,
                     schema.columns[index].data_type.base,
                     CastContext::Assignment,
                 )
@@ -287,6 +437,15 @@ pub(super) fn execute_update(
             Ok((index, &assignment.value))
         })
         .collect::<Result<Vec<_>>>()?;
+    let source_rows = materialize_mutation_source_rows(
+        state,
+        from,
+        &scope,
+        schema.columns.len(),
+        xid,
+        snapshot,
+        context,
+    )?;
     let targets = state
         .tables
         .get(&schema.id)
@@ -297,26 +456,28 @@ pub(super) fn execute_update(
             else {
                 return Ok(targets);
             };
-            if let Some(selection) = selection {
-                match evaluate(selection, RowScope::Table(&schema), &version.row, context)? {
-                    Value::Bool(true) => {}
-                    Value::Bool(false) | Value::Null => return Ok(targets),
-                    _ => unreachable!("WHERE expression was type-checked"),
+            for source_row in &source_rows {
+                let mut row = source_row.clone();
+                row[..schema.columns.len()].clone_from_slice(&version.row);
+                if matches_mutation_row(state, selection, &scope, &row, xid, snapshot, context)? {
+                    targets.push((row_id, version.xmin, version.row.clone(), row));
+                    break;
                 }
             }
-            targets.push((row_id, version.xmin, version.row.clone()));
             Ok(targets)
         })?;
     let affected = targets.len() as u64;
     let mut returned_rows = Vec::new();
-    for (row_id, version_xmin, row) in targets {
+    for (row_id, version_xmin, row, mut bound_row) in targets {
         let mut updated = row.clone();
         for (index, expression) in &assignments {
             let target = schema.columns[*index].data_type;
             updated[*index] = if is_default_expression(expression) {
                 evaluate_column_default(&schema.columns[*index], context)?
             } else {
-                evaluate_assignment_expression(expression, target, &schema, &row, context)?
+                evaluate_mutation_assignment(
+                    state, expression, target, &scope, &bound_row, xid, snapshot, context,
+                )?
             };
         }
         validate_not_null(&schema, &updated)?;
@@ -361,10 +522,11 @@ pub(super) fn execute_update(
             &mut BTreeSet::new(),
             context,
         )?;
+        bound_row[..schema.columns.len()].clone_from_slice(&updated);
         evaluate_returning_row(
             state,
             returning.as_ref(),
-            &updated,
+            &bound_row,
             &mut returned_rows,
             xid,
             snapshot,
@@ -383,11 +545,7 @@ pub(super) fn execute_delete(
     defer_all: bool,
     context: &StatementExecutionContext,
 ) -> Result<StatementResult> {
-    if !delete.tables.is_empty()
-        || delete.using.is_some()
-        || !delete.order_by.is_empty()
-        || delete.limit.is_some()
-    {
+    if !delete.tables.is_empty() || !delete.order_by.is_empty() || delete.limit.is_some() {
         return reject_unsupported("DELETE feature is not implemented");
     }
     let ast::FromTable::WithFromKeyword(from) = &delete.from else {
@@ -412,14 +570,21 @@ pub(super) fn execute_delete(
         .catalog
         .require_table(&normalize_unqualified_object_name(table_name)?)?
         .clone();
-    let returning = build_returning_plan(
+    let using = delete.using.as_deref().unwrap_or_default();
+    let scope = create_mutation_scope(
         state,
         &schema,
         alias.as_ref().map(|alias| &alias.name),
+        using,
+    )?;
+    let returning = build_returning_plan(
+        state,
+        scope.clone(),
+        schema.columns.len(),
         delete.returning.as_deref(),
     )?;
     if let Some(selection) = &delete.selection {
-        let base = infer_expression_type(selection, RowScope::Table(&schema))?;
+        let base = query::infer_query_expression_type(state, selection, &scope)?.base;
         if base != BaseType::Bool && !is_null_literal(selection) {
             return Err(PgError::create(
                 SqlState::DatatypeMismatch,
@@ -427,6 +592,15 @@ pub(super) fn execute_delete(
             ));
         }
     }
+    let source_rows = materialize_mutation_source_rows(
+        state,
+        using,
+        &scope,
+        schema.columns.len(),
+        xid,
+        snapshot,
+        context,
+    )?;
     let targets = state
         .tables
         .get(&schema.id)
@@ -437,19 +611,27 @@ pub(super) fn execute_delete(
             else {
                 return Ok(targets);
             };
-            if let Some(selection) = &delete.selection {
-                match evaluate(selection, RowScope::Table(&schema), &version.row, context)? {
-                    Value::Bool(true) => {}
-                    Value::Bool(false) | Value::Null => return Ok(targets),
-                    _ => unreachable!("WHERE expression was type-checked"),
+            for source_row in &source_rows {
+                let mut row = source_row.clone();
+                row[..schema.columns.len()].clone_from_slice(&version.row);
+                if matches_mutation_row(
+                    state,
+                    delete.selection.as_ref(),
+                    &scope,
+                    &row,
+                    xid,
+                    snapshot,
+                    context,
+                )? {
+                    targets.push((row_id, version.xmin, version.row.clone(), row));
+                    break;
                 }
             }
-            targets.push((row_id, version.xmin, version.row.clone()));
             Ok(targets)
         })?;
     let affected = targets.len() as u64;
     let mut returned_rows = Vec::new();
-    for (row_id, version_xmin, row) in targets {
+    for (row_id, version_xmin, row, bound_row) in targets {
         apply_referencing_foreign_key_actions(
             state,
             &schema,
@@ -470,7 +652,7 @@ pub(super) fn execute_delete(
         evaluate_returning_row(
             state,
             returning.as_ref(),
-            &row,
+            &bound_row,
             &mut returned_rows,
             xid,
             snapshot,

@@ -2,7 +2,6 @@
 
 use std::ops::ControlFlow;
 
-use ast::VisitMut as _;
 use sqlparser::ast;
 
 use crate::{
@@ -59,6 +58,93 @@ fn get_table_alias(table: &ast::TableFactor) -> Option<&ast::Ident> {
     alias.as_ref().map(|alias| &alias.name)
 }
 
+fn get_update_from(update: &ast::Update) -> Result<&[ast::TableWithJoins]> {
+    match &update.from {
+        None => Ok(&[]),
+        Some(ast::UpdateTableFromKind::AfterSet(from)) => Ok(from),
+        Some(ast::UpdateTableFromKind::BeforeSet(_)) => {
+            reject_unsupported("UPDATE FROM before SET is not implemented")
+        }
+    }
+}
+
+fn bind_update_scope(update: &ast::Update, catalog: &Catalog) -> Result<executor::BoundScope> {
+    let schema = resolve_table_schema(&update.table.relation, catalog)?;
+    Ok(executor::combine_bound_scopes(
+        executor::bind_target_scope(schema, get_table_alias(&update.table.relation)),
+        executor::bind_from_scope(catalog, get_update_from(update)?)?,
+    ))
+}
+
+fn bind_delete_scope(
+    delete: &ast::Delete,
+    schema: &TableSchema,
+    target: &ast::TableFactor,
+    catalog: &Catalog,
+) -> Result<executor::BoundScope> {
+    Ok(executor::combine_bound_scopes(
+        executor::bind_target_scope(schema, get_table_alias(target)),
+        executor::bind_from_scope(catalog, delete.using.as_deref().unwrap_or_default())?,
+    ))
+}
+
+fn infer_query_parameters(
+    query: &ast::Query,
+    catalog: &Catalog,
+    expected: Option<&[BaseType]>,
+    types: &mut [Option<BaseType>],
+) -> Result<()> {
+    let ast::SetExpr::Select(select) = query.body.as_ref() else {
+        return Ok(());
+    };
+    let bound = executor::bind_query_scope(catalog, select)?;
+    let scope = executor::RowScope::Bound(&bound);
+    if let Some(selection) = &select.selection {
+        infer_expression_parameters(selection, scope, Some(BaseType::Bool), types)?;
+    }
+    let positional_expected = expected.filter(|expected| {
+        expected.len() == select.projection.len()
+            && select.projection.iter().all(|item| {
+                matches!(
+                    item,
+                    ast::SelectItem::UnnamedExpr(_) | ast::SelectItem::ExprWithAlias { .. }
+                )
+            })
+    });
+    for (index, item) in select.projection.iter().enumerate() {
+        if let ast::SelectItem::UnnamedExpr(expression)
+        | ast::SelectItem::ExprWithAlias {
+            expr: expression, ..
+        } = item
+        {
+            infer_expression_parameters(
+                expression,
+                scope,
+                positional_expected.map(|expected| expected[index]),
+                types,
+            )?;
+        }
+    }
+    if let Some(order_by) = &query.order_by
+        && let ast::OrderByKind::Expressions(orders) = &order_by.kind
+    {
+        for order in orders {
+            if !is_projection_alias(&order.expr, &select.projection) {
+                infer_expression_parameters(&order.expr, scope, None, types)?;
+            }
+        }
+    }
+    if let Some(ast::LimitClause::LimitOffset { limit, offset, .. }) = &query.limit_clause {
+        if let Some(limit) = limit {
+            infer_expression_parameters(limit, scope, Some(BaseType::Int8), types)?;
+        }
+        if let Some(offset) = offset {
+            infer_expression_parameters(&offset.value, scope, Some(BaseType::Int8), types)?;
+        }
+    }
+    Ok(())
+}
+
 pub(crate) fn infer_parameter_types(
     statement: &ast::Statement,
     catalog: &Catalog,
@@ -89,26 +175,32 @@ pub(crate) fn infer_parameter_types(
                     })
                     .collect::<Result<Vec<_>>>()?
             };
-            if let Some(source) = &insert.source
-                && let ast::SetExpr::Values(values) = source.body.as_ref()
-            {
-                for row in &values.rows {
-                    if row.len() != columns.len() {
-                        return Err(PgError::create(
-                            SqlState::SyntaxError,
-                            "INSERT has wrong number of values",
-                        ));
+            if let Some(source) = &insert.source {
+                if let ast::SetExpr::Values(values) = source.body.as_ref() {
+                    for row in &values.rows {
+                        if row.len() != columns.len() {
+                            return Err(PgError::create(
+                                SqlState::SyntaxError,
+                                "INSERT has wrong number of values",
+                            ));
+                        }
+                        for (expression, column) in row.iter().zip(&columns) {
+                            infer_expression_parameters(
+                                expression,
+                                executor::RowScope::Table(
+                                    &executor::create_constant_expression_schema(),
+                                ),
+                                Some(schema.columns[*column].data_type.base),
+                                &mut types,
+                            )?;
+                        }
                     }
-                    for (expression, column) in row.iter().zip(&columns) {
-                        infer_expression_parameters(
-                            expression,
-                            executor::RowScope::Table(
-                                &executor::create_constant_expression_schema(),
-                            ),
-                            Some(schema.columns[*column].data_type.base),
-                            &mut types,
-                        )?;
-                    }
+                } else {
+                    let expected = columns
+                        .iter()
+                        .map(|column| schema.columns[*column].data_type.base)
+                        .collect::<Vec<_>>();
+                    infer_query_parameters(source, catalog, Some(&expected), &mut types)?;
                 }
             }
             let returning_scope = executor::bind_target_scope(
@@ -123,6 +215,8 @@ pub(crate) fn infer_parameter_types(
         }
         ast::Statement::Update(update) => {
             let schema = resolve_table_schema(&update.table.relation, catalog)?;
+            let bound = bind_update_scope(update, catalog)?;
+            let scope = executor::RowScope::Bound(&bound);
             for assignment in &update.assignments {
                 let ast::AssignmentTarget::ColumnName(name) = &assignment.target else {
                     continue;
@@ -140,26 +234,15 @@ pub(crate) fn infer_parameter_types(
                     })?;
                 infer_expression_parameters(
                     &assignment.value,
-                    executor::RowScope::Table(schema),
+                    scope,
                     Some(column.data_type.base),
                     &mut types,
                 )?;
             }
             if let Some(selection) = &update.selection {
-                infer_expression_parameters(
-                    selection,
-                    executor::RowScope::Table(schema),
-                    Some(BaseType::Bool),
-                    &mut types,
-                )?;
+                infer_expression_parameters(selection, scope, Some(BaseType::Bool), &mut types)?;
             }
-            let returning_scope =
-                executor::bind_target_scope(schema, get_table_alias(&update.table.relation));
-            infer_returning_parameters(
-                update.returning.as_deref(),
-                executor::RowScope::Bound(&returning_scope),
-                &mut types,
-            )?;
+            infer_returning_parameters(update.returning.as_deref(), scope, &mut types)?;
         }
         ast::Statement::Delete(delete) => {
             let ast::FromTable::WithFromKeyword(from) = &delete.from else {
@@ -167,66 +250,20 @@ pub(crate) fn infer_parameter_types(
             };
             if let Some(first) = from.first() {
                 let schema = resolve_table_schema(&first.relation, catalog)?;
+                let bound = bind_delete_scope(delete, schema, &first.relation, catalog)?;
+                let scope = executor::RowScope::Bound(&bound);
                 if let Some(selection) = &delete.selection {
                     infer_expression_parameters(
                         selection,
-                        executor::RowScope::Table(schema),
+                        scope,
                         Some(BaseType::Bool),
                         &mut types,
                     )?;
                 }
-                let returning_scope =
-                    executor::bind_target_scope(schema, get_table_alias(&first.relation));
-                infer_returning_parameters(
-                    delete.returning.as_deref(),
-                    executor::RowScope::Bound(&returning_scope),
-                    &mut types,
-                )?;
+                infer_returning_parameters(delete.returning.as_deref(), scope, &mut types)?;
             }
         }
-        ast::Statement::Query(query) => {
-            let ast::SetExpr::Select(select) = query.body.as_ref() else {
-                return Ok(finalize_parameter_types(types));
-            };
-            let bound = executor::bind_query_scope(catalog, select)?;
-            let schema = executor::RowScope::Bound(&bound);
-            if let Some(selection) = &select.selection {
-                infer_expression_parameters(selection, schema, Some(BaseType::Bool), &mut types)?;
-            }
-            for item in &select.projection {
-                match item {
-                    ast::SelectItem::UnnamedExpr(expression)
-                    | ast::SelectItem::ExprWithAlias {
-                        expr: expression, ..
-                    } => {
-                        infer_expression_parameters(expression, schema, None, &mut types)?;
-                    }
-                    _ => {}
-                }
-            }
-            if let Some(order_by) = &query.order_by
-                && let ast::OrderByKind::Expressions(orders) = &order_by.kind
-            {
-                for order in orders {
-                    if !is_projection_alias(&order.expr, &select.projection) {
-                        infer_expression_parameters(&order.expr, schema, None, &mut types)?;
-                    }
-                }
-            }
-            if let Some(ast::LimitClause::LimitOffset { limit, offset, .. }) = &query.limit_clause {
-                if let Some(limit) = limit {
-                    infer_expression_parameters(limit, schema, Some(BaseType::Int8), &mut types)?;
-                }
-                if let Some(offset) = offset {
-                    infer_expression_parameters(
-                        &offset.value,
-                        schema,
-                        Some(BaseType::Int8),
-                        &mut types,
-                    )?;
-                }
-            }
-        }
+        ast::Statement::Query(query) => infer_query_parameters(query, catalog, None, &mut types)?,
         _ => {}
     }
     let types = finalize_parameter_types(types);
@@ -240,17 +277,47 @@ pub(crate) fn substitute_typed_subqueries(
     catalog: &Catalog,
 ) -> Result<ast::Statement> {
     let mut statement = statement.clone();
-    if let ast::Statement::Query(query) = &statement
-        && let ast::SetExpr::Select(select) = query.body.as_ref()
-    {
-        let outer = executor::bind_query_scope(catalog, select)?;
-        let mut describer = TypedSubquerySubstituter {
-            catalog,
-            outer: &outer,
-            error: None,
-        };
-        let _ = statement.visit(&mut describer);
-        return describer.error.map_or(Ok(statement), Err);
+    if let ast::Statement::Insert(insert) = &mut statement {
+        if let Some(source) = &mut insert.source
+            && let ast::SetExpr::Select(select) = source.body.as_ref()
+        {
+            let outer = executor::bind_query_scope(catalog, select)?;
+            substitute_scoped_subqueries(source.as_mut(), catalog, &outer)?;
+        }
+        if let Some(returning) = &mut insert.returning {
+            let schema =
+                catalog.require_table(&executor::resolve_insert_table_name(&insert.table)?)?;
+            let outer = executor::bind_target_scope(
+                schema,
+                insert.table_alias.as_ref().map(|alias| &alias.alias),
+            );
+            substitute_scoped_subqueries(returning, catalog, &outer)?;
+        }
+        return Ok(statement);
+    }
+    let outer = match &statement {
+        ast::Statement::Query(query) => match query.body.as_ref() {
+            ast::SetExpr::Select(select) => Some(executor::bind_query_scope(catalog, select)?),
+            _ => None,
+        },
+        ast::Statement::Update(update) => Some(bind_update_scope(update, catalog)?),
+        ast::Statement::Delete(delete) => {
+            let ast::FromTable::WithFromKeyword(from) = &delete.from else {
+                return Ok(statement);
+            };
+            match from.first() {
+                Some(first) => {
+                    let schema = resolve_table_schema(&first.relation, catalog)?;
+                    Some(bind_delete_scope(delete, schema, &first.relation, catalog)?)
+                }
+                None => None,
+            }
+        }
+        _ => None,
+    };
+    if let Some(outer) = &outer {
+        substitute_scoped_subqueries(&mut statement, catalog, outer)?;
+        return Ok(statement);
     }
     let mut error = None;
     let _ = ast::visit_expressions_mut(&mut statement, |expression| {
@@ -310,6 +377,20 @@ pub(crate) fn substitute_typed_subqueries(
         ControlFlow::Continue(())
     });
     error.map_or(Ok(statement), Err)
+}
+
+fn substitute_scoped_subqueries<V: ast::VisitMut>(
+    value: &mut V,
+    catalog: &Catalog,
+    outer: &executor::BoundScope,
+) -> Result<()> {
+    let mut describer = TypedSubquerySubstituter {
+        catalog,
+        outer,
+        error: None,
+    };
+    let _ = value.visit(&mut describer);
+    describer.error.map_or(Ok(()), Err)
 }
 
 struct TypedSubquerySubstituter<'a> {
@@ -647,18 +728,51 @@ fn validate_statement(statement: &ast::Statement, catalog: &Catalog) -> Result<(
                     })
                     .collect::<Result<Vec<_>>>()?
             };
-            if let Some(source) = &insert.source
-                && let ast::SetExpr::Values(values) = source.body.as_ref()
-            {
-                for row in &values.rows {
-                    for (expression, column) in row.iter().zip(&columns) {
-                        validate_assignment(
-                            expression,
-                            schema.columns[*column].data_type,
-                            executor::RowScope::Table(
-                                &executor::create_constant_expression_schema(),
-                            ),
-                        )?;
+            if let Some(source) = &insert.source {
+                if let ast::SetExpr::Values(values) = source.body.as_ref() {
+                    for row in &values.rows {
+                        if row.len() != columns.len() {
+                            return Err(PgError::create(
+                                SqlState::SyntaxError,
+                                "INSERT has wrong number of values",
+                            ));
+                        }
+                        for (expression, column) in row.iter().zip(&columns) {
+                            validate_assignment(
+                                expression,
+                                schema.columns[*column].data_type,
+                                executor::RowScope::Table(
+                                    &executor::create_constant_expression_schema(),
+                                ),
+                            )?;
+                        }
+                    }
+                } else {
+                    validate_statement(&ast::Statement::Query(source.clone()), catalog)?;
+                    let output = executor::infer_query_output_columns(catalog, source)?;
+                    if output.len() != columns.len() {
+                        return Err(PgError::create(
+                            SqlState::SyntaxError,
+                            "INSERT has wrong number of values",
+                        ));
+                    }
+                    let unknown_columns =
+                        executor::identify_unknown_query_columns(source, columns.len());
+                    for (((_, source_type), unknown), column) in
+                        output.iter().zip(&unknown_columns).zip(&columns)
+                    {
+                        if !*unknown
+                            && !coercion::can_cast(
+                                source_type.base,
+                                schema.columns[*column].data_type.base,
+                                CastContext::Assignment,
+                            )
+                        {
+                            return Err(PgError::create(
+                                SqlState::DatatypeMismatch,
+                                "column has incompatible type",
+                            ));
+                        }
                     }
                 }
             }
@@ -673,12 +787,10 @@ fn validate_statement(statement: &ast::Statement, catalog: &Catalog) -> Result<(
         }
         ast::Statement::Update(update) => {
             let schema = resolve_table_schema(&update.table.relation, catalog)?;
+            let bound = bind_update_scope(update, catalog)?;
+            let scope = executor::RowScope::Bound(&bound);
             if let Some(selection) = &update.selection {
-                validate_boolean(
-                    selection,
-                    executor::RowScope::Table(schema),
-                    "WHERE requires a boolean expression",
-                )?;
+                validate_boolean(selection, scope, "WHERE requires a boolean expression")?;
             }
             for assignment in &update.assignments {
                 let ast::AssignmentTarget::ColumnName(name) = &assignment.target else {
@@ -695,18 +807,9 @@ fn validate_statement(statement: &ast::Statement, catalog: &Catalog) -> Result<(
                             format!("column {name:?} does not exist"),
                         )
                     })?;
-                validate_assignment(
-                    &assignment.value,
-                    column.data_type,
-                    executor::RowScope::Table(schema),
-                )?;
+                validate_assignment(&assignment.value, column.data_type, scope)?;
             }
-            let returning_scope =
-                executor::bind_target_scope(schema, get_table_alias(&update.table.relation));
-            validate_returning_items(
-                update.returning.as_deref(),
-                executor::RowScope::Bound(&returning_scope),
-            )?;
+            validate_returning_items(update.returning.as_deref(), scope)?;
         }
         ast::Statement::Delete(delete) => {
             let ast::FromTable::WithFromKeyword(from) = &delete.from else {
@@ -714,19 +817,12 @@ fn validate_statement(statement: &ast::Statement, catalog: &Catalog) -> Result<(
             };
             if let Some(first) = from.first() {
                 let schema = resolve_table_schema(&first.relation, catalog)?;
+                let bound = bind_delete_scope(delete, schema, &first.relation, catalog)?;
+                let scope = executor::RowScope::Bound(&bound);
                 if let Some(selection) = &delete.selection {
-                    validate_boolean(
-                        selection,
-                        executor::RowScope::Table(schema),
-                        "WHERE requires a boolean expression",
-                    )?;
+                    validate_boolean(selection, scope, "WHERE requires a boolean expression")?;
                 }
-                let returning_scope =
-                    executor::bind_target_scope(schema, get_table_alias(&first.relation));
-                validate_returning_items(
-                    delete.returning.as_deref(),
-                    executor::RowScope::Bound(&returning_scope),
-                )?;
+                validate_returning_items(delete.returning.as_deref(), scope)?;
             }
         }
         ast::Statement::Query(query) => {

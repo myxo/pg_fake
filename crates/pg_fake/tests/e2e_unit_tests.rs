@@ -890,6 +890,83 @@ fn matches_insert_update_and_delete_returning() {
 }
 
 #[test]
+fn matches_query_sourced_and_joined_mutations() {
+    assert_differential(
+        "CREATE TABLE __TABLE__ (
+             id INTEGER PRIMARY KEY,
+             label TEXT NOT NULL,
+             amount SMALLINT NOT NULL DEFAULT 1 CHECK (amount >= 0)
+         ); \
+         CREATE TABLE __TABLE___source (
+             source_id INTEGER,
+             target_id INTEGER,
+             label TEXT,
+             delta INTEGER
+         ); \
+         INSERT INTO __TABLE__ VALUES (1, 'old-one', 10), (2, 'old-two', 20); \
+         INSERT INTO __TABLE___source VALUES
+             (11, 1, 'joined-one', 5),
+             (12, 1, 'joined-one', 5),
+             (13, 2, 'joined-two', 3); \
+         INSERT INTO __TABLE__ (id, label)
+             SELECT source_id, label FROM __TABLE___source WHERE source_id <= 12
+             RETURNING *; \
+         INSERT INTO __TABLE__ (id, label)
+             SELECT source_id + 100, label FROM __TABLE___source WHERE FALSE
+             RETURNING *; \
+         UPDATE __TABLE__ AS target
+             SET amount = target.amount + source.delta, label = source.label
+             FROM __TABLE___source AS source
+             WHERE target.id = source.target_id
+             RETURNING target.id, target.amount; \
+         UPDATE __TABLE__ AS target
+             SET amount = (SELECT target.amount + source.delta)
+             FROM __TABLE___source AS source
+             WHERE EXISTS (SELECT 1 WHERE target.id = source.target_id)
+               AND target.id = 2
+             RETURNING target.id, target.amount, source.delta; \
+         UPDATE __TABLE__ AS target
+             SET amount = target.amount + source.delta
+             FROM __TABLE___source AS source
+             WHERE target.id = source.source_id
+             RETURNING target.*, source.target_id; \
+         DELETE FROM __TABLE__ AS target
+             USING __TABLE___source AS source
+             WHERE EXISTS (SELECT 1 WHERE target.id = source.source_id)
+             RETURNING target.*, source.target_id; \
+         SELECT * FROM __TABLE__ ORDER BY id",
+        RowOrder::Unordered,
+    );
+}
+
+#[test]
+fn preserves_joined_mutation_atomicity_and_transactions() {
+    assert_differential(
+        "CREATE TABLE __TABLE__ (
+             id INTEGER PRIMARY KEY,
+             value INTEGER NOT NULL CHECK (value >= 0)
+         ); \
+         CREATE TABLE __TABLE___source (id INTEGER, value INTEGER); \
+         INSERT INTO __TABLE__ VALUES (1, 10), (2, 20); \
+         INSERT INTO __TABLE___source VALUES (3, 30), (1, 40); \
+         INSERT INTO __TABLE__ SELECT * FROM __TABLE___source RETURNING *; \
+         SELECT * FROM __TABLE__ ORDER BY id; \
+         BEGIN; \
+         UPDATE __TABLE__ AS target SET value = source.value
+             FROM __TABLE___source AS source WHERE target.id = source.id
+             RETURNING target.*, source.value; \
+         DELETE FROM __TABLE__ AS target USING __TABLE___source AS source
+             WHERE target.id = source.id RETURNING target.*, source.value; \
+         ROLLBACK; \
+         SELECT * FROM __TABLE__ ORDER BY id; \
+         UPDATE __TABLE__ AS target SET value = source.value
+             FROM __TABLE___source AS source WHERE id = id; \
+         SELECT * FROM __TABLE__ ORDER BY id",
+        RowOrder::Unordered,
+    );
+}
+
+#[test]
 fn preserves_returning_statement_atomicity() {
     assert_differential(
         "CREATE TABLE __TABLE__ (id INTEGER PRIMARY KEY, value INTEGER UNIQUE); \
@@ -994,6 +1071,102 @@ fn reports_returning_metadata_and_prepared_results() {
             .unwrap()
             .rows,
         vec![vec![Value::Int4(1), Value::Text("second".into())]]
+    );
+}
+
+#[test]
+fn reports_prepared_joined_mutation_types_and_results() {
+    let db = Db::create();
+    let mut session = db.create_session();
+    session
+        .execute(
+            "CREATE TABLE prepared_mutation_target (id INTEGER PRIMARY KEY, label VARCHAR(10));
+             CREATE TABLE prepared_mutation_source (id INTEGER, label VARCHAR(10));
+             INSERT INTO prepared_mutation_source VALUES (1, 'source')",
+        )
+        .unwrap();
+
+    let insert = session
+        .prepare(
+            "INSERT INTO prepared_mutation_target (id, label)
+             SELECT $1, $2 WHERE $3 RETURNING id, label",
+        )
+        .unwrap();
+    assert_eq!(
+        insert.get_parameter_types(),
+        &[BaseType::Int4, BaseType::Varchar, BaseType::Bool]
+    );
+    assert_eq!(
+        session
+            .query_prepared(
+                &insert,
+                &[
+                    Value::Int4(1),
+                    Value::Text("inserted".into()),
+                    Value::Bool(true),
+                ],
+            )
+            .unwrap()
+            .rows,
+        vec![vec![Value::Int4(1), Value::Text("inserted".into())]]
+    );
+
+    let correlated_insert = session
+        .prepare(
+            "INSERT INTO prepared_mutation_target (id, label)
+             SELECT source.id + 1, (SELECT source.label)
+             FROM prepared_mutation_source AS source WHERE source.id = $1
+             RETURNING id, (SELECT label) AS label",
+        )
+        .unwrap();
+    assert_eq!(correlated_insert.get_parameter_types(), &[BaseType::Int4]);
+    assert_eq!(
+        session
+            .query_prepared(&correlated_insert, &[Value::Int4(1)])
+            .unwrap()
+            .rows,
+        vec![vec![Value::Int4(2), Value::Text("source".into())]]
+    );
+
+    let update = session
+        .prepare(
+            "UPDATE prepared_mutation_target AS target SET label = (SELECT source.label)
+             FROM prepared_mutation_source AS source
+             WHERE EXISTS (SELECT 1 WHERE target.id = source.id) AND source.id = $1
+             RETURNING target.id, source.label",
+        )
+        .unwrap();
+    assert_eq!(update.get_parameter_types(), &[BaseType::Int4]);
+    assert_eq!(
+        update
+            .get_result_columns()
+            .iter()
+            .map(|column| (column.name.as_str(), column.type_oid, column.typmod))
+            .collect::<Vec<_>>(),
+        vec![("id", 23, -1), ("label", 1043, 14)]
+    );
+    assert_eq!(
+        session
+            .query_prepared(&update, &[Value::Int4(1)])
+            .unwrap()
+            .rows,
+        vec![vec![Value::Int4(1), Value::Text("source".into())]]
+    );
+
+    let delete = session
+        .prepare(
+            "DELETE FROM prepared_mutation_target AS target
+             USING prepared_mutation_source AS source
+             WHERE EXISTS (SELECT 1 WHERE target.id = source.id) AND source.id = $1
+             RETURNING target.id, source.label",
+        )
+        .unwrap();
+    assert_eq!(
+        session
+            .query_prepared(&delete, &[Value::Int4(1)])
+            .unwrap()
+            .rows,
+        vec![vec![Value::Int4(1), Value::Text("source".into())]]
     );
 }
 

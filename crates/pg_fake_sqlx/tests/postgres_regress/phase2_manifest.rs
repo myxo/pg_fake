@@ -214,17 +214,43 @@ pub const FEATURES: &[Feature] = &[
     },
     Feature {
         name: "query-sourced mutations",
-        cases: &[Case {
-            id: "insert_select",
-            source: "returning.sql:25",
-            setup: &[
-                "CREATE TABLE mutation_source (id INTEGER)",
-                "CREATE TABLE mutation_target (id INTEGER)",
-                "INSERT INTO mutation_source VALUES (1)",
-            ],
-            sql: "INSERT INTO mutation_target SELECT id FROM mutation_source",
-            baseline: Baseline::Pending,
-        }],
+        cases: &[
+            Case {
+                id: "insert_select",
+                source: "returning.sql:25",
+                setup: &[
+                    "CREATE TABLE mutation_source (id INTEGER)",
+                    "CREATE TABLE mutation_target (id INTEGER)",
+                    "INSERT INTO mutation_source VALUES (1)",
+                ],
+                sql: "INSERT INTO mutation_target SELECT id FROM mutation_source",
+                baseline: Baseline::MustPass,
+            },
+            Case {
+                id: "update_from",
+                source: "returning.sql:44",
+                setup: &[
+                    "CREATE TABLE update_source (id INTEGER, amount INTEGER)",
+                    "CREATE TABLE update_target (id INTEGER, amount INTEGER)",
+                    "INSERT INTO update_source VALUES (1, 20)",
+                    "INSERT INTO update_target VALUES (1, 10)",
+                ],
+                sql: "UPDATE update_target AS target SET amount = source.amount FROM update_source AS source WHERE target.id = source.id RETURNING target.*, source.amount",
+                baseline: Baseline::MustPass,
+            },
+            Case {
+                id: "delete_using",
+                source: "returning.sql:51",
+                setup: &[
+                    "CREATE TABLE delete_source (id INTEGER)",
+                    "CREATE TABLE delete_target (id INTEGER)",
+                    "INSERT INTO delete_source VALUES (1)",
+                    "INSERT INTO delete_target VALUES (1)",
+                ],
+                sql: "DELETE FROM delete_target AS target USING delete_source AS source WHERE target.id = source.id RETURNING target.*, source.id",
+                baseline: Baseline::MustPass,
+            },
+        ],
     },
     Feature {
         name: "sequences",

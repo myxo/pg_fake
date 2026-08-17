@@ -36,12 +36,12 @@ use arithmetic::{
 };
 use expressions::{
     compare_values, evaluate, evaluate_and_coerce, evaluate_assignment_expression,
-    evaluate_column_default, evaluate_comparison, extract_number_literal,
-    extract_unknown_string_literal, is_default_expression, validate_check_constraint_types,
-    validate_check_constraints, validate_not_null,
+    evaluate_column_default, evaluate_comparison, extract_number_literal, is_default_expression,
+    validate_check_constraint_types, validate_check_constraints, validate_not_null,
 };
 pub(crate) use expressions::{
-    create_constant_expression_schema, infer_expression_type, is_null_literal,
+    create_constant_expression_schema, extract_unknown_string_literal, infer_expression_type,
+    is_null_literal,
 };
 use foreign_keys::{
     apply_referencing_foreign_key_actions, convert_referential_action,
@@ -53,7 +53,8 @@ pub(crate) use locks::collect_required_row_locks;
 pub(crate) use scope::infer_query_output_columns;
 use scope::{BoundColumn, bind_select_scope};
 pub(crate) use scope::{
-    BoundScope, RowScope, bind_query_scope, bind_target_scope, substitute_typed_subqueries,
+    BoundScope, RowScope, bind_from_scope, bind_query_scope, bind_target_scope,
+    combine_bound_scopes, identify_unknown_query_columns, substitute_typed_subqueries,
 };
 use writes::{execute_delete, execute_insert, execute_update};
 
@@ -322,13 +323,14 @@ pub(crate) fn execute_statement(
             context,
         ),
         ast::Statement::Update(update) => {
-            if update.from.is_some() || update.or.is_some() {
+            if update.or.is_some() {
                 return reject_unsupported("UPDATE feature is not implemented");
             }
             execute_update(
                 state,
                 &update.table,
                 &update.assignments,
+                update.from.as_ref(),
                 update.selection.as_ref(),
                 update.returning.as_deref(),
                 xid,

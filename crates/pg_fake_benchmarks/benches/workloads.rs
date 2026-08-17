@@ -297,6 +297,15 @@ fn update_benchmark(
             runtime,
             "CREATE TABLE update_row (id BIGINT PRIMARY KEY, amount INTEGER)",
         );
+        connection.execute(
+            runtime,
+            "CREATE TABLE update_from_target (id BIGINT PRIMARY KEY, amount INTEGER)",
+        );
+        connection.execute(
+            runtime,
+            "CREATE TABLE update_from_source (id BIGINT PRIMARY KEY, amount INTEGER)",
+        );
+        connection.execute(runtime, "INSERT INTO update_from_source VALUES (1, 1)");
     }
     let mut group = criterion.benchmark_group(benchmarks::find_benchmark("update_row").name);
 
@@ -319,8 +328,39 @@ fn update_benchmark(
         });
     }
     group.finish();
+
+    let mut group = criterion.benchmark_group(benchmarks::find_benchmark("update_from_row").name);
+    for (name, connection) in connections.iter_mut() {
+        group.bench_function(*name, |benchmark| {
+            benchmark.iter_custom(|iterations| {
+                let mut elapsed = Duration::ZERO;
+                for id in 0..iterations {
+                    connection.execute(
+                        runtime,
+                        &format!("INSERT INTO update_from_target VALUES ({id}, 0)"),
+                    );
+                    let update = format!(
+                        "UPDATE update_from_target AS target SET amount = source.amount \
+                         FROM update_from_source AS source WHERE target.id = {id}"
+                    );
+                    let started = Instant::now();
+                    connection.execute(runtime, &update);
+                    elapsed += started.elapsed();
+                    connection.execute(
+                        runtime,
+                        &format!("DELETE FROM update_from_target WHERE id = {id}"),
+                    );
+                }
+                elapsed
+            });
+        });
+    }
+    group.finish();
     for (_, connection) in connections.iter_mut() {
-        connection.execute(runtime, "DROP TABLE update_row");
+        connection.execute(
+            runtime,
+            "DROP TABLE update_row, update_from_target, update_from_source",
+        );
     }
 }
 

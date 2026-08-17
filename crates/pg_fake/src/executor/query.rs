@@ -247,8 +247,64 @@ pub(crate) fn materialize_uncorrelated_subqueries(
     snapshot: &Snapshot,
     context: &StatementExecutionContext,
 ) -> Result<ast::Statement> {
+    let scope = match statement {
+        ast::Statement::Insert(insert) => {
+            let schema = state
+                .catalog
+                .require_table(&resolve_insert_table_name(&insert.table)?)?;
+            Some(bind_target_scope(
+                schema,
+                insert.table_alias.as_ref().map(|alias| &alias.alias),
+            ))
+        }
+        ast::Statement::Update(update) => {
+            let ast::TableFactor::Table { name, alias, .. } = &update.table.relation else {
+                return Ok(statement.clone());
+            };
+            let schema = state
+                .catalog
+                .require_table(&normalize_unqualified_object_name(name)?)?;
+            let from = match &update.from {
+                None => &[][..],
+                Some(ast::UpdateTableFromKind::AfterSet(from)) => from.as_slice(),
+                Some(ast::UpdateTableFromKind::BeforeSet(_)) => &[][..],
+            };
+            Some(combine_bound_scopes(
+                bind_target_scope(schema, alias.as_ref().map(|alias| &alias.name)),
+                bind_from_scope(&state.catalog, from)?,
+            ))
+        }
+        ast::Statement::Delete(delete) => {
+            let ast::FromTable::WithFromKeyword(from) = &delete.from else {
+                return Ok(statement.clone());
+            };
+            let Some(ast::TableWithJoins {
+                relation: ast::TableFactor::Table { name, alias, .. },
+                ..
+            }) = from.first()
+            else {
+                return Ok(statement.clone());
+            };
+            let schema = state
+                .catalog
+                .require_table(&normalize_unqualified_object_name(name)?)?;
+            Some(combine_bound_scopes(
+                bind_target_scope(schema, alias.as_ref().map(|alias| &alias.name)),
+                bind_from_scope(&state.catalog, delete.using.as_deref().unwrap_or_default())?,
+            ))
+        }
+        _ => None,
+    };
     let mut statement = statement.clone();
-    materialize_subqueries(state, &mut statement, xid, snapshot, context, true)?;
+    materialize_subqueries(
+        state,
+        &mut statement,
+        xid,
+        snapshot,
+        context,
+        true,
+        scope.into_iter().collect(),
+    )?;
     Ok(statement)
 }
 
@@ -259,6 +315,7 @@ fn materialize_subqueries<V: ast::VisitMut>(
     snapshot: &Snapshot,
     context: &StatementExecutionContext,
     defer_unresolved: bool,
+    scopes: Vec<BoundScope>,
 ) -> Result<()> {
     let mut materializer = SubqueryMaterializer {
         state,
@@ -267,7 +324,7 @@ fn materialize_subqueries<V: ast::VisitMut>(
         context,
         error: None,
         defer_unresolved,
-        scopes: Vec::new(),
+        scopes,
     };
     let _ = value.visit(&mut materializer);
     if let Some(error) = materializer.error {
@@ -385,7 +442,7 @@ fn references_outer_scope(
     substituter.error.map_or(Ok(substituter.substituted), Err)
 }
 
-fn evaluate_query_expression(
+pub(super) fn evaluate_query_expression(
     state: &DatabaseState,
     expression: &ast::Expr,
     scope: &BoundScope,
@@ -407,7 +464,15 @@ fn evaluate_query_expression(
     if let Some(error) = substituter.error {
         return Err(error);
     }
-    materialize_subqueries(state, &mut expression, xid, snapshot, context, false)?;
+    materialize_subqueries(
+        state,
+        &mut expression,
+        xid,
+        snapshot,
+        context,
+        false,
+        Vec::new(),
+    )?;
     evaluate(&expression, RowScope::Bound(scope), row, context)
 }
 
@@ -444,7 +509,8 @@ pub(crate) fn describe_query_result_columns(
                 schema,
                 insert.table_alias.as_ref().map(|alias| &alias.alias),
             );
-            build_projection_plan(state, returning, &scope).map(|(_, columns)| columns)
+            build_mutation_projection_plan(state, returning, &scope, schema.columns.len())
+                .map(|(_, columns)| columns)
         }
         ast::Statement::Update(update) => {
             let Some(returning) = &update.returning else {
@@ -462,8 +528,17 @@ pub(crate) fn describe_query_result_columns(
             let schema = state
                 .catalog
                 .require_table(&normalize_unqualified_object_name(name)?)?;
-            let scope = bind_target_scope(schema, alias.as_ref().map(|alias| &alias.name));
-            build_projection_plan(state, returning, &scope).map(|(_, columns)| columns)
+            let from = match &update.from {
+                None => &[][..],
+                Some(ast::UpdateTableFromKind::AfterSet(from)) => from.as_slice(),
+                Some(ast::UpdateTableFromKind::BeforeSet(_)) => return Ok(Vec::new()),
+            };
+            let scope = combine_bound_scopes(
+                bind_target_scope(schema, alias.as_ref().map(|alias| &alias.name)),
+                bind_from_scope(&state.catalog, from)?,
+            );
+            build_mutation_projection_plan(state, returning, &scope, schema.columns.len())
+                .map(|(_, columns)| columns)
         }
         ast::Statement::Delete(delete) => {
             let Some(returning) = &delete.returning else {
@@ -488,8 +563,12 @@ pub(crate) fn describe_query_result_columns(
             let schema = state
                 .catalog
                 .require_table(&normalize_unqualified_object_name(name)?)?;
-            let scope = bind_target_scope(schema, alias.as_ref().map(|alias| &alias.name));
-            build_projection_plan(state, returning, &scope).map(|(_, columns)| columns)
+            let scope = combine_bound_scopes(
+                bind_target_scope(schema, alias.as_ref().map(|alias| &alias.name)),
+                bind_from_scope(&state.catalog, delete.using.as_deref().unwrap_or_default())?,
+            );
+            build_mutation_projection_plan(state, returning, &scope, schema.columns.len())
+                .map(|(_, columns)| columns)
         }
         _ => Ok(Vec::new()),
     }
@@ -2387,7 +2466,33 @@ pub(super) fn build_projection_plan<'a>(
     Ok((projections, columns))
 }
 
-fn infer_query_expression_type(
+pub(super) fn build_mutation_projection_plan<'a>(
+    state: &DatabaseState,
+    projection: &'a [ast::SelectItem],
+    scope: &BoundScope,
+    target_columns: usize,
+) -> Result<(Vec<ProjectionSource<'a>>, Vec<ColumnMeta>)> {
+    let mut target_wildcard_scope = scope.clone();
+    for column in &mut target_wildcard_scope.columns[target_columns..] {
+        column.wildcard = false;
+    }
+    let mut projections = Vec::new();
+    let mut columns = Vec::new();
+    for item in projection {
+        let item_scope = if matches!(item, ast::SelectItem::Wildcard(_)) {
+            &target_wildcard_scope
+        } else {
+            scope
+        };
+        let (mut item_projections, mut item_columns) =
+            build_projection_plan(state, std::slice::from_ref(item), item_scope)?;
+        projections.append(&mut item_projections);
+        columns.append(&mut item_columns);
+    }
+    Ok((projections, columns))
+}
+
+pub(super) fn infer_query_expression_type(
     state: &DatabaseState,
     expr: &ast::Expr,
     scope: &BoundScope,
@@ -2404,12 +2509,34 @@ fn materialize_source_rows(
     context: &StatementExecutionContext,
     selection: Option<&ast::Expr>,
 ) -> Result<Vec<Vec<Value>>> {
-    if select.from.is_empty() {
+    materialize_from_rows(
+        state,
+        &select.from,
+        scope,
+        0,
+        xid,
+        snapshot,
+        context,
+        selection,
+    )
+}
+
+pub(super) fn materialize_from_rows(
+    state: &DatabaseState,
+    from: &[ast::TableWithJoins],
+    scope: &BoundScope,
+    start_slot: usize,
+    xid: Xid,
+    snapshot: &Snapshot,
+    context: &StatementExecutionContext,
+    selection: Option<&ast::Expr>,
+) -> Result<Vec<Vec<Value>>> {
+    if from.is_empty() {
         return Ok(vec![Vec::new()]);
     }
-    let mut next_slot = 0;
+    let mut next_slot = start_slot;
     let mut rows = vec![vec![Value::Null; scope.columns.len()]];
-    for table in &select.from {
+    for table in from {
         let source = materialize_table_with_joins_rows(
             state,
             table,

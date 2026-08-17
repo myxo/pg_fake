@@ -192,7 +192,7 @@ fn parse_integer_literal(value: &str) -> Result<Value> {
     Value::parse(BaseType::Numeric, value)
 }
 
-pub(super) fn extract_unknown_string_literal(expr: &ast::Expr) -> Option<&str> {
+pub(crate) fn extract_unknown_string_literal(expr: &ast::Expr) -> Option<&str> {
     match expr {
         ast::Expr::Value(value) => match &value.value {
             ast::Value::SingleQuotedString(value) => Some(value),

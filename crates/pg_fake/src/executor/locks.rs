@@ -29,7 +29,11 @@ pub(crate) fn collect_required_row_locks(
                 state
                     .catalog
                     .require_table(&normalize_unqualified_object_name(table_name)?)?,
-                update.selection.as_ref(),
+                update
+                    .from
+                    .is_none()
+                    .then_some(update.selection.as_ref())
+                    .flatten(),
                 RowLockMode::Update,
             )
         }
@@ -52,7 +56,11 @@ pub(crate) fn collect_required_row_locks(
                 state
                     .catalog
                     .require_table(&normalize_unqualified_object_name(table_name)?)?,
-                delete.selection.as_ref(),
+                delete
+                    .using
+                    .is_none()
+                    .then_some(delete.selection.as_ref())
+                    .flatten(),
                 RowLockMode::Update,
             )
         }
