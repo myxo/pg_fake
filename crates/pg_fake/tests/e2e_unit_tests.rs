@@ -276,6 +276,88 @@ fn matches_explicit_transactions_across_sessions() {
 }
 
 #[test]
+fn matches_sequence_options_functions_and_errors() {
+    assert_differential(
+        "CREATE SEQUENCE __TABLE__ AS smallint INCREMENT BY 3 MINVALUE 10 MAXVALUE 16 START WITH 13 CACHE 8 CYCLE; \
+         SELECT nextval('__TABLE__'); \
+         SELECT nextval('__TABLE__'); \
+         SELECT nextval('__TABLE__'); \
+         SELECT currval('__TABLE__'); \
+         SELECT lastval(); \
+         SELECT setval('__TABLE__', 13); \
+         SELECT currval('__TABLE__'); \
+         SELECT nextval('__TABLE__'); \
+         SELECT setval('__TABLE__', 10, false); \
+         SELECT currval('__TABLE__'); \
+         SELECT nextval('__TABLE__'); \
+         SELECT setval('__TABLE__', 20); \
+         DROP SEQUENCE __TABLE__; \
+         SELECT lastval()",
+        RowOrder::Ordered,
+    );
+}
+
+#[test]
+fn matches_sequence_session_state_and_rollback_consumption() {
+    assert_session_differential(
+        &[
+            (SessionName::First, "CREATE SEQUENCE __TABLE__ START 20"),
+            (SessionName::First, "SELECT nextval('__TABLE__')"),
+            (SessionName::Second, "SELECT currval('__TABLE__')"),
+            (SessionName::Second, "SELECT nextval('__TABLE__')"),
+            (SessionName::First, "SELECT currval('__TABLE__')"),
+            (SessionName::Second, "SELECT currval('__TABLE__')"),
+            (SessionName::First, "BEGIN"),
+            (SessionName::First, "SELECT nextval('__TABLE__')"),
+            (SessionName::First, "ROLLBACK"),
+            (SessionName::Second, "SELECT nextval('__TABLE__')"),
+            (SessionName::First, "SELECT setval('__TABLE__', 50, true)"),
+            (SessionName::First, "SELECT currval('__TABLE__')"),
+            (SessionName::Second, "SELECT currval('__TABLE__')"),
+            (SessionName::First, "DROP SEQUENCE __TABLE__"),
+            (SessionName::First, "CREATE SEQUENCE __TABLE__ START 100"),
+            (SessionName::First, "SELECT currval('__TABLE__')"),
+            (SessionName::First, "SELECT nextval('__TABLE__')"),
+        ],
+        RowOrder::Ordered,
+    );
+}
+
+#[test]
+fn matches_sequence_validation_sqlstates() {
+    assert_differential(
+        "CREATE SEQUENCE __TABLE___zero INCREMENT 0; \
+         CREATE SEQUENCE __TABLE___bounds MINVALUE 10 MAXVALUE 5; \
+         CREATE SEQUENCE __TABLE___start MINVALUE 1 MAXVALUE 5 START 6; \
+         CREATE SEQUENCE __TABLE___cache CACHE 0; \
+         CREATE SEQUENCE __TABLE___type AS numeric; \
+         CREATE SEQUENCE __TABLE___limited MAXVALUE 2; \
+         SELECT nextval('__TABLE___limited'); \
+         SELECT nextval('__TABLE___limited'); \
+         SELECT nextval('__TABLE___limited'); \
+         SELECT setval('__TABLE___limited', 3); \
+         CREATE SEQUENCE __TABLE___limited; \
+         CREATE TABLE __TABLE___ordinary (id INTEGER); \
+         DROP SEQUENCE __TABLE___ordinary; \
+         SELECT nextval('__TABLE___ordinary')",
+        RowOrder::Ordered,
+    );
+}
+
+#[test]
+fn matches_sequence_defaults_and_failed_insert_gaps() {
+    assert_differential(
+        "CREATE SEQUENCE __TABLE___sequence; \
+         CREATE TABLE __TABLE__ (id BIGINT DEFAULT nextval('__TABLE___sequence'), marker INTEGER UNIQUE); \
+         INSERT INTO __TABLE__ (marker) VALUES (1) RETURNING id; \
+         INSERT INTO __TABLE__ (marker) VALUES (1); \
+         INSERT INTO __TABLE__ (marker) VALUES (2) RETURNING id; \
+         SELECT currval('__TABLE___sequence')",
+        RowOrder::Ordered,
+    );
+}
+
+#[test]
 fn matches_isolation_levels_across_sessions() {
     assert_session_differential(
         &[

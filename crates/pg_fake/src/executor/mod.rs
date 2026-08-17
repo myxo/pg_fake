@@ -27,6 +27,7 @@ mod foreign_keys;
 mod locks;
 mod query;
 mod scope;
+mod sequences;
 mod writes;
 
 use aggregates::{evaluate_aggregate_function, infer_aggregate_return_type, is_aggregate_function};
@@ -37,7 +38,8 @@ use arithmetic::{
 use expressions::{
     compare_values, evaluate, evaluate_and_coerce, evaluate_assignment_expression,
     evaluate_column_default, evaluate_comparison, extract_number_literal, is_default_expression,
-    validate_check_constraint_types, validate_check_constraints, validate_not_null,
+    validate_check_constraint_types, validate_check_constraints, validate_column_default,
+    validate_not_null,
 };
 pub(crate) use expressions::{
     create_constant_expression_schema, extract_unknown_string_literal, infer_expression_type,
@@ -56,6 +58,10 @@ pub(crate) use scope::{
     BoundScope, RowScope, bind_from_scope, bind_query_scope, bind_target_scope,
     combine_bound_scopes, identify_unknown_query_columns, substitute_typed_subqueries,
 };
+pub(crate) use sequences::{
+    SequenceExecutionContext, SequenceSessionState, SequenceSessionStorage, SequenceStorage,
+    SequenceValueState,
+};
 use writes::{execute_delete, execute_insert, execute_update};
 
 #[derive(Clone)]
@@ -64,6 +70,7 @@ pub(crate) struct StatementExecutionContext {
     pub(crate) statement_timestamp: chrono::DateTime<chrono::Utc>,
     pub(crate) clock_timestamp: chrono::DateTime<chrono::Utc>,
     pub(crate) rng: Arc<Mutex<ChaCha12Rng>>,
+    pub(crate) sequences: SequenceExecutionContext,
 }
 
 pub(crate) struct DatabaseState {
@@ -72,6 +79,7 @@ pub(crate) struct DatabaseState {
     pub(crate) transactions: TransactionRegistry,
     pub(crate) row_locks: RowLockManager,
     pub(crate) wait_for: WaitForGraph,
+    pub(crate) sequence_values: SequenceStorage,
 }
 pub(crate) struct RequiredRowLock {
     pub(crate) key: RowLockKey,
@@ -89,6 +97,7 @@ impl DatabaseState {
             transactions: TransactionRegistry::create(),
             row_locks: RowLockManager::create(),
             wait_for: WaitForGraph::create(),
+            sequence_values: Arc::new(Mutex::new(BTreeMap::new())),
         }
     }
 }
@@ -107,7 +116,7 @@ pub(crate) fn execute_statement(
     match &statement {
         ast::Statement::CreateTable(create) => {
             let table_name = normalize_unqualified_object_name(&create.name)?;
-            if create.if_not_exists && state.catalog.require_table(&table_name).is_ok() {
+            if create.if_not_exists && state.catalog.has_relation(&table_name) {
                 return Ok(StatementResult::Affected(0));
             }
             let mut columns = Vec::new();
@@ -179,9 +188,7 @@ pub(crate) fn execute_statement(
                     nullable,
                     default,
                 };
-                if column.default.is_some() {
-                    evaluate_column_default(&column, context)?;
-                }
+                validate_column_default(&column)?;
                 columns.push(column);
             }
             for constraint in &create.constraints {
@@ -293,6 +300,43 @@ pub(crate) fn execute_statement(
             state.tables.insert(id, Table::create(table.clone()));
             Ok(StatementResult::Affected(0))
         }
+        ast::Statement::CreateSequence {
+            temporary,
+            if_not_exists,
+            name,
+            data_type,
+            sequence_options,
+            owned_by,
+        } => {
+            if *temporary {
+                return reject_unsupported("temporary sequences are not implemented");
+            }
+            if owned_by.as_ref().is_some_and(|owned_by| {
+                owned_by.0.len() != 1
+                    || owned_by.0[0]
+                        .as_ident()
+                        .is_none_or(|name| !name.value.eq_ignore_ascii_case("none"))
+            }) {
+                return reject_unsupported("owned sequences are not implemented");
+            }
+            let name = normalize_unqualified_object_name(name)?;
+            if *if_not_exists && state.catalog.has_relation(&name) {
+                return Ok(StatementResult::Affected(0));
+            }
+            let sequence =
+                sequences::create_sequence_schema(name, data_type.as_ref(), sequence_options)?;
+            let initial = SequenceValueState {
+                last_value: sequence.start_value,
+                is_called: false,
+            };
+            let id = state.catalog.create_sequence(sequence)?;
+            state
+                .sequence_values
+                .lock()
+                .expect("sequence storage is poisoned")
+                .insert(id, initial);
+            Ok(StatementResult::Affected(0))
+        }
         ast::Statement::Drop {
             object_type: ast::ObjectType::Table,
             names,
@@ -312,6 +356,29 @@ pub(crate) fn execute_statement(
                 }
             }
             Ok(StatementResult::Affected(affected))
+        }
+        ast::Statement::Drop {
+            object_type: ast::ObjectType::Sequence,
+            names,
+            if_exists,
+            ..
+        } => {
+            for object in names {
+                let name = normalize_unqualified_object_name(object)?;
+                match state.catalog.drop_sequence(&name) {
+                    Ok(sequence) => {
+                        state
+                            .sequence_values
+                            .lock()
+                            .expect("sequence storage is poisoned")
+                            .remove(&sequence.id)
+                            .expect("catalog sequence must have storage");
+                    }
+                    Err(error) if *if_exists && error.sqlstate == SqlState::UndefinedTable => {}
+                    Err(error) => return Err(error),
+                }
+            }
+            Ok(StatementResult::Affected(0))
         }
         ast::Statement::Insert(insert) => execute_insert(
             state,

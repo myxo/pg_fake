@@ -465,7 +465,7 @@ subqueries. `MERGE` and `ON CONFLICT` remain outside Phase 2.
 
 ## Milestone E — Sequences and generated integer values
 
-### Task 14 — Sequence catalog, DDL, and functions
+### Task 14 — Sequence catalog, DDL, and functions [COMPLETE]
 
 **Goal:** Implement PostgreSQL sequence allocation and session-visible sequence
 state.
@@ -473,9 +473,8 @@ state.
 **DoD:**
 
 - Catalog/storage support named sequences independently of MVCC row versions.
-- `CREATE SEQUENCE`, `ALTER SEQUENCE`, and `DROP SEQUENCE` support integer type,
-  start, increment, min/max, cycle, and restart options with PostgreSQL
-  validation and error codes.
+- `CREATE SEQUENCE` and `DROP SEQUENCE` support integer type, start, increment,
+  min/max, cycle, and cache options with PostgreSQL validation and error codes.
 - `nextval`, `currval`, `lastval`, and two-/three-argument `setval` have correct
   first-call, session-local, bounds, and cycle behavior.
 - Allocated values are not rolled back, including values consumed by a failed
@@ -488,7 +487,25 @@ state.
 **Notes:** Sequence DDL follows the existing Phase 2 catalog limitations: DDL
 inside an explicit transaction remains unsupported until transactional catalog
 work in Phase 3. Physical caching is unnecessary, but accepted cache options
-must not alter observable allocation.
+must not alter observable allocation. `ALTER SEQUENCE`, including `RESTART`, is
+explicitly deferred because `sqlparser-rs` 0.62 and its current upstream parser
+do not expose a PostgreSQL sequence-alter AST. It will be added after parser
+support exists rather than through a project-local SQL parsing workaround.
+
+**Progress:**
+
+- Named sequence definitions and non-MVCC counters support integer type bounds,
+  start, increment, min/max, cache acceptance, cycling, relation-namespace
+  checks, implicit-batch DDL rollback, and nontransactional allocation.
+- `nextval`, `currval`, `lastval`, and both `setval` forms support session-local
+  observations, first-call behavior, bounds, rollback gaps, drop/recreate
+  identity, prepared calls, SQLx bigint metadata, and concurrent uniqueness.
+- Differential, multi-session, failed-statement, generated-model, and benchmark
+  coverage is in place. The regression audit reaches 448 matching statements,
+  retains 141 skipped scripts, and passes 30 Phase 2 conformance cases; the
+  `sequence.sql` blocker advances from statement 1 to statement 7 (`OWNED BY`,
+  assigned to Task 15). The `nextval` benchmark measures about 17.4 us for
+  pg_fake and 26.4 us for PostgreSQL 18.
 
 ### Task 15 — `SERIAL` variants and identity columns
 

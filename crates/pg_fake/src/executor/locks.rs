@@ -149,6 +149,13 @@ fn collect_insert_foreign_key_locks(
     let schema = state
         .catalog
         .require_table(&resolve_insert_table_name(&insert.table)?)?;
+    if !schema
+        .constraints
+        .iter()
+        .any(|constraint| matches!(constraint, crate::catalog::Constraint::ForeignKey(_)))
+    {
+        return Ok(Vec::new());
+    }
     let Some(source) = &insert.source else {
         return Ok(Vec::new());
     };

@@ -25,6 +25,7 @@ pub(crate) enum StatementKind {
 pub(crate) fn classify(statement: &ast::Statement) -> StatementKind {
     match statement {
         ast::Statement::CreateTable(_)
+        | ast::Statement::CreateSequence { .. }
         | ast::Statement::CreateIndex(_)
         | ast::Statement::CreateSchema { .. }
         | ast::Statement::CreateView { .. }
@@ -93,6 +94,7 @@ mod tests {
     fn classifies_statement_families() {
         let cases = [
             ("CREATE TABLE t (id INTEGER)", StatementKind::Ddl),
+            ("CREATE SEQUENCE s", StatementKind::Ddl),
             ("INSERT INTO t VALUES (1)", StatementKind::Dml),
             ("SELECT * FROM t", StatementKind::Query),
             ("BEGIN", StatementKind::TransactionControl),

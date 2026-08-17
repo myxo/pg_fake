@@ -1531,3 +1531,53 @@ fn generated_sql_matches_postgres() {
         }
     });
 }
+
+#[test]
+fn generated_sequence_allocations_follow_the_option_model() {
+    check(|src| {
+        let increments = [-5_i64, -3, -1, 1, 2, 4];
+        let (increment, _) = src.choose("increment", &increments).unwrap();
+        let min_value = src.any_of("min_value", int_in_range(-20_i64..=-1));
+        let max_value = src.any_of("max_value", int_in_range(1_i64..=20));
+        let start_value = src.any_of("start_value", int_in_range(min_value..=max_value));
+        let cycles = [false, true];
+        let (cycle, _) = src.choose("cycle", &cycles).unwrap();
+        let calls = src.any_of("calls", int_in_range(1..=8));
+        let db = pg_fake::api::Db::create();
+        let mut session = db.create_session();
+        session
+            .execute(&format!(
+                "CREATE SEQUENCE property_sequence INCREMENT {increment} MINVALUE {min_value} MAXVALUE {max_value} START {start_value} CACHE 7 {}",
+                if *cycle { "CYCLE" } else { "NO CYCLE" }
+            ))
+            .unwrap();
+        let mut expected = start_value;
+        for call in 0..calls {
+            let actual = session.query("SELECT nextval('property_sequence')", &[]);
+            if call == 0 {
+                assert_eq!(
+                    actual.unwrap().rows,
+                    vec![vec![pg_fake::value::Value::Int8(expected)]]
+                );
+                continue;
+            }
+            let candidate = i128::from(expected) + i128::from(*increment);
+            if candidate > i128::from(max_value) || candidate < i128::from(min_value) {
+                if !*cycle {
+                    assert_eq!(
+                        actual.unwrap_err().sqlstate,
+                        pg_fake::error::SqlState::SequenceGeneratorLimitExceeded
+                    );
+                    break;
+                }
+                expected = if *increment > 0 { min_value } else { max_value };
+            } else {
+                expected = candidate as i64;
+            }
+            assert_eq!(
+                actual.unwrap().rows,
+                vec![vec![pg_fake::value::Value::Int8(expected)]]
+            );
+        }
+    })
+}

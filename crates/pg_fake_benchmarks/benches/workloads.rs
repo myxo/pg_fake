@@ -214,6 +214,26 @@ fn create_table_benchmark(
     group.finish();
 }
 
+fn sequence_benchmark(
+    criterion: &mut Criterion,
+    runtime: &Runtime,
+    connections: &mut [NamedBenchmarkConnection<'_>],
+) {
+    for (_, connection) in connections.iter_mut() {
+        connection.execute(runtime, "CREATE SEQUENCE sequence_nextval");
+    }
+    let mut group = criterion.benchmark_group(benchmarks::find_benchmark("sequence_nextval").name);
+    for (name, connection) in connections.iter_mut() {
+        group.bench_function(*name, |benchmark| {
+            benchmark.iter(|| connection.fetch(runtime, "SELECT nextval('sequence_nextval')"));
+        });
+    }
+    group.finish();
+    for (_, connection) in connections.iter_mut() {
+        connection.execute(runtime, "DROP SEQUENCE sequence_nextval");
+    }
+}
+
 fn insert_benchmark(
     criterion: &mut Criterion,
     runtime: &Runtime,
@@ -944,6 +964,7 @@ fn benchmarks(criterion: &mut Criterion) {
         ];
 
         create_table_benchmark(criterion, &runtime, &mut connections);
+        sequence_benchmark(criterion, &runtime, &mut connections);
         insert_benchmark(criterion, &runtime, &mut connections);
         update_benchmark(criterion, &runtime, &mut connections);
         delete_benchmark(criterion, &runtime, &mut connections);

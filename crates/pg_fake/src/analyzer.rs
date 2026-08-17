@@ -647,6 +647,22 @@ fn infer_function_parameters(
         })
         .collect::<Vec<_>>();
     let name = executor::normalize_unqualified_object_name(&function.name)?;
+    if matches!(name.as_str(), "nextval" | "currval") {
+        for argument in arguments {
+            constrain_parameter_type(argument, Some(BaseType::Text), types)?;
+        }
+        return Ok(());
+    }
+    if name == "setval" {
+        for (argument, expected) in
+            arguments
+                .iter()
+                .zip([BaseType::Text, BaseType::Int8, BaseType::Bool])
+        {
+            constrain_parameter_type(argument, Some(expected), types)?;
+        }
+        return Ok(());
+    }
     let expected = match name.as_str() {
         "length" | "lower" | "upper" => Some(BaseType::Text),
         _ => arguments

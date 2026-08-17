@@ -42,6 +42,11 @@ pub fn list_benchmarks() -> Vec<Benchmark> {
         build_benchmark("update_from_row", postgres_values(), postgres_comparisons()),
         build_benchmark("delete_row", postgres_values(), postgres_comparisons()),
         build_benchmark(
+            "sequence_nextval",
+            postgres_values(),
+            postgres_comparisons(),
+        ),
+        build_benchmark(
             "transaction_insert",
             postgres_values(),
             postgres_comparisons(),

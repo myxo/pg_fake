@@ -208,6 +208,10 @@ not-null), sequences, and (later) views. DDL statements mutate the catalog.
 - Sequences (`SERIAL`, `GENERATED ... AS IDENTITY`) allocate values that are
   **not** rolled back on abort, matching Postgres. Sequence state lives outside
   transactional visibility rules.
+- The Phase 2 sequence surface includes `CREATE SEQUENCE`, `DROP SEQUENCE`, and
+  `nextval`/`currval`/`lastval`/`setval`. `ALTER SEQUENCE`, including `RESTART`,
+  is deferred until `sqlparser-rs` exposes a PostgreSQL sequence-alter AST;
+  valid PostgreSQL syntax is not re-parsed through a project-local workaround.
 
 ---
 

@@ -111,7 +111,7 @@ select_having:14
 select_implicit:28
 select_into:5
 select_views:4
-sequence:1
+sequence:7
 strings:1
 subselect:5
 temp:2

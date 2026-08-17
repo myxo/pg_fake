@@ -46,6 +46,38 @@ pub(super) fn evaluate_column_default(
     })
 }
 
+pub(super) fn validate_column_default(column: &ColumnDef) -> Result<()> {
+    let Some(expression) = &column.default else {
+        return Ok(());
+    };
+    if let Some(text) = extract_unknown_string_literal(expression) {
+        coercion::coerce_unknown(text, column.data_type, CastContext::Assignment)?;
+        return Ok(());
+    }
+    let source = infer_expression_type(
+        expression,
+        RowScope::Table(&create_constant_expression_schema()),
+    )
+    .map_err(|error| {
+        if error.sqlstate == SqlState::UndefinedColumn {
+            PgError::create(
+                SqlState::FeatureNotSupported,
+                "cannot use column reference in DEFAULT expression",
+            )
+        } else {
+            error
+        }
+    })?;
+    if coercion::can_cast(source, column.data_type.base, CastContext::Assignment) {
+        Ok(())
+    } else {
+        Err(PgError::create(
+            SqlState::DatatypeMismatch,
+            "default expression has incompatible type",
+        ))
+    }
+}
+
 pub(super) fn validate_not_null(schema: &TableSchema, row: &[Value]) -> Result<()> {
     if let Some(column) = schema
         .columns
@@ -598,13 +630,42 @@ fn infer_function_return_type(function: &ast::Function, schema: RowScope<'_>) ->
         {
             Ok(BaseType::TimestampTz)
         }
-        "coalesce" | "nullif" | "greatest" | "least" | "length" | "lower" | "upper" | "abs" => {
-            Err(signature_error())
+        "nextval" | "currval" if arguments.len() == 1 => {
+            validate_function_argument(arguments[0], BaseType::Text, schema, &signature_error)?;
+            Ok(BaseType::Int8)
         }
+        "lastval" if arguments.is_empty() => Ok(BaseType::Int8),
+        "setval" if matches!(arguments.len(), 2 | 3) => {
+            validate_function_argument(arguments[0], BaseType::Text, schema, &signature_error)?;
+            validate_function_argument(arguments[1], BaseType::Int8, schema, &signature_error)?;
+            if let Some(is_called) = arguments.get(2) {
+                validate_function_argument(is_called, BaseType::Bool, schema, &signature_error)?;
+            }
+            Ok(BaseType::Int8)
+        }
+        "coalesce" | "nullif" | "greatest" | "least" | "length" | "lower" | "upper" | "abs"
+        | "nextval" | "currval" | "lastval" | "setval" => Err(signature_error()),
         _ => Err(PgError::create(
             SqlState::UndefinedFunction,
             format!("function {function_name} does not exist"),
         )),
+    }
+}
+
+fn validate_function_argument(
+    argument: &ast::Expr,
+    target: BaseType,
+    schema: RowScope<'_>,
+    create_error: &impl Fn() -> PgError,
+) -> Result<()> {
+    if is_null_literal(argument) || extract_unknown_string_literal(argument).is_some() {
+        return Ok(());
+    }
+    let source = infer_expression_type(argument, schema)?;
+    if coercion::can_cast(source, target, CastContext::Implicit) {
+        Ok(())
+    } else {
+        Err(create_error())
     }
 }
 
@@ -1058,6 +1119,64 @@ fn evaluate_function(
             Ok(Value::TimestampTz(crate::value::PgTimestampTz::Finite(
                 value,
             )))
+        }
+        "nextval" | "currval" => {
+            let name = evaluate_and_coerce(
+                arguments[0],
+                BaseType::Text,
+                CastContext::Implicit,
+                schema,
+                row,
+                context,
+            )?;
+            let Value::Text(name) = name else {
+                return Ok(Value::Null);
+            };
+            let value = if function_name == "nextval" {
+                context.sequences.get_next_value(&name)?
+            } else {
+                context.sequences.get_current_value(&name)?
+            };
+            Ok(Value::Int8(value))
+        }
+        "lastval" => Ok(Value::Int8(context.sequences.get_last_value()?)),
+        "setval" => {
+            let name = evaluate_and_coerce(
+                arguments[0],
+                BaseType::Text,
+                CastContext::Implicit,
+                schema,
+                row,
+                context,
+            )?;
+            let value = evaluate_and_coerce(
+                arguments[1],
+                BaseType::Int8,
+                CastContext::Implicit,
+                schema,
+                row,
+                context,
+            )?;
+            let is_called = if let Some(argument) = arguments.get(2) {
+                evaluate_and_coerce(
+                    argument,
+                    BaseType::Bool,
+                    CastContext::Implicit,
+                    schema,
+                    row,
+                    context,
+                )?
+            } else {
+                Value::Bool(true)
+            };
+            let (Value::Text(name), Value::Int8(value), Value::Bool(is_called)) =
+                (name, value, is_called)
+            else {
+                return Ok(Value::Null);
+            };
+            Ok(Value::Int8(
+                context.sequences.set_value(&name, value, is_called)?,
+            ))
         }
         "coalesce" => {
             for argument in arguments {

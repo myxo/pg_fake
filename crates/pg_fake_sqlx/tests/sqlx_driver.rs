@@ -149,6 +149,38 @@ async fn sqlx_intervals_round_trip() {
 }
 
 #[tokio::test]
+async fn sqlx_prepared_sequence_calls_return_bigints() {
+    let mut connection = PgFakeConnection::new(Db::create());
+    connection
+        .execute("CREATE SEQUENCE sqlx_sequence START 7")
+        .await
+        .unwrap();
+    let statement = connection
+        .prepare(SqlStr::from_static("SELECT nextval($1)"))
+        .await
+        .unwrap();
+    assert_eq!(
+        statement.parameters().unwrap().left().unwrap()[0].name(),
+        "TEXT"
+    );
+    assert_eq!(statement.columns()[0].type_info().name(), "INT8");
+    let first = statement
+        .query()
+        .bind("sqlx_sequence")
+        .fetch_one(&mut connection)
+        .await
+        .unwrap();
+    let second = statement
+        .query()
+        .bind("sqlx_sequence")
+        .fetch_one(&mut connection)
+        .await
+        .unwrap();
+    assert_eq!(first.get::<i64, _>(0), 7);
+    assert_eq!(second.get::<i64, _>(0), 8);
+}
+
+#[tokio::test]
 async fn prepared_statements_transactions_and_pools_use_the_sqlx_api() {
     let db = Db::create();
     let pool = PgFakePoolOptions::new()

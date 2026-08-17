@@ -9,7 +9,7 @@ use sqlparser::ast;
 
 use crate::{
     analyzer,
-    catalog::TableSchema,
+    catalog::{SequenceSchema, TableSchema},
     error::{PgError, Result, SqlState, reject_unsupported},
     executor::{self, DatabaseState},
     parser,
@@ -76,6 +76,7 @@ pub struct Session {
     deferred_constraints: BTreeSet<String>,
     defer_all_constraints: bool,
     deferred_foreign_keys_dirty: bool,
+    sequence_session: executor::SequenceSessionStorage,
 }
 #[derive(Clone, Copy)]
 enum SessionTransactionState {
@@ -94,6 +95,8 @@ struct ActiveTransaction {
 enum DdlUndo {
     DropCreated(String),
     RestoreDropped(TableSchema, Table),
+    DropCreatedSequence(String),
+    RestoreDroppedSequence(SequenceSchema, executor::SequenceValueState),
 }
 pub struct Transaction<'session> {
     session: &'session mut Session,
@@ -132,6 +135,13 @@ fn collect_ddl_undo_for_statement(
                 .into_iter()
                 .collect())
         }
+        ast::Statement::CreateSequence { name, .. } => {
+            let name = executor::normalize_unqualified_object_name(name)?;
+            Ok((!state.catalog.has_relation(&name))
+                .then_some(DdlUndo::DropCreatedSequence(name))
+                .into_iter()
+                .collect())
+        }
         ast::Statement::Drop {
             object_type: ast::ObjectType::Table,
             names,
@@ -153,6 +163,30 @@ fn collect_ddl_undo_for_statement(
                     .expect("catalog table must have storage")
                     .clone();
                 Some(Ok(DdlUndo::RestoreDropped(schema, table)))
+            })
+            .collect(),
+        ast::Statement::Drop {
+            object_type: ast::ObjectType::Sequence,
+            names,
+            ..
+        } => names
+            .iter()
+            .filter_map(|name| {
+                let name = match executor::normalize_unqualified_object_name(name) {
+                    Ok(name) => name,
+                    Err(error) => return Some(Err(error)),
+                };
+                let sequence = match state.catalog.require_sequence(&name) {
+                    Ok(sequence) => sequence.clone(),
+                    Err(_) => return None,
+                };
+                let value = *state
+                    .sequence_values
+                    .lock()
+                    .expect("sequence storage is poisoned")
+                    .get(&sequence.id)
+                    .expect("catalog sequence must have storage");
+                Some(Ok(DdlUndo::RestoreDroppedSequence(sequence, value)))
             })
             .collect(),
         _ => Ok(Vec::new()),
@@ -387,6 +421,7 @@ impl Db {
             deferred_constraints: BTreeSet::new(),
             defer_all_constraints: false,
             deferred_foreign_keys_dirty: false,
+            sequence_session: Arc::new(Mutex::new(executor::SequenceSessionState::default())),
         }
     }
 }
@@ -872,6 +907,23 @@ impl Session {
                     state.tables.insert(schema.id, table);
                     state.catalog.restore_table(schema);
                 }
+                DdlUndo::DropCreatedSequence(name) => {
+                    if let Ok(sequence) = state.catalog.drop_sequence(&name) {
+                        state
+                            .sequence_values
+                            .lock()
+                            .expect("sequence storage is poisoned")
+                            .remove(&sequence.id);
+                    }
+                }
+                DdlUndo::RestoreDroppedSequence(sequence, value) => {
+                    state
+                        .sequence_values
+                        .lock()
+                        .expect("sequence storage is poisoned")
+                        .insert(sequence.id, value);
+                    state.catalog.restore_sequence(sequence);
+                }
             }
         }
     }
@@ -1094,6 +1146,11 @@ impl Session {
             statement_timestamp: self.db.read_clock(),
             clock_timestamp: self.db.read_clock(),
             rng: self.db.rng.clone(),
+            sequences: executor::SequenceExecutionContext::create(
+                &state.catalog,
+                state.sequence_values.clone(),
+                self.sequence_session.clone(),
+            ),
         };
         let statement = match executor::materialize_uncorrelated_subqueries(
             &state,

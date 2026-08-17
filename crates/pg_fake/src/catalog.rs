@@ -4,13 +4,29 @@ use sqlparser::ast;
 
 use crate::{
     error::{PgError, Result, SqlState, reject_unsupported},
-    value::PgType,
+    value::{BaseType, PgType},
 };
 
 pub(crate) const DEFAULT_SCHEMA: &str = "public";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub(crate) struct TableId(pub(crate) u64);
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub(crate) struct SequenceId(pub(crate) u64);
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct SequenceSchema {
+    pub(crate) id: SequenceId,
+    pub(crate) name: String,
+    pub(crate) data_type: BaseType,
+    pub(crate) increment: i64,
+    pub(crate) min_value: i64,
+    pub(crate) max_value: i64,
+    pub(crate) start_value: i64,
+    pub(crate) cycle: bool,
+    pub(crate) cache: i64,
+}
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct ColumnDef {
@@ -62,12 +78,14 @@ pub(crate) struct TableSchema {
 pub(crate) struct Schema {
     pub(crate) name: String,
     tables: BTreeMap<String, TableSchema>,
+    sequences: BTreeMap<String, SequenceSchema>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct Catalog {
     public: Schema,
     next_table_id: u64,
+    next_sequence_id: u64,
 }
 
 impl Default for Catalog {
@@ -82,8 +100,10 @@ impl Catalog {
             public: Schema {
                 name: DEFAULT_SCHEMA.into(),
                 tables: BTreeMap::new(),
+                sequences: BTreeMap::new(),
             },
             next_table_id: 1,
+            next_sequence_id: 1,
         }
     }
 
@@ -93,7 +113,7 @@ impl Catalog {
         columns: Vec<ColumnDef>,
         constraints: Vec<Constraint>,
     ) -> Result<TableId> {
-        if self.public.tables.contains_key(&name) {
+        if self.has_relation(&name) {
             return Err(PgError::create(
                 SqlState::DuplicateTable,
                 format!("relation {name:?} already exists"),
@@ -115,6 +135,12 @@ impl Catalog {
     }
 
     pub(crate) fn require_table(&self, name: &str) -> Result<&TableSchema> {
+        if self.public.sequences.contains_key(name) {
+            return Err(PgError::create(
+                SqlState::WrongObjectType,
+                format!("{name:?} is not a table"),
+            ));
+        }
         self.public.tables.get(name).ok_or_else(|| {
             PgError::create(
                 SqlState::UndefinedTable,
@@ -128,6 +154,12 @@ impl Catalog {
     }
 
     pub(crate) fn drop_table(&mut self, name: &str) -> Result<TableSchema> {
+        if self.public.sequences.contains_key(name) {
+            return Err(PgError::create(
+                SqlState::WrongObjectType,
+                format!("{name:?} is not a table"),
+            ));
+        }
         if let Some((table, constraint)) = self.public.tables.values().find_map(|table| {
             table
                 .constraints
@@ -154,6 +186,71 @@ impl Catalog {
     pub(crate) fn restore_table(&mut self, table: TableSchema) {
         let previous = self.public.tables.insert(table.name.clone(), table);
         assert!(previous.is_none(), "restored table must not already exist");
+    }
+
+    pub(crate) fn has_relation(&self, name: &str) -> bool {
+        self.public.tables.contains_key(name) || self.public.sequences.contains_key(name)
+    }
+
+    pub(crate) fn create_sequence(&mut self, mut sequence: SequenceSchema) -> Result<SequenceId> {
+        if self.has_relation(&sequence.name) {
+            return Err(PgError::create(
+                SqlState::DuplicateTable,
+                format!("relation {:?} already exists", sequence.name),
+            ));
+        }
+        let id = SequenceId(self.next_sequence_id);
+        self.next_sequence_id += 1;
+        sequence.id = id;
+        self.public
+            .sequences
+            .insert(sequence.name.clone(), sequence);
+        Ok(id)
+    }
+
+    pub(crate) fn require_sequence(&self, name: &str) -> Result<&SequenceSchema> {
+        if self.public.tables.contains_key(name) {
+            return Err(PgError::create(
+                SqlState::WrongObjectType,
+                format!("{name:?} is not a sequence"),
+            ));
+        }
+        self.public.sequences.get(name).ok_or_else(|| {
+            PgError::create(
+                SqlState::UndefinedTable,
+                format!("relation {name:?} does not exist"),
+            )
+        })
+    }
+
+    pub(crate) fn iterate_sequences(&self) -> impl Iterator<Item = &SequenceSchema> {
+        self.public.sequences.values()
+    }
+
+    pub(crate) fn drop_sequence(&mut self, name: &str) -> Result<SequenceSchema> {
+        if self.public.tables.contains_key(name) {
+            return Err(PgError::create(
+                SqlState::WrongObjectType,
+                format!("{name:?} is not a sequence"),
+            ));
+        }
+        self.public.sequences.remove(name).ok_or_else(|| {
+            PgError::create(
+                SqlState::UndefinedTable,
+                format!("sequence {name:?} does not exist"),
+            )
+        })
+    }
+
+    pub(crate) fn restore_sequence(&mut self, sequence: SequenceSchema) {
+        let previous = self
+            .public
+            .sequences
+            .insert(sequence.name.clone(), sequence);
+        assert!(
+            previous.is_none(),
+            "restored sequence must not already exist"
+        );
     }
 }
 

@@ -259,7 +259,7 @@ pub const FEATURES: &[Feature] = &[
             source: "sequence.sql:112",
             setup: &["CREATE SEQUENCE manifest_sequence"],
             sql: "SELECT nextval('manifest_sequence')",
-            baseline: Baseline::Pending,
+            baseline: Baseline::MustPass,
         }],
     },
     Feature {

@@ -23,6 +23,7 @@ pub enum SqlState {
     InvalidTextRepresentation,           // 22P02
     InvalidParameterValue,               // 22023
     StringDataRightTruncation,           // 22001
+    SequenceGeneratorLimitExceeded,      // 2200H
 
     // 21 — Cardinality Violation
     CardinalityViolation, // 21000
@@ -55,9 +56,11 @@ pub enum SqlState {
     DatatypeMismatch,       // 42804
     InvalidColumnReference, // 42P10
     GroupingError,          // 42803
+    WrongObjectType,        // 42809
 
     // 55 — Object Not In Prerequisite State
-    LockNotAvailable, // 55P03
+    ObjectNotInPrerequisiteState, // 55000
+    LockNotAvailable,             // 55P03
 
     // XX — Internal Error
     InternalError, // XX000
@@ -77,6 +80,7 @@ impl SqlState {
             SqlState::InvalidTextRepresentation => "22P02",
             SqlState::InvalidParameterValue => "22023",
             SqlState::StringDataRightTruncation => "22001",
+            SqlState::SequenceGeneratorLimitExceeded => "2200H",
             SqlState::CardinalityViolation => "21000",
             SqlState::NotNullViolation => "23502",
             SqlState::UniqueViolation => "23505",
@@ -99,6 +103,8 @@ impl SqlState {
             SqlState::DatatypeMismatch => "42804",
             SqlState::InvalidColumnReference => "42P10",
             SqlState::GroupingError => "42803",
+            SqlState::WrongObjectType => "42809",
+            SqlState::ObjectNotInPrerequisiteState => "55000",
             SqlState::LockNotAvailable => "55P03",
             SqlState::InternalError => "XX000",
         }
