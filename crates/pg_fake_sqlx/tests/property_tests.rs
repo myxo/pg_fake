@@ -35,6 +35,16 @@ enum RowOrder {
     Ordered,
 }
 
+fn returns_rows(statement: &Statement) -> bool {
+    match statement {
+        Statement::Query(_) => true,
+        Statement::Insert(insert) => insert.returning.is_some(),
+        Statement::Update(update) => update.returning.is_some(),
+        Statement::Delete(delete) => delete.returning.is_some(),
+        _ => false,
+    }
+}
+
 static TEST_LOCK: Mutex<()> = Mutex::new(());
 static TABLE_NUMBER: AtomicU64 = AtomicU64::new(1);
 
@@ -139,8 +149,8 @@ where
     for<'row> String: Decode<'row, DB> + Type<DB>,
     usize: ColumnIndex<DB::Row>,
 {
-    match statement {
-        Statement::Query(_) => match sqlx::raw_sql(AssertSqlSafe(sql))
+    if returns_rows(statement) {
+        match sqlx::raw_sql(AssertSqlSafe(sql))
             .fetch_all(&mut *connection)
             .await
         {
@@ -173,14 +183,15 @@ where
                 Outcome::Rows(values)
             }
             Err(error) => make_error_outcome(error),
-        },
-        _ => match sqlx::raw_sql(AssertSqlSafe(sql))
+        }
+    } else {
+        match sqlx::raw_sql(AssertSqlSafe(sql))
             .execute(&mut *connection)
             .await
         {
             Ok(result) => Outcome::Affected(rows_affected(result)),
             Err(error) => make_error_outcome(error),
-        },
+        }
     }
 }
 
@@ -1083,6 +1094,54 @@ fn generate_delete(src: &mut Source, table: &TableSchema) -> String {
     )
 }
 
+fn generate_returning_projection(src: &mut Source, table: &TableSchema) -> String {
+    src.select(
+        "projection",
+        &["wildcard", "qualified", "alias", "expression"],
+        |src, projection, _| match projection {
+            "wildcard" => "*".into(),
+            "qualified" => format!("{}.*", table.name),
+            "alias" => {
+                let column = choose_column(src, table, |_| true);
+                format!("{} AS returned_value", column.name)
+            }
+            "expression" => {
+                let column = choose_column(src, table, |_| true);
+                format!(
+                    "COALESCE({}, {}) AS returned_value",
+                    column.name,
+                    generate_typed_literal(src, column.data_type)
+                )
+            }
+            _ => unreachable!(),
+        },
+    )
+}
+
+fn generate_insert_returning(src: &mut Source, table: &TableSchema, next_key: &mut i64) -> String {
+    format!(
+        "{} RETURNING {}",
+        generate_insert(src, table, next_key),
+        generate_returning_projection(src, table)
+    )
+}
+
+fn generate_update_returning(src: &mut Source, table: &TableSchema) -> String {
+    format!(
+        "{} RETURNING {}",
+        generate_update(src, table),
+        generate_returning_projection(src, table)
+    )
+}
+
+fn generate_delete_returning(src: &mut Source, table: &TableSchema) -> String {
+    format!(
+        "{} RETURNING {}",
+        generate_delete(src, table),
+        generate_returning_projection(src, table)
+    )
+}
+
 fn generate_join(src: &mut Source, table: &TableSchema) -> (String, RowOrder) {
     let offset = src.any_of("offset", int_in_range(-2..=2));
     src.select(
@@ -1290,6 +1349,7 @@ fn generated_sql_matches_postgres() {
             let actions: &[&'static str] = if in_transaction {
                 &[
                     "insert",
+                    "insert_returning",
                     "select",
                     "distinct",
                     "aggregate",
@@ -1298,7 +1358,9 @@ fn generated_sql_matches_postgres() {
                     "foreign_insert",
                     "foreign_select",
                     "update",
+                    "update_returning",
                     "delete",
+                    "delete_returning",
                     "set_lock_timeout",
                     "commit",
                     "rollback",
@@ -1306,6 +1368,7 @@ fn generated_sql_matches_postgres() {
             } else {
                 &[
                     "insert",
+                    "insert_returning",
                     "select",
                     "distinct",
                     "aggregate",
@@ -1314,7 +1377,9 @@ fn generated_sql_matches_postgres() {
                     "foreign_insert",
                     "foreign_select",
                     "update",
+                    "update_returning",
                     "delete",
+                    "delete_returning",
                     "set_session",
                     "set_lock_timeout",
                     "begin",
@@ -1324,6 +1389,10 @@ fn generated_sql_matches_postgres() {
                 let (sql, order) = match action {
                     "insert" => (
                         generate_insert(src, &table, &mut next_key),
+                        RowOrder::Unordered,
+                    ),
+                    "insert_returning" => (
+                        generate_insert_returning(src, &table, &mut next_key),
                         RowOrder::Unordered,
                     ),
                     "select" => generate_select(src, &table),
@@ -1337,7 +1406,13 @@ fn generated_sql_matches_postgres() {
                     ),
                     "foreign_select" => generate_foreign_select(src, &foreign_tables),
                     "update" => (generate_update(src, &table), RowOrder::Unordered),
+                    "update_returning" => {
+                        (generate_update_returning(src, &table), RowOrder::Unordered)
+                    }
                     "delete" => (generate_delete(src, &table), RowOrder::Unordered),
+                    "delete_returning" => {
+                        (generate_delete_returning(src, &table), RowOrder::Unordered)
+                    }
                     "begin" => {
                         in_transaction = true;
                         let sql = if src.any("explicit_isolation") {

@@ -52,7 +52,9 @@ pub(crate) use foreign_keys::{contains_deferred_foreign_keys, validate_deferred_
 pub(crate) use locks::collect_required_row_locks;
 pub(crate) use scope::infer_query_output_columns;
 use scope::{BoundColumn, bind_select_scope};
-pub(crate) use scope::{BoundScope, RowScope, bind_query_scope, substitute_typed_subqueries};
+pub(crate) use scope::{
+    BoundScope, RowScope, bind_query_scope, bind_target_scope, substitute_typed_subqueries,
+};
 use writes::{execute_delete, execute_insert, execute_update};
 
 #[derive(Clone)]
@@ -320,7 +322,7 @@ pub(crate) fn execute_statement(
             context,
         ),
         ast::Statement::Update(update) => {
-            if update.from.is_some() || update.returning.is_some() || update.or.is_some() {
+            if update.from.is_some() || update.or.is_some() {
                 return reject_unsupported("UPDATE feature is not implemented");
             }
             execute_update(
@@ -328,6 +330,7 @@ pub(crate) fn execute_statement(
                 &update.table,
                 &update.assignments,
                 update.selection.as_ref(),
+                update.returning.as_deref(),
                 xid,
                 snapshot,
                 deferred_constraints,

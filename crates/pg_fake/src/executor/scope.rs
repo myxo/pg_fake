@@ -178,37 +178,45 @@ impl BoundScope {
         alias: Option<&ast::TableAlias>,
         slot: usize,
     ) -> Result<Self> {
-        let qualifier = alias
-            .map(|alias| normalize_identifier(&alias.name))
-            .unwrap_or_else(|| schema.name.clone());
         if alias.is_some_and(|alias| alias.columns.len() > schema.columns.len()) {
             return Err(PgError::create(
                 SqlState::InvalidColumnReference,
                 "table has fewer columns than specified in the column alias list",
             ));
         }
-        Ok(BoundScope {
-            columns: schema
-                .columns
-                .iter()
-                .enumerate()
-                .map(|(index, column)| BoundColumn {
-                    name: alias
-                        .and_then(|alias| alias.columns.get(index))
-                        .map(|alias| normalize_identifier(&alias.name))
-                        .unwrap_or_else(|| column.name.clone()),
-                    data_type: column.data_type,
-                    qualifier: qualifier.clone(),
-                    slot: slot + index,
-                    merged: None,
-                    unqualified: true,
-                    wildcard: true,
-                    depth: 0,
-                    table_id: Some(schema.id),
-                    source_name: column.name.clone(),
-                })
-                .collect(),
-        })
+        let mut scope = bind_target_scope(schema, alias.map(|alias| &alias.name));
+        for (index, column) in scope.columns.iter_mut().enumerate() {
+            column.slot += slot;
+            if let Some(alias) = alias.and_then(|alias| alias.columns.get(index)) {
+                column.name = normalize_identifier(&alias.name);
+            }
+        }
+        Ok(scope)
+    }
+}
+
+pub(crate) fn bind_target_scope(schema: &TableSchema, alias: Option<&ast::Ident>) -> BoundScope {
+    let qualifier = alias
+        .map(normalize_identifier)
+        .unwrap_or_else(|| schema.name.clone());
+    BoundScope {
+        columns: schema
+            .columns
+            .iter()
+            .enumerate()
+            .map(|(index, column)| BoundColumn {
+                name: column.name.clone(),
+                data_type: column.data_type,
+                qualifier: qualifier.clone(),
+                slot: index,
+                merged: None,
+                unqualified: true,
+                wildcard: true,
+                depth: 0,
+                table_id: Some(schema.id),
+                source_name: column.name.clone(),
+            })
+            .collect(),
     }
 }
 

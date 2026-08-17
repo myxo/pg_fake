@@ -10,7 +10,7 @@ use std::{
 use pg_fake::{
     api::{Db, StatementResult},
     parser::{self, Statement},
-    value::Value,
+    value::{BaseType, Value},
 };
 use postgres::{Client, NoTls, SimpleQueryMessage};
 use testcontainers::{ImageExt, runners::SyncRunner};
@@ -37,6 +37,16 @@ enum SessionName {
 
 static TABLE_NUMBER: AtomicU64 = AtomicU64::new(1);
 static TEST_LOCK: Mutex<()> = Mutex::new(());
+
+fn returns_rows(statement: &Statement) -> bool {
+    match statement {
+        Statement::Query(_) => true,
+        Statement::Insert(insert) => insert.returning.is_some(),
+        Statement::Update(update) => update.returning.is_some(),
+        Statement::Delete(delete) => delete.returning.is_some(),
+        _ => false,
+    }
+}
 
 fn assert_differential(script: &str, row_order: RowOrder) {
     let _test_lock = TEST_LOCK.lock().expect("test mutex must not be poisoned");
@@ -166,31 +176,29 @@ fn assert_session_differential(operations: &[(SessionName, &str)], row_order: Ro
 
 fn execute_on_postgres(client: &mut Client, statement: &Statement, sql: &str) -> Outcome {
     match client.simple_query(sql) {
-        Ok(messages) => match statement {
-            Statement::Query(_) => Outcome::Rows(
-                messages
-                    .iter()
-                    .filter_map(|message| match message {
-                        SimpleQueryMessage::Row(row) => Some(
-                            (0..row.len())
-                                .map(|index| row.get(index).map(str::to_owned))
-                                .collect(),
-                        ),
-                        _ => None,
-                    })
-                    .collect(),
-            ),
-            _ => Outcome::Affected(
-                messages
-                    .iter()
-                    .filter_map(|message| match message {
-                        SimpleQueryMessage::CommandComplete(rows) => Some(*rows),
-                        _ => None,
-                    })
-                    .last()
-                    .expect("non-query statements must complete"),
-            ),
-        },
+        Ok(messages) if returns_rows(statement) => Outcome::Rows(
+            messages
+                .iter()
+                .filter_map(|message| match message {
+                    SimpleQueryMessage::Row(row) => Some(
+                        (0..row.len())
+                            .map(|index| row.get(index).map(str::to_owned))
+                            .collect(),
+                    ),
+                    _ => None,
+                })
+                .collect(),
+        ),
+        Ok(messages) => Outcome::Affected(
+            messages
+                .iter()
+                .filter_map(|message| match message {
+                    SimpleQueryMessage::CommandComplete(rows) => Some(*rows),
+                    _ => None,
+                })
+                .last()
+                .expect("non-query statements must complete"),
+        ),
         Err(error) => Outcome::Error(
             error
                 .code()
@@ -206,8 +214,8 @@ fn execute_on_fake(
     statement: &Statement,
     sql: &str,
 ) -> Outcome {
-    match statement {
-        Statement::Query(_) => match session.query(sql, &[]) {
+    if returns_rows(statement) {
+        match session.query(sql, &[]) {
             Ok(result) => Outcome::Rows(
                 result
                     .rows
@@ -223,14 +231,15 @@ fn execute_on_fake(
                     .collect(),
             ),
             Err(error) => Outcome::Error(error.sqlstate.get_code().into()),
-        },
-        _ => match session.execute(sql) {
+        }
+    } else {
+        match session.execute(sql) {
             Ok(results) => match results.as_slice() {
                 [StatementResult::Affected(rows)] => Outcome::Affected(*rows),
                 _ => panic!("single non-query statement must return an affected-row result"),
             },
             Err(error) => Outcome::Error(error.sqlstate.get_code().into()),
-        },
+        }
     }
 }
 
@@ -854,6 +863,137 @@ fn reports_distinct_result_metadata() {
             .map(|column| (column.name.as_str(), column.type_oid, column.typmod))
             .collect::<Vec<_>>(),
         vec![("label", 1043, 14), ("id", 23, -1)]
+    );
+}
+
+#[test]
+fn matches_insert_update_and_delete_returning() {
+    assert_differential(
+        "CREATE TABLE __TABLE__ (
+             id INTEGER PRIMARY KEY,
+             label VARCHAR(8) DEFAULT 'new',
+             amount SMALLINT
+         ); \
+         INSERT INTO __TABLE__ AS inserted (id, amount) VALUES (1, 10), (2, 20) \
+         RETURNING inserted.*, inserted.amount + 1 AS next_amount; \
+         INSERT INTO __TABLE__ DEFAULT VALUES RETURNING *; \
+         UPDATE __TABLE__ AS updated SET label = upper(label), amount = amount + 2 \
+         WHERE id <= 2 \
+         RETURNING updated.*, updated.label AS copied_label; \
+         UPDATE __TABLE__ SET amount = 0 WHERE FALSE RETURNING *; \
+         DELETE FROM __TABLE__ AS deleted WHERE id = 2 \
+         RETURNING deleted.*, deleted.amount * 2 AS doubled; \
+         DELETE FROM __TABLE__ WHERE FALSE RETURNING *; \
+         SELECT * FROM __TABLE__ ORDER BY id NULLS LAST",
+        RowOrder::Unordered,
+    );
+}
+
+#[test]
+fn preserves_returning_statement_atomicity() {
+    assert_differential(
+        "CREATE TABLE __TABLE__ (id INTEGER PRIMARY KEY, value INTEGER UNIQUE); \
+         INSERT INTO __TABLE__ VALUES (1, 10), (2, 20); \
+         INSERT INTO __TABLE__ VALUES (3, 30), (1, 40) RETURNING *; \
+         SELECT * FROM __TABLE__ ORDER BY id; \
+         UPDATE __TABLE__ SET value = 10 RETURNING *; \
+         SELECT * FROM __TABLE__ ORDER BY id; \
+         DELETE FROM __TABLE__ RETURNING 1 / (id - id); \
+         SELECT * FROM __TABLE__ ORDER BY id; \
+         BEGIN; \
+         INSERT INTO __TABLE__ VALUES (3, 30) RETURNING id; \
+         ROLLBACK; \
+         SELECT * FROM __TABLE__ ORDER BY id",
+        RowOrder::Unordered,
+    );
+}
+
+#[test]
+fn reports_returning_metadata_and_prepared_results() {
+    let db = Db::create();
+    let mut session = db.create_session();
+    session
+        .execute(
+            "CREATE TABLE returning_metadata (
+                 id INTEGER PRIMARY KEY,
+                 label VARCHAR(10) DEFAULT 'default'
+             )",
+        )
+        .unwrap();
+
+    let direct = session
+        .execute(
+            "INSERT INTO returning_metadata (id) VALUES (0)
+             RETURNING id, label",
+        )
+        .unwrap();
+    let [StatementResult::Query(direct)] = direct.as_slice() else {
+        panic!("RETURNING must produce a native query result");
+    };
+    assert_eq!(
+        direct.rows,
+        vec![vec![Value::Int4(0), Value::Text("default".into())]]
+    );
+
+    let insert = session
+        .prepare(
+            "INSERT INTO returning_metadata (id, label) VALUES ($1, $2)
+             RETURNING id, label, label AS copied, id + 1 AS next_id",
+        )
+        .unwrap();
+    assert_eq!(
+        insert.get_parameter_types(),
+        &[BaseType::Int4, BaseType::Varchar]
+    );
+    assert_eq!(
+        insert
+            .get_result_columns()
+            .iter()
+            .map(|column| (column.name.as_str(), column.type_oid, column.typmod))
+            .collect::<Vec<_>>(),
+        vec![
+            ("id", 23, -1),
+            ("label", 1043, 14),
+            ("copied", 1043, 14),
+            ("next_id", 23, -1),
+        ]
+    );
+    let inserted = session
+        .query_prepared(&insert, &[Value::Int4(1), Value::Text("first".into())])
+        .unwrap();
+    assert_eq!(
+        inserted.rows,
+        vec![vec![
+            Value::Int4(1),
+            Value::Text("first".into()),
+            Value::Text("first".into()),
+            Value::Int4(2),
+        ]]
+    );
+
+    let update = session
+        .prepare(
+            "UPDATE returning_metadata SET label = $1 WHERE id = $2
+             RETURNING returning_metadata.*",
+        )
+        .unwrap();
+    assert_eq!(
+        session
+            .query_prepared(&update, &[Value::Text("second".into()), Value::Int4(1)])
+            .unwrap()
+            .rows,
+        vec![vec![Value::Int4(1), Value::Text("second".into())]]
+    );
+
+    let delete = session
+        .prepare("DELETE FROM returning_metadata WHERE id = $1 RETURNING *")
+        .unwrap();
+    assert_eq!(
+        session
+            .query_prepared(&delete, &[Value::Int4(1)])
+            .unwrap()
+            .rows,
+        vec![vec![Value::Int4(1), Value::Text("second".into())]]
     );
 }
 

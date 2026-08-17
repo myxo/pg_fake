@@ -221,6 +221,7 @@ fn insert_benchmark(
 ) {
     for create in [
         "CREATE TABLE insert_row (id INTEGER PRIMARY KEY CHECK (id > 0), name TEXT NOT NULL DEFAULT upper('benchmark'), CHECK (length(name) > 0))",
+        "CREATE TABLE insert_row_returning (id INTEGER PRIMARY KEY CHECK (id > 0), name TEXT NOT NULL DEFAULT upper('benchmark'), CHECK (length(name) > 0))",
         "CREATE TABLE insert_row_with_defaults (id INTEGER PRIMARY KEY CHECK (id > 0), name TEXT NOT NULL DEFAULT upper('benchmark'), CHECK (length(name) > 0))",
     ] {
         for (_, connection) in connections.iter_mut() {
@@ -244,6 +245,25 @@ fn insert_benchmark(
     group.finish();
 
     let mut group =
+        criterion.benchmark_group(benchmarks::find_benchmark("insert_row_returning").name);
+
+    for (name, connection) in connections.iter_mut() {
+        let mut id = 0;
+        group.bench_function(*name, |benchmark| {
+            benchmark.iter(|| {
+                id += 1;
+                connection.fetch(
+                    runtime,
+                    &format!(
+                        "INSERT INTO insert_row_returning VALUES ({id}, 'benchmark') RETURNING id, name"
+                    ),
+                );
+            });
+        });
+    }
+    group.finish();
+
+    let mut group =
         criterion.benchmark_group(benchmarks::find_benchmark("insert_row_with_defaults").name);
 
     for (name, connection) in connections.iter_mut() {
@@ -260,7 +280,10 @@ fn insert_benchmark(
     }
     group.finish();
     for (_, connection) in connections.iter_mut() {
-        connection.execute(runtime, "DROP TABLE insert_row, insert_row_with_defaults");
+        connection.execute(
+            runtime,
+            "DROP TABLE insert_row, insert_row_returning, insert_row_with_defaults",
+        );
     }
 }
 

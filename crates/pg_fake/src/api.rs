@@ -691,7 +691,7 @@ impl Session {
         match self.execute_prepared_statement(statement, params)? {
             StatementResult::Affected(rows) => Ok(rows),
             StatementResult::Query(_) => {
-                reject_unsupported("use query_prepared for SELECT statements")
+                reject_unsupported("use query_prepared for row-producing statements")
             }
         }
     }
@@ -704,7 +704,7 @@ impl Session {
         match self.execute_prepared_statement(statement, params)? {
             StatementResult::Query(result) => Ok(result),
             StatementResult::Affected(_) => {
-                reject_unsupported("query_prepared requires a SELECT statement")
+                reject_unsupported("query_prepared requires a row-producing statement")
             }
         }
     }

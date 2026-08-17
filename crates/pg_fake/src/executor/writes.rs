@@ -1,6 +1,69 @@
 use super::*;
 use sqlparser::ast;
 
+struct ReturningPlan<'a> {
+    scope: BoundScope,
+    projections: Vec<query::ProjectionSource<'a>>,
+    columns: Vec<ColumnMeta>,
+}
+
+fn build_returning_plan<'a>(
+    state: &DatabaseState,
+    schema: &TableSchema,
+    alias: Option<&ast::Ident>,
+    returning: Option<&'a [ast::SelectItem]>,
+) -> Result<Option<ReturningPlan<'a>>> {
+    let Some(returning) = returning else {
+        return Ok(None);
+    };
+    let scope = bind_target_scope(schema, alias);
+    let (projections, columns) = query::build_projection_plan(state, returning, &scope)?;
+    Ok(Some(ReturningPlan {
+        scope,
+        projections,
+        columns,
+    }))
+}
+
+fn evaluate_returning_row(
+    state: &DatabaseState,
+    returning: Option<&ReturningPlan<'_>>,
+    row: &[Value],
+    rows: &mut Vec<Vec<Value>>,
+    xid: Xid,
+    snapshot: &Snapshot,
+    context: &StatementExecutionContext,
+) -> Result<()> {
+    let Some(returning) = returning else {
+        return Ok(());
+    };
+    rows.push(query::evaluate_projection_values(
+        state,
+        &returning.projections,
+        &returning.scope,
+        row,
+        None,
+        xid,
+        snapshot,
+        context,
+    )?);
+    Ok(())
+}
+
+fn create_write_result(
+    affected: u64,
+    returning: Option<ReturningPlan<'_>>,
+    rows: Vec<Vec<Value>>,
+) -> StatementResult {
+    match returning {
+        Some(returning) => StatementResult::Query(QueryResult {
+            columns: returning.columns,
+            rows,
+        }),
+        None => StatementResult::Affected(affected),
+    }
+}
+
 pub(super) fn execute_insert(
     state: &mut DatabaseState,
     insert: &ast::Insert,
@@ -12,9 +75,12 @@ pub(super) fn execute_insert(
 ) -> Result<StatementResult> {
     let table_name = resolve_insert_table_name(&insert.table)?;
     let schema = state.catalog.require_table(&table_name)?.clone();
-    if insert.returning.is_some() {
-        return reject_unsupported("INSERT RETURNING is not implemented");
-    }
+    let returning = build_returning_plan(
+        state,
+        &schema,
+        insert.table_alias.as_ref().map(|alias| &alias.alias),
+        insert.returning.as_deref(),
+    )?;
     let column_indexes = if insert.columns.is_empty() {
         (0..schema.columns.len()).collect::<Vec<_>>()
     } else {
@@ -91,6 +157,7 @@ pub(super) fn execute_insert(
             })?
     };
     let affected = rows.len() as u64;
+    let mut returned_rows = Vec::new();
     for row in rows {
         if state
             .tables
@@ -120,8 +187,17 @@ pub(super) fn execute_insert(
             deferred_constraints,
             defer_all,
         )?;
+        evaluate_returning_row(
+            state,
+            returning.as_ref(),
+            &row,
+            &mut returned_rows,
+            xid,
+            snapshot,
+            context,
+        )?;
     }
-    Ok(StatementResult::Affected(affected))
+    Ok(create_write_result(affected, returning, returned_rows))
 }
 
 pub(super) fn execute_update(
@@ -129,6 +205,7 @@ pub(super) fn execute_update(
     update_table: &ast::TableWithJoins,
     assignments: &[ast::Assignment],
     selection: Option<&ast::Expr>,
+    returning_items: Option<&[ast::SelectItem]>,
     xid: Xid,
     snapshot: &Snapshot,
     deferred_constraints: &BTreeSet<String>,
@@ -140,6 +217,7 @@ pub(super) fn execute_update(
     }
     let ast::TableFactor::Table {
         name: table_name,
+        alias,
         args,
         ..
     } = &update_table.relation
@@ -153,6 +231,12 @@ pub(super) fn execute_update(
         .catalog
         .require_table(&normalize_unqualified_object_name(table_name)?)?
         .clone();
+    let returning = build_returning_plan(
+        state,
+        &schema,
+        alias.as_ref().map(|alias| &alias.name),
+        returning_items,
+    )?;
     if let Some(selection) = selection {
         let base = infer_expression_type(selection, RowScope::Table(&schema))?;
         if base != BaseType::Bool && !is_null_literal(selection) {
@@ -224,6 +308,7 @@ pub(super) fn execute_update(
             Ok(targets)
         })?;
     let affected = targets.len() as u64;
+    let mut returned_rows = Vec::new();
     for (row_id, version_xmin, row) in targets {
         let mut updated = row.clone();
         for (index, expression) in &assignments {
@@ -276,8 +361,17 @@ pub(super) fn execute_update(
             &mut BTreeSet::new(),
             context,
         )?;
+        evaluate_returning_row(
+            state,
+            returning.as_ref(),
+            &updated,
+            &mut returned_rows,
+            xid,
+            snapshot,
+            context,
+        )?;
     }
-    Ok(StatementResult::Affected(affected))
+    Ok(create_write_result(affected, returning, returned_rows))
 }
 
 pub(super) fn execute_delete(
@@ -291,7 +385,6 @@ pub(super) fn execute_delete(
 ) -> Result<StatementResult> {
     if !delete.tables.is_empty()
         || delete.using.is_some()
-        || delete.returning.is_some()
         || !delete.order_by.is_empty()
         || delete.limit.is_some()
     {
@@ -305,6 +398,7 @@ pub(super) fn execute_delete(
     }
     let ast::TableFactor::Table {
         name: table_name,
+        alias,
         args,
         ..
     } = &from[0].relation
@@ -318,6 +412,12 @@ pub(super) fn execute_delete(
         .catalog
         .require_table(&normalize_unqualified_object_name(table_name)?)?
         .clone();
+    let returning = build_returning_plan(
+        state,
+        &schema,
+        alias.as_ref().map(|alias| &alias.name),
+        delete.returning.as_deref(),
+    )?;
     if let Some(selection) = &delete.selection {
         let base = infer_expression_type(selection, RowScope::Table(&schema))?;
         if base != BaseType::Bool && !is_null_literal(selection) {
@@ -344,24 +444,12 @@ pub(super) fn execute_delete(
                     _ => unreachable!("WHERE expression was type-checked"),
                 }
             }
-            targets.push((row_id, version.xmin));
+            targets.push((row_id, version.xmin, version.row.clone()));
             Ok(targets)
         })?;
     let affected = targets.len() as u64;
-    for (row_id, version_xmin) in targets {
-        let row = state
-            .tables
-            .get(&schema.id)
-            .expect("catalog table must have storage")
-            .iterate_version_chains()
-            .find_map(|(candidate, chain)| {
-                (candidate == row_id).then(|| {
-                    find_visible_version(chain, snapshot, xid, &state.transactions)
-                        .map(|version| version.row.clone())
-                })
-            })
-            .flatten()
-            .expect("target row must remain visible");
+    let mut returned_rows = Vec::new();
+    for (row_id, version_xmin, row) in targets {
         apply_referencing_foreign_key_actions(
             state,
             &schema,
@@ -379,6 +467,15 @@ pub(super) fn execute_delete(
             .get_mut(&schema.id)
             .expect("catalog table must have storage")
             .mark_version_deleted(row_id, version_xmin, xid);
+        evaluate_returning_row(
+            state,
+            returning.as_ref(),
+            &row,
+            &mut returned_rows,
+            xid,
+            snapshot,
+            context,
+        )?;
     }
-    Ok(StatementResult::Affected(affected))
+    Ok(create_write_result(affected, returning, returned_rows))
 }

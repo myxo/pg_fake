@@ -13,6 +13,52 @@ use crate::{
     value::{BaseType, PgType, Value},
 };
 
+fn infer_returning_parameters(
+    returning: Option<&[ast::SelectItem]>,
+    scope: executor::RowScope<'_>,
+    types: &mut [Option<BaseType>],
+) -> Result<()> {
+    let Some(returning) = returning else {
+        return Ok(());
+    };
+    for item in returning {
+        if let ast::SelectItem::UnnamedExpr(expression)
+        | ast::SelectItem::ExprWithAlias {
+            expr: expression, ..
+        } = item
+        {
+            infer_expression_parameters(expression, scope, None, types)?;
+        }
+    }
+    Ok(())
+}
+
+fn validate_returning_items(
+    returning: Option<&[ast::SelectItem]>,
+    scope: executor::RowScope<'_>,
+) -> Result<()> {
+    let Some(returning) = returning else {
+        return Ok(());
+    };
+    for item in returning {
+        if let ast::SelectItem::UnnamedExpr(expression)
+        | ast::SelectItem::ExprWithAlias {
+            expr: expression, ..
+        } = item
+        {
+            executor::infer_expression_type(expression, scope)?;
+        }
+    }
+    Ok(())
+}
+
+fn get_table_alias(table: &ast::TableFactor) -> Option<&ast::Ident> {
+    let ast::TableFactor::Table { alias, .. } = table else {
+        return None;
+    };
+    alias.as_ref().map(|alias| &alias.name)
+}
+
 pub(crate) fn infer_parameter_types(
     statement: &ast::Statement,
     catalog: &Catalog,
@@ -65,6 +111,15 @@ pub(crate) fn infer_parameter_types(
                     }
                 }
             }
+            let returning_scope = executor::bind_target_scope(
+                schema,
+                insert.table_alias.as_ref().map(|alias| &alias.alias),
+            );
+            infer_returning_parameters(
+                insert.returning.as_deref(),
+                executor::RowScope::Bound(&returning_scope),
+                &mut types,
+            )?;
         }
         ast::Statement::Update(update) => {
             let schema = resolve_table_schema(&update.table.relation, catalog)?;
@@ -98,6 +153,13 @@ pub(crate) fn infer_parameter_types(
                     &mut types,
                 )?;
             }
+            let returning_scope =
+                executor::bind_target_scope(schema, get_table_alias(&update.table.relation));
+            infer_returning_parameters(
+                update.returning.as_deref(),
+                executor::RowScope::Bound(&returning_scope),
+                &mut types,
+            )?;
         }
         ast::Statement::Delete(delete) => {
             let ast::FromTable::WithFromKeyword(from) = &delete.from else {
@@ -113,6 +175,13 @@ pub(crate) fn infer_parameter_types(
                         &mut types,
                     )?;
                 }
+                let returning_scope =
+                    executor::bind_target_scope(schema, get_table_alias(&first.relation));
+                infer_returning_parameters(
+                    delete.returning.as_deref(),
+                    executor::RowScope::Bound(&returning_scope),
+                    &mut types,
+                )?;
             }
         }
         ast::Statement::Query(query) => {
@@ -593,6 +662,14 @@ fn validate_statement(statement: &ast::Statement, catalog: &Catalog) -> Result<(
                     }
                 }
             }
+            let returning_scope = executor::bind_target_scope(
+                schema,
+                insert.table_alias.as_ref().map(|alias| &alias.alias),
+            );
+            validate_returning_items(
+                insert.returning.as_deref(),
+                executor::RowScope::Bound(&returning_scope),
+            )?;
         }
         ast::Statement::Update(update) => {
             let schema = resolve_table_schema(&update.table.relation, catalog)?;
@@ -624,18 +701,31 @@ fn validate_statement(statement: &ast::Statement, catalog: &Catalog) -> Result<(
                     executor::RowScope::Table(schema),
                 )?;
             }
+            let returning_scope =
+                executor::bind_target_scope(schema, get_table_alias(&update.table.relation));
+            validate_returning_items(
+                update.returning.as_deref(),
+                executor::RowScope::Bound(&returning_scope),
+            )?;
         }
         ast::Statement::Delete(delete) => {
             let ast::FromTable::WithFromKeyword(from) = &delete.from else {
                 return Ok(());
             };
-            if let Some(first) = from.first()
-                && let Some(selection) = &delete.selection
-            {
-                validate_boolean(
-                    selection,
-                    executor::RowScope::Table(resolve_table_schema(&first.relation, catalog)?),
-                    "WHERE requires a boolean expression",
+            if let Some(first) = from.first() {
+                let schema = resolve_table_schema(&first.relation, catalog)?;
+                if let Some(selection) = &delete.selection {
+                    validate_boolean(
+                        selection,
+                        executor::RowScope::Table(schema),
+                        "WHERE requires a boolean expression",
+                    )?;
+                }
+                let returning_scope =
+                    executor::bind_target_scope(schema, get_table_alias(&first.relation));
+                validate_returning_items(
+                    delete.returning.as_deref(),
+                    executor::RowScope::Bound(&returning_scope),
                 )?;
             }
         }

@@ -242,6 +242,7 @@ fn map_results(results: Vec<StatementResult>) -> Vec<Either<PgFakeQueryResult, P
                 vec![Either::Left(PgFakeQueryResult { rows_affected })]
             }
             StatementResult::Query(result) => {
+                let rows_affected = result.rows.len() as u64;
                 let columns = Arc::new(
                     result
                         .columns
@@ -276,7 +277,7 @@ fn map_results(results: Vec<StatementResult>) -> Vec<Either<PgFakeQueryResult, P
                         })
                     })
                     .collect::<Vec<_>>();
-                output.push(Either::Left(PgFakeQueryResult::default()));
+                output.push(Either::Left(PgFakeQueryResult { rows_affected }));
                 output
             }
         })

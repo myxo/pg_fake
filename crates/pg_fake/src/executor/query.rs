@@ -415,28 +415,86 @@ pub(crate) fn describe_query_result_columns(
     state: &DatabaseState,
     statement: &ast::Statement,
 ) -> Result<Vec<ColumnMeta>> {
-    let ast::Statement::Query(query) = statement else {
-        return Ok(Vec::new());
-    };
-    match query.body.as_ref() {
-        ast::SetExpr::Select(select) => bind_select_scope(state, select).and_then(|scope| {
-            build_projection_plan(state, &select.projection, &scope).map(|(_, columns)| columns)
-        }),
-        ast::SetExpr::Values(values) => bind_values_scope(values).map(|scope| {
-            scope
-                .columns
-                .iter()
-                .map(|column| ColumnMeta {
-                    name: column.name.clone(),
-                    type_oid: column.data_type.map_to_oid(),
-                    typmod: column.data_type.typmod,
-                })
-                .collect()
-        }),
+    match statement {
+        ast::Statement::Query(query) => match query.body.as_ref() {
+            ast::SetExpr::Select(select) => bind_select_scope(state, select).and_then(|scope| {
+                build_projection_plan(state, &select.projection, &scope).map(|(_, columns)| columns)
+            }),
+            ast::SetExpr::Values(values) => bind_values_scope(values).map(|scope| {
+                scope
+                    .columns
+                    .iter()
+                    .map(|column| ColumnMeta {
+                        name: column.name.clone(),
+                        type_oid: column.data_type.map_to_oid(),
+                        typmod: column.data_type.typmod,
+                    })
+                    .collect()
+            }),
+            _ => Ok(Vec::new()),
+        },
+        ast::Statement::Insert(insert) => {
+            let Some(returning) = &insert.returning else {
+                return Ok(Vec::new());
+            };
+            let schema = state
+                .catalog
+                .require_table(&resolve_insert_table_name(&insert.table)?)?;
+            let scope = bind_target_scope(
+                schema,
+                insert.table_alias.as_ref().map(|alias| &alias.alias),
+            );
+            build_projection_plan(state, returning, &scope).map(|(_, columns)| columns)
+        }
+        ast::Statement::Update(update) => {
+            let Some(returning) = &update.returning else {
+                return Ok(Vec::new());
+            };
+            let ast::TableFactor::Table {
+                name, alias, args, ..
+            } = &update.table.relation
+            else {
+                return Ok(Vec::new());
+            };
+            if args.is_some() {
+                return Ok(Vec::new());
+            }
+            let schema = state
+                .catalog
+                .require_table(&normalize_unqualified_object_name(name)?)?;
+            let scope = bind_target_scope(schema, alias.as_ref().map(|alias| &alias.name));
+            build_projection_plan(state, returning, &scope).map(|(_, columns)| columns)
+        }
+        ast::Statement::Delete(delete) => {
+            let Some(returning) = &delete.returning else {
+                return Ok(Vec::new());
+            };
+            let ast::FromTable::WithFromKeyword(from) = &delete.from else {
+                return Ok(Vec::new());
+            };
+            let Some(ast::TableWithJoins {
+                relation:
+                    ast::TableFactor::Table {
+                        name, alias, args, ..
+                    },
+                ..
+            }) = from.first()
+            else {
+                return Ok(Vec::new());
+            };
+            if args.is_some() {
+                return Ok(Vec::new());
+            }
+            let schema = state
+                .catalog
+                .require_table(&normalize_unqualified_object_name(name)?)?;
+            let scope = bind_target_scope(schema, alias.as_ref().map(|alias| &alias.name));
+            build_projection_plan(state, returning, &scope).map(|(_, columns)| columns)
+        }
         _ => Ok(Vec::new()),
     }
 }
-enum ProjectionSource<'a> {
+pub(super) enum ProjectionSource<'a> {
     Column(usize),
     Merged(usize, usize, PgType),
     Expression(&'a ast::Expr),
@@ -1737,6 +1795,33 @@ fn evaluate_projection_value(
     }
 }
 
+pub(super) fn evaluate_projection_values(
+    state: &DatabaseState,
+    projections: &[ProjectionSource<'_>],
+    scope: &BoundScope,
+    row: &[Value],
+    aggregate_rows: Option<&[Vec<Value>]>,
+    xid: Xid,
+    snapshot: &Snapshot,
+    context: &StatementExecutionContext,
+) -> Result<Vec<Value>> {
+    projections
+        .iter()
+        .map(|projection| {
+            evaluate_projection_value(
+                state,
+                projection,
+                scope,
+                row,
+                aggregate_rows,
+                xid,
+                snapshot,
+                context,
+            )
+        })
+        .collect()
+}
+
 fn evaluate_order_keys(
     state: &DatabaseState,
     order_specs: &[RowOrderSpec<'_>],
@@ -1831,14 +1916,16 @@ fn execute_plain_select_rows(
             )? {
                 return Ok(());
             }
-            let values = projections
-                .iter()
-                .map(|projection| {
-                    evaluate_projection_value(
-                        state, projection, scope, row, None, xid, snapshot, context,
-                    )
-                })
-                .collect::<Result<Vec<_>>>()?;
+            let values = evaluate_projection_values(
+                state,
+                projections,
+                scope,
+                row,
+                None,
+                xid,
+                snapshot,
+                context,
+            )?;
             let keys = evaluate_order_keys(
                 state,
                 order_specs,
@@ -1943,21 +2030,16 @@ fn execute_grouped_select_rows(
                 _ => unreachable!("HAVING expression was type-checked"),
             }
         }
-        let values = projections
-            .iter()
-            .map(|projection| {
-                evaluate_projection_value(
-                    state,
-                    projection,
-                    scope,
-                    row,
-                    Some(&group_rows),
-                    xid,
-                    snapshot,
-                    context,
-                )
-            })
-            .collect::<Result<Vec<_>>>()?;
+        let values = evaluate_projection_values(
+            state,
+            projections,
+            scope,
+            row,
+            Some(&group_rows),
+            xid,
+            snapshot,
+            context,
+        )?;
         let keys = evaluate_order_keys(
             state,
             order_specs,
@@ -2171,7 +2253,7 @@ pub(super) fn execute_query(
     Ok(StatementResult::Query(QueryResult { columns, rows }))
 }
 
-fn build_projection_plan<'a>(
+pub(super) fn build_projection_plan<'a>(
     state: &DatabaseState,
     projection: &'a [ast::SelectItem],
     scope: &BoundScope,

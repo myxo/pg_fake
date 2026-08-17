@@ -203,6 +203,60 @@ async fn prepared_statements_transactions_and_pools_use_the_sqlx_api() {
     );
 }
 
+#[tokio::test]
+async fn sqlx_fetches_and_executes_returning_mutations() {
+    let mut connection = PgFakeConnection::new(Db::create());
+    connection
+        .execute(
+            "CREATE TABLE returning_rows (
+                 id INTEGER PRIMARY KEY,
+                 label VARCHAR(12) DEFAULT 'new'
+             )",
+        )
+        .await
+        .unwrap();
+
+    let rows = sqlx::query(
+        "INSERT INTO returning_rows (id, label) VALUES ($1, $2), ($3, DEFAULT)
+         RETURNING id, label",
+    )
+    .bind(1_i32)
+    .bind("first")
+    .bind(2_i32)
+    .fetch_all(&mut connection)
+    .await
+    .unwrap();
+    assert_eq!(rows.len(), 2);
+    assert_eq!(rows[0].get::<i32, _>("id"), 1);
+    assert_eq!(rows[0].get::<String, _>("label"), "first");
+    assert_eq!(rows[1].get::<String, _>("label"), "new");
+    assert_eq!(rows[1].columns()[1].type_info().name(), "VARCHAR");
+
+    let statement = connection
+        .prepare(SqlStr::from_static(
+            "UPDATE returning_rows SET label = $1 RETURNING id, label AS updated_label",
+        ))
+        .await
+        .unwrap();
+    assert_eq!(statement.parameters().unwrap().left().unwrap().len(), 1);
+    assert_eq!(statement.columns()[0].name(), "id");
+    assert_eq!(statement.columns()[1].name(), "updated_label");
+    assert_eq!(statement.columns()[1].type_info().name(), "VARCHAR");
+    let updated = statement
+        .query()
+        .bind("updated")
+        .fetch_all(&mut connection)
+        .await
+        .unwrap();
+    assert_eq!(updated.len(), 2);
+
+    let affected = sqlx::query("DELETE FROM returning_rows RETURNING id")
+        .execute(&mut connection)
+        .await
+        .unwrap();
+    assert_eq!(affected.rows_affected(), 2);
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn row_lock_waits_run_on_the_blocking_pool() {
     let db = Db::create_builder()

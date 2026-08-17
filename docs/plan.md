@@ -377,7 +377,7 @@ the Phase 2 list in `spec.md`.
 
 ## Milestone D — Query-producing DML
 
-### Task 12 — `INSERT` / `UPDATE` / `DELETE ... RETURNING`
+### Task 12 — `INSERT` / `UPDATE` / `DELETE ... RETURNING` [COMPLETE]
 
 **Goal:** Return affected rows from mutations through both native and SQLx APIs.
 
@@ -395,6 +395,27 @@ the Phase 2 list in `spec.md`.
   count consistently.
 - Differential/property tests cover all mutation forms, zero/many affected
   rows, errors, prepared parameters, metadata, and explicit transactions.
+
+**Completed:**
+
+- `INSERT`, `UPDATE`, and `DELETE ... RETURNING` share the bound projection
+  machinery used by queries, including `*`, qualified wildcards, expressions,
+  aliases, direct-column typmods, and target-table aliases.
+- Inserted and updated rows expose their final assigned values; deleted rows
+  expose their old values. Zero-row mutations still return described query
+  results, and failures discard all mutation and RETURNING work atomically.
+- Native execution and prepared APIs classify RETURNING as row-producing. SQLx
+  prepared metadata and `fetch*` expose returned rows, while `execute` reports
+  the affected-row count.
+- Focused PostgreSQL differential tests cover all mutation forms, defaults and
+  assignment coercion, zero/many rows, metadata, prepared parameters, explicit
+  rollback, and constraint/expression failures. The generated differential
+  suite and benchmark registry now include RETURNING workloads.
+- The Phase 2 manifest promotes RETURNING to `MustPass`; the reviewed report
+  records 442 matching corpus statements, 141 skipped scripts, and 26 passing
+  Phase 2 conformance cases with no RETURNING blocker.
+- `cargo test --workspace`, `cargo check --workspace --all-targets`, and the
+  10,000-iteration property suite pass.
 
 ### Task 13 — Query-sourced and joined mutations
 

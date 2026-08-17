@@ -29,6 +29,11 @@ pub fn list_benchmarks() -> Vec<Benchmark> {
         build_benchmark("create_table", postgres_values(), postgres_comparisons()),
         build_benchmark("insert_row", postgres_values(), postgres_comparisons()),
         build_benchmark(
+            "insert_row_returning",
+            postgres_values(),
+            postgres_comparisons(),
+        ),
+        build_benchmark(
             "insert_row_with_defaults",
             postgres_values(),
             postgres_comparisons(),

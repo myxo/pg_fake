@@ -209,7 +209,7 @@ pub const FEATURES: &[Feature] = &[
             source: "returning.sql:11",
             setup: &["CREATE TABLE returning_rows (id INTEGER)"],
             sql: "INSERT INTO returning_rows VALUES (1) RETURNING id",
-            baseline: Baseline::Pending,
+            baseline: Baseline::MustPass,
         }],
     },
     Feature {
