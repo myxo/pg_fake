@@ -107,8 +107,8 @@ rules:4
 select:2
 select_distinct:4
 select_distinct_on:1
-select_having:12
-select_implicit:12
+select_having:14
+select_implicit:28
 select_into:5
 select_views:4
 sequence:1

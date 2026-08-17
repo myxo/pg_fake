@@ -653,6 +653,65 @@ fn matches_aggregates_with_scalar_subqueries() {
 }
 
 #[test]
+fn matches_grouping_having_and_output_references() {
+    assert_differential(
+        "CREATE TABLE __TABLE__ (category INTEGER, value INTEGER); \
+         INSERT INTO __TABLE__ VALUES (1, 10), (1, 20), (2, NULL), (NULL, 5), (NULL, 5); \
+         SELECT category, count(*), sum(value) FROM __TABLE__ \
+         GROUP BY category ORDER BY category NULLS FIRST; \
+         SELECT category + 1 AS shifted, count(*) AS amount FROM __TABLE__ \
+         GROUP BY category ORDER BY amount DESC, shifted NULLS FIRST; \
+         SELECT category + 1 AS shifted, count(*) FROM __TABLE__ \
+         GROUP BY shifted HAVING count(*) > 1 ORDER BY 1 NULLS FIRST; \
+         SELECT category, count(*) FROM __TABLE__ GROUP BY 1 ORDER BY 1 NULLS FIRST",
+        RowOrder::Ordered,
+    );
+}
+
+#[test]
+fn matches_grouped_empty_input_distinct_and_filter() {
+    assert_differential(
+        "CREATE TABLE __TABLE__ (category INTEGER, value INTEGER, keep BOOLEAN); \
+         SELECT category, count(*) FROM __TABLE__ GROUP BY category; \
+         SELECT count(*) FROM __TABLE__ HAVING count(*) = 0; \
+         SELECT count(*) FROM __TABLE__ HAVING FALSE; \
+         INSERT INTO __TABLE__ VALUES \
+             (1, 10, TRUE), (1, 10, FALSE), (1, 20, TRUE), (2, NULL, TRUE); \
+         SELECT category, count(DISTINCT value), sum(DISTINCT value), \
+                count(*) FILTER (WHERE keep), sum(value) FILTER (WHERE keep) \
+         FROM __TABLE__ GROUP BY category ORDER BY category",
+        RowOrder::Ordered,
+    );
+}
+
+#[test]
+fn matches_grouping_errors_and_correlated_having() {
+    assert_differential(
+        "CREATE TABLE __TABLE__ (category INTEGER, value INTEGER); \
+         INSERT INTO __TABLE__ VALUES (1, 10), (1, 20), (2, 30); \
+         SELECT category, value, count(*) FROM __TABLE__ GROUP BY category; \
+         SELECT category FROM __TABLE__ GROUP BY sum(value); \
+         SELECT category, count(*) FROM __TABLE__ GROUP BY category ORDER BY value; \
+         SELECT category, count(*) FROM __TABLE__ GROUP BY category HAVING value > 0; \
+         SELECT category, count(*) FROM __TABLE__ outer_rows GROUP BY category \
+         HAVING EXISTS (SELECT 1 FROM __TABLE__ inner_rows \
+                        WHERE inner_rows.category = outer_rows.category \
+                          AND inner_rows.value > 15) ORDER BY category; \
+         SELECT category, count(*) FROM __TABLE__ outer_rows GROUP BY category \
+         HAVING EXISTS (SELECT 1 FROM __TABLE__ inner_rows \
+                        WHERE inner_rows.value = outer_rows.value)",
+        RowOrder::Ordered,
+    );
+
+    assert_differential(
+        "CREATE TABLE __TABLE__ (id INTEGER PRIMARY KEY, value INTEGER); \
+         INSERT INTO __TABLE__ VALUES (1, 10), (2, 20); \
+         SELECT id, value, count(*) FROM __TABLE__ GROUP BY id ORDER BY id",
+        RowOrder::Ordered,
+    );
+}
+
+#[test]
 fn matches_aggregate_errors() {
     assert_differential(
         "CREATE TABLE __TABLE__ (id INTEGER, flag BOOLEAN); \

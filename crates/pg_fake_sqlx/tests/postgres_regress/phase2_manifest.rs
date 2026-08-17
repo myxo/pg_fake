@@ -186,7 +186,7 @@ pub const FEATURES: &[Feature] = &[
                 "INSERT INTO grouped_rows VALUES (1), (1), (2)",
             ],
             sql: "SELECT id, count(*) FROM grouped_rows GROUP BY id HAVING count(*) > 1",
-            baseline: Baseline::Pending,
+            baseline: Baseline::MustPass,
         }],
     },
     Feature {

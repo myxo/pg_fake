@@ -17,6 +17,8 @@ enum AggregateKind {
 struct AggregateCall<'a> {
     kind: AggregateKind,
     argument: Option<&'a ast::Expr>,
+    filter: Option<&'a ast::Expr>,
+    distinct: bool,
     argument_type: Option<BaseType>,
     result_type: BaseType,
 }
@@ -63,7 +65,6 @@ fn parse_aggregate_call<'a>(
     };
     if function.uses_odbc_syntax
         || !matches!(function.parameters, ast::FunctionArguments::None)
-        || function.filter.is_some()
         || function.null_treatment.is_some()
         || function.over.is_some()
         || !function.within_group.is_empty()
@@ -73,13 +74,22 @@ fn parse_aggregate_call<'a>(
     let ast::FunctionArguments::List(arguments) = &function.args else {
         return Err(signature_error());
     };
-    if matches!(
-        arguments.duplicate_treatment,
-        Some(ast::DuplicateTreatment::Distinct)
-    ) || !arguments.clauses.is_empty()
-    {
+    if !arguments.clauses.is_empty() {
         return reject_unsupported("aggregate argument feature is not implemented");
     }
+    if let Some(filter) = &function.filter {
+        let data_type = infer_expression_type(filter, schema)?;
+        if data_type != BaseType::Bool && !is_null_literal(filter) {
+            return Err(PgError::create(
+                SqlState::DatatypeMismatch,
+                "FILTER expression must be type boolean",
+            ));
+        }
+    }
+    let distinct = matches!(
+        arguments.duplicate_treatment,
+        Some(ast::DuplicateTreatment::Distinct)
+    );
     if name == "count"
         && (arguments.args.is_empty()
             || matches!(
@@ -87,9 +97,17 @@ fn parse_aggregate_call<'a>(
                 [ast::FunctionArg::Unnamed(ast::FunctionArgExpr::Wildcard)]
             ))
     {
+        if distinct {
+            return Err(PgError::create(
+                SqlState::SyntaxError,
+                "DISTINCT requires an aggregate argument",
+            ));
+        }
         return Ok(AggregateCall {
             kind: AggregateKind::CountAll,
             argument: None,
+            filter: function.filter.as_deref(),
+            distinct,
             argument_type: None,
             result_type: BaseType::Int8,
         });
@@ -168,6 +186,8 @@ fn parse_aggregate_call<'a>(
     Ok(AggregateCall {
         kind,
         argument: Some(argument),
+        filter: function.filter.as_deref(),
+        distinct,
         argument_type: Some(argument_type),
         result_type,
     })
@@ -177,25 +197,43 @@ pub(super) fn evaluate_aggregate_function<F>(
     function: &ast::Function,
     schema: RowScope<'_>,
     rows: &[Vec<Value>],
-    mut evaluate_argument: F,
+    mut evaluate_expression: F,
 ) -> Result<(Value, BaseType)>
 where
-    F: FnMut(&[Value]) -> Result<Value>,
+    F: FnMut(&ast::Expr, &[Value]) -> Result<Value>,
 {
     let call = parse_aggregate_call(function, schema)?;
-    let Some(_) = call.argument else {
+    let mut filtered_rows = Vec::with_capacity(rows.len());
+    for row in rows {
+        if let Some(filter) = call.filter {
+            match evaluate_expression(filter, row)? {
+                Value::Bool(true) => {}
+                Value::Bool(false) | Value::Null => continue,
+                _ => unreachable!("aggregate FILTER expression was type-checked"),
+            }
+        }
+        filtered_rows.push(row);
+    }
+    let Some(argument) = call.argument else {
         return Ok((
-            Value::Int8(i64::try_from(rows.len()).expect("row count must fit in int8")),
+            Value::Int8(i64::try_from(filtered_rows.len()).expect("row count must fit in int8")),
             call.result_type,
         ));
     };
     let argument_type = call
         .argument_type
         .expect("aggregate expression has an argument type");
-    let mut values = Vec::with_capacity(rows.len());
-    for row in rows {
-        let value = evaluate_argument(row)?;
+    let mut values = Vec::with_capacity(filtered_rows.len());
+    for row in filtered_rows {
+        let value = evaluate_expression(argument, row)?;
         if !value.is_null() {
+            let duplicate = call.distinct
+                && values.iter().try_fold(false, |duplicate, existing| {
+                    Ok(duplicate || compare_values(existing, &value)? == Ordering::Equal)
+                })?;
+            if duplicate {
+                continue;
+            }
             values.push(value);
         }
     }

@@ -914,8 +914,29 @@ fn generate_select(src: &mut Source, table: &TableSchema) -> (String, RowOrder) 
 fn generate_aggregate(src: &mut Source, table: &TableSchema) -> (String, RowOrder) {
     src.select(
         "aggregate",
-        &["count", "sum", "average", "minimum_maximum", "boolean"],
+        &[
+            "count",
+            "sum",
+            "average",
+            "minimum_maximum",
+            "boolean",
+            "grouped",
+            "distinct_filter",
+        ],
         |src, aggregate, _| {
+            if aggregate == "grouped" {
+                let column = choose_column(src, table, |_| true);
+                return (
+                    format!(
+                        "SELECT {0}, count(*), count({1}) FROM {2}{3} GROUP BY {0} HAVING count(*) >= 1 ORDER BY {0}",
+                        column.name,
+                        table.key().name,
+                        table.name,
+                        generate_where_clause(src, table),
+                    ),
+                    RowOrder::Ordered,
+                );
+            }
             let projections = match aggregate {
                 "count" => {
                     let column = choose_column(src, table, |_| true);
@@ -951,6 +972,19 @@ fn generate_aggregate(src: &mut Source, table: &TableSchema) -> (String, RowOrde
                             .expect("boolean columns must not be empty");
                         format!("bool_and({0}), bool_or({0})", column.name)
                     }
+                }
+                "distinct_filter" => {
+                    let column = choose_column(src, table, |_| true);
+                    let filter = table
+                        .columns
+                        .iter()
+                        .find(|column| column.data_type == SqlType::Boolean)
+                        .map(|column| column.name.as_str())
+                        .unwrap_or("TRUE");
+                    format!(
+                        "count(DISTINCT {0}), count(*) FILTER (WHERE {filter})",
+                        column.name
+                    )
                 }
                 _ => unreachable!(),
             };

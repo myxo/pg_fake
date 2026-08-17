@@ -898,6 +898,7 @@ fn benchmarks(criterion: &mut Criterion) {
         inner_join_benchmark(criterion, &runtime, &mut connections);
         derived_and_scalar_subquery_benchmark(criterion, &runtime, &mut connections);
         global_aggregate_benchmark(criterion, &runtime, &mut connections);
+        grouped_aggregate_benchmark(criterion, &runtime, &mut connections);
     }
     runtime
         .block_on(
@@ -939,6 +940,42 @@ fn global_aggregate_benchmark(
     group.finish();
     for (_, connection) in connections.iter_mut() {
         connection.execute(runtime, "DROP TABLE global_aggregate_100_rows");
+    }
+}
+
+fn grouped_aggregate_benchmark(
+    criterion: &mut Criterion,
+    runtime: &Runtime,
+    connections: &mut [NamedBenchmarkConnection<'_>],
+) {
+    let values = (1..=100)
+        .map(|id| format!("({id}, {})", id % 10))
+        .collect::<Vec<_>>()
+        .join(",");
+    for (_, connection) in connections.iter_mut() {
+        connection.execute(
+            runtime,
+            "CREATE TABLE grouped_aggregate_100_rows (id INTEGER, bucket INTEGER)",
+        );
+        connection.execute(
+            runtime,
+            &format!("INSERT INTO grouped_aggregate_100_rows VALUES {values}"),
+        );
+    }
+    let query = "SELECT bucket, count(*), sum(id) FROM grouped_aggregate_100_rows GROUP BY bucket HAVING count(*) > 5 ORDER BY bucket";
+    let mut group =
+        criterion.benchmark_group(benchmarks::find_benchmark("grouped_aggregate_100_rows").name);
+    group.throughput(Throughput::Elements(100));
+    for (name, connection) in connections.iter_mut() {
+        group.bench_function(*name, |benchmark| {
+            benchmark.iter(|| {
+                connection.fetch(runtime, query);
+            });
+        });
+    }
+    group.finish();
+    for (_, connection) in connections.iter_mut() {
+        connection.execute(runtime, "DROP TABLE grouped_aggregate_100_rows");
     }
 }
 

@@ -292,7 +292,7 @@ aggregates are outside Phase 2.
 - `cargo test --workspace`, `cargo check --workspace --all-targets`, and the
   10,000-iteration property suite pass.
 
-### Task 10 — `GROUP BY`, aggregate modifiers, and `HAVING`
+### Task 10 — `GROUP BY`, aggregate modifiers, and `HAVING` [COMPLETE]
 
 **Goal:** Partition rows into groups and filter aggregate results.
 
@@ -312,6 +312,27 @@ aggregates are outside Phase 2.
   empty input, grouped errors, `HAVING`, `DISTINCT`, and `FILTER`.
 
 **Notes:** Grouping sets, rollup, and cube remain outside Phase 2.
+
+**Completed:**
+
+- Grouped execution partitions filtered source rows by columns, expressions,
+  aliases, and select-list ordinals with PostgreSQL NULL equality, empty-input
+  behavior, output ordering, and primary-key functional dependencies.
+- Grouped-column validation covers projection, `HAVING`, and `ORDER BY`,
+  including correlated `HAVING` subqueries and PostgreSQL `42803` errors for
+  ungrouped outer references.
+- `HAVING` executes after aggregation for grouped and degenerate global groups;
+  core aggregates support `DISTINCT` and `FILTER (WHERE ...)` together.
+- Focused PostgreSQL differential tests cover duplicate and NULL keys,
+  expression/alias/ordinal grouping, empty input, grouped errors, correlated
+  subqueries, primary-key dependencies, aggregate `DISTINCT`, and aggregate
+  `FILTER`. The generated differential suite and benchmark registry include
+  grouped aggregate workloads.
+- The Phase 2 manifest promotes grouping and having to `MustPass`; the reviewed
+  report records 442 matching corpus statements, 141 skipped scripts, and 24
+  passing Phase 2 conformance cases with no grouping-and-having blocker.
+- `cargo test --workspace`, `cargo check --workspace --all-targets`, and the
+  10,000-iteration property suite pass.
 
 ### Task 11 — `SELECT DISTINCT` and `DISTINCT ON`
 

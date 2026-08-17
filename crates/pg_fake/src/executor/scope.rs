@@ -1,6 +1,6 @@
 use super::{DatabaseState, normalize_identifier, normalize_unqualified_object_name};
 use crate::{
-    catalog::{Catalog, TableSchema},
+    catalog::{Catalog, TableId, TableSchema},
     error::{PgError, Result, SqlState, reject_unsupported},
     value::{BaseType, PgType},
 };
@@ -18,6 +18,8 @@ pub(super) struct BoundColumn {
     pub(super) unqualified: bool,
     pub(super) wildcard: bool,
     pub(super) depth: usize,
+    pub(super) table_id: Option<TableId>,
+    pub(super) source_name: String,
 }
 
 #[derive(Clone)]
@@ -202,6 +204,8 @@ impl BoundScope {
                     unqualified: true,
                     wildcard: true,
                     depth: 0,
+                    table_id: Some(schema.id),
+                    source_name: column.name.clone(),
                 })
                 .collect(),
         })
@@ -333,6 +337,7 @@ fn bind_table_factor(
         scope
             .columns
             .extend(columns.into_iter().enumerate().map(|(index, column)| {
+                let source_name = column.name.clone();
                 BoundColumn {
                     name: alias
                         .columns
@@ -346,6 +351,8 @@ fn bind_table_factor(
                     unqualified: true,
                     wildcard: true,
                     depth: 0,
+                    table_id: None,
+                    source_name,
                 }
             }));
         return Ok(());
@@ -467,6 +474,7 @@ fn describe_bound_query_columns(
                         .into_iter()
                         .enumerate()
                         .map(|(slot, (name, data_type))| BoundColumn {
+                            source_name: name.clone(),
                             name,
                             data_type,
                             qualifier: String::new(),
@@ -475,6 +483,7 @@ fn describe_bound_query_columns(
                             unqualified: true,
                             wildcard: true,
                             depth: 0,
+                            table_id: None,
                         })
                         .collect()
                 })
@@ -525,6 +534,8 @@ fn describe_bound_query_columns(
                         unqualified: true,
                         wildcard: true,
                         depth: 0,
+                        table_id: None,
+                        source_name: format!("column{}", slot + 1),
                     })
                 })
                 .collect()

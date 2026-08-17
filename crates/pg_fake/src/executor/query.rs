@@ -454,6 +454,10 @@ struct RowOrderSpec<'a> {
     ascending: bool,
     nulls_first: bool,
 }
+struct GroupingPlan {
+    expressions: Vec<(ast::Expr, PgType)>,
+    enabled: bool,
+}
 struct OrderedRow {
     values: Vec<Value>,
     keys: Vec<Value>,
@@ -478,6 +482,16 @@ struct AggregateMaterializer<'a> {
     snapshot: &'a Snapshot,
     context: &'a StatementExecutionContext,
     query_depth: usize,
+    error: Option<PgError>,
+}
+struct GroupedExpressionSubstituter<'a> {
+    catalog: &'a crate::catalog::Catalog,
+    grouped_expressions: &'a [(ast::Expr, PgType)],
+    grouped_columns: &'a [(usize, PgType)],
+    scope: &'a BoundScope,
+    scopes: Vec<BoundScope>,
+    query_depth: usize,
+    aggregate_depth: usize,
     error: Option<PgError>,
 }
 #[derive(Eq, Hash, PartialEq)]
@@ -578,6 +592,7 @@ impl ast::VisitorMut for AggregateMaterializer<'_> {
             },
             _ => None,
         };
+        let original_filter = function.filter.as_deref();
         let typed_expression = match super::scope::substitute_typed_subqueries(
             &self.state.catalog,
             &ast::Expr::Function(function.clone()),
@@ -596,10 +611,19 @@ impl ast::VisitorMut for AggregateMaterializer<'_> {
             &typed_function,
             RowScope::Bound(self.scope),
             self.rows,
-            |row| {
+            |typed_expression, row| {
+                let expression = if typed_function
+                    .filter
+                    .as_deref()
+                    .is_some_and(|filter| std::ptr::eq(filter, typed_expression))
+                {
+                    original_filter.expect("aggregate FILTER expression was validated")
+                } else {
+                    original_argument.expect("aggregate expression argument was validated")
+                };
                 evaluate_query_expression(
                     self.state,
-                    original_argument.expect("aggregate expression argument was validated"),
+                    expression,
                     self.scope,
                     row,
                     self.xid,
@@ -618,6 +642,137 @@ impl ast::VisitorMut for AggregateMaterializer<'_> {
                 std::ops::ControlFlow::Break(())
             }
         }
+    }
+}
+
+impl ast::VisitorMut for GroupedExpressionSubstituter<'_> {
+    type Break = ();
+
+    fn pre_visit_query(&mut self, query: &mut ast::Query) -> std::ops::ControlFlow<Self::Break> {
+        let outer = self
+            .scopes
+            .last()
+            .expect("grouped validator has a root scope");
+        let scope = match query.body.as_ref() {
+            ast::SetExpr::Select(select) => {
+                super::scope::bind_query_scope_with_outer(self.catalog, select, outer)
+            }
+            _ => Ok(outer.clone()),
+        };
+        match scope {
+            Ok(scope) => self.scopes.push(scope),
+            Err(error) => {
+                self.error = Some(error);
+                return std::ops::ControlFlow::Break(());
+            }
+        }
+        self.query_depth += 1;
+        std::ops::ControlFlow::Continue(())
+    }
+
+    fn post_visit_query(&mut self, _query: &mut ast::Query) -> std::ops::ControlFlow<Self::Break> {
+        self.query_depth -= 1;
+        self.scopes.pop().expect("visited query pushed a scope");
+        std::ops::ControlFlow::Continue(())
+    }
+
+    fn pre_visit_expr(&mut self, expression: &mut ast::Expr) -> std::ops::ControlFlow<Self::Break> {
+        if self.query_depth != 0 {
+            if self.aggregate_depth != 0 {
+                return std::ops::ControlFlow::Continue(());
+            }
+            let identifiers = match expression {
+                ast::Expr::Identifier(identifier) => Some(std::slice::from_ref(identifier)),
+                ast::Expr::CompoundIdentifier(identifiers) => Some(identifiers.as_slice()),
+                _ => None,
+            };
+            let Some(identifiers) = identifiers else {
+                return std::ops::ControlFlow::Continue(());
+            };
+            let scope = self.scopes.last().expect("nested query has a bound scope");
+            let (slot, _) = match scope.resolve_column(identifiers) {
+                Ok(resolved) => resolved,
+                Err(error) => {
+                    self.error = Some(error);
+                    return std::ops::ControlFlow::Break(());
+                }
+            };
+            let column = scope
+                .columns
+                .iter()
+                .find(|column| column.slot == slot)
+                .expect("resolved nested column is in its scope");
+            if column.depth == 0 {
+                return std::ops::ControlFlow::Continue(());
+            }
+            let grouped = self.grouped_columns.iter().any(|(slot, _)| {
+                self.scope.columns.iter().any(|root| {
+                    root.slot == *slot
+                        && root.table_id == column.table_id
+                        && root.qualifier == column.qualifier
+                        && root.source_name == column.source_name
+                })
+            });
+            if !grouped {
+                self.error = Some(PgError::create(
+                    SqlState::GroupingError,
+                    "subquery uses ungrouped column from outer query",
+                ));
+                return std::ops::ControlFlow::Break(());
+            }
+            return std::ops::ControlFlow::Continue(());
+        }
+        if matches!(expression, ast::Expr::Function(function) if is_aggregate_function(function)) {
+            self.aggregate_depth += 1;
+            return std::ops::ControlFlow::Continue(());
+        }
+        if self.aggregate_depth != 0 {
+            return std::ops::ControlFlow::Continue(());
+        }
+        if let Some((_, data_type)) = self
+            .grouped_expressions
+            .iter()
+            .find(|(grouped, _)| grouped == expression)
+        {
+            *expression = crate::analyzer::create_typed_literal(Value::Null, *data_type);
+            return std::ops::ControlFlow::Continue(());
+        }
+        let identifiers = match expression {
+            ast::Expr::Identifier(identifier) => Some(std::slice::from_ref(identifier)),
+            ast::Expr::CompoundIdentifier(identifiers) => Some(identifiers.as_slice()),
+            _ => None,
+        };
+        if let Some(identifiers) = identifiers {
+            match self.scope.resolve_column(identifiers) {
+                Ok((slot, _)) => {
+                    if let Some((_, data_type)) = self
+                        .grouped_columns
+                        .iter()
+                        .find(|(grouped, _)| *grouped == slot)
+                    {
+                        *expression =
+                            crate::analyzer::create_typed_literal(Value::Null, *data_type);
+                    }
+                }
+                Err(error) => {
+                    self.error = Some(error);
+                    return std::ops::ControlFlow::Break(());
+                }
+            }
+        }
+        std::ops::ControlFlow::Continue(())
+    }
+
+    fn post_visit_expr(
+        &mut self,
+        expression: &mut ast::Expr,
+    ) -> std::ops::ControlFlow<Self::Break> {
+        if self.query_depth == 0
+            && matches!(expression, ast::Expr::Function(function) if is_aggregate_function(function))
+        {
+            self.aggregate_depth -= 1;
+        }
+        std::ops::ControlFlow::Continue(())
     }
 }
 
@@ -661,6 +816,145 @@ fn materialize_aggregate_expression(
     };
     let _ = expression.visit(&mut materializer);
     materializer.error.map_or(Ok(expression), Err)
+}
+
+fn validate_grouped_expression(
+    state: &DatabaseState,
+    expression: &ast::Expr,
+    scope: &BoundScope,
+    grouped_expressions: &[(ast::Expr, PgType)],
+    grouped_columns: &[(usize, PgType)],
+) -> Result<bool> {
+    let mut expression = expression.clone();
+    let mut substituter = GroupedExpressionSubstituter {
+        catalog: &state.catalog,
+        grouped_expressions,
+        grouped_columns,
+        scope,
+        scopes: vec![scope.clone()],
+        query_depth: 0,
+        aggregate_depth: 0,
+        error: None,
+    };
+    let _ = expression.visit(&mut substituter);
+    if let Some(error) = substituter.error {
+        return Err(error);
+    }
+    let usage = inspect_aggregate_usage(state, &expression, scope)?;
+    if usage.outside_column {
+        return Err(PgError::create(
+            SqlState::GroupingError,
+            "column must appear in the GROUP BY clause or be used in an aggregate function",
+        ));
+    }
+    Ok(usage.found)
+}
+
+fn compare_group_keys(left: &[Value], right: &[Value]) -> Result<bool> {
+    assert_eq!(left.len(), right.len());
+    for (left, right) in left.iter().zip(right) {
+        match (left, right) {
+            (Value::Null, Value::Null) => {}
+            (Value::Null, _) | (_, Value::Null) => return Ok(false),
+            _ if compare_values(left, right)? == Ordering::Equal => {}
+            _ => return Ok(false),
+        }
+    }
+    Ok(true)
+}
+
+fn create_projection_expression(
+    projection: &ProjectionSource<'_>,
+    scope: &BoundScope,
+) -> ast::Expr {
+    match projection {
+        ProjectionSource::Expression(expression) => (*expression).clone(),
+        ProjectionSource::Column(slot) => {
+            let column = scope
+                .columns
+                .iter()
+                .find(|column| column.slot == *slot && column.wildcard)
+                .expect("projected column is present in the bound scope");
+            ast::Expr::CompoundIdentifier(vec![
+                ast::Ident::new(column.qualifier.clone()),
+                ast::Ident::new(column.name.clone()),
+            ])
+        }
+        ProjectionSource::Merged(left, right, _) => {
+            let column = scope
+                .columns
+                .iter()
+                .find(|column| column.merged == Some((*left, *right)) && column.wildcard)
+                .expect("projected merged column is present in the bound scope");
+            ast::Expr::Identifier(ast::Ident::new(column.name.clone()))
+        }
+    }
+}
+
+fn resolve_grouping_expressions(
+    state: &DatabaseState,
+    expressions: &[ast::Expr],
+    projections: &[ProjectionSource<'_>],
+    columns: &[ColumnMeta],
+    scope: &BoundScope,
+) -> Result<Vec<(ast::Expr, PgType)>> {
+    expressions
+        .iter()
+        .map(|expression| {
+            let resolved = if let Some(position) = extract_number_literal(expression)
+                && !position.contains(['.', 'e', 'E'])
+            {
+                let position = position.parse::<usize>().map_err(|_| {
+                    PgError::create(
+                        SqlState::InvalidColumnReference,
+                        "GROUP BY position is not in select list",
+                    )
+                })?;
+                if position == 0 || position > projections.len() {
+                    return Err(PgError::create(
+                        SqlState::InvalidColumnReference,
+                        "GROUP BY position is not in select list",
+                    ));
+                }
+                create_projection_expression(&projections[position - 1], scope)
+            } else if let ast::Expr::Identifier(identifier) = expression {
+                match scope.resolve_column(std::slice::from_ref(identifier)) {
+                    Ok(_) => expression.clone(),
+                    Err(error) if error.sqlstate == SqlState::UndefinedColumn => {
+                        let name = normalize_identifier(identifier);
+                        let matches = columns
+                            .iter()
+                            .enumerate()
+                            .filter(|(_, column)| column.name == name)
+                            .map(|(index, _)| index)
+                            .collect::<Vec<_>>();
+                        match matches.as_slice() {
+                            [index] => create_projection_expression(&projections[*index], scope),
+                            [] => return Err(error),
+                            _ => {
+                                return Err(PgError::create(
+                                    SqlState::AmbiguousColumn,
+                                    format!("column {name:?} is ambiguous"),
+                                ));
+                            }
+                        }
+                    }
+                    Err(error) => return Err(error),
+                }
+            } else {
+                expression.clone()
+            };
+            let usage = inspect_aggregate_usage(state, &resolved, scope)?;
+            if usage.found {
+                return Err(PgError::create(
+                    SqlState::GroupingError,
+                    "aggregate functions are not allowed in GROUP BY",
+                ));
+            }
+            let data_type = infer_query_expression_type(state, &resolved, scope)?;
+            Ok((resolved, data_type))
+        })
+        .collect()
 }
 pub(super) fn resolve_select_lock_mode(query: &ast::Query) -> Result<Option<RowLockMode>> {
     if query.locks.len() > 1 {
@@ -720,6 +1014,8 @@ fn bind_values_scope(values: &ast::Values) -> Result<BoundScope> {
                 unqualified: true,
                 wildcard: true,
                 depth: 0,
+                table_id: None,
+                source_name: format!("column{}", slot + 1),
             })
         })
         .collect::<Result<Vec<_>>>()?;
@@ -871,45 +1167,12 @@ fn execute_values_query(
     }))
 }
 
-pub(super) fn execute_query(
-    state: &DatabaseState,
+fn resolve_select_limit(
     query: &ast::Query,
-    xid: Xid,
-    snapshot: &Snapshot,
     context: &StatementExecutionContext,
-) -> Result<StatementResult> {
-    if query.with.is_some() || query.fetch.is_some() {
-        return reject_unsupported("query clause is not implemented");
-    }
-    let lock_mode = resolve_select_lock_mode(query)?;
-    let ast::SetExpr::Select(select) = query.body.as_ref() else {
-        if let ast::SetExpr::Values(values) = query.body.as_ref() {
-            return execute_values_query(query, values, context);
-        }
-        return reject_unsupported("query source is not implemented");
-    };
-    let ast::GroupByExpr::Expressions(group_by, modifiers) = &select.group_by else {
-        return reject_unsupported("GROUP BY is not implemented");
-    };
-    if select.distinct.is_some()
-        || select.into.is_some()
-        || !group_by.is_empty()
-        || !modifiers.is_empty()
-        || select.having.is_some()
-    {
-        return reject_unsupported("SELECT feature is not implemented");
-    }
-    let scope = bind_select_scope(state, select)?;
-    if let Some(selection) = &select.selection
-        && inspect_aggregate_usage(state, selection, &scope)?.found
-    {
-        return Err(PgError::create(
-            SqlState::GroupingError,
-            "aggregate functions are not allowed in WHERE",
-        ));
-    }
-    let (limit, offset) = match &query.limit_clause {
-        None => (None, 0),
+) -> Result<(Option<usize>, usize)> {
+    match &query.limit_clause {
+        None => Ok((None, 0)),
         Some(ast::LimitClause::LimitOffset {
             limit,
             offset,
@@ -929,14 +1192,21 @@ pub(super) fn execute_query(
                 .transpose()?
                 .flatten()
                 .unwrap_or(0);
-            (limit, offset)
+            Ok((limit, offset))
         }
         Some(ast::LimitClause::OffsetCommaLimit { .. }) => {
-            return reject_unsupported("LIMIT clause is not implemented");
+            reject_unsupported("LIMIT clause is not implemented")
         }
-    };
+    }
+}
+
+fn validate_select_predicates(
+    state: &DatabaseState,
+    select: &ast::Select,
+    scope: &BoundScope,
+) -> Result<()> {
     if let Some(selection) = &select.selection {
-        let base = infer_query_expression_type(state, selection, &scope)?.base;
+        let base = infer_query_expression_type(state, selection, scope)?.base;
         if base != BaseType::Bool && !is_null_literal(selection) {
             return Err(PgError::create(
                 SqlState::DatatypeMismatch,
@@ -944,26 +1214,26 @@ pub(super) fn execute_query(
             ));
         }
     }
-    let (projections, columns) = build_projection_plan(state, &select.projection, &scope)?;
-    let mut aggregate_query = false;
-    let mut outside_aggregate_column = false;
-    for item in &select.projection {
-        match item {
-            ast::SelectItem::UnnamedExpr(expression)
-            | ast::SelectItem::ExprWithAlias {
-                expr: expression, ..
-            } => {
-                let usage = inspect_aggregate_usage(state, expression, &scope)?;
-                aggregate_query |= usage.found;
-                outside_aggregate_column |= usage.outside_column;
-            }
-            ast::SelectItem::Wildcard(_) | ast::SelectItem::QualifiedWildcard(_, _) => {
-                outside_aggregate_column = true;
-            }
-            _ => {}
+    if let Some(having) = &select.having {
+        let base = infer_query_expression_type(state, having, scope)?.base;
+        if base != BaseType::Bool && !is_null_literal(having) {
+            return Err(PgError::create(
+                SqlState::DatatypeMismatch,
+                "HAVING requires a boolean expression",
+            ));
         }
     }
-    let order_specs = query
+    Ok(())
+}
+
+fn resolve_order_specs<'a>(
+    state: &DatabaseState,
+    query: &'a ast::Query,
+    projections: &[ProjectionSource<'_>],
+    columns: &[ColumnMeta],
+    scope: &BoundScope,
+) -> Result<Vec<RowOrderSpec<'a>>> {
+    query
         .order_by
         .as_ref()
         .map(|order_by| {
@@ -1002,7 +1272,7 @@ pub(super) fn execute_query(
                     {
                         OrderKey::Output(index)
                     } else {
-                        infer_query_expression_type(state, &order.expr, &scope)?;
+                        infer_query_expression_type(state, &order.expr, scope)?;
                         OrderKey::Expression(&order.expr)
                     };
                     let ascending = order.options.asc.unwrap_or(true);
@@ -1014,166 +1284,411 @@ pub(super) fn execute_query(
                 })
                 .collect::<Result<Vec<_>>>()
         })
-        .transpose()?
-        .unwrap_or_default();
-    for order in &order_specs {
-        if let OrderKey::Expression(expression) = order.key {
-            let usage = inspect_aggregate_usage(state, expression, &scope)?;
-            aggregate_query |= usage.found;
-            outside_aggregate_column |= usage.outside_column;
+        .transpose()
+        .map(|orders| orders.unwrap_or_default())
+}
+
+fn extend_grouped_columns_with_primary_keys(
+    state: &DatabaseState,
+    scope: &BoundScope,
+    grouped_columns: &mut Vec<(usize, PgType)>,
+) {
+    let mut checked_relations = Vec::new();
+    for column in scope.columns.iter().filter(|column| column.depth == 0) {
+        let Some(table_id) = column.table_id else {
+            continue;
+        };
+        let relation = (table_id, column.qualifier.clone());
+        if checked_relations.contains(&relation) {
+            continue;
+        }
+        checked_relations.push(relation.clone());
+        let table = state
+            .catalog
+            .iterate_tables()
+            .find(|table| table.id == table_id)
+            .expect("bound base table remains in the catalog");
+        let Some(primary_key) = table
+            .constraints
+            .iter()
+            .find_map(|constraint| match constraint {
+                crate::catalog::Constraint::PrimaryKey(columns) => Some(columns),
+                _ => None,
+            })
+        else {
+            continue;
+        };
+        let relation_columns = scope
+            .columns
+            .iter()
+            .filter(|column| {
+                column.depth == 0
+                    && column.table_id == Some(table_id)
+                    && column.qualifier == relation.1
+            })
+            .collect::<Vec<_>>();
+        let primary_key_is_grouped = primary_key.iter().all(|name| {
+            let matches = relation_columns
+                .iter()
+                .filter(|column| column.source_name == *name)
+                .collect::<Vec<_>>();
+            matches.len() == 1
+                && grouped_columns
+                    .iter()
+                    .any(|(slot, _)| *slot == matches[0].slot)
+        });
+        if primary_key_is_grouped {
+            for column in relation_columns {
+                if !grouped_columns.iter().any(|(slot, _)| *slot == column.slot) {
+                    grouped_columns.push((column.slot, column.data_type));
+                }
+            }
         }
     }
-    if aggregate_query && outside_aggregate_column {
-        return Err(PgError::create(
-            SqlState::GroupingError,
-            "column must appear in the GROUP BY clause or be used in an aggregate function",
-        ));
+}
+
+fn resolve_grouping_plan(
+    state: &DatabaseState,
+    select: &ast::Select,
+    group_by: &[ast::Expr],
+    projections: &[ProjectionSource<'_>],
+    columns: &[ColumnMeta],
+    order_specs: &[RowOrderSpec<'_>],
+    scope: &BoundScope,
+) -> Result<GroupingPlan> {
+    let expressions = resolve_grouping_expressions(state, group_by, projections, columns, scope)?;
+    let mut grouped_columns = expressions
+        .iter()
+        .filter_map(|(expression, _)| match expression {
+            ast::Expr::Identifier(identifier) => {
+                scope.resolve_column(std::slice::from_ref(identifier)).ok()
+            }
+            ast::Expr::CompoundIdentifier(identifiers) => scope.resolve_column(identifiers).ok(),
+            _ => None,
+        })
+        .collect::<Vec<_>>();
+    extend_grouped_columns_with_primary_keys(state, scope, &mut grouped_columns);
+
+    let mut aggregate_query = false;
+    for item in &select.projection {
+        if let ast::SelectItem::UnnamedExpr(expression)
+        | ast::SelectItem::ExprWithAlias {
+            expr: expression, ..
+        } = item
+        {
+            aggregate_query |= inspect_aggregate_usage(state, expression, scope)?.found;
+        }
     }
-    if aggregate_query && lock_mode.is_some() {
-        return reject_unsupported("FOR UPDATE is not allowed with aggregate functions");
+    if let Some(having) = &select.having {
+        aggregate_query |= inspect_aggregate_usage(state, having, scope)?.found;
     }
+    for order in order_specs {
+        if let OrderKey::Expression(expression) = order.key {
+            aggregate_query |= inspect_aggregate_usage(state, expression, scope)?.found;
+        }
+    }
+    let enabled = aggregate_query || !expressions.is_empty() || select.having.is_some();
+    if enabled {
+        for projection in projections {
+            validate_grouped_expression(
+                state,
+                &create_projection_expression(projection, scope),
+                scope,
+                &expressions,
+                &grouped_columns,
+            )?;
+        }
+        if let Some(having) = &select.having {
+            validate_grouped_expression(state, having, scope, &expressions, &grouped_columns)?;
+        }
+        for order in order_specs {
+            if let OrderKey::Expression(expression) = order.key {
+                validate_grouped_expression(
+                    state,
+                    expression,
+                    scope,
+                    &expressions,
+                    &grouped_columns,
+                )?;
+            }
+        }
+    }
+    Ok(GroupingPlan {
+        expressions,
+        enabled,
+    })
+}
+
+fn evaluate_where_clause(
+    state: &DatabaseState,
+    selection: Option<&ast::Expr>,
+    scope: &BoundScope,
+    row: &[Value],
+    xid: Xid,
+    snapshot: &Snapshot,
+    context: &StatementExecutionContext,
+) -> Result<bool> {
+    let Some(selection) = selection else {
+        return Ok(true);
+    };
+    Ok(
+        match evaluate_query_expression(state, selection, scope, row, xid, snapshot, context)? {
+            Value::Bool(value) => value,
+            Value::Null => false,
+            _ => unreachable!("WHERE expression was type-checked"),
+        },
+    )
+}
+
+fn evaluate_projection_value(
+    state: &DatabaseState,
+    projection: &ProjectionSource<'_>,
+    scope: &BoundScope,
+    row: &[Value],
+    aggregate_rows: Option<&[Vec<Value>]>,
+    xid: Xid,
+    snapshot: &Snapshot,
+    context: &StatementExecutionContext,
+) -> Result<Value> {
+    match projection {
+        ProjectionSource::Column(index) => Ok(row[*index].clone()),
+        ProjectionSource::Merged(left, right, data_type) => {
+            let value = if row[*left].is_null() {
+                row[*right].clone()
+            } else {
+                row[*left].clone()
+            };
+            if value.is_null() {
+                Ok(value)
+            } else {
+                coercion::coerce(
+                    value.clone(),
+                    value
+                        .get_base_type()
+                        .expect("non-null value has a base type"),
+                    *data_type,
+                    CastContext::Implicit,
+                )
+            }
+        }
+        ProjectionSource::Expression(expression) => {
+            let materialized;
+            let expression = if let Some(rows) = aggregate_rows {
+                materialized = materialize_aggregate_expression(
+                    state, expression, scope, rows, xid, snapshot, context,
+                )?;
+                &materialized
+            } else {
+                expression
+            };
+            evaluate_query_expression(state, expression, scope, row, xid, snapshot, context)
+        }
+    }
+}
+
+fn evaluate_order_keys(
+    state: &DatabaseState,
+    order_specs: &[RowOrderSpec<'_>],
+    values: &[Value],
+    scope: &BoundScope,
+    row: &[Value],
+    aggregate_rows: Option<&[Vec<Value>]>,
+    xid: Xid,
+    snapshot: &Snapshot,
+    context: &StatementExecutionContext,
+) -> Result<Vec<Value>> {
+    order_specs
+        .iter()
+        .map(|order| match order.key {
+            OrderKey::Output(index) => Ok(values[index].clone()),
+            OrderKey::Expression(expression) => {
+                let materialized;
+                let expression = if let Some(rows) = aggregate_rows {
+                    materialized = materialize_aggregate_expression(
+                        state, expression, scope, rows, xid, snapshot, context,
+                    )?;
+                    &materialized
+                } else {
+                    expression
+                };
+                evaluate_query_expression(state, expression, scope, row, xid, snapshot, context)
+            }
+        })
+        .collect()
+}
+
+fn execute_plain_select_rows(
+    state: &DatabaseState,
+    select: &ast::Select,
+    scope: &BoundScope,
+    projections: &[ProjectionSource<'_>],
+    order_specs: &[RowOrderSpec<'_>],
+    xid: Xid,
+    snapshot: &Snapshot,
+    context: &StatementExecutionContext,
+) -> Result<Vec<OrderedRow>> {
     let mut rows = Vec::new();
-    if aggregate_query {
-        let mut source_rows = Vec::new();
-        visit_query_source_rows(
-            state,
-            select,
-            &scope,
-            xid,
-            snapshot,
-            context,
-            select.selection.as_ref(),
-            &mut |row| {
-                if let Some(selection) = &select.selection {
-                    match evaluate_query_expression(
-                        state, selection, &scope, row, xid, snapshot, context,
-                    )? {
-                        Value::Bool(true) => {}
-                        Value::Bool(false) | Value::Null => return Ok(()),
-                        _ => unreachable!("WHERE expression was type-checked"),
-                    }
+    visit_query_source_rows(
+        state,
+        select,
+        scope,
+        xid,
+        snapshot,
+        context,
+        select.selection.as_ref(),
+        &mut |row| {
+            if !evaluate_where_clause(
+                state,
+                select.selection.as_ref(),
+                scope,
+                row,
+                xid,
+                snapshot,
+                context,
+            )? {
+                return Ok(());
+            }
+            let values = projections
+                .iter()
+                .map(|projection| {
+                    evaluate_projection_value(
+                        state, projection, scope, row, None, xid, snapshot, context,
+                    )
+                })
+                .collect::<Result<Vec<_>>>()?;
+            let keys = evaluate_order_keys(
+                state,
+                order_specs,
+                &values,
+                scope,
+                row,
+                None,
+                xid,
+                snapshot,
+                context,
+            )?;
+            rows.push(OrderedRow { values, keys });
+            Ok(())
+        },
+    )?;
+    Ok(rows)
+}
+
+fn execute_grouped_select_rows(
+    state: &DatabaseState,
+    select: &ast::Select,
+    scope: &BoundScope,
+    projections: &[ProjectionSource<'_>],
+    order_specs: &[RowOrderSpec<'_>],
+    grouped_expressions: &[(ast::Expr, PgType)],
+    xid: Xid,
+    snapshot: &Snapshot,
+    context: &StatementExecutionContext,
+) -> Result<Vec<OrderedRow>> {
+    let mut groups = if grouped_expressions.is_empty() {
+        vec![(Vec::new(), Vec::new())]
+    } else {
+        Vec::new()
+    };
+    visit_query_source_rows(
+        state,
+        select,
+        scope,
+        xid,
+        snapshot,
+        context,
+        select.selection.as_ref(),
+        &mut |row| {
+            if !evaluate_where_clause(
+                state,
+                select.selection.as_ref(),
+                scope,
+                row,
+                xid,
+                snapshot,
+                context,
+            )? {
+                return Ok(());
+            }
+            let key = grouped_expressions
+                .iter()
+                .map(|(expression, _)| {
+                    evaluate_query_expression(state, expression, scope, row, xid, snapshot, context)
+                })
+                .collect::<Result<Vec<_>>>()?;
+            let mut matching = None;
+            for (index, (group_key, _)) in groups.iter().enumerate() {
+                if compare_group_keys(group_key, &key)? {
+                    matching = Some(index);
+                    break;
                 }
-                source_rows.push(row.to_vec());
-                Ok(())
-            },
-        )?;
-        let row = vec![Value::Null; scope.columns.len()];
+            }
+            match matching {
+                Some(index) => groups[index].1.push(row.to_vec()),
+                None => groups.push((key, vec![row.to_vec()])),
+            }
+            Ok(())
+        },
+    )?;
+
+    let mut rows = Vec::new();
+    for (_, group_rows) in groups {
+        let empty_row = vec![Value::Null; scope.columns.len()];
+        let row = group_rows.first().unwrap_or(&empty_row);
+        if let Some(having) = &select.having {
+            let expression = materialize_aggregate_expression(
+                state,
+                having,
+                scope,
+                &group_rows,
+                xid,
+                snapshot,
+                context,
+            )?;
+            match evaluate_query_expression(state, &expression, scope, row, xid, snapshot, context)?
+            {
+                Value::Bool(true) => {}
+                Value::Bool(false) | Value::Null => continue,
+                _ => unreachable!("HAVING expression was type-checked"),
+            }
+        }
         let values = projections
             .iter()
-            .map(|projection| match projection {
-                ProjectionSource::Expression(expression) => {
-                    let expression = materialize_aggregate_expression(
-                        state,
-                        expression,
-                        &scope,
-                        &source_rows,
-                        xid,
-                        snapshot,
-                        context,
-                    )?;
-                    evaluate_query_expression(
-                        state,
-                        &expression,
-                        &scope,
-                        &row,
-                        xid,
-                        snapshot,
-                        context,
-                    )
-                }
-                ProjectionSource::Column(_) | ProjectionSource::Merged(_, _, _) => {
-                    unreachable!("global aggregate projection contains no bare columns")
-                }
+            .map(|projection| {
+                evaluate_projection_value(
+                    state,
+                    projection,
+                    scope,
+                    row,
+                    Some(&group_rows),
+                    xid,
+                    snapshot,
+                    context,
+                )
             })
             .collect::<Result<Vec<_>>>()?;
-        let keys = order_specs
-            .iter()
-            .map(|order| match order.key {
-                OrderKey::Output(index) => Ok(values[index].clone()),
-                OrderKey::Expression(expression) => {
-                    let expression = materialize_aggregate_expression(
-                        state,
-                        expression,
-                        &scope,
-                        &source_rows,
-                        xid,
-                        snapshot,
-                        context,
-                    )?;
-                    evaluate_query_expression(
-                        state,
-                        &expression,
-                        &scope,
-                        &row,
-                        xid,
-                        snapshot,
-                        context,
-                    )
-                }
-            })
-            .collect::<Result<Vec<_>>>()?;
-        rows.push(OrderedRow { values, keys });
-    } else {
-        visit_query_source_rows(
+        let keys = evaluate_order_keys(
             state,
-            select,
-            &scope,
+            order_specs,
+            &values,
+            scope,
+            row,
+            Some(&group_rows),
             xid,
             snapshot,
             context,
-            select.selection.as_ref(),
-            &mut |row| {
-                if let Some(selection) = &select.selection {
-                    match evaluate_query_expression(
-                        state, selection, &scope, row, xid, snapshot, context,
-                    )? {
-                        Value::Bool(true) => {}
-                        Value::Bool(false) | Value::Null => return Ok(()),
-                        _ => unreachable!("WHERE expression was type-checked"),
-                    }
-                }
-                let values = projections
-                    .iter()
-                    .map(|projection| match projection {
-                        ProjectionSource::Column(index) => Ok(row[*index].clone()),
-                        ProjectionSource::Merged(left, right, data_type) => {
-                            let value = if row[*left].is_null() {
-                                row[*right].clone()
-                            } else {
-                                row[*left].clone()
-                            };
-                            if value.is_null() {
-                                Ok(value)
-                            } else {
-                                coercion::coerce(
-                                    value.clone(),
-                                    value
-                                        .get_base_type()
-                                        .expect("non-null value has a base type"),
-                                    *data_type,
-                                    CastContext::Implicit,
-                                )
-                            }
-                        }
-                        ProjectionSource::Expression(expr) => evaluate_query_expression(
-                            state, expr, &scope, row, xid, snapshot, context,
-                        ),
-                    })
-                    .collect::<Result<Vec<_>>>()?;
-                let keys = order_specs
-                    .iter()
-                    .map(|order| match order.key {
-                        OrderKey::Output(index) => Ok(values[index].clone()),
-                        OrderKey::Expression(expression) => evaluate_query_expression(
-                            state, expression, &scope, row, xid, snapshot, context,
-                        ),
-                    })
-                    .collect::<Result<Vec<_>>>()?;
-                rows.push(OrderedRow { values, keys });
-                Ok(())
-            },
         )?;
+        rows.push(OrderedRow { values, keys });
     }
+    Ok(rows)
+}
+
+fn sort_and_limit_rows(
+    mut rows: Vec<OrderedRow>,
+    order_specs: &[RowOrderSpec<'_>],
+    limit: Option<usize>,
+    offset: usize,
+) -> Vec<Vec<Value>> {
     if !order_specs.is_empty() {
         rows.sort_by(|left, right| {
             order_specs
@@ -1211,12 +1726,89 @@ pub(super) fn execute_query(
                 .unwrap_or(Ordering::Equal)
         });
     }
-    let rows = rows
-        .into_iter()
+    rows.into_iter()
         .skip(offset)
         .take(limit.unwrap_or(usize::MAX))
         .map(|row| row.values)
-        .collect();
+        .collect()
+}
+
+pub(super) fn execute_query(
+    state: &DatabaseState,
+    query: &ast::Query,
+    xid: Xid,
+    snapshot: &Snapshot,
+    context: &StatementExecutionContext,
+) -> Result<StatementResult> {
+    if query.with.is_some() || query.fetch.is_some() {
+        return reject_unsupported("query clause is not implemented");
+    }
+    let lock_mode = resolve_select_lock_mode(query)?;
+    let ast::SetExpr::Select(select) = query.body.as_ref() else {
+        if let ast::SetExpr::Values(values) = query.body.as_ref() {
+            return execute_values_query(query, values, context);
+        }
+        return reject_unsupported("query source is not implemented");
+    };
+    let ast::GroupByExpr::Expressions(group_by, modifiers) = &select.group_by else {
+        return reject_unsupported("GROUP BY is not implemented");
+    };
+    if select.distinct.is_some() || select.into.is_some() || !modifiers.is_empty() {
+        return reject_unsupported("SELECT feature is not implemented");
+    }
+
+    let scope = bind_select_scope(state, select)?;
+    if let Some(selection) = &select.selection
+        && inspect_aggregate_usage(state, selection, &scope)?.found
+    {
+        return Err(PgError::create(
+            SqlState::GroupingError,
+            "aggregate functions are not allowed in WHERE",
+        ));
+    }
+    let (limit, offset) = resolve_select_limit(query, context)?;
+    validate_select_predicates(state, select, &scope)?;
+
+    let (projections, columns) = build_projection_plan(state, &select.projection, &scope)?;
+    let order_specs = resolve_order_specs(state, query, &projections, &columns, &scope)?;
+    let grouping = resolve_grouping_plan(
+        state,
+        select,
+        group_by,
+        &projections,
+        &columns,
+        &order_specs,
+        &scope,
+    )?;
+    if grouping.enabled && lock_mode.is_some() {
+        return reject_unsupported("FOR UPDATE is not allowed with aggregate functions");
+    }
+
+    let rows = if grouping.enabled {
+        execute_grouped_select_rows(
+            state,
+            select,
+            &scope,
+            &projections,
+            &order_specs,
+            &grouping.expressions,
+            xid,
+            snapshot,
+            context,
+        )?
+    } else {
+        execute_plain_select_rows(
+            state,
+            select,
+            &scope,
+            &projections,
+            &order_specs,
+            xid,
+            snapshot,
+            context,
+        )?
+    };
+    let rows = sort_and_limit_rows(rows, &order_specs, limit, offset);
     Ok(StatementResult::Query(QueryResult { columns, rows }))
 }
 

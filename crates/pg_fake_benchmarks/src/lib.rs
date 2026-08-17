@@ -148,6 +148,11 @@ pub fn list_benchmarks() -> Vec<Benchmark> {
             postgres_values(),
             postgres_comparisons(),
         ),
+        build_benchmark(
+            "grouped_aggregate_100_rows",
+            postgres_values(),
+            postgres_comparisons(),
+        ),
     ]
 }
 
