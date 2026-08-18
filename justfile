@@ -14,6 +14,10 @@ test:
 bench:
     PG_FAKE_DATABASE_URL='postgresql://myxo@127.0.0.1:5432/postgres' cargo bench -p pg_fake_benchmarks --bench workloads
 
+# Record benchmark results as the committed baseline
+bench-record:
+    PG_FAKE_DATABASE_URL='postgresql://myxo@127.0.0.1:5432/postgres' cargo x bench record
+
 # Record one pg_fake benchmark and open its flame graph
 profile-bench filter duration='10':
     scripts/profile-bench.py {{filter}} {{duration}}

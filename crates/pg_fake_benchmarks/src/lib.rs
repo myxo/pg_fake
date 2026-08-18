@@ -192,7 +192,7 @@ fn postgres_values() -> Vec<BenchmarkValue> {
 }
 
 fn postgres_comparisons() -> Vec<BenchmarkComparison> {
-    vec![comparison("pg_fake", "postgres_18")]
+    vec![comparison("postgres_18", "pg_fake")]
 }
 
 fn value(name: &'static str, path: &'static [&'static str]) -> BenchmarkValue {
