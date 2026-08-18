@@ -1456,7 +1456,10 @@ pub(super) fn compare_values(left: &Value, right: &Value) -> Result<Ordering> {
         (Value::Float4(left), Value::Float4(right)) => compare_float4(*left, *right),
         (Value::Float8(left), Value::Float8(right)) => compare_float8(*left, *right),
         (Value::Numeric(left), Value::Numeric(right)) => left.cmp(right),
-        (Value::Text(left), Value::Text(right)) => left.cmp(right),
+        (Value::Text(left), Value::Text(right)) => left
+            .to_lowercase()
+            .cmp(&right.to_lowercase())
+            .then_with(|| right.cmp(left)),
         (Value::Bytea(left), Value::Bytea(right)) => left.cmp(right),
         (Value::Uuid(left), Value::Uuid(right)) => left.cmp(right),
         (Value::Date(left), Value::Date(right)) => left.cmp(right),

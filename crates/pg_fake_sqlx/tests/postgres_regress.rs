@@ -29,7 +29,7 @@ struct PostgresServer {
 
 static TEST_LOCK: Mutex<()> = Mutex::new(());
 
-const MINIMUM_PASSED_STATEMENTS: usize = 442;
+const MINIMUM_PASSED_STATEMENTS: usize = 463;
 const REVIEWED_SKIPPED_SCRIPTS: usize = 141;
 
 fn postgres_server() -> PostgresServer {
@@ -165,8 +165,8 @@ fn make_error_outcome(error: sqlx::Error) -> Outcome {
         error
             .as_database_error()
             .and_then(|error| error.code())
-            .expect("database execution errors must have a SQLSTATE")
-            .into_owned(),
+            .map(|code| code.into_owned())
+            .unwrap_or_else(|| error.to_string()),
     )
 }
 

@@ -19,11 +19,11 @@ collate:1
 comments:7
 constraints:3
 conversion:2
-copy2:1
+copy2:2
 copy:2
-copydml:1
+copydml:7
 copyencoding:4
-copyselect:1
+copyselect:13
 create_aggregate:1
 create_cast:1
 create_function_sql:1
@@ -36,7 +36,7 @@ create_table_like:4
 create_type:5
 create_view:2
 date:9
-delete:1
+delete:3
 domain:1
 drop_if_exists:4
 drop_operator:1
@@ -100,7 +100,7 @@ rangetypes:31
 regex:1
 regproc:1
 reloptions:2
-returning:1
+returning:16
 rowsecurity:1
 rowtypes:1
 rules:4
@@ -132,7 +132,7 @@ typed_table:1
 union:1
 updatable_views:1
 update:8
-uuid:3
+uuid:10
 varchar:17
 window:3
 with:1

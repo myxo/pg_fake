@@ -3,6 +3,19 @@
 An in-memory, embeddable fake of PostgreSQL for use as a test double in
 automated tests.
 
+## Phase 2 SQL support
+
+Phase 2 covers joins and correlated subqueries, aggregates with `GROUP BY` /
+`HAVING`, `DISTINCT`, query-producing DML, sequences, serial and identity
+columns, foreign keys, UUID, and date/time, timestamp, and interval values.
+These features work through both the native API and SQLx.
+
+The remaining major gaps are Phase 3 features: CTEs, `ON CONFLICT`, window
+functions, views, JSON/JSONB, arrays, savepoints, general session GUCs,
+serializable isolation, and transactional DDL. `OVERRIDING SYSTEM VALUE` /
+`OVERRIDING USER VALUE` and identity declarations with multiple sequence
+options remain deferred until `sqlparser-rs` exposes them.
+
 ## Lock timeout
 
 Row-lock waits time out after one second by default. Configure the database

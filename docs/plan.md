@@ -742,7 +742,7 @@ required.
 
 ## Milestone H — Phase 2 conformance and release gate
 
-### Task 24 — Phase 2 integration, regression audit, and benchmarks
+### Task 24 — Phase 2 integration, regression audit, and benchmarks [COMPLETE]
 
 **Goal:** Prove that the complete Phase 2 surface works coherently through the
 native and SQLx APIs.
@@ -770,6 +770,37 @@ native and SQLx APIs.
   updated to distinguish completed Phase 2 behavior from Phase 3/later gaps.
 
 **Notes:** This task fixes integration defects but does not add new SQL families.
+
+**Progress (awaiting approval):**
+
+- The PostgreSQL 18 Phase 2 manifest passes all 32 cases, including the new
+  explicit-transaction scenario that combines joins, correlated subqueries,
+  grouping, `DISTINCT`, identity allocation, `RETURNING`, a foreign key, UUID,
+  temporal values, and an interval.
+- The full embedded regression audit now passes 463 statements (up from the
+  248-statement Phase 1 baseline) with 141 explicitly reviewed skipped scripts,
+  unchanged from the baseline. Fixture-related skips are platform collation,
+  encoding, and COPY corpus behavior. Phase 3 skips include `WITH`, window
+  functions, arrays, JSON/JSONPath, `ON CONFLICT`, views, rules, and stored
+  generated columns. The remaining skips cover later/out-of-scope types,
+  extensions, DDL, procedures, locking, and transaction facilities. The few
+  Phase-2-adjacent corpus cases use excluded forms or fixture formatting; the
+  conformance manifest has no Phase 2 blockers. In particular, identity
+  `OVERRIDING ... VALUE` remains parser-limited as recorded in task 15.
+- Existing native and SQLx prepared-query/transaction coverage exercises all
+  Phase 2 types and row-producing statement families. A case-insensitive text
+  sort with PostgreSQL-compatible case tie-breaking was fixed after the
+  differential generator found an ordering difference.
+- The PostgreSQL differential property suite passes 10,000 iterations in
+  138.61 seconds. The focused multi-session sequence allocation test also
+  passed three consecutive runs.
+- Benchmarks now include identity-backed `INSERT ... RETURNING` and a
+  UUID/timestamp/interval lookup. Against PostgreSQL 18, the recorded medians
+  are 19.60 us versus 261.98 us and 81.45 us versus 259.10 us respectively;
+  neither misses the order-of-magnitude target. Existing benchmark workloads
+  cover joins, grouping, subqueries, and foreign-key writes.
+- `README.md` distinguishes the completed Phase 2 surface from Phase 3/later
+  gaps, and the explicit regression skip registry was refreshed.
 
 ---
 

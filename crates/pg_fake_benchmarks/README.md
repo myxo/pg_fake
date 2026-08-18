@@ -7,7 +7,9 @@ COMMITTED and REPEATABLE READ, row-lock
 acquisition with `SELECT ... FOR UPDATE`, a 100-row full-table select, and a
 100-row multi-key `ORDER BY` with explicit NULL placement, including an ordered
 `LIMIT`/`OFFSET` paging workload. The insert workloads include primary-key,
-not-null, default, and column- and table-level `CHECK` validation.
+not-null, default, and column- and table-level `CHECK` validation. They also
+cover a sequence-backed identity insert with `RETURNING`, and a UUID key lookup
+that applies timestamp-with-time-zone and interval arithmetic.
 
 Diagnostic groups isolate costs within `pg_fake`:
 
