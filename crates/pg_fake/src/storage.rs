@@ -466,6 +466,8 @@ mod tests {
                     data_type: PgType::create(BaseType::Int4),
                     nullable: false,
                     default: None,
+                    default_sequence: None,
+                    identity: None,
                 }],
                 vec![],
             )
@@ -484,6 +486,8 @@ mod tests {
                     data_type: PgType::create(BaseType::Int4),
                     nullable: false,
                     default: None,
+                    default_sequence: None,
+                    identity: None,
                 }],
                 vec![Constraint::PrimaryKey(vec!["value".into()])],
             )

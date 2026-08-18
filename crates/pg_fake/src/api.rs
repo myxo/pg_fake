@@ -94,7 +94,11 @@ struct ActiveTransaction {
 }
 enum DdlUndo {
     DropCreated(String),
-    RestoreDropped(TableSchema, Table),
+    RestoreDropped(
+        TableSchema,
+        Table,
+        Vec<(SequenceSchema, executor::SequenceValueState)>,
+    ),
     DropCreatedSequence(String),
     RestoreDroppedSequence(SequenceSchema, executor::SequenceValueState),
 }
@@ -162,7 +166,24 @@ fn collect_ddl_undo_for_statement(
                     .get(&schema.id)
                     .expect("catalog table must have storage")
                     .clone();
-                Some(Ok(DdlUndo::RestoreDropped(schema, table)))
+                let sequences = state
+                    .catalog
+                    .iterate_sequences()
+                    .filter(|sequence| {
+                        sequence.owned_by.as_ref().map(|(table, _)| table.as_str())
+                            == Some(name.as_str())
+                    })
+                    .map(|sequence| {
+                        let value = *state
+                            .sequence_values
+                            .lock()
+                            .expect("sequence storage is poisoned")
+                            .get(&sequence.id)
+                            .expect("catalog sequence must have storage");
+                        (sequence.clone(), value)
+                    })
+                    .collect();
+                Some(Ok(DdlUndo::RestoreDropped(schema, table, sequences)))
             })
             .collect(),
         ast::Statement::Drop {
@@ -901,11 +922,28 @@ impl Session {
                 DdlUndo::DropCreated(name) => {
                     if let Ok(schema) = state.catalog.drop_table(&name) {
                         state.tables.remove(&schema.id);
+                        for sequence in state.catalog.drop_owned_sequences(&schema.name) {
+                            state
+                                .sequence_values
+                                .lock()
+                                .expect("sequence storage is poisoned")
+                                .remove(&sequence.id);
+                        }
                     }
                 }
-                DdlUndo::RestoreDropped(schema, table) => {
-                    state.tables.insert(schema.id, table);
-                    state.catalog.restore_table(schema);
+                DdlUndo::RestoreDropped(schema, table, sequences) => {
+                    if !state.catalog.has_relation(&schema.name) {
+                        state.tables.insert(schema.id, table);
+                        state.catalog.restore_table(schema);
+                        for (sequence, value) in sequences {
+                            state
+                                .sequence_values
+                                .lock()
+                                .expect("sequence storage is poisoned")
+                                .insert(sequence.id, value);
+                            state.catalog.restore_sequence(sequence);
+                        }
+                    }
                 }
                 DdlUndo::DropCreatedSequence(name) => {
                     if let Ok(sequence) = state.catalog.drop_sequence(&name) {
@@ -917,12 +955,14 @@ impl Session {
                     }
                 }
                 DdlUndo::RestoreDroppedSequence(sequence, value) => {
-                    state
-                        .sequence_values
-                        .lock()
-                        .expect("sequence storage is poisoned")
-                        .insert(sequence.id, value);
-                    state.catalog.restore_sequence(sequence);
+                    if !state.catalog.has_relation(&sequence.name) {
+                        state
+                            .sequence_values
+                            .lock()
+                            .expect("sequence storage is poisoned")
+                            .insert(sequence.id, value);
+                        state.catalog.restore_sequence(sequence);
+                    }
                 }
             }
         }

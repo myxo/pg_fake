@@ -205,6 +205,17 @@ pub(super) fn execute_insert(
         }
         let constants = create_constant_expression_schema();
         for (expr, index) in expressions.iter().zip(&column_indexes) {
+            if schema.columns[*index].identity == Some(IdentityKind::Always)
+                && !is_default_expression(expr)
+            {
+                return Err(PgError::create(
+                    SqlState::GeneratedAlways,
+                    format!(
+                        "cannot insert a non-DEFAULT value into column {:?}",
+                        schema.columns[*index].name
+                    ),
+                ));
+            }
             row[*index] = if is_default_expression(expr) {
                 evaluate_column_default(&schema.columns[*index], context)?
             } else {
@@ -229,6 +240,15 @@ pub(super) fn execute_insert(
                 .map(|expressions| build_row(expressions))
                 .collect::<Result<Vec<_>>>()?
         } else {
+            if column_indexes
+                .iter()
+                .any(|index| schema.columns[*index].identity == Some(IdentityKind::Always))
+            {
+                return Err(PgError::create(
+                    SqlState::GeneratedAlways,
+                    "cannot insert a non-DEFAULT value into an identity column",
+                ));
+            }
             let unknown_columns = identify_unknown_query_columns(source, column_indexes.len());
             let StatementResult::Query(source) =
                 query::execute_query(state, source, xid, snapshot, context)?

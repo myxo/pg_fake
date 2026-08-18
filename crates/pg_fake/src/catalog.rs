@@ -26,6 +26,13 @@ pub(crate) struct SequenceSchema {
     pub(crate) start_value: i64,
     pub(crate) cycle: bool,
     pub(crate) cache: i64,
+    pub(crate) owned_by: Option<(String, String)>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum IdentityKind {
+    Always,
+    ByDefault,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -34,6 +41,8 @@ pub(crate) struct ColumnDef {
     pub(crate) data_type: PgType,
     pub(crate) nullable: bool,
     pub(crate) default: Option<ast::Expr>,
+    pub(crate) default_sequence: Option<String>,
+    pub(crate) identity: Option<IdentityKind>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -234,12 +243,46 @@ impl Catalog {
                 format!("{name:?} is not a sequence"),
             ));
         }
+        if let Some((table, column)) = self
+            .public
+            .sequences
+            .get(name)
+            .and_then(|sequence| sequence.owned_by.as_ref())
+        {
+            return Err(PgError::create(
+                SqlState::DependentObjectsStillExist,
+                format!(
+                    "cannot drop sequence {name:?} because column {column:?} of table {table:?} requires it"
+                ),
+            ));
+        }
         self.public.sequences.remove(name).ok_or_else(|| {
             PgError::create(
                 SqlState::UndefinedTable,
                 format!("sequence {name:?} does not exist"),
             )
         })
+    }
+
+    pub(crate) fn drop_owned_sequences(&mut self, table_name: &str) -> Vec<SequenceSchema> {
+        let names = self
+            .public
+            .sequences
+            .iter()
+            .filter_map(|(name, sequence)| {
+                (sequence.owned_by.as_ref().map(|(table, _)| table.as_str()) == Some(table_name))
+                    .then_some(name.clone())
+            })
+            .collect::<Vec<_>>();
+        names
+            .into_iter()
+            .map(|name| {
+                self.public
+                    .sequences
+                    .remove(&name)
+                    .expect("owned sequence must exist")
+            })
+            .collect()
     }
 
     pub(crate) fn restore_sequence(&mut self, sequence: SequenceSchema) {
@@ -265,6 +308,8 @@ mod tests {
             data_type: PgType::create(BaseType::Int4),
             nullable,
             default: None,
+            default_sequence: None,
+            identity: None,
         }
     }
 

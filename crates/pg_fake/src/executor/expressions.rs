@@ -24,6 +24,15 @@ pub(super) fn evaluate_column_default(
     column: &ColumnDef,
     context: &StatementExecutionContext,
 ) -> Result<Value> {
+    if let Some(sequence) = &column.default_sequence {
+        let value = context.sequences.get_next_value(sequence)?;
+        return coercion::coerce(
+            Value::Int8(value),
+            BaseType::Int8,
+            column.data_type,
+            CastContext::Assignment,
+        );
+    }
     let Some(expr) = &column.default else {
         return Ok(Value::Null);
     };
@@ -634,6 +643,11 @@ fn infer_function_return_type(function: &ast::Function, schema: RowScope<'_>) ->
             validate_function_argument(arguments[0], BaseType::Text, schema, &signature_error)?;
             Ok(BaseType::Int8)
         }
+        "pg_get_serial_sequence" if arguments.len() == 2 => {
+            validate_function_argument(arguments[0], BaseType::Text, schema, &signature_error)?;
+            validate_function_argument(arguments[1], BaseType::Text, schema, &signature_error)?;
+            Ok(BaseType::Text)
+        }
         "lastval" if arguments.is_empty() => Ok(BaseType::Int8),
         "setval" if matches!(arguments.len(), 2 | 3) => {
             validate_function_argument(arguments[0], BaseType::Text, schema, &signature_error)?;
@@ -643,8 +657,19 @@ fn infer_function_return_type(function: &ast::Function, schema: RowScope<'_>) ->
             }
             Ok(BaseType::Int8)
         }
-        "coalesce" | "nullif" | "greatest" | "least" | "length" | "lower" | "upper" | "abs"
-        | "nextval" | "currval" | "lastval" | "setval" => Err(signature_error()),
+        "coalesce"
+        | "nullif"
+        | "greatest"
+        | "least"
+        | "length"
+        | "lower"
+        | "upper"
+        | "abs"
+        | "nextval"
+        | "currval"
+        | "lastval"
+        | "setval"
+        | "pg_get_serial_sequence" => Err(signature_error()),
         _ => Err(PgError::create(
             SqlState::UndefinedFunction,
             format!("function {function_name} does not exist"),
@@ -1140,6 +1165,32 @@ fn evaluate_function(
             Ok(Value::Int8(value))
         }
         "lastval" => Ok(Value::Int8(context.sequences.get_last_value()?)),
+        "pg_get_serial_sequence" => {
+            let table = evaluate_and_coerce(
+                arguments[0],
+                BaseType::Text,
+                CastContext::Implicit,
+                schema,
+                row,
+                context,
+            )?;
+            let column = evaluate_and_coerce(
+                arguments[1],
+                BaseType::Text,
+                CastContext::Implicit,
+                schema,
+                row,
+                context,
+            )?;
+            let (Value::Text(table), Value::Text(column)) = (table, column) else {
+                return Ok(Value::Null);
+            };
+            Ok(context
+                .sequences
+                .get_owned_sequence(&table, &column)?
+                .map(Value::Text)
+                .unwrap_or(Value::Null))
+        }
         "setval" => {
             let name = evaluate_and_coerce(
                 arguments[0],

@@ -38,6 +38,9 @@ pub enum SqlState {
     ActiveSqlTransaction,   // 25001
     InFailedSqlTransaction, // 25P02
 
+    // 2B — Dependent Objects Still Exist
+    DependentObjectsStillExist, // 2BP01
+
     // 40 — Transaction Rollback
     SerializationFailure, // 40001
     DeadlockDetected,     // 40P01
@@ -57,6 +60,7 @@ pub enum SqlState {
     InvalidColumnReference, // 42P10
     GroupingError,          // 42803
     WrongObjectType,        // 42809
+    GeneratedAlways,        // 428C9
 
     // 55 — Object Not In Prerequisite State
     ObjectNotInPrerequisiteState, // 55000
@@ -88,6 +92,7 @@ impl SqlState {
             SqlState::ForeignKeyViolation => "23503",
             SqlState::ActiveSqlTransaction => "25001",
             SqlState::InFailedSqlTransaction => "25P02",
+            SqlState::DependentObjectsStillExist => "2BP01",
             SqlState::SerializationFailure => "40001",
             SqlState::DeadlockDetected => "40P01",
             SqlState::UndefinedTable => "42P01",
@@ -104,6 +109,7 @@ impl SqlState {
             SqlState::InvalidColumnReference => "42P10",
             SqlState::GroupingError => "42803",
             SqlState::WrongObjectType => "42809",
+            SqlState::GeneratedAlways => "428C9",
             SqlState::ObjectNotInPrerequisiteState => "55000",
             SqlState::LockNotAvailable => "55P03",
             SqlState::InternalError => "XX000",

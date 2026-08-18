@@ -3,7 +3,10 @@ use rand_chacha::{ChaCha12Rng, rand_core::RngCore};
 
 use crate::{
     api::{ColumnMeta, QueryResult, StatementResult},
-    catalog::{Catalog, ColumnDef, ForeignKey, ForeignKeyAction, TableId, TableSchema},
+    catalog::{
+        Catalog, ColumnDef, ForeignKey, ForeignKeyAction, IdentityKind, SequenceSchema, TableId,
+        TableSchema,
+    },
     coercion::{self, CastContext},
     error::{PgError, Result, SqlState, reject_unsupported},
     storage::{RowId, Table},
@@ -121,21 +124,42 @@ pub(crate) fn execute_statement(
             }
             let mut columns = Vec::new();
             let mut constraints = Vec::new();
+            let mut sequence_schemas = Vec::new();
             for column in &create.columns {
-                let data_type = coercion::convert_ast_data_type(&column.data_type)?;
+                let column_name = normalize_identifier(&column.name);
+                let serial_type = match column.data_type.to_string().to_ascii_lowercase().as_str() {
+                    "smallserial" | "serial2" => Some(BaseType::Int2),
+                    "serial" | "serial4" => Some(BaseType::Int4),
+                    "bigserial" | "serial8" => Some(BaseType::Int8),
+                    _ => None,
+                };
+                let data_type = match serial_type {
+                    Some(base) => PgType::create(base),
+                    None => coercion::convert_ast_data_type(&column.data_type)?,
+                };
                 let mut nullable = true;
                 let mut default = None;
+                let mut default_sequence = None;
+                let mut identity = None;
                 for option in &column.options {
                     match &option.option {
                         ast::ColumnOption::Null => nullable = true,
                         ast::ColumnOption::NotNull => nullable = false,
-                        ast::ColumnOption::Default(expr) => default = Some(expr.clone()),
+                        ast::ColumnOption::Default(expr) => {
+                            if serial_type.is_some() || identity.is_some() {
+                                return Err(PgError::create(
+                                    SqlState::SyntaxError,
+                                    "multiple default values specified for column",
+                                ));
+                            }
+                            default = Some(expr.clone());
+                        }
                         ast::ColumnOption::PrimaryKey(_) => {
-                            let columns = vec![normalize_identifier(&column.name)];
+                            let columns = vec![column_name.clone()];
                             constraints.push(crate::catalog::Constraint::PrimaryKey(columns));
                         }
                         ast::ColumnOption::Unique(_) => {
-                            let columns = vec![normalize_identifier(&column.name)];
+                            let columns = vec![column_name.clone()];
                             constraints.push(crate::catalog::Constraint::Unique(columns));
                         }
                         ast::ColumnOption::Check(check) => {
@@ -144,15 +168,11 @@ pub(crate) fn execute_statement(
                         ast::ColumnOption::ForeignKey(foreign_key) => {
                             let name = resolve_foreign_key_name(
                                 option.name.as_ref(),
-                                format!(
-                                    "{}_{}_fkey",
-                                    table_name,
-                                    normalize_identifier(&column.name)
-                                ),
+                                format!("{}_{}_fkey", table_name, column_name),
                             );
                             constraints.push(crate::catalog::Constraint::ForeignKey(ForeignKey {
                                 name,
-                                columns: vec![normalize_identifier(&column.name)],
+                                columns: vec![column_name.clone()],
                                 foreign_table: crate::executor::normalize_unqualified_object_name(
                                     &foreign_key.foreign_table,
                                 )?,
@@ -175,6 +195,61 @@ pub(crate) fn execute_statement(
                                 match_kind: foreign_key.match_kind,
                             }))
                         }
+                        ast::ColumnOption::Generated {
+                            generated_as,
+                            sequence_options,
+                            generation_expr,
+                            generation_expr_mode,
+                            generated_keyword,
+                        } => {
+                            if serial_type.is_some()
+                                || default.is_some()
+                                || identity.is_some()
+                                || generation_expr.is_some()
+                                || generation_expr_mode.is_some()
+                                || !generated_keyword
+                            {
+                                return Err(PgError::create(
+                                    SqlState::SyntaxError,
+                                    "invalid identity column declaration",
+                                ));
+                            }
+                            let kind = match generated_as {
+                                ast::GeneratedAs::Always => IdentityKind::Always,
+                                ast::GeneratedAs::ByDefault => IdentityKind::ByDefault,
+                                ast::GeneratedAs::ExpStored => {
+                                    return Err(PgError::create(
+                                        SqlState::SyntaxError,
+                                        "invalid identity column declaration",
+                                    ));
+                                }
+                            };
+                            if !matches!(
+                                data_type.base,
+                                BaseType::Int2 | BaseType::Int4 | BaseType::Int8
+                            ) {
+                                return Err(PgError::create(
+                                    SqlState::DatatypeMismatch,
+                                    "identity column type must be smallint, integer, or bigint",
+                                ));
+                            }
+                            let sequence_name = create_generated_sequence_name(
+                                &state.catalog,
+                                &sequence_schemas,
+                                &table_name,
+                                &column_name,
+                            );
+                            let mut sequence = sequences::create_sequence_schema_for_type(
+                                sequence_name.clone(),
+                                data_type.base,
+                                sequence_options.as_deref().unwrap_or(&[]),
+                            )?;
+                            sequence.owned_by = Some((table_name.clone(), column_name.clone()));
+                            sequence_schemas.push(sequence);
+                            nullable = false;
+                            default_sequence = Some(sequence_name);
+                            identity = Some(kind);
+                        }
                         option => {
                             return reject_unsupported(format!(
                                 "column option is not implemented: {option}"
@@ -182,11 +257,30 @@ pub(crate) fn execute_statement(
                         }
                     }
                 }
+                if let Some(base) = serial_type {
+                    let sequence_name = create_generated_sequence_name(
+                        &state.catalog,
+                        &sequence_schemas,
+                        &table_name,
+                        &column_name,
+                    );
+                    let mut sequence = sequences::create_sequence_schema_for_type(
+                        sequence_name.clone(),
+                        base,
+                        &[],
+                    )?;
+                    sequence.owned_by = Some((table_name.clone(), column_name.clone()));
+                    sequence_schemas.push(sequence);
+                    nullable = false;
+                    default_sequence = Some(sequence_name);
+                }
                 let column = ColumnDef {
-                    name: normalize_identifier(&column.name),
+                    name: column_name,
                     data_type,
                     nullable,
                     default,
+                    default_sequence,
+                    identity,
                 };
                 validate_column_default(&column)?;
                 columns.push(column);
@@ -298,6 +392,18 @@ pub(crate) fn execute_statement(
                 .require_table(&table_name)
                 .expect("created table must exist");
             state.tables.insert(id, Table::create(table.clone()));
+            for sequence in sequence_schemas {
+                let initial = SequenceValueState {
+                    last_value: sequence.start_value,
+                    is_called: false,
+                };
+                let id = state.catalog.create_sequence(sequence)?;
+                state
+                    .sequence_values
+                    .lock()
+                    .expect("sequence storage is poisoned")
+                    .insert(id, initial);
+            }
             Ok(StatementResult::Affected(0))
         }
         ast::Statement::CreateSequence {
@@ -311,20 +417,49 @@ pub(crate) fn execute_statement(
             if *temporary {
                 return reject_unsupported("temporary sequences are not implemented");
             }
-            if owned_by.as_ref().is_some_and(|owned_by| {
-                owned_by.0.len() != 1
-                    || owned_by.0[0]
-                        .as_ident()
-                        .is_none_or(|name| !name.value.eq_ignore_ascii_case("none"))
-            }) {
-                return reject_unsupported("owned sequences are not implemented");
-            }
             let name = normalize_unqualified_object_name(name)?;
             if *if_not_exists && state.catalog.has_relation(&name) {
                 return Ok(StatementResult::Affected(0));
             }
-            let sequence =
+            let owned_by = match owned_by {
+                None => None,
+                Some(owned_by)
+                    if owned_by.0.len() == 1
+                        && owned_by.0[0]
+                            .as_ident()
+                            .is_some_and(|name| name.value.eq_ignore_ascii_case("none")) =>
+                {
+                    None
+                }
+                Some(owned_by) if owned_by.0.len() == 2 => {
+                    let Some(table) = owned_by.0[0].as_ident() else {
+                        return reject_unsupported("sequence ownership is not implemented");
+                    };
+                    let Some(column) = owned_by.0[1].as_ident() else {
+                        return reject_unsupported("sequence ownership is not implemented");
+                    };
+                    let table_name = normalize_identifier(table);
+                    let column_name = normalize_identifier(column);
+                    let table = state.catalog.require_table(&table_name)?;
+                    if !table
+                        .columns
+                        .iter()
+                        .any(|column| column.name == column_name)
+                    {
+                        return Err(PgError::create(
+                            SqlState::UndefinedColumn,
+                            format!(
+                                "column {column_name:?} of relation {table_name:?} does not exist"
+                            ),
+                        ));
+                    }
+                    Some((table_name, column_name))
+                }
+                Some(_) => return reject_unsupported("sequence ownership is not implemented"),
+            };
+            let mut sequence =
                 sequences::create_sequence_schema(name, data_type.as_ref(), sequence_options)?;
+            sequence.owned_by = owned_by;
             let initial = SequenceValueState {
                 last_value: sequence.start_value,
                 is_called: false,
@@ -349,6 +484,14 @@ pub(crate) fn execute_statement(
                 match state.catalog.drop_table(&table_name) {
                     Ok(schema) => {
                         state.tables.remove(&schema.id);
+                        for sequence in state.catalog.drop_owned_sequences(&schema.name) {
+                            state
+                                .sequence_values
+                                .lock()
+                                .expect("sequence storage is poisoned")
+                                .remove(&sequence.id)
+                                .expect("catalog sequence must have storage");
+                        }
                         affected += 1;
                     }
                     Err(error) if *if_exists && error.sqlstate == SqlState::UndefinedTable => {}
@@ -418,6 +561,27 @@ pub(crate) fn execute_statement(
         ),
         ast::Statement::Query(query) => query::execute_query(state, query, xid, snapshot, context),
         _ => reject_unsupported("statement is not implemented"),
+    }
+}
+
+fn create_generated_sequence_name(
+    catalog: &Catalog,
+    sequences: &[SequenceSchema],
+    table_name: &str,
+    column_name: &str,
+) -> String {
+    let base = format!("{table_name}_{column_name}_seq");
+    let mut number = 0;
+    loop {
+        let name = if number == 0 {
+            base.clone()
+        } else {
+            format!("{base}{number}")
+        };
+        if !catalog.has_relation(&name) && !sequences.iter().any(|sequence| sequence.name == name) {
+            return name;
+        }
+        number += 1;
     }
 }
 pub(crate) fn normalize_unqualified_object_name(name: &ast::ObjectName) -> Result<String> {

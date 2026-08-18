@@ -166,6 +166,15 @@ impl SequenceExecutionContext {
         }
         Ok(value)
     }
+
+    pub(crate) fn get_owned_sequence(&self, table: &str, column: &str) -> Result<Option<String>> {
+        let table = normalize_sequence_name(table)?;
+        let column = normalize_sequence_name(column)?;
+        Ok(self.sequences.values().find_map(|sequence| {
+            (sequence.owned_by.as_ref() == Some(&(table.clone(), column.clone())))
+                .then(|| sequence.name.clone())
+        }))
+    }
 }
 
 pub(crate) fn create_sequence_schema(
@@ -177,6 +186,14 @@ pub(crate) fn create_sequence_schema(
         Some(data_type) => coercion::convert_ast_data_type(data_type)?.base,
         None => BaseType::Int8,
     };
+    create_sequence_schema_for_type(name, data_type, options)
+}
+
+pub(crate) fn create_sequence_schema_for_type(
+    name: String,
+    data_type: BaseType,
+    options: &[ast::SequenceOptions],
+) -> Result<SequenceSchema> {
     let (type_min, type_max) = match data_type {
         BaseType::Int2 => (i64::from(i16::MIN), i64::from(i16::MAX)),
         BaseType::Int4 => (i64::from(i32::MIN), i64::from(i32::MAX)),
@@ -252,6 +269,7 @@ pub(crate) fn create_sequence_schema(
         start_value,
         cycle,
         cache,
+        owned_by: None,
     })
 }
 
