@@ -118,6 +118,27 @@ pub(crate) fn execute_statement(
         query::materialize_uncorrelated_subqueries(state, statement, xid, snapshot, context)?;
     match &statement {
         ast::Statement::CreateTable(create) => {
+            if create.temporary || create.on_commit.is_some() {
+                return reject_unsupported("temporary tables are not implemented");
+            }
+            if create.query.is_some() {
+                return reject_unsupported("CREATE TABLE AS is not implemented");
+            }
+            if create.like.is_some() || create.clone.is_some() {
+                return reject_unsupported("CREATE TABLE LIKE is not implemented");
+            }
+            if create.inherits.is_some() {
+                return reject_unsupported("table inheritance is not implemented");
+            }
+            if create.partition_by.is_some()
+                || create.partition_of.is_some()
+                || create.for_values.is_some()
+            {
+                return reject_unsupported("table partitioning is not implemented");
+            }
+            if !matches!(create.table_options, ast::CreateTableOptions::None) {
+                return reject_unsupported("CREATE TABLE options are not implemented");
+            }
             let table_name = normalize_unqualified_object_name(&create.name)?;
             if create.if_not_exists && state.catalog.has_relation(&table_name) {
                 return Ok(StatementResult::Affected(0));
@@ -476,8 +497,15 @@ pub(crate) fn execute_statement(
             object_type: ast::ObjectType::Table,
             names,
             if_exists,
+            cascade,
+            restrict,
             ..
         } => {
+            if *cascade || *restrict {
+                return reject_unsupported(
+                    "DROP TABLE with CASCADE or RESTRICT is not implemented",
+                );
+            }
             let mut affected = 0;
             for object in names {
                 let table_name = normalize_unqualified_object_name(object)?;
@@ -504,8 +532,15 @@ pub(crate) fn execute_statement(
             object_type: ast::ObjectType::Sequence,
             names,
             if_exists,
+            cascade,
+            restrict,
             ..
         } => {
+            if *cascade || *restrict {
+                return reject_unsupported(
+                    "DROP SEQUENCE with CASCADE or RESTRICT is not implemented",
+                );
+            }
             for object in names {
                 let name = normalize_unqualified_object_name(object)?;
                 match state.catalog.drop_sequence(&name) {
@@ -523,15 +558,20 @@ pub(crate) fn execute_statement(
             }
             Ok(StatementResult::Affected(0))
         }
-        ast::Statement::Insert(insert) => execute_insert(
-            state,
-            insert,
-            xid,
-            snapshot,
-            deferred_constraints,
-            defer_all,
-            context,
-        ),
+        ast::Statement::Insert(insert) => {
+            if insert.on.is_some() {
+                return reject_unsupported("INSERT ON CONFLICT is not implemented");
+            }
+            execute_insert(
+                state,
+                insert,
+                xid,
+                snapshot,
+                deferred_constraints,
+                defer_all,
+                context,
+            )
+        }
         ast::Statement::Update(update) => {
             if update.or.is_some() {
                 return reject_unsupported("UPDATE feature is not implemented");
