@@ -75,6 +75,16 @@ impl ast::VisitorMut for SubqueryMaterializer<'_> {
     }
 
     fn pre_visit_expr(&mut self, expr: &mut ast::Expr) -> std::ops::ControlFlow<Self::Break> {
+        if !matches!(
+            expr,
+            ast::Expr::AnyOp { right, .. } | ast::Expr::AllOp { right, .. }
+                if matches!(right.as_ref(), ast::Expr::Subquery(_))
+        ) && !matches!(
+            expr,
+            ast::Expr::Subquery(_) | ast::Expr::Exists { .. } | ast::Expr::InSubquery { .. }
+        ) {
+            return std::ops::ControlFlow::Continue(());
+        }
         let original = expr.clone();
         let correlation_candidate = original.clone();
         let result = (|| match original {
