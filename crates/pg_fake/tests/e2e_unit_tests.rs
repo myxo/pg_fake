@@ -1496,6 +1496,7 @@ fn matches_correlated_subqueries() {
          INSERT INTO __TABLE___children VALUES (10, 1, 10), (11, 1, 20), (12, 2, NULL); \
          SELECT p.id, (SELECT c.value FROM __TABLE___children AS c WHERE c.parent_id = p.id ORDER BY c.id LIMIT 1) FROM __TABLE__ AS p ORDER BY p.id; \
          SELECT p.id FROM __TABLE__ AS p WHERE EXISTS (SELECT 1 FROM __TABLE___children AS c WHERE c.parent_id = p.id AND c.value > p.threshold) ORDER BY p.id; \
+         SELECT p.id FROM __TABLE__ AS p WHERE EXISTS (SELECT 1 FROM __TABLE___children AS c WHERE c.parent_id = p.id) ORDER BY p.id; \
          SELECT p.id FROM __TABLE__ AS p WHERE p.id IN (SELECT c.parent_id FROM __TABLE___children AS c WHERE c.value > p.threshold) ORDER BY p.id; \
          SELECT p.id FROM __TABLE__ AS p WHERE p.threshold < ANY (SELECT c.value FROM __TABLE___children AS c WHERE c.parent_id = p.id) ORDER BY p.id; \
          SELECT p.id FROM __TABLE__ AS p WHERE p.threshold < ALL (SELECT c.value FROM __TABLE___children AS c WHERE c.parent_id = p.id) ORDER BY p.id; \
