@@ -114,9 +114,7 @@ pub(crate) fn execute_statement(
     defer_all: bool,
     context: &StatementExecutionContext,
 ) -> Result<StatementResult> {
-    let statement =
-        query::materialize_uncorrelated_subqueries(state, statement, xid, snapshot, context)?;
-    match &statement {
+    match statement {
         ast::Statement::CreateTable(create) => {
             if create.temporary || create.on_commit.is_some() {
                 return reject_unsupported("temporary tables are not implemented");
