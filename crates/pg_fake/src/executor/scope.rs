@@ -33,6 +33,87 @@ pub(crate) enum RowScope<'a> {
     Bound(&'a BoundScope),
 }
 
+fn matches_identifier(name: &str, identifier: &ast::Ident) -> bool {
+    if identifier.quote_style.is_some() {
+        name == identifier.value
+    } else {
+        name.len() == identifier.value.len()
+            && name
+                .bytes()
+                .zip(identifier.value.bytes())
+                .all(|(name, identifier)| name == identifier.to_ascii_lowercase())
+    }
+}
+
+fn resolve_bound_column<'a>(
+    scope: &'a BoundScope,
+    identifiers: &[ast::Ident],
+) -> Result<&'a BoundColumn> {
+    let mut selected = None;
+    let mut ambiguous = false;
+    match identifiers {
+        [identifier] => {
+            for column in &scope.columns {
+                if !column.unqualified || !matches_identifier(&column.name, identifier) {
+                    continue;
+                }
+                match selected {
+                    None => selected = Some(column),
+                    Some(current) if column.depth < current.depth => {
+                        selected = Some(column);
+                        ambiguous = false;
+                    }
+                    Some(current) if column.depth == current.depth => ambiguous = true,
+                    Some(_) => {}
+                }
+            }
+        }
+        [qualifier, identifier] => {
+            let depth = scope
+                .columns
+                .iter()
+                .filter(|column| matches_identifier(&column.qualifier, qualifier))
+                .map(|column| column.depth)
+                .min()
+                .ok_or_else(|| {
+                    PgError::create(
+                        SqlState::UndefinedTable,
+                        format!(
+                            "missing FROM-clause entry for table {:?}",
+                            normalize_identifier(qualifier)
+                        ),
+                    )
+                })?;
+            for column in &scope.columns {
+                if column.depth != depth
+                    || !matches_identifier(&column.qualifier, qualifier)
+                    || !matches_identifier(&column.name, identifier)
+                {
+                    continue;
+                }
+                if selected.is_some() {
+                    ambiguous = true;
+                } else {
+                    selected = Some(column);
+                }
+            }
+        }
+        _ => {}
+    }
+    if ambiguous {
+        return Err(PgError::create(
+            SqlState::AmbiguousColumn,
+            format!("column {:?} is ambiguous", identifiers),
+        ));
+    }
+    selected.ok_or_else(|| {
+        PgError::create(
+            SqlState::UndefinedColumn,
+            format!("column {:?} does not exist", identifiers),
+        )
+    })
+}
+
 impl RowScope<'_> {
     pub(super) fn resolve_column(self, identifiers: &[ast::Ident]) -> Result<(usize, PgType)> {
         match self {
@@ -46,7 +127,7 @@ impl RowScope<'_> {
                 let index = schema
                     .columns
                     .iter()
-                    .position(|column| column.name == normalize_identifier(&identifiers[0]))
+                    .position(|column| matches_identifier(&column.name, &identifiers[0]))
                     .ok_or_else(|| {
                         PgError::create(
                             SqlState::UndefinedColumn,
@@ -56,66 +137,8 @@ impl RowScope<'_> {
                 Ok((index, schema.columns[index].data_type))
             }
             RowScope::Bound(scope) => {
-                let names = identifiers
-                    .iter()
-                    .map(normalize_identifier)
-                    .collect::<Vec<_>>();
-                let depth = match names.as_slice() {
-                    [column] => scope
-                        .columns
-                        .iter()
-                        .filter(|bound| bound.unqualified && bound.name == *column)
-                        .map(|bound| bound.depth)
-                        .min(),
-                    [qualifier, _] => scope
-                        .columns
-                        .iter()
-                        .filter(|bound| bound.qualifier == *qualifier)
-                        .map(|bound| bound.depth)
-                        .min(),
-                    _ => None,
-                };
-                let matches = match names.as_slice() {
-                    [column] => scope
-                        .columns
-                        .iter()
-                        .filter(|bound| {
-                            Some(bound.depth) == depth && bound.unqualified && bound.name == *column
-                        })
-                        .collect::<Vec<_>>(),
-                    [qualifier, column] => scope
-                        .columns
-                        .iter()
-                        .filter(|bound| {
-                            Some(bound.depth) == depth
-                                && bound.qualifier == *qualifier
-                                && bound.name == *column
-                        })
-                        .collect::<Vec<_>>(),
-                    _ => Vec::new(),
-                };
-                match matches.as_slice() {
-                    [] if names.len() == 2
-                        && !scope
-                            .columns
-                            .iter()
-                            .any(|column| column.qualifier == names[0]) =>
-                    {
-                        Err(PgError::create(
-                            SqlState::UndefinedTable,
-                            format!("missing FROM-clause entry for table {:?}", names[0]),
-                        ))
-                    }
-                    [] => Err(PgError::create(
-                        SqlState::UndefinedColumn,
-                        format!("column {:?} does not exist", identifiers),
-                    )),
-                    [column] => Ok((column.slot, column.data_type)),
-                    _ => Err(PgError::create(
-                        SqlState::AmbiguousColumn,
-                        format!("column {:?} is ambiguous", identifiers),
-                    )),
-                }
+                let column = resolve_bound_column(scope, identifiers)?;
+                Ok((column.slot, column.data_type))
             }
         }
     }
@@ -128,21 +151,8 @@ impl RowScope<'_> {
         match self {
             RowScope::Table(_) => Ok(row[self.resolve_column(identifiers)?.0].clone()),
             RowScope::Bound(scope) => {
-                let names = identifiers
-                    .iter()
-                    .map(normalize_identifier)
-                    .collect::<Vec<_>>();
-                let (_, data_type) = self.resolve_column(identifiers)?;
-                let column = scope
-                    .columns
-                    .iter()
-                    .find(|column| match names.as_slice() {
-                        [name] => column.unqualified && column.name == *name,
-                        [qualifier, name] => column.qualifier == *qualifier && column.name == *name,
-                        _ => false,
-                    })
-                    .expect("resolved column must be present in scope");
-                if names.len() == 1
+                let column = resolve_bound_column(scope, identifiers)?;
+                if identifiers.len() == 1
                     && let Some((left, right)) = column.merged
                 {
                     let value = if row[left].is_null() {
@@ -158,7 +168,7 @@ impl RowScope<'_> {
                         value
                             .get_base_type()
                             .expect("non-null value has a base type"),
-                        data_type,
+                        column.data_type,
                         crate::coercion::CastContext::Implicit,
                     );
                 }
