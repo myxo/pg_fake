@@ -3,6 +3,21 @@
 An in-memory, embeddable fake of PostgreSQL for use as a test double in
 automated tests.
 
+## Command-line CLI
+
+Run a SQL file against a fresh in-memory database:
+
+```sh
+cargo run -p pg_fake_cli -- path/to/script.sql
+```
+
+Without a file argument, it starts an interactive shell. Finish SQL statements
+with `;`; use `\q` or EOF to exit:
+
+```sh
+cargo run -p pg_fake_cli
+```
+
 ## Phase 2 SQL support
 
 Phase 2 covers joins and correlated subqueries, aggregates with `GROUP BY` /

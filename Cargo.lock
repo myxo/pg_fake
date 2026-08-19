@@ -1690,6 +1690,13 @@ dependencies = [
 ]
 
 [[package]]
+name = "pg_fake_cli"
+version = "0.1.0"
+dependencies = [
+ "pg_fake",
+]
+
+[[package]]
 name = "pg_fake_sqlx"
 version = "0.1.0"
 dependencies = [
