@@ -3218,6 +3218,7 @@ fn visit_table_factor_rows(
             &mut filters,
         );
     }
+    let mut row = vec![Value::Null; scope.columns.len()];
     for (_, chain) in state
         .tables
         .get(&schema.id)
@@ -3227,7 +3228,6 @@ fn visit_table_factor_rows(
         let Some(version) = find_visible_version(chain, snapshot, xid, &state.transactions) else {
             continue;
         };
-        let mut row = vec![Value::Null; scope.columns.len()];
         row[start..start + version.row.len()].clone_from_slice(&version.row);
         let passes = filters.iter().try_fold(true, |passes, filter| {
             if !passes {
