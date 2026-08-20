@@ -1,5 +1,4 @@
 use std::{
-    collections::HashMap,
     fmt,
     future::Future,
     str::FromStr,
@@ -10,6 +9,7 @@ use std::{
 use either::Either;
 use futures_core::{future::BoxFuture, stream::BoxStream};
 use futures_util::{TryStreamExt, stream};
+use hashlink::LinkedHashMap;
 use log::LevelFilter;
 use pg_fake::api::{Db, PreparedStatement as CoreStatement, Session, StatementResult};
 use pg_fake::value::BaseType;
@@ -23,6 +23,8 @@ use url::Url;
 use crate::{
     PgFakeArguments, PgFakeColumn, PgFakeRow, PgFakeTypeInfo, PgFakeValue, error::database_error,
 };
+
+pub const DEFAULT_STATEMENT_CACHE_LIMIT_BYTES: usize = 100 * 1024 * 1024;
 
 #[derive(Debug)]
 pub struct PgFake;
@@ -73,6 +75,7 @@ impl Extend<PgFakeQueryResult> for PgFakeQueryResult {
 pub struct PgFakeConnectOptions {
     db: Db,
     log_settings: LogSettings,
+    statement_cache_limit_bytes: usize,
 }
 
 impl PgFakeConnectOptions {
@@ -80,7 +83,13 @@ impl PgFakeConnectOptions {
         Self {
             db,
             log_settings: LogSettings::default(),
+            statement_cache_limit_bytes: DEFAULT_STATEMENT_CACHE_LIMIT_BYTES,
         }
+    }
+
+    pub fn set_statement_cache_limit_bytes(mut self, limit: usize) -> Self {
+        self.statement_cache_limit_bytes = limit;
+        self
     }
 }
 
@@ -89,6 +98,10 @@ impl fmt::Debug for PgFakeConnectOptions {
         formatter
             .debug_struct("PgFakeConnectOptions")
             .field("log_settings", &self.log_settings)
+            .field(
+                "statement_cache_limit_bytes",
+                &self.statement_cache_limit_bytes,
+            )
             .finish_non_exhaustive()
     }
 }
@@ -119,7 +132,8 @@ impl ConnectOptions for PgFakeConnectOptions {
     }
 
     fn connect(&self) -> impl Future<Output = Result<PgFakeConnection, sqlx::Error>> + Send + '_ {
-        let connection = PgFakeConnection::new(self.db.clone());
+        let connection =
+            PgFakeConnection::create(self.db.clone(), self.statement_cache_limit_bytes);
         async move { Ok(connection) }
     }
 
@@ -136,7 +150,21 @@ impl ConnectOptions for PgFakeConnectOptions {
 
 struct ConnectionState {
     session: Session,
-    statements: HashMap<String, CoreStatement>,
+    statements: LinkedHashMap<String, CoreStatement>,
+    statement_cache_bytes: usize,
+    statement_cache_limit_bytes: usize,
+}
+
+impl ConnectionState {
+    fn prune_cached_statements(&mut self) {
+        while self.statement_cache_bytes > self.statement_cache_limit_bytes {
+            let (sql, _) = self
+                .statements
+                .pop_front()
+                .expect("cache must contain an entry while over its byte limit");
+            self.statement_cache_bytes -= sql.len();
+        }
+    }
 }
 
 pub struct PgFakeConnection {
@@ -147,10 +175,24 @@ pub struct PgFakeConnection {
 
 impl PgFakeConnection {
     pub fn new(db: Db) -> Self {
+        Self::create(db, DEFAULT_STATEMENT_CACHE_LIMIT_BYTES)
+    }
+
+    pub fn set_statement_cache_limit_bytes(self, limit: usize) -> Self {
+        let mut state = self.state.lock().expect("connection mutex is poisoned");
+        state.statement_cache_limit_bytes = limit;
+        state.prune_cached_statements();
+        drop(state);
+        self
+    }
+
+    fn create(db: Db, statement_cache_limit_bytes: usize) -> Self {
         Self {
             state: Arc::new(Mutex::new(ConnectionState {
                 session: db.create_session(),
-                statements: HashMap::new(),
+                statements: LinkedHashMap::new(),
+                statement_cache_bytes: 0,
+                statement_cache_limit_bytes,
             })),
             transaction_depth: 0,
             pending_rollback: false,
@@ -197,11 +239,15 @@ impl PgFakeConnection {
                     let prepared = if let Some(statement) = statement {
                         statement.statement
                     } else if persistent {
-                        if let Some(statement) = state.statements.get(&sql) {
+                        if let Some(statement) = state.statements.to_back(sql.as_str()) {
                             statement.clone()
                         } else {
                             let statement = state.session.prepare(&sql).map_err(database_error)?;
-                            state.statements.insert(sql.clone(), statement.clone());
+                            if sql.len() <= state.statement_cache_limit_bytes {
+                                state.statement_cache_bytes += sql.len();
+                                state.statements.insert(sql.clone(), statement.clone());
+                                state.prune_cached_statements();
+                            }
                             statement
                         }
                     } else {
@@ -337,11 +383,9 @@ impl Connection for PgFakeConnection {
     fn clear_cached_statements(
         &mut self,
     ) -> impl Future<Output = Result<(), sqlx::Error>> + Send + '_ {
-        self.state
-            .lock()
-            .expect("connection mutex is poisoned")
-            .statements
-            .clear();
+        let mut state = self.state.lock().expect("connection mutex is poisoned");
+        state.statements.clear();
+        state.statement_cache_bytes = 0;
         async { Ok(()) }
     }
 
@@ -557,5 +601,48 @@ impl ColumnIndex<PgFakeStatement> for str {
             .iter()
             .position(|column| column.name == self)
             .ok_or_else(|| sqlx::Error::ColumnNotFound(self.to_owned()))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn evicts_least_recently_used_statements_within_the_byte_limit() {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .build()
+            .unwrap();
+        let mut connection =
+            PgFakeConnection::new(Db::create()).set_statement_cache_limit_bytes(16);
+        runtime.block_on(async {
+            sqlx::query("SELECT 1")
+                .execute(&mut connection)
+                .await
+                .unwrap();
+            sqlx::query("SELECT 2")
+                .execute(&mut connection)
+                .await
+                .unwrap();
+            sqlx::query("SELECT 1")
+                .execute(&mut connection)
+                .await
+                .unwrap();
+            sqlx::query("SELECT 3")
+                .execute(&mut connection)
+                .await
+                .unwrap();
+        });
+
+        let state = connection.state.lock().unwrap();
+        assert_eq!(state.statement_cache_bytes, 16);
+        assert_eq!(
+            state
+                .statements
+                .keys()
+                .map(String::as_str)
+                .collect::<Vec<_>>(),
+            ["SELECT 1", "SELECT 3"]
+        );
     }
 }
