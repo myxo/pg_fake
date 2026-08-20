@@ -771,7 +771,7 @@ native and SQLx APIs.
 
 **Notes:** This task fixes integration defects but does not add new SQL families.
 
-**Progress (awaiting approval):**
+**Completed:**
 
 - The PostgreSQL 18 Phase 2 manifest passes all 32 cases, including the new
   explicit-transaction scenario that combines joins, correlated subqueries,
