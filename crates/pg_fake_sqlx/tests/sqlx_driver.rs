@@ -1,17 +1,14 @@
-use std::{env, path::PathBuf, str::FromStr, time::Duration};
+use std::{str::FromStr, time::Duration};
 
 use bigdecimal::BigDecimal;
 use pg_fake::api::Db;
 use pg_fake_sqlx::{PgFakeConnectOptions, PgFakeConnection, PgFakePoolOptions};
 use sqlx::{AssertSqlSafe, Column, Connection, Executor, Row, SqlStr, Statement, TypeInfo};
 use sqlx_postgres::PgConnection;
-use testcontainers::{Container, ImageExt, runners::SyncRunner};
-use testcontainers_modules::postgres::Postgres as PostgresImage;
 
-struct PostgresServer {
-    url: String,
-    _container: Option<Container<PostgresImage>>,
-}
+mod common;
+
+use common::start_postgres_server;
 
 #[tokio::test]
 async fn sqlx_queries_map_all_phase_one_types() {
@@ -366,33 +363,4 @@ async fn sqlx_error_category_matches_postgres() {
     tokio::task::spawn_blocking(move || drop(server))
         .await
         .unwrap();
-}
-
-fn start_postgres_server() -> PostgresServer {
-    let configured_url = env::var("PG_FAKE_DATABASE_URL").ok();
-    if configured_url.is_none() && env::var_os("DOCKER_HOST").is_none() {
-        let socket = PathBuf::from(env::var_os("HOME").expect("HOME must be set"))
-            .join(".colima/default/docker.sock");
-        if socket.exists() {
-            unsafe { env::set_var("DOCKER_HOST", format!("unix://{}", socket.display())) };
-        }
-    }
-    let container = configured_url.is_none().then(|| {
-        PostgresImage::default()
-            .with_tag("18")
-            .start()
-            .expect("must start PostgreSQL 18 container")
-    });
-    let url = configured_url.unwrap_or_else(|| {
-        let container = container.as_ref().unwrap();
-        format!(
-            "postgresql://postgres:postgres@{}:{}/postgres",
-            container.get_host().unwrap(),
-            container.get_host_port_ipv4(5432).unwrap()
-        )
-    });
-    PostgresServer {
-        url,
-        _container: container,
-    }
 }

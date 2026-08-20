@@ -1666,6 +1666,7 @@ version = "0.1.0"
 dependencies = [
  "bigdecimal",
  "chrono",
+ "dotenvy",
  "postgres",
  "rand_chacha",
  "sqlparser",
@@ -1680,6 +1681,7 @@ name = "pg_fake_benchmarks"
 version = "0.1.0"
 dependencies = [
  "criterion",
+ "dotenvy",
  "pg_fake",
  "pg_fake_sqlx",
  "sqlx",
@@ -1703,6 +1705,7 @@ dependencies = [
  "bigdecimal",
  "chaos_theory",
  "chrono",
+ "dotenvy",
  "either",
  "futures-core",
  "futures-util",

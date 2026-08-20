@@ -148,7 +148,7 @@ struct PostgresBenchmark {
 }
 
 fn postgres_benchmark(runtime: &Runtime) -> PostgresBenchmark {
-    let (container, url) = if let Ok(url) = env::var("PG_FAKE_DATABASE_URL") {
+    let (container, url) = if let Ok(url) = dotenvy::var("PG_FAKE_DATABASE_URL") {
         println!("connect to manually setup postgres on {url}");
         (None, url)
     } else {

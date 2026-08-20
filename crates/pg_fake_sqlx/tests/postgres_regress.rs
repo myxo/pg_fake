@@ -1,4 +1,4 @@
-use std::{env, fs, path::PathBuf, sync::Mutex};
+use std::{fs, path::PathBuf, sync::Mutex};
 
 use pg_fake::parser::{self, Statement};
 use pg_fake_sqlx::{Db, PgFake, PgFakeConnection};
@@ -7,13 +7,15 @@ use sqlx::{
     ValueRef,
 };
 use sqlx_postgres::{PgConnection, Postgres};
-use testcontainers::{Container, ImageExt, runners::SyncRunner};
-use testcontainers_modules::postgres::Postgres as PostgresImage;
 use tokio::runtime::Runtime;
 use url::Url;
 
+mod common;
+
 #[path = "postgres_regress/phase2_manifest.rs"]
 mod phase2_manifest;
+
+use common::start_postgres_server;
 
 #[derive(Debug, PartialEq, Eq)]
 enum Outcome {
@@ -22,48 +24,10 @@ enum Outcome {
     Error(String),
 }
 
-struct PostgresServer {
-    url: String,
-    _container: Option<Container<PostgresImage>>,
-}
-
 static TEST_LOCK: Mutex<()> = Mutex::new(());
 
 const MINIMUM_PASSED_STATEMENTS: usize = 463;
 const REVIEWED_SKIPPED_SCRIPTS: usize = 141;
-
-fn postgres_server() -> PostgresServer {
-    if let Ok(url) = env::var("PG_FAKE_DATABASE_URL") {
-        return PostgresServer {
-            url,
-            _container: None,
-        };
-    }
-    if env::var_os("DOCKER_HOST").is_none() {
-        let socket = PathBuf::from(env::var_os("HOME").expect("HOME must be set"))
-            .join(".colima/default/docker.sock");
-        if socket.exists() {
-            unsafe { env::set_var("DOCKER_HOST", format!("unix://{}", socket.display())) };
-        }
-    }
-    let container = PostgresImage::default()
-        .with_tag("18")
-        .start()
-        .expect("must start PostgreSQL 18 container");
-    let url = format!(
-        "postgresql://postgres:postgres@{}:{}/postgres",
-        container
-            .get_host()
-            .expect("container host must be available"),
-        container
-            .get_host_port_ipv4(5432)
-            .expect("PostgreSQL port must be available")
-    );
-    PostgresServer {
-        url,
-        _container: Some(container),
-    }
-}
 
 enum TestConnection<'connection> {
     Fake(&'connection mut PgFakeConnection),
@@ -450,7 +414,7 @@ fn reports_phase2_regression_progress() {
             .iter()
             .all(|path| path.extension().is_some_and(|extension| extension == "sql"))
     );
-    let server = postgres_server();
+    let server = start_postgres_server();
     let runtime = Runtime::new().expect("must create tokio runtime");
     let mut admin = runtime
         .block_on(PgConnection::connect(&server.url))

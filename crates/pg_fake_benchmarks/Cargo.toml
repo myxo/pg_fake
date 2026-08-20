@@ -6,6 +6,7 @@ license.workspace = true
 
 [dev-dependencies]
 criterion = "0.5"
+dotenvy = "0.15"
 pg_fake = { path = "../pg_fake" }
 pg_fake_sqlx = { path = "../pg_fake_sqlx" }
 sqlx = { version = "0.9", default-features = false, features = ["runtime-tokio"] }

@@ -113,8 +113,14 @@ cargo test --tests
 The default Colima socket (`~/.colima/default/docker.sock`) is detected
 automatically. For another Docker socket or Colima profile, set `DOCKER_HOST`.
 
-Set `PG_FAKE_DATABASE_URL` to use an existing PostgreSQL 18 database
-instead:
+Set `PG_FAKE_DATABASE_URL` in the workspace-root `.env` file to use an existing
+PostgreSQL 18 database instead:
+
+```sh
+PG_FAKE_DATABASE_URL=postgresql://postgres:password@localhost:5432/postgres
+```
+
+An exported environment variable takes precedence. For a one-off run:
 
 ```sh
 PG_FAKE_DATABASE_URL=postgresql://postgres:password@localhost:5432/postgres \

@@ -1,7 +1,5 @@
 use std::{
     cell::RefCell,
-    env,
-    path::PathBuf,
     str::FromStr,
     sync::{
         Mutex,
@@ -18,9 +16,11 @@ use sqlx::{
     TypeInfo, ValueRef,
 };
 use sqlx_postgres::{PgConnection, Postgres};
-use testcontainers::{Container, ImageExt, runners::SyncRunner};
-use testcontainers_modules::postgres::Postgres as PostgresImage;
 use tokio::runtime::Runtime;
+
+mod common;
+
+use common::start_postgres_server;
 
 #[derive(Debug, PartialEq, Eq)]
 enum Outcome {
@@ -48,11 +48,6 @@ fn returns_rows(statement: &Statement) -> bool {
 static TEST_LOCK: Mutex<()> = Mutex::new(());
 static TABLE_NUMBER: AtomicU64 = AtomicU64::new(1);
 
-struct PostgresServer {
-    url: String,
-    _container: Option<Container<PostgresImage>>,
-}
-
 struct PostgresCase<'connection, 'runtime> {
     connection: &'connection mut PgConnection,
     runtime: &'runtime Runtime,
@@ -77,39 +72,6 @@ impl Drop for PostgresCase<'_, '_> {
         let _ = self
             .runtime
             .block_on(sqlx::raw_sql(AssertSqlSafe(sql.as_str())).execute(&mut *self.connection));
-    }
-}
-
-fn postgres_server() -> PostgresServer {
-    if let Ok(url) = env::var("PG_FAKE_DATABASE_URL") {
-        return PostgresServer {
-            url,
-            _container: None,
-        };
-    }
-    if env::var_os("DOCKER_HOST").is_none() {
-        let socket = PathBuf::from(env::var_os("HOME").expect("HOME must be set"))
-            .join(".colima/default/docker.sock");
-        if socket.exists() {
-            unsafe { env::set_var("DOCKER_HOST", format!("unix://{}", socket.display())) };
-        }
-    }
-    let container = PostgresImage::default()
-        .with_tag("18")
-        .start()
-        .expect("must start PostgreSQL 18 container");
-    let url = format!(
-        "postgresql://postgres:postgres@{}:{}/postgres",
-        container
-            .get_host()
-            .expect("container host must be available"),
-        container
-            .get_host_port_ipv4(5432)
-            .expect("PostgreSQL port must be available")
-    );
-    PostgresServer {
-        url,
-        _container: Some(container),
     }
 }
 
@@ -1341,7 +1303,7 @@ fn lock_timeout_sql(src: &mut Source) -> String {
 #[test]
 fn generated_sql_matches_postgres() {
     let _test_lock = TEST_LOCK.lock().expect("test mutex must not be poisoned");
-    let server = postgres_server();
+    let server = start_postgres_server();
     let runtime = tokio::runtime::Builder::new_multi_thread()
         .enable_all()
         .build()

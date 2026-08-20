@@ -40,8 +40,15 @@ PostgreSQL workloads use ordinary tables with stable names inside the
 recreates that schema before benchmarking, and drops it afterward.
 
 To benchmark an existing PostgreSQL 18 instance instead, set
-`PG_FAKE_DATABASE_URL`. The connected role must be able to create and drop the
-`pgfake_benchmark` schema, which is reserved for this suite:
+`PG_FAKE_DATABASE_URL` in the workspace-root `.env` file. The connected role
+must be able to create and drop the `pgfake_benchmark` schema, which is reserved
+for this suite:
+
+```sh
+PG_FAKE_DATABASE_URL=postgresql://postgres:password@localhost:5432/postgres
+```
+
+An exported environment variable takes precedence. For a one-off run:
 
 ```sh
 PG_FAKE_DATABASE_URL=postgresql://postgres:password@localhost:5432/postgres \
