@@ -8,6 +8,6 @@
   "performance_levels": "level 0: 4 physical / 4 logical; level 1: 4 physical / 4 logical",
   "physical_cores": "8",
   "postgres_target": "18",
-  "recorded_at": "2026-08-19T18:20:28Z",
+  "recorded_at": "2026-08-20T03:50:30Z",
   "rust": "rustc 1.96.0 (ac68faa20 2026-05-25)"
 }
