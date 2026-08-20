@@ -326,6 +326,26 @@ impl Table {
         })
     }
 
+    pub(crate) fn has_unique_index(&self, columns: &[usize]) -> bool {
+        self.indexes.iter().any(|index| index.columns == columns)
+    }
+
+    pub(crate) fn find_unique_visible_row(
+        &self,
+        columns: &[usize],
+        values: &[Value],
+        snapshot: &Snapshot,
+        current_xid: Xid,
+        transactions: &TransactionRegistry,
+    ) -> Option<&Row> {
+        let row_id = self.find_unique_row(columns, values, snapshot, current_xid, transactions)?;
+        self.version_chains
+            .chains
+            .get(&row_id)
+            .and_then(|chain| find_visible_version(chain, snapshot, current_xid, transactions))
+            .map(|version| &version.row)
+    }
+
     fn add_index_entries(&mut self, row_id: RowId, row: &Row) {
         let entries = self
             .indexes
@@ -522,6 +542,10 @@ mod tests {
         assert_eq!(
             table.find_unique_row(&[0], &[Value::Int4(1)], &snapshot, xid, &transactions,),
             Some(row_id)
+        );
+        assert_eq!(
+            table.find_unique_visible_row(&[0], &[Value::Int4(1)], &snapshot, xid, &transactions,),
+            Some(&vec![Value::Int4(1)])
         );
     }
 

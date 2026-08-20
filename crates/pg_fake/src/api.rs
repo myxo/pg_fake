@@ -1887,6 +1887,78 @@ mod tests {
     }
 
     #[test]
+    fn preserves_comparison_coercion_for_point_lookup_candidates() {
+        let db = Db::create();
+        let mut session = db.create_session();
+        session
+            .execute(
+                "CREATE TABLE indexed_smallints (id SMALLINT PRIMARY KEY); \
+                 CREATE TABLE scanned_smallints (id SMALLINT); \
+                 CREATE TABLE indexed_integers (id INTEGER PRIMARY KEY); \
+                 INSERT INTO indexed_smallints VALUES (1); \
+                 INSERT INTO scanned_smallints VALUES (1); \
+                 INSERT INTO indexed_integers VALUES (1)",
+            )
+            .unwrap();
+
+        assert_eq!(
+            session
+                .query("SELECT id FROM indexed_smallints WHERE id = 1", &[])
+                .unwrap()
+                .rows,
+            vec![vec![Value::Int2(1)]]
+        );
+        assert_eq!(
+            session
+                .query("SELECT id FROM scanned_smallints WHERE id = 1", &[])
+                .unwrap()
+                .rows,
+            vec![vec![Value::Int2(1)]]
+        );
+        assert_eq!(
+            session
+                .query("SELECT id FROM indexed_integers WHERE id = 1.0", &[])
+                .unwrap()
+                .rows,
+            vec![vec![Value::Int4(1)]]
+        );
+    }
+
+    #[test]
+    fn skips_scans_for_missing_prepared_unique_keys() {
+        let db = Db::create();
+        let mut session = db.create_session();
+        session
+            .execute(
+                "CREATE SEQUENCE point_probe START WITH 1; \
+                 CREATE TABLE items (id INTEGER PRIMARY KEY); \
+                 INSERT INTO items VALUES (1), (2)",
+            )
+            .unwrap();
+        let statement = session
+            .prepare(
+                "SELECT id FROM items \
+                 WHERE nextval('point_probe') > 0 AND id = $1",
+            )
+            .unwrap();
+
+        assert!(
+            session
+                .query_prepared(&statement, &[Value::Int4(99)])
+                .unwrap()
+                .rows
+                .is_empty()
+        );
+        assert_eq!(
+            session
+                .query("SELECT nextval('point_probe')", &[])
+                .unwrap()
+                .rows,
+            vec![vec![Value::Int8(1)]]
+        );
+    }
+
+    #[test]
     fn finishes_implicit_prepared_transactions() {
         let db = Db::create();
         let mut session = db.create_session();

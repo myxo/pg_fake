@@ -3229,12 +3229,76 @@ fn visit_table_factor_rows(
         );
     }
     let mut row = vec![Value::Null; scope.columns.len()];
-    for (_, chain) in state
+    let table = state
         .tables
         .get(&schema.id)
-        .expect("catalog table must have storage")
-        .iterate_version_chains()
-    {
+        .expect("catalog table must have storage");
+    for filter in &filters {
+        let ast::Expr::BinaryOp {
+            left,
+            op: ast::BinaryOperator::Eq,
+            right,
+        } = filter
+        else {
+            continue;
+        };
+        let (column, value) = match (left.as_ref(), right.as_ref()) {
+            (ast::Expr::Identifier(column), value) if is_point_lookup_value(value) => {
+                (std::slice::from_ref(column), value)
+            }
+            (value, ast::Expr::Identifier(column)) if is_point_lookup_value(value) => {
+                (std::slice::from_ref(column), value)
+            }
+            (ast::Expr::CompoundIdentifier(column), value) if is_point_lookup_value(value) => {
+                (column.as_slice(), value)
+            }
+            (value, ast::Expr::CompoundIdentifier(column)) if is_point_lookup_value(value) => {
+                (column.as_slice(), value)
+            }
+            _ => continue,
+        };
+        let Ok((slot, _)) = scope.resolve_column(column) else {
+            continue;
+        };
+        if !(start..start + schema.columns.len()).contains(&slot) {
+            continue;
+        }
+        let column = slot - start;
+        if !table.has_unique_index(&[column])
+            || resolve_operator_type(left, right, RowScope::Bound(scope))?
+                != schema.columns[column].data_type.base
+        {
+            continue;
+        }
+        let value = evaluate_and_coerce(
+            value,
+            schema.columns[column].data_type.base,
+            CastContext::Implicit,
+            RowScope::Bound(scope),
+            &row,
+            context,
+        )?;
+        let Some(indexed_row) =
+            table.find_unique_visible_row(&[column], &[value], snapshot, xid, &state.transactions)
+        else {
+            return Ok(());
+        };
+        row[start..start + indexed_row.len()].clone_from_slice(indexed_row);
+        let passes = filters.iter().try_fold(true, |passes, filter| {
+            if !passes {
+                return Ok(false);
+            }
+            Ok(matches!(
+                evaluate(filter, RowScope::Bound(scope), &row, context)?,
+                Value::Bool(true)
+            ))
+        })?;
+        if passes {
+            visit(&row)?;
+        }
+        return Ok(());
+    }
+    for (_, chain) in table.iterate_version_chains() {
         let Some(version) = find_visible_version(chain, snapshot, xid, &state.transactions) else {
             continue;
         };
@@ -3472,18 +3536,18 @@ fn collect_pushdown_filters<'a>(
         return;
     };
     let column = match (left.as_ref(), right.as_ref()) {
-        (ast::Expr::Identifier(column), ast::Expr::Value(_)) => scope
+        (ast::Expr::Identifier(column), value) if is_point_lookup_value(value) => scope
             .resolve_column(std::slice::from_ref(column))
             .ok()
             .map(|(slot, _)| slot),
-        (ast::Expr::CompoundIdentifier(columns), ast::Expr::Value(_)) => {
+        (ast::Expr::CompoundIdentifier(columns), value) if is_point_lookup_value(value) => {
             scope.resolve_column(columns).ok().map(|(slot, _)| slot)
         }
-        (ast::Expr::Value(_), ast::Expr::Identifier(column)) => scope
+        (value, ast::Expr::Identifier(column)) if is_point_lookup_value(value) => scope
             .resolve_column(std::slice::from_ref(column))
             .ok()
             .map(|(slot, _)| slot),
-        (ast::Expr::Value(_), ast::Expr::CompoundIdentifier(columns)) => {
+        (value, ast::Expr::CompoundIdentifier(columns)) if is_point_lookup_value(value) => {
             scope.resolve_column(columns).ok().map(|(slot, _)| slot)
         }
         _ => None,
@@ -3491,6 +3555,19 @@ fn collect_pushdown_filters<'a>(
     if column.is_some_and(|slot| (start..end).contains(&slot)) {
         filters.push(expr);
     }
+}
+
+fn is_point_lookup_value(expr: &ast::Expr) -> bool {
+    matches!(expr, ast::Expr::Value(_))
+        || matches!(
+            expr,
+            ast::Expr::Cast {
+                kind: ast::CastKind::Cast | ast::CastKind::DoubleColon,
+                expr,
+                format: None,
+                ..
+            } if matches!(expr.as_ref(), ast::Expr::Value(_))
+        )
 }
 
 fn evaluate_join_condition(

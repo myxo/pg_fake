@@ -507,7 +507,7 @@ fn resolve_expression_pair_type(
     })
 }
 
-fn resolve_operator_type(
+pub(super) fn resolve_operator_type(
     left: &ast::Expr,
     right: &ast::Expr,
     schema: RowScope<'_>,

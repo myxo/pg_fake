@@ -41,8 +41,8 @@ use arithmetic::{
 use expressions::{
     compare_values, evaluate, evaluate_and_coerce, evaluate_assignment_expression,
     evaluate_column_default, evaluate_comparison, extract_number_literal, is_default_expression,
-    validate_check_constraint_types, validate_check_constraints, validate_column_default,
-    validate_not_null,
+    resolve_operator_type, validate_check_constraint_types, validate_check_constraints,
+    validate_column_default, validate_not_null,
 };
 pub(crate) use expressions::{
     create_constant_expression_schema, extract_unknown_string_literal, infer_expression_type,
