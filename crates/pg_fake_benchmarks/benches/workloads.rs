@@ -578,6 +578,19 @@ fn select_benchmark(
     }
     group.finish();
 
+    let select = "SELECT * FROM select_100_rows WHERE id = 50";
+    let mut group =
+        criterion.benchmark_group(benchmarks::find_benchmark("select_where_100_rows").name);
+
+    for (name, connection) in connections.iter_mut() {
+        group.bench_function(*name, |benchmark| {
+            benchmark.iter(|| {
+                connection.fetch(runtime, select);
+            });
+        });
+    }
+    group.finish();
+
     let select =
         "SELECT id, name FROM limit_offset_ordered_100_rows ORDER BY id DESC LIMIT 10 OFFSET 40";
     let mut group =

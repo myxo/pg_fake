@@ -4,7 +4,8 @@ The Criterion suite compares `pg_fake` with PostgreSQL 18 through SQLx. It
 covers a create/drop table lifecycle, individual constrained
 explicit/defaulted inserts, updates, deletes, explicit transactions at READ
 COMMITTED and REPEATABLE READ, row-lock
-acquisition with `SELECT ... FOR UPDATE`, a 100-row full-table select, and a
+acquisition with `SELECT ... FOR UPDATE`, a 100-row full-table select, a simple
+filtered select, and a
 100-row multi-key `ORDER BY` with explicit NULL placement, including an ordered
 `LIMIT`/`OFFSET` paging workload. The insert workloads include primary-key,
 not-null, default, and column- and table-level `CHECK` validation. They also

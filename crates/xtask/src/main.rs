@@ -217,10 +217,17 @@ fn run_benchmarks(record: bool) {
 
 fn collect_report(root: &Path, result: &str) -> Report {
     let benchmarks = list_benchmarks();
+    let (postgres_benchmarks, other_benchmarks): (Vec<_>, Vec<_>) =
+        benchmarks.iter().partition(|benchmark| {
+            benchmark
+                .values
+                .iter()
+                .any(|value| value.name == "postgres_18")
+        });
     let mut measurements = Vec::new();
     let mut speedups = Vec::new();
 
-    for benchmark in &benchmarks {
+    for benchmark in postgres_benchmarks.into_iter().chain(other_benchmarks) {
         for value in &benchmark.values {
             if let Some(average) = read_estimate(root, benchmark, value, result) {
                 measurements.push((
