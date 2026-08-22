@@ -75,6 +75,26 @@ impl Drop for PostgresCase<'_, '_> {
     }
 }
 
+struct PostgresSessionsCase<'connection, 'runtime> {
+    connections: &'connection mut [PgConnection],
+    runtime: &'runtime Runtime,
+    table: String,
+}
+
+impl Drop for PostgresSessionsCase<'_, '_> {
+    fn drop(&mut self) {
+        for connection in self.connections.iter_mut() {
+            let _ = self
+                .runtime
+                .block_on(sqlx::raw_sql(AssertSqlSafe("ROLLBACK")).execute(&mut *connection));
+        }
+        let sql = format!("DROP TABLE IF EXISTS {}", self.table);
+        let _ = self
+            .runtime
+            .block_on(sqlx::raw_sql(AssertSqlSafe(sql.as_str())).execute(&mut self.connections[0]));
+    }
+}
+
 enum TestConnection<'connection> {
     Fake(&'connection mut PgFakeConnection),
     Postgres(&'connection mut PgConnection),
@@ -1444,6 +1464,58 @@ fn generate_statement(
     )
 }
 
+fn generate_snapshot_select(src: &mut Source, table: &TableSchema) -> (String, RowOrder) {
+    (
+        format!(
+            "SELECT {0} FROM {1}{2} ORDER BY {0}",
+            table.key().name,
+            table.name,
+            generate_where_clause(src, table),
+        ),
+        RowOrder::Ordered,
+    )
+}
+
+fn generate_snapshot_statement(
+    src: &mut Source,
+    table: &TableSchema,
+    next_key: &mut i64,
+    in_transaction: &mut bool,
+) -> (String, RowOrder) {
+    let statements: &[&str] = if *in_transaction {
+        &["insert", "select", "commit", "rollback"]
+    } else {
+        &["insert", "select", "begin"]
+    };
+    src.select(
+        "snapshot_statement",
+        statements,
+        |src, statement, _| match statement {
+            "insert" => (
+                generate_main_insert(src, table, next_key),
+                RowOrder::Unordered,
+            ),
+            "select" => generate_snapshot_select(src, table),
+            "begin" => {
+                *in_transaction = true;
+                (
+                    format!("BEGIN ISOLATION LEVEL {}", isolation_level(src)),
+                    RowOrder::Unordered,
+                )
+            }
+            "commit" => {
+                *in_transaction = false;
+                ("COMMIT".into(), RowOrder::Unordered)
+            }
+            "rollback" => {
+                *in_transaction = false;
+                ("ROLLBACK".into(), RowOrder::Unordered)
+            }
+            _ => unreachable!(),
+        },
+    )
+}
+
 #[test]
 fn generated_sql_matches_postgres() {
     let _test_lock = TEST_LOCK.lock().expect("test mutex must not be poisoned");
@@ -1536,6 +1608,135 @@ fn generated_sql_matches_postgres() {
                 RowOrder::Unordered,
             );
         }
+    });
+}
+
+#[test]
+fn generated_interleaved_transaction_snapshots_match_postgres() {
+    let _test_lock = TEST_LOCK.lock().expect("test mutex must not be poisoned");
+    let server = start_postgres_server();
+    let runtime = tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()
+        .unwrap();
+    let postgres = RefCell::new(
+        (0..3)
+            .map(|_| {
+                runtime
+                    .block_on(PgConnection::connect(&server.url))
+                    .expect("must connect SQLx to PostgreSQL 18 once")
+            })
+            .collect::<Vec<_>>(),
+    );
+    check(|src| {
+        let table_name = format!(
+            "pg_fake_snapshot_property_{}_{}",
+            std::process::id(),
+            TABLE_NUMBER.fetch_add(1, Ordering::Relaxed)
+        );
+        let mut postgres_connections = postgres.borrow_mut();
+        let postgres = PostgresSessionsCase {
+            connections: &mut postgres_connections,
+            runtime: &runtime,
+            table: table_name.clone(),
+        };
+        let db = Db::create();
+        let mut fake = (0..3)
+            .map(|_| PgFakeConnection::new(db.clone()))
+            .collect::<Vec<_>>();
+        let mut table = generate_table(src, table_name);
+        table.unique_column = None;
+        let mut next_key = 1;
+        let create = table.create_sql();
+        src.log_value("sql", &create);
+        assert_statement(
+            &runtime,
+            &mut postgres.connections[0],
+            &mut fake[0],
+            &create,
+            RowOrder::Unordered,
+        );
+        let insert = generate_main_insert(src, &table, &mut next_key);
+        src.log_value("sql", &insert);
+        assert_statement(
+            &runtime,
+            &mut postgres.connections[0],
+            &mut fake[0],
+            &insert,
+            RowOrder::Unordered,
+        );
+
+        let mut in_transaction = [false; 3];
+        for session in 0..3 {
+            let begin = format!("BEGIN ISOLATION LEVEL {}", isolation_level(src));
+            src.log_value("sql", &begin);
+            assert_statement(
+                &runtime,
+                &mut postgres.connections[session],
+                &mut fake[session],
+                &begin,
+                RowOrder::Unordered,
+            );
+            in_transaction[session] = true;
+            let (select, order) = generate_snapshot_select(src, &table);
+            src.log_value("sql", &select);
+            assert_statement(
+                &runtime,
+                &mut postgres.connections[session],
+                &mut fake[session],
+                &select,
+                order,
+            );
+        }
+
+        src.repeat_n("interleaving", 12..=36, |src| {
+            let session = src.any_of("session", int_in_range(0_usize..=2));
+            let (sql, order) = generate_snapshot_statement(
+                src,
+                &table,
+                &mut next_key,
+                &mut in_transaction[session],
+            );
+            src.log_value("session", &session);
+            src.log_value("sql", &sql);
+            assert_statement(
+                &runtime,
+                &mut postgres.connections[session],
+                &mut fake[session],
+                &sql,
+                order,
+            );
+            Effect::Success
+        });
+
+        for session in 0..3 {
+            if !in_transaction[session] {
+                continue;
+            }
+            let sql = if src.any("commit_final_transaction") {
+                "COMMIT"
+            } else {
+                "ROLLBACK"
+            };
+            src.log_value("sql", &sql);
+            assert_statement(
+                &runtime,
+                &mut postgres.connections[session],
+                &mut fake[session],
+                sql,
+                RowOrder::Unordered,
+            );
+        }
+
+        let sql = format!("SELECT * FROM {} ORDER BY key", table.name);
+        src.log_value("sql", &sql);
+        assert_statement(
+            &runtime,
+            &mut postgres.connections[0],
+            &mut fake[0],
+            &sql,
+            RowOrder::Ordered,
+        );
     });
 }
 
