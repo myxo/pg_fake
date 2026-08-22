@@ -84,6 +84,8 @@ The Phase 3 surface is intentionally bounded:
 
 ### Task 1 — Phase 3 regression manifest and progress reporting
 
+**Progress:** Complete (approved).
+
 **Goal:** Turn the embedded PostgreSQL corpus and focused multi-session cases
 into an actionable Phase 3 scorecard.
 

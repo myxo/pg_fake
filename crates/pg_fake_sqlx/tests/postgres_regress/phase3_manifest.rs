@@ -1,0 +1,401 @@
+#[derive(Clone, Copy)]
+pub enum BlockerKind {
+    Fixture,
+    Parser,
+    Later,
+    Implementation,
+}
+
+impl BlockerKind {
+    pub fn get_name(self) -> &'static str {
+        match self {
+            Self::Fixture => "fixture",
+            Self::Parser => "parser",
+            Self::Later => "later",
+            Self::Implementation => "implementation",
+        }
+    }
+}
+
+pub struct Case {
+    pub id: &'static str,
+    pub source: &'static str,
+    pub setup: &'static [&'static str],
+    pub sql: &'static str,
+    pub blocker: BlockerKind,
+}
+
+pub struct Feature {
+    pub name: &'static str,
+    pub cases: &'static [Case],
+}
+
+pub struct Scenario {
+    pub feature: &'static str,
+    pub name: &'static str,
+    pub source: &'static str,
+    pub blocker: BlockerKind,
+}
+
+pub const FEATURES: &[Feature] = &[
+    Feature {
+        name: "set operations",
+        cases: &[Case {
+            id: "union_distinct",
+            source: "union.sql:9",
+            setup: &[],
+            sql: "SELECT 1 AS value UNION SELECT 1 ORDER BY value",
+            blocker: BlockerKind::Implementation,
+        }],
+    },
+    Feature {
+        name: "non-recursive CTEs",
+        cases: &[Case {
+            id: "named_cte",
+            source: "with.sql:6",
+            setup: &[],
+            sql: "WITH values_cte(value) AS (SELECT 1) SELECT value FROM values_cte",
+            blocker: BlockerKind::Implementation,
+        }],
+    },
+    Feature {
+        name: "recursive CTEs",
+        cases: &[Case {
+            id: "recursive_series",
+            source: "with.sql:20",
+            setup: &[],
+            sql: "WITH RECURSIVE series(value) AS (VALUES (1) UNION ALL SELECT value + 1 FROM series WHERE value < 3) SELECT value FROM series ORDER BY value",
+            blocker: BlockerKind::Implementation,
+        }],
+    },
+    Feature {
+        name: "data-modifying CTEs",
+        cases: &[Case {
+            id: "insert_returning_cte",
+            source: "with.sql:1371",
+            setup: &["CREATE TABLE phase3_cte_writes (id INTEGER)"],
+            sql: "WITH inserted AS (INSERT INTO phase3_cte_writes VALUES (1) RETURNING id) SELECT id FROM inserted",
+            blocker: BlockerKind::Implementation,
+        }],
+    },
+    Feature {
+        name: "ON CONFLICT DO NOTHING",
+        cases: &[Case {
+            id: "unique_arbiter",
+            source: "insert_conflict.sql:93",
+            setup: &[
+                "CREATE TABLE phase3_conflict_nothing (id INTEGER PRIMARY KEY)",
+                "INSERT INTO phase3_conflict_nothing VALUES (1)",
+            ],
+            sql: "INSERT INTO phase3_conflict_nothing VALUES (1) ON CONFLICT (id) DO NOTHING RETURNING id",
+            blocker: BlockerKind::Implementation,
+        }],
+    },
+    Feature {
+        name: "ON CONFLICT DO UPDATE",
+        cases: &[Case {
+            id: "excluded_row",
+            source: "insert_conflict.sql:96",
+            setup: &[
+                "CREATE TABLE phase3_conflict_update (id INTEGER PRIMARY KEY, value TEXT)",
+                "INSERT INTO phase3_conflict_update VALUES (1, 'old')",
+            ],
+            sql: "INSERT INTO phase3_conflict_update VALUES (1, 'new') ON CONFLICT (id) DO UPDATE SET value = excluded.value RETURNING value",
+            blocker: BlockerKind::Implementation,
+        }],
+    },
+    Feature {
+        name: "window ranking",
+        cases: &[Case {
+            id: "row_number",
+            source: "window.sql:47",
+            setup: &[
+                "CREATE TABLE phase3_window_rank (value INTEGER)",
+                "INSERT INTO phase3_window_rank VALUES (2), (1)",
+            ],
+            sql: "SELECT value, row_number() OVER (ORDER BY value) FROM phase3_window_rank ORDER BY value",
+            blocker: BlockerKind::Implementation,
+        }],
+    },
+    Feature {
+        name: "window offset and value functions",
+        cases: &[Case {
+            id: "lag",
+            source: "window.sql:61",
+            setup: &[
+                "CREATE TABLE phase3_window_offset (value INTEGER)",
+                "INSERT INTO phase3_window_offset VALUES (1), (2)",
+            ],
+            sql: "SELECT value, lag(value) OVER (ORDER BY value) FROM phase3_window_offset ORDER BY value",
+            blocker: BlockerKind::Implementation,
+        }],
+    },
+    Feature {
+        name: "window aggregate frames",
+        cases: &[Case {
+            id: "running_sum",
+            source: "window.sql:479",
+            setup: &[
+                "CREATE TABLE phase3_window_frame (value INTEGER)",
+                "INSERT INTO phase3_window_frame VALUES (1), (2), (3)",
+            ],
+            sql: "SELECT sum(value) OVER (ORDER BY value ROWS BETWEEN 1 PRECEDING AND CURRENT ROW) FROM phase3_window_frame ORDER BY value",
+            blocker: BlockerKind::Implementation,
+        }],
+    },
+    Feature {
+        name: "json",
+        cases: &[Case {
+            id: "json_text",
+            source: "json.sql:2",
+            setup: &[],
+            sql: "SELECT '{ \"value\" : 1 }'::json",
+            blocker: BlockerKind::Implementation,
+        }],
+    },
+    Feature {
+        name: "jsonb",
+        cases: &[Case {
+            id: "jsonb_normalization",
+            source: "jsonb.sql:10",
+            setup: &[],
+            sql: "SELECT '{ \"value\" : 1 }'::jsonb",
+            blocker: BlockerKind::Implementation,
+        }],
+    },
+    Feature {
+        name: "json and jsonb operators",
+        cases: &[Case {
+            id: "jsonb_extraction",
+            source: "jsonb.sql:215",
+            setup: &[],
+            sql: "SELECT '{\"value\": 1}'::jsonb ->> 'value'",
+            blocker: BlockerKind::Implementation,
+        }],
+    },
+    Feature {
+        name: "array type and I/O",
+        cases: &[Case {
+            id: "array_literal",
+            source: "arrays.sql:276",
+            setup: &[],
+            sql: "SELECT ARRAY[1, NULL, 3]",
+            blocker: BlockerKind::Implementation,
+        }],
+    },
+    Feature {
+        name: "array expressions",
+        cases: &[Case {
+            id: "array_containment",
+            source: "arrays.sql:344",
+            setup: &[],
+            sql: "SELECT ARRAY[1, 2] @> ARRAY[1]",
+            blocker: BlockerKind::Implementation,
+        }],
+    },
+    Feature {
+        name: "MVCC-versioned catalog",
+        cases: &[Case {
+            id: "own_uncommitted_table",
+            source: "transactions.sql:10",
+            setup: &["BEGIN", "CREATE TABLE phase3_catalog_mvcc (id INTEGER)"],
+            sql: "SELECT * FROM phase3_catalog_mvcc",
+            blocker: BlockerKind::Implementation,
+        }],
+    },
+    Feature {
+        name: "transactional DDL",
+        cases: &[Case {
+            id: "create_then_rollback",
+            source: "transactions.sql:120",
+            setup: &["BEGIN", "CREATE TABLE phase3_catalog_ddl (id INTEGER)"],
+            sql: "ROLLBACK",
+            blocker: BlockerKind::Implementation,
+        }],
+    },
+    Feature {
+        name: "ordinary views",
+        cases: &[Case {
+            id: "select_from_view",
+            source: "create_view.sql:29",
+            setup: &[
+                "CREATE TABLE phase3_view_source (id INTEGER)",
+                "INSERT INTO phase3_view_source VALUES (1)",
+                "CREATE VIEW phase3_view AS SELECT id FROM phase3_view_source",
+            ],
+            sql: "SELECT id FROM phase3_view",
+            blocker: BlockerKind::Implementation,
+        }],
+    },
+    Feature {
+        name: "savepoints",
+        cases: &[Case {
+            id: "create_savepoint",
+            source: "transactions.sql:73",
+            setup: &["BEGIN"],
+            sql: "SAVEPOINT phase3_savepoint",
+            blocker: BlockerKind::Implementation,
+        }],
+    },
+    Feature {
+        name: "session GUC registry",
+        cases: &[
+            Case {
+                id: "set_lock_timeout",
+                source: "focused local GUC scenario",
+                setup: &[],
+                sql: "SET lock_timeout = '10ms'",
+                blocker: BlockerKind::Implementation,
+            },
+            Case {
+                id: "show_lock_timeout",
+                source: "focused local GUC scenario",
+                setup: &[],
+                sql: "SHOW lock_timeout",
+                blocker: BlockerKind::Implementation,
+            },
+        ],
+    },
+    Feature {
+        name: "transaction-local GUCs",
+        cases: &[
+            Case {
+                id: "set_local_timezone",
+                source: "json.sql:154",
+                setup: &["BEGIN"],
+                sql: "SET LOCAL TIME ZONE 'UTC'",
+                blocker: BlockerKind::Implementation,
+            },
+            Case {
+                id: "set_local_lock_timeout",
+                source: "focused local GUC scenario",
+                setup: &["BEGIN"],
+                sql: "SET LOCAL lock_timeout = '10ms'",
+                blocker: BlockerKind::Implementation,
+            },
+        ],
+    },
+    Feature {
+        name: "SELECT row locks",
+        cases: &[Case {
+            id: "no_key_update_nowait",
+            source: "focused local row-lock scenario",
+            setup: &[
+                "CREATE TABLE phase3_row_lock (id INTEGER PRIMARY KEY)",
+                "INSERT INTO phase3_row_lock VALUES (1)",
+            ],
+            sql: "SELECT * FROM phase3_row_lock FOR NO KEY UPDATE NOWAIT",
+            blocker: BlockerKind::Implementation,
+        }],
+    },
+    Feature {
+        name: "serializable dependency tracking",
+        cases: &[Case {
+            id: "serializable_transaction",
+            source: "transactions.sql:39",
+            setup: &[],
+            sql: "BEGIN TRANSACTION ISOLATION LEVEL SERIALIZABLE",
+            blocker: BlockerKind::Implementation,
+        }],
+    },
+    Feature {
+        name: "serializable validation",
+        cases: &[Case {
+            id: "serializable_setting",
+            source: "transactions.sql:63",
+            setup: &["BEGIN"],
+            sql: "SET TRANSACTION ISOLATION LEVEL SERIALIZABLE",
+            blocker: BlockerKind::Implementation,
+        }],
+    },
+];
+
+pub const SCENARIOS: &[Scenario] = &[
+    Scenario {
+        feature: "ON CONFLICT DO NOTHING",
+        name: "concurrent_unique_insert",
+        source: "focused two-session scenario",
+        blocker: BlockerKind::Implementation,
+    },
+    Scenario {
+        feature: "ON CONFLICT DO UPDATE",
+        name: "concurrent_conflict_recheck",
+        source: "focused two-session scenario",
+        blocker: BlockerKind::Implementation,
+    },
+    Scenario {
+        feature: "MVCC-versioned catalog",
+        name: "uncommitted_ddl_visibility",
+        source: "transactions.sql:120 plus focused two-session scenario",
+        blocker: BlockerKind::Implementation,
+    },
+    Scenario {
+        feature: "transactional DDL",
+        name: "drop_and_recreate_visibility",
+        source: "transactions.sql:120 plus focused two-session scenario",
+        blocker: BlockerKind::Implementation,
+    },
+    Scenario {
+        feature: "savepoints",
+        name: "rollback_releases_subtransaction_locks",
+        source: "transactions.sql:73 plus focused two-session scenario",
+        blocker: BlockerKind::Implementation,
+    },
+    Scenario {
+        feature: "transaction-local GUCs",
+        name: "savepoint_local_setting_restore",
+        source: "transactions.sql:73 plus focused session scenario",
+        blocker: BlockerKind::Implementation,
+    },
+    Scenario {
+        feature: "SELECT row locks",
+        name: "lock_mode_compatibility_matrix",
+        source: "lock.sql plus focused two-session scenario",
+        blocker: BlockerKind::Implementation,
+    },
+    Scenario {
+        feature: "SELECT row locks",
+        name: "skip_locked_work_queue",
+        source: "limit.sql:179 plus focused two-session scenario",
+        blocker: BlockerKind::Implementation,
+    },
+    Scenario {
+        feature: "serializable dependency tracking",
+        name: "write_skew_dependency_graph",
+        source: "focused two-session scenario",
+        blocker: BlockerKind::Implementation,
+    },
+    Scenario {
+        feature: "serializable validation",
+        name: "phantom_insert_serialization_failure",
+        source: "focused two-session scenario",
+        blocker: BlockerKind::Implementation,
+    },
+];
+
+pub const LIMITATIONS: &[Scenario] = &[
+    Scenario {
+        feature: "data-modifying CTEs",
+        name: "upstream_relation_fixture",
+        source: "with.sql:383",
+        blocker: BlockerKind::Fixture,
+    },
+    Scenario {
+        feature: "array type and I/O",
+        name: "multidimensional_arrays",
+        source: "arrays.sql:121",
+        blocker: BlockerKind::Later,
+    },
+    Scenario {
+        feature: "json and jsonb operators",
+        name: "SQL_JSON_path_surface",
+        source: "jsonpath.sql:1",
+        blocker: BlockerKind::Later,
+    },
+    Scenario {
+        feature: "parser coverage",
+        name: "valid_PostgreSQL_syntax_without_sqlparser_AST",
+        source: "record when encountered by the corpus runner",
+        blocker: BlockerKind::Parser,
+    },
+];

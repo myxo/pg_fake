@@ -14,6 +14,8 @@ mod common;
 
 #[path = "postgres_regress/phase2_manifest.rs"]
 mod phase2_manifest;
+#[path = "postgres_regress/phase3_manifest.rs"]
+mod phase3_manifest;
 
 use common::start_postgres_server;
 
@@ -28,6 +30,7 @@ static TEST_LOCK: Mutex<()> = Mutex::new(());
 
 const MINIMUM_PASSED_STATEMENTS: usize = 463;
 const REVIEWED_SKIPPED_SCRIPTS: usize = 141;
+const PHASE2_CONFORMANCE_CASES: usize = 32;
 
 enum TestConnection<'connection> {
     Fake(&'connection mut PgFakeConnection),
@@ -76,7 +79,7 @@ where
     usize: ColumnIndex<DB::Row>,
 {
     match statement {
-        Statement::Query(_) => match match mode {
+        Statement::Query(_) | Statement::ShowVariable { .. } => match match mode {
             ExecutionMode::Prepared => {
                 sqlx::query(AssertSqlSafe(sql))
                     .fetch_all(&mut *connection)
@@ -394,6 +397,67 @@ fn collect_phase2_report(
     (passed, blockers, regressions)
 }
 
+fn collect_phase3_report(
+    runtime: &Runtime,
+    admin: &mut PgConnection,
+    server_url: &str,
+) -> (usize, usize, Vec<String>) {
+    let database = format!("pg_fake_regress_phase3_{}", std::process::id());
+    let sql = format!("CREATE DATABASE {database}");
+    runtime
+        .block_on(sqlx::raw_sql(AssertSqlSafe(sql.as_str())).execute(&mut *admin))
+        .expect("must create PostgreSQL Phase 3 regression database");
+    let database_url = database_url(server_url, &database);
+    let mut postgres = runtime
+        .block_on(PgConnection::connect(&database_url))
+        .expect("must connect to PostgreSQL Phase 3 regression database");
+    let mut passed = 0;
+    let mut total = 0;
+    let mut blockers = Vec::new();
+
+    for feature in phase3_manifest::FEATURES {
+        let mut fake = PgFakeConnection::new(Db::create());
+        let mut first_blocker = None;
+        for case in feature.cases {
+            total += 1;
+            let mut result = Ok(());
+            for setup in case.setup {
+                result = compare_source_statement(runtime, &mut postgres, &mut fake, setup);
+                if result.is_err() {
+                    break;
+                }
+            }
+            if result.is_ok() {
+                result = compare_source_statement(runtime, &mut postgres, &mut fake, case.sql);
+            }
+            match result {
+                Ok(()) => passed += 1,
+                Err(error) if first_blocker.is_none() => {
+                    first_blocker = Some(format!(
+                        "{} ({}) at {} [{}]: {error}",
+                        case.id,
+                        feature.name,
+                        case.source,
+                        case.blocker.get_name(),
+                    ));
+                }
+                Err(_) => {}
+            }
+        }
+        blockers.push(first_blocker.unwrap_or_else(|| format!("{}: none", feature.name)));
+        runtime
+            .block_on(sqlx::raw_sql("ROLLBACK").execute(&mut postgres))
+            .expect("must clean up Phase 3 transaction state");
+    }
+
+    drop(postgres);
+    let sql = format!("DROP DATABASE {database} WITH (FORCE)");
+    runtime
+        .block_on(sqlx::raw_sql(AssertSqlSafe(sql.as_str())).execute(&mut *admin))
+        .expect("must drop PostgreSQL Phase 3 regression database");
+    (passed, total, blockers)
+}
+
 #[test]
 fn reports_phase2_regression_progress() {
     let _test_lock = TEST_LOCK.lock().expect("test mutex must not be poisoned");
@@ -483,6 +547,41 @@ fn reports_phase2_regression_progress() {
         }
     }
 
+    let (phase2_passed, phase2_blockers, phase2_regressions) =
+        collect_phase2_report(&runtime, &mut admin, &server.url);
+    let (phase3_passed, phase3_total, phase3_blockers) =
+        collect_phase3_report(&runtime, &mut admin, &server.url);
+    eprintln!("PostgreSQL behavioral statements passed: {passed}");
+    eprintln!("PostgreSQL behavioral scripts skipped: {}", skipped.len());
+    eprintln!("Phase 2 conformance cases passed: {phase2_passed}");
+    eprintln!("Phase 3 conformance cases passed: {phase3_passed}/{phase3_total}");
+    for (name, reason) in &skipped {
+        eprintln!("SKIP {name}: {reason}");
+    }
+    for blocker in phase2_blockers {
+        eprintln!("PHASE2 BLOCKER {blocker}");
+    }
+    for blocker in phase3_blockers {
+        eprintln!("PHASE3 BLOCKER {blocker}");
+    }
+    for scenario in phase3_manifest::SCENARIOS {
+        eprintln!(
+            "PHASE3 SCENARIO {}:{} at {} [{}]",
+            scenario.feature,
+            scenario.name,
+            scenario.source,
+            scenario.blocker.get_name(),
+        );
+    }
+    for limitation in phase3_manifest::LIMITATIONS {
+        eprintln!(
+            "PHASE3 LIMITATION {}:{} at {} [{}]",
+            limitation.feature,
+            limitation.name,
+            limitation.source,
+            limitation.blocker.get_name(),
+        );
+    }
     assert!(
         passed >= MINIMUM_PASSED_STATEMENTS,
         "full corpus regressed below the reviewed baseline of {MINIMUM_PASSED_STATEMENTS}: {passed} statements passed"
@@ -492,17 +591,10 @@ fn reports_phase2_regression_progress() {
         REVIEWED_SKIPPED_SCRIPTS,
         "full corpus skipped-script count changed from the reviewed baseline"
     );
-    let (phase2_passed, phase2_blockers, phase2_regressions) =
-        collect_phase2_report(&runtime, &mut admin, &server.url);
-    eprintln!("PostgreSQL behavioral statements passed: {passed}");
-    eprintln!("PostgreSQL behavioral scripts skipped: {}", skipped.len());
-    eprintln!("Phase 2 conformance cases passed: {phase2_passed}");
-    for (name, reason) in &skipped {
-        eprintln!("SKIP {name}: {reason}");
-    }
-    for blocker in phase2_blockers {
-        eprintln!("PHASE2 BLOCKER {blocker}");
-    }
+    assert_eq!(
+        phase2_passed, PHASE2_CONFORMANCE_CASES,
+        "reviewed Phase 2 conformance cases regressed",
+    );
     assert!(
         phase2_regressions.is_empty(),
         "reviewed Phase 2 cases regressed:\n{}",
