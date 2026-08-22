@@ -419,6 +419,64 @@ fn matches_lock_timeout_and_row_lock_clauses() {
 }
 
 #[test]
+fn matches_set_operations() {
+    assert_differential(
+        "SELECT 1 AS value UNION SELECT 1 UNION SELECT 2 ORDER BY value; \
+         SELECT 1 AS value UNION ALL SELECT 1 UNION ALL SELECT 2 ORDER BY value; \
+         VALUES (1), (1), (2), (NULL) INTERSECT VALUES (1), (1), (NULL) ORDER BY 1 NULLS FIRST; \
+         VALUES (1), (1), (2), (NULL) INTERSECT ALL VALUES (1), (NULL) ORDER BY 1 NULLS FIRST; \
+         VALUES (1), (1), (2), (NULL) EXCEPT VALUES (1), (NULL) ORDER BY 1; \
+         VALUES (1), (1), (2), (NULL) EXCEPT ALL VALUES (1), (NULL) ORDER BY 1; \
+         CREATE TABLE __TABLE___left (id INTEGER); \
+         CREATE TABLE __TABLE___right (id BIGINT); \
+         INSERT INTO __TABLE___left VALUES (1), (3); \
+         INSERT INTO __TABLE___right VALUES (2), (3); \
+         SELECT id FROM __TABLE___left UNION SELECT id FROM __TABLE___right ORDER BY id LIMIT 2 OFFSET 1; \
+         (SELECT 1 AS value UNION SELECT 2) INTERSECT SELECT 2 ORDER BY value; \
+         SELECT total FROM (SELECT sum(id) AS total FROM __TABLE___left UNION SELECT 4) AS source ORDER BY total; \
+         SELECT 1 UNION SELECT 1, 2; \
+         SELECT 1 UNION SELECT true",
+        RowOrder::Ordered,
+    );
+}
+
+#[test]
+fn executes_parameterized_set_operations() {
+    let db = Db::create();
+    let mut session = db.create_session();
+    let statement = session
+        .prepare("SELECT $1 AS value UNION SELECT 2")
+        .unwrap();
+    assert_eq!(
+        session
+            .query_prepared(&statement, &[Value::Int2(1)])
+            .unwrap()
+            .rows,
+        vec![vec![Value::Int4(1)], vec![Value::Int4(2)]],
+    );
+}
+
+#[test]
+fn keeps_left_set_operation_column_metadata() {
+    let db = Db::create();
+    let mut session = db.create_session();
+    let result = session
+        .query(
+            "SELECT 1 AS left_name UNION SELECT 2::BIGINT AS right_name",
+            &[],
+        )
+        .unwrap();
+    assert_eq!(
+        result
+            .columns
+            .iter()
+            .map(|column| (column.name.as_str(), column.type_oid, column.typmod))
+            .collect::<Vec<_>>(),
+        vec![("left_name", BaseType::Int8.map_to_oid(), -1,)]
+    );
+}
+
+#[test]
 fn matches_foreign_keys_and_referential_actions() {
     assert_differential(
         "CREATE TABLE __TABLE___parents (first_id INTEGER, second_id INTEGER, PRIMARY KEY (first_id, second_id)); \

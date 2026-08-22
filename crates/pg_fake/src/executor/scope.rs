@@ -591,7 +591,62 @@ fn describe_bound_query_columns(
                 })
                 .collect()
         }
+        ast::SetExpr::Query(query) => describe_bound_query_columns(catalog, query, outer),
+        ast::SetExpr::SetOperation { left, right, .. } => {
+            let left = describe_bound_set_expression_columns(catalog, left, outer)?;
+            let right = describe_bound_set_expression_columns(catalog, right, outer)?;
+            if left.len() != right.len() {
+                return Err(PgError::create(
+                    SqlState::SyntaxError,
+                    "each set-operation query must have the same number of columns",
+                ));
+            }
+            left.into_iter()
+                .zip(right)
+                .map(|(mut left, right)| {
+                    left.data_type = PgType::create(
+                        crate::coercion::resolve_common_type(
+                            left.data_type.base,
+                            right.data_type.base,
+                        )
+                        .ok_or_else(|| {
+                            PgError::create(
+                                SqlState::DatatypeMismatch,
+                                "set-operation types cannot be matched",
+                            )
+                        })?,
+                    );
+                    Ok(left)
+                })
+                .collect()
+        }
         _ => reject_unsupported("query source is not implemented"),
+    }
+}
+
+fn describe_bound_set_expression_columns(
+    catalog: &Catalog,
+    expression: &ast::SetExpr,
+    outer: Option<&BoundScope>,
+) -> Result<Vec<BoundColumn>> {
+    match expression {
+        ast::SetExpr::Query(query) => describe_bound_query_columns(catalog, query, outer),
+        ast::SetExpr::Select(_) | ast::SetExpr::Values(_) | ast::SetExpr::SetOperation { .. } => {
+            let query = ast::Query {
+                with: None,
+                body: Box::new(expression.clone()),
+                order_by: None,
+                limit_clause: None,
+                fetch: None,
+                locks: Vec::new(),
+                for_clause: None,
+                settings: None,
+                format_clause: None,
+                pipe_operators: Vec::new(),
+            };
+            describe_bound_query_columns(catalog, &query, outer)
+        }
+        _ => reject_unsupported("set-operation input is not implemented"),
     }
 }
 

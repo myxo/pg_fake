@@ -108,6 +108,8 @@ upstream corpus a Phase 3 exit criterion.
 
 ### Task 2 — Query set operations
 
+**Progress:** Complete (approved).
+
 **Goal:** Add the set-expression machinery required by recursive CTEs and common
 PostgreSQL query composition.
 

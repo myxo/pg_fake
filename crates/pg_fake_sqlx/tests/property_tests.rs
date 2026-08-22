@@ -1318,6 +1318,35 @@ fn generate_subquery(src: &mut Source, table: &TableSchema) -> (String, RowOrder
     )
 }
 
+fn generate_set_operation(src: &mut Source) -> (String, RowOrder) {
+    src.select(
+        "set_operation",
+        &[
+            "UNION",
+            "UNION ALL",
+            "INTERSECT",
+            "INTERSECT ALL",
+            "EXCEPT",
+            "EXCEPT ALL",
+        ],
+        |src, operator, _| {
+            let left = src.any_of("left", int_in_range(-5..=5));
+            let shared = src.any_of("shared", int_in_range(-5..=5));
+            let right = src.any_of("right", int_in_range(-5..=5));
+            let mut sql = format!(
+                "VALUES ({left}), ({shared}), ({shared}), (NULL) {operator} VALUES ({right}), ({shared}), (NULL) ORDER BY 1 NULLS FIRST"
+            );
+            if let Some(limit) = src.maybe("limit", |src| row_count(src, true, false)) {
+                sql.push_str(&format!(" LIMIT {limit}"));
+            }
+            if let Some(offset) = src.maybe("offset", |src| row_count(src, true, true)) {
+                sql.push_str(&format!(" OFFSET {offset}"));
+            }
+            (sql, RowOrder::Ordered)
+        },
+    )
+}
+
 fn generate_insert(
     src: &mut Source,
     table: &TableSchema,
@@ -1355,6 +1384,7 @@ fn generate_select(
             "aggregate",
             "join",
             "subquery",
+            "set_operation",
             "foreign_join",
         ],
         |src, select_body, _| match select_body {
@@ -1363,6 +1393,7 @@ fn generate_select(
             "aggregate" => generate_aggregate(src, table),
             "join" => generate_join(src, table),
             "subquery" => generate_subquery(src, table),
+            "set_operation" => generate_set_operation(src),
             "foreign_join" => generate_foreign_select(src, foreign_tables),
             _ => unreachable!(),
         },
@@ -1608,6 +1639,33 @@ fn generated_sql_matches_postgres() {
                 RowOrder::Unordered,
             );
         }
+    });
+}
+
+#[test]
+fn generated_set_operations_match_postgres() {
+    let _test_lock = TEST_LOCK.lock().expect("test mutex must not be poisoned");
+    let server = start_postgres_server();
+    let runtime = tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()
+        .unwrap();
+    let postgres = RefCell::new(
+        runtime
+            .block_on(PgConnection::connect(&server.url))
+            .expect("must connect SQLx to PostgreSQL 18 once"),
+    );
+    let fake = RefCell::new(PgFakeConnection::new(Db::create()));
+    check(|src| {
+        let (sql, order) = generate_set_operation(src);
+        src.log_value("sql", &sql);
+        assert_statement(
+            &runtime,
+            &mut postgres.borrow_mut(),
+            &mut fake.borrow_mut(),
+            &sql,
+            order,
+        );
     });
 }
 

@@ -94,8 +94,11 @@ fn infer_query_parameters(
     expected: Option<&[BaseType]>,
     types: &mut [Option<BaseType>],
 ) -> Result<()> {
+    if !matches!(query.body.as_ref(), ast::SetExpr::Select(_)) {
+        return infer_set_expression_parameters(query.body.as_ref(), catalog, expected, types);
+    }
     let ast::SetExpr::Select(select) = query.body.as_ref() else {
-        return Ok(());
+        unreachable!("set-expression shape was checked");
     };
     let bound = executor::bind_query_scope(catalog, select)?;
     let scope = executor::RowScope::Bound(&bound);
@@ -143,6 +146,156 @@ fn infer_query_parameters(
         }
     }
     Ok(())
+}
+
+fn infer_set_expression_parameters(
+    expression: &ast::SetExpr,
+    catalog: &Catalog,
+    expected: Option<&[BaseType]>,
+    types: &mut [Option<BaseType>],
+) -> Result<()> {
+    match expression {
+        ast::SetExpr::Select(select) => {
+            let bound = executor::bind_query_scope(catalog, select)?;
+            let scope = executor::RowScope::Bound(&bound);
+            for (index, item) in select.projection.iter().enumerate() {
+                if let ast::SelectItem::UnnamedExpr(expression)
+                | ast::SelectItem::ExprWithAlias {
+                    expr: expression, ..
+                } = item
+                {
+                    infer_expression_parameters(
+                        expression,
+                        scope,
+                        expected.and_then(|expected| expected.get(index).copied()),
+                        types,
+                    )?;
+                }
+            }
+            Ok(())
+        }
+        ast::SetExpr::Values(values) => {
+            for row in &values.rows {
+                for (index, expression) in row.iter().enumerate() {
+                    infer_expression_parameters(
+                        expression,
+                        executor::RowScope::Table(&executor::create_constant_expression_schema()),
+                        expected.and_then(|expected| expected.get(index).copied()),
+                        types,
+                    )?;
+                }
+            }
+            Ok(())
+        }
+        ast::SetExpr::Query(query) => infer_query_parameters(query, catalog, expected, types),
+        ast::SetExpr::SetOperation { left, right, .. } => {
+            let left_types = infer_set_expression_types(left, catalog)?;
+            let right_types = infer_set_expression_types(right, catalog)?;
+            if left_types.len() != right_types.len() {
+                return Err(PgError::create(
+                    SqlState::SyntaxError,
+                    "each set-operation query must have the same number of columns",
+                ));
+            }
+            let targets = left_types
+                .into_iter()
+                .zip(right_types)
+                .enumerate()
+                .map(|(index, (left, right))| match (left, right) {
+                    (Some(left), Some(right)) => coercion::resolve_common_type(left, right)
+                        .ok_or_else(|| {
+                            PgError::create(
+                                SqlState::DatatypeMismatch,
+                                "set-operation types cannot be matched",
+                            )
+                        }),
+                    (Some(data_type), None) | (None, Some(data_type)) => Ok(data_type),
+                    (None, None) => Ok(expected
+                        .and_then(|expected| expected.get(index).copied())
+                        .unwrap_or(BaseType::Text)),
+                })
+                .collect::<Result<Vec<_>>>()?;
+            infer_set_expression_parameters(left, catalog, Some(&targets), types)?;
+            infer_set_expression_parameters(right, catalog, Some(&targets), types)
+        }
+        _ => reject_unsupported("set-operation input is not implemented"),
+    }
+}
+
+fn infer_set_expression_types(
+    expression: &ast::SetExpr,
+    catalog: &Catalog,
+) -> Result<Vec<Option<BaseType>>> {
+    match expression {
+        ast::SetExpr::Select(select) => {
+            let scope = executor::bind_query_scope(catalog, select)?;
+            Ok(select
+                .projection
+                .iter()
+                .flat_map(|item| match item {
+                    ast::SelectItem::Wildcard(_) => Vec::new(),
+                    ast::SelectItem::UnnamedExpr(expression)
+                    | ast::SelectItem::ExprWithAlias {
+                        expr: expression, ..
+                    } => vec![
+                        executor::infer_expression_type(
+                            expression,
+                            executor::RowScope::Bound(&scope),
+                        )
+                        .ok(),
+                    ],
+                    _ => Vec::new(),
+                })
+                .collect())
+        }
+        ast::SetExpr::Values(values) => {
+            let width = values.rows.first().map(|row| row.len()).unwrap_or(0);
+            if values.rows.iter().any(|row| row.len() != width) {
+                return Err(PgError::create(
+                    SqlState::SyntaxError,
+                    "VALUES lists must all be the same length",
+                ));
+            }
+            Ok((0..width)
+                .map(|index| {
+                    values.rows.iter().fold(None, |common, row| {
+                        let data_type = executor::infer_expression_type(
+                            &row[index],
+                            executor::RowScope::Table(
+                                &executor::create_constant_expression_schema(),
+                            ),
+                        )
+                        .ok()?;
+                        Some(match common {
+                            Some(common) => coercion::resolve_common_type(common, data_type)?,
+                            None => data_type,
+                        })
+                    })
+                })
+                .collect())
+        }
+        ast::SetExpr::Query(query) => infer_set_expression_types(&query.body, catalog),
+        ast::SetExpr::SetOperation { left, right, .. } => {
+            let left = infer_set_expression_types(left, catalog)?;
+            let right = infer_set_expression_types(right, catalog)?;
+            if left.len() != right.len() {
+                return Err(PgError::create(
+                    SqlState::SyntaxError,
+                    "each set-operation query must have the same number of columns",
+                ));
+            }
+            Ok(left
+                .into_iter()
+                .zip(right)
+                .map(|(left, right)| match (left, right) {
+                    (Some(left), Some(right)) => coercion::resolve_common_type(left, right),
+                    (Some(data_type), None) | (None, Some(data_type)) => Some(data_type),
+                    (None, None) => None,
+                })
+                .collect())
+        }
+        _ => reject_unsupported("set-operation input is not implemented"),
+    }
 }
 
 pub(crate) fn infer_parameter_types(

@@ -1055,6 +1055,7 @@ fn benchmarks(criterion: &mut Criterion) {
         global_aggregate_benchmark(criterion, &runtime, &mut connections);
         grouped_aggregate_benchmark(criterion, &runtime, &mut connections);
         select_distinct_benchmark(criterion, &runtime, &mut connections);
+        set_operation_benchmark(criterion, &runtime, &mut connections);
     }
     runtime
         .block_on(
@@ -1168,6 +1169,36 @@ fn select_distinct_benchmark(
     group.finish();
     for (_, connection) in connections.iter_mut() {
         connection.execute(runtime, "DROP TABLE select_distinct_100_rows");
+    }
+}
+
+fn set_operation_benchmark(
+    criterion: &mut Criterion,
+    runtime: &Runtime,
+    connections: &mut [NamedBenchmarkConnection<'_>],
+) {
+    let values = (1..=100)
+        .map(|value| format!("({value})"))
+        .collect::<Vec<_>>()
+        .join(",");
+    for (name, query) in [
+        (
+            "union_all_100_rows",
+            format!("VALUES {values} UNION ALL VALUES {values}"),
+        ),
+        (
+            "union_100_rows",
+            format!("VALUES {values} UNION VALUES {values}"),
+        ),
+    ] {
+        let mut group = criterion.benchmark_group(benchmarks::find_benchmark(name).name);
+        group.throughput(Throughput::Elements(100));
+        for (connection_name, connection) in connections.iter_mut() {
+            group.bench_function(*connection_name, |benchmark| {
+                benchmark.iter(|| connection.fetch(runtime, &query));
+            });
+        }
+        group.finish();
     }
 }
 
