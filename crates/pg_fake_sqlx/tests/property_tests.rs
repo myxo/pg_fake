@@ -587,82 +587,90 @@ fn choose_column<'a>(
         .expect("generated table must have a compatible column")
 }
 
-fn generate_insert(src: &mut Source, table: &TableSchema, next_key: &mut i64) -> String {
-    src.select("shape", &["full", "required", "subset"], |src, shape, _| {
-        let included = table
-            .columns
-            .iter()
-            .enumerate()
-            .filter(|(index, column)| {
-                *index == 0
-                    || shape == "full"
-                    || (!column.nullable && column.default.is_none())
-                    || (shape == "subset" && src.any("include"))
-            })
-            .collect::<Vec<_>>();
-        let mut rows = Vec::new();
-        src.repeat_n("rows", 1..=4, |src| {
-            let values = included
-                .iter()
-                .map(|(index, column)| {
-                    if *index == 0 {
-                        let key = *next_key;
-                        *next_key += 1;
-                        key.to_string()
-                    } else if column.default.is_some() && src.any("use_default") {
-                        "DEFAULT".into()
+fn generate_main_insert(src: &mut Source, table: &TableSchema, next_key: &mut i64) -> String {
+    let mut sql = src.select(
+        "insert_source",
+        &["values", "select"],
+        |src, source, _| match source {
+            "values" => src.select("shape", &["full", "required", "subset"], |src, shape, _| {
+                let included = table
+                    .columns
+                    .iter()
+                    .enumerate()
+                    .filter(|(index, column)| {
+                        *index == 0
+                            || shape == "full"
+                            || (!column.nullable && column.default.is_none())
+                            || (shape == "subset" && src.any("include"))
+                    })
+                    .collect::<Vec<_>>();
+                let mut rows = Vec::new();
+                src.repeat_n("rows", 1..=4, |src| {
+                    let values = included
+                        .iter()
+                        .map(|(index, column)| {
+                            if *index == 0 {
+                                let key = *next_key;
+                                *next_key += 1;
+                                key.to_string()
+                            } else if column.default.is_some() && src.any("use_default") {
+                                "DEFAULT".into()
+                            } else {
+                                generate_literal(src, column)
+                            }
+                        })
+                        .collect::<Vec<_>>();
+                    rows.push(format!("({})", values.join(", ")));
+                    Effect::Success
+                });
+                let columns = included
+                    .iter()
+                    .map(|(_, column)| column.name.as_str())
+                    .collect::<Vec<_>>();
+                format!(
+                    "INSERT INTO {} ({}) VALUES {}",
+                    table.name,
+                    columns.join(", "),
+                    rows.join(", ")
+                )
+            }),
+            "select" => {
+                let key = *next_key;
+                *next_key += 1;
+                let values = table
+                    .columns
+                    .iter()
+                    .enumerate()
+                    .map(|(index, column)| {
+                        if index == 0 {
+                            key.to_string()
+                        } else {
+                            generate_literal(src, column)
+                        }
+                    })
+                    .collect::<Vec<_>>();
+                let columns = table
+                    .columns
+                    .iter()
+                    .map(|column| column.name.as_str())
+                    .collect::<Vec<_>>();
+                format!(
+                    "INSERT INTO {} ({}) SELECT {} WHERE {}",
+                    table.name,
+                    columns.join(", "),
+                    values.join(", "),
+                    if src.any("source_row") {
+                        "TRUE"
                     } else {
-                        generate_literal(src, column)
+                        "FALSE"
                     }
-                })
-                .collect::<Vec<_>>();
-            rows.push(format!("({})", values.join(", ")));
-            Effect::Success
-        });
-        let columns = included
-            .iter()
-            .map(|(_, column)| column.name.as_str())
-            .collect::<Vec<_>>();
-        format!(
-            "INSERT INTO {} ({}) VALUES {}",
-            table.name,
-            columns.join(", "),
-            rows.join(", ")
-        )
-    })
-}
-
-fn generate_insert_select(src: &mut Source, table: &TableSchema, next_key: &mut i64) -> String {
-    let key = *next_key;
-    *next_key += 1;
-    let values = table
-        .columns
-        .iter()
-        .enumerate()
-        .map(|(index, column)| {
-            if index == 0 {
-                key.to_string()
-            } else {
-                generate_literal(src, column)
+                )
             }
-        })
-        .collect::<Vec<_>>();
-    let columns = table
-        .columns
-        .iter()
-        .map(|column| column.name.as_str())
-        .collect::<Vec<_>>();
-    format!(
-        "INSERT INTO {} ({}) SELECT {} WHERE {} RETURNING *",
-        table.name,
-        columns.join(", "),
-        values.join(", "),
-        if src.any("source_row") {
-            "TRUE"
-        } else {
-            "FALSE"
-        }
-    )
+            _ => unreachable!(),
+        },
+    );
+    sql.push_str(&generate_returning_clause(src, table, &table.name, None));
+    sql
 }
 
 fn generate_predicate(src: &mut Source, table: &TableSchema) -> String {
@@ -864,7 +872,7 @@ fn row_count(src: &mut Source, ordered: bool, offset: bool) -> String {
     })
 }
 
-fn generate_select(src: &mut Source, table: &TableSchema) -> (String, RowOrder) {
+fn generate_select_core(src: &mut Source, table: &TableSchema) -> (String, RowOrder) {
     let mut projections = Vec::new();
     src.repeat_n("projections", 1..=4, |src| {
         projections.push(generate_select_expression(src, table));
@@ -1072,93 +1080,114 @@ fn generate_assignment(src: &mut Source, column: &ColumnSchema) -> String {
 
 fn generate_update(src: &mut Source, table: &TableSchema) -> String {
     let column = choose_column(src, table, |column| column.name != table.key().name);
-    format!(
-        "UPDATE {} SET {} = {}{}",
-        table.name,
-        column.name,
-        generate_assignment(src, column),
-        generate_where_clause(src, table)
-    )
+    let (mut sql, target, source) = if src.any("from_clause") {
+        let cutoff = src.any_of("cutoff", int_in_range(1..=20));
+        (
+            format!(
+                "UPDATE {0} AS target SET {1} = source.{1} FROM {0} AS source \
+                 WHERE target.{2} = source.{2} AND target.{2} <= {cutoff}",
+                table.name,
+                column.name,
+                table.key().name,
+            ),
+            "target",
+            Some("source"),
+        )
+    } else {
+        (
+            format!(
+                "UPDATE {} SET {} = {}{}",
+                table.name,
+                column.name,
+                generate_assignment(src, column),
+                generate_where_clause(src, table)
+            ),
+            table.name.as_str(),
+            None,
+        )
+    };
+    sql.push_str(&generate_returning_clause(src, table, target, source));
+    sql
 }
 
 fn generate_delete(src: &mut Source, table: &TableSchema) -> String {
-    format!(
-        "DELETE FROM {}{}",
-        table.name,
-        generate_where_clause(src, table)
-    )
+    let (mut sql, target, source) = if src.any("using_clause") {
+        let cutoff = src.any_of("cutoff", int_in_range(1..=20));
+        (
+            format!(
+                "DELETE FROM {0} AS target USING {0} AS source \
+                 WHERE target.{1} = source.{1} AND target.{1} <= {cutoff}",
+                table.name,
+                table.key().name,
+            ),
+            "target",
+            Some("source"),
+        )
+    } else {
+        (
+            format!(
+                "DELETE FROM {}{}",
+                table.name,
+                generate_where_clause(src, table)
+            ),
+            table.name.as_str(),
+            None,
+        )
+    };
+    sql.push_str(&generate_returning_clause(src, table, target, source));
+    sql
 }
 
-fn generate_update_from(src: &mut Source, table: &TableSchema) -> String {
-    let column = choose_column(src, table, |column| column.name != table.key().name);
-    let cutoff = src.any_of("cutoff", int_in_range(1..=20));
-    format!(
-        "UPDATE {0} AS target SET {1} = source.{1} FROM {0} AS source \
-         WHERE target.{2} = source.{2} AND target.{2} <= {cutoff} \
-         RETURNING target.{2}, source.{1}",
-        table.name,
-        column.name,
-        table.key().name,
-    )
-}
-
-fn generate_delete_using(src: &mut Source, table: &TableSchema) -> String {
-    let cutoff = src.any_of("cutoff", int_in_range(1..=20));
-    format!(
-        "DELETE FROM {0} AS target USING {0} AS source \
-         WHERE target.{1} = source.{1} AND target.{1} <= {cutoff} \
-         RETURNING target.{1}, source.{1}",
-        table.name,
-        table.key().name,
-    )
-}
-
-fn generate_returning_projection(src: &mut Source, table: &TableSchema) -> String {
+fn generate_returning_projection(
+    src: &mut Source,
+    table: &TableSchema,
+    target: &str,
+    source: Option<&str>,
+) -> String {
+    let mut projections = vec!["qualified", "alias", "expression"];
+    if source.is_none() {
+        projections.push("wildcard");
+    } else {
+        projections.push("source");
+    }
     src.select(
-        "projection",
-        &["wildcard", "qualified", "alias", "expression"],
+        "target_list",
+        &projections,
         |src, projection, _| match projection {
             "wildcard" => "*".into(),
-            "qualified" => format!("{}.*", table.name),
+            "qualified" => format!("{target}.*"),
             "alias" => {
                 let column = choose_column(src, table, |_| true);
-                format!("{} AS returned_value", column.name)
+                format!("{target}.{} AS returned_value", column.name)
             }
             "expression" => {
                 let column = choose_column(src, table, |_| true);
                 format!(
-                    "COALESCE({}, {}) AS returned_value",
+                    "COALESCE({target}.{}, {}) AS returned_value",
                     column.name,
                     generate_typed_literal(src, column.data_type)
                 )
+            }
+            "source" => {
+                let column = choose_column(src, table, |_| true);
+                format!("{}.{} AS source_value", source.unwrap(), column.name)
             }
             _ => unreachable!(),
         },
     )
 }
 
-fn generate_insert_returning(src: &mut Source, table: &TableSchema, next_key: &mut i64) -> String {
-    format!(
-        "{} RETURNING {}",
-        generate_insert(src, table, next_key),
-        generate_returning_projection(src, table)
-    )
-}
-
-fn generate_update_returning(src: &mut Source, table: &TableSchema) -> String {
-    format!(
-        "{} RETURNING {}",
-        generate_update(src, table),
-        generate_returning_projection(src, table)
-    )
-}
-
-fn generate_delete_returning(src: &mut Source, table: &TableSchema) -> String {
-    format!(
-        "{} RETURNING {}",
-        generate_delete(src, table),
-        generate_returning_projection(src, table)
-    )
+fn generate_returning_clause(
+    src: &mut Source,
+    table: &TableSchema,
+    target: &str,
+    source: Option<&str>,
+) -> String {
+    src.maybe("returning_clause", |src| {
+        generate_returning_projection(src, table, target, source)
+    })
+    .map(|projection| format!(" RETURNING {projection}"))
+    .unwrap_or_default()
 }
 
 fn generate_join(src: &mut Source, table: &TableSchema) -> (String, RowOrder) {
@@ -1269,6 +1298,57 @@ fn generate_subquery(src: &mut Source, table: &TableSchema) -> (String, RowOrder
     )
 }
 
+fn generate_insert(
+    src: &mut Source,
+    table: &TableSchema,
+    foreign_tables: &ForeignTables,
+    next_key: &mut i64,
+    next_child_key: &mut i64,
+) -> String {
+    src.select(
+        "table_name",
+        &["main", "foreign_child"],
+        |src, table_name, _| match table_name {
+            "main" => generate_main_insert(src, table, next_key),
+            "foreign_child" => {
+                let mut sql = generate_foreign_insert(src, foreign_tables, next_child_key);
+                if src.any("returning_clause") {
+                    sql.push_str(" RETURNING *");
+                }
+                sql
+            }
+            _ => unreachable!(),
+        },
+    )
+}
+
+fn generate_select(
+    src: &mut Source,
+    table: &TableSchema,
+    foreign_tables: &ForeignTables,
+) -> (String, RowOrder) {
+    src.select(
+        "select_body",
+        &[
+            "core",
+            "distinct",
+            "aggregate",
+            "join",
+            "subquery",
+            "foreign_join",
+        ],
+        |src, select_body, _| match select_body {
+            "core" => generate_select_core(src, table),
+            "distinct" => generate_distinct(src, table),
+            "aggregate" => generate_aggregate(src, table),
+            "join" => generate_join(src, table),
+            "subquery" => generate_subquery(src, table),
+            "foreign_join" => generate_foreign_select(src, foreign_tables),
+            _ => unreachable!(),
+        },
+    )
+}
+
 fn isolation_level(src: &mut Source) -> &'static str {
     let levels = ["READ COMMITTED", "REPEATABLE READ"];
     let (level, _) = src
@@ -1295,6 +1375,70 @@ fn lock_timeout_sql(src: &mut Source) -> String {
                 "SET lock_timeout = '{}s'",
                 src.any_of("seconds", int_in_range(1..=3))
             ),
+            _ => unreachable!(),
+        },
+    )
+}
+
+fn generate_statement(
+    src: &mut Source,
+    table: &TableSchema,
+    foreign_tables: &ForeignTables,
+    next_key: &mut i64,
+    next_child_key: &mut i64,
+    in_transaction: &mut bool,
+) -> (String, RowOrder) {
+    let statements: &[&str] = if *in_transaction {
+        &[
+            "insert", "select", "update", "delete", "set", "commit", "rollback",
+        ]
+    } else {
+        &["insert", "select", "update", "delete", "set", "begin"]
+    };
+    src.select(
+        "statement",
+        statements,
+        |src, statement, _| match statement {
+            "insert" => (
+                generate_insert(src, table, foreign_tables, next_key, next_child_key),
+                RowOrder::Unordered,
+            ),
+            "select" => generate_select(src, table, foreign_tables),
+            "update" => (generate_update(src, table), RowOrder::Unordered),
+            "delete" => (generate_delete(src, table), RowOrder::Unordered),
+            "set" => {
+                let settings: &[&str] = if *in_transaction {
+                    &["lock_timeout"]
+                } else {
+                    &["session_characteristics", "lock_timeout"]
+                };
+                let sql = src.select("set", settings, |src, setting, _| match setting {
+                    "session_characteristics" => format!(
+                        "SET SESSION CHARACTERISTICS AS TRANSACTION ISOLATION LEVEL {}",
+                        isolation_level(src)
+                    ),
+                    "lock_timeout" => lock_timeout_sql(src),
+                    _ => unreachable!(),
+                });
+                (sql, RowOrder::Unordered)
+            }
+            "begin" => {
+                *in_transaction = true;
+                let sql = if src.any("explicit_isolation") {
+                    format!("BEGIN ISOLATION LEVEL {}", isolation_level(src))
+                } else {
+                    "BEGIN".into()
+                };
+                (sql, RowOrder::Unordered)
+            }
+            "commit" => {
+                *in_transaction = false;
+                ("COMMIT".into(), RowOrder::Unordered)
+            }
+            "rollback" => {
+                *in_transaction = false;
+                ("ROLLBACK".into(), RowOrder::Unordered)
+            }
             _ => unreachable!(),
         },
     )
@@ -1340,7 +1484,7 @@ fn generated_sql_matches_postgres() {
             &create,
             RowOrder::Unordered,
         );
-        let insert = generate_insert(src, &table, &mut next_key);
+        let insert = generate_main_insert(src, &table, &mut next_key);
         src.log_value("sql", &insert);
         assert_statement(
             &runtime,
@@ -1365,116 +1509,17 @@ fn generated_sql_matches_postgres() {
         }
 
         src.repeat_n("statements", 3..=14, |src| {
-            let actions: &[&'static str] = if in_transaction {
-                &[
-                    "insert",
-                    "insert_returning",
-                    "insert_select",
-                    "select",
-                    "distinct",
-                    "aggregate",
-                    "join",
-                    "subquery",
-                    "foreign_insert",
-                    "foreign_select",
-                    "update",
-                    "update_returning",
-                    "update_from",
-                    "delete",
-                    "delete_returning",
-                    "delete_using",
-                    "set_lock_timeout",
-                    "commit",
-                    "rollback",
-                ]
-            } else {
-                &[
-                    "insert",
-                    "insert_returning",
-                    "insert_select",
-                    "select",
-                    "distinct",
-                    "aggregate",
-                    "join",
-                    "subquery",
-                    "foreign_insert",
-                    "foreign_select",
-                    "update",
-                    "update_returning",
-                    "update_from",
-                    "delete",
-                    "delete_returning",
-                    "delete_using",
-                    "set_session",
-                    "set_lock_timeout",
-                    "begin",
-                ]
-            };
-            src.select("action", actions, |src, action, _| {
-                let (sql, order) = match action {
-                    "insert" => (
-                        generate_insert(src, &table, &mut next_key),
-                        RowOrder::Unordered,
-                    ),
-                    "insert_returning" => (
-                        generate_insert_returning(src, &table, &mut next_key),
-                        RowOrder::Unordered,
-                    ),
-                    "insert_select" => (
-                        generate_insert_select(src, &table, &mut next_key),
-                        RowOrder::Unordered,
-                    ),
-                    "select" => generate_select(src, &table),
-                    "distinct" => generate_distinct(src, &table),
-                    "aggregate" => generate_aggregate(src, &table),
-                    "join" => generate_join(src, &table),
-                    "subquery" => generate_subquery(src, &table),
-                    "foreign_insert" => (
-                        generate_foreign_insert(src, &foreign_tables, &mut next_child_key),
-                        RowOrder::Unordered,
-                    ),
-                    "foreign_select" => generate_foreign_select(src, &foreign_tables),
-                    "update" => (generate_update(src, &table), RowOrder::Unordered),
-                    "update_returning" => {
-                        (generate_update_returning(src, &table), RowOrder::Unordered)
-                    }
-                    "update_from" => (generate_update_from(src, &table), RowOrder::Unordered),
-                    "delete" => (generate_delete(src, &table), RowOrder::Unordered),
-                    "delete_returning" => {
-                        (generate_delete_returning(src, &table), RowOrder::Unordered)
-                    }
-                    "delete_using" => (generate_delete_using(src, &table), RowOrder::Unordered),
-                    "begin" => {
-                        in_transaction = true;
-                        let sql = if src.any("explicit_isolation") {
-                            format!("BEGIN ISOLATION LEVEL {}", isolation_level(src))
-                        } else {
-                            "BEGIN".into()
-                        };
-                        (sql, RowOrder::Unordered)
-                    }
-                    "set_session" => (
-                        format!(
-                            "SET SESSION CHARACTERISTICS AS TRANSACTION ISOLATION LEVEL {}",
-                            isolation_level(src)
-                        ),
-                        RowOrder::Unordered,
-                    ),
-                    "set_lock_timeout" => (lock_timeout_sql(src), RowOrder::Unordered),
-                    "commit" => {
-                        in_transaction = false;
-                        ("COMMIT".into(), RowOrder::Unordered)
-                    }
-                    "rollback" => {
-                        in_transaction = false;
-                        ("ROLLBACK".into(), RowOrder::Unordered)
-                    }
-                    _ => unreachable!(),
-                };
-                src.log_value("sql", &sql);
-                assert_statement(&runtime, postgres.get_connection(), &mut fake, &sql, order);
-                Effect::Success
-            })
+            let (sql, order) = generate_statement(
+                src,
+                &table,
+                &foreign_tables,
+                &mut next_key,
+                &mut next_child_key,
+                &mut in_transaction,
+            );
+            src.log_value("sql", &sql);
+            assert_statement(&runtime, postgres.get_connection(), &mut fake, &sql, order);
+            Effect::Success
         });
 
         if in_transaction {
