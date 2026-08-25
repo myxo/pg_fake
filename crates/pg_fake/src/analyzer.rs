@@ -594,21 +594,35 @@ impl ast::VisitorMut for TypedSubquerySubstituter<'_> {
 }
 
 #[cfg_attr(feature = "execution-log", tracing::instrument(skip_all))]
-pub(crate) fn bind_parameters(
-    statement: &ast::Statement,
-    infer_parameter_types: &[BaseType],
+pub(crate) fn coerce_parameters(
+    parameter_types: &[BaseType],
     values: &[Value],
-) -> Result<ast::Statement> {
-    if values.len() != infer_parameter_types.len() {
+) -> Result<Vec<Value>> {
+    if values.len() != parameter_types.len() {
         return Err(PgError::create(
             SqlState::ProtocolViolation,
             format!(
                 "bind message supplies {} parameters, but prepared statement requires {}",
                 values.len(),
-                infer_parameter_types.len()
+                parameter_types.len()
             ),
         ));
     }
+    values
+        .iter()
+        .cloned()
+        .zip(parameter_types.iter().copied())
+        .map(|(value, target)| coerce_parameter(value, target))
+        .collect()
+}
+
+#[cfg_attr(feature = "execution-log", tracing::instrument(skip_all))]
+pub(crate) fn bind_parameters(
+    statement: &ast::Statement,
+    infer_parameter_types: &[BaseType],
+    values: &[Value],
+) -> Result<ast::Statement> {
+    let values = coerce_parameters(infer_parameter_types, values)?;
     let mut statement = statement.clone();
     let mut error = None;
     let _ = ast::visit_expressions_mut(&mut statement, |expression| {
@@ -626,13 +640,7 @@ pub(crate) fn bind_parameters(
             }
         };
         let target = infer_parameter_types[index];
-        match coerce_parameter(values[index].clone(), target) {
-            Ok(value) => *expression = create_typed_literal(value, PgType::create(target)),
-            Err(bind_error) => {
-                error = Some(bind_error);
-                return ControlFlow::Break(());
-            }
-        }
+        *expression = create_typed_literal(values[index].clone(), PgType::create(target));
         ControlFlow::Continue(())
     });
     error.map_or(Ok(statement), Err)
@@ -662,7 +670,7 @@ fn count_parameters(statement: &ast::Statement) -> Result<usize> {
 }
 
 #[cfg_attr(feature = "execution-log", tracing::instrument(skip_all))]
-fn parse_placeholder_index(placeholder: &str) -> Result<usize> {
+pub(crate) fn parse_placeholder_index(placeholder: &str) -> Result<usize> {
     let index = placeholder
         .strip_prefix('$')
         .and_then(|index| index.parse::<usize>().ok())

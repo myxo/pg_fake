@@ -195,7 +195,7 @@ pub(super) fn extract_number_literal(expr: &ast::Expr) -> Option<&str> {
 }
 
 #[cfg_attr(feature = "execution-log", tracing::instrument(skip_all))]
-fn evaluate_literal(expr: &ast::Expr) -> Result<Value> {
+pub(super) fn evaluate_literal(expr: &ast::Expr) -> Result<Value> {
     if let Some(value) = extract_ast_value(expr) {
         return match value {
             ast::Value::Null => Ok(Value::Null),

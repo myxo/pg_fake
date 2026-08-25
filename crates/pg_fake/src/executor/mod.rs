@@ -28,6 +28,7 @@ mod arithmetic;
 mod expressions;
 mod foreign_keys;
 mod locks;
+mod prepared;
 mod query;
 mod scope;
 mod sequences;
@@ -55,6 +56,7 @@ use foreign_keys::{
 };
 pub(crate) use foreign_keys::{contains_deferred_foreign_keys, validate_deferred_foreign_keys};
 pub(crate) use locks::collect_required_row_locks;
+pub(crate) use prepared::{PreparedQueryPlan, build_prepared_query_plan, execute_prepared_query};
 pub(crate) use scope::infer_query_output_columns;
 use scope::{BoundColumn, bind_select_scope};
 pub(crate) use scope::{

@@ -39,6 +39,7 @@ pub struct PreparedStatement {
     statement: ast::Statement,
     parameter_types: Vec<crate::value::BaseType>,
     columns: Vec<ColumnMeta>,
+    query_plan: Option<executor::PreparedQueryPlan>,
 }
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum IsolationLevel {
@@ -567,7 +568,7 @@ impl Session {
             if self.transaction.is_none() {
                 self.start_transaction(self.default_isolation, true);
             }
-            match self.execute_statement(statement) {
+            match self.execute_statement(statement, None) {
                 Ok(result) => results.push(result),
                 Err(error) => {
                     if self.is_transaction_implicit_batch() {
@@ -750,17 +751,23 @@ impl Session {
                             )?;
                             let columns =
                                 executor::describe_query_result_columns(&state, &described)?;
-                            Ok((parameter_types, columns))
+                            let query_plan = executor::build_prepared_query_plan(
+                                &state,
+                                &statement,
+                                &parameter_types,
+                            )?;
+                            Ok((parameter_types, columns, query_plan))
                         },
                     )
                 },
             )
         };
         match prepared {
-            Ok((parameter_types, columns)) => Ok(PreparedStatement {
+            Ok((parameter_types, columns, query_plan)) => Ok(PreparedStatement {
                 statement,
                 parameter_types,
                 columns,
+                query_plan,
             }),
             Err(error) => self.abort_with_error(error),
         }
@@ -799,19 +806,35 @@ impl Session {
         statement: &PreparedStatement,
         params: &[Value],
     ) -> Result<StatementResult> {
-        let statement = match analyzer::bind_parameters(
-            &statement.statement,
-            &statement.parameter_types,
-            params,
-        ) {
-            Ok(statement) => statement,
-            Err(error) => return self.abort_with_error(error),
+        let parameters;
+        let bound_statement;
+        let prepared_query = if let Some(query_plan) = &statement.query_plan {
+            parameters = match analyzer::coerce_parameters(&statement.parameter_types, params) {
+                Ok(parameters) => parameters,
+                Err(error) => return self.abort_with_error(error),
+            };
+            bound_statement = statement.statement.clone();
+            Some((
+                query_plan,
+                parameters.as_slice(),
+                statement.columns.as_slice(),
+            ))
+        } else {
+            bound_statement = match analyzer::bind_parameters(
+                &statement.statement,
+                &statement.parameter_types,
+                params,
+            ) {
+                Ok(statement) => statement,
+                Err(error) => return self.abort_with_error(error),
+            };
+            None
         };
         let started_implicit_transaction = self.transaction.is_none();
         if started_implicit_transaction {
             self.start_transaction(self.default_isolation, true);
         }
-        match self.execute_statement(statement) {
+        match self.execute_statement(bound_statement, prepared_query) {
             Ok(result) => {
                 if started_implicit_transaction && self.is_transaction_implicit_batch() {
                     self.commit_transaction()?;
@@ -1014,7 +1037,11 @@ impl Session {
     }
 
     #[cfg_attr(feature = "execution-log", tracing::instrument(skip_all))]
-    fn execute_statement(&mut self, statement: ast::Statement) -> Result<StatementResult> {
+    fn execute_statement(
+        &mut self,
+        statement: ast::Statement,
+        prepared_query: Option<(&executor::PreparedQueryPlan, &[Value], &[ColumnMeta])>,
+    ) -> Result<StatementResult> {
         match &statement {
             ast::Statement::Analyze(_) if !self.db.strict => {
                 return Ok(StatementResult::Affected(0));
@@ -1265,15 +1292,31 @@ impl Session {
             Ok(acquired) => acquired,
             Err(error) => return self.abort_with_error(error),
         };
-        match executor::execute_statement(
-            &mut state,
-            &statement,
-            transaction.xid,
-            &snapshot,
-            &self.deferred_constraints,
-            self.defer_all_constraints,
-            &context,
-        ) {
+        let result = match prepared_query {
+            Some((plan, parameters, columns)) => executor::execute_prepared_query(
+                &state,
+                plan,
+                parameters,
+                transaction.xid,
+                &snapshot,
+            )
+            .map(|rows| {
+                StatementResult::Query(QueryResult {
+                    columns: columns.to_vec(),
+                    rows,
+                })
+            }),
+            None => executor::execute_statement(
+                &mut state,
+                &statement,
+                transaction.xid,
+                &snapshot,
+                &self.deferred_constraints,
+                self.defer_all_constraints,
+                &context,
+            ),
+        };
+        match result {
             Ok(result) => {
                 if contains_dml(&statement)
                     && executor::contains_deferred_foreign_keys(
