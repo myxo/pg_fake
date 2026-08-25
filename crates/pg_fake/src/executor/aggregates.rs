@@ -23,6 +23,7 @@ struct AggregateCall<'a> {
     result_type: BaseType,
 }
 
+#[cfg_attr(feature = "execution-log", tracing::instrument(skip_all))]
 pub(super) fn is_aggregate_function(function: &ast::Function) -> bool {
     function
         .name
@@ -38,6 +39,7 @@ pub(super) fn is_aggregate_function(function: &ast::Function) -> bool {
         })
 }
 
+#[cfg_attr(feature = "execution-log", tracing::instrument(skip_all))]
 pub(super) fn infer_aggregate_return_type(
     function: &ast::Function,
     schema: RowScope<'_>,
@@ -48,6 +50,7 @@ pub(super) fn infer_aggregate_return_type(
     parse_aggregate_call(function, schema).map(|call| Some(call.result_type))
 }
 
+#[cfg_attr(feature = "execution-log", tracing::instrument(skip_all))]
 fn parse_aggregate_call<'a>(
     function: &'a ast::Function,
     schema: RowScope<'_>,
@@ -193,6 +196,7 @@ fn parse_aggregate_call<'a>(
     })
 }
 
+#[cfg_attr(feature = "execution-log", tracing::instrument(skip_all))]
 pub(super) fn evaluate_aggregate_function<F>(
     function: &ast::Function,
     schema: RowScope<'_>,

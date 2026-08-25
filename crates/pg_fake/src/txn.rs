@@ -66,30 +66,35 @@ pub(crate) struct TransactionRegistry {
 }
 
 impl Default for TransactionRegistry {
+    #[cfg_attr(feature = "execution-log", tracing::instrument(skip_all))]
     fn default() -> Self {
         Self::create()
     }
 }
 
 impl Default for RowLockManager {
+    #[cfg_attr(feature = "execution-log", tracing::instrument(skip_all))]
     fn default() -> Self {
         Self::create()
     }
 }
 
 impl Default for WaitForGraph {
+    #[cfg_attr(feature = "execution-log", tracing::instrument(skip_all))]
     fn default() -> Self {
         Self::create()
     }
 }
 
 impl RowLockManager {
+    #[cfg_attr(feature = "execution-log", tracing::instrument(skip_all))]
     pub(crate) fn create() -> Self {
         RowLockManager {
             locks: BTreeMap::new(),
         }
     }
 
+    #[cfg_attr(feature = "execution-log", tracing::instrument(skip_all))]
     pub(crate) fn acquire(
         &mut self,
         key: RowLockKey,
@@ -131,6 +136,7 @@ impl RowLockManager {
         RowLockAttempt::Blocked(blockers.into_iter().collect())
     }
 
+    #[cfg_attr(feature = "execution-log", tracing::instrument(skip_all))]
     pub(crate) fn cancel_wait(&mut self, key: RowLockKey, xid: Xid) {
         let Some(lock) = self.locks.get_mut(&key) else {
             return;
@@ -141,6 +147,7 @@ impl RowLockManager {
         }
     }
 
+    #[cfg_attr(feature = "execution-log", tracing::instrument(skip_all))]
     pub(crate) fn release_transaction_locks(&mut self, xid: Xid) {
         self.locks.retain(|_, lock| {
             lock.holders.remove(&xid);
@@ -150,12 +157,14 @@ impl RowLockManager {
     }
 
     #[cfg(test)]
+    #[cfg_attr(feature = "execution-log", tracing::instrument(skip_all))]
     pub(crate) fn has_waiters(&self) -> bool {
         self.locks.values().any(|lock| !lock.waiters.is_empty())
     }
 }
 
 impl WaitForGraph {
+    #[cfg_attr(feature = "execution-log", tracing::instrument(skip_all))]
     pub(crate) fn create() -> Self {
         WaitForGraph {
             edges: BTreeMap::new(),
@@ -163,6 +172,7 @@ impl WaitForGraph {
         }
     }
 
+    #[cfg_attr(feature = "execution-log", tracing::instrument(skip_all))]
     pub(crate) fn register_wait_dependencies(
         &mut self,
         waiter: Xid,
@@ -187,10 +197,12 @@ impl WaitForGraph {
         Some(victim)
     }
 
+    #[cfg_attr(feature = "execution-log", tracing::instrument(skip_all))]
     pub(crate) fn clear_wait(&mut self, waiter: Xid) {
         self.edges.remove(&waiter);
     }
 
+    #[cfg_attr(feature = "execution-log", tracing::instrument(skip_all))]
     pub(crate) fn remove_transaction(&mut self, xid: Xid) {
         self.edges.remove(&xid);
         for blockers in self.edges.values_mut() {
@@ -200,10 +212,12 @@ impl WaitForGraph {
         self.victims.remove(&xid);
     }
 
+    #[cfg_attr(feature = "execution-log", tracing::instrument(skip_all))]
     pub(crate) fn take_victim(&mut self, xid: Xid) -> bool {
         self.victims.remove(&xid)
     }
 
+    #[cfg_attr(feature = "execution-log", tracing::instrument(skip_all))]
     fn find_cycle_containing(&self, xid: Xid) -> Option<BTreeSet<Xid>> {
         let collect_reachable_transactions = self.collect_reachable_transactions(xid, false);
         let reaches_xid = self.collect_reachable_transactions(xid, true);
@@ -214,6 +228,7 @@ impl WaitForGraph {
         (cycle.len() > 1).then_some(cycle)
     }
 
+    #[cfg_attr(feature = "execution-log", tracing::instrument(skip_all))]
     fn collect_reachable_transactions(&self, start: Xid, reverse: bool) -> BTreeSet<Xid> {
         let mut reached = BTreeSet::from([start]);
         let mut pending = vec![start];
@@ -237,6 +252,7 @@ impl WaitForGraph {
 }
 
 impl TransactionRegistry {
+    #[cfg_attr(feature = "execution-log", tracing::instrument(skip_all))]
     pub(crate) fn create() -> Self {
         TransactionRegistry {
             next_xid: 1,
@@ -246,6 +262,7 @@ impl TransactionRegistry {
         }
     }
 
+    #[cfg_attr(feature = "execution-log", tracing::instrument(skip_all))]
     pub(crate) fn begin(&mut self) -> Xid {
         let xid = Xid(self.next_xid);
         self.next_xid += 1;
@@ -254,6 +271,7 @@ impl TransactionRegistry {
         xid
     }
 
+    #[cfg_attr(feature = "execution-log", tracing::instrument(skip_all))]
     pub(crate) fn commit(&mut self, xid: Xid) -> CommitSeq {
         assert!(matches!(
             self.get_status(xid),
@@ -267,6 +285,7 @@ impl TransactionRegistry {
         commit_seq
     }
 
+    #[cfg_attr(feature = "execution-log", tracing::instrument(skip_all))]
     pub(crate) fn abort(&mut self, xid: Xid) {
         assert!(matches!(
             self.get_status(xid),
@@ -276,10 +295,12 @@ impl TransactionRegistry {
         self.retained_snapshots.remove(&xid);
     }
 
+    #[cfg_attr(feature = "execution-log", tracing::instrument(skip_all))]
     pub(crate) fn get_status(&self, xid: Xid) -> Option<TransactionStatus> {
         self.statuses.get(&xid).copied()
     }
 
+    #[cfg_attr(feature = "execution-log", tracing::instrument(skip_all))]
     pub(crate) fn retain_snapshot(&mut self, xid: Xid, snapshot: Snapshot) {
         assert!(matches!(
             self.get_status(xid),
@@ -292,6 +313,7 @@ impl TransactionRegistry {
         assert_eq!(*retained, snapshot.commit_seq);
     }
 
+    #[cfg_attr(feature = "execution-log", tracing::instrument(skip_all))]
     pub(crate) fn find_reclamation_horizon(&self) -> CommitSeq {
         self.retained_snapshots
             .values()
@@ -302,6 +324,7 @@ impl TransactionRegistry {
 }
 
 impl Snapshot {
+    #[cfg_attr(feature = "execution-log", tracing::instrument(skip_all))]
     pub(crate) fn create(manager: &TransactionRegistry) -> Self {
         Snapshot {
             commit_seq: manager.commit_seq,
@@ -309,6 +332,7 @@ impl Snapshot {
     }
 }
 
+#[cfg_attr(feature = "execution-log", tracing::instrument(skip_all))]
 pub(crate) fn is_visible(
     version: &RowVersion,
     snapshot: &Snapshot,
@@ -334,6 +358,7 @@ pub(crate) fn is_visible(
     xmin_visible && !xmax_invisible
 }
 
+#[cfg_attr(feature = "execution-log", tracing::instrument(skip_all))]
 pub(crate) fn find_visible_version<'a>(
     chain: &'a RowVersionChain,
     snapshot: &Snapshot,
@@ -352,6 +377,7 @@ mod tests {
     use super::*;
 
     #[test]
+    #[cfg_attr(feature = "execution-log", tracing::instrument(skip_all))]
     fn transitions_transaction_statuses_from_in_flight_to_final() {
         let mut manager = TransactionRegistry::create();
         let committed = manager.begin();
@@ -380,6 +406,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg_attr(feature = "execution-log", tracing::instrument(skip_all))]
     fn allocates_monotonic_xids_and_commit_sequences() {
         let mut manager = TransactionRegistry::create();
         let first = manager.begin();
@@ -392,6 +419,7 @@ mod tests {
         assert_eq!(manager.commit_seq, CommitSeq(2));
     }
 
+    #[cfg_attr(feature = "execution-log", tracing::instrument(skip_all))]
     fn create_version(xmin: Xid, xmax: Option<Xid>) -> RowVersion {
         RowVersion {
             xmin,
@@ -401,6 +429,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg_attr(feature = "execution-log", tracing::instrument(skip_all))]
     fn shows_own_uncommitted_insert_only_to_its_transaction() {
         let mut manager = TransactionRegistry::create();
         let writer = manager.begin();
@@ -413,6 +442,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg_attr(feature = "execution-log", tracing::instrument(skip_all))]
     fn shows_version_committed_before_snapshot() {
         let mut manager = TransactionRegistry::create();
         let writer = manager.begin();
@@ -429,6 +459,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg_attr(feature = "execution-log", tracing::instrument(skip_all))]
     fn hides_version_committed_after_snapshot() {
         let mut manager = TransactionRegistry::create();
         let writer = manager.begin();
@@ -445,6 +476,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg_attr(feature = "execution-log", tracing::instrument(skip_all))]
     fn hides_version_deleted_before_snapshot() {
         let mut manager = TransactionRegistry::create();
         let writer = manager.begin();
@@ -463,6 +495,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg_attr(feature = "execution-log", tracing::instrument(skip_all))]
     fn keeps_version_visible_during_in_flight_delete() {
         let mut manager = TransactionRegistry::create();
         let writer = manager.begin();
@@ -480,6 +513,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg_attr(feature = "execution-log", tracing::instrument(skip_all))]
     fn finds_one_visible_version_in_a_chain() {
         let mut manager = TransactionRegistry::create();
         let writer = manager.begin();
@@ -501,6 +535,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg_attr(feature = "execution-log", tracing::instrument(skip_all))]
     fn selects_highest_xid_in_wait_for_cycle() {
         let mut graph = WaitForGraph::create();
 
@@ -515,6 +550,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg_attr(feature = "execution-log", tracing::instrument(skip_all))]
     fn breaks_cycle_when_removing_wait_edge() {
         let mut graph = WaitForGraph::create();
         graph.register_wait_dependencies(Xid(4), &[Xid(7)]);

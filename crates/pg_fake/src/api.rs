@@ -107,6 +107,7 @@ pub struct Transaction<'session> {
     finished: bool,
 }
 
+#[cfg_attr(feature = "execution-log", tracing::instrument(skip_all))]
 fn abort_database_transaction(state: &mut DatabaseState, xid: Xid) {
     state.transactions.abort(xid);
     for table in state.tables.values_mut() {
@@ -117,6 +118,7 @@ fn abort_database_transaction(state: &mut DatabaseState, xid: Xid) {
     state.wait_for.remove_transaction(xid);
 }
 
+#[cfg_attr(feature = "execution-log", tracing::instrument(skip_all))]
 fn prune_database_versions(state: &mut DatabaseState) {
     let horizon = state.transactions.find_reclamation_horizon();
     for table in state.tables.values_mut() {
@@ -124,6 +126,7 @@ fn prune_database_versions(state: &mut DatabaseState) {
     }
 }
 
+#[cfg_attr(feature = "execution-log", tracing::instrument(skip_all))]
 fn collect_ddl_undo_for_statement(
     state: &DatabaseState,
     statement: &ast::Statement,
@@ -214,6 +217,7 @@ fn collect_ddl_undo_for_statement(
     }
 }
 
+#[cfg_attr(feature = "execution-log", tracing::instrument(skip_all))]
 fn create_invalid_lock_timeout_error() -> PgError {
     PgError::create(
         SqlState::InvalidParameterValue,
@@ -221,6 +225,7 @@ fn create_invalid_lock_timeout_error() -> PgError {
     )
 }
 
+#[cfg_attr(feature = "execution-log", tracing::instrument(skip_all))]
 fn parse_lock_timeout(expression: &ast::Expr) -> Result<Duration> {
     let text = match expression {
         ast::Expr::Value(value) => match &value.value {
@@ -252,6 +257,7 @@ fn parse_lock_timeout(expression: &ast::Expr) -> Result<Duration> {
         .map_err(|_| create_invalid_lock_timeout_error())
 }
 
+#[cfg_attr(feature = "execution-log", tracing::instrument(skip_all))]
 fn parse_timezone(expression: &ast::Expr) -> Result<String> {
     let value = match expression {
         ast::Expr::Value(value) => {
@@ -283,6 +289,7 @@ fn parse_timezone(expression: &ast::Expr) -> Result<String> {
     }
 }
 
+#[cfg_attr(feature = "execution-log", tracing::instrument(skip_all))]
 fn create_lock_timeout_error() -> PgError {
     PgError::create(
         SqlState::LockNotAvailable,
@@ -290,10 +297,12 @@ fn create_lock_timeout_error() -> PgError {
     )
 }
 
+#[cfg_attr(feature = "execution-log", tracing::instrument(skip_all))]
 fn create_deadlock_error() -> PgError {
     PgError::create(SqlState::DeadlockDetected, "deadlock detected")
 }
 
+#[cfg_attr(feature = "execution-log", tracing::instrument(skip_all))]
 fn parse_isolation_level(modes: &[ast::TransactionMode]) -> Result<Option<IsolationLevel>> {
     let mut isolation = None;
     for mode in modes {
@@ -325,6 +334,7 @@ fn parse_isolation_level(modes: &[ast::TransactionMode]) -> Result<Option<Isolat
     Ok(isolation)
 }
 
+#[cfg_attr(feature = "execution-log", tracing::instrument(skip_all))]
 fn acquire_row_locks<'a>(
     condvar: &Condvar,
     timeout: Duration,
@@ -419,9 +429,11 @@ fn acquire_row_locks<'a>(
 }
 
 impl Db {
+    #[cfg_attr(feature = "execution-log", tracing::instrument(skip_all))]
     pub fn create() -> Self {
         Db::create_builder().build()
     }
+    #[cfg_attr(feature = "execution-log", tracing::instrument(skip_all))]
     pub fn create_builder() -> DbBuilder {
         DbBuilder {
             lock_timeout: Duration::from_secs(1),
@@ -430,6 +442,7 @@ impl Db {
             strict: false,
         }
     }
+    #[cfg_attr(feature = "execution-log", tracing::instrument(skip_all))]
     pub fn create_session(&self) -> Session {
         Session {
             db: self.clone(),
@@ -447,6 +460,7 @@ impl Db {
     }
 }
 impl DbBuilder {
+    #[cfg_attr(feature = "execution-log", tracing::instrument(skip_all))]
     pub fn set_lock_timeout(mut self, timeout: Duration) -> Self {
         self.lock_timeout = timeout;
         self
@@ -454,18 +468,22 @@ impl DbBuilder {
     /// Enable a frozen, deterministic database clock. It begins at the Unix
     /// epoch and can subsequently be controlled through `Db::set_time` and
     /// `Db::advance_time`.
+    #[cfg_attr(feature = "execution-log", tracing::instrument(skip_all))]
     pub fn set_mock_time_enabled(mut self, enabled: bool) -> Self {
         self.mock_time = enabled;
         self
     }
+    #[cfg_attr(feature = "execution-log", tracing::instrument(skip_all))]
     pub fn set_random_seed(mut self, seed: u64) -> Self {
         self.seed = Some(seed);
         self
     }
+    #[cfg_attr(feature = "execution-log", tracing::instrument(skip_all))]
     pub fn set_strict_mode_enabled(mut self, enabled: bool) -> Self {
         self.strict = enabled;
         self
     }
+    #[cfg_attr(feature = "execution-log", tracing::instrument(skip_all))]
     pub fn build(self) -> Db {
         Db {
             state: Arc::new(Mutex::new(DatabaseState::create())),
@@ -485,11 +503,13 @@ impl DbBuilder {
     }
 }
 impl Default for Db {
+    #[cfg_attr(feature = "execution-log", tracing::instrument(skip_all))]
     fn default() -> Self {
         Self::create()
     }
 }
 impl Db {
+    #[cfg_attr(feature = "execution-log", tracing::instrument(skip_all))]
     fn read_clock(&self) -> chrono::DateTime<chrono::Utc> {
         match *self.clock.lock().expect("clock mutex is poisoned") {
             DatabaseClock::Real => chrono::Utc::now(),
@@ -498,6 +518,7 @@ impl Db {
     }
 
     /// ast::Set the frozen mock clock. Real-clock databases reject the operation.
+    #[cfg_attr(feature = "execution-log", tracing::instrument(skip_all))]
     pub fn set_time(&self, time: chrono::DateTime<chrono::Utc>) -> Result<()> {
         let mut clock = self.clock.lock().expect("clock mutex is poisoned");
         match &mut *clock {
@@ -514,6 +535,7 @@ impl Db {
 
     /// Advance the frozen mock clock by `duration`. Real-clock databases reject
     /// the operation.
+    #[cfg_attr(feature = "execution-log", tracing::instrument(skip_all))]
     pub fn advance_time(&self, duration: chrono::Duration) -> Result<()> {
         let mut clock = self.clock.lock().expect("clock mutex is poisoned");
         match &mut *clock {
@@ -531,6 +553,7 @@ impl Db {
     }
 }
 impl Session {
+    #[cfg_attr(feature = "execution-log", tracing::instrument(skip_all))]
     pub fn execute(&mut self, sql: &str) -> Result<Vec<StatementResult>> {
         if let Some(result) = self.try_execute_set_constraints(sql) {
             return result.map(|result| vec![result]);
@@ -559,6 +582,7 @@ impl Session {
         }
         Ok(results)
     }
+    #[cfg_attr(feature = "execution-log", tracing::instrument(skip_all))]
     fn try_execute_set_constraints(&mut self, sql: &str) -> Option<Result<StatementResult>> {
         let sql = sql.trim().trim_end_matches(';').trim();
         let upper = sql.to_ascii_uppercase();
@@ -676,16 +700,19 @@ impl Session {
         Some(Ok(StatementResult::Affected(0)))
     }
 
+    #[cfg_attr(feature = "execution-log", tracing::instrument(skip_all))]
     pub fn execute_params(&mut self, sql: &str, params: &[Value]) -> Result<u64> {
         let statement = self.prepare(sql)?;
         self.execute_prepared(&statement, params)
     }
 
+    #[cfg_attr(feature = "execution-log", tracing::instrument(skip_all))]
     pub fn query(&mut self, sql: &str, params: &[Value]) -> Result<QueryResult> {
         let statement = self.prepare(sql)?;
         self.query_prepared(&statement, params)
     }
 
+    #[cfg_attr(feature = "execution-log", tracing::instrument(skip_all))]
     pub fn prepare(&mut self, sql: &str) -> Result<PreparedStatement> {
         let mut statements = match parser::parse(sql) {
             Ok(statements) => statements,
@@ -739,6 +766,7 @@ impl Session {
         }
     }
 
+    #[cfg_attr(feature = "execution-log", tracing::instrument(skip_all))]
     pub fn execute_prepared(
         &mut self,
         statement: &PreparedStatement,
@@ -752,6 +780,7 @@ impl Session {
         }
     }
 
+    #[cfg_attr(feature = "execution-log", tracing::instrument(skip_all))]
     pub fn query_prepared(
         &mut self,
         statement: &PreparedStatement,
@@ -764,6 +793,7 @@ impl Session {
             }
         }
     }
+    #[cfg_attr(feature = "execution-log", tracing::instrument(skip_all))]
     pub fn execute_prepared_statement(
         &mut self,
         statement: &PreparedStatement,
@@ -796,9 +826,11 @@ impl Session {
             }
         }
     }
+    #[cfg_attr(feature = "execution-log", tracing::instrument(skip_all))]
     pub fn begin(&mut self) -> Result<Transaction<'_>> {
         self.begin_with(self.default_isolation)
     }
+    #[cfg_attr(feature = "execution-log", tracing::instrument(skip_all))]
     pub fn begin_with(&mut self, isolation: IsolationLevel) -> Result<Transaction<'_>> {
         if self.transaction.is_some() {
             return Err(PgError::create(
@@ -812,6 +844,7 @@ impl Session {
             finished: false,
         })
     }
+    #[cfg_attr(feature = "execution-log", tracing::instrument(skip_all))]
     fn start_transaction(&mut self, isolation: IsolationLevel, implicit_batch: bool) {
         assert!(self.ddl_undo.is_empty());
         assert!(self.settings_undo.is_none());
@@ -833,6 +866,7 @@ impl Session {
             transaction_timestamp: self.db.read_clock(),
         }));
     }
+    #[cfg_attr(feature = "execution-log", tracing::instrument(skip_all))]
     fn commit_transaction(&mut self) -> Result<()> {
         let Some(transaction) = self.transaction.take() else {
             return Ok(());
@@ -874,6 +908,7 @@ impl Session {
         Ok(())
     }
 
+    #[cfg_attr(feature = "execution-log", tracing::instrument(skip_all))]
     fn rollback_transaction(&mut self) -> Result<()> {
         let Some(transaction) = self.transaction.take() else {
             return Ok(());
@@ -881,6 +916,7 @@ impl Session {
         self.rollback_transaction_state(transaction)
     }
 
+    #[cfg_attr(feature = "execution-log", tracing::instrument(skip_all))]
     fn rollback_transaction_state(&mut self, transaction: SessionTransactionState) -> Result<()> {
         let xid = match transaction {
             SessionTransactionState::Active(transaction) => transaction.xid,
@@ -901,6 +937,7 @@ impl Session {
         self.db.condvar.notify_all();
         Ok(())
     }
+    #[cfg_attr(feature = "execution-log", tracing::instrument(skip_all))]
     fn mark_transaction_aborted(&mut self) {
         if let Some(SessionTransactionState::Active(transaction)) = self.transaction {
             self.transaction = Some(SessionTransactionState::Aborted {
@@ -909,6 +946,7 @@ impl Session {
             });
         }
     }
+    #[cfg_attr(feature = "execution-log", tracing::instrument(skip_all))]
     fn is_transaction_implicit_batch(&self) -> bool {
         match self.transaction {
             Some(SessionTransactionState::Active(transaction)) => transaction.implicit_batch,
@@ -916,6 +954,7 @@ impl Session {
             None => false,
         }
     }
+    #[cfg_attr(feature = "execution-log", tracing::instrument(skip_all))]
     fn rollback_ddl(&mut self, state: &mut DatabaseState) {
         for undo in self.ddl_undo.drain(..).rev() {
             match undo {
@@ -968,11 +1007,13 @@ impl Session {
         }
     }
 
+    #[cfg_attr(feature = "execution-log", tracing::instrument(skip_all))]
     fn abort_with_error<T>(&mut self, error: PgError) -> Result<T> {
         self.mark_transaction_aborted();
         Err(error)
     }
 
+    #[cfg_attr(feature = "execution-log", tracing::instrument(skip_all))]
     fn execute_statement(&mut self, statement: ast::Statement) -> Result<StatementResult> {
         match &statement {
             ast::Statement::Analyze(_) if !self.db.strict => {
@@ -1253,6 +1294,7 @@ impl Session {
     }
 }
 
+#[cfg_attr(feature = "execution-log", tracing::instrument(skip_all))]
 fn contains_dml(statement: &ast::Statement) -> bool {
     matches!(
         statement,
@@ -1260,6 +1302,7 @@ fn contains_dml(statement: &ast::Statement) -> bool {
     )
 }
 
+#[cfg_attr(feature = "execution-log", tracing::instrument(skip_all))]
 fn is_tolerated_planner_setting(variable: &ast::ObjectName) -> bool {
     let variable = variable.to_string().to_ascii_lowercase();
     matches!(
@@ -1283,6 +1326,7 @@ fn is_tolerated_planner_setting(variable: &ast::ObjectName) -> bool {
         || variable.starts_with("jit_")
 }
 
+#[cfg_attr(feature = "execution-log", tracing::instrument(skip_all))]
 fn is_tolerated_planner_reset(reset: &ast::Reset) -> bool {
     match reset {
         ast::Reset::ALL => false,
@@ -1291,28 +1335,35 @@ fn is_tolerated_planner_reset(reset: &ast::Reset) -> bool {
 }
 
 impl PreparedStatement {
+    #[cfg_attr(feature = "execution-log", tracing::instrument(skip_all))]
     pub fn get_parameter_types(&self) -> &[crate::value::BaseType] {
         &self.parameter_types
     }
 
+    #[cfg_attr(feature = "execution-log", tracing::instrument(skip_all))]
     pub fn get_result_columns(&self) -> &[ColumnMeta] {
         &self.columns
     }
 }
 
 impl Transaction<'_> {
+    #[cfg_attr(feature = "execution-log", tracing::instrument(skip_all))]
     pub fn execute(&mut self, sql: &str) -> Result<Vec<StatementResult>> {
         self.session.execute(sql)
     }
+    #[cfg_attr(feature = "execution-log", tracing::instrument(skip_all))]
     pub fn execute_params(&mut self, sql: &str, params: &[Value]) -> Result<u64> {
         self.session.execute_params(sql, params)
     }
+    #[cfg_attr(feature = "execution-log", tracing::instrument(skip_all))]
     pub fn query(&mut self, sql: &str, params: &[Value]) -> Result<QueryResult> {
         self.session.query(sql, params)
     }
+    #[cfg_attr(feature = "execution-log", tracing::instrument(skip_all))]
     pub fn prepare(&mut self, sql: &str) -> Result<PreparedStatement> {
         self.session.prepare(sql)
     }
+    #[cfg_attr(feature = "execution-log", tracing::instrument(skip_all))]
     pub fn execute_prepared(
         &mut self,
         statement: &PreparedStatement,
@@ -1320,6 +1371,7 @@ impl Transaction<'_> {
     ) -> Result<u64> {
         self.session.execute_prepared(statement, params)
     }
+    #[cfg_attr(feature = "execution-log", tracing::instrument(skip_all))]
     pub fn query_prepared(
         &mut self,
         statement: &PreparedStatement,
@@ -1327,11 +1379,13 @@ impl Transaction<'_> {
     ) -> Result<QueryResult> {
         self.session.query_prepared(statement, params)
     }
+    #[cfg_attr(feature = "execution-log", tracing::instrument(skip_all))]
     pub fn commit(mut self) -> Result<()> {
         self.session.commit_transaction()?;
         self.finished = true;
         Ok(())
     }
+    #[cfg_attr(feature = "execution-log", tracing::instrument(skip_all))]
     pub fn rollback(mut self) -> Result<()> {
         self.session.rollback_transaction()?;
         self.finished = true;
@@ -1340,6 +1394,7 @@ impl Transaction<'_> {
 }
 
 impl Drop for Transaction<'_> {
+    #[cfg_attr(feature = "execution-log", tracing::instrument(skip_all))]
     fn drop(&mut self) {
         if !self.finished {
             let _ = self.session.rollback_transaction();
@@ -1358,6 +1413,7 @@ mod tests {
 
     use super::*;
 
+    #[cfg_attr(feature = "execution-log", tracing::instrument(skip_all))]
     fn wait_until_blocked(db: &Db) {
         let deadline = Instant::now() + Duration::from_secs(1);
         loop {
@@ -1369,11 +1425,13 @@ mod tests {
         }
     }
 
+    #[cfg_attr(feature = "execution-log", tracing::instrument(skip_all))]
     fn create_affected_results(rows: u64) -> Vec<StatementResult> {
         vec![StatementResult::Affected(rows)]
     }
 
     #[test]
+    #[cfg_attr(feature = "execution-log", tracing::instrument(skip_all))]
     fn enforces_foreign_keys_and_keeps_failed_multi_row_writes_atomic() {
         let db = Db::create();
         let mut session = db.create_session();
@@ -1406,6 +1464,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg_attr(feature = "execution-log", tracing::instrument(skip_all))]
     fn applies_foreign_key_actions_to_updates_and_deletes() {
         let db = Db::create();
         let mut session = db.create_session();
@@ -1462,6 +1521,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg_attr(feature = "execution-log", tracing::instrument(skip_all))]
     fn validates_deferred_foreign_keys_at_commit_and_allows_repairs() {
         let db = Db::create();
         let mut session = db.create_session();
@@ -1488,6 +1548,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg_attr(feature = "execution-log", tracing::instrument(skip_all))]
     fn set_constraints_changes_deferrable_foreign_key_timing() {
         let db = Db::create();
         let mut session = db.create_session();
@@ -1508,6 +1569,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg_attr(feature = "execution-log", tracing::instrument(skip_all))]
     fn accepts_self_references_and_match_simple_nulls() {
         let db = Db::create();
         let mut session = db.create_session();
@@ -1529,6 +1591,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg_attr(feature = "execution-log", tracing::instrument(skip_all))]
     fn parses_compares_and_generates_uuid_values() {
         let db = Db::create();
         let mut session = db.create_session();
@@ -1558,6 +1621,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg_attr(feature = "execution-log", tracing::instrument(skip_all))]
     fn reproduces_seeded_uuid_generation_and_supports_v7() {
         let initial = chrono::DateTime::parse_from_rfc3339("2024-02-29T12:34:56Z")
             .unwrap()
@@ -1599,6 +1663,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg_attr(feature = "execution-log", tracing::instrument(skip_all))]
     fn processes_timestamp_values_and_timezone_setting() {
         let db = Db::create();
         let mut session = db.create_session();
@@ -1635,6 +1700,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg_attr(feature = "execution-log", tracing::instrument(skip_all))]
     fn preserves_interval_calendar_and_clock_parts() {
         let db = Db::create();
         let mut session = db.create_session();
@@ -1666,6 +1732,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg_attr(feature = "execution-log", tracing::instrument(skip_all))]
     fn freezes_and_controls_mock_clock() {
         let db = Db::create_builder().set_mock_time_enabled(true).build();
         let initial = chrono::DateTime::parse_from_rfc3339("2024-01-01T00:00:00Z")
@@ -1684,6 +1751,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg_attr(feature = "execution-log", tracing::instrument(skip_all))]
     fn observes_timestamp_function_boundaries() {
         let db = Db::create_builder().set_mock_time_enabled(true).build();
         let initial = chrono::DateTime::parse_from_rfc3339("2024-01-01T00:00:00Z")
@@ -1718,6 +1786,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg_attr(feature = "execution-log", tracing::instrument(skip_all))]
     fn preserves_postgres_date_and_time_special_forms() {
         let db = Db::create();
         let mut session = db.create_session();
@@ -1737,6 +1806,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg_attr(feature = "execution-log", tracing::instrument(skip_all))]
     fn rejects_partially_null_match_full_keys() {
         let db = Db::create();
         let mut session = db.create_session();
@@ -1759,6 +1829,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg_attr(feature = "execution-log", tracing::instrument(skip_all))]
     fn creates_and_drops_tables_in_autocommit() {
         let db = Db::create();
         let mut session = db.create_session();
@@ -1776,6 +1847,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg_attr(feature = "execution-log", tracing::instrument(skip_all))]
     fn selects_projections_with_metadata_in_row_id_order() {
         let db = Db::create();
         let mut session = db.create_session();
@@ -1821,6 +1893,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg_attr(feature = "execution-log", tracing::instrument(skip_all))]
     fn binds_typed_parameters_and_prepared_statements() {
         let db = Db::create();
         let mut session = db.create_session();
@@ -1887,6 +1960,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg_attr(feature = "execution-log", tracing::instrument(skip_all))]
     fn preserves_comparison_coercion_for_point_lookup_candidates() {
         let db = Db::create();
         let mut session = db.create_session();
@@ -1925,6 +1999,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg_attr(feature = "execution-log", tracing::instrument(skip_all))]
     fn skips_scans_for_missing_prepared_unique_keys() {
         let db = Db::create();
         let mut session = db.create_session();
@@ -1959,6 +2034,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg_attr(feature = "execution-log", tracing::instrument(skip_all))]
     fn finishes_implicit_prepared_transactions() {
         let db = Db::create();
         let mut session = db.create_session();
@@ -1981,6 +2057,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg_attr(feature = "execution-log", tracing::instrument(skip_all))]
     fn matches_prepared_statement_parameter_contract() {
         let db = Db::create();
         let mut session = db.create_session();
@@ -2074,6 +2151,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg_attr(feature = "execution-log", tracing::instrument(skip_all))]
     fn execute_returns_each_multi_statement_result() {
         let db = Db::create();
         let mut session = db.create_session();
@@ -2117,6 +2195,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg_attr(feature = "execution-log", tracing::instrument(skip_all))]
     fn rolls_back_implicit_batches_at_first_error() {
         let db = Db::create();
         let mut session = db.create_session();
@@ -2165,6 +2244,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg_attr(feature = "execution-log", tracing::instrument(skip_all))]
     fn splits_simple_query_transactions_at_explicit_controls() {
         let db = Db::create();
         let mut session = db.create_session();
@@ -2237,6 +2317,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg_attr(feature = "execution-log", tracing::instrument(skip_all))]
     fn reports_metadata_for_every_phase_one_type() {
         let db = Db::create();
         let mut session = db.create_session();
@@ -2281,6 +2362,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg_attr(feature = "execution-log", tracing::instrument(skip_all))]
     fn excludes_other_transactions_uncommitted_rows_from_selects() {
         let db = Db::create();
         let mut session = db.create_session();
@@ -2308,6 +2390,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg_attr(feature = "execution-log", tracing::instrument(skip_all))]
     fn reports_unknown_tables_and_columns_in_selects() {
         let db = Db::create();
         let mut session = db.create_session();
@@ -2330,6 +2413,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg_attr(feature = "execution-log", tracing::instrument(skip_all))]
     fn evaluates_arithmetic_and_comparison_projections() {
         let db = Db::create();
         let mut session = db.create_session();
@@ -2405,6 +2489,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg_attr(feature = "execution-log", tracing::instrument(skip_all))]
     fn evaluates_case_and_common_scalar_functions() {
         let db = Db::create();
         let mut session = db.create_session();
@@ -2515,6 +2600,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg_attr(feature = "execution-log", tracing::instrument(skip_all))]
     fn accepts_minimum_int4_literal_in_simple_case() {
         let db = Db::create();
         let mut session = db.create_session();
@@ -2534,6 +2620,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg_attr(feature = "execution-log", tracing::instrument(skip_all))]
     fn supports_all_phase_one_numeric_types_in_abs() {
         let db = Db::create();
         let mut session = db.create_session();
@@ -2593,6 +2680,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg_attr(feature = "execution-log", tracing::instrument(skip_all))]
     fn reports_case_and_function_type_errors() {
         let db = Db::create();
         let mut session = db.create_session();
@@ -2619,6 +2707,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg_attr(feature = "execution-log", tracing::instrument(skip_all))]
     fn coerces_phase_one_types_in_all_cast_contexts() {
         let db = Db::create();
         let mut session = db.create_session();
@@ -2729,6 +2818,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg_attr(feature = "execution-log", tracing::instrument(skip_all))]
     fn reports_postgres_coercion_error_categories() {
         let db = Db::create();
         let mut session = db.create_session();
@@ -2780,6 +2870,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg_attr(feature = "execution-log", tracing::instrument(skip_all))]
     fn orders_rows_by_columns_expressions_and_output_positions() {
         let db = Db::create();
         let mut session = db.create_session();
@@ -2871,6 +2962,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg_attr(feature = "execution-log", tracing::instrument(skip_all))]
     fn applies_postgres_order_by_null_defaults_and_validates_positions() {
         let db = Db::create();
         let mut session = db.create_session();
@@ -2928,6 +3020,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg_attr(feature = "execution-log", tracing::instrument(skip_all))]
     fn applies_limits_and_offsets_after_ordering() {
         let db = Db::create();
         let mut session = db.create_session();
@@ -2983,6 +3076,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg_attr(feature = "execution-log", tracing::instrument(skip_all))]
     fn rejects_negative_limit_and_offset() {
         let db = Db::create();
         let mut session = db.create_session();
@@ -3006,6 +3100,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg_attr(feature = "execution-log", tracing::instrument(skip_all))]
     fn applies_defaults_to_inserted_and_updated_rows() {
         let db = Db::create();
         let mut session = db.create_session();
@@ -3069,6 +3164,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg_attr(feature = "execution-log", tracing::instrument(skip_all))]
     fn enforces_not_null_after_defaults_and_assignments() {
         let db = Db::create();
         let mut session = db.create_session();
@@ -3103,6 +3199,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg_attr(feature = "execution-log", tracing::instrument(skip_all))]
     fn enforces_check_constraints_on_insert_and_update() {
         let db = Db::create();
         let mut session = db.create_session();
@@ -3154,6 +3251,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg_attr(feature = "execution-log", tracing::instrument(skip_all))]
     fn enforces_primary_and_multi_column_unique_constraints() {
         let db = Db::create();
         let mut session = db.create_session();
@@ -3215,6 +3313,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg_attr(feature = "execution-log", tracing::instrument(skip_all))]
     fn rebuilds_unique_indexes_after_rollback() {
         let db = Db::create();
         let mut session = db.create_session();
@@ -3237,6 +3336,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg_attr(feature = "execution-log", tracing::instrument(skip_all))]
     fn controls_insert_and_update_visibility_with_explicit_transactions() {
         let db = Db::create();
         let mut first = db.create_session();
@@ -3293,6 +3393,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg_attr(feature = "execution-log", tracing::instrument(skip_all))]
     fn controls_snapshot_lifetime_by_isolation_level() {
         let db = Db::create();
         let mut first = db.create_session();
@@ -3328,6 +3429,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg_attr(feature = "execution-log", tracing::instrument(skip_all))]
     fn reclaims_deleted_rows_between_autocommit_statements() {
         let db = Db::create();
         let mut session = db.create_session();
@@ -3356,6 +3458,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg_attr(feature = "execution-log", tracing::instrument(skip_all))]
     fn retains_deleted_rows_until_repeatable_read_snapshot_finishes() {
         let db = Db::create();
         let mut reader = db.create_session();
@@ -3404,6 +3507,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg_attr(feature = "execution-log", tracing::instrument(skip_all))]
     fn follows_postgres_isolation_selection_order() {
         let db = Db::create();
         let mut first = db.create_session();
@@ -3474,6 +3578,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg_attr(feature = "execution-log", tracing::instrument(skip_all))]
     fn blocks_and_rechecks_read_committed_writer_after_commit() {
         let db = Db::create_builder()
             .set_lock_timeout(Duration::from_secs(2))
@@ -3510,6 +3615,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg_attr(feature = "execution-log", tracing::instrument(skip_all))]
     fn allows_blocked_writer_after_holder_rollback() {
         let db = Db::create_builder()
             .set_lock_timeout(Duration::from_secs(2))
@@ -3546,6 +3652,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg_attr(feature = "execution-log", tracing::instrument(skip_all))]
     fn aborts_newest_deadlocked_transaction_and_allows_survivor() {
         let db = Db::create_builder()
             .set_lock_timeout(Duration::from_secs(2))
@@ -3604,6 +3711,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg_attr(feature = "execution-log", tracing::instrument(skip_all))]
     fn fails_repeatable_read_writer_after_concurrent_commit() {
         let db = Db::create_builder()
             .set_lock_timeout(Duration::from_secs(2))
@@ -3642,6 +3750,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg_attr(feature = "execution-log", tracing::instrument(skip_all))]
     fn applies_update_and_share_row_lock_compatibility() {
         let db = Db::create_builder()
             .set_lock_timeout(Duration::from_secs(2))
@@ -3701,6 +3810,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg_attr(feature = "execution-log", tracing::instrument(skip_all))]
     fn controls_waits_with_builder_and_session_lock_timeouts() {
         let db = Db::create_builder()
             .set_lock_timeout(Duration::from_millis(40))
@@ -3734,6 +3844,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg_attr(feature = "execution-log", tracing::instrument(skip_all))]
     fn restores_row_after_rolled_back_update() {
         let db = Db::create();
         let mut session = db.create_session();
@@ -3757,6 +3868,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg_attr(feature = "execution-log", tracing::instrument(skip_all))]
     fn deletes_matching_rows_and_all_rows() {
         let db = Db::create();
         let mut session = db.create_session();
@@ -3794,6 +3906,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg_attr(feature = "execution-log", tracing::instrument(skip_all))]
     fn matches_delete_visibility_to_transaction_outcome() {
         let db = Db::create();
         let mut writer = db.create_session();
@@ -3840,6 +3953,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg_attr(feature = "execution-log", tracing::instrument(skip_all))]
     fn delete_requires_a_boolean_where_expression() {
         let db = Db::create();
         let mut session = db.create_session();
@@ -3861,6 +3975,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg_attr(feature = "execution-log", tracing::instrument(skip_all))]
     fn aborts_explicit_transactions_after_errors_and_rolls_back_on_drop() {
         let db = Db::create();
         let mut session = db.create_session();
@@ -3903,6 +4018,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg_attr(feature = "execution-log", tracing::instrument(skip_all))]
     fn rejects_ddl_inside_explicit_transactions() {
         let db = Db::create();
         let mut session = db.create_session();
@@ -3926,6 +4042,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg_attr(feature = "execution-log", tracing::instrument(skip_all))]
     fn insert_uses_exact_literal_types_and_commits() {
         let db = Db::create();
         let mut session = db.create_session();
@@ -3968,6 +4085,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg_attr(feature = "execution-log", tracing::instrument(skip_all))]
     fn executes_constant_select_values_and_default_rows() {
         let db = Db::create();
         let mut session = db.create_session();
@@ -4000,6 +4118,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg_attr(feature = "execution-log", tracing::instrument(skip_all))]
     fn binds_single_table_aliases_and_qualified_columns() {
         let db = Db::create();
         let mut session = db.create_session();
@@ -4036,6 +4155,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg_attr(feature = "execution-log", tracing::instrument(skip_all))]
     fn applies_quoted_aliases_and_reports_scope_errors() {
         let db = Db::create();
         let mut session = db.create_session();
@@ -4093,6 +4213,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg_attr(feature = "execution-log", tracing::instrument(skip_all))]
     fn joins_sources_and_merges_using_columns() {
         let db = Db::create();
         let mut session = db.create_session();
@@ -4204,6 +4325,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg_attr(feature = "execution-log", tracing::instrument(skip_all))]
     fn preserves_single_table_alias_scope_property() {
         for index in 0..32 {
             let db = Db::create();
@@ -4247,6 +4369,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg_attr(feature = "execution-log", tracing::instrument(skip_all))]
     fn materializes_derived_tables_and_uncorrelated_scalar_subqueries() {
         let db = Db::create();
         let mut session = db.create_session();
@@ -4319,6 +4442,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg_attr(feature = "execution-log", tracing::instrument(skip_all))]
     fn materializes_uncorrelated_subquery_predicates() {
         let db = Db::create();
         let mut session = db.create_session();
@@ -4362,6 +4486,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg_attr(feature = "execution-log", tracing::instrument(skip_all))]
     fn executes_correlated_subqueries_with_lexical_scopes() {
         let db = Db::create();
         let mut session = db.create_session();
@@ -4479,6 +4604,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg_attr(feature = "execution-log", tracing::instrument(skip_all))]
     fn tolerates_only_planner_settings_outside_strict_mode() {
         let db = Db::create();
         let mut session = db.create_session();

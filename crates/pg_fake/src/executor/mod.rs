@@ -93,6 +93,7 @@ pub(crate) use query::describe_query_result_columns;
 pub(crate) use query::materialize_uncorrelated_subqueries;
 
 impl DatabaseState {
+    #[cfg_attr(feature = "execution-log", tracing::instrument(skip_all))]
     pub(crate) fn create() -> Self {
         DatabaseState {
             catalog: Catalog::create(),
@@ -105,6 +106,7 @@ impl DatabaseState {
     }
 }
 
+#[cfg_attr(feature = "execution-log", tracing::instrument(skip_all))]
 pub(crate) fn execute_statement(
     state: &mut DatabaseState,
     statement: &ast::Statement,
@@ -602,6 +604,7 @@ pub(crate) fn execute_statement(
     }
 }
 
+#[cfg_attr(feature = "execution-log", tracing::instrument(skip_all))]
 fn create_generated_sequence_name(
     catalog: &Catalog,
     sequences: &[SequenceSchema],
@@ -622,6 +625,7 @@ fn create_generated_sequence_name(
         number += 1;
     }
 }
+#[cfg_attr(feature = "execution-log", tracing::instrument(skip_all))]
 pub(crate) fn normalize_unqualified_object_name(name: &ast::ObjectName) -> Result<String> {
     if name.0.len() != 1 {
         return reject_unsupported("schemas are not implemented");
@@ -632,6 +636,7 @@ pub(crate) fn normalize_unqualified_object_name(name: &ast::ObjectName) -> Resul
     Ok(normalize_identifier(identifier))
 }
 
+#[cfg_attr(feature = "execution-log", tracing::instrument(skip_all))]
 pub(crate) fn resolve_insert_table_name(table: &ast::TableObject) -> Result<String> {
     let ast::TableObject::TableName(table_name) = table else {
         return reject_unsupported("insert target is not a table");
@@ -639,6 +644,7 @@ pub(crate) fn resolve_insert_table_name(table: &ast::TableObject) -> Result<Stri
     normalize_unqualified_object_name(table_name)
 }
 
+#[cfg_attr(feature = "execution-log", tracing::instrument(skip_all))]
 pub(crate) fn normalize_identifier(identifier: &ast::Ident) -> String {
     if identifier.quote_style.is_some() {
         identifier.value.clone()
@@ -647,6 +653,7 @@ pub(crate) fn normalize_identifier(identifier: &ast::Ident) -> String {
     }
 }
 
+#[cfg_attr(feature = "execution-log", tracing::instrument(skip_all))]
 fn resolve_index_column_name(column: &ast::IndexColumn) -> Result<String> {
     let ast::Expr::Identifier(identifier) = &column.column.expr else {
         return reject_unsupported("index expressions are not implemented");
@@ -659,6 +666,7 @@ mod tests {
     use super::*;
 
     #[test]
+    #[cfg_attr(feature = "execution-log", tracing::instrument(skip_all))]
     fn compares_all_phase_one_value_types() {
         let pairs = [
             (Value::Bool(false), Value::Bool(true)),

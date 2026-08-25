@@ -98,12 +98,14 @@ pub(crate) struct Catalog {
 }
 
 impl Default for Catalog {
+    #[cfg_attr(feature = "execution-log", tracing::instrument(skip_all))]
     fn default() -> Self {
         Self::create()
     }
 }
 
 impl Catalog {
+    #[cfg_attr(feature = "execution-log", tracing::instrument(skip_all))]
     pub(crate) fn create() -> Self {
         Catalog {
             public: Schema {
@@ -116,6 +118,7 @@ impl Catalog {
         }
     }
 
+    #[cfg_attr(feature = "execution-log", tracing::instrument(skip_all))]
     pub(crate) fn create_table(
         &mut self,
         name: String,
@@ -143,6 +146,7 @@ impl Catalog {
         Ok(id)
     }
 
+    #[cfg_attr(feature = "execution-log", tracing::instrument(skip_all))]
     pub(crate) fn require_table(&self, name: &str) -> Result<&TableSchema> {
         if self.public.sequences.contains_key(name) {
             return Err(PgError::create(
@@ -158,10 +162,12 @@ impl Catalog {
         })
     }
 
+    #[cfg_attr(feature = "execution-log", tracing::instrument(skip_all))]
     pub(crate) fn iterate_tables(&self) -> impl Iterator<Item = &TableSchema> {
         self.public.tables.values()
     }
 
+    #[cfg_attr(feature = "execution-log", tracing::instrument(skip_all))]
     pub(crate) fn drop_table(&mut self, name: &str) -> Result<TableSchema> {
         if self.public.sequences.contains_key(name) {
             return Err(PgError::create(
@@ -192,15 +198,18 @@ impl Catalog {
         })
     }
 
+    #[cfg_attr(feature = "execution-log", tracing::instrument(skip_all))]
     pub(crate) fn restore_table(&mut self, table: TableSchema) {
         let previous = self.public.tables.insert(table.name.clone(), table);
         assert!(previous.is_none(), "restored table must not already exist");
     }
 
+    #[cfg_attr(feature = "execution-log", tracing::instrument(skip_all))]
     pub(crate) fn has_relation(&self, name: &str) -> bool {
         self.public.tables.contains_key(name) || self.public.sequences.contains_key(name)
     }
 
+    #[cfg_attr(feature = "execution-log", tracing::instrument(skip_all))]
     pub(crate) fn create_sequence(&mut self, mut sequence: SequenceSchema) -> Result<SequenceId> {
         if self.has_relation(&sequence.name) {
             return Err(PgError::create(
@@ -217,6 +226,7 @@ impl Catalog {
         Ok(id)
     }
 
+    #[cfg_attr(feature = "execution-log", tracing::instrument(skip_all))]
     pub(crate) fn require_sequence(&self, name: &str) -> Result<&SequenceSchema> {
         if self.public.tables.contains_key(name) {
             return Err(PgError::create(
@@ -232,10 +242,12 @@ impl Catalog {
         })
     }
 
+    #[cfg_attr(feature = "execution-log", tracing::instrument(skip_all))]
     pub(crate) fn iterate_sequences(&self) -> impl Iterator<Item = &SequenceSchema> {
         self.public.sequences.values()
     }
 
+    #[cfg_attr(feature = "execution-log", tracing::instrument(skip_all))]
     pub(crate) fn drop_sequence(&mut self, name: &str) -> Result<SequenceSchema> {
         if self.public.tables.contains_key(name) {
             return Err(PgError::create(
@@ -264,6 +276,7 @@ impl Catalog {
         })
     }
 
+    #[cfg_attr(feature = "execution-log", tracing::instrument(skip_all))]
     pub(crate) fn drop_owned_sequences(&mut self, table_name: &str) -> Vec<SequenceSchema> {
         let names = self
             .public
@@ -285,6 +298,7 @@ impl Catalog {
             .collect()
     }
 
+    #[cfg_attr(feature = "execution-log", tracing::instrument(skip_all))]
     pub(crate) fn restore_sequence(&mut self, sequence: SequenceSchema) {
         let previous = self
             .public
@@ -302,6 +316,7 @@ mod tests {
     use super::*;
     use crate::value::BaseType;
 
+    #[cfg_attr(feature = "execution-log", tracing::instrument(skip_all))]
     fn create_column(name: &str, nullable: bool) -> ColumnDef {
         ColumnDef {
             name: name.into(),
@@ -314,6 +329,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg_attr(feature = "execution-log", tracing::instrument(skip_all))]
     fn creates_looks_up_and_drops_tables() {
         let mut catalog = Catalog::create();
         let users = catalog
@@ -346,6 +362,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg_attr(feature = "execution-log", tracing::instrument(skip_all))]
     fn reports_42p07_for_duplicate_table() {
         let mut catalog = Catalog::create();
         catalog
@@ -360,6 +377,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg_attr(feature = "execution-log", tracing::instrument(skip_all))]
     fn reports_42p01_for_missing_table() {
         let mut catalog = Catalog::create();
 

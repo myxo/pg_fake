@@ -1,6 +1,7 @@
 use super::*;
 use sqlparser::ast;
 
+#[cfg_attr(feature = "execution-log", tracing::instrument(skip_all))]
 pub(super) fn convert_referential_action(
     action: Option<ast::ReferentialAction>,
 ) -> ForeignKeyAction {
@@ -13,11 +14,13 @@ pub(super) fn convert_referential_action(
     }
 }
 
+#[cfg_attr(feature = "execution-log", tracing::instrument(skip_all))]
 pub(super) fn resolve_foreign_key_name(name: Option<&ast::Ident>, default: String) -> String {
     let name = name.map(normalize_identifier).unwrap_or_default();
     if name.is_empty() { default } else { name }
 }
 
+#[cfg_attr(feature = "execution-log", tracing::instrument(skip_all))]
 fn is_foreign_key_deferred(
     foreign_key: &ForeignKey,
     deferred_constraints: &BTreeSet<String>,
@@ -29,6 +32,7 @@ fn is_foreign_key_deferred(
             || deferred_constraints.contains(&foreign_key.name))
 }
 
+#[cfg_attr(feature = "execution-log", tracing::instrument(skip_all))]
 pub(crate) fn contains_deferred_foreign_keys(
     state: &DatabaseState,
     deferred_constraints: &BTreeSet<String>,
@@ -44,6 +48,7 @@ pub(crate) fn contains_deferred_foreign_keys(
     })
 }
 
+#[cfg_attr(feature = "execution-log", tracing::instrument(skip_all))]
 pub(super) fn resolve_foreign_key_column_indexes(
     schema: &TableSchema,
     columns: &[String],
@@ -65,6 +70,7 @@ pub(super) fn resolve_foreign_key_column_indexes(
         .collect()
 }
 
+#[cfg_attr(feature = "execution-log", tracing::instrument(skip_all))]
 fn compare_foreign_key_keys(left: &[Value], right: &[Value]) -> Result<bool> {
     left.iter()
         .zip(right)
@@ -79,6 +85,7 @@ fn compare_foreign_key_keys(left: &[Value], right: &[Value]) -> Result<bool> {
         })
 }
 
+#[cfg_attr(feature = "execution-log", tracing::instrument(skip_all))]
 pub(super) fn validate_foreign_key_definitions(
     catalog: &Catalog,
     schema: &TableSchema,
@@ -142,6 +149,7 @@ pub(super) fn validate_foreign_key_definitions(
     Ok(())
 }
 
+#[cfg_attr(feature = "execution-log", tracing::instrument(skip_all))]
 pub(super) fn validate_row_foreign_keys(
     state: &DatabaseState,
     schema: &TableSchema,
@@ -211,6 +219,7 @@ pub(super) fn validate_row_foreign_keys(
     Ok(())
 }
 
+#[cfg_attr(feature = "execution-log", tracing::instrument(skip_all))]
 pub(crate) fn validate_deferred_foreign_keys(state: &DatabaseState, xid: Xid) -> Result<()> {
     let snapshot = Snapshot::create(&state.transactions);
     for schema in state.catalog.iterate_tables() {
@@ -242,6 +251,7 @@ pub(crate) fn validate_deferred_foreign_keys(state: &DatabaseState, xid: Xid) ->
     Ok(())
 }
 
+#[cfg_attr(feature = "execution-log", tracing::instrument(skip_all))]
 pub(super) fn apply_referencing_foreign_key_actions(
     state: &mut DatabaseState,
     parent_schema: &TableSchema,
@@ -435,6 +445,7 @@ pub(super) fn apply_referencing_foreign_key_actions(
     Ok(())
 }
 
+#[cfg_attr(feature = "execution-log", tracing::instrument(skip_all))]
 fn apply_cascaded_row_update(
     state: &mut DatabaseState,
     schema: &TableSchema,

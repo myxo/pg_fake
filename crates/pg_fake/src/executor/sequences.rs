@@ -36,6 +36,7 @@ pub(crate) struct SequenceExecutionContext {
 }
 
 impl SequenceExecutionContext {
+    #[cfg_attr(feature = "execution-log", tracing::instrument(skip_all))]
     pub(crate) fn create(
         catalog: &Catalog,
         values: SequenceStorage,
@@ -55,6 +56,7 @@ impl SequenceExecutionContext {
         }
     }
 
+    #[cfg_attr(feature = "execution-log", tracing::instrument(skip_all))]
     fn require_sequence(&self, name: &str) -> Result<&SequenceSchema> {
         let name = normalize_sequence_name(name)?;
         if self.tables.contains(&name) {
@@ -71,6 +73,7 @@ impl SequenceExecutionContext {
         })
     }
 
+    #[cfg_attr(feature = "execution-log", tracing::instrument(skip_all))]
     pub(crate) fn get_next_value(&self, name: &str) -> Result<i64> {
         let sequence = self.require_sequence(name)?;
         let value = {
@@ -105,6 +108,7 @@ impl SequenceExecutionContext {
         Ok(value)
     }
 
+    #[cfg_attr(feature = "execution-log", tracing::instrument(skip_all))]
     pub(crate) fn get_current_value(&self, name: &str) -> Result<i64> {
         let sequence = self.require_sequence(name)?;
         self.session
@@ -124,6 +128,7 @@ impl SequenceExecutionContext {
             })
     }
 
+    #[cfg_attr(feature = "execution-log", tracing::instrument(skip_all))]
     pub(crate) fn get_last_value(&self) -> Result<i64> {
         let session = self.session.lock().expect("sequence session is poisoned");
         let Some(id) = session.last_used else {
@@ -139,6 +144,7 @@ impl SequenceExecutionContext {
             .ok_or_else(create_lastval_error)
     }
 
+    #[cfg_attr(feature = "execution-log", tracing::instrument(skip_all))]
     pub(crate) fn set_value(&self, name: &str, value: i64, is_called: bool) -> Result<i64> {
         let sequence = self.require_sequence(name)?;
         if !(sequence.min_value..=sequence.max_value).contains(&value) {
@@ -167,6 +173,7 @@ impl SequenceExecutionContext {
         Ok(value)
     }
 
+    #[cfg_attr(feature = "execution-log", tracing::instrument(skip_all))]
     pub(crate) fn get_owned_sequence(&self, table: &str, column: &str) -> Result<Option<String>> {
         let table = normalize_sequence_name(table)?;
         let column = normalize_sequence_name(column)?;
@@ -177,6 +184,7 @@ impl SequenceExecutionContext {
     }
 }
 
+#[cfg_attr(feature = "execution-log", tracing::instrument(skip_all))]
 pub(crate) fn create_sequence_schema(
     name: String,
     data_type: Option<&ast::DataType>,
@@ -189,6 +197,7 @@ pub(crate) fn create_sequence_schema(
     create_sequence_schema_for_type(name, data_type, options)
 }
 
+#[cfg_attr(feature = "execution-log", tracing::instrument(skip_all))]
 pub(crate) fn create_sequence_schema_for_type(
     name: String,
     data_type: BaseType,
@@ -273,6 +282,7 @@ pub(crate) fn create_sequence_schema_for_type(
     })
 }
 
+#[cfg_attr(feature = "execution-log", tracing::instrument(skip_all))]
 fn parse_i64(expression: &ast::Expr) -> Result<i64> {
     let text = match expression {
         ast::Expr::Value(value) => match &value.value {
@@ -298,6 +308,7 @@ fn parse_i64(expression: &ast::Expr) -> Result<i64> {
     })
 }
 
+#[cfg_attr(feature = "execution-log", tracing::instrument(skip_all))]
 fn extract_unsigned_integer(expression: &ast::Expr) -> Result<&str> {
     match expression {
         ast::Expr::Value(value) => match &value.value {
@@ -308,6 +319,7 @@ fn extract_unsigned_integer(expression: &ast::Expr) -> Result<&str> {
     }
 }
 
+#[cfg_attr(feature = "execution-log", tracing::instrument(skip_all))]
 fn normalize_sequence_name(name: &str) -> Result<String> {
     let mut parts = Vec::new();
     let mut current = String::new();
@@ -355,6 +367,7 @@ fn normalize_sequence_name(name: &str) -> Result<String> {
     }
 }
 
+#[cfg_attr(feature = "execution-log", tracing::instrument(skip_all))]
 fn create_limit_error(sequence: &SequenceSchema) -> PgError {
     PgError::create(
         SqlState::SequenceGeneratorLimitExceeded,
@@ -375,6 +388,7 @@ fn create_limit_error(sequence: &SequenceSchema) -> PgError {
     )
 }
 
+#[cfg_attr(feature = "execution-log", tracing::instrument(skip_all))]
 fn create_lastval_error() -> PgError {
     PgError::create(
         SqlState::ObjectNotInPrerequisiteState,

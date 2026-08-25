@@ -72,6 +72,7 @@ pub(crate) struct Table {
 }
 
 impl Table {
+    #[cfg_attr(feature = "execution-log", tracing::instrument(skip_all))]
     pub(crate) fn create(schema: TableSchema) -> Self {
         let indexes = schema
             .constraints
@@ -109,6 +110,7 @@ impl Table {
         }
     }
 
+    #[cfg_attr(feature = "execution-log", tracing::instrument(skip_all))]
     pub(crate) fn insert(&mut self, xmin: Xid, row: Row) -> RowId {
         let row_id = RowId(self.next_rowid);
         self.next_rowid += 1;
@@ -128,6 +130,7 @@ impl Table {
         row_id
     }
 
+    #[cfg_attr(feature = "execution-log", tracing::instrument(skip_all))]
     pub(crate) fn mark_version_deleted(
         &mut self,
         row_id: RowId,
@@ -154,6 +157,7 @@ impl Table {
         row_id
     }
 
+    #[cfg_attr(feature = "execution-log", tracing::instrument(skip_all))]
     pub(crate) fn append_updated_version(
         &mut self,
         row_id: RowId,
@@ -177,6 +181,7 @@ impl Table {
         row_id
     }
 
+    #[cfg_attr(feature = "execution-log", tracing::instrument(skip_all))]
     pub(crate) fn discard_transaction_versions(&mut self, xid: Xid) {
         self.reclamation.pending.remove(&xid);
         self.version_chains.chains.retain(|_, chain| {
@@ -191,6 +196,7 @@ impl Table {
         self.rebuild_indexes();
     }
 
+    #[cfg_attr(feature = "execution-log", tracing::instrument(skip_all))]
     pub(crate) fn commit_transaction_versions(&mut self, xid: Xid, commit_seq: CommitSeq) {
         if let Some(row_ids) = self.reclamation.pending.remove(&xid) {
             self.reclamation
@@ -201,6 +207,7 @@ impl Table {
         }
     }
 
+    #[cfg_attr(feature = "execution-log", tracing::instrument(skip_all))]
     pub(crate) fn prune_versions(
         &mut self,
         horizon: CommitSeq,
@@ -272,6 +279,7 @@ impl Table {
         }
     }
 
+    #[cfg_attr(feature = "execution-log", tracing::instrument(skip_all))]
     pub(crate) fn iterate_version_chains(&self) -> impl Iterator<Item = (RowId, &RowVersionChain)> {
         self.version_chains
             .chains
@@ -279,6 +287,7 @@ impl Table {
             .map(|(row_id, chain)| (*row_id, chain))
     }
 
+    #[cfg_attr(feature = "execution-log", tracing::instrument(skip_all))]
     pub(crate) fn has_visible_unique_conflict(
         &self,
         row: &Row,
@@ -307,6 +316,7 @@ impl Table {
         })
     }
 
+    #[cfg_attr(feature = "execution-log", tracing::instrument(skip_all))]
     pub(crate) fn find_unique_row(
         &self,
         columns: &[usize],
@@ -326,10 +336,12 @@ impl Table {
         })
     }
 
+    #[cfg_attr(feature = "execution-log", tracing::instrument(skip_all))]
     pub(crate) fn has_unique_index(&self, columns: &[usize]) -> bool {
         self.indexes.iter().any(|index| index.columns == columns)
     }
 
+    #[cfg_attr(feature = "execution-log", tracing::instrument(skip_all))]
     pub(crate) fn find_unique_visible_row(
         &self,
         columns: &[usize],
@@ -346,6 +358,7 @@ impl Table {
             .map(|version| &version.row)
     }
 
+    #[cfg_attr(feature = "execution-log", tracing::instrument(skip_all))]
     fn add_index_entries(&mut self, row_id: RowId, row: &Row) {
         let entries = self
             .indexes
@@ -359,6 +372,7 @@ impl Table {
         }
     }
 
+    #[cfg_attr(feature = "execution-log", tracing::instrument(skip_all))]
     fn rebuild_indexes(&mut self) {
         for index in &mut self.indexes {
             index.entries.clear();
@@ -389,6 +403,7 @@ impl Table {
     }
 }
 
+#[cfg_attr(feature = "execution-log", tracing::instrument(skip_all))]
 fn build_row_index_key(
     schema: &TableSchema,
     index: &UniqueIndex,
@@ -402,6 +417,7 @@ fn build_row_index_key(
     build_index_key(schema, &index.columns, &values)
 }
 
+#[cfg_attr(feature = "execution-log", tracing::instrument(skip_all))]
 fn build_index_key(
     schema: &TableSchema,
     columns: &[usize],
@@ -416,6 +432,7 @@ fn build_index_key(
         .map(UniqueIndexKey)
 }
 
+#[cfg_attr(feature = "execution-log", tracing::instrument(skip_all))]
 fn normalize_index_value(value: &Value, base: BaseType) -> Option<NormalizedIndexValue> {
     match (value, base) {
         (Value::Null, _) => None,
@@ -476,6 +493,7 @@ mod tests {
 
     use super::*;
 
+    #[cfg_attr(feature = "execution-log", tracing::instrument(skip_all))]
     fn create_table() -> Table {
         let mut catalog = Catalog::create();
         let table_id = catalog
@@ -496,6 +514,7 @@ mod tests {
         Table::create(catalog.require_table("items").unwrap().clone())
     }
 
+    #[cfg_attr(feature = "execution-log", tracing::instrument(skip_all))]
     fn create_indexed_table() -> Table {
         let mut catalog = Catalog::create();
         catalog
@@ -516,6 +535,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg_attr(feature = "execution-log", tracing::instrument(skip_all))]
     fn creates_new_version_chain_for_insert() {
         let mut table = create_table();
         let row_id = table.insert(Xid(10), vec![Value::Int4(1)]);
@@ -532,6 +552,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg_attr(feature = "execution-log", tracing::instrument(skip_all))]
     fn finds_visible_rows_through_a_unique_index() {
         let mut table = create_indexed_table();
         let mut transactions = TransactionRegistry::create();
@@ -550,6 +571,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg_attr(feature = "execution-log", tracing::instrument(skip_all))]
     fn retires_old_version_and_appends_new_version_for_update() {
         let mut table = create_table();
         let row_id = table.insert(Xid(10), vec![Value::Int4(1)]);
@@ -576,6 +598,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg_attr(feature = "execution-log", tracing::instrument(skip_all))]
     fn abort_removes_created_versions_and_restores_retired_versions() {
         let mut table = create_table();
         let existing = table.insert(Xid(10), vec![Value::Int4(1)]);
@@ -596,6 +619,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg_attr(feature = "execution-log", tracing::instrument(skip_all))]
     fn marks_current_version_deleted() {
         let mut table = create_table();
         let row_id = table.insert(Xid(10), vec![Value::Int4(1)]);

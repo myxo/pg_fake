@@ -7,6 +7,7 @@ use sqlparser::{dialect::PostgreSqlDialect, parser::Parser};
 use crate::error::{PgError, Result, SqlState};
 
 /// Parses one or more PostgreSQL statements into owned syntax trees.
+#[cfg_attr(feature = "execution-log", tracing::instrument(skip_all))]
 pub fn parse(sql: &str) -> Result<Vec<ast::Statement>> {
     Parser::parse_sql(&PostgreSqlDialect {}, sql)
         .map_err(|error| PgError::create(SqlState::SyntaxError, error.to_string()))
@@ -22,6 +23,7 @@ pub(crate) enum StatementKind {
     Unsupported,
 }
 
+#[cfg_attr(feature = "execution-log", tracing::instrument(skip_all))]
 pub(crate) fn classify(statement: &ast::Statement) -> StatementKind {
     match statement {
         ast::Statement::CreateTable(_)
@@ -52,6 +54,7 @@ mod tests {
     use super::*;
 
     #[test]
+    #[cfg_attr(feature = "execution-log", tracing::instrument(skip_all))]
     fn parses_postgres_sql() {
         let statements = parse("CREATE TABLE users (id INTEGER); SELECT * FROM users").unwrap();
 
@@ -61,6 +64,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg_attr(feature = "execution-log", tracing::instrument(skip_all))]
     fn reports_syntax_errors() {
         let error = parse("SELECT FROM").unwrap_err();
 
@@ -68,6 +72,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg_attr(feature = "execution-log", tracing::instrument(skip_all))]
     fn preserves_foreign_key_match_kind() {
         let statements = parse(
             "CREATE TABLE child (parent_id INTEGER, CONSTRAINT child_parent_fkey FOREIGN KEY (parent_id) REFERENCES parent (id) MATCH FULL)",
@@ -91,6 +96,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg_attr(feature = "execution-log", tracing::instrument(skip_all))]
     fn classifies_statement_families() {
         let cases = [
             ("CREATE TABLE t (id INTEGER)", StatementKind::Ddl),

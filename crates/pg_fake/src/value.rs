@@ -75,6 +75,7 @@ pub enum BaseType {
 
 impl BaseType {
     /// The `pg_type` OID for this base type.
+    #[cfg_attr(feature = "execution-log", tracing::instrument(skip_all))]
     pub fn map_to_oid(self) -> Oid {
         match self {
             BaseType::Bool => 16,
@@ -98,6 +99,7 @@ impl BaseType {
     }
 
     /// The canonical (internal) PostgreSQL type name, e.g. `int4`, `bpchar`.
+    #[cfg_attr(feature = "execution-log", tracing::instrument(skip_all))]
     pub fn get_postgres_name(self) -> &'static str {
         match self {
             BaseType::Bool => "bool",
@@ -121,6 +123,7 @@ impl BaseType {
     }
 
     /// Look up a base type by OID.
+    #[cfg_attr(feature = "execution-log", tracing::instrument(skip_all))]
     pub fn resolve_oid(oid: Oid) -> Option<BaseType> {
         match oid {
             16 => Some(BaseType::Bool),
@@ -146,6 +149,7 @@ impl BaseType {
 
     /// Look up a base type by SQL type name, accepting common aliases.
     /// Matching is case-insensitive.
+    #[cfg_attr(feature = "execution-log", tracing::instrument(skip_all))]
     pub(crate) fn parse_sql_name(name: &str) -> Option<BaseType> {
         match name.trim().to_ascii_lowercase().as_str() {
             "bool" | "boolean" => Some(BaseType::Bool),
@@ -184,6 +188,7 @@ pub(crate) struct PgType {
 impl PgType {
     pub(crate) const NO_TYPEMOD: i32 = -1;
 
+    #[cfg_attr(feature = "execution-log", tracing::instrument(skip_all))]
     pub(crate) fn create(base: BaseType) -> Self {
         PgType {
             base,
@@ -191,10 +196,12 @@ impl PgType {
         }
     }
 
+    #[cfg_attr(feature = "execution-log", tracing::instrument(skip_all))]
     pub(crate) fn create_with_typmod(base: BaseType, typmod: i32) -> Self {
         PgType { base, typmod }
     }
 
+    #[cfg_attr(feature = "execution-log", tracing::instrument(skip_all))]
     pub(crate) fn map_to_oid(self) -> Oid {
         self.base.map_to_oid()
     }
@@ -226,6 +233,7 @@ pub enum Value {
 }
 
 impl Value {
+    #[cfg_attr(feature = "execution-log", tracing::instrument(skip_all))]
     pub fn is_null(&self) -> bool {
         matches!(self, Value::Null)
     }
@@ -234,6 +242,7 @@ impl Value {
     ///
     /// For `Text` values the result is `BaseType::Text`; the catalog
     /// disambiguates `varchar`/`bpchar`.
+    #[cfg_attr(feature = "execution-log", tracing::instrument(skip_all))]
     pub fn get_base_type(&self) -> Option<BaseType> {
         match self {
             Value::Null => None,
@@ -259,6 +268,7 @@ impl Value {
     ///
     /// For `Null` returns an empty string; callers that need to distinguish
     /// NULL should check `is_null()` first.
+    #[cfg_attr(feature = "execution-log", tracing::instrument(skip_all))]
     pub fn format_postgres_text(&self) -> String {
         match self {
             Value::Null => String::new(),
@@ -325,6 +335,7 @@ impl Value {
     /// Parse a text input literal into a `Value` of the given base type
     /// (the type's `typinput` function). Invalid syntax yields `22P02`;
     /// out-of-range values yield `22003`.
+    #[cfg_attr(feature = "execution-log", tracing::instrument(skip_all))]
     pub(crate) fn parse(base: BaseType, input: &str) -> Result<Value> {
         match base {
             BaseType::Bool => parse_bool(input).map(Value::Bool),
@@ -352,6 +363,7 @@ impl Value {
     }
 }
 
+#[cfg_attr(feature = "execution-log", tracing::instrument(skip_all))]
 fn format_interval(value: PgInterval) -> String {
     let mut fields = Vec::new();
     if value.months != 0 {
@@ -396,6 +408,7 @@ fn format_interval(value: PgInterval) -> String {
     fields.join(" ")
 }
 
+#[cfg_attr(feature = "execution-log", tracing::instrument(skip_all))]
 fn parse_interval(input: &str) -> Result<PgInterval> {
     let input = input.trim();
     if input.is_empty() {
@@ -527,6 +540,7 @@ fn parse_interval(input: &str) -> Result<PgInterval> {
     Ok(value)
 }
 
+#[cfg_attr(feature = "execution-log", tracing::instrument(skip_all))]
 fn format_timestamp(value: NaiveDateTime) -> String {
     let output = value.format("%Y-%m-%d %H:%M:%S%.6f").to_string();
     output
@@ -535,6 +549,7 @@ fn format_timestamp(value: NaiveDateTime) -> String {
         .to_string()
 }
 
+#[cfg_attr(feature = "execution-log", tracing::instrument(skip_all))]
 fn format_float8(f: f64) -> String {
     if f.is_nan() {
         return "NaN".into();
@@ -549,6 +564,7 @@ fn format_float8(f: f64) -> String {
     format!("{}", f)
 }
 
+#[cfg_attr(feature = "execution-log", tracing::instrument(skip_all))]
 fn parse_date(input: &str) -> Result<PgDate> {
     match input.trim().to_ascii_lowercase().as_str() {
         "infinity" => Ok(PgDate::Infinity),
@@ -559,6 +575,7 @@ fn parse_date(input: &str) -> Result<PgDate> {
     }
 }
 
+#[cfg_attr(feature = "execution-log", tracing::instrument(skip_all))]
 fn parse_time(input: &str) -> Result<PgTime> {
     let input = input.trim();
     if input == "24:00" || input == "24:00:00" || input == "24:00:00.0" {
@@ -573,6 +590,7 @@ fn parse_time(input: &str) -> Result<PgTime> {
     ))
 }
 
+#[cfg_attr(feature = "execution-log", tracing::instrument(skip_all))]
 fn parse_timestamp(input: &str) -> Result<PgTimestamp> {
     let input = input.trim();
     match input.to_ascii_lowercase().as_str() {
@@ -596,6 +614,7 @@ fn parse_timestamp(input: &str) -> Result<PgTimestamp> {
     .ok_or_else(|| create_invalid_text_error(input, "timestamp"))
 }
 
+#[cfg_attr(feature = "execution-log", tracing::instrument(skip_all))]
 fn parse_timestamptz(input: &str) -> Result<PgTimestampTz> {
     let input = input.trim();
     match input.to_ascii_lowercase().as_str() {
@@ -617,6 +636,7 @@ fn parse_timestamptz(input: &str) -> Result<PgTimestampTz> {
     .ok_or_else(|| create_invalid_text_error(input, "timestamp with time zone"))
 }
 
+#[cfg_attr(feature = "execution-log", tracing::instrument(skip_all))]
 fn normalize_rfc3339_input(input: &str) -> String {
     let mut input = input.replacen(' ', "T", 1);
     if input.len() >= 3 {
@@ -628,6 +648,7 @@ fn normalize_rfc3339_input(input: &str) -> String {
     input
 }
 
+#[cfg_attr(feature = "execution-log", tracing::instrument(skip_all))]
 fn parse_bool(input: &str) -> Result<bool> {
     match input.trim().to_ascii_lowercase().as_str() {
         "t" | "true" | "y" | "yes" | "on" | "1" => Ok(true),
@@ -636,6 +657,7 @@ fn parse_bool(input: &str) -> Result<bool> {
     }
 }
 
+#[cfg_attr(feature = "execution-log", tracing::instrument(skip_all))]
 fn parse_int<T: std::str::FromStr<Err = std::num::ParseIntError>>(input: &str) -> Result<T> {
     input.trim().parse::<T>().map_err(|e| match e.kind() {
         std::num::IntErrorKind::PosOverflow | std::num::IntErrorKind::NegOverflow => {
@@ -648,6 +670,7 @@ fn parse_int<T: std::str::FromStr<Err = std::num::ParseIntError>>(input: &str) -
     })
 }
 
+#[cfg_attr(feature = "execution-log", tracing::instrument(skip_all))]
 fn parse_float<T: FloatExt>(input: &str) -> Result<T> {
     let s = input.trim();
     let lower = s.to_ascii_lowercase();
@@ -673,16 +696,19 @@ trait FloatExt: Copy + std::str::FromStr<Err = std::num::ParseFloatError> {
     fn is_infinite(self) -> bool;
 }
 impl FloatExt for f32 {
+    #[cfg_attr(feature = "execution-log", tracing::instrument(skip_all))]
     fn is_infinite(self) -> bool {
         f32::is_infinite(self)
     }
 }
 impl FloatExt for f64 {
+    #[cfg_attr(feature = "execution-log", tracing::instrument(skip_all))]
     fn is_infinite(self) -> bool {
         f64::is_infinite(self)
     }
 }
 
+#[cfg_attr(feature = "execution-log", tracing::instrument(skip_all))]
 fn parse_bytea(input: &str) -> Result<Vec<u8>> {
     let s = input.trim();
     if let Some(hex) = s.strip_prefix("\\x") {
@@ -692,6 +718,7 @@ fn parse_bytea(input: &str) -> Result<Vec<u8>> {
     }
 }
 
+#[cfg_attr(feature = "execution-log", tracing::instrument(skip_all))]
 fn decode_hex(hex: &str) -> std::result::Result<Vec<u8>, ()> {
     if !hex.len().is_multiple_of(2) {
         return Err(());
@@ -705,6 +732,7 @@ fn decode_hex(hex: &str) -> std::result::Result<Vec<u8>, ()> {
 }
 
 /// Legacy "escape" bytea format: `\\` -> `\`, `\<ooo>` (octal) -> byte, else literal.
+#[cfg_attr(feature = "execution-log", tracing::instrument(skip_all))]
 fn parse_bytea_escape(s: &str) -> std::result::Result<Vec<u8>, ()> {
     let bytes = s.as_bytes();
     let mut out = Vec::new();
@@ -739,6 +767,7 @@ fn parse_bytea_escape(s: &str) -> std::result::Result<Vec<u8>, ()> {
     Ok(out)
 }
 
+#[cfg_attr(feature = "execution-log", tracing::instrument(skip_all))]
 fn create_invalid_text_error(input: &str, type_name: &str) -> PgError {
     PgError::create(
         SqlState::InvalidTextRepresentation,
@@ -751,6 +780,7 @@ mod tests {
     use super::*;
 
     #[test]
+    #[cfg_attr(feature = "execution-log", tracing::instrument(skip_all))]
     fn stores_pg_type_typmod() {
         let t = PgType::create(BaseType::Varchar);
         assert_eq!(t.typmod, PgType::NO_TYPEMOD);
@@ -760,6 +790,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg_attr(feature = "execution-log", tracing::instrument(skip_all))]
     fn roundtrips_integers() {
         for (base, text) in [
             (BaseType::Int2, "32767"),
@@ -775,6 +806,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg_attr(feature = "execution-log", tracing::instrument(skip_all))]
     fn reports_22003_for_integer_overflow() {
         let err = Value::parse(BaseType::Int2, "40000").unwrap_err();
         assert_eq!(err.sqlstate, SqlState::NumericValueOutOfRange);
@@ -783,12 +815,14 @@ mod tests {
     }
 
     #[test]
+    #[cfg_attr(feature = "execution-log", tracing::instrument(skip_all))]
     fn reports_22p02_for_invalid_integer_syntax() {
         let err = Value::parse(BaseType::Int4, "abc").unwrap_err();
         assert_eq!(err.sqlstate, SqlState::InvalidTextRepresentation);
     }
 
     #[test]
+    #[cfg_attr(feature = "execution-log", tracing::instrument(skip_all))]
     fn accepts_postgres_boolean_forms() {
         for t in ["t", "TRUE", "y", "yes", "on", "1"] {
             assert_eq!(Value::parse(BaseType::Bool, t).unwrap(), Value::Bool(true));
@@ -801,6 +835,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg_attr(feature = "execution-log", tracing::instrument(skip_all))]
     fn roundtrips_floats_and_special_values() {
         let v = Value::parse(BaseType::Float8, "1.5").unwrap();
         assert_eq!(v.format_postgres_text(), "1.5");
@@ -813,12 +848,14 @@ mod tests {
     }
 
     #[test]
+    #[cfg_attr(feature = "execution-log", tracing::instrument(skip_all))]
     fn reports_22003_for_float_overflow() {
         let err = Value::parse(BaseType::Float4, "1e999").unwrap_err();
         assert_eq!(err.sqlstate, SqlState::NumericValueOutOfRange);
     }
 
     #[test]
+    #[cfg_attr(feature = "execution-log", tracing::instrument(skip_all))]
     fn parses_numeric_beyond_i64() {
         // 50-digit number: well outside i64/f64 exact range.
         let big = "12345678901234567890123456789012345678901234567890";
@@ -832,6 +869,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg_attr(feature = "execution-log", tracing::instrument(skip_all))]
     fn preserves_numeric_scale() {
         let v = Value::parse(BaseType::Numeric, "1.10").unwrap();
         assert_eq!(v.format_postgres_text(), "1.10");
@@ -840,12 +878,14 @@ mod tests {
     }
 
     #[test]
+    #[cfg_attr(feature = "execution-log", tracing::instrument(skip_all))]
     fn reports_22p02_for_invalid_numeric() {
         let err = Value::parse(BaseType::Numeric, "1.2.3").unwrap_err();
         assert_eq!(err.sqlstate, SqlState::InvalidTextRepresentation);
     }
 
     #[test]
+    #[cfg_attr(feature = "execution-log", tracing::instrument(skip_all))]
     fn roundtrips_text() {
         for base in [BaseType::Text, BaseType::Varchar, BaseType::Bpchar] {
             let v = Value::parse(base, "hello world").unwrap();
@@ -855,6 +895,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg_attr(feature = "execution-log", tracing::instrument(skip_all))]
     fn roundtrips_hex_bytea() {
         let v = Value::parse(BaseType::Bytea, "\\x414243").unwrap();
         assert_eq!(v, Value::Bytea(vec![0x41, 0x42, 0x43]));
@@ -865,6 +906,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg_attr(feature = "execution-log", tracing::instrument(skip_all))]
     fn roundtrips_escape_bytea() {
         let v = Value::parse(BaseType::Bytea, "ABC").unwrap();
         assert_eq!(v, Value::Bytea(b"ABC".to_vec()));
@@ -877,6 +919,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg_attr(feature = "execution-log", tracing::instrument(skip_all))]
     fn reports_22p02_for_invalid_bytea() {
         let err = Value::parse(BaseType::Bytea, "\\xZZ").unwrap_err();
         assert_eq!(err.sqlstate, SqlState::InvalidTextRepresentation);

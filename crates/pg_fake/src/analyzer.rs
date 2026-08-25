@@ -12,6 +12,7 @@ use crate::{
     value::{BaseType, PgType, Value},
 };
 
+#[cfg_attr(feature = "execution-log", tracing::instrument(skip_all))]
 fn infer_returning_parameters(
     returning: Option<&[ast::SelectItem]>,
     scope: executor::RowScope<'_>,
@@ -32,6 +33,7 @@ fn infer_returning_parameters(
     Ok(())
 }
 
+#[cfg_attr(feature = "execution-log", tracing::instrument(skip_all))]
 fn validate_returning_items(
     returning: Option<&[ast::SelectItem]>,
     scope: executor::RowScope<'_>,
@@ -51,6 +53,7 @@ fn validate_returning_items(
     Ok(())
 }
 
+#[cfg_attr(feature = "execution-log", tracing::instrument(skip_all))]
 fn get_table_alias(table: &ast::TableFactor) -> Option<&ast::Ident> {
     let ast::TableFactor::Table { alias, .. } = table else {
         return None;
@@ -58,6 +61,7 @@ fn get_table_alias(table: &ast::TableFactor) -> Option<&ast::Ident> {
     alias.as_ref().map(|alias| &alias.name)
 }
 
+#[cfg_attr(feature = "execution-log", tracing::instrument(skip_all))]
 fn get_update_from(update: &ast::Update) -> Result<&[ast::TableWithJoins]> {
     match &update.from {
         None => Ok(&[]),
@@ -68,6 +72,7 @@ fn get_update_from(update: &ast::Update) -> Result<&[ast::TableWithJoins]> {
     }
 }
 
+#[cfg_attr(feature = "execution-log", tracing::instrument(skip_all))]
 fn bind_update_scope(update: &ast::Update, catalog: &Catalog) -> Result<executor::BoundScope> {
     let schema = resolve_table_schema(&update.table.relation, catalog)?;
     Ok(executor::combine_bound_scopes(
@@ -76,6 +81,7 @@ fn bind_update_scope(update: &ast::Update, catalog: &Catalog) -> Result<executor
     ))
 }
 
+#[cfg_attr(feature = "execution-log", tracing::instrument(skip_all))]
 fn bind_delete_scope(
     delete: &ast::Delete,
     schema: &TableSchema,
@@ -88,6 +94,7 @@ fn bind_delete_scope(
     ))
 }
 
+#[cfg_attr(feature = "execution-log", tracing::instrument(skip_all))]
 fn infer_query_parameters(
     query: &ast::Query,
     catalog: &Catalog,
@@ -148,6 +155,7 @@ fn infer_query_parameters(
     Ok(())
 }
 
+#[cfg_attr(feature = "execution-log", tracing::instrument(skip_all))]
 fn infer_set_expression_parameters(
     expression: &ast::SetExpr,
     catalog: &Catalog,
@@ -222,6 +230,7 @@ fn infer_set_expression_parameters(
     }
 }
 
+#[cfg_attr(feature = "execution-log", tracing::instrument(skip_all))]
 fn infer_set_expression_types(
     expression: &ast::SetExpr,
     catalog: &Catalog,
@@ -298,6 +307,7 @@ fn infer_set_expression_types(
     }
 }
 
+#[cfg_attr(feature = "execution-log", tracing::instrument(skip_all))]
 pub(crate) fn infer_parameter_types(
     statement: &ast::Statement,
     catalog: &Catalog,
@@ -425,6 +435,7 @@ pub(crate) fn infer_parameter_types(
     Ok(types)
 }
 
+#[cfg_attr(feature = "execution-log", tracing::instrument(skip_all))]
 pub(crate) fn substitute_typed_subqueries(
     statement: &ast::Statement,
     catalog: &Catalog,
@@ -532,6 +543,7 @@ pub(crate) fn substitute_typed_subqueries(
     error.map_or(Ok(statement), Err)
 }
 
+#[cfg_attr(feature = "execution-log", tracing::instrument(skip_all))]
 fn substitute_scoped_subqueries<V: ast::VisitMut>(
     value: &mut V,
     catalog: &Catalog,
@@ -555,6 +567,7 @@ struct TypedSubquerySubstituter<'a> {
 impl ast::VisitorMut for TypedSubquerySubstituter<'_> {
     type Break = ();
 
+    #[cfg_attr(feature = "execution-log", tracing::instrument(skip_all))]
     fn pre_visit_expr(&mut self, expression: &mut ast::Expr) -> ControlFlow<Self::Break> {
         if self.error.is_some() {
             return ControlFlow::Break(());
@@ -580,6 +593,7 @@ impl ast::VisitorMut for TypedSubquerySubstituter<'_> {
     }
 }
 
+#[cfg_attr(feature = "execution-log", tracing::instrument(skip_all))]
 pub(crate) fn bind_parameters(
     statement: &ast::Statement,
     infer_parameter_types: &[BaseType],
@@ -624,6 +638,7 @@ pub(crate) fn bind_parameters(
     error.map_or(Ok(statement), Err)
 }
 
+#[cfg_attr(feature = "execution-log", tracing::instrument(skip_all))]
 fn count_parameters(statement: &ast::Statement) -> Result<usize> {
     let mut maximum = 0;
     let mut error = None;
@@ -646,6 +661,7 @@ fn count_parameters(statement: &ast::Statement) -> Result<usize> {
     error.map_or(Ok(maximum), Err)
 }
 
+#[cfg_attr(feature = "execution-log", tracing::instrument(skip_all))]
 fn parse_placeholder_index(placeholder: &str) -> Result<usize> {
     let index = placeholder
         .strip_prefix('$')
@@ -660,6 +676,7 @@ fn parse_placeholder_index(placeholder: &str) -> Result<usize> {
     Ok(index - 1)
 }
 
+#[cfg_attr(feature = "execution-log", tracing::instrument(skip_all))]
 fn resolve_table_schema<'a>(
     factor: &ast::TableFactor,
     catalog: &'a Catalog,
@@ -673,6 +690,7 @@ fn resolve_table_schema<'a>(
     catalog.require_table(&executor::normalize_unqualified_object_name(name)?)
 }
 
+#[cfg_attr(feature = "execution-log", tracing::instrument(skip_all))]
 fn infer_expression_parameters(
     expression: &ast::Expr,
     schema: executor::RowScope<'_>,
@@ -783,6 +801,7 @@ fn infer_expression_parameters(
     error.map_or(Ok(()), Err)
 }
 
+#[cfg_attr(feature = "execution-log", tracing::instrument(skip_all))]
 fn infer_function_parameters(
     function: &ast::Function,
     schema: executor::RowScope<'_>,
@@ -828,6 +847,7 @@ fn infer_function_parameters(
     Ok(())
 }
 
+#[cfg_attr(feature = "execution-log", tracing::instrument(skip_all))]
 fn constrain_parameter_type(
     expression: &ast::Expr,
     expected: Option<BaseType>,
@@ -864,6 +884,7 @@ fn constrain_parameter_type(
     Ok(())
 }
 
+#[cfg_attr(feature = "execution-log", tracing::instrument(skip_all))]
 fn finalize_parameter_types(types: Vec<Option<BaseType>>) -> Vec<BaseType> {
     types
         .into_iter()
@@ -871,6 +892,7 @@ fn finalize_parameter_types(types: Vec<Option<BaseType>>) -> Vec<BaseType> {
         .collect()
 }
 
+#[cfg_attr(feature = "execution-log", tracing::instrument(skip_all))]
 fn validate_statement(statement: &ast::Statement, catalog: &Catalog) -> Result<()> {
     match statement {
         ast::Statement::Insert(insert) => {
@@ -1039,6 +1061,7 @@ fn validate_statement(statement: &ast::Statement, catalog: &Catalog) -> Result<(
     Ok(())
 }
 
+#[cfg_attr(feature = "execution-log", tracing::instrument(skip_all))]
 fn is_projection_alias(expression: &ast::Expr, projection: &[ast::SelectItem]) -> bool {
     let ast::Expr::Identifier(identifier) = expression else {
         return false;
@@ -1049,6 +1072,7 @@ fn is_projection_alias(expression: &ast::Expr, projection: &[ast::SelectItem]) -
     })
 }
 
+#[cfg_attr(feature = "execution-log", tracing::instrument(skip_all))]
 fn validate_boolean(
     expression: &ast::Expr,
     schema: executor::RowScope<'_>,
@@ -1062,6 +1086,7 @@ fn validate_boolean(
     }
 }
 
+#[cfg_attr(feature = "execution-log", tracing::instrument(skip_all))]
 fn validate_assignment(
     expression: &ast::Expr,
     target: PgType,
@@ -1084,6 +1109,7 @@ fn validate_assignment(
     }
 }
 
+#[cfg_attr(feature = "execution-log", tracing::instrument(skip_all))]
 fn validate_implicit_type(
     expression: &ast::Expr,
     target: BaseType,
@@ -1105,6 +1131,7 @@ fn validate_implicit_type(
     }
 }
 
+#[cfg_attr(feature = "execution-log", tracing::instrument(skip_all))]
 fn coerce_parameter(value: Value, target: BaseType) -> Result<Value> {
     let Some(source) = value.get_base_type() else {
         return Ok(Value::Null);
@@ -1112,6 +1139,7 @@ fn coerce_parameter(value: Value, target: BaseType) -> Result<Value> {
     coercion::coerce(value, source, PgType::create(target), CastContext::Implicit)
 }
 
+#[cfg_attr(feature = "execution-log", tracing::instrument(skip_all))]
 pub(crate) fn create_typed_literal(value: Value, data_type: PgType) -> ast::Expr {
     let literal = match value {
         Value::Null => ast::Value::Null,
@@ -1156,6 +1184,7 @@ pub(crate) fn create_typed_literal(value: Value, data_type: PgType) -> ast::Expr
     }
 }
 
+#[cfg_attr(feature = "execution-log", tracing::instrument(skip_all))]
 fn convert_to_ast_data_type(data_type: PgType) -> ast::DataType {
     match data_type.base {
         BaseType::Bool => ast::DataType::Boolean,

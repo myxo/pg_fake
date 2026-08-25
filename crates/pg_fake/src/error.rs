@@ -72,6 +72,7 @@ pub enum SqlState {
 
 impl SqlState {
     /// The 5-character Postgres error code string.
+    #[cfg_attr(feature = "execution-log", tracing::instrument(skip_all))]
     pub fn get_code(self) -> &'static str {
         match self {
             SqlState::SuccessfulCompletion => "00000",
@@ -118,6 +119,7 @@ impl SqlState {
 }
 
 impl std::fmt::Display for SqlState {
+    #[cfg_attr(feature = "execution-log", tracing::instrument(skip_all))]
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.write_str(self.get_code())
     }
@@ -138,6 +140,7 @@ pub struct PgError {
 }
 
 impl PgError {
+    #[cfg_attr(feature = "execution-log", tracing::instrument(skip_all))]
     pub(crate) fn create(sqlstate: SqlState, message: impl Into<String>) -> Self {
         PgError {
             sqlstate,
@@ -152,6 +155,7 @@ impl PgError {
 /// Crate-wide result alias.
 pub type Result<T> = std::result::Result<T, PgError>;
 
+#[cfg_attr(feature = "execution-log", tracing::instrument(skip_all))]
 pub(crate) fn reject_unsupported<T>(message: impl Into<String>) -> Result<T> {
     Err(PgError::create(SqlState::FeatureNotSupported, message))
 }

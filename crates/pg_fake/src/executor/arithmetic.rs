@@ -2,6 +2,7 @@ use super::*;
 use bigdecimal::{BigDecimal, Signed};
 use sqlparser::ast;
 
+#[cfg_attr(feature = "execution-log", tracing::instrument(skip_all))]
 pub(super) fn evaluate_unary_operator(operator: ast::UnaryOperator, value: Value) -> Result<Value> {
     if value.is_null() {
         return Ok(Value::Null);
@@ -40,6 +41,7 @@ pub(super) fn evaluate_unary_operator(operator: ast::UnaryOperator, value: Value
     }
 }
 
+#[cfg_attr(feature = "execution-log", tracing::instrument(skip_all))]
 pub(super) fn evaluate_boolean_operator(
     operator: &ast::BinaryOperator,
     left: Value,
@@ -63,6 +65,7 @@ pub(super) fn evaluate_boolean_operator(
     }
 }
 
+#[cfg_attr(feature = "execution-log", tracing::instrument(skip_all))]
 pub(super) fn evaluate_distinctness(left: Value, right: Value, equal: bool) -> Result<Value> {
     match (&left, &right) {
         (Value::Null, Value::Null) => Ok(Value::Bool(equal)),
@@ -74,6 +77,7 @@ pub(super) fn evaluate_distinctness(left: Value, right: Value, equal: bool) -> R
     }
 }
 
+#[cfg_attr(feature = "execution-log", tracing::instrument(skip_all))]
 pub(super) fn evaluate_numeric_operator(
     operator: &ast::BinaryOperator,
     left: Value,
@@ -199,6 +203,7 @@ pub(super) fn evaluate_numeric_operator(
 // NUMERIC division scale from normalized base-10000 weights, keeps at least 16
 // significant decimal digits and both input scales, clamps it to 0..=1000, and
 // rounds ties away from zero.
+#[cfg_attr(feature = "execution-log", tracing::instrument(skip_all))]
 fn divide_numeric(left: &BigDecimal, right: &BigDecimal) -> BigDecimal {
     let (left_weight, left_first_digit) = describe_numeric_division_operand(left);
     let (right_weight, right_first_digit) = describe_numeric_division_operand(right);
@@ -237,6 +242,7 @@ fn divide_numeric(left: &BigDecimal, right: &BigDecimal) -> BigDecimal {
     BigDecimal::new(quotient, result_scale)
 }
 
+#[cfg_attr(feature = "execution-log", tracing::instrument(skip_all))]
 fn describe_numeric_division_operand(value: &BigDecimal) -> (i64, u16) {
     if value == &BigDecimal::from(0) {
         return (0, 0);
@@ -271,6 +277,7 @@ fn describe_numeric_division_operand(value: &BigDecimal) -> (i64, u16) {
     )
 }
 
+#[cfg_attr(feature = "execution-log", tracing::instrument(skip_all))]
 pub(super) fn infer_interval_arithmetic_type(
     operator: &ast::BinaryOperator,
     left: BaseType,
@@ -328,12 +335,14 @@ pub(super) fn infer_interval_arithmetic_type(
     }
 }
 
+#[cfg_attr(feature = "execution-log", tracing::instrument(skip_all))]
 pub(super) fn evaluate_temporal_arithmetic(
     operator: &ast::BinaryOperator,
     left: Value,
     right: Value,
 ) -> Result<Value> {
     use chrono::{Days, Months, TimeDelta};
+    #[cfg_attr(feature = "execution-log", tracing::instrument(skip_all))]
     fn scale_interval(
         value: crate::value::PgInterval,
         factor: f64,
@@ -369,6 +378,7 @@ pub(super) fn evaluate_temporal_arithmetic(
             micros: scaled_micros.round() as i64,
         })
     }
+    #[cfg_attr(feature = "execution-log", tracing::instrument(skip_all))]
     fn negate_interval_if(
         mut interval: crate::value::PgInterval,
         negative: bool,
@@ -380,6 +390,7 @@ pub(super) fn evaluate_temporal_arithmetic(
         }
         interval
     }
+    #[cfg_attr(feature = "execution-log", tracing::instrument(skip_all))]
     fn add_interval_to_timestamp(
         mut value: chrono::NaiveDateTime,
         interval: crate::value::PgInterval,

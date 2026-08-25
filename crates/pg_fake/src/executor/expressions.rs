@@ -1,6 +1,7 @@
 use super::*;
 use sqlparser::ast;
 
+#[cfg_attr(feature = "execution-log", tracing::instrument(skip_all))]
 pub(super) fn evaluate_assignment_expression(
     expr: &ast::Expr,
     target: PgType,
@@ -20,6 +21,7 @@ pub(super) fn evaluate_assignment_expression(
     }
 }
 
+#[cfg_attr(feature = "execution-log", tracing::instrument(skip_all))]
 pub(super) fn evaluate_column_default(
     column: &ColumnDef,
     context: &StatementExecutionContext,
@@ -55,6 +57,7 @@ pub(super) fn evaluate_column_default(
     })
 }
 
+#[cfg_attr(feature = "execution-log", tracing::instrument(skip_all))]
 pub(super) fn validate_column_default(column: &ColumnDef) -> Result<()> {
     let Some(expression) = &column.default else {
         return Ok(());
@@ -87,6 +90,7 @@ pub(super) fn validate_column_default(column: &ColumnDef) -> Result<()> {
     }
 }
 
+#[cfg_attr(feature = "execution-log", tracing::instrument(skip_all))]
 pub(super) fn validate_not_null(schema: &TableSchema, row: &[Value]) -> Result<()> {
     if let Some(column) = schema
         .columns
@@ -105,6 +109,7 @@ pub(super) fn validate_not_null(schema: &TableSchema, row: &[Value]) -> Result<(
     Ok(())
 }
 
+#[cfg_attr(feature = "execution-log", tracing::instrument(skip_all))]
 pub(super) fn validate_check_constraint_types(schema: &TableSchema) -> Result<()> {
     for constraint in &schema.constraints {
         let crate::catalog::Constraint::Check(expression) = constraint else {
@@ -124,6 +129,7 @@ pub(super) fn validate_check_constraint_types(schema: &TableSchema) -> Result<()
     Ok(())
 }
 
+#[cfg_attr(feature = "execution-log", tracing::instrument(skip_all))]
 pub(super) fn validate_check_constraints(
     schema: &TableSchema,
     row: &[Value],
@@ -157,10 +163,12 @@ pub(super) fn validate_check_constraints(
     Ok(())
 }
 
+#[cfg_attr(feature = "execution-log", tracing::instrument(skip_all))]
 pub(super) fn is_default_expression(expr: &ast::Expr) -> bool {
     matches!(expr, ast::Expr::Identifier(identifier) if identifier.quote_style.is_none() && identifier.value.eq_ignore_ascii_case("default"))
 }
 
+#[cfg_attr(feature = "execution-log", tracing::instrument(skip_all))]
 pub(crate) fn create_constant_expression_schema() -> TableSchema {
     TableSchema {
         id: TableId(0),
@@ -170,6 +178,7 @@ pub(crate) fn create_constant_expression_schema() -> TableSchema {
     }
 }
 
+#[cfg_attr(feature = "execution-log", tracing::instrument(skip_all))]
 fn extract_ast_value(expr: &ast::Expr) -> Option<&ast::Value> {
     let ast::Expr::Value(value) = expr else {
         return None;
@@ -177,6 +186,7 @@ fn extract_ast_value(expr: &ast::Expr) -> Option<&ast::Value> {
     Some(&value.value)
 }
 
+#[cfg_attr(feature = "execution-log", tracing::instrument(skip_all))]
 pub(super) fn extract_number_literal(expr: &ast::Expr) -> Option<&str> {
     let ast::Value::Number(value, _) = extract_ast_value(expr)? else {
         return None;
@@ -184,6 +194,7 @@ pub(super) fn extract_number_literal(expr: &ast::Expr) -> Option<&str> {
     Some(value)
 }
 
+#[cfg_attr(feature = "execution-log", tracing::instrument(skip_all))]
 fn evaluate_literal(expr: &ast::Expr) -> Result<Value> {
     if let Some(value) = extract_ast_value(expr) {
         return match value {
@@ -223,6 +234,7 @@ fn evaluate_literal(expr: &ast::Expr) -> Result<Value> {
     }
 }
 
+#[cfg_attr(feature = "execution-log", tracing::instrument(skip_all))]
 fn parse_integer_literal(value: &str) -> Result<Value> {
     if let Ok(value) = value.parse::<i32>() {
         return Ok(Value::Int4(value));
@@ -233,6 +245,7 @@ fn parse_integer_literal(value: &str) -> Result<Value> {
     Value::parse(BaseType::Numeric, value)
 }
 
+#[cfg_attr(feature = "execution-log", tracing::instrument(skip_all))]
 pub(crate) fn extract_unknown_string_literal(expr: &ast::Expr) -> Option<&str> {
     match expr {
         ast::Expr::Value(value) => match &value.value {
@@ -244,6 +257,7 @@ pub(crate) fn extract_unknown_string_literal(expr: &ast::Expr) -> Option<&str> {
     }
 }
 
+#[cfg_attr(feature = "execution-log", tracing::instrument(skip_all))]
 pub(crate) fn infer_expression_type(expr: &ast::Expr, schema: RowScope<'_>) -> Result<BaseType> {
     if let Some(value) = extract_ast_value(expr) {
         return match value {
@@ -458,6 +472,7 @@ pub(crate) fn infer_expression_type(expr: &ast::Expr, schema: RowScope<'_>) -> R
     }
 }
 
+#[cfg_attr(feature = "execution-log", tracing::instrument(skip_all))]
 pub(crate) fn is_null_literal(expr: &ast::Expr) -> bool {
     match expr {
         ast::Expr::Value(value) if matches!(&value.value, ast::Value::Null) => true,
@@ -466,6 +481,7 @@ pub(crate) fn is_null_literal(expr: &ast::Expr) -> bool {
     }
 }
 
+#[cfg_attr(feature = "execution-log", tracing::instrument(skip_all))]
 fn is_numeric_type(base: BaseType) -> bool {
     matches!(
         base,
@@ -478,6 +494,7 @@ fn is_numeric_type(base: BaseType) -> bool {
     )
 }
 
+#[cfg_attr(feature = "execution-log", tracing::instrument(skip_all))]
 fn resolve_expression_pair_type(
     left: &ast::Expr,
     right: &ast::Expr,
@@ -507,6 +524,7 @@ fn resolve_expression_pair_type(
     })
 }
 
+#[cfg_attr(feature = "execution-log", tracing::instrument(skip_all))]
 pub(super) fn resolve_operator_type(
     left: &ast::Expr,
     right: &ast::Expr,
@@ -537,6 +555,7 @@ pub(super) fn resolve_operator_type(
     }
 }
 
+#[cfg_attr(feature = "execution-log", tracing::instrument(skip_all))]
 fn resolve_expression_list_type(
     expressions: &[&ast::Expr],
     schema: RowScope<'_>,
@@ -564,6 +583,7 @@ fn resolve_expression_list_type(
     Ok(result.unwrap_or(BaseType::Text))
 }
 
+#[cfg_attr(feature = "execution-log", tracing::instrument(skip_all))]
 fn extract_function_arguments(function: &ast::Function) -> Result<Vec<&ast::Expr>> {
     if function.uses_odbc_syntax
         || !matches!(function.parameters, ast::FunctionArguments::None)
@@ -593,6 +613,7 @@ fn extract_function_arguments(function: &ast::Function) -> Result<Vec<&ast::Expr
         .collect()
 }
 
+#[cfg_attr(feature = "execution-log", tracing::instrument(skip_all))]
 fn infer_function_return_type(function: &ast::Function, schema: RowScope<'_>) -> Result<BaseType> {
     if let Some(result) = infer_aggregate_return_type(function, schema)? {
         return Ok(result);
@@ -677,6 +698,7 @@ fn infer_function_return_type(function: &ast::Function, schema: RowScope<'_>) ->
     }
 }
 
+#[cfg_attr(feature = "execution-log", tracing::instrument(skip_all))]
 fn validate_function_argument(
     argument: &ast::Expr,
     target: BaseType,
@@ -694,6 +716,7 @@ fn validate_function_argument(
     }
 }
 
+#[cfg_attr(feature = "execution-log", tracing::instrument(skip_all))]
 pub(super) fn evaluate(
     expr: &ast::Expr,
     schema: RowScope<'_>,
@@ -941,6 +964,7 @@ pub(super) fn evaluate(
     }
 }
 
+#[cfg_attr(feature = "execution-log", tracing::instrument(skip_all))]
 fn validate_membership_types(
     expr: &ast::Expr,
     list: &[ast::Expr],
@@ -962,6 +986,7 @@ fn validate_membership_types(
     Ok(())
 }
 
+#[cfg_attr(feature = "execution-log", tracing::instrument(skip_all))]
 fn extract_row_fields(expr: &ast::Expr) -> &[ast::Expr] {
     match expr {
         ast::Expr::Tuple(fields) => fields,
@@ -969,6 +994,7 @@ fn extract_row_fields(expr: &ast::Expr) -> &[ast::Expr] {
     }
 }
 
+#[cfg_attr(feature = "execution-log", tracing::instrument(skip_all))]
 fn evaluate_membership(
     expr: &ast::Expr,
     list: &[ast::Expr],
@@ -1003,6 +1029,7 @@ fn evaluate_membership(
     }
 }
 
+#[cfg_attr(feature = "execution-log", tracing::instrument(skip_all))]
 fn evaluate_quantified(
     left: &ast::Expr,
     compare_op: &ast::BinaryOperator,
@@ -1031,6 +1058,7 @@ fn evaluate_quantified(
     Ok(result)
 }
 
+#[cfg_attr(feature = "execution-log", tracing::instrument(skip_all))]
 fn evaluate_row_comparison(
     left: &ast::Expr,
     right: &ast::Expr,
@@ -1066,6 +1094,7 @@ fn evaluate_row_comparison(
     Ok(result)
 }
 
+#[cfg_attr(feature = "execution-log", tracing::instrument(skip_all))]
 pub(super) fn evaluate_and_coerce(
     expression: &ast::Expr,
     target: BaseType,
@@ -1087,6 +1116,7 @@ pub(super) fn evaluate_and_coerce(
     }
 }
 
+#[cfg_attr(feature = "execution-log", tracing::instrument(skip_all))]
 fn evaluate_function(
     function: &ast::Function,
     schema: RowScope<'_>,
@@ -1348,6 +1378,7 @@ fn evaluate_function(
     }
 }
 
+#[cfg_attr(feature = "execution-log", tracing::instrument(skip_all))]
 pub(super) fn evaluate_comparison(
     operator: &ast::BinaryOperator,
     left: &Value,
@@ -1365,6 +1396,7 @@ pub(super) fn evaluate_comparison(
     }))
 }
 
+#[cfg_attr(feature = "execution-log", tracing::instrument(skip_all))]
 fn extract_datetime_field(field: ast::DateTimeField, value: Value) -> Result<Value> {
     use chrono::{Datelike, Timelike};
     let value = match value {
@@ -1447,6 +1479,7 @@ fn extract_datetime_field(field: ast::DateTimeField, value: Value) -> Result<Val
     Ok(Value::Numeric(value.into()))
 }
 
+#[cfg_attr(feature = "execution-log", tracing::instrument(skip_all))]
 pub(super) fn compare_values(left: &Value, right: &Value) -> Result<Ordering> {
     Ok(match (left, right) {
         (Value::Bool(left), Value::Bool(right)) => left.cmp(right),
@@ -1488,6 +1521,7 @@ pub(super) fn compare_values(left: &Value, right: &Value) -> Result<Ordering> {
     })
 }
 
+#[cfg_attr(feature = "execution-log", tracing::instrument(skip_all))]
 fn compare_float4(left: f32, right: f32) -> Ordering {
     match (left.is_nan(), right.is_nan()) {
         (true, true) => Ordering::Equal,
@@ -1499,6 +1533,7 @@ fn compare_float4(left: f32, right: f32) -> Ordering {
     }
 }
 
+#[cfg_attr(feature = "execution-log", tracing::instrument(skip_all))]
 fn compare_float8(left: f64, right: f64) -> Ordering {
     match (left.is_nan(), right.is_nan()) {
         (true, true) => Ordering::Equal,

@@ -1,6 +1,7 @@
 use super::*;
 use sqlparser::ast;
 
+#[cfg_attr(feature = "execution-log", tracing::instrument(skip_all))]
 pub(crate) fn collect_required_row_locks(
     state: &DatabaseState,
     statement: &ast::Statement,
@@ -139,6 +140,7 @@ pub(crate) fn collect_required_row_locks(
         })
 }
 
+#[cfg_attr(feature = "execution-log", tracing::instrument(skip_all))]
 fn collect_insert_foreign_key_locks(
     state: &DatabaseState,
     insert: &ast::Insert,

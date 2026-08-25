@@ -33,6 +33,7 @@ pub(crate) enum RowScope<'a> {
     Bound(&'a BoundScope),
 }
 
+#[cfg_attr(feature = "execution-log", tracing::instrument(skip_all))]
 fn matches_identifier(name: &str, identifier: &ast::Ident) -> bool {
     if identifier.quote_style.is_some() {
         name == identifier.value
@@ -45,6 +46,7 @@ fn matches_identifier(name: &str, identifier: &ast::Ident) -> bool {
     }
 }
 
+#[cfg_attr(feature = "execution-log", tracing::instrument(skip_all))]
 fn resolve_bound_column<'a>(
     scope: &'a BoundScope,
     identifiers: &[ast::Ident],
@@ -115,6 +117,7 @@ fn resolve_bound_column<'a>(
 }
 
 impl RowScope<'_> {
+    #[cfg_attr(feature = "execution-log", tracing::instrument(skip_all))]
     pub(super) fn resolve_column(self, identifiers: &[ast::Ident]) -> Result<(usize, PgType)> {
         match self {
             RowScope::Table(schema) => {
@@ -143,6 +146,7 @@ impl RowScope<'_> {
         }
     }
 
+    #[cfg_attr(feature = "execution-log", tracing::instrument(skip_all))]
     pub(super) fn resolve_column_value(
         self,
         identifiers: &[ast::Ident],
@@ -179,10 +183,12 @@ impl RowScope<'_> {
 }
 
 impl BoundScope {
+    #[cfg_attr(feature = "execution-log", tracing::instrument(skip_all))]
     pub(super) fn resolve_column(&self, identifiers: &[ast::Ident]) -> Result<(usize, PgType)> {
         RowScope::Bound(self).resolve_column(identifiers)
     }
 
+    #[cfg_attr(feature = "execution-log", tracing::instrument(skip_all))]
     fn bind_table(
         schema: &TableSchema,
         alias: Option<&ast::TableAlias>,
@@ -205,6 +211,7 @@ impl BoundScope {
     }
 }
 
+#[cfg_attr(feature = "execution-log", tracing::instrument(skip_all))]
 pub(crate) fn bind_target_scope(schema: &TableSchema, alias: Option<&ast::Ident>) -> BoundScope {
     let qualifier = alias
         .map(normalize_identifier)
@@ -230,10 +237,12 @@ pub(crate) fn bind_target_scope(schema: &TableSchema, alias: Option<&ast::Ident>
     }
 }
 
+#[cfg_attr(feature = "execution-log", tracing::instrument(skip_all))]
 pub(crate) fn bind_query_scope(catalog: &Catalog, select: &ast::Select) -> Result<BoundScope> {
     bind_from_scope(catalog, &select.from)
 }
 
+#[cfg_attr(feature = "execution-log", tracing::instrument(skip_all))]
 pub(crate) fn bind_from_scope(
     catalog: &Catalog,
     from: &[ast::TableWithJoins],
@@ -247,6 +256,7 @@ pub(crate) fn bind_from_scope(
     Ok(scope)
 }
 
+#[cfg_attr(feature = "execution-log", tracing::instrument(skip_all))]
 pub(crate) fn combine_bound_scopes(mut target: BoundScope, mut source: BoundScope) -> BoundScope {
     let start = target.columns.len();
     for column in &mut source.columns {
@@ -256,6 +266,7 @@ pub(crate) fn combine_bound_scopes(mut target: BoundScope, mut source: BoundScop
     target
 }
 
+#[cfg_attr(feature = "execution-log", tracing::instrument(skip_all))]
 pub(crate) fn identify_unknown_query_columns(query: &ast::Query, columns: usize) -> Vec<bool> {
     let ast::SetExpr::Select(select) = query.body.as_ref() else {
         return vec![false; columns];
@@ -278,6 +289,7 @@ pub(crate) fn identify_unknown_query_columns(query: &ast::Query, columns: usize)
     }
 }
 
+#[cfg_attr(feature = "execution-log", tracing::instrument(skip_all))]
 pub(crate) fn bind_query_scope_with_outer(
     catalog: &Catalog,
     select: &ast::Select,
@@ -296,6 +308,7 @@ pub(crate) fn bind_query_scope_with_outer(
     Ok(scope)
 }
 
+#[cfg_attr(feature = "execution-log", tracing::instrument(skip_all))]
 fn bind_table_with_joins(
     catalog: &Catalog,
     table: &ast::TableWithJoins,
@@ -324,6 +337,7 @@ fn bind_table_with_joins(
     Ok(())
 }
 
+#[cfg_attr(feature = "execution-log", tracing::instrument(skip_all))]
 fn bind_table_factor(
     catalog: &Catalog,
     factor: &ast::TableFactor,
@@ -429,6 +443,7 @@ fn bind_table_factor(
     Ok(())
 }
 
+#[cfg_attr(feature = "execution-log", tracing::instrument(skip_all))]
 pub(crate) fn infer_query_output_columns(
     catalog: &Catalog,
     query: &ast::Query,
@@ -441,6 +456,7 @@ pub(crate) fn infer_query_output_columns(
     })
 }
 
+#[cfg_attr(feature = "execution-log", tracing::instrument(skip_all))]
 fn describe_bound_query_columns(
     catalog: &Catalog,
     query: &ast::Query,
@@ -624,6 +640,7 @@ fn describe_bound_query_columns(
     }
 }
 
+#[cfg_attr(feature = "execution-log", tracing::instrument(skip_all))]
 fn describe_bound_set_expression_columns(
     catalog: &Catalog,
     expression: &ast::SetExpr,
@@ -650,6 +667,7 @@ fn describe_bound_set_expression_columns(
     }
 }
 
+#[cfg_attr(feature = "execution-log", tracing::instrument(skip_all))]
 pub(super) fn infer_expression_data_type(
     catalog: &Catalog,
     expr: &ast::Expr,
@@ -681,6 +699,7 @@ pub(super) fn infer_expression_data_type(
     )?))
 }
 
+#[cfg_attr(feature = "execution-log", tracing::instrument(skip_all))]
 pub(crate) fn substitute_typed_subqueries(
     catalog: &Catalog,
     expression: &ast::Expr,
@@ -705,6 +724,7 @@ struct TypedSubquerySubstituter<'a> {
 impl ast::VisitorMut for TypedSubquerySubstituter<'_> {
     type Break = ();
 
+    #[cfg_attr(feature = "execution-log", tracing::instrument(skip_all))]
     fn pre_visit_expr(&mut self, expression: &mut ast::Expr) -> ControlFlow<Self::Break> {
         if self.error.is_some() {
             return ControlFlow::Break(());
@@ -834,6 +854,7 @@ impl ast::VisitorMut for TypedSubquerySubstituter<'_> {
     }
 }
 
+#[cfg_attr(feature = "execution-log", tracing::instrument(skip_all))]
 fn bind_join_constraint(
     catalog: &Catalog,
     scope: &mut BoundScope,
@@ -885,6 +906,7 @@ fn bind_join_constraint(
     Ok(())
 }
 
+#[cfg_attr(feature = "execution-log", tracing::instrument(skip_all))]
 fn bind_join_columns(
     scope: &mut BoundScope,
     names: &[String],
@@ -931,6 +953,7 @@ fn bind_join_columns(
     Ok(())
 }
 
+#[cfg_attr(feature = "execution-log", tracing::instrument(skip_all))]
 pub(super) fn bind_select_scope(state: &DatabaseState, select: &ast::Select) -> Result<BoundScope> {
     bind_query_scope(&state.catalog, select)
 }

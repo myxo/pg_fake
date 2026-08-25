@@ -9,12 +9,14 @@ struct SubqueryDetector {
 impl ast::Visitor for SubqueryDetector {
     type Break = ();
 
+    #[cfg_attr(feature = "execution-log", tracing::instrument(skip_all))]
     fn pre_visit_query(&mut self, _query: &ast::Query) -> std::ops::ControlFlow<Self::Break> {
         self.found = true;
         std::ops::ControlFlow::Break(())
     }
 }
 
+#[cfg_attr(feature = "execution-log", tracing::instrument(skip_all))]
 fn contains_subquery(expression: &ast::Expr) -> bool {
     let mut detector = SubqueryDetector { found: false };
     let _ = ast::Visit::visit(expression, &mut detector);
@@ -32,6 +34,7 @@ struct SubqueryMaterializer<'a> {
 }
 
 impl SubqueryMaterializer<'_> {
+    #[cfg_attr(feature = "execution-log", tracing::instrument(skip_all))]
     fn execute(&self, query: &ast::Query) -> Result<QueryResult> {
         let query = materialize_uncorrelated_subqueries(
             self.state,
@@ -55,6 +58,7 @@ impl SubqueryMaterializer<'_> {
 impl ast::VisitorMut for SubqueryMaterializer<'_> {
     type Break = ();
 
+    #[cfg_attr(feature = "execution-log", tracing::instrument(skip_all))]
     fn pre_visit_query(&mut self, query: &mut ast::Query) -> std::ops::ControlFlow<Self::Break> {
         let scope = match query.body.as_ref() {
             ast::SetExpr::Select(select) => bind_query_scope(&self.state.catalog, select),
@@ -69,11 +73,13 @@ impl ast::VisitorMut for SubqueryMaterializer<'_> {
         std::ops::ControlFlow::Continue(())
     }
 
+    #[cfg_attr(feature = "execution-log", tracing::instrument(skip_all))]
     fn post_visit_query(&mut self, _query: &mut ast::Query) -> std::ops::ControlFlow<Self::Break> {
         self.scopes.pop().expect("visited query pushed a scope");
         std::ops::ControlFlow::Continue(())
     }
 
+    #[cfg_attr(feature = "execution-log", tracing::instrument(skip_all))]
     fn pre_visit_expr(&mut self, expr: &mut ast::Expr) -> std::ops::ControlFlow<Self::Break> {
         if !matches!(
             expr,
@@ -269,6 +275,7 @@ impl ast::VisitorMut for SubqueryMaterializer<'_> {
     }
 }
 
+#[cfg_attr(feature = "execution-log", tracing::instrument(skip_all))]
 pub(crate) fn materialize_uncorrelated_subqueries(
     state: &DatabaseState,
     statement: &ast::Statement,
@@ -337,6 +344,7 @@ pub(crate) fn materialize_uncorrelated_subqueries(
     Ok(statement)
 }
 
+#[cfg_attr(feature = "execution-log", tracing::instrument(skip_all))]
 fn materialize_subqueries<V: ast::VisitMut>(
     state: &DatabaseState,
     value: &mut V,
@@ -374,6 +382,7 @@ struct OuterReferenceSubstituter<'a> {
 impl ast::VisitorMut for OuterReferenceSubstituter<'_> {
     type Break = ();
 
+    #[cfg_attr(feature = "execution-log", tracing::instrument(skip_all))]
     fn pre_visit_query(&mut self, query: &mut ast::Query) -> std::ops::ControlFlow<Self::Break> {
         let ast::SetExpr::Select(select) = query.body.as_ref() else {
             self.scopes.push(BoundScope {
@@ -391,11 +400,13 @@ impl ast::VisitorMut for OuterReferenceSubstituter<'_> {
         std::ops::ControlFlow::Continue(())
     }
 
+    #[cfg_attr(feature = "execution-log", tracing::instrument(skip_all))]
     fn post_visit_query(&mut self, _query: &mut ast::Query) -> std::ops::ControlFlow<Self::Break> {
         self.scopes.pop().expect("visited query pushed a scope");
         std::ops::ControlFlow::Continue(())
     }
 
+    #[cfg_attr(feature = "execution-log", tracing::instrument(skip_all))]
     fn pre_visit_expr(&mut self, expression: &mut ast::Expr) -> std::ops::ControlFlow<Self::Break> {
         let identifiers = match expression {
             ast::Expr::Identifier(identifier) => std::slice::from_ref(identifier),
@@ -452,6 +463,7 @@ impl ast::VisitorMut for OuterReferenceSubstituter<'_> {
     }
 }
 
+#[cfg_attr(feature = "execution-log", tracing::instrument(skip_all))]
 fn references_outer_scope(
     catalog: &Catalog,
     expression: &ast::Expr,
@@ -471,6 +483,7 @@ fn references_outer_scope(
     substituter.error.map_or(Ok(substituter.substituted), Err)
 }
 
+#[cfg_attr(feature = "execution-log", tracing::instrument(skip_all))]
 pub(super) fn evaluate_query_expression(
     state: &DatabaseState,
     expression: &ast::Expr,
@@ -508,6 +521,7 @@ pub(super) fn evaluate_query_expression(
     evaluate(&expression, RowScope::Bound(scope), row, context)
 }
 
+#[cfg_attr(feature = "execution-log", tracing::instrument(skip_all))]
 pub(crate) fn describe_query_result_columns(
     state: &DatabaseState,
     statement: &ast::Statement,
@@ -606,6 +620,7 @@ pub(crate) fn describe_query_result_columns(
     }
 }
 
+#[cfg_attr(feature = "execution-log", tracing::instrument(skip_all))]
 fn describe_set_expression_columns(
     state: &DatabaseState,
     query: &ast::Query,
@@ -723,16 +738,19 @@ enum JoinKey {
 impl ast::VisitorMut for AggregateValidator<'_> {
     type Break = ();
 
+    #[cfg_attr(feature = "execution-log", tracing::instrument(skip_all))]
     fn pre_visit_query(&mut self, _query: &mut ast::Query) -> std::ops::ControlFlow<Self::Break> {
         self.query_depth += 1;
         std::ops::ControlFlow::Continue(())
     }
 
+    #[cfg_attr(feature = "execution-log", tracing::instrument(skip_all))]
     fn post_visit_query(&mut self, _query: &mut ast::Query) -> std::ops::ControlFlow<Self::Break> {
         self.query_depth -= 1;
         std::ops::ControlFlow::Continue(())
     }
 
+    #[cfg_attr(feature = "execution-log", tracing::instrument(skip_all))]
     fn pre_visit_expr(&mut self, expression: &mut ast::Expr) -> std::ops::ControlFlow<Self::Break> {
         if self.query_depth != 0 {
             return std::ops::ControlFlow::Continue(());
@@ -764,6 +782,7 @@ impl ast::VisitorMut for AggregateValidator<'_> {
         std::ops::ControlFlow::Continue(())
     }
 
+    #[cfg_attr(feature = "execution-log", tracing::instrument(skip_all))]
     fn post_visit_expr(
         &mut self,
         expression: &mut ast::Expr,
@@ -780,16 +799,19 @@ impl ast::VisitorMut for AggregateValidator<'_> {
 impl ast::VisitorMut for AggregateMaterializer<'_> {
     type Break = ();
 
+    #[cfg_attr(feature = "execution-log", tracing::instrument(skip_all))]
     fn pre_visit_query(&mut self, _query: &mut ast::Query) -> std::ops::ControlFlow<Self::Break> {
         self.query_depth += 1;
         std::ops::ControlFlow::Continue(())
     }
 
+    #[cfg_attr(feature = "execution-log", tracing::instrument(skip_all))]
     fn post_visit_query(&mut self, _query: &mut ast::Query) -> std::ops::ControlFlow<Self::Break> {
         self.query_depth -= 1;
         std::ops::ControlFlow::Continue(())
     }
 
+    #[cfg_attr(feature = "execution-log", tracing::instrument(skip_all))]
     fn pre_visit_expr(&mut self, expression: &mut ast::Expr) -> std::ops::ControlFlow<Self::Break> {
         if self.query_depth != 0 {
             return std::ops::ControlFlow::Continue(());
@@ -863,6 +885,7 @@ impl ast::VisitorMut for AggregateMaterializer<'_> {
 impl ast::VisitorMut for GroupedExpressionSubstituter<'_> {
     type Break = ();
 
+    #[cfg_attr(feature = "execution-log", tracing::instrument(skip_all))]
     fn pre_visit_query(&mut self, query: &mut ast::Query) -> std::ops::ControlFlow<Self::Break> {
         let outer = self
             .scopes
@@ -885,12 +908,14 @@ impl ast::VisitorMut for GroupedExpressionSubstituter<'_> {
         std::ops::ControlFlow::Continue(())
     }
 
+    #[cfg_attr(feature = "execution-log", tracing::instrument(skip_all))]
     fn post_visit_query(&mut self, _query: &mut ast::Query) -> std::ops::ControlFlow<Self::Break> {
         self.query_depth -= 1;
         self.scopes.pop().expect("visited query pushed a scope");
         std::ops::ControlFlow::Continue(())
     }
 
+    #[cfg_attr(feature = "execution-log", tracing::instrument(skip_all))]
     fn pre_visit_expr(&mut self, expression: &mut ast::Expr) -> std::ops::ControlFlow<Self::Break> {
         if self.query_depth != 0 {
             if self.aggregate_depth != 0 {
@@ -978,6 +1003,7 @@ impl ast::VisitorMut for GroupedExpressionSubstituter<'_> {
         std::ops::ControlFlow::Continue(())
     }
 
+    #[cfg_attr(feature = "execution-log", tracing::instrument(skip_all))]
     fn post_visit_expr(
         &mut self,
         expression: &mut ast::Expr,
@@ -994,16 +1020,19 @@ impl ast::VisitorMut for GroupedExpressionSubstituter<'_> {
 impl ast::VisitorMut for BoundExpressionNormalizer<'_> {
     type Break = ();
 
+    #[cfg_attr(feature = "execution-log", tracing::instrument(skip_all))]
     fn pre_visit_query(&mut self, _query: &mut ast::Query) -> std::ops::ControlFlow<Self::Break> {
         self.query_depth += 1;
         std::ops::ControlFlow::Continue(())
     }
 
+    #[cfg_attr(feature = "execution-log", tracing::instrument(skip_all))]
     fn post_visit_query(&mut self, _query: &mut ast::Query) -> std::ops::ControlFlow<Self::Break> {
         self.query_depth -= 1;
         std::ops::ControlFlow::Continue(())
     }
 
+    #[cfg_attr(feature = "execution-log", tracing::instrument(skip_all))]
     fn pre_visit_expr(&mut self, expression: &mut ast::Expr) -> std::ops::ControlFlow<Self::Break> {
         if self.query_depth != 0 {
             return std::ops::ControlFlow::Continue(());
@@ -1030,6 +1059,7 @@ impl ast::VisitorMut for BoundExpressionNormalizer<'_> {
     }
 }
 
+#[cfg_attr(feature = "execution-log", tracing::instrument(skip_all))]
 fn normalize_bound_expression(expression: &ast::Expr, scope: &BoundScope) -> Result<ast::Expr> {
     let mut expression = expression.clone();
     let mut normalizer = BoundExpressionNormalizer {
@@ -1041,6 +1071,7 @@ fn normalize_bound_expression(expression: &ast::Expr, scope: &BoundScope) -> Res
     normalizer.error.map_or(Ok(expression), Err)
 }
 
+#[cfg_attr(feature = "execution-log", tracing::instrument(skip_all))]
 fn compare_bound_expressions(
     left: &ast::Expr,
     right: &ast::Expr,
@@ -1049,6 +1080,7 @@ fn compare_bound_expressions(
     Ok(normalize_bound_expression(left, scope)? == normalize_bound_expression(right, scope)?)
 }
 
+#[cfg_attr(feature = "execution-log", tracing::instrument(skip_all))]
 fn inspect_aggregate_usage(
     state: &DatabaseState,
     expression: &ast::Expr,
@@ -1067,6 +1099,7 @@ fn inspect_aggregate_usage(
     validator.error.map_or(Ok(validator.usage), Err)
 }
 
+#[cfg_attr(feature = "execution-log", tracing::instrument(skip_all))]
 fn materialize_aggregate_expression(
     state: &DatabaseState,
     expression: &ast::Expr,
@@ -1091,6 +1124,7 @@ fn materialize_aggregate_expression(
     materializer.error.map_or(Ok(expression), Err)
 }
 
+#[cfg_attr(feature = "execution-log", tracing::instrument(skip_all))]
 fn validate_grouped_expression(
     state: &DatabaseState,
     expression: &ast::Expr,
@@ -1123,6 +1157,7 @@ fn validate_grouped_expression(
     Ok(usage.found)
 }
 
+#[cfg_attr(feature = "execution-log", tracing::instrument(skip_all))]
 fn compare_group_keys(left: &[Value], right: &[Value]) -> Result<bool> {
     assert_eq!(left.len(), right.len());
     for (left, right) in left.iter().zip(right) {
@@ -1136,6 +1171,7 @@ fn compare_group_keys(left: &[Value], right: &[Value]) -> Result<bool> {
     Ok(true)
 }
 
+#[cfg_attr(feature = "execution-log", tracing::instrument(skip_all))]
 fn create_projection_expression(
     projection: &ProjectionSource<'_>,
     scope: &BoundScope,
@@ -1164,6 +1200,7 @@ fn create_projection_expression(
     }
 }
 
+#[cfg_attr(feature = "execution-log", tracing::instrument(skip_all))]
 fn resolve_grouping_expressions(
     state: &DatabaseState,
     expressions: &[ast::Expr],
@@ -1229,6 +1266,7 @@ fn resolve_grouping_expressions(
         })
         .collect()
 }
+#[cfg_attr(feature = "execution-log", tracing::instrument(skip_all))]
 pub(super) fn resolve_select_lock_mode(query: &ast::Query) -> Result<Option<RowLockMode>> {
     if query.locks.len() > 1 {
         return reject_unsupported("multiple row-lock clauses are not implemented");
@@ -1245,6 +1283,7 @@ pub(super) fn resolve_select_lock_mode(query: &ast::Query) -> Result<Option<RowL
     }))
 }
 
+#[cfg_attr(feature = "execution-log", tracing::instrument(skip_all))]
 fn bind_values_scope(values: &ast::Values) -> Result<BoundScope> {
     let width = values.rows.first().map(|row| row.len()).unwrap_or(0);
     if values.rows.iter().any(|row| row.len() != width) {
@@ -1295,6 +1334,7 @@ fn bind_values_scope(values: &ast::Values) -> Result<BoundScope> {
     Ok(BoundScope { columns })
 }
 
+#[cfg_attr(feature = "execution-log", tracing::instrument(skip_all))]
 fn execute_values_query(
     query: &ast::Query,
     values: &ast::Values,
@@ -1440,6 +1480,7 @@ fn execute_values_query(
     }))
 }
 
+#[cfg_attr(feature = "execution-log", tracing::instrument(skip_all))]
 fn execute_set_expression(
     state: &DatabaseState,
     query: &ast::Query,
@@ -1486,6 +1527,7 @@ fn execute_set_expression(
     }
 }
 
+#[cfg_attr(feature = "execution-log", tracing::instrument(skip_all))]
 fn execute_set_operation(
     operator: ast::SetOperator,
     quantifier: ast::SetQuantifier,
@@ -1523,6 +1565,7 @@ fn execute_set_operation(
     Ok(QueryResult { columns, rows })
 }
 
+#[cfg_attr(feature = "execution-log", tracing::instrument(skip_all))]
 fn resolve_set_columns(left: &[ColumnMeta], right: &[ColumnMeta]) -> Result<Vec<ColumnMeta>> {
     if left.len() != right.len() {
         return Err(PgError::create(
@@ -1553,6 +1596,7 @@ fn resolve_set_columns(left: &[ColumnMeta], right: &[ColumnMeta]) -> Result<Vec<
         .collect()
 }
 
+#[cfg_attr(feature = "execution-log", tracing::instrument(skip_all))]
 fn coerce_set_rows(
     rows: Vec<Vec<Value>>,
     source: &[ColumnMeta],
@@ -1580,6 +1624,7 @@ fn coerce_set_rows(
         .collect()
 }
 
+#[cfg_attr(feature = "execution-log", tracing::instrument(skip_all))]
 fn remove_set_duplicates(rows: Vec<Vec<Value>>) -> Result<Vec<Vec<Value>>> {
     let mut selected: Vec<Vec<Value>> = Vec::new();
     for row in rows {
@@ -1597,6 +1642,7 @@ fn remove_set_duplicates(rows: Vec<Vec<Value>>) -> Result<Vec<Vec<Value>>> {
     Ok(selected)
 }
 
+#[cfg_attr(feature = "execution-log", tracing::instrument(skip_all))]
 fn select_set_intersection(
     left: Vec<Vec<Value>>,
     right: Vec<Vec<Value>>,
@@ -1619,6 +1665,7 @@ fn select_set_intersection(
     Ok(selected)
 }
 
+#[cfg_attr(feature = "execution-log", tracing::instrument(skip_all))]
 fn select_set_difference(left: Vec<Vec<Value>>, right: Vec<Vec<Value>>) -> Result<Vec<Vec<Value>>> {
     let mut consumed = vec![false; right.len()];
     let mut selected = Vec::new();
@@ -1639,6 +1686,7 @@ fn select_set_difference(left: Vec<Vec<Value>>, right: Vec<Vec<Value>>) -> Resul
     Ok(selected)
 }
 
+#[cfg_attr(feature = "execution-log", tracing::instrument(skip_all))]
 fn sort_set_rows(
     rows: &mut [Vec<Value>],
     columns: &[ColumnMeta],
@@ -1721,6 +1769,7 @@ fn sort_set_rows(
     Ok(())
 }
 
+#[cfg_attr(feature = "execution-log", tracing::instrument(skip_all))]
 fn resolve_select_limit(
     query: &ast::Query,
     context: &StatementExecutionContext,
@@ -1754,6 +1803,7 @@ fn resolve_select_limit(
     }
 }
 
+#[cfg_attr(feature = "execution-log", tracing::instrument(skip_all))]
 fn validate_select_predicates(
     state: &DatabaseState,
     select: &ast::Select,
@@ -1780,6 +1830,7 @@ fn validate_select_predicates(
     Ok(())
 }
 
+#[cfg_attr(feature = "execution-log", tracing::instrument(skip_all))]
 fn resolve_order_specs<'a>(
     state: &DatabaseState,
     query: &'a ast::Query,
@@ -1858,6 +1909,7 @@ fn resolve_order_specs<'a>(
         .map(|orders| orders.unwrap_or_default())
 }
 
+#[cfg_attr(feature = "execution-log", tracing::instrument(skip_all))]
 fn create_order_expression(
     order: &RowOrderSpec<'_>,
     projections: &[ProjectionSource<'_>],
@@ -1869,6 +1921,7 @@ fn create_order_expression(
     }
 }
 
+#[cfg_attr(feature = "execution-log", tracing::instrument(skip_all))]
 fn resolve_distinct_plan<'a>(
     state: &DatabaseState,
     select: &'a ast::Select,
@@ -1971,6 +2024,7 @@ fn resolve_distinct_plan<'a>(
     }
 }
 
+#[cfg_attr(feature = "execution-log", tracing::instrument(skip_all))]
 fn extend_grouped_columns_with_primary_keys(
     state: &DatabaseState,
     scope: &BoundScope,
@@ -2030,6 +2084,7 @@ fn extend_grouped_columns_with_primary_keys(
     }
 }
 
+#[cfg_attr(feature = "execution-log", tracing::instrument(skip_all))]
 fn resolve_grouping_plan(
     state: &DatabaseState,
     select: &ast::Select,
@@ -2127,6 +2182,7 @@ fn resolve_grouping_plan(
     })
 }
 
+#[cfg_attr(feature = "execution-log", tracing::instrument(skip_all))]
 fn evaluate_where_clause(
     state: &DatabaseState,
     selection: Option<&ast::Expr>,
@@ -2148,6 +2204,7 @@ fn evaluate_where_clause(
     )
 }
 
+#[cfg_attr(feature = "execution-log", tracing::instrument(skip_all))]
 fn evaluate_select_expression(
     state: &DatabaseState,
     expression: &ast::Expr,
@@ -2170,6 +2227,7 @@ fn evaluate_select_expression(
     evaluate_query_expression(state, expression, scope, row, xid, snapshot, context)
 }
 
+#[cfg_attr(feature = "execution-log", tracing::instrument(skip_all))]
 fn evaluate_projection_value(
     state: &DatabaseState,
     projection: &ProjectionSource<'_>,
@@ -2214,6 +2272,7 @@ fn evaluate_projection_value(
     }
 }
 
+#[cfg_attr(feature = "execution-log", tracing::instrument(skip_all))]
 pub(super) fn evaluate_projection_values(
     state: &DatabaseState,
     projections: &[ProjectionSource<'_>],
@@ -2241,6 +2300,7 @@ pub(super) fn evaluate_projection_values(
         .collect()
 }
 
+#[cfg_attr(feature = "execution-log", tracing::instrument(skip_all))]
 fn evaluate_order_keys(
     state: &DatabaseState,
     order_specs: &[RowOrderSpec<'_>],
@@ -2270,6 +2330,7 @@ fn evaluate_order_keys(
         .collect()
 }
 
+#[cfg_attr(feature = "execution-log", tracing::instrument(skip_all))]
 fn evaluate_distinct_keys(
     state: &DatabaseState,
     distinct: &DistinctPlan<'_>,
@@ -2303,6 +2364,7 @@ fn evaluate_distinct_keys(
         .collect()
 }
 
+#[cfg_attr(feature = "execution-log", tracing::instrument(skip_all))]
 fn execute_plain_select_rows(
     state: &DatabaseState,
     select: &ast::Select,
@@ -2396,6 +2458,7 @@ fn execute_plain_select_rows(
     Ok(rows)
 }
 
+#[cfg_attr(feature = "execution-log", tracing::instrument(skip_all))]
 fn execute_correlated_exists_rows(
     state: &DatabaseState,
     select: &ast::Select,
@@ -2543,6 +2606,7 @@ fn execute_correlated_exists_rows(
     Some(result.map(|()| rows))
 }
 
+#[cfg_attr(feature = "execution-log", tracing::instrument(skip_all))]
 fn execute_any_membership_rows(
     state: &DatabaseState,
     select: &ast::Select,
@@ -2666,6 +2730,7 @@ fn execute_any_membership_rows(
     Some(result.map(|()| rows))
 }
 
+#[cfg_attr(feature = "execution-log", tracing::instrument(skip_all))]
 fn execute_grouped_select_rows(
     state: &DatabaseState,
     select: &ast::Select,
@@ -2787,6 +2852,7 @@ fn execute_grouped_select_rows(
     Ok(rows)
 }
 
+#[cfg_attr(feature = "execution-log", tracing::instrument(skip_all))]
 fn sort_ordered_rows(rows: &mut [OrderedRow], order_specs: &[RowOrderSpec<'_>]) {
     if !order_specs.is_empty() {
         rows.sort_by(|left, right| {
@@ -2827,6 +2893,7 @@ fn sort_ordered_rows(rows: &mut [OrderedRow], order_specs: &[RowOrderSpec<'_>]) 
     }
 }
 
+#[cfg_attr(feature = "execution-log", tracing::instrument(skip_all))]
 fn remove_duplicate_rows(
     rows: Vec<OrderedRow>,
     distinct: &DistinctPlan<'_>,
@@ -2860,6 +2927,7 @@ fn remove_duplicate_rows(
     Ok(selected)
 }
 
+#[cfg_attr(feature = "execution-log", tracing::instrument(skip_all))]
 fn finalize_select_rows(
     mut rows: Vec<OrderedRow>,
     order_specs: &[RowOrderSpec<'_>],
@@ -2882,6 +2950,7 @@ fn finalize_select_rows(
         .collect())
 }
 
+#[cfg_attr(feature = "execution-log", tracing::instrument(skip_all))]
 pub(super) fn execute_query(
     state: &DatabaseState,
     query: &ast::Query,
@@ -2980,6 +3049,7 @@ pub(super) fn execute_query(
     Ok(StatementResult::Query(QueryResult { columns, rows }))
 }
 
+#[cfg_attr(feature = "execution-log", tracing::instrument(skip_all))]
 pub(super) fn build_projection_plan<'a>(
     state: &DatabaseState,
     projection: &'a [ast::SelectItem],
@@ -3114,6 +3184,7 @@ pub(super) fn build_projection_plan<'a>(
     Ok((projections, columns))
 }
 
+#[cfg_attr(feature = "execution-log", tracing::instrument(skip_all))]
 pub(super) fn build_mutation_projection_plan<'a>(
     state: &DatabaseState,
     projection: &'a [ast::SelectItem],
@@ -3140,6 +3211,7 @@ pub(super) fn build_mutation_projection_plan<'a>(
     Ok((projections, columns))
 }
 
+#[cfg_attr(feature = "execution-log", tracing::instrument(skip_all))]
 pub(super) fn infer_query_expression_type(
     state: &DatabaseState,
     expr: &ast::Expr,
@@ -3148,6 +3220,7 @@ pub(super) fn infer_query_expression_type(
     super::scope::infer_expression_data_type(&state.catalog, expr, scope)
 }
 
+#[cfg_attr(feature = "execution-log", tracing::instrument(skip_all))]
 fn materialize_source_rows(
     state: &DatabaseState,
     select: &ast::Select,
@@ -3169,6 +3242,7 @@ fn materialize_source_rows(
     )
 }
 
+#[cfg_attr(feature = "execution-log", tracing::instrument(skip_all))]
 pub(super) fn materialize_from_rows(
     state: &DatabaseState,
     from: &[ast::TableWithJoins],
@@ -3216,6 +3290,7 @@ pub(super) fn materialize_from_rows(
     Ok(rows)
 }
 
+#[cfg_attr(feature = "execution-log", tracing::instrument(skip_all))]
 fn visit_query_source_rows(
     state: &DatabaseState,
     select: &ast::Select,
@@ -3239,6 +3314,7 @@ fn visit_query_source_rows(
     Ok(())
 }
 
+#[cfg_attr(feature = "execution-log", tracing::instrument(skip_all))]
 fn can_stream_inner_join(table: &ast::TableWithJoins) -> bool {
     matches!(table.relation, ast::TableFactor::Table { .. })
         && table.joins.iter().all(|join| {
@@ -3252,6 +3328,7 @@ fn can_stream_inner_join(table: &ast::TableWithJoins) -> bool {
         })
 }
 
+#[cfg_attr(feature = "execution-log", tracing::instrument(skip_all))]
 fn visit_streamed_inner_join_rows(
     state: &DatabaseState,
     table: &ast::TableWithJoins,
@@ -3306,6 +3383,7 @@ fn visit_streamed_inner_join_rows(
     )
 }
 
+#[cfg_attr(feature = "execution-log", tracing::instrument(skip_all))]
 fn resolve_hash_join_slots(
     operator: &ast::JoinOperator,
     scope: &BoundScope,
@@ -3353,6 +3431,7 @@ fn resolve_hash_join_slots(
     .then_some((left_slot, right_slot))
 }
 
+#[cfg_attr(feature = "execution-log", tracing::instrument(skip_all))]
 fn resolve_hash_expression_slot(
     expression: &ast::Expr,
     scope: &BoundScope,
@@ -3366,6 +3445,7 @@ fn resolve_hash_expression_slot(
     }
 }
 
+#[cfg_attr(feature = "execution-log", tracing::instrument(skip_all))]
 fn visit_hash_join_rows(
     state: &DatabaseState,
     table: &ast::TableWithJoins,
@@ -3432,6 +3512,7 @@ fn visit_hash_join_rows(
     )
 }
 
+#[cfg_attr(feature = "execution-log", tracing::instrument(skip_all))]
 fn create_hash_join_key(value: &Value) -> Option<JoinKey> {
     match value {
         Value::Null => None,
@@ -3446,6 +3527,7 @@ fn create_hash_join_key(value: &Value) -> Option<JoinKey> {
     }
 }
 
+#[cfg_attr(feature = "execution-log", tracing::instrument(skip_all))]
 fn visit_nested_loop_join_rows(
     state: &DatabaseState,
     table: &ast::TableWithJoins,
@@ -3513,6 +3595,7 @@ fn visit_nested_loop_join_rows(
     )
 }
 
+#[cfg_attr(feature = "execution-log", tracing::instrument(skip_all))]
 fn visit_table_factor_rows(
     state: &DatabaseState,
     factor: &ast::TableFactor,
@@ -3639,6 +3722,7 @@ fn visit_table_factor_rows(
     Ok(())
 }
 
+#[cfg_attr(feature = "execution-log", tracing::instrument(skip_all))]
 fn materialize_table_with_joins_rows(
     state: &DatabaseState,
     table: &ast::TableWithJoins,
@@ -3733,6 +3817,7 @@ fn materialize_table_with_joins_rows(
     Ok(rows)
 }
 
+#[cfg_attr(feature = "execution-log", tracing::instrument(skip_all))]
 fn materialize_table_factor_rows(
     state: &DatabaseState,
     factor: &ast::TableFactor,
@@ -3835,6 +3920,7 @@ fn materialize_table_factor_rows(
         .map(|rows| rows.into_iter().flatten().collect())
 }
 
+#[cfg_attr(feature = "execution-log", tracing::instrument(skip_all))]
 fn collect_pushdown_filters<'a>(
     expr: &'a ast::Expr,
     scope: &BoundScope,
@@ -3877,6 +3963,7 @@ fn collect_pushdown_filters<'a>(
     }
 }
 
+#[cfg_attr(feature = "execution-log", tracing::instrument(skip_all))]
 fn is_point_lookup_value(expr: &ast::Expr) -> bool {
     matches!(expr, ast::Expr::Value(_))
         || matches!(
@@ -3890,6 +3977,7 @@ fn is_point_lookup_value(expr: &ast::Expr) -> bool {
         )
 }
 
+#[cfg_attr(feature = "execution-log", tracing::instrument(skip_all))]
 fn evaluate_join_condition(
     state: &DatabaseState,
     operator: &ast::JoinOperator,
@@ -3946,6 +4034,7 @@ fn evaluate_join_condition(
     }
 }
 
+#[cfg_attr(feature = "execution-log", tracing::instrument(skip_all))]
 fn evaluate_using_join_condition(
     names: &[String],
     row: &[Value],
@@ -3983,6 +4072,7 @@ fn evaluate_using_join_condition(
     Ok(true)
 }
 
+#[cfg_attr(feature = "execution-log", tracing::instrument(skip_all))]
 fn evaluate_row_count(
     expr: &ast::Expr,
     clause: RowCountClause,

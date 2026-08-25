@@ -7,6 +7,7 @@ struct ReturningPlan<'a> {
     columns: Vec<ColumnMeta>,
 }
 
+#[cfg_attr(feature = "execution-log", tracing::instrument(skip_all))]
 fn build_returning_plan<'a>(
     state: &DatabaseState,
     scope: BoundScope,
@@ -25,6 +26,7 @@ fn build_returning_plan<'a>(
     }))
 }
 
+#[cfg_attr(feature = "execution-log", tracing::instrument(skip_all))]
 fn create_mutation_scope(
     state: &DatabaseState,
     schema: &TableSchema,
@@ -37,6 +39,7 @@ fn create_mutation_scope(
     ))
 }
 
+#[cfg_attr(feature = "execution-log", tracing::instrument(skip_all))]
 fn materialize_mutation_source_rows(
     state: &DatabaseState,
     from: &[ast::TableWithJoins],
@@ -61,6 +64,7 @@ fn materialize_mutation_source_rows(
     )
 }
 
+#[cfg_attr(feature = "execution-log", tracing::instrument(skip_all))]
 fn evaluate_mutation_assignment(
     state: &DatabaseState,
     expression: &ast::Expr,
@@ -85,6 +89,7 @@ fn evaluate_mutation_assignment(
     }
 }
 
+#[cfg_attr(feature = "execution-log", tracing::instrument(skip_all))]
 fn matches_mutation_row(
     state: &DatabaseState,
     selection: Option<&ast::Expr>,
@@ -108,6 +113,7 @@ fn matches_mutation_row(
     )
 }
 
+#[cfg_attr(feature = "execution-log", tracing::instrument(skip_all))]
 fn evaluate_returning_row(
     state: &DatabaseState,
     returning: Option<&ReturningPlan<'_>>,
@@ -133,6 +139,7 @@ fn evaluate_returning_row(
     Ok(())
 }
 
+#[cfg_attr(feature = "execution-log", tracing::instrument(skip_all))]
 fn create_write_result(
     affected: u64,
     returning: Option<ReturningPlan<'_>>,
@@ -147,6 +154,7 @@ fn create_write_result(
     }
 }
 
+#[cfg_attr(feature = "execution-log", tracing::instrument(skip_all))]
 pub(super) fn execute_insert(
     state: &mut DatabaseState,
     insert: &ast::Insert,
@@ -360,6 +368,7 @@ pub(super) fn execute_insert(
     Ok(create_write_result(affected, returning, returned_rows))
 }
 
+#[cfg_attr(feature = "execution-log", tracing::instrument(skip_all))]
 pub(super) fn execute_update(
     state: &mut DatabaseState,
     update_table: &ast::TableWithJoins,
@@ -556,6 +565,7 @@ pub(super) fn execute_update(
     Ok(create_write_result(affected, returning, returned_rows))
 }
 
+#[cfg_attr(feature = "execution-log", tracing::instrument(skip_all))]
 pub(super) fn execute_delete(
     state: &mut DatabaseState,
     delete: &ast::Delete,

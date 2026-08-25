@@ -14,6 +14,7 @@ pub(crate) enum CastContext {
     Explicit,
 }
 
+#[cfg_attr(feature = "execution-log", tracing::instrument(skip_all))]
 pub(crate) fn convert_ast_data_type(data_type: &ast::DataType) -> Result<PgType> {
     let (base, typmod) = match data_type {
         ast::DataType::Bool | ast::DataType::Boolean => (BaseType::Bool, PgType::NO_TYPEMOD),
@@ -80,6 +81,7 @@ pub(crate) fn convert_ast_data_type(data_type: &ast::DataType) -> Result<PgType>
     Ok(PgType::create_with_typmod(base, typmod))
 }
 
+#[cfg_attr(feature = "execution-log", tracing::instrument(skip_all))]
 fn encode_character_typmod(length: Option<ast::CharacterLength>, default_one: bool) -> Result<i32> {
     let length = match length {
         Some(ast::CharacterLength::IntegerLength { length, unit: None }) => Some(length),
@@ -105,6 +107,7 @@ fn encode_character_typmod(length: Option<ast::CharacterLength>, default_one: bo
         .map(|typmod| typmod.unwrap_or(PgType::NO_TYPEMOD))
 }
 
+#[cfg_attr(feature = "execution-log", tracing::instrument(skip_all))]
 fn encode_numeric_typmod(info: ast::ExactNumberInfo) -> Result<i32> {
     let (precision, scale) = match info {
         ast::ExactNumberInfo::None => return Ok(PgType::NO_TYPEMOD),
@@ -120,6 +123,7 @@ fn encode_numeric_typmod(info: ast::ExactNumberInfo) -> Result<i32> {
     Ok(((precision as i32) << 16) + scale as i32 + 4)
 }
 
+#[cfg_attr(feature = "execution-log", tracing::instrument(skip_all))]
 fn encode_time_typmod(precision: Option<u64>) -> Result<i32> {
     match precision {
         None => Ok(PgType::NO_TYPEMOD),
@@ -131,6 +135,7 @@ fn encode_time_typmod(precision: Option<u64>) -> Result<i32> {
     }
 }
 
+#[cfg_attr(feature = "execution-log", tracing::instrument(skip_all))]
 pub(crate) fn resolve_common_type(left: BaseType, right: BaseType) -> Option<BaseType> {
     if left == right {
         return Some(left);
@@ -143,10 +148,12 @@ pub(crate) fn resolve_common_type(left: BaseType, right: BaseType) -> Option<Bas
     Some(if left_rank > right_rank { left } else { right })
 }
 
+#[cfg_attr(feature = "execution-log", tracing::instrument(skip_all))]
 pub(crate) fn can_cast(source: BaseType, target: BaseType, context: CastContext) -> bool {
     resolve_required_cast_context(source, target).is_some_and(|required| context >= required)
 }
 
+#[cfg_attr(feature = "execution-log", tracing::instrument(skip_all))]
 fn resolve_required_cast_context(source: BaseType, target: BaseType) -> Option<CastContext> {
     if source == target || is_string_type(source) && is_string_type(target) {
         return Some(CastContext::Implicit);
@@ -213,6 +220,7 @@ fn resolve_required_cast_context(source: BaseType, target: BaseType) -> Option<C
     None
 }
 
+#[cfg_attr(feature = "execution-log", tracing::instrument(skip_all))]
 pub(crate) fn coerce(
     value: Value,
     source: BaseType,
@@ -252,6 +260,7 @@ pub(crate) fn coerce(
     apply_typmod(value, target, context)
 }
 
+#[cfg_attr(feature = "execution-log", tracing::instrument(skip_all))]
 pub(crate) fn coerce_unknown(text: &str, target: PgType, context: CastContext) -> Result<Value> {
     let value = if is_string_type(target.base) {
         Value::Text(text.into())
@@ -261,6 +270,7 @@ pub(crate) fn coerce_unknown(text: &str, target: PgType, context: CastContext) -
     apply_typmod(value, target, context)
 }
 
+#[cfg_attr(feature = "execution-log", tracing::instrument(skip_all))]
 fn convert_non_string_value(value: Value, target: BaseType) -> Result<Value> {
     match (value, target) {
         (Value::Date(crate::value::PgDate::Finite(value)), BaseType::Timestamp) => {
@@ -405,6 +415,7 @@ fn convert_non_string_value(value: Value, target: BaseType) -> Result<Value> {
     }
 }
 
+#[cfg_attr(feature = "execution-log", tracing::instrument(skip_all))]
 fn convert_float_to_int(value: f64, target: BaseType) -> Result<Value> {
     if !value.is_finite() {
         return Err(create_out_of_range_error(target));
@@ -427,6 +438,7 @@ fn convert_float_to_int(value: f64, target: BaseType) -> Result<Value> {
     }
 }
 
+#[cfg_attr(feature = "execution-log", tracing::instrument(skip_all))]
 fn convert_numeric_to_int(value: BigDecimal, target: BaseType) -> Result<Value> {
     let rounded = value.with_scale_round(0, RoundingMode::HalfUp);
     match target {
@@ -446,6 +458,7 @@ fn convert_numeric_to_int(value: BigDecimal, target: BaseType) -> Result<Value> 
     }
 }
 
+#[cfg_attr(feature = "execution-log", tracing::instrument(skip_all))]
 fn apply_typmod(value: Value, target: PgType, context: CastContext) -> Result<Value> {
     if target.typmod == PgType::NO_TYPEMOD {
         return Ok(value);
@@ -507,6 +520,7 @@ fn apply_typmod(value: Value, target: PgType, context: CastContext) -> Result<Va
     }
 }
 
+#[cfg_attr(feature = "execution-log", tracing::instrument(skip_all))]
 fn round_timestamp(
     value: crate::value::PgTimestamp,
     typmod: i32,
@@ -524,6 +538,7 @@ fn round_timestamp(
     })
 }
 
+#[cfg_attr(feature = "execution-log", tracing::instrument(skip_all))]
 fn round_timestamptz(
     value: crate::value::PgTimestampTz,
     typmod: i32,
@@ -541,6 +556,7 @@ fn round_timestamptz(
     })
 }
 
+#[cfg_attr(feature = "execution-log", tracing::instrument(skip_all))]
 fn get_numeric_rank(base: BaseType) -> Option<u8> {
     match base {
         BaseType::Int2 => Some(0),
@@ -553,10 +569,12 @@ fn get_numeric_rank(base: BaseType) -> Option<u8> {
     }
 }
 
+#[cfg_attr(feature = "execution-log", tracing::instrument(skip_all))]
 fn is_string_type(base: BaseType) -> bool {
     matches!(base, BaseType::Text | BaseType::Varchar | BaseType::Bpchar)
 }
 
+#[cfg_attr(feature = "execution-log", tracing::instrument(skip_all))]
 fn create_cannot_cast_error(source: BaseType, target: BaseType) -> PgError {
     PgError::create(
         SqlState::CannotCoerce,
@@ -568,6 +586,7 @@ fn create_cannot_cast_error(source: BaseType, target: BaseType) -> PgError {
     )
 }
 
+#[cfg_attr(feature = "execution-log", tracing::instrument(skip_all))]
 fn create_out_of_range_error(target: BaseType) -> PgError {
     PgError::create(
         SqlState::NumericValueOutOfRange,
@@ -580,6 +599,7 @@ mod tests {
     use super::*;
 
     #[test]
+    #[cfg_attr(feature = "execution-log", tracing::instrument(skip_all))]
     fn follows_postgres_numeric_cast_directions() {
         assert!(can_cast(
             BaseType::Int2,
@@ -599,6 +619,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg_attr(feature = "execution-log", tracing::instrument(skip_all))]
     fn rounds_numeric_assignments_and_checks_ranges() {
         assert_eq!(
             coerce(
@@ -624,6 +645,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg_attr(feature = "execution-log", tracing::instrument(skip_all))]
     fn provides_assignment_conversion_for_every_numeric_pair() {
         let values = [
             (BaseType::Int2, Value::Int2(2)),

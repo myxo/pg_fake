@@ -24,6 +24,12 @@ would be a win.
 
 TODO
 
+Run the SQLx adapter example:
+
+```sh
+cargo run -p pg_fake_sqlx --bin sqlx_example
+```
+
 ## Command-line interface
 
 Run a SQL file against a fresh in-memory database:
