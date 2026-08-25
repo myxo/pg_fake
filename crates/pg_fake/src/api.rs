@@ -836,6 +836,7 @@ impl Session {
             )
         };
         let execution_statement = bound_statement.as_ref().unwrap_or(&statement.statement);
+        let read_only_prepared = prepared_query.is_some();
         let started_implicit_transaction = self.transaction.is_none();
         if started_implicit_transaction {
             self.start_transaction(self.default_isolation, true);
@@ -843,7 +844,11 @@ impl Session {
         match self.execute_statement(execution_statement, prepared_query) {
             Ok(result) => {
                 if started_implicit_transaction && self.is_transaction_implicit_batch() {
-                    self.commit_transaction()?;
+                    if read_only_prepared {
+                        self.commit_read_only_transaction();
+                    } else {
+                        self.commit_transaction()?;
+                    }
                 }
                 Ok(result)
             }
@@ -935,6 +940,21 @@ impl Session {
         self.deferred_foreign_keys_dirty = false;
         self.db.condvar.notify_all();
         Ok(())
+    }
+
+    #[cfg_attr(feature = "execution-log", tracing::instrument(skip_all))]
+    fn commit_read_only_transaction(&mut self) {
+        let Some(SessionTransactionState::Active(transaction)) = self.transaction.take() else {
+            unreachable!("a read-only transaction must be active while committing")
+        };
+        assert!(transaction.implicit_batch);
+        let mut state = self.db.state.lock().expect("database mutex is poisoned");
+        state.transactions.finish_read_only(transaction.xid);
+        self.ddl_undo.clear();
+        self.settings_undo = None;
+        self.deferred_constraints.clear();
+        self.defer_all_constraints = false;
+        self.deferred_foreign_keys_dirty = false;
     }
 
     #[cfg_attr(feature = "execution-log", tracing::instrument(skip_all))]

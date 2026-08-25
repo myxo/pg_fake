@@ -286,6 +286,16 @@ impl TransactionRegistry {
     }
 
     #[cfg_attr(feature = "execution-log", tracing::instrument(skip_all))]
+    pub(crate) fn finish_read_only(&mut self, xid: Xid) {
+        assert!(matches!(
+            self.get_status(xid),
+            Some(TransactionStatus::InFlight)
+        ));
+        self.statuses.remove(&xid);
+        self.retained_snapshots.remove(&xid);
+    }
+
+    #[cfg_attr(feature = "execution-log", tracing::instrument(skip_all))]
     pub(crate) fn abort(&mut self, xid: Xid) {
         assert!(matches!(
             self.get_status(xid),

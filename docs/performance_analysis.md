@@ -226,3 +226,27 @@ The first 10,000-row heap measurement was anomalously slower; repeating that
 diagnostic produced 212.38 us, within 0.34% of the accepted baseline. The full
 test suite passed, as did all four SQLx differential property tests with 10,000
 generated iterations.
+
+## Optimization 5 measurement
+
+The first read-only autocommit candidate bypassed transaction registration. It
+improved the heap workload but regressed the primary-key workload by 8.0% in a
+direct A/B test, so it was rejected and fully removed.
+
+The accepted candidate retains normal implicit transaction registration and
+snapshot creation. When a prepared plan proves the transaction was read-only,
+completion removes its in-flight registry entry without advancing the write
+commit sequence, scanning tables for modified versions, pruning versions,
+releasing nonexistent row locks, or updating the wait graph.
+
+| Query | Before | Candidate | Change |
+| --- | ---: | ---: | ---: |
+| SQLx 100-row heap predicate | 12.37 us | 11.16 us | 9.8% faster |
+| SQLx 100-row primary-key predicate | 8.55 us | 8.43 us | within measurement variance |
+
+All 178 regular tests passed. In the 10,000-iteration SQLx property run, the
+sequence, set-operation, and interleaved-transaction groups passed. The general
+SQL generator found a text-collation ordering difference for `SELECT DISTINCT
+... ORDER BY`; replaying its exact seed with this candidate removed fails
+identically, confirming that difference is pre-existing and unrelated to
+read-only transaction completion.
