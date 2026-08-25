@@ -203,3 +203,26 @@ remain unchanged, and no SQLx code is involved.
 This removes a fixed setup cost. It is therefore most visible for indexed and
 small-table queries, while expression evaluation dominates the 10,000-row heap
 scan.
+
+## Optimization 4 measurement
+
+Prepared query plans now borrow their retained SQL AST for the shared
+transaction checks instead of cloning it on every execution. The fallback path
+still owns the parameter-bound AST it creates. Prepared `SELECT` plans also
+skip the DDL classifier because their statement kind was established during
+preparation.
+
+| Query | Before | Candidate | Change |
+| --- | ---: | ---: | ---: |
+| SQLx 100-row heap predicate | 14.09 us | 12.37 us | 12.2% faster |
+| SQLx 100-row primary-key predicate | 10.01 us | 8.55 us | 14.6% faster |
+| prepared indexed select | 1.083 us | 286 ns | 73.6% faster |
+| prepared 100-row heap predicate | 2.993 us | 2.199 us | 26.5% faster |
+| prepared 100-row indexed predicate | 1.130 us | 331 ns | 70.7% faster |
+| prepared 10,000-row heap predicate | 211.66 us | 212.38 us | no measurable change |
+| prepared 10,000-row indexed predicate | 1.197 us | 395 ns | 67.0% faster |
+
+The first 10,000-row heap measurement was anomalously slower; repeating that
+diagnostic produced 212.38 us, within 0.34% of the accepted baseline. The full
+test suite passed, as did all four SQLx differential property tests with 10,000
+generated iterations.

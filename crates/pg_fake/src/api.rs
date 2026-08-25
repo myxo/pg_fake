@@ -568,7 +568,7 @@ impl Session {
             if self.transaction.is_none() {
                 self.start_transaction(self.default_isolation, true);
             }
-            match self.execute_statement(statement, None) {
+            match self.execute_statement(&statement, None) {
                 Ok(result) => results.push(result),
                 Err(error) => {
                     if self.is_transaction_implicit_batch() {
@@ -807,34 +807,40 @@ impl Session {
         params: &[Value],
     ) -> Result<StatementResult> {
         let parameters;
-        let bound_statement;
-        let prepared_query = if let Some(query_plan) = &statement.query_plan {
+        let (bound_statement, prepared_query) = if let Some(query_plan) = &statement.query_plan {
             parameters = match analyzer::coerce_parameters(&statement.parameter_types, params) {
                 Ok(parameters) => parameters,
                 Err(error) => return self.abort_with_error(error),
             };
-            bound_statement = statement.statement.clone();
-            Some((
-                query_plan,
-                parameters.as_slice(),
-                statement.columns.as_slice(),
-            ))
+            (
+                None,
+                Some((
+                    query_plan,
+                    parameters.as_slice(),
+                    statement.columns.as_slice(),
+                )),
+            )
         } else {
-            bound_statement = match analyzer::bind_parameters(
-                &statement.statement,
-                &statement.parameter_types,
-                params,
-            ) {
-                Ok(statement) => statement,
-                Err(error) => return self.abort_with_error(error),
-            };
-            None
+            (
+                Some(
+                    match analyzer::bind_parameters(
+                        &statement.statement,
+                        &statement.parameter_types,
+                        params,
+                    ) {
+                        Ok(statement) => statement,
+                        Err(error) => return self.abort_with_error(error),
+                    },
+                ),
+                None,
+            )
         };
+        let execution_statement = bound_statement.as_ref().unwrap_or(&statement.statement);
         let started_implicit_transaction = self.transaction.is_none();
         if started_implicit_transaction {
             self.start_transaction(self.default_isolation, true);
         }
-        match self.execute_statement(bound_statement, prepared_query) {
+        match self.execute_statement(execution_statement, prepared_query) {
             Ok(result) => {
                 if started_implicit_transaction && self.is_transaction_implicit_batch() {
                     self.commit_transaction()?;
@@ -1039,10 +1045,10 @@ impl Session {
     #[cfg_attr(feature = "execution-log", tracing::instrument(skip_all))]
     fn execute_statement(
         &mut self,
-        statement: ast::Statement,
+        statement: &ast::Statement,
         prepared_query: Option<(&executor::PreparedQueryPlan, &[Value], &[ColumnMeta])>,
     ) -> Result<StatementResult> {
-        match &statement {
+        match statement {
             ast::Statement::Analyze(_) if !self.db.strict => {
                 return Ok(StatementResult::Affected(0));
             }
@@ -1223,7 +1229,8 @@ impl Session {
         if matches!(
             self.transaction,
             Some(SessionTransactionState::Active(transaction)) if !transaction.implicit_batch
-        ) && matches!(parser::classify(&statement), parser::StatementKind::Ddl)
+        ) && prepared_query.is_none()
+            && matches!(parser::classify(statement), parser::StatementKind::Ddl)
         {
             return self.abort_with_error(PgError::create(
                 SqlState::FeatureNotSupported,
@@ -1280,7 +1287,7 @@ impl Session {
         };
         let statement = match executor::materialize_uncorrelated_subqueries(
             &state,
-            &statement,
+            statement,
             transaction.xid,
             &snapshot,
             &context,
