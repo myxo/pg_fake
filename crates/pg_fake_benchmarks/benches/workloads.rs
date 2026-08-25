@@ -1088,6 +1088,7 @@ fn benchmarks(criterion: &mut Criterion) {
         foreign_key_insert_benchmark(criterion, &runtime, &mut connections);
         inner_join_benchmark(criterion, &runtime, &mut connections);
         derived_and_scalar_subquery_benchmark(criterion, &runtime, &mut connections);
+        materialized_cte_benchmark(criterion, &runtime, &mut connections);
         global_aggregate_benchmark(criterion, &runtime, &mut connections);
         grouped_aggregate_benchmark(criterion, &runtime, &mut connections);
         select_distinct_benchmark(criterion, &runtime, &mut connections);
@@ -1288,6 +1289,42 @@ fn derived_and_scalar_subquery_benchmark(
             runtime,
             "DROP TABLE derived_and_scalar_subquery_100_rows, correlated_exists_100_rows",
         );
+    }
+}
+
+fn materialized_cte_benchmark(
+    criterion: &mut Criterion,
+    runtime: &Runtime,
+    connections: &mut [NamedBenchmarkConnection<'_>],
+) {
+    let values = (1..=100)
+        .map(|id| format!("({id})"))
+        .collect::<Vec<_>>()
+        .join(",");
+    for (_, connection) in connections.iter_mut() {
+        connection.execute(
+            runtime,
+            "CREATE TABLE materialized_cte_100_rows (id INTEGER)",
+        );
+        connection.execute(
+            runtime,
+            &format!("INSERT INTO materialized_cte_100_rows VALUES {values}"),
+        );
+    }
+    let query = "WITH source(value) AS (SELECT id FROM materialized_cte_100_rows) SELECT left_source.value FROM source AS left_source JOIN source AS right_source ON left_source.value = right_source.value ORDER BY left_source.value";
+    let mut group =
+        criterion.benchmark_group(benchmarks::find_benchmark("materialized_cte_100_rows").name);
+    group.throughput(Throughput::Elements(100));
+    for (name, connection) in connections.iter_mut() {
+        group.bench_function(*name, |benchmark| {
+            benchmark.iter(|| {
+                connection.fetch(runtime, query);
+            });
+        });
+    }
+    group.finish();
+    for (_, connection) in connections.iter_mut() {
+        connection.execute(runtime, "DROP TABLE materialized_cte_100_rows");
     }
 }
 

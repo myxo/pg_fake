@@ -673,6 +673,10 @@ pub(super) fn infer_expression_data_type(
     expr: &ast::Expr,
     scope: &BoundScope,
 ) -> Result<PgType> {
+    if matches!(expr, ast::Expr::Value(value) if matches!(value.value, ast::Value::Placeholder(_)))
+    {
+        return Ok(PgType::create(BaseType::Text));
+    }
     if let ast::Expr::Subquery(query) = expr {
         let columns = describe_bound_query_columns(catalog, query, Some(scope))?;
         if columns.len() != 1 {

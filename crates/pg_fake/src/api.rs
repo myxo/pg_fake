@@ -740,8 +740,11 @@ impl Session {
         }
         let prepared = {
             let state = self.db.state.lock().expect("database mutex is poisoned");
-            analyzer::substitute_typed_subqueries(&statement, &state.catalog).and_then(
-                |described| {
+            executor::expand_ctes_for_analysis(&statement)
+                .and_then(|statement| {
+                    analyzer::substitute_typed_subqueries(&statement, &state.catalog)
+                })
+                .and_then(|described| {
                     analyzer::infer_parameter_types(&described, &state.catalog).and_then(
                         |parameter_types| {
                             let described = analyzer::bind_parameters(
@@ -759,8 +762,7 @@ impl Session {
                             Ok((parameter_types, columns, query_plan))
                         },
                     )
-                },
-            )
+                })
         };
         match prepared {
             Ok((parameter_types, columns, query_plan)) => Ok(PreparedStatement {
@@ -1305,9 +1307,19 @@ impl Session {
                 self.sequence_session.clone(),
             ),
         };
-        let statement = match executor::materialize_uncorrelated_subqueries(
+        let statement = match executor::materialize_ctes(
             &state,
             statement,
+            transaction.xid,
+            &snapshot,
+            &context,
+        ) {
+            Ok(statement) => statement,
+            Err(error) => return self.abort_with_error(error),
+        };
+        let statement = match executor::materialize_uncorrelated_subqueries(
+            &state,
+            &statement,
             transaction.xid,
             &snapshot,
             &context,
@@ -4702,6 +4714,82 @@ mod tests {
                 .unwrap_err()
                 .sqlstate,
             SqlState::FeatureNotSupported
+        );
+    }
+
+    #[test]
+    #[cfg_attr(feature = "execution-log", tracing::instrument(skip_all))]
+    fn materializes_non_recursive_ctes_once_with_aliases_and_empty_results() {
+        let db = Db::create();
+        let mut session = db.create_session();
+        session
+            .execute("CREATE TABLE items (id INTEGER PRIMARY KEY)")
+            .unwrap();
+        session
+            .execute("INSERT INTO items VALUES (1), (2)")
+            .unwrap();
+
+        let result = session
+            .query(
+                "WITH source(value) AS (SELECT id FROM items), doubled AS (SELECT value * 2 AS value FROM source) SELECT source.value, doubled.value FROM source JOIN doubled ON doubled.value = source.value * 2 ORDER BY source.value",
+                &[],
+            )
+            .unwrap();
+        assert_eq!(
+            result.rows,
+            vec![
+                vec![Value::Int4(1), Value::Int4(2)],
+                vec![Value::Int4(2), Value::Int4(4)],
+            ]
+        );
+
+        session.execute("CREATE SEQUENCE samples").unwrap();
+        let result = session
+            .query(
+                "WITH sampled(value) AS (SELECT nextval('samples')) SELECT left_sample.value = right_sample.value FROM sampled AS left_sample CROSS JOIN sampled AS right_sample",
+                &[],
+            )
+            .unwrap();
+        assert_eq!(result.rows, vec![vec![Value::Bool(true)]]);
+
+        assert_eq!(
+            session
+                .query(
+                    "WITH values_cte(value) AS (SELECT 1) SELECT (WITH values_cte(value) AS (SELECT 2) SELECT value FROM values_cte) FROM values_cte",
+                    &[],
+                )
+                .unwrap()
+                .rows,
+            vec![vec![Value::Int4(2)]]
+        );
+        assert_eq!(
+            session
+                .query(
+                    "WITH later_value(value) AS (SELECT value FROM first_value), first_value(value) AS (SELECT 1) SELECT value FROM later_value",
+                    &[],
+                )
+                .unwrap_err()
+                .sqlstate,
+            SqlState::UndefinedTable
+        );
+
+        let result = session
+            .query(
+                "WITH empty_values(value) AS (SELECT id FROM items WHERE false) SELECT value FROM empty_values",
+                &[],
+            )
+            .unwrap();
+        assert!(result.rows.is_empty());
+
+        let statement = session
+            .prepare("WITH parameterized(value) AS (SELECT $1) SELECT value FROM parameterized")
+            .unwrap();
+        assert_eq!(
+            session
+                .query_prepared(&statement, &[Value::Text("seven".into())])
+                .unwrap()
+                .rows,
+            vec![vec![Value::Text("seven".into())]]
         );
     }
 }

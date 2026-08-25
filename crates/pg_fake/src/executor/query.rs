@@ -2,6 +2,410 @@ use super::*;
 use ast::VisitMut as _;
 use sqlparser::ast;
 
+struct MaterializedCte {
+    name: String,
+    result: QueryResult,
+}
+
+#[derive(Clone)]
+struct InlineCte {
+    name: String,
+    query: Box<ast::Query>,
+    alias: ast::TableAlias,
+}
+
+struct InlineCteReferenceReplacer<'a> {
+    ctes: &'a [InlineCte],
+    error: Option<PgError>,
+}
+
+struct CteForwardReferenceDetector<'a> {
+    names: &'a [String],
+    error: Option<PgError>,
+}
+
+impl ast::VisitorMut for CteForwardReferenceDetector<'_> {
+    type Break = ();
+
+    #[cfg_attr(feature = "execution-log", tracing::instrument(skip_all))]
+    fn pre_visit_table_factor(
+        &mut self,
+        factor: &mut ast::TableFactor,
+    ) -> std::ops::ControlFlow<Self::Break> {
+        let ast::TableFactor::Table {
+            name, args: None, ..
+        } = factor
+        else {
+            return std::ops::ControlFlow::Continue(());
+        };
+        let Ok(name) = normalize_unqualified_object_name(name) else {
+            return std::ops::ControlFlow::Continue(());
+        };
+        if self.names.contains(&name) {
+            self.error = Some(PgError::create(
+                SqlState::UndefinedTable,
+                format!("relation {name:?} does not exist"),
+            ));
+            return std::ops::ControlFlow::Break(());
+        }
+        std::ops::ControlFlow::Continue(())
+    }
+}
+
+#[cfg_attr(feature = "execution-log", tracing::instrument(skip_all))]
+fn reject_cte_forward_references(query: &ast::Query, names: &[String]) -> Result<()> {
+    let mut query = query.clone();
+    let mut detector = CteForwardReferenceDetector { names, error: None };
+    let _ = query.visit(&mut detector);
+    detector.error.map_or(Ok(()), Err)
+}
+
+impl ast::VisitorMut for InlineCteReferenceReplacer<'_> {
+    type Break = ();
+
+    #[cfg_attr(feature = "execution-log", tracing::instrument(skip_all))]
+    fn pre_visit_query(&mut self, query: &mut ast::Query) -> std::ops::ControlFlow<Self::Break> {
+        if query.with.is_none() {
+            return std::ops::ControlFlow::Continue(());
+        }
+        match inline_query_ctes(query) {
+            Ok(expanded) => *query = expanded,
+            Err(error) => {
+                self.error = Some(error);
+                return std::ops::ControlFlow::Break(());
+            }
+        }
+        std::ops::ControlFlow::Continue(())
+    }
+
+    #[cfg_attr(feature = "execution-log", tracing::instrument(skip_all))]
+    fn pre_visit_table_factor(
+        &mut self,
+        factor: &mut ast::TableFactor,
+    ) -> std::ops::ControlFlow<Self::Break> {
+        let ast::TableFactor::Table {
+            name,
+            alias,
+            args: None,
+            ..
+        } = factor
+        else {
+            return std::ops::ControlFlow::Continue(());
+        };
+        let Ok(name) = normalize_unqualified_object_name(name) else {
+            return std::ops::ControlFlow::Continue(());
+        };
+        let Some(cte) = self.ctes.iter().rev().find(|cte| cte.name == name) else {
+            return std::ops::ControlFlow::Continue(());
+        };
+        let alias = match alias {
+            Some(alias) if alias.columns.is_empty() => ast::TableAlias {
+                columns: cte.alias.columns.clone(),
+                ..alias.clone()
+            },
+            Some(alias) => alias.clone(),
+            None => cte.alias.clone(),
+        };
+        *factor = ast::TableFactor::Derived {
+            lateral: false,
+            subquery: cte.query.clone(),
+            alias: Some(alias),
+            sample: None,
+        };
+        std::ops::ControlFlow::Continue(())
+    }
+}
+
+#[cfg_attr(feature = "execution-log", tracing::instrument(skip_all))]
+fn inline_query_ctes(query: &ast::Query) -> Result<ast::Query> {
+    let mut query = query.clone();
+    let Some(with) = query.with.take() else {
+        return Ok(query);
+    };
+    if with.recursive {
+        return reject_unsupported("WITH RECURSIVE is not implemented");
+    }
+    let names = with
+        .cte_tables
+        .iter()
+        .map(|cte| normalize_identifier(&cte.alias.name))
+        .collect::<Vec<_>>();
+    let mut ctes = Vec::new();
+    for (index, cte) in with.cte_tables.into_iter().enumerate() {
+        let name = normalize_identifier(&cte.alias.name);
+        if ctes
+            .iter()
+            .any(|existing: &InlineCte| existing.name == name)
+        {
+            return Err(PgError::create(
+                SqlState::SyntaxError,
+                format!("WITH query name {name:?} specified more than once"),
+            ));
+        }
+        let mut cte_query = inline_query_ctes(&cte.query)?;
+        reject_cte_forward_references(&cte_query, &names[index..])?;
+        let mut replacer = InlineCteReferenceReplacer {
+            ctes: &ctes,
+            error: None,
+        };
+        let _ = cte_query.visit(&mut replacer);
+        if let Some(error) = replacer.error {
+            return Err(error);
+        }
+        ctes.push(InlineCte {
+            name,
+            query: Box::new(cte_query),
+            alias: cte.alias,
+        });
+    }
+    let mut replacer = InlineCteReferenceReplacer {
+        ctes: &ctes,
+        error: None,
+    };
+    let _ = query.visit(&mut replacer);
+    if let Some(error) = replacer.error {
+        return Err(error);
+    }
+    Ok(query)
+}
+
+#[cfg_attr(feature = "execution-log", tracing::instrument(skip_all))]
+pub(crate) fn expand_ctes_for_analysis(statement: &ast::Statement) -> Result<ast::Statement> {
+    let ast::Statement::Query(query) = statement else {
+        return Ok(statement.clone());
+    };
+    Ok(ast::Statement::Query(Box::new(inline_query_ctes(query)?)))
+}
+
+struct CteReferenceReplacer<'a> {
+    ctes: &'a [MaterializedCte],
+    masked: Vec<Vec<String>>,
+}
+
+impl ast::VisitorMut for CteReferenceReplacer<'_> {
+    type Break = ();
+
+    #[cfg_attr(feature = "execution-log", tracing::instrument(skip_all))]
+    fn pre_visit_query(&mut self, query: &mut ast::Query) -> std::ops::ControlFlow<Self::Break> {
+        self.masked.push(
+            query
+                .with
+                .as_ref()
+                .map(|with| {
+                    with.cte_tables
+                        .iter()
+                        .map(|cte| normalize_identifier(&cte.alias.name))
+                        .collect()
+                })
+                .unwrap_or_default(),
+        );
+        std::ops::ControlFlow::Continue(())
+    }
+
+    #[cfg_attr(feature = "execution-log", tracing::instrument(skip_all))]
+    fn post_visit_query(&mut self, _query: &mut ast::Query) -> std::ops::ControlFlow<Self::Break> {
+        self.masked.pop().expect("visited query pushed CTE mask");
+        std::ops::ControlFlow::Continue(())
+    }
+
+    #[cfg_attr(feature = "execution-log", tracing::instrument(skip_all))]
+    fn pre_visit_table_factor(
+        &mut self,
+        factor: &mut ast::TableFactor,
+    ) -> std::ops::ControlFlow<Self::Break> {
+        let ast::TableFactor::Table {
+            name,
+            alias,
+            args: None,
+            ..
+        } = factor
+        else {
+            return std::ops::ControlFlow::Continue(());
+        };
+        let Ok(name) = normalize_unqualified_object_name(name) else {
+            return std::ops::ControlFlow::Continue(());
+        };
+        let Some(cte) = self.ctes.iter().rev().find(|cte| {
+            cte.name == name && !self.masked.iter().any(|masked| masked.contains(&name))
+        }) else {
+            return std::ops::ControlFlow::Continue(());
+        };
+        let columns = cte
+            .result
+            .columns
+            .iter()
+            .map(|column| ast::TableAliasColumnDef::from_name(column.name.clone()))
+            .collect::<Vec<_>>();
+        let alias = match alias {
+            Some(alias) if alias.columns.is_empty() => ast::TableAlias {
+                columns,
+                ..alias.clone()
+            },
+            Some(alias) => alias.clone(),
+            None => ast::TableAlias {
+                explicit: false,
+                name: ast::Ident::new(cte.name.clone()),
+                columns,
+                at: None,
+            },
+        };
+        *factor = ast::TableFactor::Derived {
+            lateral: false,
+            subquery: Box::new(create_cte_values_query(&cte.result)),
+            alias: Some(alias),
+            sample: None,
+        };
+        std::ops::ControlFlow::Continue(())
+    }
+}
+
+#[cfg_attr(feature = "execution-log", tracing::instrument(skip_all))]
+fn create_cte_values_query(result: &QueryResult) -> ast::Query {
+    let rows = if result.rows.is_empty() {
+        let row = result
+            .columns
+            .iter()
+            .map(|column| {
+                crate::analyzer::create_typed_literal(
+                    Value::Null,
+                    PgType::create_with_typmod(
+                        BaseType::resolve_oid(column.type_oid)
+                            .expect("CTE result type OID is supported"),
+                        column.typmod,
+                    ),
+                )
+            })
+            .collect::<Vec<_>>();
+        let values = ast::Values {
+            explicit_row: false,
+            value_keyword: false,
+            rows: vec![ast::Parens::with_empty_span(row.clone())],
+        };
+        ast::SetExpr::SetOperation {
+            op: ast::SetOperator::Except,
+            set_quantifier: ast::SetQuantifier::All,
+            left: Box::new(ast::SetExpr::Values(values.clone())),
+            right: Box::new(ast::SetExpr::Values(values)),
+        }
+    } else {
+        ast::SetExpr::Values(ast::Values {
+            explicit_row: false,
+            value_keyword: false,
+            rows: result
+                .rows
+                .iter()
+                .map(|row| {
+                    ast::Parens::with_empty_span(
+                        row.iter()
+                            .zip(&result.columns)
+                            .map(|(value, column)| {
+                                crate::analyzer::create_typed_literal(
+                                    value.clone(),
+                                    PgType::create_with_typmod(
+                                        BaseType::resolve_oid(column.type_oid)
+                                            .expect("CTE result type OID is supported"),
+                                        column.typmod,
+                                    ),
+                                )
+                            })
+                            .collect(),
+                    )
+                })
+                .collect(),
+        })
+    };
+    ast::Query {
+        with: None,
+        body: Box::new(rows),
+        order_by: None,
+        limit_clause: None,
+        fetch: None,
+        locks: Vec::new(),
+        for_clause: None,
+        settings: None,
+        format_clause: None,
+        pipe_operators: Vec::new(),
+    }
+}
+
+#[cfg_attr(feature = "execution-log", tracing::instrument(skip_all))]
+fn materialize_query_ctes(
+    state: &DatabaseState,
+    query: &ast::Query,
+    xid: Xid,
+    snapshot: &Snapshot,
+    context: &StatementExecutionContext,
+) -> Result<ast::Query> {
+    let mut query = query.clone();
+    let Some(with) = query.with.take() else {
+        return Ok(query);
+    };
+    if with.recursive {
+        return reject_unsupported("WITH RECURSIVE is not implemented");
+    }
+    let names = with
+        .cte_tables
+        .iter()
+        .map(|cte| normalize_identifier(&cte.alias.name))
+        .collect::<Vec<_>>();
+    let mut ctes = Vec::new();
+    for (index, cte) in with.cte_tables.into_iter().enumerate() {
+        let name = normalize_identifier(&cte.alias.name);
+        if ctes
+            .iter()
+            .any(|existing: &MaterializedCte| existing.name == name)
+        {
+            return Err(PgError::create(
+                SqlState::SyntaxError,
+                format!("WITH query name {name:?} specified more than once"),
+            ));
+        }
+        let mut cte_query = *cte.query;
+        reject_cte_forward_references(&cte_query, &names[index..])?;
+        let _ = cte_query.visit(&mut CteReferenceReplacer {
+            ctes: &ctes,
+            masked: Vec::new(),
+        });
+        let StatementResult::Query(result) =
+            execute_query(state, &cte_query, xid, snapshot, context)?
+        else {
+            unreachable!("CTE query produces query rows");
+        };
+        if cte.alias.columns.len() > result.columns.len() {
+            return Err(PgError::create(
+                SqlState::InvalidColumnReference,
+                "WITH query has fewer columns than specified in column list",
+            ));
+        }
+        let mut result = result;
+        for (column, alias) in result.columns.iter_mut().zip(&cte.alias.columns) {
+            column.name = normalize_identifier(&alias.name);
+        }
+        ctes.push(MaterializedCte { name, result });
+    }
+    let _ = query.visit(&mut CteReferenceReplacer {
+        ctes: &ctes,
+        masked: Vec::new(),
+    });
+    Ok(query)
+}
+
+#[cfg_attr(feature = "execution-log", tracing::instrument(skip_all))]
+pub(crate) fn materialize_ctes(
+    state: &DatabaseState,
+    statement: &ast::Statement,
+    xid: Xid,
+    snapshot: &Snapshot,
+    context: &StatementExecutionContext,
+) -> Result<ast::Statement> {
+    let ast::Statement::Query(query) = statement else {
+        return Ok(statement.clone());
+    };
+    Ok(ast::Statement::Query(Box::new(materialize_query_ctes(
+        state, query, xid, snapshot, context,
+    )?)))
+}
+
 struct SubqueryDetector {
     found: bool,
 }
@@ -2958,7 +3362,11 @@ pub(super) fn execute_query(
     snapshot: &Snapshot,
     context: &StatementExecutionContext,
 ) -> Result<StatementResult> {
-    if query.with.is_some() || query.fetch.is_some() {
+    if query.with.is_some() {
+        let query = materialize_query_ctes(state, query, xid, snapshot, context)?;
+        return execute_query(state, &query, xid, snapshot, context);
+    }
+    if query.fetch.is_some() {
         return reject_unsupported("query clause is not implemented");
     }
     let lock_mode = resolve_select_lock_mode(query)?;

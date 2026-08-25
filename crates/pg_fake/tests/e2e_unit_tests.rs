@@ -441,6 +441,20 @@ fn matches_set_operations() {
 }
 
 #[test]
+fn matches_non_recursive_ctes() {
+    assert_differential(
+        "CREATE TABLE __TABLE__ (id INTEGER); \
+         INSERT INTO __TABLE__ VALUES (1), (2); \
+         WITH source(value) AS (SELECT id FROM __TABLE__), doubled(value) AS (SELECT value * 2 FROM source) SELECT source.value, doubled.value FROM source JOIN doubled ON doubled.value = source.value * 2 ORDER BY source.value; \
+         CREATE SEQUENCE __TABLE___sequence; \
+         WITH sampled(value) AS (SELECT nextval('__TABLE___sequence')) SELECT left_sample.value = right_sample.value FROM sampled AS left_sample CROSS JOIN sampled AS right_sample; \
+         WITH values_cte(value) AS (SELECT 1) SELECT (WITH values_cte(value) AS (SELECT 2) SELECT value FROM values_cte) FROM values_cte; \
+         WITH empty_values(value) AS (SELECT id FROM __TABLE__ WHERE false) SELECT value FROM empty_values",
+        RowOrder::Ordered,
+    );
+}
+
+#[test]
 fn executes_parameterized_set_operations() {
     let db = Db::create();
     let mut session = db.create_session();

@@ -170,6 +170,11 @@ pub fn list_benchmarks() -> Vec<Benchmark> {
             postgres_comparisons(),
         ),
         build_benchmark(
+            "materialized_cte_100_rows",
+            postgres_values(),
+            postgres_comparisons(),
+        ),
+        build_benchmark(
             "correlated_exists_100_rows",
             postgres_values(),
             postgres_comparisons(),

@@ -1318,6 +1318,17 @@ fn generate_subquery(src: &mut Source, table: &TableSchema) -> (String, RowOrder
     )
 }
 
+fn generate_cte(_src: &mut Source, table: &TableSchema) -> (String, RowOrder) {
+    let key = &table.key().name;
+    (
+        format!(
+            "WITH source(value) AS (SELECT {key} FROM {}) SELECT source.value FROM source ORDER BY source.value",
+            table.name
+        ),
+        RowOrder::Ordered,
+    )
+}
+
 fn generate_set_operation(src: &mut Source) -> (String, RowOrder) {
     src.select(
         "set_operation",
@@ -1384,6 +1395,7 @@ fn generate_select(
             "aggregate",
             "join",
             "subquery",
+            "cte",
             "set_operation",
             "foreign_join",
         ],
@@ -1393,6 +1405,7 @@ fn generate_select(
             "aggregate" => generate_aggregate(src, table),
             "join" => generate_join(src, table),
             "subquery" => generate_subquery(src, table),
+            "cte" => generate_cte(src, table),
             "set_operation" => generate_set_operation(src),
             "foreign_join" => generate_foreign_select(src, foreign_tables),
             _ => unreachable!(),

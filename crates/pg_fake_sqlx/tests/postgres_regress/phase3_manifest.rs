@@ -50,13 +50,36 @@ pub const FEATURES: &[Feature] = &[
     },
     Feature {
         name: "non-recursive CTEs",
-        cases: &[Case {
-            id: "named_cte",
-            source: "with.sql:6",
-            setup: &[],
-            sql: "WITH values_cte(value) AS (SELECT 1) SELECT value FROM values_cte",
-            blocker: BlockerKind::Implementation,
-        }],
+        cases: &[
+            Case {
+                id: "named_cte",
+                source: "with.sql:6",
+                setup: &[],
+                sql: "WITH values_cte(value) AS (SELECT 1) SELECT value FROM values_cte",
+                blocker: BlockerKind::Implementation,
+            },
+            Case {
+                id: "dependency_chain",
+                source: "with.sql:11",
+                setup: &[],
+                sql: "WITH first_value(value) AS (SELECT 1), second_value(value) AS (SELECT value + 1 FROM first_value) SELECT value FROM second_value",
+                blocker: BlockerKind::Implementation,
+            },
+            Case {
+                id: "repeated_materialized_reference",
+                source: "with.sql:14",
+                setup: &["CREATE SEQUENCE phase3_cte_sequence"],
+                sql: "WITH sampled(value) AS (SELECT nextval('phase3_cte_sequence')) SELECT left_sample.value = right_sample.value FROM sampled AS left_sample CROSS JOIN sampled AS right_sample",
+                blocker: BlockerKind::Implementation,
+            },
+            Case {
+                id: "nested_shadowing",
+                source: "with.sql:17",
+                setup: &[],
+                sql: "WITH values_cte(value) AS (SELECT 1) SELECT (WITH values_cte(value) AS (SELECT 2) SELECT value FROM values_cte) FROM values_cte",
+                blocker: BlockerKind::Implementation,
+            },
+        ],
     },
     Feature {
         name: "recursive CTEs",

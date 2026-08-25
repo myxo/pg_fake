@@ -134,6 +134,8 @@ PostgreSQL query composition.
 
 ### Task 3 — Non-recursive CTEs
 
+**Progress:** Complete (approved).
+
 **Goal:** Bind and execute named query results within one statement.
 
 **DoD:**

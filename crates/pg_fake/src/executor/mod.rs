@@ -92,6 +92,8 @@ pub(crate) struct RequiredRowLock {
 }
 
 pub(crate) use query::describe_query_result_columns;
+pub(crate) use query::expand_ctes_for_analysis;
+pub(crate) use query::materialize_ctes;
 pub(crate) use query::materialize_uncorrelated_subqueries;
 
 impl DatabaseState {
