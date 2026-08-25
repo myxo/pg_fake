@@ -5,7 +5,7 @@ covers a create/drop table lifecycle, individual constrained
 explicit/defaulted inserts, updates, deletes, explicit transactions at READ
 COMMITTED and REPEATABLE READ, row-lock
 acquisition with `SELECT ... FOR UPDATE`, a 100-row full-table select, a simple
-filtered select, and a
+filtered heap select, the same filtered select over a primary key, and a
 100-row multi-key `ORDER BY` with explicit NULL placement, including an ordered
 `LIMIT`/`OFFSET` paging workload. The insert workloads include primary-key,
 not-null, default, and column- and table-level `CHECK` validation. They also
@@ -26,9 +26,9 @@ Diagnostic groups isolate costs within `pg_fake`:
 - `concurrent_uncontended_reads` compares sequential and parallel sessions, and
   `concurrent_same_row_contention` exercises a blocking same-row update.
 
-The point-lookup comparison is intentionally useful before index-assisted query
-execution exists: similar timings expose the missing optimization, while future
-changes can demonstrate the expected separation. The MVCC benchmark retains old
+The point-lookup comparison isolates native core index execution across table
+sizes, while the paired SQLx filtered selects compare otherwise identical heap
+and primary-key queries against PostgreSQL. The MVCC benchmark retains old
 versions intentionally; the regular update benchmark deletes its fixture row
 after each timed update.
 

@@ -566,6 +566,16 @@ fn select_benchmark(
             connection.execute(runtime, &insert);
         }
     }
+    for (_, connection) in connections.iter_mut() {
+        connection.execute(
+            runtime,
+            "CREATE TABLE select_where_indexed_100_rows (id INTEGER PRIMARY KEY, name TEXT)",
+        );
+        connection.execute(
+            runtime,
+            &insert_values_sql("select_where_indexed_100_rows", 100),
+        );
+    }
     let select = "SELECT * FROM select_100_rows";
     let mut group = criterion.benchmark_group(benchmarks::find_benchmark("select_100_rows").name);
 
@@ -581,6 +591,19 @@ fn select_benchmark(
     let select = "SELECT * FROM select_100_rows WHERE id = 50";
     let mut group =
         criterion.benchmark_group(benchmarks::find_benchmark("select_where_100_rows").name);
+
+    for (name, connection) in connections.iter_mut() {
+        group.bench_function(*name, |benchmark| {
+            benchmark.iter(|| {
+                connection.fetch(runtime, select);
+            });
+        });
+    }
+    group.finish();
+
+    let select = "SELECT * FROM select_where_indexed_100_rows WHERE id = 50";
+    let mut group =
+        criterion.benchmark_group(benchmarks::find_benchmark("select_where_indexed_100_rows").name);
 
     for (name, connection) in connections.iter_mut() {
         group.bench_function(*name, |benchmark| {
@@ -607,7 +630,7 @@ fn select_benchmark(
     for (_, connection) in connections.iter_mut() {
         connection.execute(
             runtime,
-            "DROP TABLE select_100_rows, limit_offset_ordered_100_rows",
+            "DROP TABLE select_100_rows, select_where_indexed_100_rows, limit_offset_ordered_100_rows",
         );
     }
 }

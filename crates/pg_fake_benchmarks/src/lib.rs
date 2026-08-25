@@ -73,6 +73,11 @@ pub fn list_benchmarks() -> Vec<Benchmark> {
             postgres_comparisons(),
         ),
         build_benchmark(
+            "select_where_indexed_100_rows",
+            postgres_values(),
+            postgres_comparisons(),
+        ),
+        build_benchmark(
             "limit_offset_ordered_100_rows",
             postgres_values(),
             postgres_comparisons(),
