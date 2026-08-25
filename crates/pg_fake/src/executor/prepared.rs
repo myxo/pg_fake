@@ -37,7 +37,6 @@ enum PreparedExpression {
         left: Box<PreparedExpression>,
         operator: ast::BinaryOperator,
         right: Box<PreparedExpression>,
-        target: BaseType,
     },
 }
 
@@ -47,25 +46,7 @@ impl PreparedExpression {
             Self::Column { data_type, .. }
             | Self::Parameter { data_type, .. }
             | Self::Literal { data_type, .. } => *data_type,
-            Self::Binary {
-                operator, target, ..
-            } => {
-                if matches!(
-                    operator,
-                    ast::BinaryOperator::Eq
-                        | ast::BinaryOperator::NotEq
-                        | ast::BinaryOperator::Gt
-                        | ast::BinaryOperator::Lt
-                        | ast::BinaryOperator::GtEq
-                        | ast::BinaryOperator::LtEq
-                        | ast::BinaryOperator::And
-                        | ast::BinaryOperator::Or
-                ) {
-                    BaseType::Bool
-                } else {
-                    *target
-                }
-            }
+            Self::Binary { .. } => BaseType::Bool,
         }
     }
 
@@ -248,24 +229,21 @@ fn bind_prepared_expression(
             else {
                 return Ok(None);
             };
-            let target = if matches!(operator, ast::BinaryOperator::And | ast::BinaryOperator::Or) {
+            if matches!(operator, ast::BinaryOperator::And | ast::BinaryOperator::Or) {
                 if left_expression.get_data_type() != BaseType::Bool
                     || right_expression.get_data_type() != BaseType::Bool
                 {
                     return Ok(None);
                 }
-                BaseType::Bool
             } else {
                 if left_expression.get_data_type() != right_expression.get_data_type() {
                     return Ok(None);
                 }
-                left_expression.get_data_type()
-            };
+            }
             Ok(Some(PreparedExpression::Binary {
                 left: Box::new(left_expression),
                 operator: operator.clone(),
                 right: Box::new(right_expression),
-                target,
             }))
         }
         _ => Ok(None),
@@ -280,20 +258,15 @@ fn find_unique_access(
         left,
         operator: ast::BinaryOperator::Eq,
         right,
-        target,
     } = selection
     else {
         return None;
     };
     let (column, value) = match (left.as_ref(), right.as_ref()) {
-        (PreparedExpression::Column { slot, data_type }, value)
-            if !value.has_column() && data_type == target =>
-        {
+        (PreparedExpression::Column { slot, .. }, value) if !value.has_column() => {
             (*slot, value.clone())
         }
-        (value, PreparedExpression::Column { slot, data_type })
-            if !value.has_column() && data_type == target =>
-        {
+        (value, PreparedExpression::Column { slot, .. }) if !value.has_column() => {
             (*slot, value.clone())
         }
         _ => return None,
@@ -386,20 +359,9 @@ fn evaluate_prepared_expression(
             left,
             operator,
             right,
-            target,
         } => {
-            let left_value = coercion::coerce(
-                evaluate_prepared_expression(left, row, parameters)?,
-                left.get_data_type(),
-                PgType::create(*target),
-                CastContext::Implicit,
-            )?;
-            let right_value = coercion::coerce(
-                evaluate_prepared_expression(right, row, parameters)?,
-                right.get_data_type(),
-                PgType::create(*target),
-                CastContext::Implicit,
-            )?;
+            let left_value = evaluate_prepared_expression(left, row, parameters)?;
+            let right_value = evaluate_prepared_expression(right, row, parameters)?;
             match operator {
                 ast::BinaryOperator::Eq
                 | ast::BinaryOperator::NotEq

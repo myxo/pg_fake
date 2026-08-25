@@ -156,3 +156,27 @@ Native-core diagnostics provide the corresponding executor measurements:
 | prepared 100-row indexed predicate | 5.70 us | 2.78 us | 51.2% faster |
 | prepared 10,000-row heap predicate | 1.98 ms | 340.26 us | 82.8% faster |
 | prepared 10,000-row indexed predicate | 5.74 us | 2.86 us | 50.1% faster |
+
+## Optimization 2 measurement
+
+Bound comparisons already require operands with matching types, and prepared
+parameters are coerced once before execution. Removing the two generic
+coercion calls from each bound binary-expression evaluation therefore preserves
+the fallback for mixed or unsupported expressions while eliminating redundant
+work for every candidate row.
+
+| Query | Before | Candidate | Change |
+| --- | ---: | ---: | ---: |
+| SQLx 100-row heap predicate | 18.24 us | 16.84 us | 7.7% faster |
+| SQLx 100-row primary-key predicate | 12.98 us | 13.14 us | 1.3% slower, within noise |
+| prepared indexed select | 2.785 us | 2.753 us | 1.2% faster |
+| prepared 100-row heap predicate | 6.02 us | 4.63 us | 23.0% faster |
+| prepared 100-row indexed predicate | 2.779 us | 2.751 us | 1.0% faster |
+| prepared 10,000-row heap predicate | 340.26 us | 212.35 us | 37.6% faster |
+| prepared 10,000-row indexed predicate | 2.862 us | 2.837 us | 0.9% faster |
+
+The improvement scales with the number of rows whose predicate is evaluated.
+An indexed lookup evaluates only one candidate, so its small native saving is
+hidden by SQLx and transaction overhead. PostgreSQL timings varied materially
+during the SQLx run, but the native heap diagnostics isolate and confirm the
+per-row reduction.
