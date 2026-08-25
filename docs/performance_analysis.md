@@ -180,3 +180,26 @@ An indexed lookup evaluates only one candidate, so its small native saving is
 hidden by SQLx and transaction overhead. PostgreSQL timings varied materially
 during the SQLx run, but the native heap diagnostics isolate and confirm the
 per-row reduction.
+
+## Optimization 3 measurement
+
+Once a prepared plan has proven that a statement is a plain single-table
+`SELECT` without subqueries or row-lock clauses, execution bypasses generic
+sequence-context construction, subquery materialization, DDL bookkeeping, and
+row-lock discovery. Transaction creation, snapshots, and the database mutex
+remain unchanged, and no SQLx code is involved.
+
+| Query | Before | Candidate | Change |
+| --- | ---: | ---: | ---: |
+| SQLx 100-row heap predicate | 16.84 us | 14.09 us | 16.5% faster |
+| SQLx 100-row primary-key predicate | 13.14 us | 10.01 us | 23.9% faster |
+| parse, analyze, and indexed select | 13.37 us | 11.25 us | 16.0% faster |
+| prepared indexed select | 2.753 us | 1.083 us | 60.5% faster |
+| prepared 100-row heap predicate | 4.63 us | 2.99 us | 35.2% faster |
+| prepared 100-row indexed predicate | 2.751 us | 1.130 us | 59.2% faster |
+| prepared 10,000-row heap predicate | 212.35 us | 211.66 us | no measurable change |
+| prepared 10,000-row indexed predicate | 2.837 us | 1.197 us | 58.1% faster |
+
+This removes a fixed setup cost. It is therefore most visible for indexed and
+small-table queries, while expression evaluation dominates the 10,000-row heap
+scan.

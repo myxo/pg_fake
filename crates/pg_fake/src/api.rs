@@ -1249,6 +1249,24 @@ impl Session {
         }
         transaction.statement_started = true;
         self.transaction = Some(SessionTransactionState::Active(transaction));
+        if let Some((plan, parameters, columns)) = prepared_query {
+            return match executor::execute_prepared_query(
+                &state,
+                plan,
+                parameters,
+                transaction.xid,
+                &snapshot,
+            ) {
+                Ok(rows) => Ok(StatementResult::Query(QueryResult {
+                    columns: columns.to_vec(),
+                    rows,
+                })),
+                Err(error) => {
+                    drop(state);
+                    self.abort_with_error(error)
+                }
+            };
+        }
         let context = executor::StatementExecutionContext {
             transaction_timestamp: transaction.transaction_timestamp,
             statement_timestamp: self.db.read_clock(),
@@ -1292,30 +1310,15 @@ impl Session {
             Ok(acquired) => acquired,
             Err(error) => return self.abort_with_error(error),
         };
-        let result = match prepared_query {
-            Some((plan, parameters, columns)) => executor::execute_prepared_query(
-                &state,
-                plan,
-                parameters,
-                transaction.xid,
-                &snapshot,
-            )
-            .map(|rows| {
-                StatementResult::Query(QueryResult {
-                    columns: columns.to_vec(),
-                    rows,
-                })
-            }),
-            None => executor::execute_statement(
-                &mut state,
-                &statement,
-                transaction.xid,
-                &snapshot,
-                &self.deferred_constraints,
-                self.defer_all_constraints,
-                &context,
-            ),
-        };
+        let result = executor::execute_statement(
+            &mut state,
+            &statement,
+            transaction.xid,
+            &snapshot,
+            &self.deferred_constraints,
+            self.defer_all_constraints,
+            &context,
+        );
         match result {
             Ok(result) => {
                 if contains_dml(&statement)
