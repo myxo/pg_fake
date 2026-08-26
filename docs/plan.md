@@ -157,6 +157,8 @@ PostgreSQL query composition.
 
 ### Task 4 — Recursive CTEs
 
+**Progress:** Complete (approved).
+
 **Goal:** Execute bounded recursive queries using PostgreSQL's working-table
 semantics.
 

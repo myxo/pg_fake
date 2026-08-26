@@ -283,11 +283,17 @@ where
                         )),
                     )?
                 }
-                (AggregateKind::Average(BaseType::Float8), Some(sum)) => evaluate_numeric_operator(
-                    &ast::BinaryOperator::Divide,
-                    sum,
-                    Value::Float8(values.len() as f64),
-                )?,
+                (AggregateKind::Average(BaseType::Float8), Some(sum)) => {
+                    let average = evaluate_numeric_operator(
+                        &ast::BinaryOperator::Divide,
+                        sum,
+                        Value::Float8(values.len() as f64),
+                    )?;
+                    match average {
+                        Value::Float8(value) if value == 0.0 => Value::Float8(0.0),
+                        average => average,
+                    }
+                }
                 _ => unreachable!("average accumulator type was checked"),
             }
         }

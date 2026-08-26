@@ -455,6 +455,64 @@ fn matches_non_recursive_ctes() {
 }
 
 #[test]
+fn matches_recursive_ctes() {
+    assert_differential(
+        "WITH RECURSIVE series(value) AS (VALUES (1) UNION ALL SELECT value + 1 FROM series WHERE value < 5) SELECT value FROM series ORDER BY value; \
+         CREATE TABLE __TABLE___edges (parent INTEGER, child INTEGER); \
+         INSERT INTO __TABLE___edges VALUES (1, 2), (1, 3), (2, 4), (3, 5); \
+         WITH RECURSIVE walk(value) AS (VALUES (1) UNION ALL SELECT edges.child FROM walk JOIN __TABLE___edges AS edges ON edges.parent = walk.value) SELECT value FROM walk ORDER BY value; \
+         CREATE TABLE __TABLE___cycle (parent INTEGER, child INTEGER); \
+         INSERT INTO __TABLE___cycle VALUES (1, 2), (2, 1); \
+         WITH RECURSIVE walk(value) AS (VALUES (1) UNION SELECT edges.child FROM walk JOIN __TABLE___cycle AS edges ON edges.parent = walk.value) SELECT value FROM walk ORDER BY value; \
+         WITH RECURSIVE empty(value) AS (SELECT 1 WHERE false UNION ALL SELECT value + 1 FROM empty WHERE value < 3) SELECT value FROM empty; \
+         WITH RECURSIVE values_cte(value) AS (VALUES (1)), series(value) AS (SELECT value FROM values_cte UNION ALL SELECT value + 1 FROM series WHERE value < 3) SELECT value FROM series ORDER BY value; \
+         WITH RECURSIVE first_cte(value) AS (SELECT value FROM later_cte), later_cte(value) AS (VALUES (7)) SELECT value FROM first_cte; \
+         WITH RECURSIVE nullable(value) AS (VALUES (NULL::INTEGER) UNION SELECT value + 1 FROM nullable WHERE value < 3) SELECT value FROM nullable; \
+         WITH RECURSIVE series(value) AS (VALUES (1::BIGINT) UNION ALL SELECT value + 1 FROM series WHERE value < 3) SELECT value FROM series ORDER BY value; \
+         SELECT value FROM (WITH RECURSIVE series(value) AS (VALUES (1) UNION ALL SELECT value + 1 FROM series WHERE value < 3) SELECT value FROM series) AS nested ORDER BY value; \
+         WITH RECURSIVE series(value) AS (VALUES (1) UNION ALL SELECT series.value + 1 FROM series LEFT JOIN (VALUES (true)) AS preserved(flag) ON true WHERE series.value < 3) SELECT value FROM series ORDER BY value",
+        RowOrder::Ordered,
+    );
+}
+
+#[test]
+fn matches_recursive_cte_errors() {
+    assert_differential(
+        "WITH RECURSIVE series(value) AS (SELECT value + 1 FROM series UNION ALL VALUES (1)) SELECT value FROM series; \
+         WITH RECURSIVE series(value) AS (VALUES (1) UNION ALL SELECT left_series.value + 1 FROM series AS left_series CROSS JOIN series AS right_series) SELECT value FROM series; \
+         WITH RECURSIVE first_cte(value) AS (SELECT value FROM second_cte), second_cte(value) AS (SELECT value FROM first_cte) SELECT value FROM first_cte; \
+         WITH RECURSIVE series(value) AS (VALUES (1::SMALLINT) UNION ALL SELECT value + 1 FROM series WHERE value < 2) SELECT value FROM series; \
+         WITH RECURSIVE series(value) AS (VALUES (1) UNION ALL SELECT (SELECT value FROM series) WHERE false) SELECT value FROM series; \
+         WITH RECURSIVE series(value) AS (VALUES (1) UNION ALL SELECT nullable.value FROM (VALUES (1)) AS source(value) LEFT JOIN series AS nullable ON true) SELECT value FROM series",
+        RowOrder::Ordered,
+    );
+}
+
+#[test]
+fn executes_parameterized_recursive_ctes() {
+    let db = Db::create();
+    let mut session = db.create_session();
+    let statement = session
+        .prepare(
+            "WITH RECURSIVE series(value) AS (VALUES ($1::INTEGER) UNION ALL SELECT value + 1 FROM series WHERE value < $2::INTEGER) SELECT value FROM series ORDER BY value",
+        )
+        .unwrap();
+    let result = session
+        .query_prepared(&statement, &[Value::Int4(2), Value::Int4(4)])
+        .unwrap();
+    assert_eq!(
+        result.rows,
+        vec![
+            vec![Value::Int4(2)],
+            vec![Value::Int4(3)],
+            vec![Value::Int4(4)],
+        ]
+    );
+    assert_eq!(result.columns[0].name, "value");
+    assert_eq!(result.columns[0].type_oid, BaseType::Int4.map_to_oid());
+}
+
+#[test]
 fn executes_parameterized_set_operations() {
     let db = Db::create();
     let mut session = db.create_session();
@@ -721,13 +779,16 @@ fn matches_global_aggregate_results() {
          SELECT avg(small_value), avg(int_value), avg(big_value), avg(numeric_value),
                 avg(real_value), avg(double_value), sum(elapsed), avg(elapsed)
          FROM __TABLE__; \
+         SELECT min(label), max(label) FROM (VALUES ('a'), ('MiXeD')) AS labels(label); \
+         SELECT lower('AB  '::CHAR(4)), upper('ab  '::CHAR(4)), length('ab  '::CHAR(4)); \
          SELECT min(int_value), max(int_value), min(label), max(label),
                 min(bytes), max(bytes), min(happened_on), max(happened_on),
                 bool_and(flag), bool_or(flag)
          FROM __TABLE__; \
          SELECT count(*) + count(int_value), coalesce(sum(int_value), 0),
                 max(int_value) - min(int_value)
-         FROM __TABLE__ ORDER BY count(*)",
+         FROM __TABLE__ ORDER BY count(*); \
+         SELECT avg(-0.0::REAL)",
         RowOrder::Ordered,
     );
 }

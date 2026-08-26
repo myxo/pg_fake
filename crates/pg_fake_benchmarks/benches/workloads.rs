@@ -1089,6 +1089,7 @@ fn benchmarks(criterion: &mut Criterion) {
         inner_join_benchmark(criterion, &runtime, &mut connections);
         derived_and_scalar_subquery_benchmark(criterion, &runtime, &mut connections);
         materialized_cte_benchmark(criterion, &runtime, &mut connections);
+        recursive_cte_benchmark(criterion, &runtime, &mut connections);
         global_aggregate_benchmark(criterion, &runtime, &mut connections);
         grouped_aggregate_benchmark(criterion, &runtime, &mut connections);
         select_distinct_benchmark(criterion, &runtime, &mut connections);
@@ -1325,6 +1326,52 @@ fn materialized_cte_benchmark(
     group.finish();
     for (_, connection) in connections.iter_mut() {
         connection.execute(runtime, "DROP TABLE materialized_cte_100_rows");
+    }
+}
+
+fn recursive_cte_benchmark(
+    criterion: &mut Criterion,
+    runtime: &Runtime,
+    connections: &mut [NamedBenchmarkConnection<'_>],
+) {
+    let series_query = "WITH RECURSIVE series(value) AS (VALUES (1) UNION ALL SELECT value + 1 FROM series WHERE value < 100) SELECT value FROM series";
+    let mut group = criterion
+        .benchmark_group(benchmarks::find_benchmark("recursive_cte_numeric_series_100_rows").name);
+    group.throughput(Throughput::Elements(100));
+    for (name, connection) in connections.iter_mut() {
+        group.bench_function(*name, |benchmark| {
+            benchmark.iter(|| connection.fetch(runtime, series_query));
+        });
+    }
+    group.finish();
+
+    let edges = (2..=127)
+        .map(|child| format!("({}, {child})", child / 2))
+        .collect::<Vec<_>>()
+        .join(",");
+    for (_, connection) in connections.iter_mut() {
+        connection.execute(
+            runtime,
+            "CREATE TABLE recursive_cte_branching_edges (parent INTEGER, child INTEGER)",
+        );
+        connection.execute(
+            runtime,
+            &format!("INSERT INTO recursive_cte_branching_edges VALUES {edges}"),
+        );
+    }
+    let traversal_query = "WITH RECURSIVE walk(value) AS (VALUES (1) UNION ALL SELECT edges.child FROM walk JOIN recursive_cte_branching_edges AS edges ON edges.parent = walk.value) SELECT value FROM walk";
+    let mut group = criterion.benchmark_group(
+        benchmarks::find_benchmark("recursive_cte_branching_traversal_127_rows").name,
+    );
+    group.throughput(Throughput::Elements(127));
+    for (name, connection) in connections.iter_mut() {
+        group.bench_function(*name, |benchmark| {
+            benchmark.iter(|| connection.fetch(runtime, traversal_query));
+        });
+    }
+    group.finish();
+    for (_, connection) in connections.iter_mut() {
+        connection.execute(runtime, "DROP TABLE recursive_cte_branching_edges");
     }
 }
 

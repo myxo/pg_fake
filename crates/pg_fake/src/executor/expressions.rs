@@ -195,6 +195,11 @@ pub(super) fn extract_number_literal(expr: &ast::Expr) -> Option<&str> {
 }
 
 #[cfg_attr(feature = "execution-log", tracing::instrument(skip_all))]
+fn is_parameter_placeholder(expr: &ast::Expr) -> bool {
+    matches!(extract_ast_value(expr), Some(ast::Value::Placeholder(_)))
+}
+
+#[cfg_attr(feature = "execution-log", tracing::instrument(skip_all))]
 pub(super) fn evaluate_literal(expr: &ast::Expr) -> Result<Value> {
     if let Some(value) = extract_ast_value(expr) {
         return match value {
@@ -440,6 +445,7 @@ pub(crate) fn infer_expression_type(expr: &ast::Expr, schema: RowScope<'_>) -> R
             let target = coercion::convert_ast_data_type(data_type)?;
             if extract_unknown_string_literal(expr).is_none()
                 && !is_null_literal(expr)
+                && !is_parameter_placeholder(expr)
                 && !coercion::can_cast(
                     infer_expression_type(expr, schema)?,
                     target.base,
@@ -530,6 +536,12 @@ pub(super) fn resolve_operator_type(
     right: &ast::Expr,
     schema: RowScope<'_>,
 ) -> Result<BaseType> {
+    if is_parameter_placeholder(left) {
+        return infer_expression_type(right, schema);
+    }
+    if is_parameter_placeholder(right) {
+        return infer_expression_type(left, schema);
+    }
     let left_type = infer_expression_type(left, schema)?;
     let right_type = infer_expression_type(right, schema)?;
     if left_type != right_type
@@ -1343,19 +1355,40 @@ fn evaluate_function(
         }
         "length" => match evaluate(arguments[0], schema, row, context)? {
             Value::Null => Ok(Value::Null),
-            Value::Text(value) => Ok(Value::Int4(
-                i32::try_from(value.chars().count()).expect("text length must fit in int4"),
-            )),
+            Value::Text(value) => {
+                let value = if infer_expression_type(arguments[0], schema)? == BaseType::Bpchar {
+                    value.trim_end_matches(' ')
+                } else {
+                    &value
+                };
+                Ok(Value::Int4(
+                    i32::try_from(value.chars().count()).expect("text length must fit in int4"),
+                ))
+            }
             _ => unreachable!("length argument was type-checked"),
         },
         "lower" => match evaluate(arguments[0], schema, row, context)? {
             Value::Null => Ok(Value::Null),
-            Value::Text(value) => Ok(Value::Text(value.to_lowercase())),
+            Value::Text(value) => {
+                let value = if infer_expression_type(arguments[0], schema)? == BaseType::Bpchar {
+                    value.trim_end_matches(' ')
+                } else {
+                    &value
+                };
+                Ok(Value::Text(value.to_lowercase()))
+            }
             _ => unreachable!("lower argument was type-checked"),
         },
         "upper" => match evaluate(arguments[0], schema, row, context)? {
             Value::Null => Ok(Value::Null),
-            Value::Text(value) => Ok(Value::Text(value.to_uppercase())),
+            Value::Text(value) => {
+                let value = if infer_expression_type(arguments[0], schema)? == BaseType::Bpchar {
+                    value.trim_end_matches(' ')
+                } else {
+                    &value
+                };
+                Ok(Value::Text(value.to_uppercase()))
+            }
             _ => unreachable!("upper argument was type-checked"),
         },
         "abs" => match evaluate(arguments[0], schema, row, context)? {
@@ -1489,10 +1522,7 @@ pub(super) fn compare_values(left: &Value, right: &Value) -> Result<Ordering> {
         (Value::Float4(left), Value::Float4(right)) => compare_float4(*left, *right),
         (Value::Float8(left), Value::Float8(right)) => compare_float8(*left, *right),
         (Value::Numeric(left), Value::Numeric(right)) => left.cmp(right),
-        (Value::Text(left), Value::Text(right)) => left
-            .to_lowercase()
-            .cmp(&right.to_lowercase())
-            .then_with(|| right.cmp(left)),
+        (Value::Text(left), Value::Text(right)) => left.cmp(right),
         (Value::Bytea(left), Value::Bytea(right)) => left.cmp(right),
         (Value::Uuid(left), Value::Uuid(right)) => left.cmp(right),
         (Value::Date(left), Value::Date(right)) => left.cmp(right),

@@ -83,13 +83,39 @@ pub const FEATURES: &[Feature] = &[
     },
     Feature {
         name: "recursive CTEs",
-        cases: &[Case {
-            id: "recursive_series",
-            source: "with.sql:20",
-            setup: &[],
-            sql: "WITH RECURSIVE series(value) AS (VALUES (1) UNION ALL SELECT value + 1 FROM series WHERE value < 3) SELECT value FROM series ORDER BY value",
-            blocker: BlockerKind::Implementation,
-        }],
+        cases: &[
+            Case {
+                id: "recursive_series",
+                source: "with.sql:20",
+                setup: &[],
+                sql: "WITH RECURSIVE series(value) AS (VALUES (1) UNION ALL SELECT value + 1 FROM series WHERE value < 3) SELECT value FROM series ORDER BY value",
+                blocker: BlockerKind::Implementation,
+            },
+            Case {
+                id: "recursive_union_cycle",
+                source: "with.sql:81",
+                setup: &[
+                    "CREATE TABLE phase3_recursive_edges (parent INTEGER, child INTEGER)",
+                    "INSERT INTO phase3_recursive_edges VALUES (1, 2), (2, 1)",
+                ],
+                sql: "WITH RECURSIVE walk(value) AS (VALUES (1) UNION SELECT edges.child FROM walk JOIN phase3_recursive_edges AS edges ON edges.parent = walk.value) SELECT value FROM walk ORDER BY value",
+                blocker: BlockerKind::Implementation,
+            },
+            Case {
+                id: "recursive_empty_seed",
+                source: "with.sql:111",
+                setup: &[],
+                sql: "WITH RECURSIVE empty(value) AS (SELECT 1 WHERE false UNION ALL SELECT value + 1 FROM empty WHERE value < 3) SELECT value FROM empty",
+                blocker: BlockerKind::Implementation,
+            },
+            Case {
+                id: "recursive_reference_in_seed",
+                source: "with.sql:220",
+                setup: &[],
+                sql: "WITH RECURSIVE invalid(value) AS (SELECT value + 1 FROM invalid UNION ALL VALUES (1)) SELECT value FROM invalid",
+                blocker: BlockerKind::Implementation,
+            },
+        ],
     },
     Feature {
         name: "data-modifying CTEs",

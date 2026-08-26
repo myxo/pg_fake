@@ -107,6 +107,7 @@ fn infer_query_parameters(
     let ast::SetExpr::Select(select) = query.body.as_ref() else {
         unreachable!("set-expression shape was checked");
     };
+    infer_from_parameters(&select.from, catalog, types)?;
     let bound = executor::bind_query_scope(catalog, select)?;
     let scope = executor::RowScope::Bound(&bound);
     if let Some(selection) = &select.selection {
@@ -164,8 +165,12 @@ fn infer_set_expression_parameters(
 ) -> Result<()> {
     match expression {
         ast::SetExpr::Select(select) => {
+            infer_from_parameters(&select.from, catalog, types)?;
             let bound = executor::bind_query_scope(catalog, select)?;
             let scope = executor::RowScope::Bound(&bound);
+            if let Some(selection) = &select.selection {
+                infer_expression_parameters(selection, scope, Some(BaseType::Bool), types)?;
+            }
             for (index, item) in select.projection.iter().enumerate() {
                 if let ast::SelectItem::UnnamedExpr(expression)
                 | ast::SelectItem::ExprWithAlias {
@@ -227,6 +232,38 @@ fn infer_set_expression_parameters(
             infer_set_expression_parameters(right, catalog, Some(&targets), types)
         }
         _ => reject_unsupported("set-operation input is not implemented"),
+    }
+}
+
+#[cfg_attr(feature = "execution-log", tracing::instrument(skip_all))]
+fn infer_from_parameters(
+    from: &[ast::TableWithJoins],
+    catalog: &Catalog,
+    types: &mut [Option<BaseType>],
+) -> Result<()> {
+    for table in from {
+        infer_table_factor_parameters(&table.relation, catalog, types)?;
+        for join in &table.joins {
+            infer_table_factor_parameters(&join.relation, catalog, types)?;
+        }
+    }
+    Ok(())
+}
+
+#[cfg_attr(feature = "execution-log", tracing::instrument(skip_all))]
+fn infer_table_factor_parameters(
+    factor: &ast::TableFactor,
+    catalog: &Catalog,
+    types: &mut [Option<BaseType>],
+) -> Result<()> {
+    match factor {
+        ast::TableFactor::Derived { subquery, .. } => {
+            infer_query_parameters(subquery, catalog, None, types)
+        }
+        ast::TableFactor::NestedJoin {
+            table_with_joins, ..
+        } => infer_from_parameters(std::slice::from_ref(table_with_joins), catalog, types),
+        _ => Ok(()),
     }
 }
 

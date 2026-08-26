@@ -1318,14 +1318,45 @@ fn generate_subquery(src: &mut Source, table: &TableSchema) -> (String, RowOrder
     )
 }
 
-fn generate_cte(_src: &mut Source, table: &TableSchema) -> (String, RowOrder) {
-    let key = &table.key().name;
-    (
-        format!(
-            "WITH source(value) AS (SELECT {key} FROM {}) SELECT source.value FROM source ORDER BY source.value",
-            table.name
-        ),
-        RowOrder::Ordered,
+fn generate_cte(src: &mut Source, table: &TableSchema) -> (String, RowOrder) {
+    src.select(
+        "cte_kind",
+        &["materialized", "recursive_all", "recursive_distinct"],
+        |src, cte_kind, _| match cte_kind {
+            "materialized" => {
+                let key = &table.key().name;
+                (
+                    format!(
+                        "WITH source(value) AS (SELECT {key} FROM {}) SELECT source.value FROM source ORDER BY source.value",
+                        table.name
+                    ),
+                    RowOrder::Ordered,
+                )
+            }
+            "recursive_all" => {
+                let start = src.any_of("start", int_in_range(-3..=3));
+                let length = src.any_of("length", int_in_range(0..=8));
+                let end = start + length;
+                (
+                    format!(
+                        "WITH RECURSIVE series(value) AS (VALUES ({start}) UNION ALL SELECT value + 1 FROM series WHERE value < {end}) SELECT value FROM series ORDER BY value"
+                    ),
+                    RowOrder::Ordered,
+                )
+            }
+            "recursive_distinct" => {
+                let start = src.any_of("start", int_in_range(-3..=3));
+                let length = src.any_of("length", int_in_range(0..=8));
+                let end = start + length;
+                (
+                    format!(
+                        "WITH RECURSIVE series(value) AS (VALUES ({start}) UNION SELECT value + 1 FROM series CROSS JOIN (VALUES (1), (2)) AS branches(branch) WHERE value < {end}) SELECT value FROM series ORDER BY value"
+                    ),
+                    RowOrder::Ordered,
+                )
+            }
+            _ => unreachable!(),
+        },
     )
 }
 

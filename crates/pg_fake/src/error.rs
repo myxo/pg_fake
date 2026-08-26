@@ -58,6 +58,7 @@ pub enum SqlState {
     CannotCoerce,           // 42846
     DatatypeMismatch,       // 42804
     InvalidColumnReference, // 42P10
+    InvalidRecursion,       // 42P19
     GroupingError,          // 42803
     WrongObjectType,        // 42809
     GeneratedAlways,        // 428C9
@@ -108,6 +109,7 @@ impl SqlState {
             SqlState::CannotCoerce => "42846",
             SqlState::DatatypeMismatch => "42804",
             SqlState::InvalidColumnReference => "42P10",
+            SqlState::InvalidRecursion => "42P19",
             SqlState::GroupingError => "42803",
             SqlState::WrongObjectType => "42809",
             SqlState::GeneratedAlways => "428C9",
