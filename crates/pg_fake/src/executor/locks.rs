@@ -2,6 +2,39 @@ use super::*;
 use sqlparser::ast;
 
 #[cfg_attr(feature = "execution-log", tracing::instrument(skip_all))]
+pub(crate) fn collect_required_cte_row_locks(
+    state: &DatabaseState,
+    statement: &ast::Statement,
+    xid: Xid,
+    snapshot: &Snapshot,
+    context: &StatementExecutionContext,
+) -> Result<Vec<RequiredRowLock>> {
+    let ast::Statement::Query(query) = statement else {
+        return Ok(Vec::new());
+    };
+    if query::has_zero_limit(query) {
+        return Ok(Vec::new());
+    }
+    let reachable = query::collect_reachable_cte_names(query);
+    let mut locks = Vec::new();
+    if let Some(with) = &query.with {
+        for cte in &with.cte_tables {
+            if !reachable.contains(&normalize_identifier(&cte.alias.name)) {
+                continue;
+            }
+            let statement = ast::Statement::Query(cte.query.clone());
+            locks.extend(collect_required_cte_row_locks(
+                state, &statement, xid, snapshot, context,
+            )?);
+            locks.extend(collect_required_row_locks(
+                state, &statement, xid, snapshot, context,
+            )?);
+        }
+    }
+    Ok(locks)
+}
+
+#[cfg_attr(feature = "execution-log", tracing::instrument(skip_all))]
 pub(crate) fn collect_required_row_locks(
     state: &DatabaseState,
     statement: &ast::Statement,

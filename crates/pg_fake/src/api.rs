@@ -303,6 +303,12 @@ fn create_deadlock_error() -> PgError {
     PgError::create(SqlState::DeadlockDetected, "deadlock detected")
 }
 
+#[derive(Clone, Copy)]
+enum RowLockTarget<'a> {
+    Ctes(&'a ast::Statement),
+    Statement(&'a ast::Statement),
+}
+
 #[cfg_attr(feature = "execution-log", tracing::instrument(skip_all))]
 fn parse_isolation_level(modes: &[ast::TransactionMode]) -> Result<Option<IsolationLevel>> {
     let mut isolation = None;
@@ -340,7 +346,7 @@ fn acquire_row_locks<'a>(
     condvar: &Condvar,
     timeout: Duration,
     mut state: MutexGuard<'a, DatabaseState>,
-    statement: &ast::Statement,
+    target: RowLockTarget<'_>,
     xid: Xid,
     isolation: IsolationLevel,
     mut snapshot: Snapshot,
@@ -348,8 +354,14 @@ fn acquire_row_locks<'a>(
 ) -> Result<(MutexGuard<'a, DatabaseState>, Snapshot)> {
     let deadline = (timeout != Duration::ZERO).then(|| Instant::now() + timeout);
     loop {
-        let required =
-            executor::collect_required_row_locks(&state, statement, xid, &snapshot, context)?;
+        let required = match target {
+            RowLockTarget::Ctes(statement) => executor::collect_required_cte_row_locks(
+                &state, statement, xid, &snapshot, context,
+            )?,
+            RowLockTarget::Statement(statement) => {
+                executor::collect_required_row_locks(&state, statement, xid, &snapshot, context)?
+            }
+        };
         let mut blocked = None;
         for required_lock in required {
             match state
@@ -740,13 +752,18 @@ impl Session {
         }
         let prepared = {
             let state = self.db.state.lock().expect("database mutex is poisoned");
-            executor::expand_ctes_for_analysis(&statement)
-                .and_then(|statement| {
-                    analyzer::substitute_typed_subqueries(&statement, &state.catalog)
+            analyzer::count_parameters(&statement)
+                .and_then(|parameter_count| {
+                    executor::expand_ctes_for_analysis(&statement, &state.catalog)
+                        .map(|statement| (statement, parameter_count))
                 })
-                .and_then(|described| {
-                    analyzer::infer_parameter_types(&described, &state.catalog).and_then(
-                        |parameter_types| {
+                .and_then(|(statement, parameter_count)| {
+                    analyzer::substitute_typed_subqueries(&statement, &state.catalog)
+                        .map(|statement| (statement, parameter_count))
+                })
+                .and_then(|(described, parameter_count)| {
+                    analyzer::infer_parameter_types(&described, &state.catalog, parameter_count)
+                        .and_then(|parameter_types| {
                             let described = analyzer::bind_parameters(
                                 &described,
                                 &parameter_types,
@@ -760,8 +777,7 @@ impl Session {
                                 &parameter_types,
                             )?;
                             Ok((parameter_types, columns, query_plan))
-                        },
-                    )
+                        })
                 })
         };
         match prepared {
@@ -1265,7 +1281,7 @@ impl Session {
         let state_lock = self.db.state.clone();
         let condvar = self.db.condvar.clone();
         let mut state = state_lock.lock().expect("database mutex is poisoned");
-        let snapshot = match transaction.isolation {
+        let mut snapshot = match transaction.isolation {
             IsolationLevel::ReadCommitted => Snapshot::create(&state.transactions),
             IsolationLevel::RepeatableRead => *transaction
                 .snapshot
@@ -1307,6 +1323,19 @@ impl Session {
                 self.sequence_session.clone(),
             ),
         };
+        (state, snapshot) = match acquire_row_locks(
+            &condvar,
+            self.lock_timeout,
+            state,
+            RowLockTarget::Ctes(statement),
+            transaction.xid,
+            transaction.isolation,
+            snapshot,
+            &context,
+        ) {
+            Ok(acquired) => acquired,
+            Err(error) => return self.abort_with_error(error),
+        };
         let statement = match executor::materialize_ctes(
             &state,
             statement,
@@ -1340,7 +1369,7 @@ impl Session {
             &condvar,
             self.lock_timeout,
             state,
-            &statement,
+            RowLockTarget::Statement(&statement),
             transaction.xid,
             transaction.isolation,
             snapshot,
@@ -4790,6 +4819,185 @@ mod tests {
                 .unwrap()
                 .rows,
             vec![vec![Value::Text("seven".into())]]
+        );
+    }
+
+    #[test]
+    #[cfg_attr(feature = "execution-log", tracing::instrument(skip_all))]
+    fn retains_parameters_from_unreferenced_ctes() {
+        let db = Db::create();
+        let mut session = db.create_session();
+        let statement = session
+            .prepare("WITH unused AS (SELECT $1) SELECT 1")
+            .unwrap();
+
+        assert_eq!(
+            session
+                .query_prepared(&statement, &[Value::Text("unused".into())])
+                .unwrap()
+                .rows,
+            vec![vec![Value::Int4(1)]]
+        );
+    }
+
+    #[test]
+    #[cfg_attr(feature = "execution-log", tracing::instrument(skip_all))]
+    fn does_not_evaluate_unread_cte_rows() {
+        let db = Db::create();
+        let mut session = db.create_session();
+        session
+            .execute("CREATE SEQUENCE unused_cte_sequence")
+            .unwrap();
+        session
+            .execute("CREATE SEQUENCE limited_cte_sequence")
+            .unwrap();
+
+        assert_eq!(
+            session
+                .query(
+                    "WITH unused AS (SELECT nextval('unused_cte_sequence')) SELECT 1",
+                    &[],
+                )
+                .unwrap()
+                .rows,
+            vec![vec![Value::Int4(1)]]
+        );
+        assert_eq!(
+            session
+                .query("SELECT nextval('unused_cte_sequence')", &[])
+                .unwrap()
+                .rows,
+            vec![vec![Value::Int8(1)]]
+        );
+
+        assert!(
+            session
+                .query(
+                    "WITH limited(value) AS (SELECT nextval('limited_cte_sequence')) SELECT value FROM limited LIMIT 0",
+                    &[],
+                )
+                .unwrap()
+                .rows
+                .is_empty()
+        );
+        assert_eq!(
+            session
+                .query("SELECT nextval('limited_cte_sequence')", &[])
+                .unwrap()
+                .rows,
+            vec![vec![Value::Int8(1)]]
+        );
+    }
+
+    #[test]
+    #[cfg_attr(feature = "execution-log", tracing::instrument(skip_all))]
+    fn acquires_row_locks_requested_by_ctes() {
+        let db = Db::create();
+        let mut first = db.create_session();
+        let mut second = db.create_session();
+        first
+            .execute("CREATE TABLE items (id INTEGER PRIMARY KEY, value INTEGER)")
+            .unwrap();
+        first.execute("INSERT INTO items VALUES (1, 1)").unwrap();
+        first.execute("BEGIN").unwrap();
+        first
+            .query(
+                "WITH locked AS (SELECT * FROM items WHERE id = 1 FOR UPDATE) SELECT * FROM locked",
+                &[],
+            )
+            .unwrap();
+
+        let (result_sender, result_receiver) = mpsc::channel();
+        let handle = thread::spawn(move || {
+            result_sender
+                .send(second.execute("UPDATE items SET value = 2 WHERE id = 1"))
+                .unwrap();
+        });
+        wait_until_blocked(&db);
+        first.execute("COMMIT").unwrap();
+        assert_eq!(
+            result_receiver
+                .recv_timeout(Duration::from_secs(1))
+                .unwrap(),
+            Ok(create_affected_results(1))
+        );
+        handle.join().unwrap();
+    }
+
+    #[test]
+    #[cfg_attr(feature = "execution-log", tracing::instrument(skip_all))]
+    fn resolves_a_cte_self_name_to_an_existing_table() {
+        let db = Db::create();
+        let mut session = db.create_session();
+        session
+            .execute("CREATE TABLE items (id INTEGER PRIMARY KEY)")
+            .unwrap();
+        session
+            .execute("INSERT INTO items VALUES (1), (2)")
+            .unwrap();
+
+        assert_eq!(
+            session
+                .query(
+                    "WITH items AS (SELECT * FROM items) SELECT * FROM items ORDER BY id",
+                    &[],
+                )
+                .unwrap()
+                .rows,
+            vec![vec![Value::Int4(1)], vec![Value::Int4(2)]]
+        );
+    }
+
+    #[test]
+    #[cfg_attr(feature = "execution-log", tracing::instrument(skip_all))]
+    fn preserves_quoted_cte_output_column_names() {
+        let db = Db::create();
+        let mut session = db.create_session();
+
+        let result = session
+            .query(
+                "WITH c(\"Value\") AS (SELECT 1) SELECT \"Value\" FROM c",
+                &[],
+            )
+            .unwrap();
+        assert_eq!(result.columns[0].name, "Value");
+        assert_eq!(result.rows, vec![vec![Value::Int4(1)]]);
+    }
+
+    #[test]
+    #[cfg_attr(feature = "execution-log", tracing::instrument(skip_all))]
+    fn executes_with_prefixed_writes() {
+        let db = Db::create();
+        let mut session = db.create_session();
+        session
+            .execute("CREATE TABLE items (id INTEGER PRIMARY KEY, value INTEGER)")
+            .unwrap();
+
+        assert_eq!(
+            session
+                .execute("WITH source AS (SELECT 1, 10) INSERT INTO items SELECT * FROM source")
+                .unwrap(),
+            create_affected_results(1)
+        );
+        assert_eq!(
+            session
+                .query(
+                    "WITH source(value) AS (SELECT 20) UPDATE items SET value = source.value FROM source WHERE id = 1 RETURNING items.value",
+                    &[],
+                )
+                .unwrap()
+                .rows,
+            vec![vec![Value::Int4(20)]]
+        );
+        assert_eq!(
+            session
+                .query(
+                    "WITH source(id) AS (SELECT 1) DELETE FROM items USING source WHERE items.id = source.id RETURNING items.id",
+                    &[],
+                )
+                .unwrap()
+                .rows,
+            vec![vec![Value::Int4(1)]]
         );
     }
 }

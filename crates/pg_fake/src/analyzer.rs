@@ -311,8 +311,9 @@ fn infer_set_expression_types(
 pub(crate) fn infer_parameter_types(
     statement: &ast::Statement,
     catalog: &Catalog,
+    parameter_count: usize,
 ) -> Result<Vec<BaseType>> {
-    let mut types = vec![None; count_parameters(statement)?];
+    let mut types = vec![None; parameter_count];
     match statement {
         ast::Statement::Insert(insert) => {
             let schema =
@@ -647,7 +648,7 @@ pub(crate) fn bind_parameters(
 }
 
 #[cfg_attr(feature = "execution-log", tracing::instrument(skip_all))]
-fn count_parameters(statement: &ast::Statement) -> Result<usize> {
+pub(crate) fn count_parameters(statement: &ast::Statement) -> Result<usize> {
     let mut maximum = 0;
     let mut error = None;
     let _ = ast::visit_expressions(statement, |expression| {

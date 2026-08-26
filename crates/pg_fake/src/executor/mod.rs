@@ -55,7 +55,7 @@ use foreign_keys::{
     validate_row_foreign_keys,
 };
 pub(crate) use foreign_keys::{contains_deferred_foreign_keys, validate_deferred_foreign_keys};
-pub(crate) use locks::collect_required_row_locks;
+pub(crate) use locks::{collect_required_cte_row_locks, collect_required_row_locks};
 pub(crate) use prepared::{PreparedQueryPlan, build_prepared_query_plan, execute_prepared_query};
 pub(crate) use scope::infer_query_output_columns;
 use scope::{BoundColumn, bind_select_scope};
