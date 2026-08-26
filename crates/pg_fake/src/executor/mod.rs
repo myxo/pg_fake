@@ -46,8 +46,8 @@ use expressions::{
     validate_column_default, validate_not_null,
 };
 pub(crate) use expressions::{
-    create_constant_expression_schema, extract_unknown_string_literal, infer_expression_type,
-    is_null_literal,
+    create_constant_expression_schema, extract_unknown_string_literal, infer_expression_data_type,
+    infer_expression_type, is_null_literal,
 };
 use foreign_keys::{
     apply_referencing_foreign_key_actions, convert_referential_action,

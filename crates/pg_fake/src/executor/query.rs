@@ -41,6 +41,11 @@ struct RecursivePlacementValidator<'a> {
     invalid: bool,
 }
 
+struct QueryAggregateDetector {
+    query_depth: usize,
+    found: bool,
+}
+
 impl ast::VisitorMut for RecursiveReferenceCounter<'_> {
     type Break = ();
 
@@ -187,6 +192,44 @@ impl ast::VisitorMut for RecursivePlacementValidator<'_> {
     }
 }
 
+impl ast::VisitorMut for QueryAggregateDetector {
+    type Break = ();
+
+    #[cfg_attr(feature = "execution-log", tracing::instrument(skip_all))]
+    fn pre_visit_query(&mut self, _query: &mut ast::Query) -> std::ops::ControlFlow<Self::Break> {
+        self.query_depth += 1;
+        std::ops::ControlFlow::Continue(())
+    }
+
+    #[cfg_attr(feature = "execution-log", tracing::instrument(skip_all))]
+    fn post_visit_query(&mut self, _query: &mut ast::Query) -> std::ops::ControlFlow<Self::Break> {
+        self.query_depth -= 1;
+        std::ops::ControlFlow::Continue(())
+    }
+
+    #[cfg_attr(feature = "execution-log", tracing::instrument(skip_all))]
+    fn pre_visit_expr(&mut self, expression: &mut ast::Expr) -> std::ops::ControlFlow<Self::Break> {
+        if self.query_depth == 1
+            && matches!(expression, ast::Expr::Function(function) if is_aggregate_function(function))
+        {
+            self.found = true;
+            return std::ops::ControlFlow::Break(());
+        }
+        std::ops::ControlFlow::Continue(())
+    }
+}
+
+#[cfg_attr(feature = "execution-log", tracing::instrument(skip_all))]
+fn contains_query_aggregate(query: &ast::Query) -> bool {
+    let mut query = query.clone();
+    let mut detector = QueryAggregateDetector {
+        query_depth: 0,
+        found: false,
+    };
+    let _ = query.visit(&mut detector);
+    detector.found
+}
+
 #[cfg_attr(feature = "execution-log", tracing::instrument(skip_all))]
 fn validate_recursive_placements(expression: &ast::SetExpr, name: &str) -> Result<()> {
     let mut query = create_set_expression_query(expression.clone());
@@ -243,6 +286,12 @@ fn validate_recursive_cte(query: &ast::Query, name: &str) -> Result<bool> {
         ));
     }
     validate_recursive_placements(right, name)?;
+    if contains_query_aggregate(&create_set_expression_query((**right).clone())) {
+        return Err(PgError::create(
+            SqlState::InvalidRecursion,
+            "aggregate functions are not allowed in a recursive query's recursive term",
+        ));
+    }
     Ok(true)
 }
 
@@ -572,7 +621,7 @@ fn validate_recursive_cte_types(catalog: &Catalog, query: &ast::Query) -> Result
                 "recursive query column types cannot be matched",
             ));
         };
-        if common != seed.base {
+        if common != seed.base || seed.base == recursive.base && seed.typmod != recursive.typmod {
             return Err(PgError::create(
                 SqlState::DatatypeMismatch,
                 "recursive query column type does not match non-recursive term",
@@ -1060,6 +1109,11 @@ fn materialize_recursive_query_ctes(
                 masked: Vec::new(),
             });
             let recursive = validate_recursive_cte(&cte_query, name)?;
+            let demand = if recursive {
+                resolve_direct_cte_demand(&mut query, name, context)?
+            } else {
+                None
+            };
             let mut result = if skips_rows {
                 QueryResult {
                     columns: if recursive {
@@ -1073,7 +1127,9 @@ fn materialize_recursive_query_ctes(
                     rows: Vec::new(),
                 }
             } else if recursive {
-                execute_recursive_cte(state, &cte_query, &cte.alias, name, xid, snapshot, context)?
+                execute_recursive_cte(
+                    state, &cte_query, &cte.alias, name, demand, xid, snapshot, context,
+                )?
             } else {
                 let StatementResult::Query(result) =
                     execute_query(state, &cte_query, xid, snapshot, context)?
@@ -1107,6 +1163,69 @@ fn materialize_recursive_query_ctes(
         masked: Vec::new(),
     });
     Ok(query)
+}
+
+#[cfg_attr(feature = "execution-log", tracing::instrument(skip_all))]
+fn resolve_direct_cte_demand(
+    query: &mut ast::Query,
+    name: &str,
+    context: &StatementExecutionContext,
+) -> Result<Option<usize>> {
+    let ast::SetExpr::Select(select) = query.body.as_ref() else {
+        return Ok(None);
+    };
+    let ast::GroupByExpr::Expressions(group_by, modifiers) = &select.group_by else {
+        return Ok(None);
+    };
+    let [table] = select.from.as_slice() else {
+        return Ok(None);
+    };
+    let ast::TableFactor::Table {
+        name: table_name,
+        args: None,
+        ..
+    } = &table.relation
+    else {
+        return Ok(None);
+    };
+    if query.order_by.is_some()
+        || select.distinct.is_some()
+        || select.selection.is_some()
+        || select.having.is_some()
+        || !group_by.is_empty()
+        || !modifiers.is_empty()
+        || !table.joins.is_empty()
+        || normalize_unqualified_object_name(table_name)? != name
+        || count_query_recursive_references(query, name) != 1
+        || contains_query_aggregate(query)
+    {
+        return Ok(None);
+    }
+    let (limit, offset) = resolve_select_limit(query, context)?;
+    let Some(limit) = limit else {
+        return Ok(None);
+    };
+    let Some(ast::LimitClause::LimitOffset {
+        limit: limit_expression,
+        offset: offset_expression,
+        ..
+    }) = &mut query.limit_clause
+    else {
+        unreachable!("select limit was resolved");
+    };
+    if limit_expression.is_some() {
+        *limit_expression = Some(crate::analyzer::create_typed_literal(
+            Value::Int8(i64::try_from(limit).expect("LIMIT value originated as int8")),
+            PgType::create(BaseType::Int8),
+        ));
+    }
+    if let Some(offset_expression) = offset_expression {
+        offset_expression.value = crate::analyzer::create_typed_literal(
+            Value::Int8(i64::try_from(offset).expect("OFFSET value originated as int8")),
+            PgType::create(BaseType::Int8),
+        );
+    }
+    Ok(Some(offset.saturating_add(limit)))
 }
 
 #[cfg_attr(feature = "execution-log", tracing::instrument(skip_all))]
@@ -1155,6 +1274,7 @@ fn execute_recursive_cte(
     query: &ast::Query,
     alias: &ast::TableAlias,
     name: &str,
+    output_demand: Option<usize>,
     xid: Xid,
     snapshot: &Snapshot,
     context: &StatementExecutionContext,
@@ -1168,6 +1288,19 @@ fn execute_recursive_cte(
     else {
         unreachable!("recursive CTE shape was validated");
     };
+    if query.fetch.is_some() || !query.locks.is_empty() || query.for_clause.is_some() {
+        return reject_unsupported("recursive query clause is not implemented");
+    }
+    let (limit, offset) = resolve_select_limit(query, context)?;
+    let generation_demand = query
+        .order_by
+        .is_none()
+        .then(|| match (limit, output_demand) {
+            (Some(limit), Some(output_demand)) => offset.saturating_add(limit.min(output_demand)),
+            (Some(limit), None) => offset.saturating_add(limit),
+            (None, Some(output_demand)) => offset.saturating_add(output_demand),
+            (None, None) => usize::MAX,
+        });
     let StatementResult::Query(mut seed) = execute_query(
         state,
         &create_set_expression_query((**left).clone()),
@@ -1210,8 +1343,13 @@ fn execute_recursive_cte(
     if distinct {
         rows = remove_set_duplicates(rows)?;
     }
+    if let Some(generation_demand) = generation_demand {
+        rows.truncate(generation_demand);
+    }
     let mut working = rows.clone();
-    while !working.is_empty() {
+    while !working.is_empty()
+        && generation_demand.is_none_or(|generation_demand| rows.len() < generation_demand)
+    {
         let mut recursive_query = create_set_expression_query((**right).clone());
         let _ = recursive_query.visit(&mut CteReferenceReplacer {
             ctes: &[MaterializedCte {
@@ -1248,14 +1386,13 @@ fn execute_recursive_cte(
             }
             working = new_rows;
         }
+        if let Some(generation_demand) = generation_demand {
+            working.truncate(generation_demand - rows.len());
+        }
         rows.extend(working.iter().cloned());
     }
     let mut result = QueryResult { columns, rows };
-    if query.fetch.is_some() || !query.locks.is_empty() || query.for_clause.is_some() {
-        return reject_unsupported("recursive query clause is not implemented");
-    }
     sort_set_rows(&mut result.rows, &result.columns, query)?;
-    let (limit, offset) = resolve_select_limit(query, context)?;
     result.rows = result
         .rows
         .into_iter()
@@ -2582,23 +2719,37 @@ fn bind_values_scope(values: &ast::Values) -> Result<BoundScope> {
                     !is_null_literal(expression)
                         && extract_unknown_string_literal(expression).is_none()
                 })
-                .try_fold(None, |common, expression| {
-                    let data_type = infer_expression_type(expression, RowScope::Table(&constants))?;
+                .try_fold(None::<PgType>, |common, expression| {
+                    let data_type =
+                        infer_expression_data_type(expression, RowScope::Table(&constants))?;
                     Ok(Some(match common {
-                        Some(common) => coercion::resolve_common_type(common, data_type)
-                            .ok_or_else(|| {
+                        Some(common) => {
+                            let base = coercion::resolve_common_type(common.base, data_type.base)
+                                .ok_or_else(|| {
                                 PgError::create(
                                     SqlState::DatatypeMismatch,
                                     "VALUES types cannot be matched",
                                 )
-                            })?,
+                            })?;
+                            PgType::create_with_typmod(
+                                base,
+                                if base == common.base
+                                    && base == data_type.base
+                                    && common.typmod == data_type.typmod
+                                {
+                                    common.typmod
+                                } else {
+                                    PgType::NO_TYPEMOD
+                                },
+                            )
+                        }
                         None => data_type,
                     }))
                 })?
-                .unwrap_or(BaseType::Text);
+                .unwrap_or(PgType::create(BaseType::Text));
             Ok(BoundColumn {
                 name: format!("column{}", slot + 1),
-                data_type: PgType::create(data_type),
+                data_type,
                 qualifier: String::new(),
                 slot,
                 merged: None,
@@ -2881,15 +3032,17 @@ fn resolve_recursive_columns(
     recursive: &[ColumnMeta],
 ) -> Result<Vec<ColumnMeta>> {
     let columns = resolve_set_columns(seed, recursive)?;
-    for (seed, column) in seed.iter().zip(&columns) {
-        if seed.type_oid != column.type_oid {
+    for ((seed, recursive), column) in seed.iter().zip(recursive).zip(&columns) {
+        if seed.type_oid != column.type_oid
+            || seed.type_oid == recursive.type_oid && seed.typmod != recursive.typmod
+        {
             return Err(PgError::create(
                 SqlState::DatatypeMismatch,
                 "recursive query column type does not match non-recursive term",
             ));
         }
     }
-    Ok(columns)
+    Ok(seed.to_vec())
 }
 
 #[cfg_attr(feature = "execution-log", tracing::instrument(skip_all))]
@@ -4441,7 +4594,7 @@ pub(super) fn build_projection_plan<'a>(
                         _ => "?column?".into(),
                     },
                     type_oid: data_type.map_to_oid(),
-                    typmod: PgType::NO_TYPEMOD,
+                    typmod: data_type.typmod,
                 });
             }
             ast::SelectItem::ExprWithAlias { expr, alias } => {
@@ -4465,7 +4618,7 @@ pub(super) fn build_projection_plan<'a>(
                         (
                             ProjectionSource::Expression(expr),
                             data_type,
-                            PgType::NO_TYPEMOD,
+                            data_type.typmod,
                         )
                     }
                 };

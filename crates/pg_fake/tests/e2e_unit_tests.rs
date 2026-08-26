@@ -470,7 +470,8 @@ fn matches_recursive_ctes() {
          WITH RECURSIVE nullable(value) AS (VALUES (NULL::INTEGER) UNION SELECT value + 1 FROM nullable WHERE value < 3) SELECT value FROM nullable; \
          WITH RECURSIVE series(value) AS (VALUES (1::BIGINT) UNION ALL SELECT value + 1 FROM series WHERE value < 3) SELECT value FROM series ORDER BY value; \
          SELECT value FROM (WITH RECURSIVE series(value) AS (VALUES (1) UNION ALL SELECT value + 1 FROM series WHERE value < 3) SELECT value FROM series) AS nested ORDER BY value; \
-         WITH RECURSIVE series(value) AS (VALUES (1) UNION ALL SELECT series.value + 1 FROM series LEFT JOIN (VALUES (true)) AS preserved(flag) ON true WHERE series.value < 3) SELECT value FROM series ORDER BY value",
+         WITH RECURSIVE series(value) AS (VALUES (1) UNION ALL SELECT series.value + 1 FROM series LEFT JOIN (VALUES (true)) AS preserved(flag) ON true WHERE series.value < 3) SELECT value FROM series ORDER BY value; \
+         WITH RECURSIVE limited(value) AS (VALUES (1) UNION ALL SELECT value + 1 FROM limited) SELECT value FROM limited LIMIT 3",
         RowOrder::Ordered,
     );
 }
@@ -483,7 +484,9 @@ fn matches_recursive_cte_errors() {
          WITH RECURSIVE first_cte(value) AS (SELECT value FROM second_cte), second_cte(value) AS (SELECT value FROM first_cte) SELECT value FROM first_cte; \
          WITH RECURSIVE series(value) AS (VALUES (1::SMALLINT) UNION ALL SELECT value + 1 FROM series WHERE value < 2) SELECT value FROM series; \
          WITH RECURSIVE series(value) AS (VALUES (1) UNION ALL SELECT (SELECT value FROM series) WHERE false) SELECT value FROM series; \
-         WITH RECURSIVE series(value) AS (VALUES (1) UNION ALL SELECT nullable.value FROM (VALUES (1)) AS source(value) LEFT JOIN series AS nullable ON true) SELECT value FROM series",
+         WITH RECURSIVE series(value) AS (VALUES (1) UNION ALL SELECT nullable.value FROM (VALUES (1)) AS source(value) LEFT JOIN series AS nullable ON true) SELECT value FROM series; \
+         WITH RECURSIVE series(value) AS (VALUES (1) UNION ALL SELECT max(value) + 1 FROM series HAVING max(value) < 3) SELECT value FROM series; \
+         WITH RECURSIVE labels(value) AS (VALUES ('a'::VARCHAR(2)) UNION ALL SELECT (value || 'a')::VARCHAR(3) FROM labels WHERE length(value) < 2) SELECT value FROM labels",
         RowOrder::Ordered,
     );
 }
@@ -510,6 +513,93 @@ fn executes_parameterized_recursive_ctes() {
     );
     assert_eq!(result.columns[0].name, "value");
     assert_eq!(result.columns[0].type_oid, BaseType::Int4.map_to_oid());
+
+    let statement = session
+        .prepare(
+            "WITH RECURSIVE series(value) AS (VALUES (1) UNION ALL SELECT series.value + 1 FROM series JOIN (VALUES (1)) AS expected(value) ON expected.value = $1 WHERE series.value < 2) SELECT value FROM series ORDER BY value",
+        )
+        .unwrap();
+    assert_eq!(statement.get_parameter_types(), &[BaseType::Int4]);
+    assert_eq!(
+        session
+            .query_prepared(&statement, &[Value::Int4(1)])
+            .unwrap()
+            .rows,
+        vec![vec![Value::Int4(1)], vec![Value::Int4(2)]]
+    );
+}
+
+#[test]
+fn preserves_matching_recursive_typmods() {
+    let db = Db::create();
+    let mut session = db.create_session();
+    let result = session
+        .query(
+            "WITH RECURSIVE labels(value) AS (VALUES ('a'::VARCHAR(2)) UNION ALL SELECT value::VARCHAR(2) FROM labels WHERE false) SELECT value FROM labels",
+            &[],
+        )
+        .unwrap();
+
+    assert_eq!(result.columns[0].type_oid, BaseType::Varchar.map_to_oid());
+    assert_eq!(result.columns[0].typmod, 6);
+
+    let result = session
+        .query(
+            "WITH RECURSIVE amounts(value) AS (VALUES (1::NUMERIC(4, 2)) UNION ALL SELECT value::NUMERIC(4, 2) FROM amounts WHERE false) SELECT value FROM amounts",
+            &[],
+        )
+        .unwrap();
+    assert_eq!(result.columns[0].type_oid, BaseType::Numeric.map_to_oid());
+    assert_eq!(result.columns[0].typmod, (4 << 16) + 2 + 4);
+}
+
+#[test]
+fn limits_unbounded_recursive_ctes() {
+    let db = Db::create();
+    let mut session = db.create_session();
+
+    assert_eq!(
+        session
+            .query(
+                "WITH RECURSIVE limited(value) AS (VALUES (1) UNION ALL SELECT value + 1 FROM limited LIMIT 3) SELECT value FROM limited",
+                &[],
+            )
+            .unwrap()
+            .rows,
+        vec![
+            vec![Value::Int4(1)],
+            vec![Value::Int4(2)],
+            vec![Value::Int4(3)],
+        ]
+    );
+    assert_eq!(
+        session
+            .query(
+                "WITH RECURSIVE limited(value) AS (VALUES (1) UNION ALL SELECT value + 1 FROM limited) SELECT value FROM limited LIMIT 3",
+                &[],
+            )
+            .unwrap()
+            .rows,
+        vec![
+            vec![Value::Int4(1)],
+            vec![Value::Int4(2)],
+            vec![Value::Int4(3)],
+        ]
+    );
+    assert_eq!(
+        session
+            .query(
+                "WITH RECURSIVE limited(value) AS (VALUES (1) UNION ALL SELECT value + 1 FROM limited LIMIT 3 OFFSET 2) SELECT value FROM limited",
+                &[],
+            )
+            .unwrap()
+            .rows,
+        vec![
+            vec![Value::Int4(3)],
+            vec![Value::Int4(4)],
+            vec![Value::Int4(5)],
+        ]
+    );
 }
 
 #[test]

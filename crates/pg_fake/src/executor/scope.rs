@@ -573,28 +573,42 @@ fn describe_bound_query_columns(
                             !super::is_null_literal(expr)
                                 && super::extract_unknown_string_literal(expr).is_none()
                         })
-                        .try_fold(None, |common, expr| {
-                            let data_type = super::infer_expression_type(
+                        .try_fold(None::<PgType>, |common, expr| {
+                            let data_type = super::infer_expression_data_type(
                                 expr,
                                 RowScope::Table(&super::create_constant_expression_schema()),
                             )?;
                             Ok(Some(match common {
                                 Some(common) => {
-                                    crate::coercion::resolve_common_type(common, data_type)
-                                        .ok_or_else(|| {
-                                            PgError::create(
-                                                SqlState::DatatypeMismatch,
-                                                "VALUES types cannot be matched",
-                                            )
-                                        })?
+                                    let base = crate::coercion::resolve_common_type(
+                                        common.base,
+                                        data_type.base,
+                                    )
+                                    .ok_or_else(|| {
+                                        PgError::create(
+                                            SqlState::DatatypeMismatch,
+                                            "VALUES types cannot be matched",
+                                        )
+                                    })?;
+                                    PgType::create_with_typmod(
+                                        base,
+                                        if base == common.base
+                                            && base == data_type.base
+                                            && common.typmod == data_type.typmod
+                                        {
+                                            common.typmod
+                                        } else {
+                                            PgType::NO_TYPEMOD
+                                        },
+                                    )
                                 }
                                 None => data_type,
                             }))
                         })?
-                        .unwrap_or(BaseType::Text);
+                        .unwrap_or(PgType::create(BaseType::Text));
                     Ok(BoundColumn {
                         name: format!("column{}", slot + 1),
-                        data_type: PgType::create(data_type),
+                        data_type,
                         qualifier: String::new(),
                         slot,
                         merged: None,
@@ -697,10 +711,7 @@ pub(super) fn infer_expression_data_type(
     if let Some(error) = describer.error {
         return Err(error);
     }
-    Ok(PgType::create(super::infer_expression_type(
-        &expression,
-        RowScope::Bound(scope),
-    )?))
+    super::infer_expression_data_type(&expression, RowScope::Bound(scope))
 }
 
 #[cfg_attr(feature = "execution-log", tracing::instrument(skip_all))]

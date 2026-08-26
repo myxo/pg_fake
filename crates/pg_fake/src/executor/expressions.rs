@@ -479,6 +479,23 @@ pub(crate) fn infer_expression_type(expr: &ast::Expr, schema: RowScope<'_>) -> R
 }
 
 #[cfg_attr(feature = "execution-log", tracing::instrument(skip_all))]
+pub(crate) fn infer_expression_data_type(
+    expression: &ast::Expr,
+    schema: RowScope<'_>,
+) -> Result<PgType> {
+    match expression {
+        ast::Expr::Identifier(column) => Ok(schema.resolve_column(std::slice::from_ref(column))?.1),
+        ast::Expr::CompoundIdentifier(columns) => Ok(schema.resolve_column(columns)?.1),
+        ast::Expr::Nested(expression) => infer_expression_data_type(expression, schema),
+        ast::Expr::Cast { data_type, .. } => {
+            infer_expression_type(expression, schema)?;
+            coercion::convert_ast_data_type(data_type)
+        }
+        _ => Ok(PgType::create(infer_expression_type(expression, schema)?)),
+    }
+}
+
+#[cfg_attr(feature = "execution-log", tracing::instrument(skip_all))]
 pub(crate) fn is_null_literal(expr: &ast::Expr) -> bool {
     match expr {
         ast::Expr::Value(value) if matches!(&value.value, ast::Value::Null) => true,

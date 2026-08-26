@@ -247,6 +247,26 @@ fn infer_from_parameters(
             infer_table_factor_parameters(&join.relation, catalog, types)?;
         }
     }
+    let bound = executor::bind_from_scope(catalog, from)?;
+    let scope = executor::RowScope::Bound(&bound);
+    for table in from {
+        for join in &table.joins {
+            let constraint = match &join.join_operator {
+                ast::JoinOperator::Join(constraint)
+                | ast::JoinOperator::Inner(constraint)
+                | ast::JoinOperator::CrossJoin(constraint)
+                | ast::JoinOperator::Left(constraint)
+                | ast::JoinOperator::LeftOuter(constraint)
+                | ast::JoinOperator::Right(constraint)
+                | ast::JoinOperator::RightOuter(constraint)
+                | ast::JoinOperator::FullOuter(constraint) => constraint,
+                _ => continue,
+            };
+            if let ast::JoinConstraint::On(expression) = constraint {
+                infer_expression_parameters(expression, scope, Some(BaseType::Bool), types)?;
+            }
+        }
+    }
     Ok(())
 }
 
@@ -1239,9 +1259,22 @@ fn convert_to_ast_data_type(data_type: PgType) -> ast::DataType {
         BaseType::Int8 => ast::DataType::BigInt(None),
         BaseType::Float4 => ast::DataType::Real,
         BaseType::Float8 => ast::DataType::DoublePrecision,
-        BaseType::Numeric => ast::DataType::Numeric(ast::ExactNumberInfo::None),
+        BaseType::Numeric if data_type.typmod == PgType::NO_TYPEMOD => {
+            ast::DataType::Numeric(ast::ExactNumberInfo::None)
+        }
+        BaseType::Numeric => {
+            let encoded = data_type.typmod - 4;
+            ast::DataType::Numeric(ast::ExactNumberInfo::PrecisionAndScale(
+                u64::try_from(encoded >> 16).expect("valid numeric precision"),
+                i64::from(encoded & 0xffff),
+            ))
+        }
         BaseType::Text => ast::DataType::Text,
-        BaseType::Varchar => ast::DataType::Varchar(None),
+        BaseType::Varchar if data_type.typmod == PgType::NO_TYPEMOD => ast::DataType::Varchar(None),
+        BaseType::Varchar => ast::DataType::Varchar(Some(ast::CharacterLength::IntegerLength {
+            length: u64::try_from(data_type.typmod - 4).expect("valid character typmod"),
+            unit: None,
+        })),
         BaseType::Bpchar if data_type.typmod == PgType::NO_TYPEMOD => {
             ast::DataType::Custom(ast::Ident::new("bpchar").into(), Vec::new())
         }
@@ -1252,9 +1285,21 @@ fn convert_to_ast_data_type(data_type: PgType) -> ast::DataType {
         BaseType::Bytea => ast::DataType::Bytea,
         BaseType::Uuid => ast::DataType::Uuid,
         BaseType::Date => ast::DataType::Date,
-        BaseType::Time => ast::DataType::Time(None, ast::TimezoneInfo::WithoutTimeZone),
-        BaseType::Timestamp => ast::DataType::Timestamp(None, ast::TimezoneInfo::WithoutTimeZone),
-        BaseType::TimestampTz => ast::DataType::Timestamp(None, ast::TimezoneInfo::WithTimeZone),
+        BaseType::Time => ast::DataType::Time(
+            (data_type.typmod != PgType::NO_TYPEMOD)
+                .then(|| u64::try_from(data_type.typmod).expect("valid time precision")),
+            ast::TimezoneInfo::WithoutTimeZone,
+        ),
+        BaseType::Timestamp => ast::DataType::Timestamp(
+            (data_type.typmod != PgType::NO_TYPEMOD)
+                .then(|| u64::try_from(data_type.typmod).expect("valid timestamp precision")),
+            ast::TimezoneInfo::WithoutTimeZone,
+        ),
+        BaseType::TimestampTz => ast::DataType::Timestamp(
+            (data_type.typmod != PgType::NO_TYPEMOD)
+                .then(|| u64::try_from(data_type.typmod).expect("valid timestamptz precision")),
+            ast::TimezoneInfo::WithTimeZone,
+        ),
         BaseType::Interval => ast::DataType::Interval {
             fields: None,
             precision: None,
