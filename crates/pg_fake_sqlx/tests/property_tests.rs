@@ -8,7 +8,7 @@ use std::{
 };
 
 use bigdecimal::BigDecimal;
-use chaos_theory::{Effect, Source, check, make::int_in_range};
+use chaos_theory::{Effect, Source, check, make::int_in};
 use pg_fake::parser::{self, Statement};
 use pg_fake_sqlx::{Db, PgFake, PgFakeConnection};
 use sqlx::{
@@ -243,7 +243,7 @@ fn normalize_rows(rows: &mut [Vec<Option<String>>], column_types: &[String]) {
 }
 
 fn integer(src: &mut Source, label: &str) -> i32 {
-    src.any_of(label, int_in_range(-20..=20))
+    src.any_of(label, int_in(-20..=20))
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -450,16 +450,16 @@ fn generate_non_null_literal(src: &mut Source, data_type: SqlType) -> String {
             integer(src, "integer").to_string()
         }
         SqlType::Numeric | SqlType::Real | SqlType::Double => {
-            decimal_literal(src.any_of("decimal", int_in_range(-2000..=2000)))
+            decimal_literal(src.any_of("decimal", int_in(-2000..=2000)))
         }
         SqlType::Boolean => if src.any("boolean") { "TRUE" } else { "FALSE" }.into(),
         SqlType::Text | SqlType::Varchar | SqlType::Char => text_literal(src, "text"),
         SqlType::Bytea => {
             let bytes = [
-                src.any_of("a", int_in_range(0_u8..=255)),
-                src.any_of("b", int_in_range(0_u8..=255)),
-                src.any_of("c", int_in_range(0_u8..=255)),
-                src.any_of("d", int_in_range(0_u8..=255)),
+                src.any_of("a", int_in(0_u8..=255)),
+                src.any_of("b", int_in(0_u8..=255)),
+                src.any_of("c", int_in(0_u8..=255)),
+                src.any_of("d", int_in(0_u8..=255)),
             ];
             format!(
                 r"'\x{:02x}{:02x}{:02x}{:02x}'",
@@ -805,7 +805,7 @@ fn generate_select_expression(src: &mut Source, table: &TableSchema) -> String {
                 let (operator, _) = src.choose("operator", operators).unwrap();
                 let right = if column.data_type == SqlType::Real {
                     if *operator == "/" {
-                        src.any_of("right", int_in_range(1..=5)).to_string()
+                        src.any_of("right", int_in(1..=5)).to_string()
                     } else {
                         integer(src, "right").to_string()
                     }
@@ -886,7 +886,7 @@ fn row_count(src: &mut Source, ordered: bool, offset: bool) -> String {
     src.select("value", choices, |src, value, _| match value {
         "null" => "NULL".into(),
         "zero" => "0".into(),
-        "small" => src.any_of("count", int_in_range(1..=8)).to_string(),
+        "small" => src.any_of("count", int_in(1..=8)).to_string(),
         "beyond" => "1000".into(),
         _ => unreachable!(),
     })
@@ -1101,7 +1101,7 @@ fn generate_assignment(src: &mut Source, column: &ColumnSchema) -> String {
 fn generate_update(src: &mut Source, table: &TableSchema) -> String {
     let column = choose_column(src, table, |column| column.name != table.key().name);
     let (mut sql, target, source) = if src.any("from_clause") {
-        let cutoff = src.any_of("cutoff", int_in_range(1..=20));
+        let cutoff = src.any_of("cutoff", int_in(1..=20));
         (
             format!(
                 "UPDATE {0} AS target SET {1} = source.{1} FROM {0} AS source \
@@ -1132,7 +1132,7 @@ fn generate_update(src: &mut Source, table: &TableSchema) -> String {
 
 fn generate_delete(src: &mut Source, table: &TableSchema) -> String {
     let (mut sql, target, source) = if src.any("using_clause") {
-        let cutoff = src.any_of("cutoff", int_in_range(1..=20));
+        let cutoff = src.any_of("cutoff", int_in(1..=20));
         (
             format!(
                 "DELETE FROM {0} AS target USING {0} AS source \
@@ -1211,7 +1211,7 @@ fn generate_returning_clause(
 }
 
 fn generate_join(src: &mut Source, table: &TableSchema) -> (String, RowOrder) {
-    let offset = src.any_of("offset", int_in_range(-2..=2));
+    let offset = src.any_of("offset", int_in(-2..=2));
     src.select(
         "join",
         &["inner", "left", "right", "full", "cross"],
@@ -1295,7 +1295,7 @@ fn generate_subquery(src: &mut Source, table: &TableSchema) -> (String, RowOrder
             ),
             "quantified" => {
                 let operator = if src.any("all") { "ALL" } else { "ANY" };
-                let value = src.any_of("value", int_in_range(1..=20));
+                let value = src.any_of("value", int_in(1..=20));
                 (
                     format!(
                         "SELECT {value} = {operator} (SELECT {key} FROM {})",
@@ -1349,8 +1349,8 @@ fn generate_cte(src: &mut Source, table: &TableSchema) -> (String, RowOrder) {
                 )
             }
             "recursive_all" => {
-                let start = src.any_of("start", int_in_range(-3..=3));
-                let length = src.any_of("length", int_in_range(0..=8));
+                let start = src.any_of("start", int_in(-3..=3));
+                let length = src.any_of("length", int_in(0..=8));
                 let end = start + length;
                 (
                     format!(
@@ -1360,8 +1360,8 @@ fn generate_cte(src: &mut Source, table: &TableSchema) -> (String, RowOrder) {
                 )
             }
             "recursive_distinct" => {
-                let start = src.any_of("start", int_in_range(-3..=3));
-                let length = src.any_of("length", int_in_range(0..=8));
+                let start = src.any_of("start", int_in(-3..=3));
+                let length = src.any_of("length", int_in(0..=8));
                 let end = start + length;
                 (
                     format!(
@@ -1387,9 +1387,9 @@ fn generate_set_operation(src: &mut Source) -> (String, RowOrder) {
             "EXCEPT ALL",
         ],
         |src, operator, _| {
-            let left = src.any_of("left", int_in_range(-5..=5));
-            let shared = src.any_of("shared", int_in_range(-5..=5));
-            let right = src.any_of("right", int_in_range(-5..=5));
+            let left = src.any_of("left", int_in(-5..=5));
+            let shared = src.any_of("shared", int_in(-5..=5));
+            let right = src.any_of("right", int_in(-5..=5));
             let mut sql = format!(
                 "VALUES ({left}), ({shared}), ({shared}), (NULL) {operator} VALUES ({right}), ({shared}), (NULL) ORDER BY 1 NULLS FIRST"
             );
@@ -1475,15 +1475,15 @@ fn lock_timeout_sql(src: &mut Source) -> String {
             "zero" => "SET lock_timeout = 0".into(),
             "integer" => format!(
                 "SET lock_timeout = {}",
-                src.any_of("milliseconds", int_in_range(1..=1000))
+                src.any_of("milliseconds", int_in(1..=1000))
             ),
             "milliseconds" => format!(
                 "SET lock_timeout = '{}ms'",
-                src.any_of("milliseconds", int_in_range(1..=1000))
+                src.any_of("milliseconds", int_in(1..=1000))
             ),
             "seconds" => format!(
                 "SET lock_timeout = '{}s'",
-                src.any_of("seconds", int_in_range(1..=3))
+                src.any_of("seconds", int_in(1..=3))
             ),
             _ => unreachable!(),
         },
@@ -1807,7 +1807,7 @@ fn generated_interleaved_transaction_snapshots_match_postgres() {
         }
 
         src.repeat_n("interleaving", 12..=36, |src| {
-            let session = src.any_of("session", int_in_range(0_usize..=2));
+            let session = src.any_of("session", int_in(0_usize..=2));
             let (sql, order) = generate_snapshot_statement(
                 src,
                 &table,
@@ -1862,12 +1862,12 @@ fn generated_sequence_allocations_follow_the_option_model() {
     check(|src| {
         let increments = [-5_i64, -3, -1, 1, 2, 4];
         let (increment, _) = src.choose("increment", &increments).unwrap();
-        let min_value = src.any_of("min_value", int_in_range(-20_i64..=-1));
-        let max_value = src.any_of("max_value", int_in_range(1_i64..=20));
-        let start_value = src.any_of("start_value", int_in_range(min_value..=max_value));
+        let min_value = src.any_of("min_value", int_in(-20_i64..=-1));
+        let max_value = src.any_of("max_value", int_in(1_i64..=20));
+        let start_value = src.any_of("start_value", int_in(min_value..=max_value));
         let cycles = [false, true];
         let (cycle, _) = src.choose("cycle", &cycles).unwrap();
-        let calls = src.any_of("calls", int_in_range(1..=8));
+        let calls = src.any_of("calls", int_in(1..=8));
         let db = pg_fake::api::Db::create();
         let mut session = db.create_session();
         session
