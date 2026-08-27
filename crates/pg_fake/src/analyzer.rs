@@ -365,12 +365,11 @@ fn infer_set_expression_types(
 }
 
 #[cfg_attr(feature = "execution-log", tracing::instrument(skip_all))]
-pub(crate) fn infer_parameter_types(
+fn constrain_statement_parameters(
     statement: &ast::Statement,
     catalog: &Catalog,
-    parameter_count: usize,
-) -> Result<Vec<BaseType>> {
-    let mut types = vec![None; parameter_count];
+    types: &mut [Option<BaseType>],
+) -> Result<()> {
     match statement {
         ast::Statement::Insert(insert) => {
             let schema =
@@ -412,7 +411,7 @@ pub(crate) fn infer_parameter_types(
                                     &executor::create_constant_expression_schema(),
                                 ),
                                 Some(schema.columns[*column].data_type.base),
-                                &mut types,
+                                types,
                             )?;
                         }
                     }
@@ -421,7 +420,7 @@ pub(crate) fn infer_parameter_types(
                         .iter()
                         .map(|column| schema.columns[*column].data_type.base)
                         .collect::<Vec<_>>();
-                    infer_query_parameters(source, catalog, Some(&expected), &mut types)?;
+                    infer_query_parameters(source, catalog, Some(&expected), types)?;
                 }
             }
             let returning_scope = executor::bind_target_scope(
@@ -431,7 +430,7 @@ pub(crate) fn infer_parameter_types(
             infer_returning_parameters(
                 insert.returning.as_deref(),
                 executor::RowScope::Bound(&returning_scope),
-                &mut types,
+                types,
             )?;
         }
         ast::Statement::Update(update) => {
@@ -457,39 +456,53 @@ pub(crate) fn infer_parameter_types(
                     &assignment.value,
                     scope,
                     Some(column.data_type.base),
-                    &mut types,
+                    types,
                 )?;
             }
             if let Some(selection) = &update.selection {
-                infer_expression_parameters(selection, scope, Some(BaseType::Bool), &mut types)?;
+                infer_expression_parameters(selection, scope, Some(BaseType::Bool), types)?;
             }
-            infer_returning_parameters(update.returning.as_deref(), scope, &mut types)?;
+            infer_returning_parameters(update.returning.as_deref(), scope, types)?;
         }
         ast::Statement::Delete(delete) => {
             let ast::FromTable::WithFromKeyword(from) = &delete.from else {
-                return Ok(finalize_parameter_types(types));
+                return Ok(());
             };
             if let Some(first) = from.first() {
                 let schema = resolve_table_schema(&first.relation, catalog)?;
                 let bound = bind_delete_scope(delete, schema, &first.relation, catalog)?;
                 let scope = executor::RowScope::Bound(&bound);
                 if let Some(selection) = &delete.selection {
-                    infer_expression_parameters(
-                        selection,
-                        scope,
-                        Some(BaseType::Bool),
-                        &mut types,
-                    )?;
+                    infer_expression_parameters(selection, scope, Some(BaseType::Bool), types)?;
                 }
-                infer_returning_parameters(delete.returning.as_deref(), scope, &mut types)?;
+                infer_returning_parameters(delete.returning.as_deref(), scope, types)?;
             }
         }
-        ast::Statement::Query(query) => infer_query_parameters(query, catalog, None, &mut types)?,
+        ast::Statement::Query(query) => infer_query_parameters(query, catalog, None, types)?,
         _ => {}
     }
+    Ok(())
+}
+
+#[cfg_attr(feature = "execution-log", tracing::instrument(skip_all))]
+pub(crate) fn infer_parameter_types_with_data_modifying_ctes(
+    described: &ast::Statement,
+    data_modifying_ctes: &[ast::Statement],
+    catalog: &Catalog,
+    parameter_count: usize,
+) -> Result<Vec<BaseType>> {
+    let mut types = vec![None; parameter_count];
+    for statement in data_modifying_ctes {
+        constrain_statement_parameters(statement, catalog, &mut types)?;
+    }
+    constrain_statement_parameters(described, catalog, &mut types)?;
     let types = finalize_parameter_types(types);
-    let bound = bind_parameters(statement, &types, &vec![Value::Null; types.len()])?;
+    let bound = bind_parameters(described, &types, &vec![Value::Null; types.len()])?;
     validate_statement(&bound, catalog)?;
+    for statement in data_modifying_ctes {
+        let bound = bind_parameters(statement, &types, &vec![Value::Null; types.len()])?;
+        validate_statement(&bound, catalog)?;
+    }
     Ok(types)
 }
 

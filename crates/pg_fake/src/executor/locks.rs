@@ -12,7 +12,16 @@ pub(crate) fn collect_required_cte_row_locks(
     let ast::Statement::Query(query) = statement else {
         return Ok(Vec::new());
     };
-    if query::has_zero_limit(query) {
+    if query::has_zero_limit(query)
+        && query.with.as_ref().is_none_or(|with| {
+            with.cte_tables.iter().all(|cte| {
+                !matches!(
+                    cte.query.body.as_ref(),
+                    ast::SetExpr::Insert(_) | ast::SetExpr::Update(_) | ast::SetExpr::Delete(_)
+                )
+            })
+        })
+    {
         return Ok(Vec::new());
     }
     let reachable = query::collect_reachable_cte_names(query);
@@ -22,7 +31,7 @@ pub(crate) fn collect_required_cte_row_locks(
             if !reachable.contains(&normalize_identifier(&cte.alias.name)) {
                 continue;
             }
-            let statement = ast::Statement::Query(cte.query.clone());
+            let statement = query::convert_query_to_statement(cte.query.as_ref().clone());
             locks.extend(collect_required_cte_row_locks(
                 state, &statement, xid, snapshot, context,
             )?);

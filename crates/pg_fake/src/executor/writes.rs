@@ -345,7 +345,7 @@ pub(super) fn execute_insert(
             .tables
             .get_mut(&schema.id)
             .expect("catalog table must have storage")
-            .insert(xid, row.clone());
+            .insert(xid, context.command_id, row.clone());
         validate_row_foreign_keys(
             state,
             &schema,
@@ -485,6 +485,9 @@ pub(super) fn execute_update(
             else {
                 return Ok(targets);
             };
+            if version.xmax == Some(xid) && version.xmax_command_id == Some(context.command_id) {
+                return Ok(targets);
+            }
             for source_row in &source_rows {
                 let mut row = source_row.clone();
                 row[..schema.columns.len()].clone_from_slice(&version.row);
@@ -529,7 +532,13 @@ pub(super) fn execute_update(
             .tables
             .get_mut(&schema.id)
             .expect("catalog table must have storage")
-            .append_updated_version(row_id, version_xmin, xid, updated.clone());
+            .append_updated_version(
+                row_id,
+                version_xmin,
+                xid,
+                context.command_id,
+                updated.clone(),
+            );
         validate_row_foreign_keys(
             state,
             &schema,
@@ -641,6 +650,9 @@ pub(super) fn execute_delete(
             else {
                 return Ok(targets);
             };
+            if version.xmax == Some(xid) && version.xmax_command_id == Some(context.command_id) {
+                return Ok(targets);
+            }
             for source_row in &source_rows {
                 let mut row = source_row.clone();
                 row[..schema.columns.len()].clone_from_slice(&version.row);
@@ -678,7 +690,7 @@ pub(super) fn execute_delete(
             .tables
             .get_mut(&schema.id)
             .expect("catalog table must have storage")
-            .mark_version_deleted(row_id, version_xmin, xid);
+            .mark_version_deleted(row_id, version_xmin, xid, context.command_id);
         evaluate_returning_row(
             state,
             returning.as_ref(),

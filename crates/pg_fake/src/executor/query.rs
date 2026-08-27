@@ -17,7 +17,7 @@ struct InlineCte {
 }
 
 struct InlineCteReferenceReplacer<'a> {
-    catalog: &'a Catalog,
+    state: &'a DatabaseState,
     ctes: &'a [InlineCte],
     masked: Vec<Vec<String>>,
     pending_mask: Option<Vec<String>>,
@@ -365,7 +365,7 @@ impl ast::VisitorMut for InlineCteReferenceReplacer<'_> {
         if query.with.is_none() {
             return std::ops::ControlFlow::Continue(());
         }
-        match inline_query_ctes(query, self.catalog) {
+        match inline_query_ctes(query, self.state) {
             Ok(expanded) => *query = expanded,
             Err(error) => {
                 self.error = Some(error);
@@ -423,11 +423,11 @@ impl ast::VisitorMut for InlineCteReferenceReplacer<'_> {
 }
 
 #[cfg_attr(feature = "execution-log", tracing::instrument(skip_all))]
-fn inline_query_ctes(query: &ast::Query, catalog: &Catalog) -> Result<ast::Query> {
+fn inline_query_ctes(query: &ast::Query, state: &DatabaseState) -> Result<ast::Query> {
     let mut query = query.clone();
     let Some(with) = query.with.take() else {
         let mut replacer = InlineCteReferenceReplacer {
-            catalog,
+            state,
             ctes: &[],
             masked: Vec::new(),
             pending_mask: None,
@@ -440,7 +440,7 @@ fn inline_query_ctes(query: &ast::Query, catalog: &Catalog) -> Result<ast::Query
         return Ok(query);
     };
     if with.recursive {
-        return inline_recursive_query_ctes(query, with, catalog);
+        return inline_recursive_query_ctes(query, with, state);
     }
     let names = with
         .cte_tables
@@ -459,10 +459,10 @@ fn inline_query_ctes(query: &ast::Query, catalog: &Catalog) -> Result<ast::Query
                 format!("WITH query name {name:?} specified more than once"),
             ));
         }
-        let mut cte_query = inline_query_ctes(&cte.query, catalog)?;
-        reject_cte_forward_references(&cte_query, &names[index..], catalog)?;
+        let mut cte_query = inline_query_ctes(&cte.query, state)?;
+        reject_cte_forward_references(&cte_query, &names[index..], &state.catalog)?;
         let mut replacer = InlineCteReferenceReplacer {
-            catalog,
+            state,
             ctes: &ctes,
             masked: Vec::new(),
             pending_mask: None,
@@ -472,15 +472,33 @@ fn inline_query_ctes(query: &ast::Query, catalog: &Catalog) -> Result<ast::Query
         if let Some(error) = replacer.error {
             return Err(error);
         }
+        let mut alias = cte.alias;
+        if is_data_modifying_query(&cte_query) {
+            let statement = convert_query_to_statement(cte_query);
+            let columns = describe_query_result_columns(state, &statement)?;
+            if alias.columns.is_empty() {
+                alias.columns = columns
+                    .iter()
+                    .map(|column| ast::TableAliasColumnDef {
+                        name: ast::Ident::with_quote('"', column.name.clone()),
+                        data_type: None,
+                    })
+                    .collect();
+            }
+            cte_query = create_cte_values_query(&QueryResult {
+                columns,
+                rows: Vec::new(),
+            });
+        }
         ctes.push(InlineCte {
             name,
             query: Box::new(cte_query),
-            alias: cte.alias,
+            alias,
             masked_names: names[index..].to_vec(),
         });
     }
     let mut replacer = InlineCteReferenceReplacer {
-        catalog,
+        state,
         ctes: &ctes,
         masked: Vec::new(),
         pending_mask: None,
@@ -497,7 +515,7 @@ fn inline_query_ctes(query: &ast::Query, catalog: &Catalog) -> Result<ast::Query
 fn inline_recursive_query_ctes(
     mut query: ast::Query,
     with: ast::With,
-    catalog: &Catalog,
+    state: &DatabaseState,
 ) -> Result<ast::Query> {
     let names = with
         .cte_tables
@@ -531,9 +549,9 @@ fn inline_recursive_query_ctes(
             let cte = pending[index]
                 .take()
                 .expect("pending CTE was checked as present");
-            let mut cte_query = inline_query_ctes(&cte.query, catalog)?;
+            let mut cte_query = inline_query_ctes(&cte.query, state)?;
             let mut replacer = InlineCteReferenceReplacer {
-                catalog,
+                state,
                 ctes: &ctes,
                 masked: Vec::new(),
                 pending_mask: None,
@@ -554,7 +572,7 @@ fn inline_recursive_query_ctes(
                     masked_names: names.clone(),
                 };
                 let mut replacer = InlineCteReferenceReplacer {
-                    catalog,
+                    state,
                     ctes: std::slice::from_ref(&seed),
                     masked: Vec::new(),
                     pending_mask: None,
@@ -564,7 +582,7 @@ fn inline_recursive_query_ctes(
                 if let Some(error) = replacer.error {
                     return Err(error);
                 }
-                validate_recursive_cte_types(catalog, &cte_query)?;
+                validate_recursive_cte_types(&state.catalog, &cte_query)?;
             }
             ctes.push(InlineCte {
                 name: name.clone(),
@@ -579,7 +597,7 @@ fn inline_recursive_query_ctes(
         }
     }
     let mut replacer = InlineCteReferenceReplacer {
-        catalog,
+        state,
         ctes: &ctes,
         masked: Vec::new(),
         pending_mask: None,
@@ -634,18 +652,75 @@ fn validate_recursive_cte_types(catalog: &Catalog, query: &ast::Query) -> Result
 #[cfg_attr(feature = "execution-log", tracing::instrument(skip_all))]
 pub(crate) fn expand_ctes_for_analysis(
     statement: &ast::Statement,
-    catalog: &Catalog,
-) -> Result<ast::Statement> {
+    state: &DatabaseState,
+) -> Result<(ast::Statement, Vec<ast::Statement>)> {
     let ast::Statement::Query(query) = statement else {
-        return Ok(statement.clone());
+        return Ok((statement.clone(), Vec::new()));
     };
-    Ok(convert_query_to_statement(inline_query_ctes(
-        query, catalog,
-    )?))
+    let mut mutations = Vec::new();
+    if let Some(with) = &query.with
+        && !with.recursive
+        && with
+            .cte_tables
+            .iter()
+            .any(|cte| is_data_modifying_query(&cte.query))
+    {
+        let names = with
+            .cte_tables
+            .iter()
+            .map(|cte| normalize_identifier(&cte.alias.name))
+            .collect::<Vec<_>>();
+        let mut ctes = Vec::new();
+        for (index, cte) in with.cte_tables.iter().enumerate() {
+            let name = normalize_identifier(&cte.alias.name);
+            let mut cte_query = inline_query_ctes(&cte.query, state)?;
+            reject_cte_forward_references(&cte_query, &names[index..], &state.catalog)?;
+            let mut replacer = InlineCteReferenceReplacer {
+                state,
+                ctes: &ctes,
+                masked: Vec::new(),
+                pending_mask: None,
+                error: None,
+            };
+            let _ = cte_query.visit(&mut replacer);
+            if let Some(error) = replacer.error {
+                return Err(error);
+            }
+            let mut alias = cte.alias.clone();
+            if is_data_modifying_query(&cte_query) {
+                let mutation = convert_query_to_statement(cte_query.clone());
+                let columns = describe_query_result_columns(state, &mutation)?;
+                if alias.columns.is_empty() {
+                    alias.columns = columns
+                        .iter()
+                        .map(|column| ast::TableAliasColumnDef {
+                            name: ast::Ident::with_quote('"', column.name.clone()),
+                            data_type: None,
+                        })
+                        .collect();
+                }
+                mutations.push(mutation);
+                cte_query = create_cte_values_query(&QueryResult {
+                    columns,
+                    rows: Vec::new(),
+                });
+            }
+            ctes.push(InlineCte {
+                name,
+                query: Box::new(cte_query),
+                alias,
+                masked_names: names[index..].to_vec(),
+            });
+        }
+    }
+    Ok((
+        convert_query_to_statement(inline_query_ctes(query, state)?),
+        mutations,
+    ))
 }
 
 #[cfg_attr(feature = "execution-log", tracing::instrument(skip_all))]
-fn convert_query_to_statement(query: ast::Query) -> ast::Statement {
+pub(super) fn convert_query_to_statement(query: ast::Query) -> ast::Statement {
     match query.body.as_ref() {
         ast::SetExpr::Insert(statement)
         | ast::SetExpr::Update(statement)
@@ -720,6 +795,14 @@ fn collect_cte_references(query: &ast::Query, names: &[String]) -> BTreeSet<Stri
 }
 
 #[cfg_attr(feature = "execution-log", tracing::instrument(skip_all))]
+fn is_data_modifying_query(query: &ast::Query) -> bool {
+    matches!(
+        query.body.as_ref(),
+        ast::SetExpr::Insert(_) | ast::SetExpr::Update(_) | ast::SetExpr::Delete(_)
+    )
+}
+
+#[cfg_attr(feature = "execution-log", tracing::instrument(skip_all))]
 pub(super) fn collect_reachable_cte_names(query: &ast::Query) -> BTreeSet<String> {
     let Some(with) = &query.with else {
         return BTreeSet::new();
@@ -732,6 +815,12 @@ pub(super) fn collect_reachable_cte_names(query: &ast::Query) -> BTreeSet<String
     let mut body = query.clone();
     body.with = None;
     let mut reachable = collect_cte_references(&body, &names);
+    reachable.extend(
+        with.cte_tables
+            .iter()
+            .filter(|cte| is_data_modifying_query(&cte.query))
+            .map(|cte| normalize_identifier(&cte.alias.name)),
+    );
     for (index, cte) in with.cte_tables.iter().enumerate().rev() {
         if reachable.contains(&names[index]) {
             reachable.extend(collect_cte_references(&cte.query, &names[..index]));
@@ -963,6 +1052,16 @@ fn materialize_query_ctes(
         }
         return Ok(query);
     };
+    if with
+        .cte_tables
+        .iter()
+        .any(|cte| is_data_modifying_query(&cte.query))
+    {
+        return Err(PgError::create(
+            SqlState::FeatureNotSupported,
+            "WITH clause containing a data-modifying statement must be at the top level",
+        ));
+    }
     if with.recursive {
         return materialize_recursive_query_ctes(state, query, with, xid, snapshot, context);
     }
@@ -1404,17 +1503,150 @@ fn execute_recursive_cte(
 
 #[cfg_attr(feature = "execution-log", tracing::instrument(skip_all))]
 pub(crate) fn materialize_ctes(
-    state: &DatabaseState,
+    state: &mut DatabaseState,
     statement: &ast::Statement,
     xid: Xid,
     snapshot: &Snapshot,
+    deferred_constraints: &BTreeSet<String>,
+    defer_all: bool,
     context: &StatementExecutionContext,
 ) -> Result<ast::Statement> {
     let ast::Statement::Query(query) = statement else {
         return Ok(statement.clone());
     };
+    if query.with.is_none() {
+        return Ok(convert_query_to_statement(materialize_query_ctes(
+            state, query, xid, snapshot, context,
+        )?));
+    }
+    let mut query = query.as_ref().clone();
+    let with = query
+        .with
+        .take()
+        .expect("WITH clause was checked as present");
+    if with.recursive {
+        if with
+            .cte_tables
+            .iter()
+            .any(|cte| is_data_modifying_query(&cte.query))
+        {
+            return Err(PgError::create(
+                SqlState::InvalidRecursion,
+                "recursive query must not contain data-modifying statements",
+            ));
+        }
+        return Ok(convert_query_to_statement(
+            materialize_recursive_query_ctes(state, query, with, xid, snapshot, context)?,
+        ));
+    }
+    let names = with
+        .cte_tables
+        .iter()
+        .map(|cte| normalize_identifier(&cte.alias.name))
+        .collect::<Vec<_>>();
+    let mut body = query.clone();
+    body.with = None;
+    let mut consumed = collect_cte_references(&body, &names);
+    for cte in &with.cte_tables {
+        consumed.extend(collect_cte_references(&cte.query, &names));
+    }
+    let mut reachable = collect_cte_references(&body, &names);
+    reachable.extend(
+        with.cte_tables
+            .iter()
+            .filter(|cte| is_data_modifying_query(&cte.query))
+            .map(|cte| normalize_identifier(&cte.alias.name)),
+    );
+    for (index, cte) in with.cte_tables.iter().enumerate().rev() {
+        if reachable.contains(&names[index]) {
+            reachable.extend(collect_cte_references(&cte.query, &names[..index]));
+        }
+    }
+    let skips_rows = has_zero_limit(&query);
+    let mut ctes = Vec::new();
+    let mut seen = BTreeSet::new();
+    for (index, cte) in with.cte_tables.into_iter().enumerate() {
+        let name = normalize_identifier(&cte.alias.name);
+        if !seen.insert(name.clone()) {
+            return Err(PgError::create(
+                SqlState::SyntaxError,
+                format!("WITH query name {name:?} specified more than once"),
+            ));
+        }
+        let modifying = is_data_modifying_query(&cte.query);
+        let mut cte_query = *cte.query;
+        reject_cte_forward_references(&cte_query, &names[index..], &state.catalog)?;
+        if !reachable.contains(&name) {
+            continue;
+        }
+        let _ = cte_query.visit(&mut CteReferenceReplacer {
+            ctes: &ctes,
+            masked: Vec::new(),
+        });
+        let result = if modifying {
+            cte_query = materialize_query_ctes(state, &cte_query, xid, snapshot, context)?;
+            let cte_statement = convert_query_to_statement(cte_query);
+            let cte_statement =
+                materialize_uncorrelated_subqueries(state, &cte_statement, xid, snapshot, context)?;
+            match execute_statement(
+                state,
+                &cte_statement,
+                xid,
+                snapshot,
+                deferred_constraints,
+                defer_all,
+                context,
+            )? {
+                StatementResult::Query(result) => result,
+                StatementResult::Affected(_) if consumed.contains(&name) => {
+                    return Err(PgError::create(
+                        SqlState::FeatureNotSupported,
+                        "WITH query does not have a RETURNING clause",
+                    ));
+                }
+                StatementResult::Affected(_) => QueryResult {
+                    columns: Vec::new(),
+                    rows: Vec::new(),
+                },
+            }
+        } else if skips_rows {
+            QueryResult {
+                columns: describe_query_result_columns(
+                    state,
+                    &ast::Statement::Query(Box::new(cte_query.clone())),
+                )?,
+                rows: Vec::new(),
+            }
+        } else {
+            let StatementResult::Query(result) =
+                execute_query(state, &cte_query, xid, snapshot, context)?
+            else {
+                unreachable!("CTE query produces query rows");
+            };
+            result
+        };
+        if cte.alias.columns.len() > result.columns.len() {
+            return Err(PgError::create(
+                SqlState::InvalidColumnReference,
+                "WITH query has fewer columns than specified in column list",
+            ));
+        }
+        let mut result = result;
+        for (column, alias) in result.columns.iter_mut().zip(&cte.alias.columns) {
+            column.name = normalize_identifier(&alias.name);
+        }
+        ctes.push(MaterializedCte {
+            name,
+            alias: cte.alias,
+            result,
+        });
+    }
+    let _ = query.visit(&mut CteReferenceReplacer {
+        ctes: &ctes,
+        masked: Vec::new(),
+    });
     Ok(convert_query_to_statement(materialize_query_ctes(
-        state, query, xid, snapshot, context,
+        state, &query, xid, snapshot, context,
     )?))
 }
 

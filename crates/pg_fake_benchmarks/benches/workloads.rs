@@ -1089,6 +1089,7 @@ fn benchmarks(criterion: &mut Criterion) {
         inner_join_benchmark(criterion, &runtime, &mut connections);
         derived_and_scalar_subquery_benchmark(criterion, &runtime, &mut connections);
         materialized_cte_benchmark(criterion, &runtime, &mut connections);
+        data_modifying_cte_benchmark(criterion, &runtime, &mut connections);
         recursive_cte_benchmark(criterion, &runtime, &mut connections);
         global_aggregate_benchmark(criterion, &runtime, &mut connections);
         grouped_aggregate_benchmark(criterion, &runtime, &mut connections);
@@ -1326,6 +1327,40 @@ fn materialized_cte_benchmark(
     group.finish();
     for (_, connection) in connections.iter_mut() {
         connection.execute(runtime, "DROP TABLE materialized_cte_100_rows");
+    }
+}
+
+fn data_modifying_cte_benchmark(
+    criterion: &mut Criterion,
+    runtime: &Runtime,
+    connections: &mut [NamedBenchmarkConnection<'_>],
+) {
+    let values = (1..=100)
+        .map(|id| format!("({id}, {id})"))
+        .collect::<Vec<_>>()
+        .join(",");
+    for (_, connection) in connections.iter_mut() {
+        connection.execute(
+            runtime,
+            "CREATE TABLE data_modifying_cte_update_100_rows (id INTEGER PRIMARY KEY, value INTEGER)",
+        );
+        connection.execute(
+            runtime,
+            &format!("INSERT INTO data_modifying_cte_update_100_rows VALUES {values}"),
+        );
+    }
+    let query = "WITH updated AS (UPDATE data_modifying_cte_update_100_rows SET value = value RETURNING id) SELECT count(*) FROM updated";
+    let mut group = criterion
+        .benchmark_group(benchmarks::find_benchmark("data_modifying_cte_update_100_rows").name);
+    group.throughput(Throughput::Elements(100));
+    for (name, connection) in connections.iter_mut() {
+        group.bench_function(*name, |benchmark| {
+            benchmark.iter(|| connection.fetch(runtime, query));
+        });
+    }
+    group.finish();
+    for (_, connection) in connections.iter_mut() {
+        connection.execute(runtime, "DROP TABLE data_modifying_cte_update_100_rows");
     }
 }
 

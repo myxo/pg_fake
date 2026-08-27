@@ -1321,13 +1321,28 @@ fn generate_subquery(src: &mut Source, table: &TableSchema) -> (String, RowOrder
 fn generate_cte(src: &mut Source, table: &TableSchema) -> (String, RowOrder) {
     src.select(
         "cte_kind",
-        &["materialized", "recursive_all", "recursive_distinct"],
+        &[
+            "materialized",
+            "data_modifying",
+            "recursive_all",
+            "recursive_distinct",
+        ],
         |src, cte_kind, _| match cte_kind {
             "materialized" => {
                 let key = &table.key().name;
                 (
                     format!(
                         "WITH source(value) AS (SELECT {key} FROM {}) SELECT source.value FROM source ORDER BY source.value",
+                        table.name
+                    ),
+                    RowOrder::Ordered,
+                )
+            }
+            "data_modifying" => {
+                let key = &table.key().name;
+                (
+                    format!(
+                        "WITH changed(value) AS (UPDATE {} SET {key} = {key} RETURNING {key}) SELECT left_row.value, right_row.value FROM changed AS left_row JOIN changed AS right_row ON left_row.value = right_row.value ORDER BY left_row.value",
                         table.name
                     ),
                     RowOrder::Ordered,

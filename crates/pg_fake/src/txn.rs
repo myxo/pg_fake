@@ -11,6 +11,9 @@ pub(crate) struct Xid(pub(crate) u64);
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub(crate) struct CommitSeq(pub(crate) u64);
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub(crate) struct CommandId(pub(crate) u64);
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum TransactionStatus {
     InFlight,
@@ -21,6 +24,7 @@ pub(crate) enum TransactionStatus {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct Snapshot {
     pub(crate) commit_seq: CommitSeq,
+    pub(crate) command_id: CommandId,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
@@ -338,6 +342,20 @@ impl Snapshot {
     pub(crate) fn create(manager: &TransactionRegistry) -> Self {
         Snapshot {
             commit_seq: manager.commit_seq,
+            command_id: CommandId(u64::MAX),
+        }
+    }
+
+    #[cfg_attr(feature = "execution-log", tracing::instrument(skip_all))]
+    pub(crate) fn use_command(self, command_id: CommandId) -> Self {
+        Snapshot { command_id, ..self }
+    }
+
+    #[cfg_attr(feature = "execution-log", tracing::instrument(skip_all))]
+    pub(crate) fn include_current_command(self) -> Self {
+        Snapshot {
+            command_id: CommandId(self.command_id.0.saturating_add(1)),
+            ..self
         }
     }
 }
@@ -349,7 +367,7 @@ pub(crate) fn is_visible(
     current_xid: Xid,
     manager: &TransactionRegistry,
 ) -> bool {
-    let xmin_visible = version.xmin == current_xid
+    let xmin_visible = version.xmin == current_xid && version.xmin_command_id < snapshot.command_id
         || matches!(
             manager.get_status(version.xmin),
             Some(TransactionStatus::Committed(commit_seq))
@@ -358,6 +376,9 @@ pub(crate) fn is_visible(
     let xmax_invisible = matches!(
         version.xmax,
         Some(xmax) if xmax == current_xid
+            && version
+                .xmax_command_id
+                .is_some_and(|command_id| command_id < snapshot.command_id)
             || matches!(
                 manager.get_status(xmax),
                 Some(TransactionStatus::Committed(commit_seq))
@@ -433,7 +454,9 @@ mod tests {
     fn create_version(xmin: Xid, xmax: Option<Xid>) -> RowVersion {
         RowVersion {
             xmin,
+            xmin_command_id: CommandId(0),
             xmax,
+            xmax_command_id: xmax.map(|_| CommandId(0)),
             row: vec![],
         }
     }

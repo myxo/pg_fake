@@ -90,6 +90,7 @@ struct ActiveTransaction {
     isolation: IsolationLevel,
     snapshot: Option<Snapshot>,
     statement_started: bool,
+    next_command_id: u64,
     implicit_batch: bool,
     transaction_timestamp: chrono::DateTime<chrono::Utc>,
 }
@@ -754,30 +755,34 @@ impl Session {
             let state = self.db.state.lock().expect("database mutex is poisoned");
             analyzer::count_parameters(&statement)
                 .and_then(|parameter_count| {
-                    executor::expand_ctes_for_analysis(&statement, &state.catalog)
-                        .map(|statement| (statement, parameter_count))
+                    executor::expand_ctes_for_analysis(&statement, &state)
+                        .map(|(statement, mutations)| (statement, mutations, parameter_count))
                 })
-                .and_then(|(statement, parameter_count)| {
+                .and_then(|(statement, mutations, parameter_count)| {
                     analyzer::substitute_typed_subqueries(&statement, &state.catalog)
-                        .map(|statement| (statement, parameter_count))
+                        .map(|statement| (statement, mutations, parameter_count))
                 })
-                .and_then(|(described, parameter_count)| {
-                    analyzer::infer_parameter_types(&described, &state.catalog, parameter_count)
-                        .and_then(|parameter_types| {
-                            let described = analyzer::bind_parameters(
-                                &described,
-                                &parameter_types,
-                                &vec![Value::Null; parameter_types.len()],
-                            )?;
-                            let columns =
-                                executor::describe_query_result_columns(&state, &described)?;
-                            let query_plan = executor::build_prepared_query_plan(
-                                &state,
-                                &statement,
-                                &parameter_types,
-                            )?;
-                            Ok((parameter_types, columns, query_plan))
-                        })
+                .and_then(|(described, mutations, parameter_count)| {
+                    analyzer::infer_parameter_types_with_data_modifying_ctes(
+                        &described,
+                        &mutations,
+                        &state.catalog,
+                        parameter_count,
+                    )
+                    .and_then(|parameter_types| {
+                        let described = analyzer::bind_parameters(
+                            &described,
+                            &parameter_types,
+                            &vec![Value::Null; parameter_types.len()],
+                        )?;
+                        let columns = executor::describe_query_result_columns(&state, &described)?;
+                        let query_plan = executor::build_prepared_query_plan(
+                            &state,
+                            &statement,
+                            &parameter_types,
+                        )?;
+                        Ok((parameter_types, columns, query_plan))
+                    })
                 })
         };
         match prepared {
@@ -914,6 +919,7 @@ impl Session {
             isolation,
             snapshot: None,
             statement_started: false,
+            next_command_id: 0,
             implicit_batch,
             transaction_timestamp: self.db.read_clock(),
         }));
@@ -1281,12 +1287,15 @@ impl Session {
         let state_lock = self.db.state.clone();
         let condvar = self.db.condvar.clone();
         let mut state = state_lock.lock().expect("database mutex is poisoned");
+        let command_id = crate::txn::CommandId(transaction.next_command_id);
+        transaction.next_command_id += 1;
         let mut snapshot = match transaction.isolation {
             IsolationLevel::ReadCommitted => Snapshot::create(&state.transactions),
             IsolationLevel::RepeatableRead => *transaction
                 .snapshot
                 .get_or_insert_with(|| Snapshot::create(&state.transactions)),
-        };
+        }
+        .use_command(command_id);
         if transaction.isolation == IsolationLevel::RepeatableRead {
             state
                 .transactions
@@ -1313,6 +1322,7 @@ impl Session {
             };
         }
         let context = executor::StatementExecutionContext {
+            command_id,
             transaction_timestamp: transaction.transaction_timestamp,
             statement_timestamp: self.db.read_clock(),
             clock_timestamp: self.db.read_clock(),
@@ -1323,6 +1333,7 @@ impl Session {
                 self.sequence_session.clone(),
             ),
         };
+        let statement_contains_dml = contains_dml(statement);
         (state, snapshot) = match acquire_row_locks(
             &condvar,
             self.lock_timeout,
@@ -1337,10 +1348,12 @@ impl Session {
             Err(error) => return self.abort_with_error(error),
         };
         let statement = match executor::materialize_ctes(
-            &state,
+            &mut state,
             statement,
             transaction.xid,
             &snapshot,
+            &self.deferred_constraints,
+            self.defer_all_constraints,
             &context,
         ) {
             Ok(statement) => statement,
@@ -1389,7 +1402,7 @@ impl Session {
         );
         match result {
             Ok(result) => {
-                if contains_dml(&statement)
+                if statement_contains_dml
                     && executor::contains_deferred_foreign_keys(
                         &state,
                         &self.deferred_constraints,
@@ -1410,10 +1423,20 @@ impl Session {
 
 #[cfg_attr(feature = "execution-log", tracing::instrument(skip_all))]
 fn contains_dml(statement: &ast::Statement) -> bool {
-    matches!(
-        statement,
-        ast::Statement::Insert(_) | ast::Statement::Update(_) | ast::Statement::Delete(_)
-    )
+    match statement {
+        ast::Statement::Insert(_) | ast::Statement::Update(_) | ast::Statement::Delete(_) => true,
+        ast::Statement::Query(query) => {
+            matches!(
+                query.body.as_ref(),
+                ast::SetExpr::Insert(_) | ast::SetExpr::Update(_) | ast::SetExpr::Delete(_)
+            ) || query.with.as_ref().is_some_and(|with| {
+                with.cte_tables
+                    .iter()
+                    .any(|cte| contains_dml(&ast::Statement::Query(cte.query.clone())))
+            })
+        }
+        _ => false,
+    }
 }
 
 #[cfg_attr(feature = "execution-log", tracing::instrument(skip_all))]
@@ -2484,11 +2507,11 @@ mod tests {
         let mut state = db.state.lock().unwrap();
         let writer = state.transactions.begin();
         let table_id = state.catalog.require_table("items").unwrap().id;
-        state
-            .tables
-            .get_mut(&table_id)
-            .unwrap()
-            .insert(writer, vec![Value::Int4(1)]);
+        state.tables.get_mut(&table_id).unwrap().insert(
+            writer,
+            crate::txn::CommandId(0),
+            vec![Value::Int4(1)],
+        );
         drop(state);
 
         assert!(
@@ -2755,6 +2778,7 @@ mod tests {
         let table_id = state.catalog.require_table("numbers").unwrap().id;
         state.tables.get_mut(&table_id).unwrap().insert(
             xid,
+            crate::txn::CommandId(0),
             vec![
                 Value::Int2(-2),
                 Value::Int4(-4),
@@ -4995,6 +5019,144 @@ mod tests {
                     "WITH source(id) AS (SELECT 1) DELETE FROM items USING source WHERE items.id = source.id RETURNING items.id",
                     &[],
                 )
+                .unwrap()
+                .rows,
+            vec![vec![Value::Int4(1)]]
+        );
+    }
+
+    #[test]
+    #[cfg_attr(feature = "execution-log", tracing::instrument(skip_all))]
+    fn executes_data_modifying_ctes_once_with_statement_snapshot_visibility() {
+        let db = Db::create();
+        let mut session = db.create_session();
+        session
+            .execute("CREATE TABLE items (id INTEGER PRIMARY KEY, value INTEGER)")
+            .unwrap();
+        session.execute("INSERT INTO items VALUES (1, 10)").unwrap();
+
+        let result = session
+            .query(
+                "WITH inserted AS (INSERT INTO items VALUES (2, 20) RETURNING id, value) SELECT inserted.id, inserted.value, (SELECT count(*) FROM items) FROM inserted",
+                &[],
+            )
+            .unwrap();
+        assert_eq!(
+            result.rows,
+            vec![vec![Value::Int4(2), Value::Int4(20), Value::Int8(1)]]
+        );
+        assert_eq!(
+            session
+                .query("SELECT id, value FROM items ORDER BY id", &[])
+                .unwrap()
+                .rows,
+            vec![
+                vec![Value::Int4(1), Value::Int4(10)],
+                vec![Value::Int4(2), Value::Int4(20)],
+            ]
+        );
+    }
+
+    #[test]
+    #[cfg_attr(feature = "execution-log", tracing::instrument(skip_all))]
+    fn composes_insert_update_and_delete_ctes_through_returning_rows() {
+        let db = Db::create();
+        let mut session = db.create_session();
+        session
+            .execute("CREATE TABLE items (id INTEGER PRIMARY KEY, value INTEGER)")
+            .unwrap();
+
+        assert_eq!(
+            session
+                .query(
+                    "WITH inserted AS (INSERT INTO items VALUES (1, 10) RETURNING id, value) SELECT left_row.id, right_row.value FROM inserted AS left_row CROSS JOIN inserted AS right_row",
+                    &[],
+                )
+                .unwrap()
+                .rows,
+            vec![vec![Value::Int4(1), Value::Int4(10)]]
+        );
+        assert_eq!(
+            session
+                .query(
+                    "WITH updated AS (UPDATE items SET value = value + 5 RETURNING id, value) SELECT id, value FROM updated",
+                    &[],
+                )
+                .unwrap()
+                .rows,
+            vec![vec![Value::Int4(1), Value::Int4(15)]]
+        );
+        assert_eq!(
+            session
+                .query(
+                    "WITH removed AS (DELETE FROM items RETURNING id, value), copied AS (INSERT INTO items SELECT id + 1, value FROM removed RETURNING id, value) SELECT id, value FROM copied",
+                    &[],
+                )
+                .unwrap()
+                .rows,
+            vec![vec![Value::Int4(2), Value::Int4(15)]]
+        );
+
+        let statement = session
+            .prepare(
+                "WITH inserted AS (INSERT INTO items VALUES ($1, $2) RETURNING id, value) SELECT id, value FROM inserted",
+            )
+            .unwrap();
+        assert_eq!(
+            statement.get_parameter_types(),
+            &[crate::value::BaseType::Int4, crate::value::BaseType::Int4]
+        );
+        assert_eq!(
+            session
+                .query_prepared(&statement, &[Value::Int4(3), Value::Int4(30)])
+                .unwrap()
+                .rows,
+            vec![vec![Value::Int4(3), Value::Int4(30)]]
+        );
+    }
+
+    #[test]
+    #[cfg_attr(feature = "execution-log", tracing::instrument(skip_all))]
+    fn executes_unreferenced_mutations_and_rolls_back_a_failing_cte_statement() {
+        let db = Db::create();
+        let mut session = db.create_session();
+        session
+            .execute("CREATE TABLE items (id INTEGER PRIMARY KEY)")
+            .unwrap();
+
+        assert_eq!(
+            session
+                .query(
+                    "WITH unreferenced AS (INSERT INTO items VALUES (1)) SELECT 42",
+                    &[],
+                )
+                .unwrap()
+                .rows,
+            vec![vec![Value::Int4(42)]]
+        );
+        assert_eq!(
+            session
+                .query(
+                    "WITH missing_rows AS (INSERT INTO items VALUES (2)) SELECT * FROM missing_rows",
+                    &[],
+                )
+                .unwrap_err()
+                .sqlstate,
+            SqlState::FeatureNotSupported
+        );
+        assert_eq!(
+            session
+                .query(
+                    "WITH first_insert AS (INSERT INTO items VALUES (3) RETURNING id), failing_insert AS (INSERT INTO items VALUES (1) RETURNING id) SELECT * FROM first_insert",
+                    &[],
+                )
+                .unwrap_err()
+                .sqlstate,
+            SqlState::UniqueViolation
+        );
+        assert_eq!(
+            session
+                .query("SELECT id FROM items ORDER BY id", &[])
                 .unwrap()
                 .rows,
             vec![vec![Value::Int4(1)]]

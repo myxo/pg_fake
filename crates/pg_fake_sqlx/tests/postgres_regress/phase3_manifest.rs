@@ -119,13 +119,49 @@ pub const FEATURES: &[Feature] = &[
     },
     Feature {
         name: "data-modifying CTEs",
-        cases: &[Case {
-            id: "insert_returning_cte",
-            source: "with.sql:1371",
-            setup: &["CREATE TABLE phase3_cte_writes (id INTEGER)"],
-            sql: "WITH inserted AS (INSERT INTO phase3_cte_writes VALUES (1) RETURNING id) SELECT id FROM inserted",
-            blocker: BlockerKind::Implementation,
-        }],
+        cases: &[
+            Case {
+                id: "insert_returning_cte",
+                source: "with.sql:1371",
+                setup: &["CREATE TABLE phase3_cte_writes (id INTEGER)"],
+                sql: "WITH inserted AS (INSERT INTO phase3_cte_writes VALUES (1) RETURNING id) SELECT id FROM inserted",
+                blocker: BlockerKind::Implementation,
+            },
+            Case {
+                id: "statement_snapshot_visibility",
+                source: "with.sql:1391",
+                setup: &[
+                    "CREATE TABLE phase3_cte_snapshot (id INTEGER)",
+                    "INSERT INTO phase3_cte_snapshot VALUES (1)",
+                ],
+                sql: "WITH inserted AS (INSERT INTO phase3_cte_snapshot VALUES (2) RETURNING id) SELECT id, (SELECT count(*) FROM phase3_cte_snapshot) FROM inserted",
+                blocker: BlockerKind::Implementation,
+            },
+            Case {
+                id: "delete_feeds_insert",
+                source: "with.sql:1429",
+                setup: &[
+                    "CREATE TABLE phase3_cte_move (id INTEGER PRIMARY KEY, value INTEGER)",
+                    "INSERT INTO phase3_cte_move VALUES (1, 10)",
+                ],
+                sql: "WITH removed AS (DELETE FROM phase3_cte_move RETURNING id, value), copied AS (INSERT INTO phase3_cte_move SELECT id + 1, value FROM removed RETURNING id, value) SELECT id, value FROM copied",
+                blocker: BlockerKind::Implementation,
+            },
+            Case {
+                id: "unreferenced_mutation",
+                source: "with.sql:1352",
+                setup: &["CREATE TABLE phase3_cte_unreferenced (id INTEGER)"],
+                sql: "WITH unused AS (INSERT INTO phase3_cte_unreferenced VALUES (1)) SELECT 1",
+                blocker: BlockerKind::Implementation,
+            },
+            Case {
+                id: "referenced_without_returning",
+                source: "with.sql:1703",
+                setup: &["CREATE TABLE phase3_cte_no_returning (id INTEGER)"],
+                sql: "WITH inserted AS (INSERT INTO phase3_cte_no_returning VALUES (1)) SELECT * FROM inserted",
+                blocker: BlockerKind::Implementation,
+            },
+        ],
     },
     Feature {
         name: "ON CONFLICT DO NOTHING",

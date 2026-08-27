@@ -175,6 +175,11 @@ pub fn list_benchmarks() -> Vec<Benchmark> {
             postgres_comparisons(),
         ),
         build_benchmark(
+            "data_modifying_cte_update_100_rows",
+            postgres_values(),
+            postgres_comparisons(),
+        ),
+        build_benchmark(
             "recursive_cte_numeric_series_100_rows",
             postgres_values(),
             postgres_comparisons(),

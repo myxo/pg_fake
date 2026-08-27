@@ -159,6 +159,7 @@ pub(super) fn validate_row_foreign_keys(
     deferred_constraints: &BTreeSet<String>,
     defer_all: bool,
 ) -> Result<()> {
+    let snapshot = snapshot.include_current_command();
     for constraint in &schema.constraints {
         let crate::catalog::Constraint::ForeignKey(foreign_key) = constraint else {
             continue;
@@ -204,7 +205,7 @@ pub(super) fn validate_row_foreign_keys(
             .tables
             .get(&foreign_schema.id)
             .expect("catalog table must have storage")
-            .find_unique_row(&referred_indexes, &key, snapshot, xid, &state.transactions)
+            .find_unique_row(&referred_indexes, &key, &snapshot, xid, &state.transactions)
             .is_some();
         if !found {
             return Err(PgError::create(
@@ -264,6 +265,7 @@ pub(super) fn apply_referencing_foreign_key_actions(
     visited: &mut BTreeSet<(TableId, RowId)>,
     context: &StatementExecutionContext,
 ) -> Result<()> {
+    let snapshot = snapshot.include_current_command();
     let foreign_keys = state
         .catalog
         .iterate_tables()
@@ -319,10 +321,15 @@ pub(super) fn apply_referencing_foreign_key_actions(
             .expect("catalog table must have storage")
             .iterate_version_chains()
             .try_fold(Vec::new(), |mut children, (row_id, chain)| {
-                let Some(version) = find_visible_version(chain, snapshot, xid, &state.transactions)
+                let Some(version) =
+                    find_visible_version(chain, &snapshot, xid, &state.transactions)
                 else {
                     return Ok(children);
                 };
+                if version.xmax == Some(xid) && version.xmax_command_id == Some(context.command_id)
+                {
+                    return Ok(children);
+                }
                 let key = child_indexes
                     .iter()
                     .map(|index| version.row[*index].clone())
@@ -363,7 +370,7 @@ pub(super) fn apply_referencing_foreign_key_actions(
                         &row,
                         None,
                         xid,
-                        snapshot,
+                        &snapshot,
                         deferred_constraints,
                         defer_all,
                         visited,
@@ -373,7 +380,7 @@ pub(super) fn apply_referencing_foreign_key_actions(
                         .tables
                         .get_mut(&child_schema.id)
                         .expect("catalog table must have storage")
-                        .mark_version_deleted(row_id, version_xmin, xid);
+                        .mark_version_deleted(row_id, version_xmin, xid, context.command_id);
                 }
                 ForeignKeyAction::Cascade => {
                     let mut updated = row.clone();
@@ -391,7 +398,7 @@ pub(super) fn apply_referencing_foreign_key_actions(
                         &row,
                         updated,
                         xid,
-                        snapshot,
+                        &snapshot,
                         deferred_constraints,
                         defer_all,
                         visited,
@@ -411,7 +418,7 @@ pub(super) fn apply_referencing_foreign_key_actions(
                         &row,
                         updated,
                         xid,
-                        snapshot,
+                        &snapshot,
                         deferred_constraints,
                         defer_all,
                         visited,
@@ -432,7 +439,7 @@ pub(super) fn apply_referencing_foreign_key_actions(
                         &row,
                         updated,
                         xid,
-                        snapshot,
+                        &snapshot,
                         deferred_constraints,
                         defer_all,
                         visited,
@@ -480,7 +487,13 @@ fn apply_cascaded_row_update(
         .tables
         .get_mut(&schema.id)
         .expect("catalog table must have storage")
-        .append_updated_version(row_id, version_xmin, xid, updated.clone());
+        .append_updated_version(
+            row_id,
+            version_xmin,
+            xid,
+            context.command_id,
+            updated.clone(),
+        );
     validate_row_foreign_keys(
         state,
         schema,

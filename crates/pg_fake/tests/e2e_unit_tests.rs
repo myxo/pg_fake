@@ -455,6 +455,59 @@ fn matches_non_recursive_ctes() {
 }
 
 #[test]
+fn matches_data_modifying_ctes() {
+    assert_differential(
+        "CREATE TABLE __TABLE__ (id INTEGER PRIMARY KEY, value INTEGER); \
+         INSERT INTO __TABLE__ VALUES (1, 10); \
+         WITH inserted AS (INSERT INTO __TABLE__ VALUES (2, 20) RETURNING id, value) SELECT inserted.id, inserted.value, (SELECT count(*) FROM __TABLE__) FROM inserted; \
+         WITH inserted AS (INSERT INTO __TABLE__ VALUES (3, 30) RETURNING id, value) SELECT left_row.id, right_row.value FROM inserted AS left_row CROSS JOIN inserted AS right_row; \
+         WITH inserted AS (INSERT INTO __TABLE__ VALUES (7, 70) RETURNING id), updated AS (UPDATE __TABLE__ SET value = 71 WHERE id = 7 RETURNING id) SELECT inserted.id, (SELECT count(*) FROM updated) FROM inserted; \
+         WITH updated AS (UPDATE __TABLE__ SET value = value + 1 WHERE id = 1 RETURNING id, value) SELECT id, value FROM updated; \
+         WITH removed AS (DELETE FROM __TABLE__ WHERE id = 2 RETURNING id, value), copied AS (INSERT INTO __TABLE__ SELECT id + 10, value FROM removed RETURNING id, value) SELECT id, value FROM copied; \
+         WITH first_update AS (UPDATE __TABLE__ SET value = 12 WHERE id = 1 RETURNING value), second_update AS (UPDATE __TABLE__ SET value = 13 WHERE id = 1 RETURNING value) SELECT first_update.value, (SELECT count(*) FROM second_update) FROM first_update; \
+         WITH unused AS (INSERT INTO __TABLE__ VALUES (4, 40)) SELECT 1; \
+         SELECT id, value FROM __TABLE__ ORDER BY id; \
+         WITH inserted AS (INSERT INTO __TABLE__ VALUES (5, 50)) SELECT * FROM inserted; \
+         SELECT id FROM __TABLE__ WHERE id = 5; \
+         WITH first_insert AS (INSERT INTO __TABLE__ VALUES (6, 60) RETURNING id), failing_insert AS (INSERT INTO __TABLE__ VALUES (1, 99) RETURNING id) SELECT id FROM first_insert; \
+         SELECT id FROM __TABLE__ WHERE id = 6",
+        RowOrder::Ordered,
+    );
+}
+
+#[test]
+fn preserves_data_modifying_cte_sequence_gaps() {
+    assert_differential(
+        "CREATE SEQUENCE __TABLE___sequence; \
+         CREATE TABLE __TABLE__ (id INTEGER PRIMARY KEY, allocated BIGINT DEFAULT nextval('__TABLE___sequence')); \
+         INSERT INTO __TABLE__ (id) VALUES (1); \
+         WITH first_insert AS (INSERT INTO __TABLE__ (id) VALUES (2) RETURNING allocated), failing_insert AS (INSERT INTO __TABLE__ (id) VALUES (1) RETURNING allocated) SELECT allocated FROM first_insert; \
+         SELECT nextval('__TABLE___sequence'); \
+         WITH first_insert AS (INSERT INTO __TABLE__ (id) VALUES (3) RETURNING allocated), second_insert AS (INSERT INTO __TABLE__ (id) VALUES (4) RETURNING allocated) SELECT first_insert.allocated, second_insert.allocated FROM first_insert CROSS JOIN second_insert; \
+         SELECT id, allocated FROM __TABLE__ ORDER BY id",
+        RowOrder::Ordered,
+    );
+}
+
+#[test]
+fn matches_deferred_foreign_keys_from_data_modifying_ctes() {
+    assert_differential(
+        "CREATE TABLE __TABLE___parent (id INTEGER PRIMARY KEY); \
+         CREATE TABLE __TABLE___child (id INTEGER PRIMARY KEY, parent_id INTEGER REFERENCES __TABLE___parent(id) DEFERRABLE INITIALLY DEFERRED); \
+         BEGIN; \
+         WITH inserted AS (INSERT INTO __TABLE___child VALUES (1, 10) RETURNING id) SELECT id FROM inserted; \
+         INSERT INTO __TABLE___parent VALUES (10); \
+         COMMIT; \
+         SELECT id, parent_id FROM __TABLE___child; \
+         BEGIN; \
+         WITH inserted AS (INSERT INTO __TABLE___child VALUES (2, 20) RETURNING id) SELECT id FROM inserted; \
+         COMMIT; \
+         SELECT id, parent_id FROM __TABLE___child ORDER BY id",
+        RowOrder::Ordered,
+    );
+}
+
+#[test]
 fn matches_recursive_ctes() {
     assert_differential(
         "WITH RECURSIVE series(value) AS (VALUES (1) UNION ALL SELECT value + 1 FROM series WHERE value < 5) SELECT value FROM series ORDER BY value; \

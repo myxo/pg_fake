@@ -11,8 +11,8 @@ use crate::{
     error::{PgError, Result, SqlState, reject_unsupported},
     storage::{RowId, Table},
     txn::{
-        RowLockKey, RowLockManager, RowLockMode, Snapshot, TransactionRegistry, TransactionStatus,
-        WaitForGraph, Xid, find_visible_version,
+        CommandId, RowLockKey, RowLockManager, RowLockMode, Snapshot, TransactionRegistry,
+        TransactionStatus, WaitForGraph, Xid, find_visible_version,
     },
     value::{BaseType, DAYS_PER_MONTH, MICROSECONDS_PER_DAY, PgType, Value},
 };
@@ -71,6 +71,7 @@ use writes::{execute_delete, execute_insert, execute_update};
 
 #[derive(Clone)]
 pub(crate) struct StatementExecutionContext {
+    pub(crate) command_id: CommandId,
     pub(crate) transaction_timestamp: chrono::DateTime<chrono::Utc>,
     pub(crate) statement_timestamp: chrono::DateTime<chrono::Utc>,
     pub(crate) clock_timestamp: chrono::DateTime<chrono::Utc>,

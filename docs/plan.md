@@ -82,9 +82,7 @@ The Phase 3 surface is intentionally bounded:
 
 ## Milestone A — Conformance baseline and set operations
 
-### Task 1 — Phase 3 regression manifest and progress reporting
-
-**Progress:** Complete (approved).
+### Task 1 — Phase 3 regression manifest and progress reporting [COMPLETE]
 
 **Goal:** Turn the embedded PostgreSQL corpus and focused multi-session cases
 into an actionable Phase 3 scorecard.
@@ -106,9 +104,7 @@ into an actionable Phase 3 scorecard.
 **Notes:** This task changes test infrastructure only. It does not make the full
 upstream corpus a Phase 3 exit criterion.
 
-### Task 2 — Query set operations
-
-**Progress:** Complete (approved).
+### Task 2 — Query set operations [COMPLETE]
 
 **Goal:** Add the set-expression machinery required by recursive CTEs and common
 PostgreSQL query composition.
@@ -132,9 +128,7 @@ PostgreSQL query composition.
 
 ## Milestone B — Common table expressions
 
-### Task 3 — Non-recursive CTEs
-
-**Progress:** Complete (approved).
+### Task 3 — Non-recursive CTEs [COMPLETE]
 
 **Goal:** Bind and execute named query results within one statement.
 
@@ -155,9 +149,7 @@ PostgreSQL query composition.
 - Differential/property cases cover dependency chains, repeated references,
   nested scopes, name shadowing, volatility, metadata, and invalid recursion.
 
-### Task 4 — Recursive CTEs
-
-**Progress:** Complete (approved).
+### Task 4 — Recursive CTEs [COMPLETE]
 
 **Goal:** Execute bounded recursive queries using PostgreSQL's working-table
 semantics.
@@ -182,7 +174,7 @@ semantics.
 **Notes:** `SEARCH` and `CYCLE` clauses are outside this phase. No arbitrary
 recursion-depth limit is introduced because PostgreSQL does not impose one.
 
-### Task 5 — Data-modifying CTEs
+### Task 5 — Data-modifying CTEs [COMPLETE]
 
 **Goal:** Allow a top-level statement to consume rows returned by mutations in
 its `WITH` clause.

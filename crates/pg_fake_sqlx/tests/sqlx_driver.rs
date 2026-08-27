@@ -286,6 +286,36 @@ async fn sqlx_fetches_and_executes_returning_mutations() {
     assert_eq!(affected.rows_affected(), 2);
 }
 
+#[tokio::test]
+async fn sqlx_prepares_and_fetches_data_modifying_ctes() {
+    let mut connection = PgFakeConnection::new(Db::create());
+    connection
+        .execute("CREATE TABLE cte_rows (id INTEGER PRIMARY KEY, label VARCHAR(12))")
+        .await
+        .unwrap();
+
+    let statement = connection
+        .prepare(SqlStr::from_static(
+            "WITH inserted AS (INSERT INTO cte_rows VALUES ($1, $2) RETURNING id, label) SELECT id, label FROM inserted",
+        ))
+        .await
+        .unwrap();
+    assert_eq!(statement.parameters().unwrap().left().unwrap().len(), 2);
+    assert_eq!(statement.columns()[0].name(), "id");
+    assert_eq!(statement.columns()[1].name(), "label");
+    assert_eq!(statement.columns()[1].type_info().name(), "VARCHAR");
+
+    let row = statement
+        .query()
+        .bind(1_i32)
+        .bind("created")
+        .fetch_one(&mut connection)
+        .await
+        .unwrap();
+    assert_eq!(row.get::<i32, _>("id"), 1);
+    assert_eq!(row.get::<String, _>("label"), "created");
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn row_lock_waits_run_on_the_blocking_pool() {
     let db = Db::create_builder()
