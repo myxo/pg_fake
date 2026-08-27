@@ -437,7 +437,7 @@ fn acquire_row_locks<'a>(
                 )
             })
         {
-            snapshot = Snapshot::create(&state.transactions);
+            snapshot = Snapshot::create(&state.transactions).use_command(snapshot.command_id);
         }
     }
 }
@@ -761,6 +761,15 @@ impl Session {
                 .and_then(|(statement, mutations, parameter_count)| {
                     analyzer::substitute_typed_subqueries(&statement, &state.catalog)
                         .map(|statement| (statement, mutations, parameter_count))
+                })
+                .and_then(|(statement, mutations, parameter_count)| {
+                    mutations
+                        .iter()
+                        .map(|mutation| {
+                            analyzer::substitute_typed_subqueries(mutation, &state.catalog)
+                        })
+                        .collect::<Result<Vec<_>>>()
+                        .map(|mutations| (statement, mutations, parameter_count))
                 })
                 .and_then(|(described, mutations, parameter_count)| {
                     analyzer::infer_parameter_types_with_data_modifying_ctes(
@@ -5054,6 +5063,163 @@ mod tests {
                 vec![Value::Int4(1), Value::Int4(10)],
                 vec![Value::Int4(2), Value::Int4(20)],
             ]
+        );
+    }
+
+    #[test]
+    #[cfg_attr(feature = "execution-log", tracing::instrument(skip_all))]
+    fn preserves_data_modifying_cte_snapshot_visibility_after_lock_wait() {
+        let db = Db::create_builder()
+            .set_lock_timeout(Duration::from_secs(2))
+            .build();
+        let mut first = db.create_session();
+        let mut second = db.create_session();
+        first
+            .execute("CREATE TABLE items (id INTEGER PRIMARY KEY, value INTEGER)")
+            .unwrap();
+        first.execute("INSERT INTO items VALUES (1, 1)").unwrap();
+        first.execute("BEGIN").unwrap();
+        first
+            .execute("UPDATE items SET value = 2 WHERE id = 1")
+            .unwrap();
+
+        let (result_sender, result_receiver) = mpsc::channel();
+        let handle = thread::spawn(move || {
+            result_sender
+                .send(second.query(
+                    "WITH updated AS (UPDATE items SET value = value + 1 WHERE id = 1 RETURNING value) SELECT updated.value, items.value FROM updated CROSS JOIN items",
+                    &[],
+                ))
+                .unwrap();
+        });
+        wait_until_blocked(&db);
+        first.execute("COMMIT").unwrap();
+
+        assert_eq!(
+            result_receiver
+                .recv_timeout(Duration::from_secs(1))
+                .unwrap()
+                .unwrap()
+                .rows,
+            vec![vec![Value::Int4(3), Value::Int4(2)]]
+        );
+        handle.join().unwrap();
+    }
+
+    #[test]
+    #[cfg_attr(feature = "execution-log", tracing::instrument(skip_all))]
+    fn evaluates_cte_sources_required_by_mutations_with_zero_limit() {
+        let db = Db::create();
+        let mut session = db.create_session();
+        session
+            .execute("CREATE TABLE items (value INTEGER)")
+            .unwrap();
+
+        assert!(
+            session
+                .query(
+                    "WITH source(value) AS (SELECT 1), inserted AS (INSERT INTO items SELECT value FROM source RETURNING value) SELECT * FROM inserted LIMIT 0",
+                    &[],
+                )
+                .unwrap()
+                .rows
+                .is_empty()
+        );
+        assert_eq!(
+            session.query("SELECT value FROM items", &[]).unwrap().rows,
+            vec![vec![Value::Int4(1)]]
+        );
+    }
+
+    #[test]
+    #[cfg_attr(feature = "execution-log", tracing::instrument(skip_all))]
+    fn evaluates_data_modifying_cte_defaults_once_during_lock_discovery() {
+        let db = Db::create();
+        let mut session = db.create_session();
+        session.execute("CREATE SEQUENCE item_ids").unwrap();
+        session.execute("CREATE SEQUENCE parent_ids").unwrap();
+        session
+            .execute("CREATE TABLE parents (id INTEGER PRIMARY KEY)")
+            .unwrap();
+        session.execute("INSERT INTO parents VALUES (1)").unwrap();
+        session
+            .execute(
+                "CREATE TABLE items (id BIGINT DEFAULT nextval('item_ids'), parent_id INTEGER REFERENCES parents(id))",
+            )
+            .unwrap();
+
+        assert_eq!(
+            session
+                .query(
+                    "WITH inserted AS (INSERT INTO items (parent_id) VALUES (1) RETURNING id) SELECT id FROM inserted",
+                    &[],
+                )
+                .unwrap()
+                .rows,
+            vec![vec![Value::Int8(1)]]
+        );
+        assert_eq!(
+            session
+                .query(
+                    "WITH inserted AS (INSERT INTO items (parent_id) VALUES (nextval('parent_ids')) RETURNING parent_id) SELECT parent_id FROM inserted",
+                    &[],
+                )
+                .unwrap()
+                .rows,
+            vec![vec![Value::Int4(1)]]
+        );
+    }
+
+    #[test]
+    #[cfg_attr(feature = "execution-log", tracing::instrument(skip_all))]
+    fn substitutes_typed_subqueries_in_data_modifying_ctes() {
+        let db = Db::create();
+        let mut session = db.create_session();
+        session
+            .execute("CREATE TABLE items (id INTEGER PRIMARY KEY, value INTEGER)")
+            .unwrap();
+        session.execute("INSERT INTO items VALUES (1, 1)").unwrap();
+
+        assert_eq!(
+            session
+                .query(
+                    "WITH updated AS (UPDATE items SET value = (SELECT 2) RETURNING id, value) SELECT id, value FROM updated",
+                    &[],
+                )
+                .unwrap()
+                .rows,
+            vec![vec![Value::Int4(1), Value::Int4(2)]]
+        );
+    }
+
+    #[test]
+    #[cfg_attr(feature = "execution-log", tracing::instrument(skip_all))]
+    fn permits_nonrecursive_mutations_under_with_recursive() {
+        let db = Db::create();
+        let mut session = db.create_session();
+        session
+            .execute("CREATE TABLE items (id INTEGER PRIMARY KEY)")
+            .unwrap();
+
+        assert_eq!(
+            session
+                .query(
+                    "WITH RECURSIVE inserted AS (INSERT INTO items VALUES (1) RETURNING id) SELECT id FROM inserted",
+                    &[],
+                )
+                .unwrap()
+                .rows,
+            vec![vec![Value::Int4(1)]]
+        );
+        assert_eq!(
+            session
+                .query(
+                    "WITH RECURSIVE inserted AS (INSERT INTO items SELECT value FROM series WHERE value = 2 RETURNING id), series(value) AS (VALUES (1) UNION ALL SELECT value + 1 FROM series WHERE value < 2) SELECT id FROM inserted",
+                    &[],
+                )
+                .unwrap()
+                .rows,
+            vec![vec![Value::Int4(2)]]
         );
     }
 

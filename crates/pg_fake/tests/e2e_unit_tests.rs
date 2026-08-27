@@ -476,6 +476,23 @@ fn matches_data_modifying_ctes() {
 }
 
 #[test]
+fn matches_reviewed_data_modifying_cte_compositions() {
+    assert_differential(
+        "CREATE TABLE __TABLE__ (id INTEGER PRIMARY KEY, value INTEGER); \
+         WITH source(id, value) AS (SELECT 1, 1), inserted AS (INSERT INTO __TABLE__ SELECT id, value FROM source RETURNING id) SELECT * FROM inserted LIMIT 0; \
+         SELECT id, value FROM __TABLE__; \
+         WITH updated AS (UPDATE __TABLE__ SET value = (SELECT 2) RETURNING id, value) SELECT id, value FROM updated; \
+         WITH RECURSIVE inserted AS (INSERT INTO __TABLE__ SELECT value, value FROM series WHERE value = 2 RETURNING id), series(value) AS (VALUES (1) UNION ALL SELECT value + 1 FROM series WHERE value < 2) SELECT id FROM inserted; \
+         CREATE SEQUENCE __TABLE___item_ids; \
+         CREATE TABLE __TABLE___parents (id INTEGER PRIMARY KEY); \
+         INSERT INTO __TABLE___parents VALUES (1); \
+         CREATE TABLE __TABLE___children (id BIGINT DEFAULT nextval('__TABLE___item_ids'), parent_id INTEGER REFERENCES __TABLE___parents(id)); \
+         WITH inserted AS (INSERT INTO __TABLE___children (parent_id) VALUES (1) RETURNING id) SELECT id FROM inserted",
+        RowOrder::Ordered,
+    );
+}
+
+#[test]
 fn preserves_data_modifying_cte_sequence_gaps() {
     assert_differential(
         "CREATE SEQUENCE __TABLE___sequence; \

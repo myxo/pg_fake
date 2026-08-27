@@ -232,33 +232,51 @@ fn collect_insert_foreign_key_locks(
         if expressions.len() != column_indexes.len() {
             continue;
         }
-        let mut row = schema
-            .columns
-            .iter()
-            .map(|column| evaluate_column_default(column, context))
-            .collect::<Result<Vec<_>>>()?;
-        for (expression, index) in expressions.iter().zip(&column_indexes) {
-            row[*index] = if is_default_expression(expression) {
-                evaluate_column_default(&schema.columns[*index], context)?
-            } else {
-                evaluate_assignment_expression(
-                    expression,
-                    schema.columns[*index].data_type,
-                    &create_constant_expression_schema(),
-                    &[],
-                    context,
-                )?
-            };
-        }
         for constraint in &schema.constraints {
             let crate::catalog::Constraint::ForeignKey(foreign_key) = constraint else {
                 continue;
             };
             let local = resolve_foreign_key_column_indexes(schema, &foreign_key.columns)?;
-            let key = local
-                .iter()
-                .map(|index| row[*index].clone())
-                .collect::<Vec<_>>();
+            let mut key = Vec::new();
+            for index in local {
+                let Some(position) = column_indexes
+                    .iter()
+                    .position(|provided| *provided == index)
+                else {
+                    key.clear();
+                    break;
+                };
+                let expression = &expressions[position];
+                let mut has_side_effect = false;
+                let _ = ast::visit_expressions(expression, |nested| {
+                    if let ast::Expr::Function(function) = nested
+                        && normalize_unqualified_object_name(&function.name).is_ok_and(|name| {
+                            matches!(
+                                name.as_str(),
+                                "gen_random_uuid" | "uuidv4" | "uuidv7" | "nextval" | "setval"
+                            )
+                        })
+                    {
+                        has_side_effect = true;
+                        return std::ops::ControlFlow::Break(());
+                    }
+                    std::ops::ControlFlow::Continue(())
+                });
+                if is_default_expression(expression) || has_side_effect {
+                    key.clear();
+                    break;
+                }
+                key.push(evaluate_assignment_expression(
+                    expression,
+                    schema.columns[index].data_type,
+                    &create_constant_expression_schema(),
+                    &[],
+                    context,
+                )?);
+            }
+            if key.len() != foreign_key.columns.len() {
+                continue;
+            }
             if key.iter().any(Value::is_null) {
                 continue;
             }
