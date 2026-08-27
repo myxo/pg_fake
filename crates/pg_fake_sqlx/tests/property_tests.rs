@@ -1,6 +1,8 @@
+use std::str::FromStr;
+
+#[cfg(test)]
 use std::{
     cell::RefCell,
-    str::FromStr,
     sync::{
         Mutex,
         atomic::{AtomicU64, Ordering},
@@ -8,7 +10,9 @@ use std::{
 };
 
 use bigdecimal::BigDecimal;
-use chaos_theory::{Effect, Source, check, make::int_in};
+#[cfg(test)]
+use chaos_theory::check;
+use chaos_theory::{Effect, Source, make::int_in};
 use pg_fake::parser::{self, Statement};
 use pg_fake_sqlx::{Db, PgFake, PgFakeConnection};
 use sqlx::{
@@ -18,8 +22,10 @@ use sqlx::{
 use sqlx_postgres::{PgConnection, Postgres};
 use tokio::runtime::Runtime;
 
+#[cfg(test)]
 mod common;
 
+#[cfg(test)]
 use common::start_postgres_server;
 
 #[derive(Debug, PartialEq, Eq)]
@@ -45,7 +51,9 @@ fn returns_rows(statement: &Statement) -> bool {
     }
 }
 
+#[cfg(test)]
 static TEST_LOCK: Mutex<()> = Mutex::new(());
+#[cfg(test)]
 static TABLE_NUMBER: AtomicU64 = AtomicU64::new(1);
 
 struct PostgresCase<'connection, 'runtime> {
@@ -75,12 +83,14 @@ impl Drop for PostgresCase<'_, '_> {
     }
 }
 
+#[cfg(test)]
 struct PostgresSessionsCase<'connection, 'runtime> {
     connections: &'connection mut [PgConnection],
     runtime: &'runtime Runtime,
     table: String,
 }
 
+#[cfg(test)]
 impl Drop for PostgresSessionsCase<'_, '_> {
     fn drop(&mut self) {
         for connection in self.connections.iter_mut() {
@@ -1554,6 +1564,7 @@ fn generate_statement(
     )
 }
 
+#[cfg(test)]
 fn generate_snapshot_select(src: &mut Source, table: &TableSchema) -> (String, RowOrder) {
     (
         format!(
@@ -1566,6 +1577,7 @@ fn generate_snapshot_select(src: &mut Source, table: &TableSchema) -> (String, R
     )
 }
 
+#[cfg(test)]
 fn generate_snapshot_statement(
     src: &mut Source,
     table: &TableSchema,
@@ -1606,6 +1618,107 @@ fn generate_snapshot_statement(
     )
 }
 
+fn run_generated_sql_case(
+    src: &mut Source,
+    runtime: &Runtime,
+    postgres: &mut PgConnection,
+    table_name: String,
+) {
+    let mut postgres = PostgresCase {
+        connection: postgres,
+        runtime,
+        table: table_name.clone(),
+    };
+    let mut fake = PgFakeConnection::new(Db::create());
+    let table = generate_table(src, table_name);
+    let foreign_tables = generate_foreign_tables(src, &table);
+    let mut next_key = 1;
+    let mut next_child_key = 1;
+    let mut in_transaction = false;
+    let create = table.create_sql();
+    src.log_value("sql", &create);
+    assert_statement(
+        runtime,
+        postgres.get_connection(),
+        &mut fake,
+        &create,
+        RowOrder::Unordered,
+    );
+    let insert = generate_main_insert(src, &table, &mut next_key);
+    src.log_value("sql", &insert);
+    assert_statement(
+        runtime,
+        postgres.get_connection(),
+        &mut fake,
+        &insert,
+        RowOrder::Unordered,
+    );
+    for sql in [
+        foreign_tables.create_parent_sql(),
+        foreign_tables.create_child_sql(),
+        format!("INSERT INTO {} (id) VALUES (1)", foreign_tables.parent),
+    ] {
+        src.log_value("sql", &sql);
+        assert_statement(
+            runtime,
+            postgres.get_connection(),
+            &mut fake,
+            &sql,
+            RowOrder::Unordered,
+        );
+    }
+
+    src.repeat_n("statements", 3..=14, |src| {
+        let (sql, order) = generate_statement(
+            src,
+            &table,
+            &foreign_tables,
+            &mut next_key,
+            &mut next_child_key,
+            &mut in_transaction,
+        );
+        src.log_value("sql", &sql);
+        assert_statement(runtime, postgres.get_connection(), &mut fake, &sql, order);
+        Effect::Success
+    });
+
+    if in_transaction {
+        let sql = if src.any("commit_final_transaction") {
+            "COMMIT"
+        } else {
+            "ROLLBACK"
+        };
+        assert_statement(
+            runtime,
+            postgres.get_connection(),
+            &mut fake,
+            sql,
+            RowOrder::Unordered,
+        );
+    }
+}
+
+pub fn fuzz_generated_sql_matches_postgres(src: &mut Source) {
+    let database_url = dotenvy::var("PG_FAKE_DATABASE_URL")
+        .expect("PG_FAKE_DATABASE_URL must point to PostgreSQL 18 when fuzzing");
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap();
+    let mut postgres = runtime
+        .block_on(PgConnection::connect(&database_url))
+        .expect("must connect SQLx to PostgreSQL 18");
+    let table_name = "pg_fake_generated_sql_fuzz".to_owned();
+    let sql = format!(
+        "DROP TABLE IF EXISTS {0}_foreign_child, {0}_foreign_parent, {0}",
+        table_name
+    );
+    runtime
+        .block_on(sqlx::raw_sql(AssertSqlSafe(sql.as_str())).execute(&mut postgres))
+        .expect("must clean PostgreSQL state before a fuzz input");
+    run_generated_sql_case(src, &runtime, &mut postgres, table_name);
+}
+
 #[test]
 fn generated_sql_matches_postgres() {
     let _test_lock = TEST_LOCK.lock().expect("test mutex must not be poisoned");
@@ -1625,79 +1738,7 @@ fn generated_sql_matches_postgres() {
             std::process::id(),
             TABLE_NUMBER.fetch_add(1, Ordering::Relaxed)
         );
-        let mut postgres = postgres.borrow_mut();
-        let mut postgres = PostgresCase {
-            connection: &mut postgres,
-            runtime: &runtime,
-            table: table_name.clone(),
-        };
-        let mut fake = PgFakeConnection::new(Db::create());
-        let table = generate_table(src, table_name);
-        let foreign_tables = generate_foreign_tables(src, &table);
-        let mut next_key = 1;
-        let mut next_child_key = 1;
-        let mut in_transaction = false;
-        let create = table.create_sql();
-        src.log_value("sql", &create);
-        assert_statement(
-            &runtime,
-            postgres.get_connection(),
-            &mut fake,
-            &create,
-            RowOrder::Unordered,
-        );
-        let insert = generate_main_insert(src, &table, &mut next_key);
-        src.log_value("sql", &insert);
-        assert_statement(
-            &runtime,
-            postgres.get_connection(),
-            &mut fake,
-            &insert,
-            RowOrder::Unordered,
-        );
-        for sql in [
-            foreign_tables.create_parent_sql(),
-            foreign_tables.create_child_sql(),
-            format!("INSERT INTO {} (id) VALUES (1)", foreign_tables.parent),
-        ] {
-            src.log_value("sql", &sql);
-            assert_statement(
-                &runtime,
-                postgres.get_connection(),
-                &mut fake,
-                &sql,
-                RowOrder::Unordered,
-            );
-        }
-
-        src.repeat_n("statements", 3..=14, |src| {
-            let (sql, order) = generate_statement(
-                src,
-                &table,
-                &foreign_tables,
-                &mut next_key,
-                &mut next_child_key,
-                &mut in_transaction,
-            );
-            src.log_value("sql", &sql);
-            assert_statement(&runtime, postgres.get_connection(), &mut fake, &sql, order);
-            Effect::Success
-        });
-
-        if in_transaction {
-            let sql = if src.any("commit_final_transaction") {
-                "COMMIT"
-            } else {
-                "ROLLBACK"
-            };
-            assert_statement(
-                &runtime,
-                postgres.get_connection(),
-                &mut fake,
-                sql,
-                RowOrder::Unordered,
-            );
-        }
+        run_generated_sql_case(src, &runtime, &mut postgres.borrow_mut(), table_name);
     });
 }
 

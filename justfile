@@ -14,6 +14,10 @@ test:
 bench:
     cargo bench -p pg_fake_benchmarks --bench workloads
 
+# Fuzz generated SQL against PostgreSQL 18
+fuzz-generated-sql:
+    cargo +nightly fuzz run generated_sql_matches_postgres
+
 # Record benchmark results as the committed baseline
 bench-record:
     cargo x bench record

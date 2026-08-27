@@ -56,5 +56,4 @@ for current numbers.
 The only way to be sure we are compatible with postgres is to make differential tests
 against it. Basically, just apply sql to both systems and see that they return the same result.
 
-Right now we run the postgres regression test and property tests with custom generators.
-When we have more implemented sql features, we will start proper fuzzing.
+We run the PostgreSQL regression tests and differential property tests with custom generators.

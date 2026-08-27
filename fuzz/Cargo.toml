@@ -1,0 +1,29 @@
+[package]
+name = "pg_fake_fuzz"
+version = "0.0.0"
+publish = false
+edition = "2024"
+
+[package.metadata]
+cargo-fuzz = true
+
+[dependencies]
+bigdecimal = "0.4"
+chaos_theory = "0.5"
+dotenvy = "0.15"
+libfuzzer-sys = { package = "chaos_theory_libfuzzer", version = "0.4.13" }
+pg_fake = { path = "../crates/pg_fake" }
+pg_fake_sqlx = { path = "../crates/pg_fake_sqlx" }
+sqlx = { version = "0.9", default-features = false, features = ["bigdecimal", "runtime-tokio"] }
+sqlx-postgres = "0.9"
+tokio = { version = "1", features = ["rt", "sync", "time"] }
+
+[[bin]]
+name = "generated_sql_matches_postgres"
+path = "fuzz_targets/generated_sql_matches_postgres.rs"
+test = false
+doc = false
+bench = false
+
+[workspace]
+members = ["."]
