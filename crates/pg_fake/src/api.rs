@@ -1365,6 +1365,31 @@ impl Session {
                 }
             };
         }
+        let one_shot_plan = match executor::build_prepared_query_plan(&state, statement, &[]) {
+            Ok(plan) => plan,
+            Err(error) => {
+                drop(state);
+                return self.abort_with_error(error);
+            }
+        };
+        if let Some(plan) = one_shot_plan {
+            return match executor::execute_prepared_query(
+                &state,
+                &plan,
+                &[],
+                transaction.xid,
+                &snapshot,
+            ) {
+                Ok(rows) => Ok(StatementResult::Query(QueryResult {
+                    columns: plan.columns().to_vec(),
+                    rows,
+                })),
+                Err(error) => {
+                    drop(state);
+                    self.abort_with_error(error)
+                }
+            };
+        }
         let statement_contains_dml = contains_dml(statement);
         let sequences = if statement_contains_dml || contains_sequence_function(statement) {
             executor::SequenceExecutionContext::create(

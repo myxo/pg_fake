@@ -8,6 +8,13 @@ pub(crate) struct PreparedQueryPlan {
     projection: Vec<usize>,
     selection: Option<PreparedExpression>,
     access: PreparedAccess,
+    columns: Vec<ColumnMeta>,
+}
+
+impl PreparedQueryPlan {
+    pub(crate) fn columns(&self) -> &[ColumnMeta] {
+        &self.columns
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -114,37 +121,88 @@ pub(crate) fn build_prepared_query_plan(
     else {
         return Ok(None);
     };
+    if !select.projection.iter().all(|item| {
+        matches!(
+            item,
+            ast::SelectItem::Wildcard(options)
+                if options == &ast::WildcardAdditionalOptions::default()
+        ) || matches!(
+            item,
+            ast::SelectItem::UnnamedExpr(
+                ast::Expr::Identifier(_) | ast::Expr::CompoundIdentifier(_)
+            ) | ast::SelectItem::ExprWithAlias {
+                expr: ast::Expr::Identifier(_) | ast::Expr::CompoundIdentifier(_),
+                ..
+            }
+        )
+    }) {
+        return Ok(None);
+    }
     let table_name = normalize_unqualified_object_name(name)?;
     let schema = state.catalog.require_table(&table_name)?;
     let scope = bind_query_scope(&state.catalog, select)?;
     let mut projection = Vec::new();
+    let mut columns = Vec::new();
     for item in &select.projection {
         match item {
             ast::SelectItem::Wildcard(options)
                 if options == &ast::WildcardAdditionalOptions::default() =>
             {
-                projection.extend(
-                    scope
-                        .columns
-                        .iter()
-                        .filter(|column| column.wildcard)
-                        .map(|column| column.slot),
-                );
+                for column in scope.columns.iter().filter(|column| column.wildcard) {
+                    projection.push(column.slot);
+                    columns.push(ColumnMeta {
+                        name: column.name.clone(),
+                        type_oid: column.data_type.map_to_oid(),
+                        typmod: column.data_type.typmod,
+                    });
+                }
             }
             ast::SelectItem::UnnamedExpr(ast::Expr::Identifier(column)) => {
-                projection.push(scope.resolve_column(std::slice::from_ref(column))?.0);
+                let (slot, data_type) = scope.resolve_column(std::slice::from_ref(column))?;
+                projection.push(slot);
+                columns.push(ColumnMeta {
+                    name: column.value.clone(),
+                    type_oid: data_type.map_to_oid(),
+                    typmod: data_type.typmod,
+                });
             }
-            ast::SelectItem::UnnamedExpr(ast::Expr::CompoundIdentifier(columns)) => {
-                projection.push(scope.resolve_column(columns)?.0);
+            ast::SelectItem::UnnamedExpr(ast::Expr::CompoundIdentifier(identifiers)) => {
+                let (slot, data_type) = scope.resolve_column(identifiers)?;
+                projection.push(slot);
+                columns.push(ColumnMeta {
+                    name: identifiers
+                        .last()
+                        .expect("compound identifier is non-empty")
+                        .value
+                        .clone(),
+                    type_oid: data_type.map_to_oid(),
+                    typmod: data_type.typmod,
+                });
             }
             ast::SelectItem::ExprWithAlias {
                 expr: ast::Expr::Identifier(column),
-                ..
-            } => projection.push(scope.resolve_column(std::slice::from_ref(column))?.0),
+                alias,
+            } => {
+                let (slot, data_type) = scope.resolve_column(std::slice::from_ref(column))?;
+                projection.push(slot);
+                columns.push(ColumnMeta {
+                    name: alias.value.clone(),
+                    type_oid: data_type.map_to_oid(),
+                    typmod: data_type.typmod,
+                });
+            }
             ast::SelectItem::ExprWithAlias {
-                expr: ast::Expr::CompoundIdentifier(columns),
-                ..
-            } => projection.push(scope.resolve_column(columns)?.0),
+                expr: ast::Expr::CompoundIdentifier(identifiers),
+                alias,
+            } => {
+                let (slot, data_type) = scope.resolve_column(identifiers)?;
+                projection.push(slot);
+                columns.push(ColumnMeta {
+                    name: alias.value.clone(),
+                    type_oid: data_type.map_to_oid(),
+                    typmod: data_type.typmod,
+                });
+            }
             _ => return Ok(None),
         }
     }
@@ -154,6 +212,9 @@ pub(crate) fn build_prepared_query_plan(
             else {
                 return Ok(None);
             };
+            if selection.get_data_type() != BaseType::Bool {
+                return Ok(None);
+            }
             Some(selection)
         }
         None => None,
@@ -168,6 +229,7 @@ pub(crate) fn build_prepared_query_plan(
         projection,
         selection,
         access,
+        columns,
     }))
 }
 
@@ -194,10 +256,10 @@ fn bind_prepared_expression(
         ast::Expr::Value(value) => match &value.value {
             ast::Value::Placeholder(placeholder) => {
                 let index = crate::analyzer::parse_placeholder_index(placeholder)?;
-                Ok(Some(PreparedExpression::Parameter {
-                    index,
-                    data_type: parameter_types[index],
-                }))
+                let Some(data_type) = parameter_types.get(index).copied() else {
+                    return Ok(None);
+                };
+                Ok(Some(PreparedExpression::Parameter { index, data_type }))
             }
             ast::Value::SingleQuotedString(_) => Ok(None),
             _ => Ok(Some(PreparedExpression::Literal {
