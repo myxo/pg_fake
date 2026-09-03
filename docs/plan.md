@@ -1,6 +1,11 @@
 # pg_fake — Phase 3 Implementation Plan
 
-Phase 3 delivers the scope from `spec.md` §9: CTEs (including recursive and
+Phase 3 delivers the scope from `spec.md` §9. Migration-critical DDL,
+transaction, JSONB, temporal, locking, and query-expression features are
+scheduled before the broader window, array, and SERIALIZABLE work so useful
+SQLx application workloads become runnable earlier.
+
+The Phase 3 commitments are: CTEs (including recursive and
 data-modifying forms), `INSERT ... ON CONFLICT`, window functions, views,
 JSON/JSONB, arrays, savepoints, general session GUC handling, the remaining
 `SELECT ... FOR UPDATE` family, SERIALIZABLE isolation, and transactional DDL.
@@ -31,7 +36,8 @@ scope boundaries. The completed Phase 2 plan is archived in
   Otherwise, the completion handoff must explain why.
 - Before a task can be marked complete, the property suite must pass at least
   10,000 `chaos_theory` iterations with
-  `CHAOS_THEORY_CHECK_ITERS=10000 CHAOS_THEORY_CHECK_TIME=600s cargo test -p pg_fake_sqlx --test property_tests`.
+  `CHAOS_THEORY_CHECK_ITERS=10000 CHAOS_THEORY_CHECK_TIME=600s` and
+  `cargo test -p pg_fake_sqlx --test property_tests`.
 - After implementing a task, update its progress but do not mark it complete
   until the user approves the result, as required by `AGENTS.md`.
 - Valid PostgreSQL syntax that `sqlparser-rs` cannot represent must be fixed in
@@ -39,6 +45,9 @@ scope boundaries. The completed Phase 2 plan is archived in
 - Features not listed here retain the unsupported-feature behavior from
   `spec.md` §10. Optimization-only clauses may be tolerated only when ignoring
   them cannot change Tier-A behavior, and strict mode must still reject them.
+- Tasks 8 through 26 are the priority track. They must be taken in order before
+  Tasks 27 onward unless a prerequisite defect forces a narrowly documented
+  exception.
 
 ## Phase 3 regression focus
 
@@ -57,6 +66,9 @@ The primary upstream source files for this phase are:
   corpus, and focused local multi-session scenarios where the upstream corpus
   cannot express controlled interleavings.
 
+Every task in the priority track must promote representative application and
+migration SQL into stable local regression fixtures.
+
 Passing an entire source file is not a per-task requirement because those files
 exercise extensions, privileges, procedural code, DDL, types, and planner
 behavior beyond Phase 3. Each task instead promotes relevant statements into
@@ -65,7 +77,7 @@ the Phase 3 conformance set and records newly exposed blockers.
 The Phase 3 surface is intentionally bounded:
 
 - views are ordinary read-only views; automatic view updates, materialized
-  views, recursive views, rules, triggers, privileges, and security-barrier or
+  views, recursive views, rules, privileges, and security-barrier or
   security-invoker behavior remain later work;
 - JSONPath and SQL/JSON constructors and query functions are outside this phase;
 - arrays cover one-dimensional arrays of supported scalar element types with
@@ -74,9 +86,14 @@ The Phase 3 surface is intentionally bounded:
 - the GUC registry models settings that affect supported behavior or are emitted
   by supported drivers. It does not attempt PostgreSQL's full server-wide
   configuration catalog;
-- `MERGE`, grouping sets, table functions, `LATERAL`, stored generated columns,
-  triggers, and new general-purpose `ALTER TABLE` families are not pulled into
-  Phase 3.
+- procedural functions, `DO`, triggers, schemas, index DDL, and `ALTER TABLE`
+  are limited to the forms explicitly listed in Tasks 10–15. They are not a
+  promise of complete PL/pgSQL or general-purpose PostgreSQL DDL support;
+- `LATERAL` is limited initially to correlated relation/subquery forms;
+  broader table-function support remains later work;
+- `MERGE`, grouping sets, stored generated columns, new general-purpose type
+  families, extensions, procedures, privileges, server-level database
+  management, and wire-protocol support remain later work.
 
 ---
 
@@ -273,184 +290,9 @@ its `WITH` clause.
 
 ---
 
-## Milestone D — Window functions
+## Milestone D — Transactional catalog and migration DDL
 
-### Task 8 — Window binding, partitioning, ordering, and ranking
-
-**Goal:** Add a window execution stage and the ranking functions that establish
-its core row-set semantics.
-
-**DoD:**
-
-- `OVER (...)` binds `PARTITION BY` and window `ORDER BY` expressions using the
-  input scope, while final projection aliases and final ordering obey
-  PostgreSQL visibility rules.
-- Named `WINDOW` clauses support inheritance and reject cycles, overrides, and
-  illegal references with PostgreSQL-compatible errors.
-- `row_number`, `rank`, `dense_rank`, `percent_rank`, `cume_dist`, and `ntile`
-  implement peer-group, NULL-ordering, empty-partition, and result-type behavior.
-- Multiple compatible and incompatible window specifications in one query
-  produce correct results without changing the query's output row count.
-- Window functions work after grouping and `HAVING` but before final
-  `DISTINCT`, ordering, and limiting; illegal placement and nesting are rejected.
-- Differential/property cases cover partitions, peers, NULLs, named windows,
-  aggregates as inputs, clause ordering, metadata, and errors.
-
-### Task 9 — Offset and value window functions
-
-**Goal:** Add position-sensitive access to rows within a partition or frame.
-
-**DoD:**
-
-- `lag`, `lead`, `first_value`, `last_value`, and `nth_value` support their
-  PostgreSQL argument, default, type-coercion, and NULL behavior.
-- Offset and default expressions are evaluated with PostgreSQL timing and may
-  use parameters and volatile scalar expressions where legal.
-- Functions distinguish the partition from the active frame exactly as
-  PostgreSQL does (`lag`/`lead` use the partition; value functions use the
-  frame).
-- Unsupported `RESPECT NULLS`/`IGNORE NULLS` and `FROM FIRST`/`FROM LAST`
-  syntax is rejected rather than silently ignored.
-- Differential/property cases cover partition edges, dynamic and invalid
-  offsets, defaults, all-NULL inputs, peer groups, metadata, and errors.
-
-### Task 10 — Aggregate windows and frame semantics
-
-**Goal:** Run existing aggregates over PostgreSQL window frames.
-
-**DoD:**
-
-- Core aggregate functions execute as windows with and without `PARTITION BY`
-  and window ordering, preserving aggregate result types and NULL behavior.
-- `ROWS`, `RANGE`, and `GROUPS` frames support unbounded, current-row, and legal
-  preceding/following bounds, including validated typed offsets.
-- Default frames and peer handling match PostgreSQL, including the common
-  `last_value` behavior under an ordered default frame.
-- `EXCLUDE CURRENT ROW`, `EXCLUDE GROUP`, `EXCLUDE TIES`, and `EXCLUDE NO OTHERS`
-  are implemented where the parser represents them.
-- Frame-bound errors, illegal ordering requirements, nested windows, and
-  unsupported aggregate modifiers return PostgreSQL-compatible errors.
-- Differential/property cases cover empty/singleton partitions, peers, NULLs,
-  every frame mode and exclusion, moving aggregates, and final filtering/order.
-- The benchmark suite includes ranking and moving-window aggregate workloads.
-
----
-
-## Milestone E — JSON, JSONB, and arrays
-
-### Task 11 — JSON type and text fidelity
-
-**Goal:** Add PostgreSQL `json` storage while preserving its textual nature.
-
-**DoD:**
-
-- `BaseType`, `PgType`, and `Value` support `json` with OID 114 through native
-  and SQLx APIs.
-- Assignment and explicit casts validate JSON while preserving insignificant
-  whitespace, object-key order, duplicate keys, numeric spelling, and canonical
-  text output behavior expected from PostgreSQL `json`.
-- Unknown literals, text casts, parameters, defaults, constraints, joins where
-  legal, and `RETURNING` use central coercion and metadata paths.
-- Invalid documents, unsupported Unicode escapes, nesting, and numeric edge
-  cases return PostgreSQL-compatible error codes.
-- Operations PostgreSQL does not define for `json`, including ordinary equality
-  and ordering, remain rejected.
-- Differential/property cases are derived from the applicable portion of
-  `json.sql` and include round trips, duplicate keys, Unicode, numbers, NULL,
-  metadata, and errors.
-
-### Task 12 — JSONB representation and comparison
-
-**Goal:** Add normalized `jsonb` values with PostgreSQL equality and ordering.
-
-**DoD:**
-
-- `BaseType`, `PgType`, and `Value` support `jsonb` with OID 3802 through native
-  and SQLx APIs.
-- Input normalization removes insignificant whitespace, applies PostgreSQL
-  duplicate-key rules, normalizes numeric values, and produces compatible text
-  output independent of object insertion order.
-- Equality, ordering, hashing/equivalence used by unique constraints,
-  `DISTINCT`, grouping, set operations, joins, and window partitions match
-  PostgreSQL for supported values.
-- Casts among `json`, `jsonb`, and text follow central coercion rules and retain
-  each type's distinct fidelity guarantees.
-- Differential/property cases cover every JSON value kind, object key ordering,
-  duplicate keys, numeric normalization, nesting, comparisons, constraints,
-  metadata, and errors.
-
-### Task 13 — Core JSON and JSONB operators and functions
-
-**Goal:** Make JSON values useful for common application queries and mutations.
-
-**DoD:**
-
-- Field and path extraction supports `->`, `->>`, `#>`, and `#>>` with correct
-  missing-path, negative-index, scalar, and SQL-NULL versus JSON-null behavior.
-- JSONB containment and existence support `@>`, `<@`, `?`, `?|`, and `?&` with
-  PostgreSQL recursive containment semantics.
-- JSONB mutation supports concatenation and deletion operators represented by
-  the parser, including key, index, and path deletion.
-- Common functions include `json_typeof`, `jsonb_typeof`, array length,
-  object/array expansion, `json_build_array`/`jsonb_build_array`,
-  `json_build_object`/`jsonb_build_object`, `to_json`/`to_jsonb`, and
-  `jsonb_set` for supported scalar and array inputs.
-- Set-returning JSON functions are accepted only in query positions supported
-  by the executor; unsupported table-function placement fails loudly.
-- Differential/property cases cover nesting, missing paths, negative indexes,
-  containment, duplicate keys, JSON nulls, SQL NULLs, mutations, and errors.
-- The benchmark suite includes JSONB extraction and containment workloads.
-
-**Notes:** JSONPath operators/functions, SQL/JSON constructors, JSON_TABLE,
-indexes, and record-population functions remain later work.
-
-### Task 14 — One-dimensional array type and I/O
-
-**Goal:** Add one-dimensional arrays of supported scalar PostgreSQL types.
-
-**DoD:**
-
-- `BaseType`, `PgType`, and `Value` represent arrays with an element type and
-  ordered values, including SQL NULL elements and empty arrays.
-- Array OIDs and element OIDs are correct for every supported scalar element
-  type through native prepared statements and SQLx encode/decode paths.
-- Array literals, `ARRAY[...]`, text input/output, parameters, defaults, casts,
-  and common-element type resolution match PostgreSQL for the supported subset.
-- Equality and lexicographic ordering support constraints, joins, grouping,
-  `DISTINCT`, set operations, and window partition/order keys.
-- Ragged, multidimensional, non-default-lower-bound, incompatible-element, and
-  malformed inputs fail explicitly with compatible error categories.
-- Differential/property cases cover empty/all-NULL/mixed arrays, escaping,
-  coercion, every supported element family, comparison, metadata, and errors.
-
-### Task 15 — Array subscripting, operators, aggregates, and functions
-
-**Goal:** Support common PostgreSQL array expressions end to end.
-
-**DoD:**
-
-- One-based scalar subscripting reads and assigns array elements where
-  PostgreSQL permits it; out-of-range reads and assignment expansion match the
-  supported one-dimensional semantics.
-- Concatenation, containment, and overlap operators (`||`, `@>`, `<@`, `&&`)
-  implement PostgreSQL duplicate, ordering, and NULL behavior.
-- `ANY(array)` and `ALL(array)` integrate with the existing quantified
-  comparison machinery, including empty and NULL arrays.
-- Common functions include `array_length`, `cardinality`, `array_lower`,
-  `array_upper`, `array_append`, `array_prepend`, `array_cat`, `array_position`,
-  `array_positions`, `array_remove`, `array_replace`, and `array_agg`.
-- `unnest` is supported in query positions already modeled by the executor;
-  unsupported table-function and multi-array forms fail loudly.
-- Differential/property cases cover bounds, empty arrays, NULL arrays/elements,
-  duplicates, coercion, assignments, quantified comparisons, aggregation, and
-  errors.
-- The benchmark suite includes array containment and `array_agg` workloads.
-
----
-
-## Milestone F — Transactional catalog and views
-
-### Task 16 — MVCC-versioned catalog foundation
+### Task 8 — MVCC-versioned catalog foundation
 
 **Goal:** Make relation metadata obey the same snapshot boundaries as table
 rows without duplicating transaction machinery.
@@ -472,7 +314,7 @@ rows without duplicating transaction machinery.
 - Unit/property and controlled multi-session tests cover visibility, name reuse,
   concurrent snapshots, abort, dependency identity, and GC horizons.
 
-### Task 17 — Transactional DDL for the supported catalog surface
+### Task 9 — Transactional DDL for the supported catalog surface
 
 **Goal:** Allow existing DDL operations inside explicit transactions with
 PostgreSQL commit and rollback semantics.
@@ -497,10 +339,64 @@ PostgreSQL commit and rollback semantics.
 - Differential and multi-session tests cover create/use/drop, rollback, name
   reuse, dependencies, prepared statements, and implicit versus explicit DDL.
 
-**Notes:** This task makes the already-supported DDL surface transactional. It
-does not add broad `ALTER TABLE`, schema, index, or type-definition families.
+**Notes:** This task makes the already-supported DDL surface transactional;
+Tasks 10–15 add the bounded migration surface.
 
-### Task 18 — Ordinary views
+### Task 10 — Qualified names, search path, and temporary relations
+
+**Goal:** Resolve common migration namespaces and temporary objects.
+
+**DoD:**
+
+- `public.name`, `pg_temp.name`, and unqualified names obey
+  PostgreSQL lookup, shadowing, duplicate-name, and missing-object behavior.
+- `CREATE TEMP[TEMPORARY] TABLE`, `DROP TABLE`, and transaction cleanup isolate
+  temporary relations per session and honor the required `ON COMMIT` forms.
+- Qualified table, sequence, index, view, function, and trigger references used
+  by the migration corpus bind to stable catalog identities.
+- Unsupported schemas and search-path behavior fail explicitly; support is not
+  broadened beyond the Phase 3 migration fixtures and SQLx startup requirements.
+- Differential, transaction, and multi-session cases cover qualification,
+  shadowing, rollback, cleanup, and prepared metadata.
+
+### Task 11 — Migration `ALTER TABLE` families
+
+**Goal:** Implement the table evolution operations required by the Phase 3
+migration fixtures.
+
+**DoD:**
+
+- Add/drop/rename column, rename table, `ALTER COLUMN ... TYPE ... USING`,
+  set/drop default, set/drop `NOT NULL`, and add/drop constraints execute
+  transactionally.
+- Existing rows are backfilled and coerced as PostgreSQL requires; validation
+  failures are atomic and use compatible `SQLSTATE` values.
+- Unique, check, and foreign-key constraints support the fixtures'
+  `NOT VALID` and later `VALIDATE CONSTRAINT` lifecycle.
+- Column/table renames preserve dependent indexes, constraints, sequences,
+  triggers, views, prepared identity, and row data.
+- Multi-action statements, `IF EXISTS`/`IF NOT EXISTS`, cascades explicitly used
+  by the fixtures, rollback, and errors have focused differential coverage.
+
+### Task 12 — Index DDL and partial unique indexes
+
+**Goal:** Model the indexes created, dropped, renamed, and used as arbiters by
+common application migrations.
+
+**DoD:**
+
+- `CREATE [UNIQUE] INDEX`, `DROP INDEX`, and `ALTER INDEX ...
+  RENAME TO` forms support qualification and `IF EXISTS`/`IF NOT EXISTS`.
+- Multi-column keys, sort direction, and partial-index predicates used by the
+  migrations are stored and validated with PostgreSQL NULL behavior.
+- Partial unique indexes enforce writes and participate in `ON CONFLICT`
+  inference only when PostgreSQL would select them.
+- Index objects and dependencies follow transactional catalog visibility and
+  table/column rename and drop behavior.
+- Differential/property cases cover duplicate data, predicate transitions,
+  rollback, name collisions, arbiter inference, and metadata.
+
+### Task 13 — Ordinary views and catalog-object renames
 
 **Goal:** Store named query definitions in the catalog and expand them with
 PostgreSQL scope and metadata behavior.
@@ -513,8 +409,8 @@ PostgreSQL scope and metadata behavior.
 - Selecting from a view binds its stored query with the caller's snapshot and
   session settings while preserving view-column names, types, typmods, aliases,
   and nested view scopes.
-- Views compose with joins, CTEs, subqueries, aggregation, windows, JSON, arrays,
-  prepared statements, and other views.
+- Views compose with joins, CTEs, subqueries, aggregation, prepared statements,
+  and other views; later type/window tasks add their own view cross-coverage.
 - View definitions are transactional and follow catalog snapshot visibility;
   dropping referenced objects or a referenced view fails rather than leaving a
   dangling definition.
@@ -522,15 +418,274 @@ PostgreSQL scope and metadata behavior.
   caller-only names cannot leak into stored definitions.
 - Mutations targeting views return a clear unsupported-feature error in this
   phase.
+- `ALTER TRIGGER ... RENAME TO` and related supported catalog-object renames
+  preserve identity and dependencies across commit and rollback.
 - Differential/property cases cover nested views, replacement, dependencies,
   metadata, name shadowing, transactions, errors, and prepared queries.
 - The benchmark suite includes a nested filtered view query.
 
+### Task 14 — Migration-local settings and table locks
+
+**Goal:** Execute migration coordination statements rather than ignoring them.
+
+**DoD:**
+
+- `SET LOCAL lock_timeout` and `SET LOCAL statement_timeout` parse, validate,
+  take effect for the transaction, and restore on commit or rollback.
+- `LOCK TABLE ... IN ACCESS EXCLUSIVE MODE` and `... IN EXCLUSIVE MODE`,
+  including multiple qualified relations, use the lock manager with the
+  corresponding PostgreSQL compatibility.
+- Lock waits, configured timeouts, deadlock participation, release, and
+  concurrent DDL/DML conflicts have controlled multi-session coverage.
+- Modes or settings outside the bounded migration surface remain explicit
+  unsupported features until Tasks 28–29 broaden GUC behavior.
+
+### Task 15 — Procedural migrations and triggers
+
+**Goal:** Add the procedural execution substrate required by migration
+functions, triggers, and one-off blocks.
+
+**DoD:**
+
+- `CREATE [OR REPLACE] FUNCTION` and `DROP FUNCTION` support the exact SQL and
+  PL/pgSQL signatures, declarations, assignments, conditionals, queries, and
+  return behavior listed in the Phase 3 migration fixtures.
+- `DO` blocks execute atomically, and errors abort the surrounding SQLx
+  migration transaction.
+- `SELECT ... INTO`, `GET DIAGNOSTICS ... = ROW_COUNT`, `RAISE EXCEPTION` with
+  formatted arguments and `USING HINT`, nested `IF`/`ELSIF`/`ELSE`, and
+  statement-local CTEs work inside supported blocks.
+- `CREATE TRIGGER`, `DROP TRIGGER`, and the required rename form implement
+  `BEFORE` row-trigger timing, `NEW` mutation, return, and invocation
+  semantics.
+- Function and trigger dependencies, replacement, qualification, rollback,
+  table/column changes, and drop behavior are represented in the transactional
+  catalog.
+- PostgreSQL differential tests cover every supported function, trigger,
+  and `DO` control-flow shape, including observable trigger side effects.
+
+**Notes:** This task is a fixture-bounded procedural interpreter, not complete
+PL/pgSQL. It must never accept an unimplemented construct as a no-op. Tasks
+16–20 add cross-feature expressions and validate complete migration blocks.
+
 ---
 
-## Milestone G — Savepoints and session settings
+## Milestone E — JSON and JSONB
 
-### Task 19 — Savepoints and subtransaction recovery
+### Task 16 — JSON type and text fidelity
+
+**Goal:** Add PostgreSQL `json` storage while preserving its textual nature.
+
+**DoD:**
+
+- `BaseType`, `PgType`, and `Value` support `json` with OID 114 through native
+  and SQLx APIs.
+- Assignment and casts validate JSON while preserving whitespace, key order,
+  duplicate keys, numeric spelling, and PostgreSQL `json` text behavior.
+- Unknown literals, parameters, defaults, constraints, `RETURNING`, invalid
+  documents, Unicode, nesting, metadata, and errors have differential/property
+  coverage.
+- Operations PostgreSQL does not define for `json`, including ordinary equality
+  and ordering, remain rejected.
+
+### Task 17 — JSONB representation and comparison
+
+**Goal:** Add normalized `jsonb` values with PostgreSQL equality and ordering.
+
+**DoD:**
+
+- `BaseType`, `PgType`, and `Value` support `jsonb` with OID 3802 through native
+  and SQLx encode/decode APIs, including SQLx JSON wrappers.
+- Normalization, duplicate-key handling, numeric values, and canonical output
+  match PostgreSQL for all JSON value kinds.
+- Equality, ordering, and hashing work in constraints, joins, grouping,
+  `DISTINCT`, set operations, and window partitions.
+- Casts among `json`, `jsonb`, and text, nesting, metadata, malformed input, and
+  normalization have differential/property coverage.
+
+### Task 18 — Core JSON and JSONB operators and functions
+
+**Goal:** Cover the planned JSON surface used by application queries and
+migrations.
+
+**DoD:**
+
+- Extraction supports `->`, `->>`, `#>`, and `#>>`; JSONB containment and
+  existence support `@>`, `<@`, `?`, `?|`, and `?&` with PostgreSQL SQL-NULL
+  versus JSON-null behavior.
+- Concatenation/deletion and the planned builders and mutation functions
+  work, including `json[b]_build_object`, `json[b]_build_array`, `to_json[b]`,
+  and `jsonb_set`.
+- Array/object length, expansion, missing paths, negative indexes, duplicate
+  keys, containment, parameters, and errors have differential/property tests.
+- Set-returning JSON functions are accepted only in executor positions with
+  implemented semantics; unsupported placement fails loudly.
+- Benchmarks cover JSONB extraction and containment.
+
+**Notes:** JSONPath, SQL/JSON constructors, `JSON_TABLE`, JSON indexes, and
+record-population functions remain later work.
+
+---
+
+## Milestone F — Migration query completion
+
+### Task 19 — Migration data-transform query subset
+
+**Goal:** Execute relational expressions commonly embedded in migration
+backfills and reconciliation blocks.
+
+**DoD:**
+
+- The window substrate supports `row_number()` and aggregate
+  `count(...) OVER (...)` forms with required partitioning, ordering, peer, NULL,
+  and result-type behavior.
+- Pattern matching covers `LIKE`/`ILIKE`, regular-expression
+  operators/functions, escaping, NULLs, and compatible invalid-pattern errors.
+- `string_agg` and every other aggregate or scalar expression uniquely required
+  by migration SQL match PostgreSQL typing, ordering, filtering, and NULL rules.
+- Correlated subqueries, CTEs, temporary-table joins, and data-modifying
+  statements in the migration fixtures compose with Tasks 10–18.
+- Every distinct transform shape has a focused PostgreSQL differential fixture,
+  including empty, duplicate, NULL, and rollback cases.
+
+### Task 20 — Transactional migration-chain gate
+
+**Goal:** Prove that realistic migration chains run unchanged through SQLx.
+
+**DoD:**
+
+- Starting from an empty `PgFake` database, the Phase 3 migration conformance
+  chains apply in order and unchanged inside SQLx-managed transactions.
+- The resulting schema, constraints, indexes, views, functions, triggers,
+  sequence state, and representative transformed rows match PostgreSQL 18.
+- Procedural blocks run their complete catalog checks, JSONB parsing,
+  reconciliation queries, diagnostics, and error paths without reduced or
+  rewritten SQL.
+- Each migration is tested both as part of the full chain and at its recorded
+  pre-migration schema/data boundary; a failure identifies the migration and
+  first mismatching statement.
+- Reapplying through SQLx reports the same already-applied/no-op behavior, and a
+  deliberately failing migration rolls back catalog and data changes.
+- The manifest has no unresolved migration blocker.
+
+---
+
+## Milestone G — Priority runtime SQL
+
+### Task 21 — Temporal, formatting, numeric, and pattern expressions
+
+**Goal:** Implement common scalar and aggregate expression families used by
+application queries.
+
+**DoD:**
+
+- `to_timestamp`, `to_char`, `date_trunc`, and `AT TIME ZONE` support the
+  argument types, formats, time-zone interpretation, and NULL/error behavior
+  covered by the Phase 3 fixtures.
+- `floor`, required numeric coercions, `LIKE`/`ILIKE`, regular-expression
+  operations, and `string_agg` cover every runtime shape in the manifest.
+- Expression results and metadata work through SQLx decoding, prepared
+  parameters, grouping, ordering, filtering, and updates.
+- Differential/property tests cover boundary timestamps, time zones, negative
+  epochs/numbers, formatting, escaping, invalid inputs, NULLs, and collation
+  assumptions.
+
+### Task 22 — Bounded `LATERAL` joins
+
+**Goal:** Execute common correlated lateral subquery shapes.
+
+**DoD:**
+
+- `LATERAL` subqueries on the required inner/left join forms are evaluated for
+  each row with correct correlation scope, aliasing, NULL extension, ordering,
+  and limiting.
+- Planner/executor behavior composes with aggregates, CTEs, prepared
+  parameters, JSONB, and temporal expressions used by the manifest.
+- Illegal references and unsupported lateral table-function forms fail with
+  compatible error categories rather than being treated as ordinary joins.
+- Differential/property tests cover zero/one/many inner rows, nested scopes,
+  NULLs, volatile expressions, metadata, and errors.
+
+### Task 23 — Complete `SELECT` row-locking clauses
+
+**Goal:** Implement work queues and the remaining planned PostgreSQL row-lock
+surface.
+
+**DoD:**
+
+- `FOR UPDATE`, `FOR NO KEY UPDATE`, `FOR SHARE`, and `FOR KEY SHARE` implement
+  PostgreSQL's compatibility matrix.
+- `OF relation`, multiple clauses, `NOWAIT`, and especially `SKIP LOCKED` select
+  and lock the correct base rows after qualification, ordering, and limiting.
+- Wait/recheck behavior, lock timeouts, deadlocks, rollback, and READ COMMITTED
+  versus REPEATABLE READ outcomes use the existing lock manager without busy
+  waiting.
+- Legal composition and rejection rules for joins, subqueries, CTEs, views,
+  grouping, windows, `DISTINCT`, and set operations match PostgreSQL.
+- Differential/property and controlled multi-session tests include work-queue
+  queries and a `SKIP LOCKED` benchmark.
+
+### Task 24 — Advisory locks
+
+**Goal:** Support transaction-scoped application coordination.
+
+**DoD:**
+
+- The manifest's `pg_advisory_xact_lock` and try-lock forms support required
+  integer signatures, key identity, reentrancy, waiting, and return values.
+- Advisory locks are isolated from row/table lock identities but participate in
+  timeout, deadlock detection, transaction release, and rollback behavior.
+- Session-level advisory-lock forms remain unsupported unless the manifest
+  requires them.
+- Controlled multi-session differential tests cover contention, ordering,
+  repeated acquisition, abort, timeouts, deadlocks, and SQLx transactions.
+
+### Task 25 — PostgreSQL compatibility utilities and maintenance statements
+
+**Goal:** Cover the small server-facing surface reached on normal startup and
+runtime paths without pretending to be a complete PostgreSQL server.
+
+**DoD:**
+
+- `pg_is_in_recovery()` returns a deterministic primary-server result for
+  startup and migration logic.
+- `regclass`, `pg_lsn`, and the explicitly supported catalog
+  functions/relations have PostgreSQL-compatible types and observable
+  semantics recorded in the conformance manifest.
+- `TRUNCATE` supports relation lists, identity, foreign-key,
+  transaction, and locking behavior.
+- Unsupported catalog columns/functions and server-management statements fail
+  explicitly; `CREATE DATABASE` and `DROP DATABASE` remain harness concerns,
+  not SQL executed by `pg_fake`.
+- Focused PostgreSQL differential tests cover all accepted utility queries,
+  metadata, transaction behavior, and errors.
+
+### Task 26 — SQLx application-workload conformance gate
+
+**Goal:** Demonstrate that realistic SQLx workloads run on `pg_fake`, not merely
+that isolated SQL parses.
+
+**DoD:**
+
+- The conformance application applies the Task 20 migration chains and runs all
+  priority SQL families through `pg_fake_sqlx` pools, prepared queries, typed
+  rows, and transactions.
+- Representative workflows cover identity/session data, work claiming and
+  accounting, payment/promotion state, request limits, thread/execution state,
+  and append-only logs.
+- Concurrent workflows exercise advisory locks, table/row locks, `SKIP LOCKED`,
+  transactions, triggers, JSONB, temporal expressions, and rollback.
+- Every in-scope manifest entry is either executed by the suite or has a focused
+  replay; none remains unsupported, unclassified, or silently skipped.
+- PostgreSQL 18 and `pg_fake` agree on Tier-A results, metadata, affected rows,
+  transaction outcomes, and `SQLSTATE`; a documented command reproduces the
+  full gate.
+
+---
+
+## Milestone H — Remaining Phase 3 transaction features
+
+### Task 27 — Savepoints and subtransaction recovery
 
 **Goal:** Implement nested transaction checkpoints used by PostgreSQL clients
 and SQLx nested transactions.
@@ -555,7 +710,7 @@ and SQLx nested transactions.
   transactions.
 - The benchmark suite includes nested savepoint create/release and rollback.
 
-### Task 20 — Typed GUC registry and general `SET`/`SHOW`/`RESET`
+### Task 28 — Typed GUC registry and general `SET`/`SHOW`/`RESET`
 
 **Goal:** Replace scattered session-variable handling with a typed registry for
 settings that affect supported behavior or driver compatibility.
@@ -579,7 +734,7 @@ settings that affect supported behavior or driver compatibility.
 - Differential/property cases cover aliases, units, invalid values, reset,
   session isolation, strict mode, and prepared statements.
 
-### Task 21 — Transaction-local settings and GUC functions
+### Task 29 — Transaction-local settings and GUC functions
 
 **Goal:** Complete transactional GUC behavior and the common functional access
 surface.
@@ -603,37 +758,97 @@ surface.
   session defaults, functions, missing names, prepared statements, and SQLx
   startup behavior.
 
+**Notes:** Task 14 supplies the early `SET LOCAL` migration subset. This task
+generalizes it onto the registry and adds all remaining
+Phase 3 functional/session behavior.
+
 ---
 
-## Milestone H — Row locking and SERIALIZABLE isolation
+## Milestone I — Complete window functions
 
-### Task 22 — Complete `SELECT` row-locking clauses
+### Task 30 — Named windows and remaining ranking functions
 
-**Goal:** Implement PostgreSQL row-lock strengths, wait policies, and query
-placement rules.
+**Goal:** Extend Task 19's migration window substrate to the full planned
+binding, partitioning, ordering, and ranking surface.
 
 **DoD:**
 
-- `FOR UPDATE`, `FOR NO KEY UPDATE`, `FOR SHARE`, and `FOR KEY SHARE` acquire
-  distinct lock modes with PostgreSQL's compatibility matrix.
-- `OF relation`, multiple locking clauses, `NOWAIT`, and `SKIP LOCKED` select
-  and lock the correct base rows after query qualification without locking
-  null-extended or non-selected rows.
-- Row locking composes with joins, subqueries, CTEs, views where legal,
-  ordering, and limiting, and is rejected with the correct error category for
-  grouping, windows, `DISTINCT`, set operations, and other illegal contexts.
-- UPDATE chooses `FOR UPDATE` strength only when a key relevant to a usable
-  unique index changes and otherwise uses `FOR NO KEY UPDATE`; foreign-key
-  checks use the matching key-share behavior.
-- Waits recheck visibility after wakeup and produce correct READ COMMITTED versus
-  REPEATABLE READ outcomes; timeouts, deadlocks, `NOWAIT`, and `SKIP LOCKED`
-  use the existing lock manager without busy waiting.
-- Differential and controlled multi-session cases cover the full compatibility
-  matrix, joins, `OF`, limits, wakeups, rollback, timeouts, deadlocks, and SQLx.
-- The benchmark suite includes uncontended locking and a `SKIP LOCKED` work
-  queue.
+- Named `WINDOW` clauses support inheritance and reject cycles, overrides, and
+  illegal references with compatible errors.
+- `rank`, `dense_rank`, `percent_rank`, `cume_dist`, and `ntile` implement
+  peer-group, NULL-ordering, empty-partition, and result-type behavior alongside
+  `row_number`.
+- Multiple compatible/incompatible window specifications run after grouping and
+  `HAVING` and before final `DISTINCT`, ordering, and limiting.
+- Differential/property cases cover partitions, peers, NULLs, named windows,
+  clause ordering, metadata, placement, nesting, and errors.
 
-### Task 23 — SERIALIZABLE dependency tracking
+### Task 31 — Offset and value window functions
+
+**Goal:** Add position-sensitive access to rows within a partition or frame.
+
+**DoD:**
+
+- `lag`, `lead`, `first_value`, `last_value`, and `nth_value` support PostgreSQL
+  arguments, defaults, coercion, timing, and NULL behavior.
+- `lag`/`lead` use the partition while value functions use the active frame.
+- Unsupported NULL-treatment and direction syntax is rejected, not ignored.
+- Differential/property cases cover edges, offsets, defaults, NULLs, peers,
+  parameters, metadata, and errors.
+
+### Task 32 — Aggregate windows and frame semantics
+
+**Goal:** Complete existing aggregates over PostgreSQL window frames.
+
+**DoD:**
+
+- Core aggregates run as windows with correct result types, NULL behavior,
+  default frames, and peer handling.
+- `ROWS`, `RANGE`, and `GROUPS` support legal unbounded/current/offset bounds
+  and represented `EXCLUDE` forms.
+- Invalid bounds, ordering requirements, nesting, and unsupported modifiers
+  produce compatible errors.
+- Differential/property tests cover all frame modes, moving aggregates, peers,
+  NULLs, exclusions, and final filtering/order; benchmarks cover ranking and
+  moving aggregates.
+
+---
+
+## Milestone J — Arrays
+
+### Task 33 — One-dimensional array type and I/O
+
+**Goal:** Add one-dimensional arrays of supported scalar PostgreSQL types.
+
+**DoD:**
+
+- `BaseType`, `PgType`, and `Value` represent typed arrays, NULL elements, and
+  empty arrays with correct array/element OIDs through native and SQLx APIs.
+- Literals, `ARRAY[...]`, text I/O, parameters, defaults, casts, common-element
+  resolution, equality, and lexicographic ordering match PostgreSQL.
+- Unsupported dimensions/lower bounds/elements and malformed values fail
+  explicitly; differential/property tests cover I/O, coercion, comparison,
+  metadata, NULLs, and errors.
+
+### Task 34 — Array subscripting, operators, aggregates, and functions
+
+**Goal:** Support common PostgreSQL array expressions end to end.
+
+**DoD:**
+
+- One-based reads/assignments, concatenation, containment, overlap, and
+  `ANY(array)`/`ALL(array)` match PostgreSQL bounds, duplicate, and NULL rules.
+- The planned array inspection/mutation functions, `array_agg`, and supported
+  `unnest` positions work; unsupported table-function forms fail loudly.
+- Differential/property tests cover empty/NULL arrays, NULL elements,
+  expansion, duplicates, coercion, aggregation, and errors; benchmarks cover
+  containment and `array_agg`.
+
+---
+
+## Milestone K — SERIALIZABLE isolation
+
+### Task 35 — SERIALIZABLE dependency tracking
 
 **Goal:** Track the read/write dependencies needed to detect SSI dangerous
 structures without changing READ COMMITTED or REPEATABLE READ behavior.
@@ -655,7 +870,7 @@ structures without changing READ COMMITTED or REPEATABLE READ behavior.
   transactions, overlapping snapshots, savepoint rollback, cleanup horizons,
   and unique-key gaps.
 
-### Task 24 — SSI validation and predicate conflicts
+### Task 36 — SSI validation and predicate conflicts
 
 **Goal:** Reject executions that are not serializable while allowing valid
 concurrent histories.
@@ -682,9 +897,9 @@ concurrent histories.
 
 ---
 
-## Milestone I — Phase 3 conformance and release gate
+## Milestone L — Phase 3 conformance and release gate
 
-### Task 25 — Phase 3 integration, regression audit, and benchmarks
+### Task 37 — Phase 3 integration, regression audit, and benchmarks
 
 **Goal:** Prove that the complete Phase 3 surface works coherently through the
 native and SQLx APIs.
@@ -711,10 +926,12 @@ native and SQLx APIs.
   target are reported rather than hidden.
 - The unsupported-feature registry and user-facing feature documentation
   distinguish completed Phase 3 behavior from later gaps.
+- The Task 26 SQLx application-workload gate remains green and is reported
+  separately from the broader synthetic/upstream conformance results.
 
 **Notes:** This task fixes integration defects but does not add new SQL families.
 
-### Task 26 — External PostgreSQL-driven fuzzing
+### Task 38 — External PostgreSQL-driven fuzzing
 
 **Goal:** Discover SQL through an external fuzzer running against PostgreSQL,
 then replay the captured workload against `pg_fake` to find behavioral gaps that
@@ -765,8 +982,10 @@ stateful workload model are intentionally research outcomes of this task.
 
 ## Phase 3 exit criteria
 
-- All 26 tasks meet their DoD and have been approved before being marked
+- All 38 tasks meet their DoD and have been approved before being marked
   complete.
+- The prioritized migration and SQLx application-workload gates in Tasks 20
+  and 26 pass without unsupported, unclassified, or silently skipped SQL.
 - The Phase 3 conformance manifest passes against PostgreSQL 18 without
   regressing the 32 Phase 2 cases.
 - The embedded regression corpus improves from the 463/141 Phase 2 baseline,
@@ -782,6 +1001,8 @@ stateful workload model are intentionally research outcomes of this task.
   mismatch, and minimized fixed cases are retained as deterministic regressions.
 - Later work remains explicit: JSONPath and the broader SQL/JSON surface,
   multidimensional/non-default-bound arrays, materialized/updatable/recursive
-  views, rules/triggers, broad schema/index/`ALTER TABLE` DDL, privileges,
-  `MERGE`, grouping sets, table functions, `LATERAL`, generated columns, new
-  type families, extensions, procedures, and wire-protocol support.
+  views, rules, general-purpose PL/pgSQL/triggers/schema/index/`ALTER TABLE`
+  beyond the explicitly planned subset, privileges, `MERGE`, grouping sets,
+  broader table functions/`LATERAL`, generated columns, new type families,
+  extensions, procedures, server-level database management, and wire-protocol
+  support.
