@@ -5395,9 +5395,9 @@ fn visit_query_source_rows(
     visit: &mut dyn FnMut(&[Value]) -> Result<()>,
 ) -> Result<()> {
     if let [table] = select.from.as_slice()
-        && can_stream_inner_join(table)
+        && can_stream_join(table)
     {
-        return visit_streamed_inner_join_rows(
+        return visit_streamed_join_rows(
             state, table, scope, xid, snapshot, context, selection, visit,
         );
     }
@@ -5408,7 +5408,7 @@ fn visit_query_source_rows(
 }
 
 #[cfg_attr(feature = "execution-log", tracing::instrument(skip_all))]
-fn can_stream_inner_join(table: &ast::TableWithJoins) -> bool {
+fn can_stream_join(table: &ast::TableWithJoins) -> bool {
     matches!(table.relation, ast::TableFactor::Table { .. })
         && table.joins.iter().all(|join| {
             matches!(join.relation, ast::TableFactor::Table { .. })
@@ -5417,12 +5417,14 @@ fn can_stream_inner_join(table: &ast::TableWithJoins) -> bool {
                     ast::JoinOperator::Join(_)
                         | ast::JoinOperator::Inner(_)
                         | ast::JoinOperator::CrossJoin(_)
+                        | ast::JoinOperator::Left(_)
+                        | ast::JoinOperator::LeftOuter(_)
                 )
         })
 }
 
 #[cfg_attr(feature = "execution-log", tracing::instrument(skip_all))]
-fn visit_streamed_inner_join_rows(
+fn visit_streamed_join_rows(
     state: &DatabaseState,
     table: &ast::TableWithJoins,
     scope: &BoundScope,
@@ -5497,12 +5499,18 @@ fn resolve_hash_join_slots(
     scope: &BoundScope,
     left_start: usize,
     right_start: usize,
-) -> Option<(usize, usize)> {
+) -> Option<(usize, usize, bool)> {
     let (ast::JoinOperator::Join(ast::JoinConstraint::On(expression))
-    | ast::JoinOperator::Inner(ast::JoinConstraint::On(expression))) = operator
+    | ast::JoinOperator::Inner(ast::JoinConstraint::On(expression))
+    | ast::JoinOperator::Left(ast::JoinConstraint::On(expression))
+    | ast::JoinOperator::LeftOuter(ast::JoinConstraint::On(expression))) = operator
     else {
         return None;
     };
+    let preserve_left = matches!(
+        operator,
+        ast::JoinOperator::Left(_) | ast::JoinOperator::LeftOuter(_)
+    );
     let ast::Expr::BinaryOp {
         left,
         op: ast::BinaryOperator::Eq,
@@ -5532,11 +5540,11 @@ fn resolve_hash_join_slots(
     if (left_start..right_start).contains(&right_slot)
         && (right_start..scope.columns.len()).contains(&left_slot)
     {
-        return Some((right_slot, left_slot));
+        return Some((right_slot, left_slot, preserve_left));
     }
     ((left_start..right_start).contains(&left_slot)
         && (right_start..scope.columns.len()).contains(&right_slot))
-    .then_some((left_slot, right_slot))
+    .then_some((left_slot, right_slot, preserve_left))
 }
 
 #[cfg_attr(feature = "execution-log", tracing::instrument(skip_all))]
@@ -5563,7 +5571,7 @@ fn visit_hash_join_chain_rows(
     context: &StatementExecutionContext,
     selection: Option<&ast::Expr>,
     starts: &[usize],
-    hash_slots: &[(usize, usize)],
+    hash_slots: &[(usize, usize, bool)],
     visit: &mut dyn FnMut(&[Value]) -> Result<()>,
 ) -> Result<()> {
     let mut rows = Vec::new();
@@ -5581,7 +5589,7 @@ fn visit_hash_join_chain_rows(
             Ok(())
         },
     )?;
-    for (index, (left_slot, right_slot)) in hash_slots.iter().copied().enumerate() {
+    for (index, (left_slot, right_slot, preserve_left)) in hash_slots.iter().copied().enumerate() {
         let mut right_rows = std::collections::HashMap::<JoinKey, Vec<Vec<Value>>>::new();
         visit_table_factor_rows(
             state,
@@ -5601,24 +5609,24 @@ fn visit_hash_join_chain_rows(
         )?;
         let mut joined = Vec::new();
         for left in &rows {
-            let Some(key) = create_hash_join_key(&left[left_slot]) else {
-                continue;
-            };
-            let Some(matches) = right_rows.get(&key) else {
-                continue;
-            };
-            joined.extend(matches.iter().map(|right| {
-                left.iter()
-                    .zip(right)
-                    .map(|(left, right)| {
-                        if left.is_null() {
-                            right.clone()
-                        } else {
-                            left.clone()
-                        }
-                    })
-                    .collect::<Vec<_>>()
-            }));
+            let matches =
+                create_hash_join_key(&left[left_slot]).and_then(|key| right_rows.get(&key));
+            if let Some(matches) = matches {
+                joined.extend(matches.iter().map(|right| {
+                    left.iter()
+                        .zip(right)
+                        .map(|(left, right)| {
+                            if left.is_null() {
+                                right.clone()
+                            } else {
+                                left.clone()
+                            }
+                        })
+                        .collect::<Vec<_>>()
+                }));
+            } else if preserve_left {
+                joined.push(left.clone());
+            }
         }
         rows = joined;
     }
