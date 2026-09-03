@@ -113,8 +113,10 @@ pub struct Transaction<'session> {
 #[cfg_attr(feature = "execution-log", tracing::instrument(skip_all))]
 fn abort_database_transaction(state: &mut DatabaseState, xid: Xid) {
     state.transactions.abort(xid);
-    for table in state.tables.values_mut() {
-        table.discard_transaction_versions(xid);
+    for table_id in state.take_touched_tables(xid) {
+        if let Some(table) = state.tables.get_mut(&table_id) {
+            table.discard_transaction_versions(xid);
+        }
     }
     prune_database_versions(state);
     state.row_locks.release_transaction_locks(xid);
@@ -952,6 +954,7 @@ impl Session {
         if transaction.read_only {
             assert!(self.ddl_undo.is_empty());
             assert!(!self.deferred_foreign_keys_dirty);
+            assert!(!state.has_touched_tables(transaction.xid));
             state.transactions.finish_read_only(transaction.xid);
             self.settings_undo = None;
             self.deferred_constraints.clear();
@@ -975,8 +978,12 @@ impl Session {
             return Err(error);
         }
         let commit_seq = state.transactions.commit(transaction.xid);
-        for table in state.tables.values_mut() {
-            table.commit_transaction_versions(transaction.xid, commit_seq);
+        for table_id in state.take_touched_tables(transaction.xid) {
+            state
+                .tables
+                .get_mut(&table_id)
+                .expect("touched table must exist at commit")
+                .commit_transaction_versions(transaction.xid, commit_seq);
         }
         prune_database_versions(&mut state);
         state.row_locks.release_transaction_locks(transaction.xid);
@@ -1308,6 +1315,7 @@ impl Session {
         let Some(SessionTransactionState::Active(mut transaction)) = self.transaction else {
             unreachable!("transaction must be active while executing a statement")
         };
+        let was_read_only = transaction.read_only;
         transaction.read_only &=
             prepared_query.is_some() || is_plain_read_only_statement(statement);
         let state_lock = self.db.state.clone();
@@ -1441,7 +1449,9 @@ impl Session {
         );
         match result {
             Ok(result) => {
+                let has_writes = state.has_touched_tables(transaction.xid);
                 if statement_contains_dml
+                    && has_writes
                     && executor::contains_deferred_foreign_keys(
                         &state,
                         &self.deferred_constraints,
@@ -1449,6 +1459,13 @@ impl Session {
                     )
                 {
                     self.deferred_foreign_keys_dirty = true;
+                }
+                if statement_contains_dml && was_read_only && !has_writes {
+                    let Some(SessionTransactionState::Active(transaction)) = &mut self.transaction
+                    else {
+                        unreachable!("statement transaction remains active")
+                    };
+                    transaction.read_only = true;
                 }
                 Ok(result)
             }

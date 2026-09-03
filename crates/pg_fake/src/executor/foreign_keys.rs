@@ -381,6 +381,7 @@ pub(super) fn apply_referencing_foreign_key_actions(
                         .get_mut(&child_schema.id)
                         .expect("catalog table must have storage")
                         .mark_version_deleted(row_id, version_xmin, xid, context.command_id);
+                    state.mark_table_touched(xid, child_schema.id);
                 }
                 ForeignKeyAction::Cascade => {
                     let mut updated = row.clone();
@@ -494,6 +495,7 @@ fn apply_cascaded_row_update(
             context.command_id,
             updated.clone(),
         );
+    state.mark_table_touched(xid, schema.id);
     validate_row_foreign_keys(
         state,
         schema,

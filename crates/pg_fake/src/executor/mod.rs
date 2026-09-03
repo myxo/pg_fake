@@ -88,6 +88,7 @@ pub(crate) struct DatabaseState {
     pub(crate) row_locks: RowLockManager,
     pub(crate) wait_for: WaitForGraph,
     pub(crate) sequence_values: SequenceStorage,
+    touched_tables: BTreeMap<Xid, Vec<TableId>>,
 }
 pub(crate) struct RequiredRowLock {
     pub(crate) key: RowLockKey,
@@ -114,7 +115,28 @@ impl DatabaseState {
             row_locks: RowLockManager::create(),
             wait_for: WaitForGraph::create(),
             sequence_values: Arc::new(Mutex::new(BTreeMap::new())),
+            touched_tables: BTreeMap::new(),
         }
+    }
+
+    #[cfg_attr(feature = "execution-log", tracing::instrument(skip_all))]
+    pub(crate) fn mark_table_touched(&mut self, xid: Xid, table_id: TableId) {
+        let tables = self.touched_tables.entry(xid).or_default();
+        if !tables.contains(&table_id) {
+            tables.push(table_id);
+        }
+    }
+
+    #[cfg_attr(feature = "execution-log", tracing::instrument(skip_all))]
+    pub(crate) fn has_touched_tables(&self, xid: Xid) -> bool {
+        self.touched_tables
+            .get(&xid)
+            .is_some_and(|tables| !tables.is_empty())
+    }
+
+    #[cfg_attr(feature = "execution-log", tracing::instrument(skip_all))]
+    pub(crate) fn take_touched_tables(&mut self, xid: Xid) -> Vec<TableId> {
+        self.touched_tables.remove(&xid).unwrap_or_default()
     }
 }
 

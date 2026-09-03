@@ -346,6 +346,7 @@ pub(super) fn execute_insert(
             .get_mut(&schema.id)
             .expect("catalog table must have storage")
             .insert(xid, context.command_id, row.clone());
+        state.mark_table_touched(xid, schema.id);
         validate_row_foreign_keys(
             state,
             &schema,
@@ -528,6 +529,7 @@ pub(super) fn execute_update(
                 context.command_id,
                 updated.clone(),
             );
+        state.mark_table_touched(xid, schema.id);
         validate_row_foreign_keys(
             state,
             &schema,
@@ -661,6 +663,7 @@ pub(super) fn execute_delete(
             .get_mut(&schema.id)
             .expect("catalog table must have storage")
             .mark_version_deleted(row_id, version_xmin, xid, context.command_id);
+        state.mark_table_touched(xid, schema.id);
         evaluate_returning_row(
             state,
             returning.as_ref(),
