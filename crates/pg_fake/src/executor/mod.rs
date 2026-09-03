@@ -89,6 +89,7 @@ pub(crate) struct DatabaseState {
     pub(crate) wait_for: WaitForGraph,
     pub(crate) sequence_values: SequenceStorage,
     touched_tables: BTreeMap<Xid, Vec<TableId>>,
+    reclaimable_tables: Vec<TableId>,
 }
 pub(crate) struct RequiredRowLock {
     pub(crate) key: RowLockKey,
@@ -116,6 +117,7 @@ impl DatabaseState {
             wait_for: WaitForGraph::create(),
             sequence_values: Arc::new(Mutex::new(BTreeMap::new())),
             touched_tables: BTreeMap::new(),
+            reclaimable_tables: Vec::new(),
         }
     }
 
@@ -137,6 +139,24 @@ impl DatabaseState {
     #[cfg_attr(feature = "execution-log", tracing::instrument(skip_all))]
     pub(crate) fn take_touched_tables(&mut self, xid: Xid) -> Vec<TableId> {
         self.touched_tables.remove(&xid).unwrap_or_default()
+    }
+
+    #[cfg_attr(feature = "execution-log", tracing::instrument(skip_all))]
+    pub(crate) fn mark_table_reclaimable(&mut self, table_id: TableId) {
+        if !self.reclaimable_tables.contains(&table_id) {
+            self.reclaimable_tables.push(table_id);
+        }
+    }
+
+    #[cfg_attr(feature = "execution-log", tracing::instrument(skip_all))]
+    pub(crate) fn reclaimable_table_ids(&self) -> Vec<TableId> {
+        self.reclaimable_tables.clone()
+    }
+
+    #[cfg_attr(feature = "execution-log", tracing::instrument(skip_all))]
+    pub(crate) fn clear_table_reclaimable(&mut self, table_id: TableId) {
+        self.reclaimable_tables
+            .retain(|candidate| *candidate != table_id);
     }
 }
 

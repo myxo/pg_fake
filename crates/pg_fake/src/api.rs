@@ -126,8 +126,15 @@ fn abort_database_transaction(state: &mut DatabaseState, xid: Xid) {
 #[cfg_attr(feature = "execution-log", tracing::instrument(skip_all))]
 fn prune_database_versions(state: &mut DatabaseState) {
     let horizon = state.transactions.find_reclamation_horizon();
-    for table in state.tables.values_mut() {
+    for table_id in state.reclaimable_table_ids() {
+        let Some(table) = state.tables.get_mut(&table_id) else {
+            state.clear_table_reclaimable(table_id);
+            continue;
+        };
         table.prune_versions(horizon, &state.transactions);
+        if !table.has_reclaimable_versions() {
+            state.clear_table_reclaimable(table_id);
+        }
     }
 }
 
@@ -979,11 +986,14 @@ impl Session {
         }
         let commit_seq = state.transactions.commit(transaction.xid);
         for table_id in state.take_touched_tables(transaction.xid) {
-            state
+            let has_reclamation = state
                 .tables
                 .get_mut(&table_id)
                 .expect("touched table must exist at commit")
                 .commit_transaction_versions(transaction.xid, commit_seq);
+            if has_reclamation {
+                state.mark_table_reclaimable(table_id);
+            }
         }
         prune_database_versions(&mut state);
         state.row_locks.release_transaction_locks(transaction.xid);

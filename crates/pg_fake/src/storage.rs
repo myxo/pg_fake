@@ -208,14 +208,22 @@ impl Table {
     }
 
     #[cfg_attr(feature = "execution-log", tracing::instrument(skip_all))]
-    pub(crate) fn commit_transaction_versions(&mut self, xid: Xid, commit_seq: CommitSeq) {
+    pub(crate) fn commit_transaction_versions(&mut self, xid: Xid, commit_seq: CommitSeq) -> bool {
         if let Some(row_ids) = self.reclamation.pending.remove(&xid) {
             self.reclamation
                 .committed
                 .entry(commit_seq)
                 .or_default()
                 .extend(row_ids);
+            true
+        } else {
+            false
         }
+    }
+
+    #[cfg_attr(feature = "execution-log", tracing::instrument(skip_all))]
+    pub(crate) fn has_reclaimable_versions(&self) -> bool {
+        !self.reclamation.committed.is_empty()
     }
 
     #[cfg_attr(feature = "execution-log", tracing::instrument(skip_all))]
