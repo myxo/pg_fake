@@ -4885,42 +4885,49 @@ fn execute_grouped_select_rows(
 #[cfg_attr(feature = "execution-log", tracing::instrument(skip_all))]
 fn sort_ordered_rows(rows: &mut [OrderedRow], order_specs: &[RowOrderSpec<'_>]) {
     if !order_specs.is_empty() {
-        rows.sort_by(|left, right| {
-            order_specs
-                .iter()
-                .zip(left.keys.iter().zip(&right.keys))
-                .find_map(|(spec, (left, right))| {
-                    let ordering = match (left, right) {
-                        (Value::Null, Value::Null) => Ordering::Equal,
-                        (Value::Null, _) => {
-                            if spec.nulls_first {
-                                Ordering::Less
-                            } else {
-                                Ordering::Greater
-                            }
-                        }
-                        (_, Value::Null) => {
-                            if spec.nulls_first {
-                                Ordering::Greater
-                            } else {
-                                Ordering::Less
-                            }
-                        }
-                        _ => {
-                            let ordering = compare_values(left, right)
-                                .expect("ORDER BY expression type was checked");
-                            if spec.ascending {
-                                ordering
-                            } else {
-                                ordering.reverse()
-                            }
-                        }
-                    };
-                    (ordering != Ordering::Equal).then_some(ordering)
-                })
-                .unwrap_or(Ordering::Equal)
-        });
+        rows.sort_by(|left, right| compare_ordered_rows(left, right, order_specs));
     }
+}
+
+#[cfg_attr(feature = "execution-log", tracing::instrument(skip_all))]
+fn compare_ordered_rows(
+    left: &OrderedRow,
+    right: &OrderedRow,
+    order_specs: &[RowOrderSpec<'_>],
+) -> Ordering {
+    order_specs
+        .iter()
+        .zip(left.keys.iter().zip(&right.keys))
+        .find_map(|(spec, (left, right))| {
+            let ordering = match (left, right) {
+                (Value::Null, Value::Null) => Ordering::Equal,
+                (Value::Null, _) => {
+                    if spec.nulls_first {
+                        Ordering::Less
+                    } else {
+                        Ordering::Greater
+                    }
+                }
+                (_, Value::Null) => {
+                    if spec.nulls_first {
+                        Ordering::Greater
+                    } else {
+                        Ordering::Less
+                    }
+                }
+                _ => {
+                    let ordering =
+                        compare_values(left, right).expect("ORDER BY expression type was checked");
+                    if spec.ascending {
+                        ordering
+                    } else {
+                        ordering.reverse()
+                    }
+                }
+            };
+            (ordering != Ordering::Equal).then_some(ordering)
+        })
+        .unwrap_or(Ordering::Equal)
 }
 
 #[cfg_attr(feature = "execution-log", tracing::instrument(skip_all))]
@@ -4967,6 +4974,18 @@ fn finalize_select_rows(
 ) -> Result<Vec<Vec<Value>>> {
     if matches!(distinct, DistinctPlan::Rows) {
         rows = remove_duplicate_rows(rows, distinct)?;
+    }
+    if !order_specs.is_empty()
+        && matches!(distinct, DistinctPlan::None)
+        && let Some(limit) = limit
+    {
+        let required = offset.saturating_add(limit);
+        if required < rows.len() {
+            rows.select_nth_unstable_by(required, |left, right| {
+                compare_ordered_rows(left, right, order_specs)
+            });
+            rows.truncate(required);
+        }
     }
     sort_ordered_rows(&mut rows, order_specs);
     if matches!(distinct, DistinctPlan::On { .. }) {
