@@ -64,9 +64,13 @@ cargo x bench
 
 The command restores the baseline committed under `results/`, runs Criterion,
 and prints Criterion's statistical changes. It also prints the current CPU and
-system information, every benchmark's average latency, and the relative timing
-for every comparison declared by the shared benchmark catalog. It does not
-modify the committed results.
+system information, every benchmark's average latency and percentage change
+from the committed measurement, and the relative timing for every comparison
+declared by the shared benchmark catalog. Positive changes are slower and
+negative changes are faster; benchmarks without a committed measurement show
+`N/A`. Comparisons use `🟢 ↑` for a faster candidate, `🔴 ↓` for a slower
+candidate, and `⚪ →` when timings are equal. It does not modify the committed
+results.
 
 After making an intentional performance change, replace the committed baseline:
 

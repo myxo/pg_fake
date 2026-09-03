@@ -18,7 +18,7 @@ const BASELINE_FILES: [&str; 4] = [
 ];
 
 struct Report {
-    measurements: Vec<(String, String)>,
+    measurements: Vec<(String, String, String)>,
     speedups: Vec<(String, String, String, String)>,
 }
 
@@ -184,7 +184,7 @@ fn restore_baseline(record: bool) {
         for value in &benchmark.values {
             let source = find_baseline_path(&results_root, benchmark, value);
             let target = find_baseline_path(&criterion_root, benchmark, value);
-            if record && !source.exists() {
+            if record && !has_complete_baseline(&source) {
                 continue;
             }
             copy_baseline(&source, &target);
@@ -217,6 +217,7 @@ fn run_benchmarks(record: bool) {
 
 fn collect_report(root: &Path, result: &str) -> Report {
     let benchmarks = list_benchmarks();
+    let previous_root = find_results_root().join("criterion");
     let (postgres_benchmarks, other_benchmarks): (Vec<_>, Vec<_>) =
         benchmarks.iter().partition(|benchmark| {
             benchmark
@@ -230,9 +231,14 @@ fn collect_report(root: &Path, result: &str) -> Report {
     for benchmark in postgres_benchmarks.into_iter().chain(other_benchmarks) {
         for value in &benchmark.values {
             if let Some(average) = read_estimate(root, benchmark, value, result) {
+                let change = read_estimate(&previous_root, benchmark, value, BASELINE).map_or_else(
+                    || "N/A".to_owned(),
+                    |previous| format_change(previous, average),
+                );
                 measurements.push((
                     format!("{}/{}", benchmark.name, value.name),
                     format_time(average),
+                    change,
                 ));
             }
         }
@@ -279,11 +285,11 @@ fn print_environment(environment: &[(String, String)]) {
 fn print_report(report: &Report) {
     println!("\nBenchmarks\n");
     print_table(
-        &["benchmark", "average"],
+        &["benchmark", "average", "change vs previous"],
         &report
             .measurements
             .iter()
-            .map(|(name, average)| vec![name.clone(), average.clone()])
+            .map(|(name, average, change)| vec![name.clone(), average.clone(), change.clone()])
             .collect::<Vec<_>>(),
     );
     if !report.speedups.is_empty() {
@@ -358,9 +364,11 @@ fn format_markdown(
         )
         .unwrap();
     }
-    markdown.push_str("\n## Benchmarks\n\n| Benchmark | Average |\n| --- | ---: |\n");
-    for (name, average) in &report.measurements {
-        writeln!(markdown, "| {name} | {average} |").unwrap();
+    markdown.push_str(
+        "\n## Benchmarks\n\n| Benchmark | Average | Change vs previous |\n| --- | ---: | ---: |\n",
+    );
+    for (name, average, change) in &report.measurements {
+        writeln!(markdown, "| {name} | {average} | {change} |").unwrap();
     }
     if !report.speedups.is_empty() {
         markdown.push_str(
@@ -378,16 +386,20 @@ fn format_markdown(
 }
 
 fn copy_baseline(source: &Path, target: &Path) {
+    assert!(
+        has_complete_baseline(source),
+        "baseline is incomplete: {}",
+        source.display()
+    );
     fs::create_dir_all(target).expect("baseline directory must be creatable");
     for file in BASELINE_FILES {
         let source = source.join(file);
-        assert!(
-            source.is_file(),
-            "baseline file is missing: {}",
-            source.display()
-        );
         fs::copy(&source, target.join(file)).expect("baseline file must be copied");
     }
+}
+
+fn has_complete_baseline(path: &Path) -> bool {
+    BASELINE_FILES.iter().all(|file| path.join(file).is_file())
 }
 
 fn find_results_root() -> PathBuf {
@@ -457,15 +469,27 @@ fn format_time(nanoseconds: f64) -> String {
     format!("{:.2} s", nanoseconds / 1_000_000_000.0)
 }
 
+fn format_change(previous: f64, current: f64) -> String {
+    assert!(
+        previous > 0.0,
+        "previous benchmark estimate must be positive"
+    );
+    let change = (current - previous) / previous * 100.0;
+    if change.abs() < 0.005 {
+        return "0.00%".to_owned();
+    }
+    format!("{change:+.2}%")
+}
+
 fn format_relative(baseline: f64, candidate: f64) -> String {
     let ratio = candidate / baseline;
     if ratio > 1.0 {
-        return format!("{ratio:.2}x slower");
+        return format!("🔴 ↓ {ratio:.2}x");
     }
     if ratio < 1.0 {
-        return format!("{:.2}x faster", 1.0 / ratio);
+        return format!("🟢 ↑ {:.2}x", 1.0 / ratio);
     }
-    "same".to_owned()
+    "⚪ → same".to_owned()
 }
 
 fn print_table(headers: &[&str], rows: &[Vec<String>]) {
@@ -505,4 +529,53 @@ fn format_row(values: &[impl AsRef<str>], widths: &[usize]) -> String {
         }
     }
     row
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{
+        BASELINE, collect_report, find_results_root, format_change, format_markdown,
+        format_relative, has_complete_baseline,
+    };
+
+    #[test]
+    fn formats_benchmark_change_as_percentage() {
+        assert_eq!(format_change(100.0, 125.0), "+25.00%");
+        assert_eq!(format_change(100.0, 75.0), "-25.00%");
+        assert_eq!(format_change(100.0, 100.0), "0.00%");
+    }
+
+    #[test]
+    fn formats_relative_timing_with_colored_arrows() {
+        assert_eq!(format_relative(100.0, 125.0), "🔴 ↓ 1.25x");
+        assert_eq!(format_relative(100.0, 50.0), "🟢 ↑ 2.00x");
+        assert_eq!(format_relative(100.0, 100.0), "⚪ → same");
+    }
+
+    #[test]
+    fn detects_complete_baselines() {
+        let results = find_results_root().join("criterion");
+
+        assert!(has_complete_baseline(
+            &results.join("create_table/pg_fake/repo-baseline")
+        ));
+        assert!(!has_complete_baseline(&find_results_root()));
+    }
+
+    #[test]
+    fn reports_change_from_committed_measurements() {
+        let root = find_results_root().join("criterion");
+        let report = collect_report(&root, BASELINE);
+
+        assert!(
+            report
+                .measurements
+                .iter()
+                .all(|(_, _, change)| change == "0.00%")
+        );
+        assert!(
+            format_markdown(serde_json::Map::new(), &report)
+                .contains("| Benchmark | Average | Change vs previous |")
+        );
+    }
 }

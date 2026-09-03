@@ -97,40 +97,40 @@
 
 | Benchmark | Baseline | Candidate | Relative |
 | --- | --- | --- | ---: |
-| create_table | postgres_18 | pg_fake | 49.66x faster |
-| insert_row | postgres_18 | pg_fake | 3.09x faster |
-| insert_row_returning | postgres_18 | pg_fake | 1.77x faster |
-| insert_row_with_defaults | postgres_18 | pg_fake | 3.06x faster |
-| update_row | postgres_18 | pg_fake | 4.12x faster |
-| update_from_row | postgres_18 | pg_fake | 4.72x faster |
-| delete_row | postgres_18 | pg_fake | 8.22x faster |
-| sequence_nextval | postgres_18 | pg_fake | 1.85x faster |
-| serial_identity_insert | postgres_18 | pg_fake | 2.08x faster |
-| uuid_temporal_select | postgres_18 | pg_fake | 1.51x faster |
-| transaction_insert | postgres_18 | pg_fake | 3.67x faster |
-| transaction_repeatable_read_select_for_update | postgres_18 | pg_fake | 2.84x faster |
-| select_100_rows | postgres_18 | pg_fake | 2.55x faster |
-| select_where_100_rows | postgres_18 | pg_fake | 2.09x faster |
-| select_where_indexed_100_rows | postgres_18 | pg_fake | 3.78x faster |
-| limit_offset_ordered_100_rows | postgres_18 | pg_fake | 1.24x slower |
-| order_by_100_rows | postgres_18 | pg_fake | 1.21x faster |
-| foreign_key_insert | postgres_18 | pg_fake | 3.28x faster |
-| selective_inner_join | postgres_18 | pg_fake | 1.78x slower |
-| many_match_inner_join | postgres_18 | pg_fake | 1.75x slower |
-| derived_and_scalar_subquery_100_rows | postgres_18 | pg_fake | 2.43x slower |
-| correlated_exists_100_rows | postgres_18 | pg_fake | 1.30x faster |
-| global_aggregate_100_rows | postgres_18 | pg_fake | 1.84x slower |
-| grouped_aggregate_100_rows | postgres_18 | pg_fake | 1.95x slower |
-| select_distinct_100_rows | postgres_18 | pg_fake | 1.00x slower |
-| union_all_100_rows | postgres_18 | pg_fake | 2.27x slower |
-| union_100_rows | postgres_18 | pg_fake | 2.67x slower |
-| adapter_overhead_select_100_rows | core | sqlx | 1.24x slower |
-| core_parsed_vs_prepared_point_select | parse_and_analyze | prepared_reuse | 36.44x faster |
-| transaction_history_point_select | 1 | 100 | 1.07x slower |
-| transaction_history_point_select | 1 | 10,000 | 1.18x slower |
-| transaction_history_point_select | 1 | 100,000 | 1.25x slower |
-| mvcc_old_snapshot_read | 1 | 100 | 11.56x slower |
-| mvcc_old_snapshot_read | 1 | 10,000 | 5477.32x slower |
-| point_lookup_index_vs_scan | heap_scan/100 | unique_index/100 | 6.55x faster |
-| point_lookup_index_vs_scan | heap_scan/10,000 | unique_index/10,000 | 506.81x faster |
-| concurrent_uncontended_reads | sequential | parallel | 1.13x faster |
+| create_table | postgres_18 | pg_fake | 🟢 ↑ 49.66x |
+| insert_row | postgres_18 | pg_fake | 🟢 ↑ 3.09x |
+| insert_row_returning | postgres_18 | pg_fake | 🟢 ↑ 1.77x |
+| insert_row_with_defaults | postgres_18 | pg_fake | 🟢 ↑ 3.06x |
+| update_row | postgres_18 | pg_fake | 🟢 ↑ 4.12x |
+| update_from_row | postgres_18 | pg_fake | 🟢 ↑ 4.72x |
+| delete_row | postgres_18 | pg_fake | 🟢 ↑ 8.22x |
+| sequence_nextval | postgres_18 | pg_fake | 🟢 ↑ 1.85x |
+| serial_identity_insert | postgres_18 | pg_fake | 🟢 ↑ 2.08x |
+| uuid_temporal_select | postgres_18 | pg_fake | 🟢 ↑ 1.51x |
+| transaction_insert | postgres_18 | pg_fake | 🟢 ↑ 3.67x |
+| transaction_repeatable_read_select_for_update | postgres_18 | pg_fake | 🟢 ↑ 2.84x |
+| select_100_rows | postgres_18 | pg_fake | 🟢 ↑ 2.55x |
+| select_where_100_rows | postgres_18 | pg_fake | 🟢 ↑ 2.09x |
+| select_where_indexed_100_rows | postgres_18 | pg_fake | 🟢 ↑ 3.78x |
+| limit_offset_ordered_100_rows | postgres_18 | pg_fake | 🔴 ↓ 1.24x |
+| order_by_100_rows | postgres_18 | pg_fake | 🟢 ↑ 1.21x |
+| foreign_key_insert | postgres_18 | pg_fake | 🟢 ↑ 3.28x |
+| selective_inner_join | postgres_18 | pg_fake | 🔴 ↓ 1.78x |
+| many_match_inner_join | postgres_18 | pg_fake | 🔴 ↓ 1.75x |
+| derived_and_scalar_subquery_100_rows | postgres_18 | pg_fake | 🔴 ↓ 2.43x |
+| correlated_exists_100_rows | postgres_18 | pg_fake | 🟢 ↑ 1.30x |
+| global_aggregate_100_rows | postgres_18 | pg_fake | 🔴 ↓ 1.84x |
+| grouped_aggregate_100_rows | postgres_18 | pg_fake | 🔴 ↓ 1.95x |
+| select_distinct_100_rows | postgres_18 | pg_fake | 🔴 ↓ 1.00x |
+| union_all_100_rows | postgres_18 | pg_fake | 🔴 ↓ 2.27x |
+| union_100_rows | postgres_18 | pg_fake | 🔴 ↓ 2.67x |
+| adapter_overhead_select_100_rows | core | sqlx | 🔴 ↓ 1.24x |
+| core_parsed_vs_prepared_point_select | parse_and_analyze | prepared_reuse | 🟢 ↑ 36.44x |
+| transaction_history_point_select | 1 | 100 | 🔴 ↓ 1.07x |
+| transaction_history_point_select | 1 | 10,000 | 🔴 ↓ 1.18x |
+| transaction_history_point_select | 1 | 100,000 | 🔴 ↓ 1.25x |
+| mvcc_old_snapshot_read | 1 | 100 | 🔴 ↓ 11.56x |
+| mvcc_old_snapshot_read | 1 | 10,000 | 🔴 ↓ 5477.32x |
+| point_lookup_index_vs_scan | heap_scan/100 | unique_index/100 | 🟢 ↑ 6.55x |
+| point_lookup_index_vs_scan | heap_scan/10,000 | unique_index/10,000 | 🟢 ↑ 506.81x |
+| concurrent_uncontended_reads | sequential | parallel | 🟢 ↑ 1.13x |
