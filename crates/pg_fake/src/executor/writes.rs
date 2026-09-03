@@ -604,7 +604,7 @@ pub(super) fn execute_delete(
     deferred_constraints: &BTreeSet<String>,
     defer_all: bool,
     context: &StatementExecutionContext,
-    mutation_targets: Option<Vec<RequiredRowLock>>,
+    mut mutation_targets: Option<Vec<RequiredRowLock>>,
 ) -> Result<StatementResult> {
     if !delete.tables.is_empty() || !delete.order_by.is_empty() || delete.limit.is_some() {
         return reject_unsupported("DELETE feature is not implemented");
@@ -653,6 +653,35 @@ pub(super) fn execute_delete(
             ));
         }
     }
+    let has_referencing_foreign_keys = state.catalog.has_referencing_foreign_keys(&schema.name);
+    if using.is_empty() && returning.is_none() && !has_referencing_foreign_keys {
+        if let Some(mutation_targets) = mutation_targets.take() {
+            let targets = mutation_targets
+                .into_iter()
+                .filter(|required| required.key.table_id == schema.id)
+                .collect::<Vec<_>>();
+            let affected = targets.len() as u64;
+            for required in targets {
+                let candidate = required
+                    .mutation_candidate
+                    .expect("mutation target locks retain their selected version");
+                state
+                    .tables
+                    .get_mut(&schema.id)
+                    .expect("catalog table must have storage")
+                    .mark_version_deleted(
+                        required.key.row_id,
+                        candidate.version_xmin,
+                        xid,
+                        context.command_id,
+                    );
+            }
+            if affected != 0 {
+                state.mark_table_touched(xid, schema.id);
+            }
+            return Ok(StatementResult::Affected(affected));
+        }
+    }
     let source_rows = materialize_mutation_source_rows(
         state,
         using,
@@ -674,7 +703,6 @@ pub(super) fn execute_delete(
         mutation_targets,
     )?;
     let affected = targets.len() as u64;
-    let has_referencing_foreign_keys = state.catalog.has_referencing_foreign_keys(&schema.name);
     let mut returned_rows = Vec::new();
     for (row_id, version_xmin, row, bound_row) in targets {
         if has_referencing_foreign_keys {
@@ -740,9 +768,12 @@ fn collect_mutation_targets(
                 let candidate = required
                     .mutation_candidate
                     .expect("mutation target locks retain their selected row");
+                let candidate_row = candidate
+                    .row
+                    .expect("row-consuming mutations retain their selected row");
                 let bound_row = if needs_bound_row {
                     let mut row = source_row.clone();
-                    row[..schema.columns.len()].clone_from_slice(&candidate.row);
+                    row[..schema.columns.len()].clone_from_slice(&candidate_row);
                     Some(row)
                 } else {
                     None
@@ -750,7 +781,7 @@ fn collect_mutation_targets(
                 Ok((
                     required.key.row_id,
                     candidate.version_xmin,
-                    candidate.row,
+                    candidate_row,
                     bound_row,
                 ))
             })

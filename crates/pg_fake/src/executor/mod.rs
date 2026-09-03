@@ -98,7 +98,7 @@ pub(crate) struct RequiredRowLock {
 }
 pub(crate) struct MutationCandidate {
     pub(crate) version_xmin: Xid,
-    pub(crate) row: Vec<Value>,
+    pub(crate) row: Option<Vec<Value>>,
 }
 
 pub(crate) use query::describe_query_result_columns;

@@ -54,7 +54,7 @@ pub(crate) fn collect_required_row_locks(
     if let ast::Statement::Insert(insert) = statement {
         return collect_insert_foreign_key_locks(state, insert, xid, snapshot, context);
     }
-    let (schema, alias, selection, mode, retain_mutation_candidates) = match statement {
+    let target = match statement {
         ast::Statement::Update(update) => {
             let table = &update.table;
             if !table.joins.is_empty() {
@@ -81,6 +81,7 @@ pub(crate) fn collect_required_row_locks(
                     .flatten(),
                 RowLockMode::Update,
                 update.from.is_none(),
+                true,
             )
         }
         ast::Statement::Delete(delete) => {
@@ -99,10 +100,11 @@ pub(crate) fn collect_required_row_locks(
             else {
                 return Ok(Vec::new());
             };
+            let schema = state
+                .catalog
+                .require_table(&normalize_unqualified_object_name(table_name)?)?;
             (
-                state
-                    .catalog
-                    .require_table(&normalize_unqualified_object_name(table_name)?)?,
+                schema,
                 alias.as_ref().map(|alias| &alias.name),
                 delete
                     .using
@@ -111,6 +113,8 @@ pub(crate) fn collect_required_row_locks(
                     .flatten(),
                 RowLockMode::Update,
                 delete.using.is_none(),
+                delete.returning.is_some()
+                    || state.catalog.has_referencing_foreign_keys(&schema.name),
             )
         }
         ast::Statement::Query(query) => {
@@ -140,10 +144,12 @@ pub(crate) fn collect_required_row_locks(
                 select.selection.as_ref(),
                 mode,
                 false,
+                false,
             )
         }
         _ => return Ok(Vec::new()),
     };
+    let (schema, alias, selection, mode, retain_mutation_candidates, retain_mutation_row) = target;
     if let Some(selection) = selection {
         let base = infer_expression_type(selection, RowScope::Table(schema))?;
         if base != BaseType::Bool && !is_null_literal(selection) {
@@ -175,7 +181,7 @@ pub(crate) fn collect_required_row_locks(
             mode,
             mutation_candidate: retain_mutation_candidates.then(|| MutationCandidate {
                 version_xmin: version.xmin,
-                row: version.row.clone(),
+                row: retain_mutation_row.then(|| version.row.clone()),
             }),
         }]);
     }
@@ -213,7 +219,7 @@ pub(crate) fn collect_required_row_locks(
                 mode,
                 mutation_candidate: retain_mutation_candidates.then(|| MutationCandidate {
                     version_xmin: version.xmin,
-                    row: version.row.clone(),
+                    row: retain_mutation_row.then(|| version.row.clone()),
                 }),
             });
             Ok(locks)
