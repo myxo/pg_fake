@@ -489,6 +489,7 @@ pub(super) fn execute_update(
         mutation_targets,
     )?;
     let affected = targets.len() as u64;
+    let has_referencing_foreign_keys = state.catalog.has_referencing_foreign_keys(&schema.name);
     let mut returned_rows = Vec::new();
     for (row_id, version_xmin, row, mut bound_row) in targets {
         let mut updated = row.clone();
@@ -547,18 +548,20 @@ pub(super) fn execute_update(
             deferred_constraints,
             defer_all,
         )?;
-        apply_referencing_foreign_key_actions(
-            state,
-            &schema,
-            &row,
-            Some(&updated),
-            xid,
-            snapshot,
-            deferred_constraints,
-            defer_all,
-            &mut BTreeSet::new(),
-            context,
-        )?;
+        if has_referencing_foreign_keys {
+            apply_referencing_foreign_key_actions(
+                state,
+                &schema,
+                &row,
+                Some(&updated),
+                xid,
+                snapshot,
+                deferred_constraints,
+                defer_all,
+                &mut BTreeSet::new(),
+                context,
+            )?;
+        }
         bound_row[..schema.columns.len()].clone_from_slice(&updated);
         evaluate_returning_row(
             state,
@@ -652,20 +655,23 @@ pub(super) fn execute_delete(
         mutation_targets,
     )?;
     let affected = targets.len() as u64;
+    let has_referencing_foreign_keys = state.catalog.has_referencing_foreign_keys(&schema.name);
     let mut returned_rows = Vec::new();
     for (row_id, version_xmin, row, bound_row) in targets {
-        apply_referencing_foreign_key_actions(
-            state,
-            &schema,
-            &row,
-            None,
-            xid,
-            snapshot,
-            deferred_constraints,
-            defer_all,
-            &mut BTreeSet::new(),
-            context,
-        )?;
+        if has_referencing_foreign_keys {
+            apply_referencing_foreign_key_actions(
+                state,
+                &schema,
+                &row,
+                None,
+                xid,
+                snapshot,
+                deferred_constraints,
+                defer_all,
+                &mut BTreeSet::new(),
+                context,
+            )?;
+        }
         state
             .tables
             .get_mut(&schema.id)

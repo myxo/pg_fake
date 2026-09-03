@@ -245,6 +245,10 @@ impl Catalog {
             .collect()
     }
 
+    pub(crate) fn has_referencing_foreign_keys(&self, parent: &str) -> bool {
+        self.referencing_foreign_keys.contains_key(parent)
+    }
+
     #[cfg_attr(feature = "execution-log", tracing::instrument(skip_all))]
     fn rebuild_foreign_key_metadata(&mut self) {
         let mut deferrable_foreign_keys = Vec::new();
