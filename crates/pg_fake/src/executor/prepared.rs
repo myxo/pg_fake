@@ -5,7 +5,7 @@ use super::*;
 pub(crate) struct PreparedQueryPlan {
     table_name: String,
     table_id: TableId,
-    projection: Vec<usize>,
+    projection: Vec<PreparedProjection>,
     selection: Option<PreparedExpression>,
     access: PreparedAccess,
     columns: Vec<ColumnMeta>,
@@ -27,6 +27,12 @@ enum PreparedAccess {
 }
 
 #[derive(Debug, Clone)]
+enum PreparedProjection {
+    Column(usize),
+    Expression(PreparedExpression),
+}
+
+#[derive(Debug, Clone)]
 enum PreparedExpression {
     Column {
         slot: usize,
@@ -44,6 +50,7 @@ enum PreparedExpression {
         left: Box<PreparedExpression>,
         operator: ast::BinaryOperator,
         right: Box<PreparedExpression>,
+        data_type: BaseType,
     },
 }
 
@@ -53,7 +60,7 @@ impl PreparedExpression {
             Self::Column { data_type, .. }
             | Self::Parameter { data_type, .. }
             | Self::Literal { data_type, .. } => *data_type,
-            Self::Binary { .. } => BaseType::Bool,
+            Self::Binary { data_type, .. } => *data_type,
         }
     }
 
@@ -121,21 +128,18 @@ pub(crate) fn build_prepared_query_plan(
     else {
         return Ok(None);
     };
-    if !select.projection.iter().all(|item| {
-        matches!(
-            item,
-            ast::SelectItem::Wildcard(options)
-                if options == &ast::WildcardAdditionalOptions::default()
-        ) || matches!(
-            item,
-            ast::SelectItem::UnnamedExpr(
-                ast::Expr::Identifier(_) | ast::Expr::CompoundIdentifier(_)
-            ) | ast::SelectItem::ExprWithAlias {
-                expr: ast::Expr::Identifier(_) | ast::Expr::CompoundIdentifier(_),
-                ..
-            }
-        )
-    }) {
+    if !select.projection.iter().all(|item| match item {
+        ast::SelectItem::Wildcard(options) => options == &ast::WildcardAdditionalOptions::default(),
+        ast::SelectItem::UnnamedExpr(expression)
+        | ast::SelectItem::ExprWithAlias {
+            expr: expression, ..
+        } => is_prepared_expression_candidate(expression),
+        _ => false,
+    }) || select
+        .selection
+        .as_ref()
+        .is_some_and(|expression| !is_prepared_expression_candidate(expression))
+    {
         return Ok(None);
     }
     let table_name = normalize_unqualified_object_name(name)?;
@@ -149,7 +153,7 @@ pub(crate) fn build_prepared_query_plan(
                 if options == &ast::WildcardAdditionalOptions::default() =>
             {
                 for column in scope.columns.iter().filter(|column| column.wildcard) {
-                    projection.push(column.slot);
+                    projection.push(PreparedProjection::Column(column.slot));
                     columns.push(ColumnMeta {
                         name: column.name.clone(),
                         type_oid: column.data_type.map_to_oid(),
@@ -159,7 +163,7 @@ pub(crate) fn build_prepared_query_plan(
             }
             ast::SelectItem::UnnamedExpr(ast::Expr::Identifier(column)) => {
                 let (slot, data_type) = scope.resolve_column(std::slice::from_ref(column))?;
-                projection.push(slot);
+                projection.push(PreparedProjection::Column(slot));
                 columns.push(ColumnMeta {
                     name: column.value.clone(),
                     type_oid: data_type.map_to_oid(),
@@ -168,7 +172,7 @@ pub(crate) fn build_prepared_query_plan(
             }
             ast::SelectItem::UnnamedExpr(ast::Expr::CompoundIdentifier(identifiers)) => {
                 let (slot, data_type) = scope.resolve_column(identifiers)?;
-                projection.push(slot);
+                projection.push(PreparedProjection::Column(slot));
                 columns.push(ColumnMeta {
                     name: identifiers
                         .last()
@@ -184,7 +188,7 @@ pub(crate) fn build_prepared_query_plan(
                 alias,
             } => {
                 let (slot, data_type) = scope.resolve_column(std::slice::from_ref(column))?;
-                projection.push(slot);
+                projection.push(PreparedProjection::Column(slot));
                 columns.push(ColumnMeta {
                     name: alias.value.clone(),
                     type_oid: data_type.map_to_oid(),
@@ -196,11 +200,42 @@ pub(crate) fn build_prepared_query_plan(
                 alias,
             } => {
                 let (slot, data_type) = scope.resolve_column(identifiers)?;
-                projection.push(slot);
+                projection.push(PreparedProjection::Column(slot));
                 columns.push(ColumnMeta {
                     name: alias.value.clone(),
                     type_oid: data_type.map_to_oid(),
                     typmod: data_type.typmod,
+                });
+            }
+            ast::SelectItem::UnnamedExpr(expression) => {
+                let Some(expression) =
+                    bind_prepared_expression(expression, &scope, parameter_types)?
+                else {
+                    return Ok(None);
+                };
+                let data_type = expression.get_data_type();
+                projection.push(PreparedProjection::Expression(expression));
+                columns.push(ColumnMeta {
+                    name: "?column?".into(),
+                    type_oid: data_type.map_to_oid(),
+                    typmod: PgType::NO_TYPEMOD,
+                });
+            }
+            ast::SelectItem::ExprWithAlias {
+                expr: expression,
+                alias,
+            } => {
+                let Some(expression) =
+                    bind_prepared_expression(expression, &scope, parameter_types)?
+                else {
+                    return Ok(None);
+                };
+                let data_type = expression.get_data_type();
+                projection.push(PreparedProjection::Expression(expression));
+                columns.push(ColumnMeta {
+                    name: normalize_identifier(alias),
+                    type_oid: data_type.map_to_oid(),
+                    typmod: PgType::NO_TYPEMOD,
                 });
             }
             _ => return Ok(None),
@@ -231,6 +266,32 @@ pub(crate) fn build_prepared_query_plan(
         access,
         columns,
     }))
+}
+
+fn is_prepared_expression_candidate(expression: &ast::Expr) -> bool {
+    match expression {
+        ast::Expr::Identifier(_) | ast::Expr::CompoundIdentifier(_) | ast::Expr::Value(_) => true,
+        ast::Expr::Nested(expression) => is_prepared_expression_candidate(expression),
+        ast::Expr::BinaryOp {
+            left,
+            op:
+                ast::BinaryOperator::Eq
+                | ast::BinaryOperator::NotEq
+                | ast::BinaryOperator::Gt
+                | ast::BinaryOperator::Lt
+                | ast::BinaryOperator::GtEq
+                | ast::BinaryOperator::LtEq
+                | ast::BinaryOperator::And
+                | ast::BinaryOperator::Or
+                | ast::BinaryOperator::Plus
+                | ast::BinaryOperator::Minus
+                | ast::BinaryOperator::Multiply
+                | ast::BinaryOperator::Divide
+                | ast::BinaryOperator::Modulo,
+            right,
+        } => is_prepared_expression_candidate(left) && is_prepared_expression_candidate(right),
+        _ => false,
+    }
 }
 
 fn bind_prepared_expression(
@@ -280,7 +341,12 @@ fn bind_prepared_expression(
                 | ast::BinaryOperator::GtEq
                 | ast::BinaryOperator::LtEq
                 | ast::BinaryOperator::And
-                | ast::BinaryOperator::Or),
+                | ast::BinaryOperator::Or
+                | ast::BinaryOperator::Plus
+                | ast::BinaryOperator::Minus
+                | ast::BinaryOperator::Multiply
+                | ast::BinaryOperator::Divide
+                | ast::BinaryOperator::Modulo),
             right,
         } => {
             let Some(left_expression) = bind_prepared_expression(left, scope, parameter_types)?
@@ -291,21 +357,48 @@ fn bind_prepared_expression(
             else {
                 return Ok(None);
             };
-            if matches!(operator, ast::BinaryOperator::And | ast::BinaryOperator::Or) {
-                if left_expression.get_data_type() != BaseType::Bool
-                    || right_expression.get_data_type() != BaseType::Bool
-                {
-                    return Ok(None);
-                }
-            } else {
-                if left_expression.get_data_type() != right_expression.get_data_type() {
-                    return Ok(None);
-                }
-            }
+            let data_type =
+                if matches!(operator, ast::BinaryOperator::And | ast::BinaryOperator::Or) {
+                    if left_expression.get_data_type() != BaseType::Bool
+                        || right_expression.get_data_type() != BaseType::Bool
+                    {
+                        return Ok(None);
+                    }
+                    BaseType::Bool
+                } else {
+                    if left_expression.get_data_type() != right_expression.get_data_type() {
+                        return Ok(None);
+                    }
+                    if matches!(
+                        operator,
+                        ast::BinaryOperator::Plus
+                            | ast::BinaryOperator::Minus
+                            | ast::BinaryOperator::Multiply
+                            | ast::BinaryOperator::Divide
+                            | ast::BinaryOperator::Modulo
+                    ) {
+                        let data_type = left_expression.get_data_type();
+                        if !matches!(
+                            data_type,
+                            BaseType::Int2
+                                | BaseType::Int4
+                                | BaseType::Int8
+                                | BaseType::Float4
+                                | BaseType::Float8
+                                | BaseType::Numeric
+                        ) {
+                            return Ok(None);
+                        }
+                        data_type
+                    } else {
+                        BaseType::Bool
+                    }
+                };
             Ok(Some(PreparedExpression::Binary {
                 left: Box::new(left_expression),
                 operator: operator.clone(),
                 right: Box::new(right_expression),
+                data_type,
             }))
         }
         _ => Ok(None),
@@ -320,6 +413,7 @@ fn find_unique_access(
         left,
         operator: ast::BinaryOperator::Eq,
         right,
+        ..
     } = selection
     else {
         return None;
@@ -377,8 +471,13 @@ pub(crate) fn execute_prepared_query(
         rows.push(
             plan.projection
                 .iter()
-                .map(|slot| row[*slot].clone())
-                .collect(),
+                .map(|projection| match projection {
+                    PreparedProjection::Column(slot) => Ok(row[*slot].clone()),
+                    PreparedProjection::Expression(expression) => {
+                        evaluate_prepared_expression(expression, row, parameters)
+                    }
+                })
+                .collect::<Result<_>>()?,
         );
         Ok(())
     };
@@ -421,6 +520,7 @@ fn evaluate_prepared_expression(
             left,
             operator,
             right,
+            ..
         } => {
             let left_value = evaluate_prepared_expression(left, row, parameters)?;
             let right_value = evaluate_prepared_expression(right, row, parameters)?;
@@ -439,6 +539,17 @@ fn evaluate_prepared_expression(
                 }
                 ast::BinaryOperator::And | ast::BinaryOperator::Or => {
                     evaluate_boolean_operator(operator, left_value, right_value)
+                }
+                ast::BinaryOperator::Plus
+                | ast::BinaryOperator::Minus
+                | ast::BinaryOperator::Multiply
+                | ast::BinaryOperator::Divide
+                | ast::BinaryOperator::Modulo => {
+                    if left_value.is_null() || right_value.is_null() {
+                        Ok(Value::Null)
+                    } else {
+                        evaluate_numeric_operator(operator, left_value, right_value)
+                    }
                 }
                 _ => unreachable!("prepared expression only contains supported operators"),
             }
