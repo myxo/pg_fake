@@ -91,7 +91,7 @@ pub(super) fn resolve_conflict_arbiter(
                     Constraint::PrimaryKey { columns, .. } | Constraint::Unique { columns, .. } => {
                         columns
                     }
-                    Constraint::Check(_) | Constraint::ForeignKey(_) => return None,
+                    Constraint::Check { .. } | Constraint::ForeignKey(_) => return None,
                 };
                 let indexes = columns
                     .iter()
@@ -123,7 +123,7 @@ pub(super) fn resolve_conflict_arbiter(
                         ..
                     } => constraint_name == &name,
                     Constraint::ForeignKey(foreign_key) => foreign_key.name == name,
-                    Constraint::Check(_) => false,
+                    Constraint::Check { .. } => false,
                 })
             else {
                 return Err(PgError::create(
@@ -149,7 +149,7 @@ pub(super) fn resolve_conflict_arbiter(
                             .collect(),
                     )
                 }
-                Constraint::Check(_) | Constraint::ForeignKey(_) => {
+                Constraint::Check { .. } | Constraint::ForeignKey(_) => {
                     return Err(PgError::create(
                         SqlState::WrongObjectType,
                         format!("constraint {name:?} has no associated index"),
@@ -610,7 +610,7 @@ fn execute_insert_conflict(
     has_referencing_foreign_keys: bool,
     xid: Xid,
     snapshot: &Snapshot,
-    deferred_constraints: &BTreeSet<String>,
+    deferred_constraints: &BTreeSet<ConstraintId>,
     defer_all: bool,
     context: &StatementExecutionContext,
 ) -> Result<InsertConflictOutcome> {
@@ -761,7 +761,7 @@ fn insert_new_row(
     returned_rows: &mut Vec<Vec<Value>>,
     xid: Xid,
     snapshot: &Snapshot,
-    deferred_constraints: &BTreeSet<String>,
+    deferred_constraints: &BTreeSet<ConstraintId>,
     defer_all: bool,
     context: &StatementExecutionContext,
 ) -> Result<RowId> {
@@ -812,7 +812,7 @@ pub(super) fn execute_insert(
     insert: &ast::Insert,
     xid: Xid,
     snapshot: &Snapshot,
-    deferred_constraints: &BTreeSet<String>,
+    deferred_constraints: &BTreeSet<ConstraintId>,
     defer_all: bool,
     context: &StatementExecutionContext,
 ) -> Result<StatementResult> {
@@ -856,7 +856,7 @@ pub(super) fn execute_insert(
             .constraints
             .iter()
             .any(|constraint| matches!(constraint, Constraint::ForeignKey(_)));
-    let has_referencing_foreign_keys = state.catalog.has_referencing_foreign_keys(&schema.name);
+    let has_referencing_foreign_keys = state.catalog.has_referencing_foreign_keys(schema.id);
     let mut returned_rows = Vec::new();
     let mut affected = 0;
     let mut affected_rows = BTreeSet::new();
@@ -935,7 +935,7 @@ pub(super) fn execute_update(
     returning_items: Option<&[ast::SelectItem]>,
     xid: Xid,
     snapshot: &Snapshot,
-    deferred_constraints: &BTreeSet<String>,
+    deferred_constraints: &BTreeSet<ConstraintId>,
     defer_all: bool,
     context: &StatementExecutionContext,
     mutation_targets: Option<Vec<RequiredRowLock>>,
@@ -1005,7 +1005,7 @@ pub(super) fn execute_update(
         mutation_targets,
     )?;
     let affected = targets.len() as u64;
-    let has_referencing_foreign_keys = state.catalog.has_referencing_foreign_keys(&schema.name);
+    let has_referencing_foreign_keys = state.catalog.has_referencing_foreign_keys(schema.id);
     let has_foreign_keys = schema
         .constraints
         .iter()
@@ -1144,7 +1144,7 @@ pub(super) fn execute_delete(
     delete: &ast::Delete,
     xid: Xid,
     snapshot: &Snapshot,
-    deferred_constraints: &BTreeSet<String>,
+    deferred_constraints: &BTreeSet<ConstraintId>,
     defer_all: bool,
     context: &StatementExecutionContext,
     mut mutation_targets: Option<Vec<RequiredRowLock>>,
@@ -1196,7 +1196,7 @@ pub(super) fn execute_delete(
             ));
         }
     }
-    let has_referencing_foreign_keys = state.catalog.has_referencing_foreign_keys(&schema.name);
+    let has_referencing_foreign_keys = state.catalog.has_referencing_foreign_keys(schema.id);
     if using.is_empty() && returning.is_none() && !has_referencing_foreign_keys {
         if let Some(mutation_targets) = mutation_targets.take() {
             let targets = mutation_targets

@@ -4,10 +4,14 @@ use sqlparser::ast;
 
 use crate::{
     error::{PgError, Result, SqlState, reject_unsupported},
+    txn::{CommandId, CommitSeq, Snapshot, TransactionRegistry, TransactionStatus, Xid},
     value::{BaseType, PgType},
 };
 
 pub(crate) const DEFAULT_SCHEMA: &str = "public";
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub(crate) struct SchemaId(pub(crate) u64);
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub(crate) struct TableId(pub(crate) u64);
@@ -15,9 +19,13 @@ pub(crate) struct TableId(pub(crate) u64);
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub(crate) struct SequenceId(pub(crate) u64);
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub(crate) struct ConstraintId(pub(crate) u64);
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct SequenceSchema {
     pub(crate) id: SequenceId,
+    pub(crate) schema_id: SchemaId,
     pub(crate) name: String,
     pub(crate) data_type: BaseType,
     pub(crate) increment: i64,
@@ -26,7 +34,7 @@ pub(crate) struct SequenceSchema {
     pub(crate) start_value: i64,
     pub(crate) cycle: bool,
     pub(crate) cache: i64,
-    pub(crate) owned_by: Option<(String, String)>,
+    pub(crate) owned_by: Option<(TableId, String)>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -47,10 +55,38 @@ pub(crate) struct ColumnDef {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum Constraint {
-    PrimaryKey { name: String, columns: Vec<String> },
-    Unique { name: String, columns: Vec<String> },
-    Check(Box<ast::Expr>),
+    PrimaryKey {
+        id: ConstraintId,
+        name: String,
+        columns: Vec<String>,
+    },
+    Unique {
+        id: ConstraintId,
+        name: String,
+        columns: Vec<String>,
+    },
+    Check {
+        id: ConstraintId,
+        expression: Box<ast::Expr>,
+    },
     ForeignKey(ForeignKey),
+}
+
+impl Constraint {
+    pub(crate) fn get_id(&self) -> ConstraintId {
+        match self {
+            Self::PrimaryKey { id, .. } | Self::Unique { id, .. } | Self::Check { id, .. } => *id,
+            Self::ForeignKey(foreign_key) => foreign_key.id,
+        }
+    }
+
+    pub(crate) fn get_name(&self) -> Option<&str> {
+        match self {
+            Self::PrimaryKey { name, .. } | Self::Unique { name, .. } => Some(name),
+            Self::Check { .. } => None,
+            Self::ForeignKey(foreign_key) => Some(&foreign_key.name),
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -64,9 +100,11 @@ pub(crate) enum ForeignKeyAction {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct ForeignKey {
+    pub(crate) id: ConstraintId,
     pub(crate) name: String,
     pub(crate) columns: Vec<String>,
     pub(crate) foreign_table: String,
+    pub(crate) foreign_table_id: TableId,
     pub(crate) referred_columns: Vec<String>,
     pub(crate) on_delete: ForeignKeyAction,
     pub(crate) on_update: ForeignKeyAction,
@@ -78,6 +116,7 @@ pub(crate) struct ForeignKey {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct TableSchema {
     pub(crate) id: TableId,
+    pub(crate) schema_id: SchemaId,
     pub(crate) name: String,
     pub(crate) columns: Vec<ColumnDef>,
     pub(crate) constraints: Vec<Constraint>,
@@ -85,6 +124,7 @@ pub(crate) struct TableSchema {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct Schema {
+    pub(crate) id: SchemaId,
     pub(crate) name: String,
     tables: BTreeMap<String, TableSchema>,
     sequences: BTreeMap<String, SequenceSchema>,
@@ -92,11 +132,45 @@ pub(crate) struct Schema {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct Catalog {
-    public: Schema,
+    schemas: BTreeMap<String, Schema>,
+    next_schema_id: u64,
     next_table_id: u64,
     next_sequence_id: u64,
-    deferrable_foreign_keys: Vec<(String, bool)>,
-    referencing_foreign_keys: BTreeMap<String, Vec<(String, usize)>>,
+    next_constraint_id: u64,
+    deferrable_foreign_keys: Vec<(ConstraintId, bool)>,
+    referencing_foreign_keys: BTreeMap<TableId, Vec<(TableId, usize)>>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct SchemaIdentity {
+    id: SchemaId,
+    name: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct CatalogVersion<T> {
+    xmin: Option<Xid>,
+    xmin_command_id: CommandId,
+    xmax: Option<Xid>,
+    xmax_command_id: Option<CommandId>,
+    value: T,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct CatalogHistory {
+    schemas: BTreeMap<SchemaId, Vec<CatalogVersion<SchemaIdentity>>>,
+    tables: BTreeMap<TableId, Vec<CatalogVersion<TableSchema>>>,
+    sequences: BTreeMap<SequenceId, Vec<CatalogVersion<SequenceSchema>>>,
+    next_schema_id: u64,
+    next_table_id: u64,
+    next_sequence_id: u64,
+    next_constraint_id: u64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct ReclaimedCatalogObjects {
+    pub(crate) tables: Vec<TableId>,
+    pub(crate) sequences: Vec<SequenceId>,
 }
 
 impl Default for Catalog {
@@ -109,17 +183,94 @@ impl Default for Catalog {
 impl Catalog {
     #[cfg_attr(feature = "execution-log", tracing::instrument(skip_all))]
     pub(crate) fn create() -> Self {
+        let public = Schema {
+            id: SchemaId(1),
+            name: DEFAULT_SCHEMA.into(),
+            tables: BTreeMap::new(),
+            sequences: BTreeMap::new(),
+        };
         Catalog {
-            public: Schema {
-                name: DEFAULT_SCHEMA.into(),
-                tables: BTreeMap::new(),
-                sequences: BTreeMap::new(),
-            },
+            schemas: BTreeMap::from([(public.name.clone(), public)]),
+            next_schema_id: 2,
             next_table_id: 1,
             next_sequence_id: 1,
+            next_constraint_id: 1,
             deferrable_foreign_keys: Vec::new(),
             referencing_foreign_keys: BTreeMap::new(),
         }
+    }
+
+    fn get_default_schema(&self) -> &Schema {
+        self.require_schema(DEFAULT_SCHEMA)
+            .expect("the public schema must exist")
+    }
+
+    fn get_default_schema_mut(&mut self) -> &mut Schema {
+        self.schemas
+            .get_mut(DEFAULT_SCHEMA)
+            .expect("the public schema must exist")
+    }
+
+    fn get_schema_by_id_mut(&mut self, id: SchemaId) -> &mut Schema {
+        self.schemas
+            .values_mut()
+            .find(|schema| schema.id == id)
+            .expect("catalog object schema must exist")
+    }
+
+    #[cfg_attr(not(test), allow(dead_code))]
+    pub(crate) fn create_schema(&mut self, name: String) -> Result<SchemaId> {
+        if self.schemas.contains_key(&name) {
+            return Err(PgError::create(
+                SqlState::DuplicateSchema,
+                format!("schema {name:?} already exists"),
+            ));
+        }
+        let id = SchemaId(self.next_schema_id);
+        self.next_schema_id += 1;
+        let previous = self.schemas.insert(
+            name.clone(),
+            Schema {
+                id,
+                name,
+                tables: BTreeMap::new(),
+                sequences: BTreeMap::new(),
+            },
+        );
+        assert!(previous.is_none(), "new schema must not replace a schema");
+        Ok(id)
+    }
+
+    #[cfg_attr(not(test), allow(dead_code))]
+    pub(crate) fn drop_schema(&mut self, name: &str) -> Result<Schema> {
+        if name == DEFAULT_SCHEMA {
+            return reject_unsupported("dropping the public schema is not implemented");
+        }
+        let schema = self.schemas.get(name).ok_or_else(|| {
+            PgError::create(
+                SqlState::InvalidSchemaName,
+                format!("schema {name:?} does not exist"),
+            )
+        })?;
+        if !schema.tables.is_empty() || !schema.sequences.is_empty() {
+            return Err(PgError::create(
+                SqlState::DependentObjectsStillExist,
+                format!("cannot drop schema {name:?} because other objects depend on it"),
+            ));
+        }
+        Ok(self
+            .schemas
+            .remove(name)
+            .expect("required schema must exist"))
+    }
+
+    pub(crate) fn require_schema(&self, name: &str) -> Result<&Schema> {
+        self.schemas.get(name).ok_or_else(|| {
+            PgError::create(
+                SqlState::InvalidSchemaName,
+                format!("schema {name:?} does not exist"),
+            )
+        })
     }
 
     #[cfg_attr(feature = "execution-log", tracing::instrument(skip_all))]
@@ -127,7 +278,7 @@ impl Catalog {
         &mut self,
         name: String,
         columns: Vec<ColumnDef>,
-        constraints: Vec<Constraint>,
+        mut constraints: Vec<Constraint>,
     ) -> Result<TableId> {
         if self.has_relation(&name) {
             return Err(PgError::create(
@@ -138,10 +289,29 @@ impl Catalog {
 
         let id = TableId(self.next_table_id);
         self.next_table_id += 1;
-        self.public.tables.insert(
+        let schema_id = self.get_default_schema().id;
+        for constraint in &mut constraints {
+            let constraint_id = ConstraintId(self.next_constraint_id);
+            self.next_constraint_id += 1;
+            match constraint {
+                Constraint::PrimaryKey { id, .. }
+                | Constraint::Unique { id, .. }
+                | Constraint::Check { id, .. } => *id = constraint_id,
+                Constraint::ForeignKey(foreign_key) => {
+                    foreign_key.id = constraint_id;
+                    foreign_key.foreign_table_id = if foreign_key.foreign_table == name {
+                        id
+                    } else {
+                        self.require_table(&foreign_key.foreign_table)?.id
+                    };
+                }
+            }
+        }
+        self.get_default_schema_mut().tables.insert(
             name.clone(),
             TableSchema {
                 id,
+                schema_id,
                 name,
                 columns,
                 constraints,
@@ -153,13 +323,31 @@ impl Catalog {
 
     #[cfg_attr(feature = "execution-log", tracing::instrument(skip_all))]
     pub(crate) fn require_table(&self, name: &str) -> Result<&TableSchema> {
-        if self.public.sequences.contains_key(name) {
+        let schema = self.get_default_schema();
+        if schema.sequences.contains_key(name) {
             return Err(PgError::create(
                 SqlState::WrongObjectType,
                 format!("{name:?} is not a table"),
             ));
         }
-        self.public.tables.get(name).ok_or_else(|| {
+        schema.tables.get(name).ok_or_else(|| {
+            PgError::create(
+                SqlState::UndefinedTable,
+                format!("relation {name:?} does not exist"),
+            )
+        })
+    }
+
+    #[cfg_attr(not(test), allow(dead_code))]
+    pub(crate) fn require_table_mut(&mut self, name: &str) -> Result<&mut TableSchema> {
+        let schema = self.get_default_schema_mut();
+        if schema.sequences.contains_key(name) {
+            return Err(PgError::create(
+                SqlState::WrongObjectType,
+                format!("{name:?} is not a table"),
+            ));
+        }
+        schema.tables.get_mut(name).ok_or_else(|| {
             PgError::create(
                 SqlState::UndefinedTable,
                 format!("relation {name:?} does not exist"),
@@ -168,24 +356,57 @@ impl Catalog {
     }
 
     #[cfg_attr(feature = "execution-log", tracing::instrument(skip_all))]
+    pub(crate) fn require_table_by_id(&self, id: TableId) -> Result<&TableSchema> {
+        self.schemas
+            .values()
+            .flat_map(|schema| schema.tables.values())
+            .find(|table| table.id == id)
+            .ok_or_else(|| {
+                PgError::create(
+                    SqlState::UndefinedTable,
+                    format!("relation with id {} does not exist", id.0),
+                )
+            })
+    }
+
+    pub(crate) fn has_constraint(&self, table_id: TableId, constraint_id: ConstraintId) -> bool {
+        self.require_table_by_id(table_id).is_ok_and(|table| {
+            table
+                .constraints
+                .iter()
+                .any(|constraint| constraint.get_id() == constraint_id)
+        })
+    }
+
+    #[cfg_attr(feature = "execution-log", tracing::instrument(skip_all))]
     pub(crate) fn iterate_tables(&self) -> impl Iterator<Item = &TableSchema> {
-        self.public.tables.values()
+        self.schemas
+            .values()
+            .flat_map(|schema| schema.tables.values())
     }
 
     #[cfg_attr(feature = "execution-log", tracing::instrument(skip_all))]
     pub(crate) fn drop_table(&mut self, name: &str) -> Result<TableSchema> {
-        if self.public.sequences.contains_key(name) {
+        if self.get_default_schema().sequences.contains_key(name) {
             return Err(PgError::create(
                 SqlState::WrongObjectType,
                 format!("{name:?} is not a table"),
             ));
         }
-        if let Some((table, constraint)) = self.public.tables.values().find_map(|table| {
+        let target = self.get_default_schema().tables.get(name).ok_or_else(|| {
+            PgError::create(
+                SqlState::UndefinedTable,
+                format!("table {name:?} does not exist"),
+            )
+        })?;
+        if let Some((table, constraint)) = self.iterate_tables().find_map(|table| {
             table
                 .constraints
                 .iter()
                 .find_map(|constraint| match constraint {
-                    Constraint::ForeignKey(foreign_key) if foreign_key.foreign_table == name => {
+                    Constraint::ForeignKey(foreign_key)
+                        if foreign_key.foreign_table_id == target.id =>
+                    {
                         Some((table.name.as_str(), foreign_key.name.as_str()))
                     }
                     _ => None,
@@ -195,19 +416,21 @@ impl Catalog {
                 "cannot drop table {name:?} because constraint {constraint:?} on table {table:?} depends on it"
             ));
         }
-        let table = self.public.tables.remove(name).ok_or_else(|| {
-            PgError::create(
-                SqlState::UndefinedTable,
-                format!("table {name:?} does not exist"),
-            )
-        })?;
+        let table = self
+            .get_default_schema_mut()
+            .tables
+            .remove(name)
+            .expect("required table must exist");
         self.rebuild_foreign_key_metadata();
         Ok(table)
     }
 
     #[cfg_attr(feature = "execution-log", tracing::instrument(skip_all))]
     pub(crate) fn restore_table(&mut self, table: TableSchema) {
-        let previous = self.public.tables.insert(table.name.clone(), table);
+        let previous = self
+            .get_schema_by_id_mut(table.schema_id)
+            .tables
+            .insert(table.name.clone(), table);
         assert!(previous.is_none(), "restored table must not already exist");
         self.rebuild_foreign_key_metadata();
     }
@@ -215,27 +438,28 @@ impl Catalog {
     #[cfg_attr(feature = "execution-log", tracing::instrument(skip_all))]
     pub(crate) fn contains_deferred_foreign_keys(
         &self,
-        deferred_constraints: &std::collections::BTreeSet<String>,
+        deferred_constraints: &std::collections::BTreeSet<ConstraintId>,
         defer_all: bool,
     ) -> bool {
         self.deferrable_foreign_keys
             .iter()
-            .any(|(name, initially_deferred)| {
-                defer_all || *initially_deferred || deferred_constraints.contains(name)
+            .any(|(id, initially_deferred)| {
+                defer_all || *initially_deferred || deferred_constraints.contains(id)
             })
     }
 
     #[cfg_attr(feature = "execution-log", tracing::instrument(skip_all))]
-    pub(crate) fn referencing_foreign_keys(&self, parent: &str) -> Vec<(TableSchema, ForeignKey)> {
+    pub(crate) fn referencing_foreign_keys(
+        &self,
+        parent: TableId,
+    ) -> Vec<(TableSchema, ForeignKey)> {
         self.referencing_foreign_keys
-            .get(parent)
+            .get(&parent)
             .into_iter()
             .flatten()
             .map(|(table, constraint)| {
                 let schema = self
-                    .public
-                    .tables
-                    .get(table)
+                    .require_table_by_id(*table)
                     .expect("foreign key metadata references an existing table");
                 let Constraint::ForeignKey(foreign_key) = &schema.constraints[*constraint] else {
                     unreachable!("foreign key metadata references a foreign key")
@@ -245,27 +469,27 @@ impl Catalog {
             .collect()
     }
 
-    pub(crate) fn has_referencing_foreign_keys(&self, parent: &str) -> bool {
-        self.referencing_foreign_keys.contains_key(parent)
+    pub(crate) fn has_referencing_foreign_keys(&self, parent: TableId) -> bool {
+        self.referencing_foreign_keys.contains_key(&parent)
     }
 
     #[cfg_attr(feature = "execution-log", tracing::instrument(skip_all))]
     fn rebuild_foreign_key_metadata(&mut self) {
         let mut deferrable_foreign_keys = Vec::new();
-        let mut referencing_foreign_keys: BTreeMap<String, Vec<(String, usize)>> = BTreeMap::new();
-        for schema in self.public.tables.values() {
-            for (index, constraint) in schema.constraints.iter().enumerate() {
+        let mut referencing_foreign_keys: BTreeMap<TableId, Vec<(TableId, usize)>> =
+            BTreeMap::new();
+        for table in self.iterate_tables() {
+            for (index, constraint) in table.constraints.iter().enumerate() {
                 let Constraint::ForeignKey(foreign_key) = constraint else {
                     continue;
                 };
                 if foreign_key.deferrable {
-                    deferrable_foreign_keys
-                        .push((foreign_key.name.clone(), foreign_key.initially_deferred));
+                    deferrable_foreign_keys.push((foreign_key.id, foreign_key.initially_deferred));
                 }
                 referencing_foreign_keys
-                    .entry(foreign_key.foreign_table.clone())
+                    .entry(foreign_key.foreign_table_id)
                     .or_default()
-                    .push((schema.name.clone(), index));
+                    .push((table.id, index));
             }
         }
         self.deferrable_foreign_keys = deferrable_foreign_keys;
@@ -274,7 +498,8 @@ impl Catalog {
 
     #[cfg_attr(feature = "execution-log", tracing::instrument(skip_all))]
     pub(crate) fn has_relation(&self, name: &str) -> bool {
-        self.public.tables.contains_key(name) || self.public.sequences.contains_key(name)
+        let schema = self.get_default_schema();
+        schema.tables.contains_key(name) || schema.sequences.contains_key(name)
     }
 
     #[cfg_attr(feature = "execution-log", tracing::instrument(skip_all))]
@@ -288,7 +513,8 @@ impl Catalog {
         let id = SequenceId(self.next_sequence_id);
         self.next_sequence_id += 1;
         sequence.id = id;
-        self.public
+        sequence.schema_id = self.get_default_schema().id;
+        self.get_default_schema_mut()
             .sequences
             .insert(sequence.name.clone(), sequence);
         Ok(id)
@@ -296,13 +522,14 @@ impl Catalog {
 
     #[cfg_attr(feature = "execution-log", tracing::instrument(skip_all))]
     pub(crate) fn require_sequence(&self, name: &str) -> Result<&SequenceSchema> {
-        if self.public.tables.contains_key(name) {
+        let schema = self.get_default_schema();
+        if schema.tables.contains_key(name) {
             return Err(PgError::create(
                 SqlState::WrongObjectType,
                 format!("{name:?} is not a sequence"),
             ));
         }
-        self.public.sequences.get(name).ok_or_else(|| {
+        schema.sequences.get(name).ok_or_else(|| {
             PgError::create(
                 SqlState::UndefinedTable,
                 format!("relation {name:?} does not exist"),
@@ -312,53 +539,62 @@ impl Catalog {
 
     #[cfg_attr(feature = "execution-log", tracing::instrument(skip_all))]
     pub(crate) fn iterate_sequences(&self) -> impl Iterator<Item = &SequenceSchema> {
-        self.public.sequences.values()
+        self.schemas
+            .values()
+            .flat_map(|schema| schema.sequences.values())
     }
 
     #[cfg_attr(feature = "execution-log", tracing::instrument(skip_all))]
     pub(crate) fn drop_sequence(&mut self, name: &str) -> Result<SequenceSchema> {
-        if self.public.tables.contains_key(name) {
+        if self.get_default_schema().tables.contains_key(name) {
             return Err(PgError::create(
                 SqlState::WrongObjectType,
                 format!("{name:?} is not a sequence"),
             ));
         }
         if let Some((table, column)) = self
-            .public
+            .get_default_schema()
             .sequences
             .get(name)
             .and_then(|sequence| sequence.owned_by.as_ref())
         {
+            let table = self
+                .require_table_by_id(*table)
+                .expect("sequence owner must remain visible");
             return Err(PgError::create(
                 SqlState::DependentObjectsStillExist,
                 format!(
-                    "cannot drop sequence {name:?} because column {column:?} of table {table:?} requires it"
+                    "cannot drop sequence {name:?} because column {column:?} of table {:?} requires it",
+                    table.name
                 ),
             ));
         }
-        self.public.sequences.remove(name).ok_or_else(|| {
-            PgError::create(
-                SqlState::UndefinedTable,
-                format!("sequence {name:?} does not exist"),
-            )
-        })
+        self.get_default_schema_mut()
+            .sequences
+            .remove(name)
+            .ok_or_else(|| {
+                PgError::create(
+                    SqlState::UndefinedTable,
+                    format!("sequence {name:?} does not exist"),
+                )
+            })
     }
 
     #[cfg_attr(feature = "execution-log", tracing::instrument(skip_all))]
-    pub(crate) fn drop_owned_sequences(&mut self, table_name: &str) -> Vec<SequenceSchema> {
+    pub(crate) fn drop_owned_sequences(&mut self, table_id: TableId) -> Vec<SequenceSchema> {
         let names = self
-            .public
+            .get_default_schema()
             .sequences
             .iter()
             .filter_map(|(name, sequence)| {
-                (sequence.owned_by.as_ref().map(|(table, _)| table.as_str()) == Some(table_name))
+                (sequence.owned_by.as_ref().map(|(table, _)| *table) == Some(table_id))
                     .then_some(name.clone())
             })
             .collect::<Vec<_>>();
         names
             .into_iter()
             .map(|name| {
-                self.public
+                self.get_default_schema_mut()
                     .sequences
                     .remove(&name)
                     .expect("owned sequence must exist")
@@ -369,7 +605,7 @@ impl Catalog {
     #[cfg_attr(feature = "execution-log", tracing::instrument(skip_all))]
     pub(crate) fn restore_sequence(&mut self, sequence: SequenceSchema) {
         let previous = self
-            .public
+            .get_schema_by_id_mut(sequence.schema_id)
             .sequences
             .insert(sequence.name.clone(), sequence);
         assert!(
@@ -379,10 +615,362 @@ impl Catalog {
     }
 }
 
+impl CatalogHistory {
+    #[cfg_attr(feature = "execution-log", tracing::instrument(skip_all))]
+    pub(crate) fn create() -> Self {
+        let schema = SchemaIdentity {
+            id: SchemaId(1),
+            name: DEFAULT_SCHEMA.into(),
+        };
+        CatalogHistory {
+            schemas: BTreeMap::from([(
+                schema.id,
+                vec![CatalogVersion {
+                    xmin: None,
+                    xmin_command_id: CommandId(0),
+                    xmax: None,
+                    xmax_command_id: None,
+                    value: schema,
+                }],
+            )]),
+            tables: BTreeMap::new(),
+            sequences: BTreeMap::new(),
+            next_schema_id: 2,
+            next_table_id: 1,
+            next_sequence_id: 1,
+            next_constraint_id: 1,
+        }
+    }
+
+    #[cfg_attr(feature = "execution-log", tracing::instrument(skip_all))]
+    pub(crate) fn materialize(
+        &self,
+        xid: Option<Xid>,
+        snapshot: Snapshot,
+        transactions: &TransactionRegistry,
+    ) -> Catalog {
+        let schemas = self
+            .schemas
+            .values()
+            .filter_map(|versions| {
+                find_visible_catalog_version(versions, xid, snapshot, transactions)
+            })
+            .map(|schema| {
+                (
+                    schema.name.clone(),
+                    Schema {
+                        id: schema.id,
+                        name: schema.name.clone(),
+                        tables: BTreeMap::new(),
+                        sequences: BTreeMap::new(),
+                    },
+                )
+            })
+            .collect::<BTreeMap<_, _>>();
+        assert!(
+            schemas.contains_key(DEFAULT_SCHEMA),
+            "the public schema must remain visible"
+        );
+        let mut catalog = Catalog {
+            schemas,
+            next_schema_id: self.next_schema_id,
+            next_table_id: self.next_table_id,
+            next_sequence_id: self.next_sequence_id,
+            next_constraint_id: self.next_constraint_id,
+            deferrable_foreign_keys: Vec::new(),
+            referencing_foreign_keys: BTreeMap::new(),
+        };
+        for versions in self.tables.values() {
+            let Some(table) = find_visible_catalog_version(versions, xid, snapshot, transactions)
+            else {
+                continue;
+            };
+            let previous = catalog
+                .get_schema_by_id_mut(table.schema_id)
+                .tables
+                .insert(table.name.clone(), table.clone());
+            assert!(
+                previous.is_none(),
+                "visible catalog relation names must be unique"
+            );
+        }
+        for versions in self.sequences.values() {
+            let Some(sequence) =
+                find_visible_catalog_version(versions, xid, snapshot, transactions)
+            else {
+                continue;
+            };
+            let previous = catalog
+                .get_schema_by_id_mut(sequence.schema_id)
+                .sequences
+                .insert(sequence.name.clone(), sequence.clone());
+            assert!(
+                previous.is_none(),
+                "visible catalog relation names must be unique"
+            );
+        }
+        catalog.rebuild_foreign_key_metadata();
+        catalog
+    }
+
+    #[cfg_attr(feature = "execution-log", tracing::instrument(skip_all))]
+    pub(crate) fn record_changes(
+        &mut self,
+        previous: &Catalog,
+        current: &Catalog,
+        xid: Xid,
+        command_id: CommandId,
+    ) {
+        record_catalog_changes(
+            &mut self.schemas,
+            previous.schemas.values().map(|schema| {
+                (
+                    schema.id,
+                    SchemaIdentity {
+                        id: schema.id,
+                        name: schema.name.clone(),
+                    },
+                )
+            }),
+            current.schemas.values().map(|schema| {
+                (
+                    schema.id,
+                    SchemaIdentity {
+                        id: schema.id,
+                        name: schema.name.clone(),
+                    },
+                )
+            }),
+            xid,
+            command_id,
+        );
+        record_catalog_changes(
+            &mut self.tables,
+            previous
+                .schemas
+                .values()
+                .flat_map(|schema| schema.tables.values())
+                .map(|table| (table.id, table.clone())),
+            current
+                .schemas
+                .values()
+                .flat_map(|schema| schema.tables.values())
+                .map(|table| (table.id, table.clone())),
+            xid,
+            command_id,
+        );
+        record_catalog_changes(
+            &mut self.sequences,
+            previous
+                .schemas
+                .values()
+                .flat_map(|schema| schema.sequences.values())
+                .map(|sequence| (sequence.id, sequence.clone())),
+            current
+                .schemas
+                .values()
+                .flat_map(|schema| schema.sequences.values())
+                .map(|sequence| (sequence.id, sequence.clone())),
+            xid,
+            command_id,
+        );
+        self.next_schema_id = self.next_schema_id.max(current.next_schema_id);
+        self.next_table_id = self.next_table_id.max(current.next_table_id);
+        self.next_sequence_id = self.next_sequence_id.max(current.next_sequence_id);
+        self.next_constraint_id = self.next_constraint_id.max(current.next_constraint_id);
+    }
+
+    #[cfg_attr(feature = "execution-log", tracing::instrument(skip_all))]
+    pub(crate) fn discard_transaction(&mut self, xid: Xid) -> ReclaimedCatalogObjects {
+        discard_catalog_transaction(&mut self.schemas, xid);
+        ReclaimedCatalogObjects {
+            tables: discard_catalog_transaction(&mut self.tables, xid),
+            sequences: discard_catalog_transaction(&mut self.sequences, xid),
+        }
+    }
+
+    #[cfg_attr(feature = "execution-log", tracing::instrument(skip_all))]
+    pub(crate) fn prune(
+        &mut self,
+        horizon: CommitSeq,
+        transactions: &TransactionRegistry,
+        protected_tables: &std::collections::BTreeSet<TableId>,
+    ) -> ReclaimedCatalogObjects {
+        prune_catalog_versions(
+            &mut self.schemas,
+            horizon,
+            transactions,
+            &std::collections::BTreeSet::new(),
+        );
+        ReclaimedCatalogObjects {
+            tables: prune_catalog_versions(
+                &mut self.tables,
+                horizon,
+                transactions,
+                protected_tables,
+            ),
+            sequences: prune_catalog_versions(
+                &mut self.sequences,
+                horizon,
+                transactions,
+                &std::collections::BTreeSet::new(),
+            ),
+        }
+    }
+}
+
+#[cfg_attr(feature = "execution-log", tracing::instrument(skip_all))]
+fn record_catalog_changes<Id, T>(
+    histories: &mut BTreeMap<Id, Vec<CatalogVersion<T>>>,
+    previous: impl Iterator<Item = (Id, T)>,
+    current: impl Iterator<Item = (Id, T)>,
+    xid: Xid,
+    command_id: CommandId,
+) where
+    Id: Copy + Ord,
+    T: Clone + PartialEq,
+{
+    let previous = previous.collect::<BTreeMap<_, _>>();
+    let current = current.collect::<BTreeMap<_, _>>();
+    for (id, old) in &previous {
+        if current.get(id).is_some_and(|new| new == old) {
+            continue;
+        }
+        let version = histories
+            .get_mut(id)
+            .and_then(|versions| {
+                versions
+                    .iter_mut()
+                    .rev()
+                    .find(|version| version.xmax.is_none() && &version.value == old)
+            })
+            .expect("materialized catalog object must have a live version");
+        version.xmax = Some(xid);
+        version.xmax_command_id = Some(command_id);
+    }
+    for (id, new) in current {
+        if previous.get(&id).is_some_and(|old| old == &new) {
+            continue;
+        }
+        histories.entry(id).or_default().push(CatalogVersion {
+            xmin: Some(xid),
+            xmin_command_id: command_id,
+            xmax: None,
+            xmax_command_id: None,
+            value: new,
+        });
+    }
+}
+
+#[cfg_attr(feature = "execution-log", tracing::instrument(skip_all))]
+fn discard_catalog_transaction<Id, T>(
+    histories: &mut BTreeMap<Id, Vec<CatalogVersion<T>>>,
+    xid: Xid,
+) -> Vec<Id>
+where
+    Id: Copy + Ord,
+{
+    for versions in histories.values_mut() {
+        versions.retain(|version| version.xmin != Some(xid));
+        for version in versions {
+            if version.xmax == Some(xid) {
+                version.xmax = None;
+                version.xmax_command_id = None;
+            }
+        }
+    }
+    let removed = histories
+        .iter()
+        .filter_map(|(id, versions)| versions.is_empty().then_some(*id))
+        .collect::<Vec<_>>();
+    histories.retain(|_, versions| !versions.is_empty());
+    removed
+}
+
+#[cfg_attr(feature = "execution-log", tracing::instrument(skip_all))]
+fn prune_catalog_versions<Id, T>(
+    histories: &mut BTreeMap<Id, Vec<CatalogVersion<T>>>,
+    horizon: CommitSeq,
+    transactions: &TransactionRegistry,
+    protected: &std::collections::BTreeSet<Id>,
+) -> Vec<Id>
+where
+    Id: Copy + Ord,
+{
+    for (id, versions) in histories.iter_mut() {
+        let retained = versions
+            .iter()
+            .filter(|version| {
+                !matches!(
+                    version.xmax.and_then(|xmax| transactions.get_status(xmax)),
+                    Some(TransactionStatus::Committed(commit_seq)) if commit_seq <= horizon
+                )
+            })
+            .count();
+        if retained != 0 || !protected.contains(id) {
+            versions.retain(|version| {
+                !matches!(
+                    version.xmax.and_then(|xmax| transactions.get_status(xmax)),
+                    Some(TransactionStatus::Committed(commit_seq)) if commit_seq <= horizon
+                )
+            });
+        }
+    }
+    let removed = histories
+        .iter()
+        .filter_map(|(id, versions)| versions.is_empty().then_some(*id))
+        .collect::<Vec<_>>();
+    histories.retain(|_, versions| !versions.is_empty());
+    removed
+}
+
+#[cfg_attr(feature = "execution-log", tracing::instrument(skip_all))]
+fn find_visible_catalog_version<'a, T>(
+    versions: &'a [CatalogVersion<T>],
+    xid: Option<Xid>,
+    snapshot: Snapshot,
+    transactions: &TransactionRegistry,
+) -> Option<&'a T> {
+    versions
+        .iter()
+        .rev()
+        .find(|version| is_catalog_version_visible(version, xid, snapshot, transactions))
+        .map(|version| &version.value)
+}
+
+#[cfg_attr(feature = "execution-log", tracing::instrument(skip_all))]
+fn is_catalog_version_visible<T>(
+    version: &CatalogVersion<T>,
+    xid: Option<Xid>,
+    snapshot: Snapshot,
+    transactions: &TransactionRegistry,
+) -> bool {
+    let xmin_visible = match version.xmin {
+        None => true,
+        Some(xmin) if Some(xmin) == xid => version.xmin_command_id < snapshot.command_id,
+        Some(xmin) => matches!(
+            transactions.get_status(xmin),
+            Some(TransactionStatus::Committed(commit_seq)) if commit_seq <= snapshot.commit_seq
+        ),
+    };
+    let xmax_visible = match version.xmax {
+        None => false,
+        Some(xmax) if Some(xmax) == xid => version
+            .xmax_command_id
+            .is_some_and(|command_id| command_id < snapshot.command_id),
+        Some(xmax) => matches!(
+            transactions.get_status(xmax),
+            Some(TransactionStatus::Committed(commit_seq)) if commit_seq <= snapshot.commit_seq
+        ),
+    };
+    xmin_visible && !xmax_visible
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::value::BaseType;
+    use chaos_theory::check;
 
     #[cfg_attr(feature = "execution-log", tracing::instrument(skip_all))]
     fn create_column(name: &str, nullable: bool) -> ColumnDef {
@@ -393,6 +981,16 @@ mod tests {
             default: None,
             default_sequence: None,
             identity: None,
+        }
+    }
+
+    #[cfg_attr(feature = "execution-log", tracing::instrument(skip_all))]
+    fn get_constraint_id(constraint: &Constraint) -> ConstraintId {
+        match constraint {
+            Constraint::PrimaryKey { id, .. }
+            | Constraint::Unique { id, .. }
+            | Constraint::Check { id, .. } => *id,
+            Constraint::ForeignKey(foreign_key) => foreign_key.id,
         }
     }
 
@@ -411,7 +1009,10 @@ mod tests {
             .create_table("posts".into(), vec![create_column("id", false)], vec![])
             .unwrap();
 
-        assert_eq!(catalog.public.name, DEFAULT_SCHEMA);
+        assert_eq!(
+            catalog.require_schema(DEFAULT_SCHEMA).unwrap().name,
+            DEFAULT_SCHEMA
+        );
         assert_eq!(users, TableId(1));
         assert_eq!(posts, TableId(2));
         assert_eq!(catalog.require_table("users").unwrap().id, users);
@@ -456,6 +1057,558 @@ mod tests {
         assert_eq!(
             catalog.drop_table("missing").unwrap_err().sqlstate,
             SqlState::UndefinedTable
+        );
+    }
+
+    #[test]
+    #[cfg_attr(feature = "execution-log", tracing::instrument(skip_all))]
+    fn versions_catalog_visibility_and_preserves_relation_identity() {
+        let mut transactions = TransactionRegistry::create();
+        let mut history = CatalogHistory::create();
+        let before_create = Snapshot::create(&transactions);
+        let creator = transactions.begin();
+        let mut catalog = history.materialize(
+            Some(creator),
+            before_create.use_command(CommandId(0)),
+            &transactions,
+        );
+        let previous = catalog.clone();
+        let table_id = catalog
+            .create_table("items".into(), vec![create_column("id", false)], vec![])
+            .unwrap();
+        history.record_changes(&previous, &catalog, creator, CommandId(0));
+
+        assert!(
+            history
+                .materialize(
+                    Some(creator),
+                    before_create.use_command(CommandId(1)),
+                    &transactions,
+                )
+                .require_table("items")
+                .is_ok()
+        );
+        assert!(
+            history
+                .materialize(None, before_create, &transactions)
+                .require_table("items")
+                .is_err()
+        );
+
+        transactions.commit(creator);
+        let after_create = Snapshot::create(&transactions);
+        assert_eq!(
+            history
+                .materialize(None, after_create, &transactions)
+                .require_table("items")
+                .unwrap()
+                .id,
+            table_id
+        );
+        assert!(
+            history
+                .materialize(None, before_create, &transactions)
+                .require_table("items")
+                .is_err()
+        );
+    }
+
+    #[test]
+    #[cfg_attr(feature = "execution-log", tracing::instrument(skip_all))]
+    fn discards_aborted_catalog_versions_and_reclaims_created_identity() {
+        let mut transactions = TransactionRegistry::create();
+        let mut history = CatalogHistory::create();
+        let creator = transactions.begin();
+        let snapshot = Snapshot::create(&transactions);
+        let mut catalog = history.materialize(Some(creator), snapshot, &transactions);
+        let previous = catalog.clone();
+        let table_id = catalog
+            .create_table("items".into(), vec![create_column("id", false)], vec![])
+            .unwrap();
+        history.record_changes(&previous, &catalog, creator, CommandId(0));
+
+        let reclaimed = history.discard_transaction(creator);
+        transactions.abort(creator);
+
+        assert_eq!(reclaimed.tables, vec![table_id]);
+        assert!(
+            history
+                .materialize(None, Snapshot::create(&transactions), &transactions)
+                .require_table("items")
+                .is_err()
+        );
+    }
+
+    #[test]
+    #[cfg_attr(feature = "execution-log", tracing::instrument(skip_all))]
+    fn assigns_new_relation_and_constraint_identities_after_name_reuse() {
+        let mut catalog = Catalog::create();
+        let first_table = catalog
+            .create_table(
+                "items".into(),
+                vec![create_column("id", false)],
+                vec![Constraint::PrimaryKey {
+                    id: ConstraintId(0),
+                    name: "items_pkey".into(),
+                    columns: vec!["id".into()],
+                }],
+            )
+            .unwrap();
+        let first_constraint =
+            get_constraint_id(&catalog.require_table("items").unwrap().constraints[0]);
+        catalog.drop_table("items").unwrap();
+        let second_table = catalog
+            .create_table(
+                "items".into(),
+                vec![create_column("id", false)],
+                vec![Constraint::PrimaryKey {
+                    id: ConstraintId(0),
+                    name: "items_pkey".into(),
+                    columns: vec!["id".into()],
+                }],
+            )
+            .unwrap();
+        let second_constraint =
+            get_constraint_id(&catalog.require_table("items").unwrap().constraints[0]);
+
+        assert_ne!(first_table, second_table);
+        assert_ne!(first_constraint, second_constraint);
+    }
+
+    #[test]
+    #[cfg_attr(feature = "execution-log", tracing::instrument(skip_all))]
+    fn versions_schema_visibility_and_identity() {
+        let mut transactions = TransactionRegistry::create();
+        let mut history = CatalogHistory::create();
+        let before_create = Snapshot::create(&transactions);
+        let creator = transactions.begin();
+        let mut catalog = history.materialize(Some(creator), before_create, &transactions);
+        let previous = catalog.clone();
+        let first_id = catalog.create_schema("app".into()).unwrap();
+        history.record_changes(&previous, &catalog, creator, CommandId(0));
+
+        assert!(
+            history
+                .materialize(
+                    Some(creator),
+                    before_create.use_command(CommandId(1)),
+                    &transactions,
+                )
+                .require_schema("app")
+                .is_ok()
+        );
+        assert!(
+            history
+                .materialize(None, before_create, &transactions)
+                .require_schema("app")
+                .is_err()
+        );
+
+        transactions.commit(creator);
+        let before_drop = Snapshot::create(&transactions);
+        let changer = transactions.begin();
+        let mut catalog = history.materialize(Some(changer), before_drop, &transactions);
+        let previous = catalog.clone();
+        catalog.drop_schema("app").unwrap();
+        history.record_changes(&previous, &catalog, changer, CommandId(0));
+        let mut catalog = history.materialize(
+            Some(changer),
+            before_drop.use_command(CommandId(1)),
+            &transactions,
+        );
+        let previous = catalog.clone();
+        let second_id = catalog.create_schema("app".into()).unwrap();
+        history.record_changes(&previous, &catalog, changer, CommandId(1));
+
+        assert_ne!(first_id, second_id);
+        assert_eq!(
+            history
+                .materialize(
+                    Some(changer),
+                    before_drop.use_command(CommandId(2)),
+                    &transactions,
+                )
+                .require_schema("app")
+                .unwrap()
+                .id,
+            second_id
+        );
+        assert_eq!(
+            history
+                .materialize(None, before_drop, &transactions)
+                .require_schema("app")
+                .unwrap()
+                .id,
+            first_id
+        );
+    }
+
+    #[test]
+    #[cfg_attr(feature = "execution-log", tracing::instrument(skip_all))]
+    fn keeps_the_default_schema_materializable() {
+        let mut catalog = Catalog::create();
+
+        assert_eq!(
+            catalog.drop_schema(DEFAULT_SCHEMA).unwrap_err().sqlstate,
+            SqlState::FeatureNotSupported
+        );
+        assert_eq!(
+            catalog.require_schema(DEFAULT_SCHEMA).unwrap().id,
+            SchemaId(1)
+        );
+    }
+
+    #[test]
+    #[cfg_attr(feature = "execution-log", tracing::instrument(skip_all))]
+    fn preserves_catalog_snapshot_model_across_generated_name_reuse() {
+        check(|source| {
+            let commit_create: bool = source.any("commit_create");
+            let commit_change: bool = source.any("commit_change");
+            let recreate: bool = source.any("recreate");
+            let mut transactions = TransactionRegistry::create();
+            let mut history = CatalogHistory::create();
+            let creator = transactions.begin();
+            let before_create = Snapshot::create(&transactions);
+            let mut catalog = history.materialize(Some(creator), before_create, &transactions);
+            let previous = catalog.clone();
+            let first_id = catalog
+                .create_table("items".into(), vec![create_column("id", false)], vec![])
+                .unwrap();
+            history.record_changes(&previous, &catalog, creator, CommandId(0));
+
+            if !commit_create {
+                history.discard_transaction(creator);
+                transactions.abort(creator);
+                assert!(
+                    history
+                        .materialize(None, Snapshot::create(&transactions), &transactions)
+                        .require_table("items")
+                        .is_err()
+                );
+                return;
+            }
+
+            transactions.commit(creator);
+            let retained_snapshot = Snapshot::create(&transactions);
+            let reader = transactions.begin();
+            transactions.retain_snapshot(reader, retained_snapshot);
+            let changer = transactions.begin();
+            let mut catalog = history.materialize(Some(changer), retained_snapshot, &transactions);
+            let previous = catalog.clone();
+            catalog.drop_table("items").unwrap();
+            history.record_changes(&previous, &catalog, changer, CommandId(0));
+            let second_id = recreate.then(|| {
+                let mut catalog = history.materialize(
+                    Some(changer),
+                    retained_snapshot.use_command(CommandId(1)),
+                    &transactions,
+                );
+                let previous = catalog.clone();
+                let id = catalog
+                    .create_table("items".into(), vec![create_column("id", false)], vec![])
+                    .unwrap();
+                history.record_changes(&previous, &catalog, changer, CommandId(1));
+                id
+            });
+
+            assert_eq!(
+                history
+                    .materialize(Some(reader), retained_snapshot, &transactions)
+                    .require_table("items")
+                    .unwrap()
+                    .id,
+                first_id
+            );
+            if commit_change {
+                transactions.commit(changer);
+            } else {
+                history.discard_transaction(changer);
+                transactions.abort(changer);
+            }
+            let latest = history.materialize(None, Snapshot::create(&transactions), &transactions);
+            if commit_change {
+                match second_id {
+                    Some(id) => assert_eq!(latest.require_table("items").unwrap().id, id),
+                    None => assert!(latest.require_table("items").is_err()),
+                }
+            } else {
+                assert_eq!(latest.require_table("items").unwrap().id, first_id);
+            }
+            assert_eq!(
+                history
+                    .materialize(Some(reader), retained_snapshot, &transactions)
+                    .require_table("items")
+                    .unwrap()
+                    .id,
+                first_id
+            );
+        });
+    }
+
+    #[test]
+    #[cfg_attr(feature = "execution-log", tracing::instrument(skip_all))]
+    fn binds_foreign_keys_and_sequence_owners_to_table_identities() {
+        let mut catalog = Catalog::create();
+        let parent = catalog
+            .create_table(
+                "parents".into(),
+                vec![create_column("id", false)],
+                vec![Constraint::PrimaryKey {
+                    id: ConstraintId(0),
+                    name: "parents_pkey".into(),
+                    columns: vec!["id".into()],
+                }],
+            )
+            .unwrap();
+        let child = catalog
+            .create_table(
+                "children".into(),
+                vec![create_column("parent_id", false)],
+                vec![Constraint::ForeignKey(ForeignKey {
+                    id: ConstraintId(0),
+                    name: "children_parent_id_fkey".into(),
+                    columns: vec!["parent_id".into()],
+                    foreign_table: "parents".into(),
+                    foreign_table_id: TableId(0),
+                    referred_columns: vec!["id".into()],
+                    on_delete: ForeignKeyAction::NoAction,
+                    on_update: ForeignKeyAction::NoAction,
+                    deferrable: false,
+                    initially_deferred: false,
+                    match_kind: None,
+                })],
+            )
+            .unwrap();
+        let Constraint::ForeignKey(foreign_key) =
+            &catalog.require_table("children").unwrap().constraints[0]
+        else {
+            unreachable!()
+        };
+        assert_eq!(foreign_key.foreign_table_id, parent);
+        assert_eq!(catalog.referencing_foreign_keys(parent)[0].0.id, child);
+
+        let mut sequence = SequenceSchema {
+            id: SequenceId(0),
+            schema_id: SchemaId(0),
+            name: "parents_id_seq".into(),
+            data_type: BaseType::Int8,
+            increment: 1,
+            min_value: 1,
+            max_value: i64::MAX,
+            start_value: 1,
+            cycle: false,
+            cache: 1,
+            owned_by: Some((parent, "id".into())),
+        };
+        let sequence_id = catalog.create_sequence(sequence.clone()).unwrap();
+        sequence.id = sequence_id;
+        sequence.schema_id = SchemaId(1);
+        assert_eq!(
+            catalog.require_sequence("parents_id_seq").unwrap(),
+            &sequence
+        );
+    }
+
+    #[test]
+    #[cfg_attr(feature = "execution-log", tracing::instrument(skip_all))]
+    fn preserves_old_identity_across_transactional_drop_and_recreate() {
+        let mut transactions = TransactionRegistry::create();
+        let mut history = CatalogHistory::create();
+        let creator = transactions.begin();
+        let mut catalog = history.materialize(
+            Some(creator),
+            Snapshot::create(&transactions).use_command(CommandId(0)),
+            &transactions,
+        );
+        let previous = catalog.clone();
+        let old_id = catalog
+            .create_table("items".into(), vec![create_column("id", false)], vec![])
+            .unwrap();
+        history.record_changes(&previous, &catalog, creator, CommandId(0));
+        transactions.commit(creator);
+
+        let reader = transactions.begin();
+        let old_snapshot = Snapshot::create(&transactions);
+        transactions.retain_snapshot(reader, old_snapshot);
+        let changer = transactions.begin();
+        let mut catalog = history.materialize(Some(changer), old_snapshot, &transactions);
+        let previous = catalog.clone();
+        catalog.drop_table("items").unwrap();
+        history.record_changes(&previous, &catalog, changer, CommandId(0));
+        let mut catalog = history.materialize(
+            Some(changer),
+            old_snapshot.use_command(CommandId(1)),
+            &transactions,
+        );
+        let previous = catalog.clone();
+        let new_id = catalog
+            .create_table("items".into(), vec![create_column("id", false)], vec![])
+            .unwrap();
+        history.record_changes(&previous, &catalog, changer, CommandId(1));
+
+        assert_ne!(old_id, new_id);
+        assert_eq!(
+            history
+                .materialize(
+                    Some(changer),
+                    old_snapshot.use_command(CommandId(2)),
+                    &transactions,
+                )
+                .require_table("items")
+                .unwrap()
+                .id,
+            new_id
+        );
+        assert_eq!(
+            history
+                .materialize(Some(reader), old_snapshot, &transactions)
+                .require_table("items")
+                .unwrap()
+                .id,
+            old_id
+        );
+
+        transactions.commit(changer);
+        let reclaimed = history.prune(
+            transactions.find_reclamation_horizon(),
+            &transactions,
+            &std::collections::BTreeSet::new(),
+        );
+        assert!(reclaimed.tables.is_empty());
+        assert_eq!(
+            history
+                .materialize(Some(reader), old_snapshot, &transactions)
+                .require_table("items")
+                .unwrap()
+                .id,
+            old_id
+        );
+        transactions.finish_read_only(reader);
+        let reclaimed = history.prune(
+            transactions.find_reclamation_horizon(),
+            &transactions,
+            &std::collections::BTreeSet::new(),
+        );
+        assert_eq!(reclaimed.tables, vec![old_id]);
+        assert_eq!(
+            history
+                .materialize(None, Snapshot::create(&transactions), &transactions)
+                .require_table("items")
+                .unwrap()
+                .id,
+            new_id
+        );
+    }
+
+    #[test]
+    #[cfg_attr(feature = "execution-log", tracing::instrument(skip_all))]
+    fn does_not_apply_deferred_state_to_a_recreated_constraint() {
+        let mut catalog = Catalog::create();
+        catalog
+            .create_table(
+                "parents".into(),
+                vec![create_column("id", false)],
+                vec![Constraint::PrimaryKey {
+                    id: ConstraintId(0),
+                    name: "parents_pkey".into(),
+                    columns: vec!["id".into()],
+                }],
+            )
+            .unwrap();
+        let create_child_constraint = || {
+            Constraint::ForeignKey(ForeignKey {
+                id: ConstraintId(0),
+                name: "children_parent_id_fkey".into(),
+                columns: vec!["parent_id".into()],
+                foreign_table: "parents".into(),
+                foreign_table_id: TableId(0),
+                referred_columns: vec!["id".into()],
+                on_delete: ForeignKeyAction::NoAction,
+                on_update: ForeignKeyAction::NoAction,
+                deferrable: true,
+                initially_deferred: false,
+                match_kind: None,
+            })
+        };
+        catalog
+            .create_table(
+                "children".into(),
+                vec![create_column("parent_id", false)],
+                vec![create_child_constraint()],
+            )
+            .unwrap();
+        let old_id = get_constraint_id(&catalog.require_table("children").unwrap().constraints[0]);
+        catalog.drop_table("children").unwrap();
+        catalog
+            .create_table(
+                "children".into(),
+                vec![create_column("parent_id", false)],
+                vec![create_child_constraint()],
+            )
+            .unwrap();
+        let new_id = get_constraint_id(&catalog.require_table("children").unwrap().constraints[0]);
+
+        assert_ne!(old_id, new_id);
+        assert!(!catalog.contains_deferred_foreign_keys(
+            &std::collections::BTreeSet::from([old_id]),
+            false,
+        ));
+    }
+
+    #[test]
+    #[cfg_attr(feature = "execution-log", tracing::instrument(skip_all))]
+    fn versions_sequence_creation_and_abort() {
+        let mut transactions = TransactionRegistry::create();
+        let mut history = CatalogHistory::create();
+        let creator = transactions.begin();
+        let before_create = Snapshot::create(&transactions);
+        let mut catalog = history.materialize(Some(creator), before_create, &transactions);
+        let previous = catalog.clone();
+        let sequence_id = catalog
+            .create_sequence(SequenceSchema {
+                id: SequenceId(0),
+                schema_id: SchemaId(0),
+                name: "item_ids".into(),
+                data_type: BaseType::Int8,
+                increment: 1,
+                min_value: 1,
+                max_value: i64::MAX,
+                start_value: 1,
+                cycle: false,
+                cache: 1,
+                owned_by: None,
+            })
+            .unwrap();
+        history.record_changes(&previous, &catalog, creator, CommandId(0));
+
+        assert_eq!(
+            history
+                .materialize(
+                    Some(creator),
+                    before_create.use_command(CommandId(1)),
+                    &transactions,
+                )
+                .require_sequence("item_ids")
+                .unwrap()
+                .id,
+            sequence_id
+        );
+        assert!(
+            history
+                .materialize(None, before_create, &transactions)
+                .require_sequence("item_ids")
+                .is_err()
+        );
+        assert_eq!(
+            history.discard_transaction(creator).sequences,
+            vec![sequence_id]
+        );
+        transactions.abort(creator);
+        assert!(
+            history
+                .materialize(None, Snapshot::create(&transactions), &transactions)
+                .require_sequence("item_ids")
+                .is_err()
         );
     }
 }

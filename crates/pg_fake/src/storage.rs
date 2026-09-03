@@ -98,7 +98,7 @@ impl Table {
                         entries: BTreeMap::new(),
                     })
                 }
-                Constraint::Check(_) | Constraint::ForeignKey(_) => None,
+                Constraint::Check { .. } | Constraint::ForeignKey(_) => None,
             })
             .collect();
         Table {
@@ -707,6 +707,7 @@ mod tests {
                     identity: None,
                 }],
                 vec![Constraint::PrimaryKey {
+                    id: crate::catalog::ConstraintId(0),
                     name: "values_pkey".into(),
                     columns: vec!["value".into()],
                 }],

@@ -41,6 +41,9 @@ pub enum SqlState {
     // 2B — Dependent Objects Still Exist
     DependentObjectsStillExist, // 2BP01
 
+    // 3F — Invalid Schema Name
+    InvalidSchemaName, // 3F000
+
     // 40 — Transaction Rollback
     SerializationFailure, // 40001
     DeadlockDetected,     // 40P01
@@ -48,6 +51,7 @@ pub enum SqlState {
     // 42 — Syntax Error / Access Rule
     UndefinedTable,         // 42P01
     DuplicateTable,         // 42P07
+    DuplicateSchema,        // 42P06
     AmbiguousColumn,        // 42702
     SyntaxError,            // 42601
     UndefinedColumn,        // 42703
@@ -95,10 +99,12 @@ impl SqlState {
             SqlState::ActiveSqlTransaction => "25001",
             SqlState::InFailedSqlTransaction => "25P02",
             SqlState::DependentObjectsStillExist => "2BP01",
+            SqlState::InvalidSchemaName => "3F000",
             SqlState::SerializationFailure => "40001",
             SqlState::DeadlockDetected => "40P01",
             SqlState::UndefinedTable => "42P01",
             SqlState::DuplicateTable => "42P07",
+            SqlState::DuplicateSchema => "42P06",
             SqlState::AmbiguousColumn => "42702",
             SqlState::SyntaxError => "42601",
             SqlState::UndefinedColumn => "42703",

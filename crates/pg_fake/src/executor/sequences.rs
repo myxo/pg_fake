@@ -1,12 +1,12 @@
 use std::{
-    collections::{BTreeMap, BTreeSet},
+    collections::BTreeMap,
     sync::{Arc, Mutex},
 };
 
 use sqlparser::ast;
 
 use crate::{
-    catalog::{Catalog, SequenceId, SequenceSchema},
+    catalog::{Catalog, SequenceId, SequenceSchema, TableId},
     coercion,
     error::{PgError, Result, SqlState, reject_unsupported},
     value::BaseType,
@@ -30,7 +30,7 @@ pub(crate) struct SequenceSessionState {
 #[derive(Clone)]
 pub(crate) struct SequenceExecutionContext {
     sequences: BTreeMap<String, SequenceSchema>,
-    tables: BTreeSet<String>,
+    tables: BTreeMap<String, TableId>,
     values: SequenceStorage,
     session: SequenceSessionStorage,
 }
@@ -49,7 +49,7 @@ impl SequenceExecutionContext {
                 .collect(),
             tables: catalog
                 .iterate_tables()
-                .map(|table| table.name.clone())
+                .map(|table| (table.name.clone(), table.id))
                 .collect(),
             values,
             session,
@@ -60,7 +60,7 @@ impl SequenceExecutionContext {
     pub(crate) fn create_empty(values: SequenceStorage, session: SequenceSessionStorage) -> Self {
         SequenceExecutionContext {
             sequences: BTreeMap::new(),
-            tables: BTreeSet::new(),
+            tables: BTreeMap::new(),
             values,
             session,
         }
@@ -69,7 +69,7 @@ impl SequenceExecutionContext {
     #[cfg_attr(feature = "execution-log", tracing::instrument(skip_all))]
     fn require_sequence(&self, name: &str) -> Result<&SequenceSchema> {
         let name = normalize_sequence_name(name)?;
-        if self.tables.contains(&name) {
+        if self.tables.contains_key(&name) {
             return Err(PgError::create(
                 SqlState::WrongObjectType,
                 format!("{name:?} is not a sequence"),
@@ -187,8 +187,11 @@ impl SequenceExecutionContext {
     pub(crate) fn get_owned_sequence(&self, table: &str, column: &str) -> Result<Option<String>> {
         let table = normalize_sequence_name(table)?;
         let column = normalize_sequence_name(column)?;
+        let Some(table_id) = self.tables.get(&table) else {
+            return Ok(None);
+        };
         Ok(self.sequences.values().find_map(|sequence| {
-            (sequence.owned_by.as_ref() == Some(&(table.clone(), column.clone())))
+            (sequence.owned_by.as_ref() == Some(&(*table_id, column.clone())))
                 .then(|| sequence.name.clone())
         }))
     }
@@ -280,6 +283,7 @@ pub(crate) fn create_sequence_schema_for_type(
     }
     Ok(SequenceSchema {
         id: SequenceId(0),
+        schema_id: crate::catalog::SchemaId(0),
         name,
         data_type,
         increment,
@@ -330,7 +334,7 @@ fn extract_unsigned_integer(expression: &ast::Expr) -> Result<&str> {
 }
 
 #[cfg_attr(feature = "execution-log", tracing::instrument(skip_all))]
-fn normalize_sequence_name(name: &str) -> Result<String> {
+pub(crate) fn normalize_sequence_name(name: &str) -> Result<String> {
     let mut parts = Vec::new();
     let mut current = String::new();
     let mut quoted = false;

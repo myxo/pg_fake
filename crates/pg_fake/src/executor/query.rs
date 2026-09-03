@@ -1403,7 +1403,7 @@ fn materialize_recursive_data_modifying_ctes(
     with: ast::With,
     xid: Xid,
     snapshot: &Snapshot,
-    deferred_constraints: &BTreeSet<String>,
+    deferred_constraints: &BTreeSet<ConstraintId>,
     defer_all: bool,
     context: &StatementExecutionContext,
 ) -> Result<ast::Query> {
@@ -1835,7 +1835,7 @@ pub(crate) fn materialize_ctes(
     statement: &ast::Statement,
     xid: Xid,
     snapshot: &Snapshot,
-    deferred_constraints: &BTreeSet<String>,
+    deferred_constraints: &BTreeSet<ConstraintId>,
     defer_all: bool,
     context: &StatementExecutionContext,
 ) -> Result<ast::Statement> {

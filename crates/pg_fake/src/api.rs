@@ -5,11 +5,11 @@ use std::{
 };
 
 use rand_chacha::{ChaCha12Rng, rand_core::SeedableRng};
-use sqlparser::ast;
+use sqlparser::ast::{self, Visit as _};
 
 use crate::{
     analyzer,
-    catalog::{SequenceSchema, TableSchema},
+    catalog::{ConstraintId, SequenceId, SequenceSchema, TableId, TableSchema},
     error::{PgError, Result, SqlState, reject_unsupported},
     executor::{self, DatabaseState},
     parser,
@@ -40,6 +40,197 @@ pub struct PreparedStatement {
     parameter_types: Vec<crate::value::BaseType>,
     columns: Vec<ColumnMeta>,
     query_plan: Option<executor::PreparedQueryPlan>,
+    catalog_dependencies: Vec<PreparedCatalogDependency>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum PreparedCatalogDependency {
+    Table(TableSchema),
+    Sequence { name: String, id: SequenceId },
+    Constraint { table: TableId, id: ConstraintId },
+}
+
+fn extract_prepared_sequence_name(expression: &ast::Expr) -> Option<&str> {
+    match expression {
+        ast::Expr::Value(value) => match &value.value {
+            ast::Value::SingleQuotedString(value) => Some(value),
+            _ => None,
+        },
+        ast::Expr::Nested(expression) => extract_prepared_sequence_name(expression),
+        _ => None,
+    }
+}
+
+struct PreparedDependencyCollector<'catalog> {
+    catalog: &'catalog crate::catalog::Catalog,
+    dependencies: Vec<PreparedCatalogDependency>,
+    error: Option<PgError>,
+}
+
+impl PreparedDependencyCollector<'_> {
+    fn add_dependency(&mut self, dependency: PreparedCatalogDependency) {
+        if !self.dependencies.contains(&dependency) {
+            self.dependencies.push(dependency);
+        }
+    }
+
+    fn collect_table(&mut self, relation: &ast::ObjectName) -> Result<()> {
+        let name = executor::normalize_unqualified_object_name(relation)?;
+        let table = self.catalog.require_table(&name)?.clone();
+        self.add_dependency(PreparedCatalogDependency::Table(table.clone()));
+        for dependency in
+            table
+                .constraints
+                .iter()
+                .map(|constraint| PreparedCatalogDependency::Constraint {
+                    table: table.id,
+                    id: constraint.get_id(),
+                })
+        {
+            self.add_dependency(dependency);
+        }
+        Ok(())
+    }
+}
+
+impl ast::Visitor for PreparedDependencyCollector<'_> {
+    type Break = ();
+
+    fn pre_visit_relation(
+        &mut self,
+        relation: &ast::ObjectName,
+    ) -> std::ops::ControlFlow<Self::Break> {
+        if let Err(error) = self.collect_table(relation) {
+            self.error = Some(error);
+            return std::ops::ControlFlow::Break(());
+        }
+        std::ops::ControlFlow::Continue(())
+    }
+
+    fn pre_visit_expr(&mut self, expression: &ast::Expr) -> std::ops::ControlFlow<Self::Break> {
+        let ast::Expr::Function(function) = expression else {
+            return std::ops::ControlFlow::Continue(());
+        };
+        let Ok(name) = executor::normalize_unqualified_object_name(&function.name) else {
+            return std::ops::ControlFlow::Continue(());
+        };
+        if !matches!(name.as_str(), "nextval" | "currval" | "setval") {
+            return std::ops::ControlFlow::Continue(());
+        }
+        let ast::FunctionArguments::List(arguments) = &function.args else {
+            return std::ops::ControlFlow::Continue(());
+        };
+        let Some(ast::FunctionArg::Unnamed(ast::FunctionArgExpr::Expr(argument))) =
+            arguments.args.first()
+        else {
+            return std::ops::ControlFlow::Continue(());
+        };
+        let Some(name) = extract_prepared_sequence_name(argument) else {
+            return std::ops::ControlFlow::Continue(());
+        };
+        let name = match executor::normalize_sequence_name(name) {
+            Ok(name) => name,
+            Err(error) => {
+                self.error = Some(error);
+                return std::ops::ControlFlow::Break(());
+            }
+        };
+        match self.catalog.require_sequence(&name) {
+            Ok(sequence) => {
+                let id = sequence.id;
+                self.add_dependency(PreparedCatalogDependency::Sequence { name, id });
+                std::ops::ControlFlow::Continue(())
+            }
+            Err(error) => {
+                self.error = Some(error);
+                std::ops::ControlFlow::Break(())
+            }
+        }
+    }
+}
+
+fn collect_prepared_catalog_dependencies(
+    catalog: &crate::catalog::Catalog,
+    statements: impl IntoIterator<Item = ast::Statement>,
+) -> Result<Vec<PreparedCatalogDependency>> {
+    let mut collector = PreparedDependencyCollector {
+        catalog,
+        dependencies: Vec::new(),
+        error: None,
+    };
+    for statement in statements {
+        match &statement {
+            ast::Statement::Query(_)
+            | ast::Statement::Insert(_)
+            | ast::Statement::Update(_)
+            | ast::Statement::Delete(_) => {
+                let _ = statement.visit(&mut collector);
+            }
+            ast::Statement::Drop {
+                object_type: ast::ObjectType::Table,
+                names,
+                ..
+            } => {
+                for name in names {
+                    let Ok(name) = executor::normalize_unqualified_object_name(name) else {
+                        continue;
+                    };
+                    if let Ok(table) = catalog.require_table(&name) {
+                        collector.add_dependency(PreparedCatalogDependency::Table(table.clone()));
+                    }
+                }
+            }
+            ast::Statement::Drop {
+                object_type: ast::ObjectType::Sequence,
+                names,
+                ..
+            } => {
+                for name in names {
+                    let Ok(name) = executor::normalize_unqualified_object_name(name) else {
+                        continue;
+                    };
+                    if let Ok(sequence) = catalog.require_sequence(&name) {
+                        collector.add_dependency(PreparedCatalogDependency::Sequence {
+                            name,
+                            id: sequence.id,
+                        });
+                    }
+                }
+            }
+            _ => {}
+        }
+        if let Some(error) = collector.error.take() {
+            return Err(error);
+        }
+        if let ast::Statement::Insert(insert) = &statement
+            && let Some(ast::OnInsert::OnConflict(ast::OnConflict {
+                conflict_target: Some(ast::ConflictTarget::OnConstraint(name)),
+                ..
+            })) = &insert.on
+        {
+            let table_name = executor::resolve_insert_table_name(&insert.table)?;
+            let table = catalog.require_table(&table_name)?;
+            let constraint_name = executor::normalize_unqualified_object_name(name)?;
+            let constraint = table
+                .constraints
+                .iter()
+                .find(|constraint| constraint.get_name() == Some(constraint_name.as_str()))
+                .ok_or_else(|| {
+                    PgError::create(
+                        SqlState::UndefinedObject,
+                        format!(
+                            "constraint {constraint_name:?} for table {:?} does not exist",
+                            table.name
+                        ),
+                    )
+                })?;
+            collector.add_dependency(PreparedCatalogDependency::Constraint {
+                table: table.id,
+                id: constraint.get_id(),
+            });
+        }
+    }
+    Ok(collector.dependencies)
 }
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum IsolationLevel {
@@ -74,7 +265,7 @@ pub struct Session {
     timezone: String,
     ddl_undo: Vec<DdlUndo>,
     settings_undo: Option<(IsolationLevel, Duration, String)>,
-    deferred_constraints: BTreeSet<String>,
+    deferred_constraints: BTreeSet<ConstraintId>,
     defer_all_constraints: bool,
     deferred_foreign_keys_dirty: bool,
     sequence_session: executor::SequenceSessionStorage,
@@ -112,6 +303,18 @@ pub struct Transaction<'session> {
 
 #[cfg_attr(feature = "execution-log", tracing::instrument(skip_all))]
 fn abort_database_transaction(state: &mut DatabaseState, xid: Xid) {
+    let reclaimed = state.catalog_history.discard_transaction(xid);
+    for table_id in reclaimed.tables {
+        state.tables.remove(&table_id);
+    }
+    let mut sequence_values = state
+        .sequence_values
+        .lock()
+        .expect("sequence storage is poisoned");
+    for sequence_id in reclaimed.sequences {
+        sequence_values.remove(&sequence_id);
+    }
+    drop(sequence_values);
     state.transactions.abort(xid);
     for table_id in state.take_touched_tables(xid) {
         if let Some(table) = state.tables.get_mut(&table_id) {
@@ -135,6 +338,20 @@ fn prune_database_versions(state: &mut DatabaseState) {
         if !table.has_reclaimable_versions() {
             state.clear_table_reclaimable(table_id);
         }
+    }
+    let protected_tables = state.collect_touched_tables();
+    let reclaimed = state
+        .catalog_history
+        .prune(horizon, &state.transactions, &protected_tables);
+    for table_id in reclaimed.tables {
+        state.tables.remove(&table_id);
+    }
+    let mut sequence_values = state
+        .sequence_values
+        .lock()
+        .expect("sequence storage is poisoned");
+    for sequence_id in reclaimed.sequences {
+        sequence_values.remove(&sequence_id);
     }
 }
 
@@ -185,8 +402,7 @@ fn collect_ddl_undo_for_statement(
                     .catalog
                     .iterate_sequences()
                     .filter(|sequence| {
-                        sequence.owned_by.as_ref().map(|(table, _)| table.as_str())
-                            == Some(name.as_str())
+                        sequence.owned_by.as_ref().map(|(table, _)| *table) == Some(schema.id)
                     })
                     .map(|sequence| {
                         let value = *state
@@ -369,6 +585,7 @@ fn acquire_row_locks<'a>(
 )> {
     let deadline = (timeout != Duration::ZERO).then(|| Instant::now() + timeout);
     loop {
+        state.load_catalog(Some(xid), snapshot);
         let required = match target {
             RowLockTarget::Ctes(statement) => executor::collect_required_cte_row_locks(
                 &state, statement, xid, &snapshot, context,
@@ -595,7 +812,7 @@ impl Session {
             if self.transaction.is_none() {
                 self.start_transaction(self.default_isolation, true);
             }
-            match self.execute_statement(&statement, None) {
+            match self.execute_statement(&statement, None, None) {
                 Ok(result) => results.push(result),
                 Err(error) => {
                     if self.is_transaction_implicit_batch() {
@@ -650,7 +867,16 @@ impl Session {
                     .collect::<Vec<_>>(),
             )
         };
-        let state = self.db.state.lock().expect("database mutex is poisoned");
+        let mut state = self.db.state.lock().expect("database mutex is poisoned");
+        let transaction = match self.transaction {
+            Some(SessionTransactionState::Active(transaction)) => transaction,
+            _ => unreachable!(),
+        };
+        let snapshot = transaction
+            .snapshot
+            .unwrap_or_else(|| Snapshot::create(&state.transactions))
+            .use_command(crate::txn::CommandId(transaction.next_command_id));
+        state.load_catalog(Some(transaction.xid), snapshot);
         let constraints = state
             .catalog
             .iterate_tables()
@@ -702,19 +928,20 @@ impl Session {
         } else {
             for foreign_key in selected {
                 if deferred {
-                    self.deferred_constraints.insert(foreign_key.name.clone());
+                    self.deferred_constraints.insert(foreign_key.id);
                 } else {
-                    self.deferred_constraints.remove(&foreign_key.name);
+                    self.deferred_constraints.remove(&foreign_key.id);
                 }
             }
         }
         if !deferred && self.deferred_foreign_keys_dirty {
-            let state = self.db.state.lock().expect("database mutex is poisoned");
-            let xid = match self.transaction {
-                Some(SessionTransactionState::Active(transaction)) => transaction.xid,
+            let mut state = self.db.state.lock().expect("database mutex is poisoned");
+            let transaction = match self.transaction {
+                Some(SessionTransactionState::Active(transaction)) => transaction,
                 _ => unreachable!(),
             };
-            if let Err(error) = executor::validate_deferred_foreign_keys(&state, xid) {
+            state.load_catalog(Some(transaction.xid), snapshot);
+            if let Err(error) = executor::validate_deferred_foreign_keys(&state, transaction.xid) {
                 drop(state);
                 return Some(self.abort_with_error(error));
             }
@@ -766,55 +993,82 @@ impl Session {
             ));
         }
         let prepared = {
-            let state = self.db.state.lock().expect("database mutex is poisoned");
+            let mut state = self.db.state.lock().expect("database mutex is poisoned");
+            let (xid, snapshot) = match self.transaction {
+                Some(SessionTransactionState::Active(transaction)) => (
+                    Some(transaction.xid),
+                    transaction
+                        .snapshot
+                        .unwrap_or_else(|| Snapshot::create(&state.transactions))
+                        .use_command(crate::txn::CommandId(transaction.next_command_id)),
+                ),
+                Some(SessionTransactionState::Aborted { .. }) => unreachable!(),
+                None => (None, Snapshot::create(&state.transactions)),
+            };
+            state.load_catalog(xid, snapshot);
             analyzer::count_parameters(&statement)
                 .and_then(|parameter_count| {
                     executor::expand_ctes_for_analysis(&statement, &state)
                         .map(|(statement, mutations)| (statement, mutations, parameter_count))
                 })
                 .and_then(|(statement, mutations, parameter_count)| {
-                    analyzer::substitute_typed_subqueries(&statement, &state.catalog)
-                        .map(|statement| (statement, mutations, parameter_count))
-                })
-                .and_then(|(statement, mutations, parameter_count)| {
-                    mutations
-                        .iter()
-                        .map(|mutation| {
-                            analyzer::substitute_typed_subqueries(mutation, &state.catalog)
-                        })
-                        .collect::<Result<Vec<_>>>()
-                        .map(|mutations| (statement, mutations, parameter_count))
-                })
-                .and_then(|(described, mutations, parameter_count)| {
-                    analyzer::infer_parameter_types_with_data_modifying_ctes(
-                        &described,
-                        &mutations,
+                    let catalog_dependencies = collect_prepared_catalog_dependencies(
                         &state.catalog,
-                        parameter_count,
+                        std::iter::once(statement.clone()).chain(mutations.iter().cloned()),
+                    )?;
+                    analyzer::substitute_typed_subqueries(&statement, &state.catalog).map(
+                        |statement| (statement, mutations, parameter_count, catalog_dependencies),
                     )
-                    .and_then(|parameter_types| {
-                        let described = analyzer::bind_parameters(
-                            &described,
-                            &parameter_types,
-                            &vec![Value::Null; parameter_types.len()],
-                        )?;
-                        let columns = executor::describe_query_result_columns(&state, &described)?;
-                        let query_plan = executor::build_prepared_query_plan(
-                            &state,
-                            &statement,
-                            &parameter_types,
-                        )?;
-                        Ok((parameter_types, columns, query_plan))
-                    })
                 })
+                .and_then(
+                    |(statement, mutations, parameter_count, catalog_dependencies)| {
+                        mutations
+                            .iter()
+                            .map(|mutation| {
+                                analyzer::substitute_typed_subqueries(mutation, &state.catalog)
+                            })
+                            .collect::<Result<Vec<_>>>()
+                            .map(|mutations| {
+                                (statement, mutations, parameter_count, catalog_dependencies)
+                            })
+                    },
+                )
+                .and_then(
+                    |(described, mutations, parameter_count, catalog_dependencies)| {
+                        analyzer::infer_parameter_types_with_data_modifying_ctes(
+                            &described,
+                            &mutations,
+                            &state.catalog,
+                            parameter_count,
+                        )
+                        .and_then(|parameter_types| {
+                            let described = analyzer::bind_parameters(
+                                &described,
+                                &parameter_types,
+                                &vec![Value::Null; parameter_types.len()],
+                            )?;
+                            let columns =
+                                executor::describe_query_result_columns(&state, &described)?;
+                            let query_plan = executor::build_prepared_query_plan(
+                                &state,
+                                &statement,
+                                &parameter_types,
+                            )?;
+                            Ok((parameter_types, columns, query_plan, catalog_dependencies))
+                        })
+                    },
+                )
         };
         match prepared {
-            Ok((parameter_types, columns, query_plan)) => Ok(PreparedStatement {
-                statement,
-                parameter_types,
-                columns,
-                query_plan,
-            }),
+            Ok((parameter_types, columns, query_plan, catalog_dependencies)) => {
+                Ok(PreparedStatement {
+                    statement,
+                    parameter_types,
+                    columns,
+                    query_plan,
+                    catalog_dependencies,
+                })
+            }
             Err(error) => self.abort_with_error(error),
         }
     }
@@ -887,7 +1141,11 @@ impl Session {
         if started_implicit_transaction {
             self.start_transaction(self.default_isolation, true);
         }
-        match self.execute_statement(execution_statement, prepared_query) {
+        match self.execute_statement(
+            execution_statement,
+            prepared_query,
+            Some(&statement.catalog_dependencies),
+        ) {
             Ok(result) => {
                 if started_implicit_transaction && self.is_transaction_implicit_batch() {
                     if read_only_prepared {
@@ -958,11 +1216,17 @@ impl Session {
         };
         let state_lock = self.db.state.clone();
         let mut state = state_lock.lock().expect("database mutex is poisoned");
+        let snapshot = transaction
+            .snapshot
+            .unwrap_or_else(|| Snapshot::create(&state.transactions))
+            .use_command(crate::txn::CommandId(transaction.next_command_id));
+        state.load_catalog(Some(transaction.xid), snapshot);
         if transaction.read_only {
             assert!(self.ddl_undo.is_empty());
             assert!(!self.deferred_foreign_keys_dirty);
             assert!(!state.has_touched_tables(transaction.xid));
             state.transactions.finish_read_only(transaction.xid);
+            prune_database_versions(&mut state);
             self.settings_undo = None;
             self.deferred_constraints.clear();
             self.defer_all_constraints = false;
@@ -1015,6 +1279,7 @@ impl Session {
         assert!(transaction.implicit_batch);
         let mut state = self.db.state.lock().expect("database mutex is poisoned");
         state.transactions.finish_read_only(transaction.xid);
+        prune_database_versions(&mut state);
         self.ddl_undo.clear();
         self.settings_undo = None;
         self.deferred_constraints.clear();
@@ -1038,6 +1303,16 @@ impl Session {
         };
         let state_lock = self.db.state.clone();
         let mut state = state_lock.lock().expect("database mutex is poisoned");
+        let snapshot = match transaction {
+            SessionTransactionState::Active(transaction) => transaction
+                .snapshot
+                .unwrap_or_else(|| Snapshot::create(&state.transactions))
+                .use_command(crate::txn::CommandId(transaction.next_command_id)),
+            SessionTransactionState::Aborted { .. } => {
+                Snapshot::create(&state.transactions).use_command(crate::txn::CommandId(u64::MAX))
+            }
+        };
+        state.load_catalog(Some(xid), snapshot);
         self.rollback_ddl(&mut state);
         if let Some((default_isolation, lock_timeout, timezone)) = self.settings_undo.take() {
             self.default_isolation = default_isolation;
@@ -1075,7 +1350,7 @@ impl Session {
                 DdlUndo::DropCreated(name) => {
                     if let Ok(schema) = state.catalog.drop_table(&name) {
                         state.tables.remove(&schema.id);
-                        for sequence in state.catalog.drop_owned_sequences(&schema.name) {
+                        for sequence in state.catalog.drop_owned_sequences(schema.id) {
                             state
                                 .sequence_values
                                 .lock()
@@ -1132,6 +1407,7 @@ impl Session {
         &mut self,
         statement: &ast::Statement,
         prepared_query: Option<(&executor::PreparedQueryPlan, &[Value], &[ColumnMeta])>,
+        prepared_dependencies: Option<&[PreparedCatalogDependency]>,
     ) -> Result<StatementResult> {
         match statement {
             ast::Statement::Analyze(_) if !self.db.strict => {
@@ -1345,6 +1621,43 @@ impl Session {
                 .transactions
                 .retain_snapshot(transaction.xid, snapshot);
         }
+        state.load_catalog(Some(transaction.xid), snapshot);
+        let prepared_dependency_error = prepared_dependencies.and_then(|dependencies| {
+            dependencies.iter().find_map(|dependency| match dependency {
+                PreparedCatalogDependency::Table(schema) => {
+                    match state.catalog.require_table(&schema.name) {
+                        Ok(table) if table == schema => None,
+                        Ok(_) => Some(PgError::create(
+                            SqlState::FeatureNotSupported,
+                            "cached plan must be replanned",
+                        )),
+                        Err(error) => Some(error),
+                    }
+                }
+                PreparedCatalogDependency::Sequence { name, id } => {
+                    match state.catalog.require_sequence(name) {
+                        Ok(sequence) if sequence.id == *id => None,
+                        Ok(_) => Some(PgError::create(
+                            SqlState::FeatureNotSupported,
+                            "cached plan must be replanned",
+                        )),
+                        Err(error) => Some(error),
+                    }
+                }
+                PreparedCatalogDependency::Constraint { table, id } => {
+                    (!state.catalog.has_constraint(*table, *id)).then(|| {
+                        PgError::create(
+                            SqlState::FeatureNotSupported,
+                            "cached plan must be replanned",
+                        )
+                    })
+                }
+            })
+        });
+        if let Some(error) = prepared_dependency_error {
+            drop(state);
+            return self.abort_with_error(error);
+        }
         transaction.statement_started = true;
         self.transaction = Some(SessionTransactionState::Active(transaction));
         if let Some((plan, parameters, columns)) = prepared_query {
@@ -1474,6 +1787,8 @@ impl Session {
             };
             self.ddl_undo.extend(undo);
         }
+        let catalog_before = matches!(parser::classify(statement), parser::StatementKind::Ddl)
+            .then(|| state.catalog.clone());
         let (mut state, snapshot, locked_rows) = match acquire_row_locks(
             &condvar,
             self.lock_timeout,
@@ -1502,6 +1817,13 @@ impl Session {
         );
         match result {
             Ok(result) => {
+                if let Some(catalog_before) = catalog_before {
+                    state.record_catalog_changes(
+                        &catalog_before,
+                        transaction.xid,
+                        context.command_id,
+                    );
+                }
                 let has_writes = state.has_touched_tables(transaction.xid);
                 if statement_contains_dml
                     && has_writes
@@ -3795,6 +4117,326 @@ mod tests {
                 .iterate_version_chains()
                 .count(),
             0
+        );
+    }
+
+    #[test]
+    #[cfg_attr(feature = "execution-log", tracing::instrument(skip_all))]
+    fn retains_dropped_table_until_repeatable_read_snapshot_finishes() {
+        let db = Db::create();
+        let mut reader = db.create_session();
+        let mut writer = db.create_session();
+        writer.execute("CREATE TABLE items (id INTEGER)").unwrap();
+        writer.execute("INSERT INTO items VALUES (1)").unwrap();
+        let table_id = db
+            .state
+            .lock()
+            .unwrap()
+            .catalog
+            .require_table("items")
+            .unwrap()
+            .id;
+        reader
+            .execute("BEGIN ISOLATION LEVEL REPEATABLE READ")
+            .unwrap();
+        assert_eq!(
+            reader.query("SELECT * FROM items", &[]).unwrap().rows,
+            vec![vec![Value::Int4(1)]]
+        );
+
+        writer.execute("DROP TABLE items").unwrap();
+        assert_eq!(
+            writer
+                .query("SELECT * FROM items", &[])
+                .unwrap_err()
+                .sqlstate,
+            SqlState::UndefinedTable
+        );
+        assert_eq!(
+            reader.query("SELECT * FROM items", &[]).unwrap().rows,
+            vec![vec![Value::Int4(1)]]
+        );
+        assert!(db.state.lock().unwrap().tables.contains_key(&table_id));
+
+        reader.execute("ROLLBACK").unwrap();
+        assert!(!db.state.lock().unwrap().tables.contains_key(&table_id));
+    }
+
+    #[test]
+    #[cfg_attr(feature = "execution-log", tracing::instrument(skip_all))]
+    fn exposes_catalog_and_rows_atomically_at_commit() {
+        let mut state = DatabaseState::create();
+        let writer = state.transactions.begin();
+        let concurrent_snapshot = Snapshot::create(&state.transactions);
+        state.load_catalog(
+            Some(writer),
+            concurrent_snapshot.use_command(crate::txn::CommandId(0)),
+        );
+        let previous = state.catalog.clone();
+        let table_id = state
+            .catalog
+            .create_table(
+                "items".into(),
+                vec![crate::catalog::ColumnDef {
+                    name: "id".into(),
+                    data_type: crate::value::PgType::create(BaseType::Int4),
+                    nullable: false,
+                    default: None,
+                    default_sequence: None,
+                    identity: None,
+                }],
+                vec![],
+            )
+            .unwrap();
+        let schema = state.catalog.require_table("items").unwrap().clone();
+        let mut table = Table::create(schema);
+        table.insert(writer, crate::txn::CommandId(0), vec![Value::Int4(1)]);
+        state.tables.insert(table_id, table);
+        state.record_catalog_changes(&previous, writer, crate::txn::CommandId(0));
+        let concurrent_reader = state.transactions.begin();
+
+        assert!(
+            state
+                .catalog_history
+                .materialize(None, concurrent_snapshot, &state.transactions)
+                .require_table("items")
+                .is_err()
+        );
+        assert!(
+            crate::txn::find_visible_version(
+                state
+                    .tables
+                    .get(&table_id)
+                    .unwrap()
+                    .iterate_version_chains()
+                    .next()
+                    .unwrap()
+                    .1,
+                &concurrent_snapshot,
+                concurrent_reader,
+                &state.transactions,
+            )
+            .is_none()
+        );
+
+        state.transactions.commit(writer);
+        let committed_snapshot = Snapshot::create(&state.transactions);
+        let committed_reader = state.transactions.begin();
+        assert_eq!(
+            state
+                .catalog_history
+                .materialize(None, committed_snapshot, &state.transactions)
+                .require_table("items")
+                .unwrap()
+                .id,
+            table_id
+        );
+        assert_eq!(
+            crate::txn::find_visible_version(
+                state
+                    .tables
+                    .get(&table_id)
+                    .unwrap()
+                    .iterate_version_chains()
+                    .next()
+                    .unwrap()
+                    .1,
+                &committed_snapshot,
+                committed_reader,
+                &state.transactions,
+            )
+            .unwrap()
+            .row,
+            vec![Value::Int4(1)]
+        );
+    }
+
+    #[test]
+    #[cfg_attr(feature = "execution-log", tracing::instrument(skip_all))]
+    fn retains_dropped_table_while_a_read_committed_writer_uses_it() {
+        let db = Db::create();
+        let mut writer = db.create_session();
+        let mut dropper = db.create_session();
+        writer.execute("CREATE TABLE items (id INTEGER)").unwrap();
+        writer.execute("INSERT INTO items VALUES (1)").unwrap();
+        let table_id = db
+            .state
+            .lock()
+            .unwrap()
+            .catalog
+            .require_table("items")
+            .unwrap()
+            .id;
+
+        writer.execute("BEGIN").unwrap();
+        writer.execute("UPDATE items SET id = 2").unwrap();
+        dropper.execute("DROP TABLE items").unwrap();
+        assert!(db.state.lock().unwrap().tables.contains_key(&table_id));
+
+        writer.execute("COMMIT").unwrap();
+        assert!(!db.state.lock().unwrap().tables.contains_key(&table_id));
+        assert_eq!(
+            dropper
+                .query("SELECT * FROM items", &[])
+                .unwrap_err()
+                .sqlstate,
+            SqlState::UndefinedTable
+        );
+    }
+
+    #[test]
+    #[cfg_attr(feature = "execution-log", tracing::instrument(skip_all))]
+    fn prepared_query_does_not_retarget_a_recreated_relation() {
+        let db = Db::create();
+        let mut session = db.create_session();
+        session.execute("CREATE TABLE items (id INTEGER)").unwrap();
+        session.execute("INSERT INTO items VALUES (1)").unwrap();
+        let prepared = session.prepare("SELECT id FROM items").unwrap();
+
+        session.execute("DROP TABLE items").unwrap();
+        session.execute("CREATE TABLE items (id INTEGER)").unwrap();
+        session.execute("INSERT INTO items VALUES (2)").unwrap();
+
+        assert_eq!(
+            session.query_prepared(&prepared, &[]).unwrap_err().sqlstate,
+            SqlState::FeatureNotSupported
+        );
+    }
+
+    #[test]
+    #[cfg_attr(feature = "execution-log", tracing::instrument(skip_all))]
+    fn prepared_fallback_queries_and_mutations_do_not_retarget_recreated_relations() {
+        let db = Db::create();
+        let mut session = db.create_session();
+        session.execute("CREATE TABLE items (id INTEGER)").unwrap();
+        session.execute("INSERT INTO items VALUES (1)").unwrap();
+        let ordered = session.prepare("SELECT id FROM items ORDER BY id").unwrap();
+        let update = session.prepare("UPDATE items SET id = id + 1").unwrap();
+
+        session.execute("DROP TABLE items").unwrap();
+        session.execute("CREATE TABLE items (id INTEGER)").unwrap();
+        session.execute("INSERT INTO items VALUES (2)").unwrap();
+
+        assert_eq!(
+            session.query_prepared(&ordered, &[]).unwrap_err().sqlstate,
+            SqlState::FeatureNotSupported
+        );
+        assert_eq!(
+            session.execute_prepared(&update, &[]).unwrap_err().sqlstate,
+            SqlState::FeatureNotSupported
+        );
+        assert_eq!(
+            session.query("SELECT id FROM items", &[]).unwrap().rows,
+            vec![vec![Value::Int4(2)]]
+        );
+    }
+
+    #[test]
+    #[cfg_attr(feature = "execution-log", tracing::instrument(skip_all))]
+    fn prepared_queries_reject_changed_table_schema_versions() {
+        let db = Db::create();
+        let mut session = db.create_session();
+        session.execute("CREATE TABLE items (id INTEGER)").unwrap();
+        let prepared = session.prepare("SELECT * FROM items").unwrap();
+        {
+            let mut state = db.state.lock().unwrap();
+            let changer = state.transactions.begin();
+            let snapshot = Snapshot::create(&state.transactions);
+            state.load_catalog(Some(changer), snapshot);
+            let previous = state.catalog.clone();
+            state
+                .catalog
+                .require_table_mut("items")
+                .unwrap()
+                .columns
+                .push(crate::catalog::ColumnDef {
+                    name: "value".into(),
+                    data_type: crate::value::PgType::create(BaseType::Text),
+                    nullable: true,
+                    default: None,
+                    default_sequence: None,
+                    identity: None,
+                });
+            state.record_catalog_changes(&previous, changer, crate::txn::CommandId(0));
+            state.transactions.commit(changer);
+        }
+
+        assert_eq!(
+            session.query_prepared(&prepared, &[]).unwrap_err().sqlstate,
+            SqlState::FeatureNotSupported
+        );
+    }
+
+    #[test]
+    #[cfg_attr(feature = "execution-log", tracing::instrument(skip_all))]
+    fn prepared_subqueries_ddl_sequences_and_constraints_keep_catalog_dependencies() {
+        let db = Db::create();
+        let mut session = db.create_session();
+        session
+            .execute("CREATE TABLE items (id INTEGER PRIMARY KEY)")
+            .unwrap();
+        session
+            .execute("CREATE TABLE permissions (item_id INTEGER)")
+            .unwrap();
+        session.execute("CREATE SEQUENCE ids").unwrap();
+        session.execute("CREATE SEQUENCE \"Ids\"").unwrap();
+        assert!(session.query("SELECT nextval('IDS')", &[]).is_ok());
+        assert!(session.query("SELECT nextval('public.ids')", &[]).is_ok());
+        assert!(session.query("SELECT nextval('\"Ids\"')", &[]).is_ok());
+        let subquery = session
+            .prepare(
+                "SELECT id FROM items WHERE EXISTS (SELECT 1 FROM permissions WHERE item_id = items.id)",
+            )
+            .unwrap();
+        let drop_table = session.prepare("DROP TABLE permissions").unwrap();
+        let sequence = session.prepare("SELECT nextval('IDS')").unwrap();
+        let qualified_sequence = session.prepare("SELECT nextval('public.ids')").unwrap();
+        let quoted_sequence = session.prepare("SELECT nextval('\"Ids\"')").unwrap();
+        let conflict = session
+            .prepare("INSERT INTO items VALUES (1) ON CONFLICT ON CONSTRAINT items_pkey DO NOTHING")
+            .unwrap();
+        assert!(conflict.catalog_dependencies.iter().any(|dependency| {
+            matches!(dependency, PreparedCatalogDependency::Constraint { .. })
+        }));
+
+        session.execute("DROP TABLE permissions").unwrap();
+        session
+            .execute("CREATE TABLE permissions (item_id INTEGER)")
+            .unwrap();
+        assert_eq!(
+            session.query_prepared(&subquery, &[]).unwrap_err().sqlstate,
+            SqlState::FeatureNotSupported
+        );
+        assert_eq!(
+            session
+                .execute_prepared(&drop_table, &[])
+                .unwrap_err()
+                .sqlstate,
+            SqlState::FeatureNotSupported
+        );
+        assert!(session.prepare("SELECT * FROM permissions").is_ok());
+
+        session.execute("DROP SEQUENCE ids").unwrap();
+        session.execute("CREATE SEQUENCE ids").unwrap();
+        session.execute("DROP SEQUENCE \"Ids\"").unwrap();
+        session.execute("CREATE SEQUENCE \"Ids\"").unwrap();
+        assert_eq!(
+            session.query_prepared(&sequence, &[]).unwrap_err().sqlstate,
+            SqlState::FeatureNotSupported
+        );
+        assert_eq!(
+            session
+                .query_prepared(&qualified_sequence, &[])
+                .unwrap_err()
+                .sqlstate,
+            SqlState::FeatureNotSupported
+        );
+        assert_eq!(
+            session
+                .query_prepared(&quoted_sequence, &[])
+                .unwrap_err()
+                .sqlstate,
+            SqlState::FeatureNotSupported
         );
     }
 

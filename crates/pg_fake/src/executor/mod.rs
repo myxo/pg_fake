@@ -4,8 +4,8 @@ use rand_chacha::{ChaCha12Rng, rand_core::RngCore};
 use crate::{
     api::{ColumnMeta, QueryResult, StatementResult},
     catalog::{
-        Catalog, ColumnDef, ForeignKey, ForeignKeyAction, IdentityKind, SequenceSchema, TableId,
-        TableSchema,
+        Catalog, CatalogHistory, ColumnDef, ConstraintId, ForeignKey, ForeignKeyAction,
+        IdentityKind, SequenceSchema, TableId, TableSchema,
     },
     coercion::{self, CastContext},
     error::{PgError, Result, SqlState, reject_unsupported},
@@ -83,6 +83,7 @@ pub(crate) struct StatementExecutionContext {
 
 pub(crate) struct DatabaseState {
     pub(crate) catalog: Catalog,
+    pub(crate) catalog_history: CatalogHistory,
     pub(crate) tables: BTreeMap<TableId, Table>,
     pub(crate) transactions: TransactionRegistry,
     pub(crate) row_locks: RowLockManager,
@@ -106,20 +107,44 @@ pub(crate) use query::detect_statement_features;
 pub(crate) use query::expand_ctes_for_analysis;
 pub(crate) use query::materialize_ctes;
 pub(crate) use query::materialize_uncorrelated_subqueries;
+pub(crate) use sequences::normalize_sequence_name;
 
 impl DatabaseState {
     #[cfg_attr(feature = "execution-log", tracing::instrument(skip_all))]
     pub(crate) fn create() -> Self {
+        let catalog_history = CatalogHistory::create();
+        let transactions = TransactionRegistry::create();
+        let catalog =
+            catalog_history.materialize(None, Snapshot::create(&transactions), &transactions);
         DatabaseState {
-            catalog: Catalog::create(),
+            catalog,
+            catalog_history,
             tables: BTreeMap::new(),
-            transactions: TransactionRegistry::create(),
+            transactions,
             row_locks: RowLockManager::create(),
             wait_for: WaitForGraph::create(),
             sequence_values: Arc::new(Mutex::new(BTreeMap::new())),
             touched_tables: BTreeMap::new(),
             reclaimable_tables: Vec::new(),
         }
+    }
+
+    #[cfg_attr(feature = "execution-log", tracing::instrument(skip_all))]
+    pub(crate) fn load_catalog(&mut self, xid: Option<Xid>, snapshot: Snapshot) {
+        self.catalog = self
+            .catalog_history
+            .materialize(xid, snapshot, &self.transactions);
+    }
+
+    #[cfg_attr(feature = "execution-log", tracing::instrument(skip_all))]
+    pub(crate) fn record_catalog_changes(
+        &mut self,
+        previous: &Catalog,
+        xid: Xid,
+        command_id: CommandId,
+    ) {
+        self.catalog_history
+            .record_changes(previous, &self.catalog, xid, command_id);
     }
 
     #[cfg_attr(feature = "execution-log", tracing::instrument(skip_all))]
@@ -140,6 +165,11 @@ impl DatabaseState {
     #[cfg_attr(feature = "execution-log", tracing::instrument(skip_all))]
     pub(crate) fn take_touched_tables(&mut self, xid: Xid) -> Vec<TableId> {
         self.touched_tables.remove(&xid).unwrap_or_default()
+    }
+
+    #[cfg_attr(feature = "execution-log", tracing::instrument(skip_all))]
+    pub(crate) fn collect_touched_tables(&self) -> BTreeSet<TableId> {
+        self.touched_tables.values().flatten().copied().collect()
     }
 
     #[cfg_attr(feature = "execution-log", tracing::instrument(skip_all))]
@@ -167,7 +197,7 @@ pub(crate) fn execute_statement(
     statement: &ast::Statement,
     xid: Xid,
     snapshot: &Snapshot,
-    deferred_constraints: &BTreeSet<String>,
+    deferred_constraints: &BTreeSet<ConstraintId>,
     defer_all: bool,
     context: &StatementExecutionContext,
     mutation_targets: Option<Vec<RequiredRowLock>>,
@@ -234,6 +264,7 @@ pub(crate) fn execute_statement(
                         ast::ColumnOption::PrimaryKey(_) => {
                             let columns = vec![column_name.clone()];
                             constraints.push(crate::catalog::Constraint::PrimaryKey {
+                                id: ConstraintId(0),
                                 name: option
                                     .name
                                     .as_ref()
@@ -245,6 +276,7 @@ pub(crate) fn execute_statement(
                         ast::ColumnOption::Unique(_) => {
                             let columns = vec![column_name.clone()];
                             constraints.push(crate::catalog::Constraint::Unique {
+                                id: ConstraintId(0),
                                 name: option
                                     .name
                                     .as_ref()
@@ -254,7 +286,10 @@ pub(crate) fn execute_statement(
                             });
                         }
                         ast::ColumnOption::Check(check) => {
-                            constraints.push(crate::catalog::Constraint::Check(check.expr.clone()))
+                            constraints.push(crate::catalog::Constraint::Check {
+                                id: ConstraintId(0),
+                                expression: check.expr.clone(),
+                            })
                         }
                         ast::ColumnOption::ForeignKey(foreign_key) => {
                             let name = resolve_foreign_key_name(
@@ -262,11 +297,13 @@ pub(crate) fn execute_statement(
                                 format!("{}_{}_fkey", table_name, column_name),
                             );
                             constraints.push(crate::catalog::Constraint::ForeignKey(ForeignKey {
+                                id: ConstraintId(0),
                                 name,
                                 columns: vec![column_name.clone()],
                                 foreign_table: crate::executor::normalize_unqualified_object_name(
                                     &foreign_key.foreign_table,
                                 )?,
+                                foreign_table_id: TableId(0),
                                 referred_columns: foreign_key
                                     .referred_columns
                                     .iter()
@@ -330,12 +367,11 @@ pub(crate) fn execute_statement(
                                 &table_name,
                                 &column_name,
                             );
-                            let mut sequence = sequences::create_sequence_schema_for_type(
+                            let sequence = sequences::create_sequence_schema_for_type(
                                 sequence_name.clone(),
                                 data_type.base,
                                 sequence_options.as_deref().unwrap_or(&[]),
                             )?;
-                            sequence.owned_by = Some((table_name.clone(), column_name.clone()));
                             sequence_schemas.push(sequence);
                             nullable = false;
                             default_sequence = Some(sequence_name);
@@ -355,12 +391,11 @@ pub(crate) fn execute_statement(
                         &table_name,
                         &column_name,
                     );
-                    let mut sequence = sequences::create_sequence_schema_for_type(
+                    let sequence = sequences::create_sequence_schema_for_type(
                         sequence_name.clone(),
                         base,
                         &[],
                     )?;
-                    sequence.owned_by = Some((table_name.clone(), column_name.clone()));
                     sequence_schemas.push(sequence);
                     nullable = false;
                     default_sequence = Some(sequence_name);
@@ -385,6 +420,7 @@ pub(crate) fn execute_statement(
                             .map(resolve_index_column_name)
                             .collect::<Result<Vec<_>>>()?;
                         constraints.push(crate::catalog::Constraint::PrimaryKey {
+                            id: ConstraintId(0),
                             name: primary_key
                                 .name
                                 .as_ref()
@@ -401,6 +437,7 @@ pub(crate) fn execute_statement(
                             .collect::<Result<Vec<_>>>()?;
                         let default_name = format!("{table_name}_{}_key", columns.join("_"));
                         constraints.push(crate::catalog::Constraint::Unique {
+                            id: ConstraintId(0),
                             name: unique
                                 .name
                                 .as_ref()
@@ -410,7 +447,10 @@ pub(crate) fn execute_statement(
                         })
                     }
                     ast::TableConstraint::Check(check) => {
-                        constraints.push(crate::catalog::Constraint::Check(check.expr.clone()))
+                        constraints.push(crate::catalog::Constraint::Check {
+                            id: ConstraintId(0),
+                            expression: check.expr.clone(),
+                        })
                     }
                     ast::TableConstraint::ForeignKey(foreign_key) => {
                         let name = resolve_foreign_key_name(
@@ -418,6 +458,7 @@ pub(crate) fn execute_statement(
                             format!("{}_fkey", table_name),
                         );
                         constraints.push(crate::catalog::Constraint::ForeignKey(ForeignKey {
+                            id: ConstraintId(0),
                             name,
                             columns: foreign_key
                                 .columns
@@ -427,6 +468,7 @@ pub(crate) fn execute_statement(
                             foreign_table: crate::executor::normalize_unqualified_object_name(
                                 &foreign_key.foreign_table,
                             )?,
+                            foreign_table_id: TableId(0),
                             referred_columns: foreign_key
                                 .referred_columns
                                 .iter()
@@ -457,7 +499,7 @@ pub(crate) fn execute_statement(
                 let (constraint_columns, primary_key) = match constraint {
                     crate::catalog::Constraint::PrimaryKey { columns, .. } => (columns, true),
                     crate::catalog::Constraint::Unique { columns, .. } => (columns, false),
-                    crate::catalog::Constraint::Check(_)
+                    crate::catalog::Constraint::Check { .. }
                     | crate::catalog::Constraint::ForeignKey(_) => continue,
                 };
                 for name in constraint_columns {
@@ -477,12 +519,14 @@ pub(crate) fn execute_statement(
             }
             validate_check_constraint_types(&TableSchema {
                 id: TableId(0),
+                schema_id: crate::catalog::SchemaId(0),
                 name: table_name.clone(),
                 columns: columns.clone(),
                 constraints: constraints.clone(),
             })?;
             let proposed = TableSchema {
                 id: TableId(0),
+                schema_id: crate::catalog::SchemaId(0),
                 name: table_name.clone(),
                 columns: columns.clone(),
                 constraints: constraints.clone(),
@@ -494,9 +538,16 @@ pub(crate) fn execute_statement(
             let table = state
                 .catalog
                 .require_table(&table_name)
-                .expect("created table must exist");
+                .expect("created table must exist")
+                .clone();
             state.tables.insert(id, Table::create(table.clone()));
-            for sequence in sequence_schemas {
+            for mut sequence in sequence_schemas {
+                let column = table
+                    .columns
+                    .iter()
+                    .find(|column| column.default_sequence.as_ref() == Some(&sequence.name))
+                    .expect("generated sequence must belong to a table column");
+                sequence.owned_by = Some((id, column.name.clone()));
                 let initial = SequenceValueState {
                     last_value: sequence.start_value,
                     is_called: false,
@@ -557,7 +608,7 @@ pub(crate) fn execute_statement(
                             ),
                         ));
                     }
-                    Some((table_name, column_name))
+                    Some((table.id, column_name))
                 }
                 Some(_) => return reject_unsupported("sequence ownership is not implemented"),
             };
@@ -594,15 +645,7 @@ pub(crate) fn execute_statement(
                 let table_name = normalize_unqualified_object_name(object)?;
                 match state.catalog.drop_table(&table_name) {
                     Ok(schema) => {
-                        state.tables.remove(&schema.id);
-                        for sequence in state.catalog.drop_owned_sequences(&schema.name) {
-                            state
-                                .sequence_values
-                                .lock()
-                                .expect("sequence storage is poisoned")
-                                .remove(&sequence.id)
-                                .expect("catalog sequence must have storage");
-                        }
+                        state.catalog.drop_owned_sequences(schema.id);
                         affected += 1;
                     }
                     Err(error) if *if_exists && error.sqlstate == SqlState::UndefinedTable => {}
@@ -627,14 +670,7 @@ pub(crate) fn execute_statement(
             for object in names {
                 let name = normalize_unqualified_object_name(object)?;
                 match state.catalog.drop_sequence(&name) {
-                    Ok(sequence) => {
-                        state
-                            .sequence_values
-                            .lock()
-                            .expect("sequence storage is poisoned")
-                            .remove(&sequence.id)
-                            .expect("catalog sequence must have storage");
-                    }
+                    Ok(_) => {}
                     Err(error) if *if_exists && error.sqlstate == SqlState::UndefinedTable => {}
                     Err(error) => return Err(error),
                 }

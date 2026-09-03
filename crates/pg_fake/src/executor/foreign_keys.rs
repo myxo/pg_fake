@@ -23,19 +23,19 @@ pub(super) fn resolve_foreign_key_name(name: Option<&ast::Ident>, default: Strin
 #[cfg_attr(feature = "execution-log", tracing::instrument(skip_all))]
 fn is_foreign_key_deferred(
     foreign_key: &ForeignKey,
-    deferred_constraints: &BTreeSet<String>,
+    deferred_constraints: &BTreeSet<ConstraintId>,
     defer_all: bool,
 ) -> bool {
     foreign_key.deferrable
         && (foreign_key.initially_deferred
             || defer_all
-            || deferred_constraints.contains(&foreign_key.name))
+            || deferred_constraints.contains(&foreign_key.id))
 }
 
 #[cfg_attr(feature = "execution-log", tracing::instrument(skip_all))]
 pub(crate) fn contains_deferred_foreign_keys(
     state: &DatabaseState,
-    deferred_constraints: &BTreeSet<String>,
+    deferred_constraints: &BTreeSet<ConstraintId>,
     defer_all: bool,
 ) -> bool {
     state
@@ -158,7 +158,7 @@ pub(super) fn validate_row_foreign_keys(
     row: &[Value],
     xid: Xid,
     snapshot: &Snapshot,
-    deferred_constraints: &BTreeSet<String>,
+    deferred_constraints: &BTreeSet<ConstraintId>,
     defer_all: bool,
 ) -> Result<()> {
     let snapshot = snapshot.include_current_command();
@@ -188,7 +188,9 @@ pub(super) fn validate_row_foreign_keys(
             }
             continue;
         }
-        let foreign_schema = state.catalog.require_table(&foreign_key.foreign_table)?;
+        let foreign_schema = state
+            .catalog
+            .require_table_by_id(foreign_key.foreign_table_id)?;
         let referred_columns = if foreign_key.referred_columns.is_empty() {
             foreign_schema
                 .constraints
@@ -262,13 +264,13 @@ pub(super) fn apply_referencing_foreign_key_actions(
     new_row: Option<&[Value]>,
     xid: Xid,
     snapshot: &Snapshot,
-    deferred_constraints: &BTreeSet<String>,
+    deferred_constraints: &BTreeSet<ConstraintId>,
     defer_all: bool,
     visited: &mut BTreeSet<(TableId, RowId)>,
     context: &StatementExecutionContext,
 ) -> Result<()> {
     let snapshot = snapshot.include_current_command();
-    let foreign_keys = state.catalog.referencing_foreign_keys(&parent_schema.name);
+    let foreign_keys = state.catalog.referencing_foreign_keys(parent_schema.id);
     for (child_schema, foreign_key) in foreign_keys {
         let referred_columns = if foreign_key.referred_columns.is_empty() {
             parent_schema
@@ -449,7 +451,7 @@ fn apply_cascaded_row_update(
     updated: Vec<Value>,
     xid: Xid,
     snapshot: &Snapshot,
-    deferred_constraints: &BTreeSet<String>,
+    deferred_constraints: &BTreeSet<ConstraintId>,
     defer_all: bool,
     visited: &mut BTreeSet<(TableId, RowId)>,
     context: &StatementExecutionContext,

@@ -1739,6 +1739,7 @@ name = "pg_fake"
 version = "0.1.0"
 dependencies = [
  "bigdecimal",
+ "chaos_theory",
  "chrono",
  "dotenvy",
  "postgres",

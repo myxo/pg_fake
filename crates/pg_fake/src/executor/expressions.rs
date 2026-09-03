@@ -112,7 +112,7 @@ pub(super) fn validate_not_null(schema: &TableSchema, row: &[Value]) -> Result<(
 #[cfg_attr(feature = "execution-log", tracing::instrument(skip_all))]
 pub(super) fn validate_check_constraint_types(schema: &TableSchema) -> Result<()> {
     for constraint in &schema.constraints {
-        let crate::catalog::Constraint::Check(expression) = constraint else {
+        let crate::catalog::Constraint::Check { expression, .. } = constraint else {
             continue;
         };
         let base = infer_expression_type(expression, RowScope::Table(schema))?;
@@ -136,7 +136,7 @@ pub(super) fn validate_check_constraints(
     context: &StatementExecutionContext,
 ) -> Result<()> {
     for constraint in &schema.constraints {
-        let crate::catalog::Constraint::Check(expression) = constraint else {
+        let crate::catalog::Constraint::Check { expression, .. } = constraint else {
             continue;
         };
         match evaluate_and_coerce(
@@ -172,6 +172,7 @@ pub(super) fn is_default_expression(expr: &ast::Expr) -> bool {
 pub(crate) fn create_constant_expression_schema() -> TableSchema {
     TableSchema {
         id: TableId(0),
+        schema_id: crate::catalog::SchemaId(0),
         name: String::new(),
         columns: Vec::new(),
         constraints: Vec::new(),

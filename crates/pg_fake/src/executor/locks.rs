@@ -115,8 +115,7 @@ pub(crate) fn collect_required_row_locks(
                     .flatten(),
                 RowLockMode::Update,
                 delete.using.is_none(),
-                delete.returning.is_some()
-                    || state.catalog.has_referencing_foreign_keys(&schema.name),
+                delete.returning.is_some() || state.catalog.has_referencing_foreign_keys(schema.id),
             )
         }
         ast::Statement::Query(query) => {
@@ -571,7 +570,9 @@ fn collect_insert_foreign_key_locks(
             if key.iter().any(Value::is_null) {
                 continue;
             }
-            let foreign_schema = state.catalog.require_table(&foreign_key.foreign_table)?;
+            let foreign_schema = state
+                .catalog
+                .require_table_by_id(foreign_key.foreign_table_id)?;
             let referred = if foreign_key.referred_columns.is_empty() {
                 foreign_schema
                     .constraints
