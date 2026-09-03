@@ -90,6 +90,7 @@ struct ActiveTransaction {
     isolation: IsolationLevel,
     snapshot: Option<Snapshot>,
     statement_started: bool,
+    read_only: bool,
     next_command_id: u64,
     implicit_batch: bool,
     transaction_timestamp: chrono::DateTime<chrono::Utc>,
@@ -928,6 +929,7 @@ impl Session {
             isolation,
             snapshot: None,
             statement_started: false,
+            read_only: true,
             next_command_id: 0,
             implicit_batch,
             transaction_timestamp: self.db.read_clock(),
@@ -943,6 +945,15 @@ impl Session {
         };
         let state_lock = self.db.state.clone();
         let mut state = state_lock.lock().expect("database mutex is poisoned");
+        if transaction.read_only {
+            assert!(self.ddl_undo.is_empty());
+            assert!(!self.deferred_foreign_keys_dirty);
+            state.transactions.finish_read_only(transaction.xid);
+            self.settings_undo = None;
+            self.deferred_constraints.clear();
+            self.defer_all_constraints = false;
+            return Ok(());
+        }
         if self.deferred_foreign_keys_dirty
             && let Err(error) = executor::validate_deferred_foreign_keys(&state, transaction.xid)
         {
@@ -1293,6 +1304,8 @@ impl Session {
         let Some(SessionTransactionState::Active(mut transaction)) = self.transaction else {
             unreachable!("transaction must be active while executing a statement")
         };
+        transaction.read_only &=
+            prepared_query.is_some() || is_plain_read_only_statement(statement);
         let state_lock = self.db.state.clone();
         let condvar = self.db.condvar.clone();
         let mut state = state_lock.lock().expect("database mutex is poisoned");
@@ -1454,6 +1467,20 @@ fn contains_dml(statement: &ast::Statement) -> bool {
         }
         _ => false,
     }
+}
+
+#[cfg_attr(feature = "execution-log", tracing::instrument(skip_all))]
+fn is_plain_read_only_statement(statement: &ast::Statement) -> bool {
+    let ast::Statement::Query(query) = statement else {
+        return false;
+    };
+    query.with.is_none()
+        && query.locks.is_empty()
+        && query.for_clause.is_none()
+        && !matches!(
+            query.body.as_ref(),
+            ast::SetExpr::Insert(_) | ast::SetExpr::Update(_) | ast::SetExpr::Delete(_)
+        )
 }
 
 #[cfg_attr(feature = "execution-log", tracing::instrument(skip_all))]
