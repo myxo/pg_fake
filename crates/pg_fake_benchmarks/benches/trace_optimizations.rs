@@ -63,7 +63,7 @@ fn create_join_session() -> Session {
 fn create_catalog_session() -> Session {
     let mut session = Db::create().create_session();
     let mut sql = String::from(
-        "CREATE TABLE catalog_target (id INTEGER); INSERT INTO catalog_target VALUES (1);",
+        "CREATE TABLE catalog_target (id INTEGER PRIMARY KEY); INSERT INTO catalog_target VALUES (1);",
     );
     for id in 1..=100 {
         sql.push_str(&format!("CREATE TABLE unrelated_{id} (id INTEGER);"));
@@ -170,6 +170,18 @@ fn benchmark_trace_optimizations(criterion: &mut Criterion) {
     group.throughput(Throughput::Elements(1));
     group.bench_function("generic_execute", |benchmark| {
         benchmark.iter(|| execute(&mut catalog_session, "SELECT id FROM catalog_target"));
+    });
+    group.finish();
+
+    let mut group = criterion.benchmark_group("trace_update_miss_100_unrelated_tables");
+    group.throughput(Throughput::Elements(1));
+    group.bench_function("generic_execute", |benchmark| {
+        benchmark.iter(|| {
+            execute(
+                &mut catalog_session,
+                "UPDATE catalog_target SET id = id WHERE id = 2",
+            );
+        });
     });
     group.finish();
 
