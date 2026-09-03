@@ -210,6 +210,15 @@ fn benchmark_trace_optimizations(criterion: &mut Criterion) {
             );
         });
     });
+    group.throughput(Throughput::Elements(900));
+    group.bench_function("cross", |benchmark| {
+        benchmark.iter(|| {
+            execute(
+                &mut join_session,
+                "SELECT u.name, t.name FROM join_users u CROSS JOIN join_teams t",
+            );
+        });
+    });
     group.finish();
 
     let mut catalog_session = create_catalog_session();

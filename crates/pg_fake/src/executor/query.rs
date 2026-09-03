@@ -5476,6 +5476,25 @@ fn visit_streamed_join_rows(
             visit,
         );
     }
+    let mut right_sources = Vec::with_capacity(table.joins.len());
+    for (index, join) in table.joins.iter().enumerate() {
+        let mut rows = Vec::new();
+        visit_table_factor_rows(
+            state,
+            &join.relation,
+            scope,
+            xid,
+            snapshot,
+            context,
+            selection,
+            starts[index + 1],
+            &mut |row| {
+                rows.push(row.to_vec());
+                Ok(())
+            },
+        )?;
+        right_sources.push(rows);
+    }
     visit_table_factor_rows(
         state,
         &table.relation,
@@ -5487,7 +5506,17 @@ fn visit_streamed_join_rows(
         starts[0],
         &mut |row| {
             visit_nested_loop_join_rows(
-                state, table, scope, xid, snapshot, context, selection, &starts, 0, row, visit,
+                state,
+                table,
+                scope,
+                xid,
+                snapshot,
+                context,
+                &starts,
+                &right_sources,
+                0,
+                row,
+                visit,
             )
         },
     )
@@ -5659,8 +5688,8 @@ fn visit_nested_loop_join_rows(
     xid: Xid,
     snapshot: &Snapshot,
     context: &StatementExecutionContext,
-    selection: Option<&ast::Expr>,
     starts: &[usize],
+    right_sources: &[Vec<Vec<Value>>],
     index: usize,
     left: &[Value],
     visit: &mut dyn FnMut(&[Value]) -> Result<()>,
@@ -5668,55 +5697,45 @@ fn visit_nested_loop_join_rows(
     let Some(join) = table.joins.get(index) else {
         return visit(left);
     };
-    visit_table_factor_rows(
-        state,
-        &join.relation,
-        scope,
-        xid,
-        snapshot,
-        context,
-        selection,
-        starts[index + 1],
-        &mut |right| {
-            let row = left
-                .iter()
-                .zip(right)
-                .map(|(left, right)| {
-                    if left.is_null() {
-                        right.clone()
-                    } else {
-                        left.clone()
-                    }
-                })
-                .collect::<Vec<_>>();
-            if evaluate_join_condition(
+    for right in &right_sources[index] {
+        let row = left
+            .iter()
+            .zip(right)
+            .map(|(left, right)| {
+                if left.is_null() {
+                    right.clone()
+                } else {
+                    left.clone()
+                }
+            })
+            .collect::<Vec<_>>();
+        if evaluate_join_condition(
+            state,
+            &join.join_operator,
+            &row,
+            scope,
+            starts[0],
+            starts[index + 1],
+            xid,
+            snapshot,
+            context,
+        )? {
+            visit_nested_loop_join_rows(
                 state,
-                &join.join_operator,
-                &row,
+                table,
                 scope,
-                starts[0],
-                starts[index + 1],
                 xid,
                 snapshot,
                 context,
-            )? {
-                visit_nested_loop_join_rows(
-                    state,
-                    table,
-                    scope,
-                    xid,
-                    snapshot,
-                    context,
-                    selection,
-                    starts,
-                    index + 1,
-                    &row,
-                    visit,
-                )?;
-            }
-            Ok(())
-        },
-    )
+                starts,
+                right_sources,
+                index + 1,
+                &row,
+                visit,
+            )?;
+        }
+    }
+    Ok(())
 }
 
 #[cfg_attr(feature = "execution-log", tracing::instrument(skip_all))]
