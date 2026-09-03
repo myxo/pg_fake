@@ -3945,6 +3945,57 @@ mod tests {
 
     #[test]
     #[cfg_attr(feature = "execution-log", tracing::instrument(skip_all))]
+    fn waits_for_on_conflict_rows_and_rechecks_commit_or_rollback() {
+        let db = Db::create_builder()
+            .set_lock_timeout(Duration::from_secs(2))
+            .build();
+        let mut first = db.create_session();
+        let mut second = db.create_session();
+        first
+            .execute("CREATE TABLE items (id INTEGER PRIMARY KEY)")
+            .unwrap();
+        first.execute("BEGIN").unwrap();
+        first.execute("INSERT INTO items VALUES (1)").unwrap();
+
+        let (result_sender, result_receiver) = mpsc::channel();
+        let handle = thread::spawn(move || {
+            result_sender
+                .send(second.execute("INSERT INTO items VALUES (1) ON CONFLICT (id) DO NOTHING"))
+                .unwrap();
+        });
+        wait_until_blocked(&db);
+        first.execute("COMMIT").unwrap();
+        assert_eq!(
+            result_receiver
+                .recv_timeout(Duration::from_secs(1))
+                .unwrap(),
+            Ok(create_affected_results(0))
+        );
+        handle.join().unwrap();
+
+        let mut first = db.create_session();
+        let mut second = db.create_session();
+        first.execute("BEGIN").unwrap();
+        first.execute("INSERT INTO items VALUES (2)").unwrap();
+        let (result_sender, result_receiver) = mpsc::channel();
+        let handle = thread::spawn(move || {
+            result_sender
+                .send(second.execute("INSERT INTO items VALUES (2) ON CONFLICT (id) DO NOTHING"))
+                .unwrap();
+        });
+        wait_until_blocked(&db);
+        first.execute("ROLLBACK").unwrap();
+        assert_eq!(
+            result_receiver
+                .recv_timeout(Duration::from_secs(1))
+                .unwrap(),
+            Ok(create_affected_results(1))
+        );
+        handle.join().unwrap();
+    }
+
+    #[test]
+    #[cfg_attr(feature = "execution-log", tracing::instrument(skip_all))]
     fn aborts_newest_deadlocked_transaction_and_allows_survivor() {
         let db = Db::create_builder()
             .set_lock_timeout(Duration::from_secs(2))

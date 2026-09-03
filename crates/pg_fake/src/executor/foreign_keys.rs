@@ -105,7 +105,7 @@ pub(super) fn validate_foreign_key_definitions(
                 .constraints
                 .iter()
                 .find_map(|constraint| match constraint {
-                    crate::catalog::Constraint::PrimaryKey(columns) => Some(columns.clone()),
+                    crate::catalog::Constraint::PrimaryKey { columns, .. } => Some(columns.clone()),
                     _ => None,
                 })
                 .ok_or_else(|| {
@@ -125,10 +125,17 @@ pub(super) fn validate_foreign_key_definitions(
                 "number of referencing and referenced columns for foreign key disagree",
             ));
         }
-        if !referred.constraints.iter().any(|constraint| matches!(constraint,
-            crate::catalog::Constraint::PrimaryKey(columns) | crate::catalog::Constraint::Unique(columns) if *columns == referred_columns
-        )) {
-            return Err(PgError::create(SqlState::InvalidColumnReference, "there is no unique constraint matching given keys for referenced table"));
+        if !referred.constraints.iter().any(|constraint| {
+            matches!(constraint,
+                crate::catalog::Constraint::PrimaryKey { columns, .. }
+                | crate::catalog::Constraint::Unique { columns, .. }
+                    if *columns == referred_columns
+            )
+        }) {
+            return Err(PgError::create(
+                SqlState::InvalidColumnReference,
+                "there is no unique constraint matching given keys for referenced table",
+            ));
         }
         for (local, referred_index) in local_indexes.iter().zip(referred_indexes) {
             if schema.columns[*local].data_type.base
@@ -187,7 +194,7 @@ pub(super) fn validate_row_foreign_keys(
                 .constraints
                 .iter()
                 .find_map(|constraint| match constraint {
-                    crate::catalog::Constraint::PrimaryKey(columns) => Some(columns.clone()),
+                    crate::catalog::Constraint::PrimaryKey { columns, .. } => Some(columns.clone()),
                     _ => None,
                 })
                 .expect("foreign key definition was validated")
@@ -268,7 +275,7 @@ pub(super) fn apply_referencing_foreign_key_actions(
                 .constraints
                 .iter()
                 .find_map(|constraint| match constraint {
-                    crate::catalog::Constraint::PrimaryKey(columns) => Some(columns.clone()),
+                    crate::catalog::Constraint::PrimaryKey { columns, .. } => Some(columns.clone()),
                     _ => None,
                 })
                 .expect("foreign key definition was validated")
@@ -459,6 +466,7 @@ fn apply_cascaded_row_update(
             xid,
             &state.transactions,
             Some(row_id),
+            None,
             None,
         )
     {

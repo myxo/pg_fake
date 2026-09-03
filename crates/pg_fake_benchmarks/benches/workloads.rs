@@ -1073,6 +1073,7 @@ fn benchmarks(criterion: &mut Criterion) {
         serial_identity_benchmark(criterion, &runtime, &mut connections);
         uuid_temporal_benchmark(criterion, &runtime, &mut connections);
         insert_benchmark(criterion, &runtime, &mut connections);
+        on_conflict_benchmark(criterion, &runtime, &mut connections);
         update_benchmark(criterion, &runtime, &mut connections);
         delete_benchmark(criterion, &runtime, &mut connections);
         transaction_benchmark(criterion, &runtime, &mut connections);
@@ -1101,6 +1102,36 @@ fn benchmarks(criterion: &mut Criterion) {
             sqlx::query("DROP SCHEMA pgfake_benchmark CASCADE").execute(&mut postgres.connection),
         )
         .unwrap();
+}
+
+fn on_conflict_benchmark(
+    criterion: &mut Criterion,
+    runtime: &Runtime,
+    connections: &mut [NamedBenchmarkConnection<'_>],
+) {
+    for (_, connection) in connections.iter_mut() {
+        connection.execute(
+            runtime,
+            "CREATE TABLE insert_on_conflict_do_nothing (id INTEGER PRIMARY KEY, value TEXT)",
+        );
+        connection.execute(
+            runtime,
+            "INSERT INTO insert_on_conflict_do_nothing VALUES (1, 'existing')",
+        );
+    }
+    let query = "INSERT INTO insert_on_conflict_do_nothing VALUES (1, 'proposed') ON CONFLICT (id) DO NOTHING";
+    let mut group =
+        criterion.benchmark_group(benchmarks::find_benchmark("insert_on_conflict_do_nothing").name);
+    group.throughput(Throughput::Elements(1));
+    for (name, connection) in connections.iter_mut() {
+        group.bench_function(*name, |benchmark| {
+            benchmark.iter(|| connection.execute(runtime, query));
+        });
+    }
+    group.finish();
+    for (_, connection) in connections.iter_mut() {
+        connection.execute(runtime, "DROP TABLE insert_on_conflict_do_nothing");
+    }
 }
 
 fn global_aggregate_benchmark(

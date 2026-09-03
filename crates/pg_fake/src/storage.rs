@@ -83,7 +83,7 @@ impl Table {
             .constraints
             .iter()
             .filter_map(|constraint| match constraint {
-                Constraint::PrimaryKey(columns) | Constraint::Unique(columns) => {
+                Constraint::PrimaryKey { columns, .. } | Constraint::Unique { columns, .. } => {
                     Some(UniqueIndex {
                         columns: columns
                             .iter()
@@ -329,14 +329,16 @@ impl Table {
         transactions: &TransactionRegistry,
         excluded_row: Option<RowId>,
         changed_columns: Option<&BTreeSet<usize>>,
+        arbiter_columns: Option<&[usize]>,
     ) -> bool {
         let snapshot = snapshot.include_current_command();
         self.indexes
             .iter()
             .filter(|index| {
-                changed_columns.is_none_or(|columns| {
-                    index.columns.iter().any(|column| columns.contains(column))
-                })
+                arbiter_columns.is_none_or(|columns| index.columns == columns)
+                    && changed_columns.is_none_or(|columns| {
+                        index.columns.iter().any(|column| columns.contains(column))
+                    })
             })
             .any(|index| {
                 let Some(key) = build_row_index_key(&self.schema, index, row) else {
@@ -359,6 +361,85 @@ impl Table {
                     })
                 })
             })
+    }
+
+    #[cfg_attr(feature = "execution-log", tracing::instrument(skip_all))]
+    pub(crate) fn find_conflicting_row(
+        &self,
+        row: &Row,
+        current_xid: Xid,
+        transactions: &TransactionRegistry,
+        arbiter_columns: Option<&[usize]>,
+    ) -> Option<RowId> {
+        self.indexes
+            .iter()
+            .filter(|index| arbiter_columns.is_none_or(|columns| index.columns == columns))
+            .find_map(|index| {
+                let key = build_row_index_key(&self.schema, index, row)?;
+                index.entries.get(&key)?.iter().find_map(|row_id| {
+                    self.version_chains
+                        .chains
+                        .get(row_id)?
+                        .versions
+                        .iter()
+                        .rev()
+                        .any(|version| {
+                            version.xmin != current_xid
+                                && !matches!(
+                                    transactions.get_status(version.xmin),
+                                    Some(TransactionStatus::Aborted)
+                                )
+                                && version.xmax.is_none_or(|xmax| {
+                                    !matches!(
+                                        transactions.get_status(xmax),
+                                        Some(TransactionStatus::Committed(_))
+                                    )
+                                })
+                                && build_row_index_key(&self.schema, index, &version.row).as_ref()
+                                    == Some(&key)
+                        })
+                        .then_some(*row_id)
+                })
+            })
+    }
+
+    #[cfg_attr(feature = "execution-log", tracing::instrument(skip_all))]
+    pub(crate) fn find_unique_candidate_rows(
+        &self,
+        current_xid: Xid,
+        transactions: &TransactionRegistry,
+        arbiter_columns: Option<&[usize]>,
+    ) -> Vec<RowId> {
+        self.version_chains
+            .chains
+            .iter()
+            .filter_map(|(row_id, chain)| {
+                chain
+                    .versions
+                    .iter()
+                    .rev()
+                    .find(|version| {
+                        version.xmin != current_xid
+                            && !matches!(
+                                transactions.get_status(version.xmin),
+                                Some(TransactionStatus::Aborted)
+                            )
+                            && version.xmax.is_none_or(|xmax| {
+                                !matches!(
+                                    transactions.get_status(xmax),
+                                    Some(TransactionStatus::Committed(_))
+                                )
+                            })
+                    })
+                    .is_some_and(|version| {
+                        self.indexes.iter().any(|index| {
+                            arbiter_columns.is_none_or(|columns| index.columns == columns)
+                                && build_row_index_key(&self.schema, index, &version.row).is_some()
+                        })
+                    })
+                    .then_some(*row_id)
+            })
+            .collect()
     }
 
     #[cfg_attr(feature = "execution-log", tracing::instrument(skip_all))]
@@ -601,7 +682,10 @@ mod tests {
                     default_sequence: None,
                     identity: None,
                 }],
-                vec![Constraint::PrimaryKey(vec!["value".into()])],
+                vec![Constraint::PrimaryKey {
+                    name: "values_pkey".into(),
+                    columns: vec!["value".into()],
+                }],
             )
             .unwrap();
         Table::create(catalog.require_table("items").unwrap().clone())

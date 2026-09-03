@@ -703,6 +703,57 @@ fn generate_main_insert(src: &mut Source, table: &TableSchema, next_key: &mut i6
     sql
 }
 
+fn generate_on_conflict_insert(
+    src: &mut Source,
+    table: &TableSchema,
+    next_key: &mut i64,
+) -> String {
+    let key = src.any_of("key", int_in(1..=*next_key - 1));
+    let columns = table
+        .columns
+        .iter()
+        .map(|column| column.name.as_str())
+        .collect::<Vec<_>>();
+    let mut rows = Vec::new();
+    src.repeat_n("rows", 1..=3, |src| {
+        let values = table
+            .columns
+            .iter()
+            .enumerate()
+            .map(|(index, column)| {
+                if index == 0 {
+                    key.to_string()
+                } else {
+                    generate_literal(src, column)
+                }
+            })
+            .collect::<Vec<_>>();
+        rows.push(format!("({})", values.join(", ")));
+        Effect::Success
+    });
+    let target = src.select(
+        "target",
+        &["none", "columns", "constraint"],
+        |_src, target, _| match target {
+            "none" => String::new(),
+            "columns" => format!(" ({})", table.key().name),
+            "constraint" => format!(" ON CONSTRAINT {}_pkey", table.name),
+            _ => unreachable!(),
+        },
+    );
+    let returning = if src.any("returning") {
+        " RETURNING *"
+    } else {
+        ""
+    };
+    format!(
+        "INSERT INTO {} ({}) VALUES {} ON CONFLICT{target} DO NOTHING{returning}",
+        table.name,
+        columns.join(", "),
+        rows.join(", ")
+    )
+}
+
 fn generate_predicate(src: &mut Source, table: &TableSchema) -> String {
     src.select(
         "predicate",
@@ -1510,10 +1561,25 @@ fn generate_statement(
 ) -> (String, RowOrder) {
     let statements: &[&str] = if *in_transaction {
         &[
-            "insert", "select", "update", "delete", "set", "commit", "rollback",
+            "insert",
+            "on_conflict",
+            "select",
+            "update",
+            "delete",
+            "set",
+            "commit",
+            "rollback",
         ]
     } else {
-        &["insert", "select", "update", "delete", "set", "begin"]
+        &[
+            "insert",
+            "on_conflict",
+            "select",
+            "update",
+            "delete",
+            "set",
+            "begin",
+        ]
     };
     src.select(
         "statement",
@@ -1521,6 +1587,10 @@ fn generate_statement(
         |src, statement, _| match statement {
             "insert" => (
                 generate_insert(src, table, foreign_tables, next_key, next_child_key),
+                RowOrder::Unordered,
+            ),
+            "on_conflict" => (
+                generate_on_conflict_insert(src, table, next_key),
                 RowOrder::Unordered,
             ),
             "select" => generate_select(src, table, foreign_tables),

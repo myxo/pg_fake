@@ -233,11 +233,25 @@ pub(crate) fn execute_statement(
                         }
                         ast::ColumnOption::PrimaryKey(_) => {
                             let columns = vec![column_name.clone()];
-                            constraints.push(crate::catalog::Constraint::PrimaryKey(columns));
+                            constraints.push(crate::catalog::Constraint::PrimaryKey {
+                                name: option
+                                    .name
+                                    .as_ref()
+                                    .map(normalize_identifier)
+                                    .unwrap_or_else(|| format!("{table_name}_pkey")),
+                                columns,
+                            });
                         }
                         ast::ColumnOption::Unique(_) => {
                             let columns = vec![column_name.clone()];
-                            constraints.push(crate::catalog::Constraint::Unique(columns));
+                            constraints.push(crate::catalog::Constraint::Unique {
+                                name: option
+                                    .name
+                                    .as_ref()
+                                    .map(normalize_identifier)
+                                    .unwrap_or_else(|| format!("{table_name}_{column_name}_key")),
+                                columns,
+                            });
                         }
                         ast::ColumnOption::Check(check) => {
                             constraints.push(crate::catalog::Constraint::Check(check.expr.clone()))
@@ -365,22 +379,35 @@ pub(crate) fn execute_statement(
             for constraint in &create.constraints {
                 match constraint {
                     ast::TableConstraint::PrimaryKey(primary_key) => {
-                        constraints.push(crate::catalog::Constraint::PrimaryKey(
-                            primary_key
-                                .columns
-                                .iter()
-                                .map(resolve_index_column_name)
-                                .collect::<Result<Vec<_>>>()?,
-                        ))
+                        let columns = primary_key
+                            .columns
+                            .iter()
+                            .map(resolve_index_column_name)
+                            .collect::<Result<Vec<_>>>()?;
+                        constraints.push(crate::catalog::Constraint::PrimaryKey {
+                            name: primary_key
+                                .name
+                                .as_ref()
+                                .map(normalize_identifier)
+                                .unwrap_or_else(|| format!("{table_name}_pkey")),
+                            columns,
+                        })
                     }
                     ast::TableConstraint::Unique(unique) => {
-                        constraints.push(crate::catalog::Constraint::Unique(
-                            unique
-                                .columns
-                                .iter()
-                                .map(resolve_index_column_name)
-                                .collect::<Result<Vec<_>>>()?,
-                        ))
+                        let columns = unique
+                            .columns
+                            .iter()
+                            .map(resolve_index_column_name)
+                            .collect::<Result<Vec<_>>>()?;
+                        let default_name = format!("{table_name}_{}_key", columns.join("_"));
+                        constraints.push(crate::catalog::Constraint::Unique {
+                            name: unique
+                                .name
+                                .as_ref()
+                                .map(normalize_identifier)
+                                .unwrap_or(default_name),
+                            columns,
+                        })
                     }
                     ast::TableConstraint::Check(check) => {
                         constraints.push(crate::catalog::Constraint::Check(check.expr.clone()))
@@ -428,8 +455,8 @@ pub(crate) fn execute_statement(
             }
             for constraint in &constraints {
                 let (constraint_columns, primary_key) = match constraint {
-                    crate::catalog::Constraint::PrimaryKey(columns) => (columns, true),
-                    crate::catalog::Constraint::Unique(columns) => (columns, false),
+                    crate::catalog::Constraint::PrimaryKey { columns, .. } => (columns, true),
+                    crate::catalog::Constraint::Unique { columns, .. } => (columns, false),
                     crate::catalog::Constraint::Check(_)
                     | crate::catalog::Constraint::ForeignKey(_) => continue,
                 };
@@ -614,20 +641,15 @@ pub(crate) fn execute_statement(
             }
             Ok(StatementResult::Affected(0))
         }
-        ast::Statement::Insert(insert) => {
-            if insert.on.is_some() {
-                return reject_unsupported("INSERT ON CONFLICT is not implemented");
-            }
-            execute_insert(
-                state,
-                insert,
-                xid,
-                snapshot,
-                deferred_constraints,
-                defer_all,
-                context,
-            )
-        }
+        ast::Statement::Insert(insert) => execute_insert(
+            state,
+            insert,
+            xid,
+            snapshot,
+            deferred_constraints,
+            defer_all,
+            context,
+        ),
         ast::Statement::Update(update) => {
             if update.or.is_some() {
                 return reject_unsupported("UPDATE feature is not implemented");

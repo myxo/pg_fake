@@ -200,7 +200,7 @@ its `WITH` clause.
 
 ## Milestone C — Conflicting inserts
 
-### Task 6 — `ON CONFLICT DO NOTHING` and arbiter inference
+### Task 6 — `ON CONFLICT DO NOTHING` and arbiter inference [COMPLETE]
 
 **Goal:** Skip conflicting proposed rows using PostgreSQL unique-index inference.
 
@@ -220,6 +220,19 @@ its `WITH` clause.
   waiting, rollback, and committed-conflict behavior match PostgreSQL.
 - Differential/property and multi-session tests cover every target form,
   duplicate proposals, NULL keys, partial success, metadata, and errors.
+
+**Progress:**
+
+- [x] Preserve names for primary-key and unique constraints and resolve conflict
+  targets against their backing unique indexes.
+- [x] Execute `DO NOTHING` row by row, including `RETURNING`, defaults,
+  sequences, NULL keys, and non-conflict errors.
+- [x] Lock conflicting rows, including uncommitted candidates, and recheck after
+  concurrent commit or rollback.
+- [x] Add focused native, SQLx differential/property, multi-session, and
+  benchmark coverage.
+- [x] Run formatting, focused/workspace tests, and the 10,000-iteration property
+  gate.
 
 ### Task 7 — `ON CONFLICT DO UPDATE`
 

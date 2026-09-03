@@ -1637,6 +1637,38 @@ fn matches_primary_and_unique_constraints() {
 }
 
 #[test]
+fn matches_on_conflict_do_nothing() {
+    assert_differential(
+        "CREATE TABLE __TABLE__ (
+             id SERIAL PRIMARY KEY,
+             tenant INTEGER,
+             email TEXT,
+             CONSTRAINT __TABLE___tenant_email UNIQUE (tenant, email)
+         ); \
+         INSERT INTO __TABLE__ (tenant, email) VALUES (1, 'a'); \
+         INSERT INTO __TABLE__ (tenant, email) VALUES (1, 'b'), (1, 'a')
+             ON CONFLICT (email, tenant) DO NOTHING RETURNING id, email; \
+         INSERT INTO __TABLE__ (tenant, email) VALUES (1, 'c') RETURNING id; \
+         INSERT INTO __TABLE__ (id, tenant, email) VALUES (1, 2, 'd')
+             ON CONFLICT ON CONSTRAINT __TABLE___pkey DO NOTHING RETURNING id; \
+         INSERT INTO __TABLE__ (id, tenant, email) VALUES (19, 1, 'a')
+             ON CONFLICT ON CONSTRAINT __TABLE___tenant_email DO NOTHING RETURNING id; \
+         INSERT INTO __TABLE__ (tenant, email) VALUES (NULL, 'n'), (NULL, 'n')
+             ON CONFLICT DO NOTHING RETURNING email; \
+         INSERT INTO __TABLE__ (id, tenant, email) VALUES (20, 1, 'a')
+             ON CONFLICT (id) DO NOTHING; \
+         INSERT INTO __TABLE__ (id, tenant, email) VALUES (21, 3, 'x')
+             ON CONFLICT (email) DO NOTHING; \
+         INSERT INTO __TABLE__ (id, tenant, email) VALUES (22, 3, 'x')
+             ON CONFLICT ON CONSTRAINT missing_constraint DO NOTHING; \
+         INSERT INTO __TABLE__ (id, tenant, email) VALUES (30, 4, 'z'), (31, 1, 'a')
+             ON CONFLICT (id) DO NOTHING; \
+         SELECT id, tenant, email FROM __TABLE__ ORDER BY id",
+        RowOrder::Ordered,
+    );
+}
+
+#[test]
 fn matches_check_constraints() {
     assert_differential(
         "CREATE TABLE __TABLE__ (

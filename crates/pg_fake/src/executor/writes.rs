@@ -1,11 +1,150 @@
 use super::*;
 use crate::catalog::Constraint;
+use crate::txn::RowLockAttempt;
 use sqlparser::ast;
 
 struct ReturningPlan<'a> {
     scope: BoundScope,
     projections: Vec<query::ProjectionSource<'a>>,
     columns: Vec<ColumnMeta>,
+}
+
+pub(super) enum ConflictArbiter {
+    Any,
+    Index(Vec<usize>),
+}
+
+impl ConflictArbiter {
+    pub(super) fn get_columns(&self) -> Option<&[usize]> {
+        match self {
+            ConflictArbiter::Any => None,
+            ConflictArbiter::Index(columns) => Some(columns),
+        }
+    }
+}
+
+#[cfg_attr(feature = "execution-log", tracing::instrument(skip_all))]
+pub(super) fn resolve_conflict_arbiter(
+    schema: &TableSchema,
+    on: Option<&ast::OnInsert>,
+) -> Result<Option<ConflictArbiter>> {
+    let Some(on) = on else {
+        return Ok(None);
+    };
+    let ast::OnInsert::OnConflict(conflict) = on else {
+        return reject_unsupported("INSERT conflict action is not implemented");
+    };
+    if !matches!(conflict.action, ast::OnConflictAction::DoNothing) {
+        return reject_unsupported("ON CONFLICT DO UPDATE is not implemented");
+    }
+    let Some(target) = &conflict.conflict_target else {
+        return Ok(Some(ConflictArbiter::Any));
+    };
+    let constraint_columns = match target {
+        ast::ConflictTarget::Columns(columns) => {
+            let requested = columns
+                .iter()
+                .map(|column| {
+                    let name = normalize_identifier(column);
+                    schema
+                        .columns
+                        .iter()
+                        .position(|definition| definition.name == name)
+                        .ok_or_else(|| {
+                            PgError::create(
+                                SqlState::UndefinedColumn,
+                                format!("column {name:?} does not exist"),
+                            )
+                        })
+                })
+                .collect::<Result<BTreeSet<_>>>()?;
+            if requested.len() != columns.len() {
+                return Err(PgError::create(
+                    SqlState::InvalidColumnReference,
+                    "there is no unique or exclusion constraint matching the ON CONFLICT specification",
+                ));
+            }
+            schema.constraints.iter().find_map(|constraint| {
+                let columns = match constraint {
+                    Constraint::PrimaryKey { columns, .. } | Constraint::Unique { columns, .. } => {
+                        columns
+                    }
+                    Constraint::Check(_) | Constraint::ForeignKey(_) => return None,
+                };
+                let indexes = columns
+                    .iter()
+                    .map(|name| {
+                        schema
+                            .columns
+                            .iter()
+                            .position(|column| column.name == *name)
+                            .expect("constraint columns must exist")
+                    })
+                    .collect::<Vec<_>>();
+                (indexes.len() == requested.len()
+                    && indexes.iter().all(|index| requested.contains(index)))
+                .then_some(indexes)
+            })
+        }
+        ast::ConflictTarget::OnConstraint(name) => {
+            let name = crate::executor::normalize_unqualified_object_name(name)?;
+            let Some(constraint) = schema
+                .constraints
+                .iter()
+                .find(|constraint| match constraint {
+                    Constraint::PrimaryKey {
+                        name: constraint_name,
+                        ..
+                    }
+                    | Constraint::Unique {
+                        name: constraint_name,
+                        ..
+                    } => constraint_name == &name,
+                    Constraint::ForeignKey(foreign_key) => foreign_key.name == name,
+                    Constraint::Check(_) => false,
+                })
+            else {
+                return Err(PgError::create(
+                    SqlState::UndefinedObject,
+                    format!(
+                        "constraint {name:?} for table {:?} does not exist",
+                        schema.name
+                    ),
+                ));
+            };
+            match constraint {
+                Constraint::PrimaryKey { columns, .. } | Constraint::Unique { columns, .. } => {
+                    Some(
+                        columns
+                            .iter()
+                            .map(|name| {
+                                schema
+                                    .columns
+                                    .iter()
+                                    .position(|column| column.name == *name)
+                                    .expect("constraint columns must exist")
+                            })
+                            .collect(),
+                    )
+                }
+                Constraint::Check(_) | Constraint::ForeignKey(_) => {
+                    return Err(PgError::create(
+                        SqlState::WrongObjectType,
+                        format!("constraint {name:?} has no associated index"),
+                    ));
+                }
+            }
+        }
+    };
+    constraint_columns
+        .map(ConflictArbiter::Index)
+        .map(Some)
+        .ok_or_else(|| {
+            PgError::create(
+                SqlState::InvalidColumnReference,
+                "there is no unique or exclusion constraint matching the ON CONFLICT specification",
+            )
+        })
 }
 
 #[cfg_attr(feature = "execution-log", tracing::instrument(skip_all))]
@@ -167,6 +306,7 @@ pub(super) fn execute_insert(
 ) -> Result<StatementResult> {
     let table_name = resolve_insert_table_name(&insert.table)?;
     let schema = state.catalog.require_table(&table_name)?.clone();
+    let conflict_arbiter = resolve_conflict_arbiter(&schema, insert.on.as_ref())?;
     let returning_scope = bind_target_scope(
         &schema,
         insert.table_alias.as_ref().map(|alias| &alias.alias),
@@ -351,20 +491,40 @@ pub(super) fn execute_insert(
                 Ok(vec![row])
             })?
     };
-    let affected = rows.len() as u64;
     let can_move_inserted_row = returning.is_none()
         && !schema
             .constraints
             .iter()
             .any(|constraint| matches!(constraint, Constraint::ForeignKey(_)));
     let mut returned_rows = Vec::new();
+    let mut affected = 0;
     for row in rows {
-        if state
+        let table = state
             .tables
             .get(&schema.id)
-            .expect("catalog table must have storage")
-            .has_visible_unique_conflict(&row, snapshot, xid, &state.transactions, None, None)
+            .expect("catalog table must have storage");
+        if let Some(arbiter) = &conflict_arbiter
+            && table.has_visible_unique_conflict(
+                &row,
+                snapshot,
+                xid,
+                &state.transactions,
+                None,
+                None,
+                arbiter.get_columns(),
+            )
         {
+            continue;
+        }
+        if table.has_visible_unique_conflict(
+            &row,
+            snapshot,
+            xid,
+            &state.transactions,
+            None,
+            None,
+            None,
+        ) {
             return Err(PgError::create(
                 SqlState::UniqueViolation,
                 format!(
@@ -373,20 +533,43 @@ pub(super) fn execute_insert(
                 ),
             ));
         }
+        affected += 1;
         if can_move_inserted_row {
-            state
+            let row_id = state
                 .tables
                 .get_mut(&schema.id)
                 .expect("catalog table must have storage")
                 .insert(xid, context.command_id, row);
+            assert!(matches!(
+                state.row_locks.acquire(
+                    RowLockKey {
+                        table_id: schema.id,
+                        row_id,
+                    },
+                    xid,
+                    RowLockMode::Update,
+                ),
+                RowLockAttempt::Acquired
+            ));
             state.mark_table_touched(xid, schema.id);
             continue;
         }
-        state
+        let row_id = state
             .tables
             .get_mut(&schema.id)
             .expect("catalog table must have storage")
             .insert(xid, context.command_id, row.clone());
+        assert!(matches!(
+            state.row_locks.acquire(
+                RowLockKey {
+                    table_id: schema.id,
+                    row_id,
+                },
+                xid,
+                RowLockMode::Update,
+            ),
+            RowLockAttempt::Acquired
+        ));
         state.mark_table_touched(xid, schema.id);
         validate_row_foreign_keys(
             state,
@@ -589,6 +772,7 @@ pub(super) fn execute_update(
                 &state.transactions,
                 Some(row_id),
                 Some(&assigned),
+                None,
             )
         {
             return Err(PgError::create(

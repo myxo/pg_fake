@@ -352,6 +352,43 @@ async fn row_lock_waits_run_on_the_blocking_pool() {
         .unwrap();
 }
 
+#[tokio::test]
+async fn sqlx_on_conflict_returns_only_inserted_rows_with_metadata() {
+    let mut connection = PgFakeConnection::new(Db::create());
+    connection
+        .execute("CREATE TABLE conflict_items (id INTEGER PRIMARY KEY, label TEXT UNIQUE)")
+        .await
+        .unwrap();
+    connection
+        .execute("INSERT INTO conflict_items VALUES (1, 'existing')")
+        .await
+        .unwrap();
+
+    let rows = sqlx::query(
+        "INSERT INTO conflict_items VALUES ($1, $2), ($3, $4) \
+         ON CONFLICT (id) DO NOTHING RETURNING id, label",
+    )
+    .bind(1_i32)
+    .bind("ignored")
+    .bind(2_i32)
+    .bind("inserted")
+    .fetch_all(&mut connection)
+    .await
+    .unwrap();
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0].get::<i32, _>("id"), 2);
+    assert_eq!(rows[0].get::<String, _>("label"), "inserted");
+    assert_eq!(rows[0].columns()[0].type_info().name(), "INT4");
+    assert_eq!(rows[0].columns()[1].type_info().name(), "TEXT");
+
+    let skipped =
+        sqlx::query("INSERT INTO conflict_items VALUES (1, 'other') ON CONFLICT DO NOTHING")
+            .execute(&mut connection)
+            .await
+            .unwrap();
+    assert_eq!(skipped.rows_affected(), 0);
+}
+
 #[tokio::test(flavor = "multi_thread")]
 async fn sqlx_error_category_matches_postgres() {
     let server = tokio::task::spawn_blocking(start_postgres_server)

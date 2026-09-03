@@ -52,7 +52,9 @@ pub(crate) fn collect_required_row_locks(
     context: &StatementExecutionContext,
 ) -> Result<Vec<RequiredRowLock>> {
     if let ast::Statement::Insert(insert) = statement {
-        return collect_insert_foreign_key_locks(state, insert, xid, snapshot, context);
+        let mut locks = collect_insert_foreign_key_locks(state, insert, xid, snapshot, context)?;
+        locks.extend(collect_insert_conflict_locks(state, insert, xid, context)?);
+        return Ok(locks);
     }
     let target = match statement {
         ast::Statement::Update(update) => {
@@ -224,6 +226,133 @@ pub(crate) fn collect_required_row_locks(
             });
             Ok(locks)
         })
+}
+
+#[cfg_attr(feature = "execution-log", tracing::instrument(skip_all))]
+fn collect_insert_conflict_locks(
+    state: &DatabaseState,
+    insert: &ast::Insert,
+    xid: Xid,
+    context: &StatementExecutionContext,
+) -> Result<Vec<RequiredRowLock>> {
+    let schema = state
+        .catalog
+        .require_table(&resolve_insert_table_name(&insert.table)?)?;
+    let Some(arbiter) = writes::resolve_conflict_arbiter(schema, insert.on.as_ref())? else {
+        return Ok(Vec::new());
+    };
+    let values = insert.source.as_ref().and_then(|source| {
+        if let ast::SetExpr::Values(values) = source.body.as_ref() {
+            Some(values)
+        } else {
+            None
+        }
+    });
+    let column_indexes = if insert.columns.is_empty() {
+        (0..schema.columns.len()).collect::<Vec<_>>()
+    } else {
+        insert
+            .columns
+            .iter()
+            .map(|column| {
+                let name = normalize_unqualified_object_name(column)?;
+                schema
+                    .columns
+                    .iter()
+                    .position(|definition| definition.name == name)
+                    .ok_or_else(|| {
+                        PgError::create(
+                            SqlState::UndefinedColumn,
+                            format!("column {name:?} does not exist"),
+                        )
+                    })
+            })
+            .collect::<Result<Vec<_>>>()?
+    };
+    let table = state
+        .tables
+        .get(&schema.id)
+        .expect("catalog table must have storage");
+    let mut locks = Vec::new();
+    let mut needs_fallback = values.is_none();
+    for expressions in values.into_iter().flat_map(|values| &values.rows) {
+        if expressions.len() != column_indexes.len() {
+            continue;
+        }
+        let mut row = Vec::with_capacity(schema.columns.len());
+        let mut evaluable = true;
+        for (index, column) in schema.columns.iter().enumerate() {
+            let expression = column_indexes
+                .iter()
+                .position(|provided| *provided == index)
+                .map(|position| &expressions[position]);
+            let value = match expression {
+                Some(expression) if !is_default_expression(expression) => {
+                    let mut has_function = false;
+                    let _ = ast::visit_expressions(expression, |nested| {
+                        if matches!(nested, ast::Expr::Function(_)) {
+                            has_function = true;
+                            return std::ops::ControlFlow::Break(());
+                        }
+                        std::ops::ControlFlow::Continue(())
+                    });
+                    if has_function {
+                        evaluable = false;
+                        break;
+                    }
+                    evaluate_assignment_expression(
+                        expression,
+                        column.data_type,
+                        &create_constant_expression_schema(),
+                        &[],
+                        context,
+                    )?
+                }
+                Some(_) | None => {
+                    if column.default_sequence.is_some()
+                        || !matches!(column.default, None | Some(ast::Expr::Value(_)))
+                    {
+                        evaluable = false;
+                        break;
+                    }
+                    evaluate_column_default(column, context)?
+                }
+            };
+            row.push(value);
+        }
+        if !evaluable {
+            needs_fallback = true;
+            continue;
+        }
+        if let Some(row_id) =
+            table.find_conflicting_row(&row, xid, &state.transactions, arbiter.get_columns())
+        {
+            locks.push(RequiredRowLock {
+                key: RowLockKey {
+                    table_id: schema.id,
+                    row_id,
+                },
+                mode: RowLockMode::Update,
+                mutation_candidate: None,
+            });
+        }
+    }
+    if needs_fallback {
+        locks.extend(
+            table
+                .find_unique_candidate_rows(xid, &state.transactions, arbiter.get_columns())
+                .into_iter()
+                .map(|row_id| RequiredRowLock {
+                    key: RowLockKey {
+                        table_id: schema.id,
+                        row_id,
+                    },
+                    mode: RowLockMode::Update,
+                    mutation_candidate: None,
+                }),
+        );
+    }
+    Ok(locks)
 }
 
 #[cfg_attr(feature = "execution-log", tracing::instrument(skip_all))]
@@ -442,7 +571,9 @@ fn collect_insert_foreign_key_locks(
                     .constraints
                     .iter()
                     .find_map(|constraint| match constraint {
-                        crate::catalog::Constraint::PrimaryKey(columns) => Some(columns.clone()),
+                        crate::catalog::Constraint::PrimaryKey { columns, .. } => {
+                            Some(columns.clone())
+                        }
                         _ => None,
                     })
                     .expect("foreign key definition was validated")

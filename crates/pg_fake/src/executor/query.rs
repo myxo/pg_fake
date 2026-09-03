@@ -4127,7 +4127,7 @@ fn extend_grouped_columns_with_primary_keys(
             .constraints
             .iter()
             .find_map(|constraint| match constraint {
-                crate::catalog::Constraint::PrimaryKey(columns) => Some(columns),
+                crate::catalog::Constraint::PrimaryKey { columns, .. } => Some(columns),
                 _ => None,
             })
         else {

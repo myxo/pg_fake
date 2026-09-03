@@ -449,8 +449,8 @@ fn find_unique_access(
         .constraints
         .iter()
         .any(|constraint| match constraint {
-            crate::catalog::Constraint::PrimaryKey(columns)
-            | crate::catalog::Constraint::Unique(columns) => {
+            crate::catalog::Constraint::PrimaryKey { columns, .. }
+            | crate::catalog::Constraint::Unique { columns, .. } => {
                 columns.len() == 1 && columns[0] == schema.columns[column].name
             }
             _ => false,

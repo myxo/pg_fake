@@ -47,8 +47,8 @@ pub(crate) struct ColumnDef {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum Constraint {
-    PrimaryKey(Vec<String>),
-    Unique(Vec<String>),
+    PrimaryKey { name: String, columns: Vec<String> },
+    Unique { name: String, columns: Vec<String> },
     Check(Box<ast::Expr>),
     ForeignKey(ForeignKey),
 }
