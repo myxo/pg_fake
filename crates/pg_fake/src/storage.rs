@@ -119,7 +119,7 @@ impl Table {
     pub(crate) fn insert(&mut self, xmin: Xid, command_id: CommandId, row: Row) -> RowId {
         let row_id = RowId(self.next_rowid);
         self.next_rowid += 1;
-        let index_row = row.clone();
+        self.add_index_entries(row_id, &row);
         let previous = self.version_chains.chains.insert(
             row_id,
             RowVersionChain {
@@ -133,7 +133,6 @@ impl Table {
             },
         );
         assert!(previous.is_none());
-        self.add_index_entries(row_id, &index_row);
         row_id
     }
 
@@ -176,7 +175,7 @@ impl Table {
         row: Row,
     ) -> RowId {
         self.mark_version_deleted(row_id, version_xmin, xmin, command_id);
-        let index_row = row.clone();
+        self.add_index_entries(row_id, &row);
         self.version_chains
             .chains
             .get_mut(&row_id)
@@ -189,7 +188,6 @@ impl Table {
                 xmax_command_id: None,
                 row,
             });
-        self.add_index_entries(row_id, &index_row);
         row_id
     }
 
