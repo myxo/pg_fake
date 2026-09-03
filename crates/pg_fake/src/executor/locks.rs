@@ -54,7 +54,7 @@ pub(crate) fn collect_required_row_locks(
     if let ast::Statement::Insert(insert) = statement {
         return collect_insert_foreign_key_locks(state, insert, xid, snapshot, context);
     }
-    let (schema, selection, mode, retain_mutation_candidates) = match statement {
+    let (schema, alias, selection, mode, retain_mutation_candidates) = match statement {
         ast::Statement::Update(update) => {
             let table = &update.table;
             if !table.joins.is_empty() {
@@ -62,6 +62,7 @@ pub(crate) fn collect_required_row_locks(
             }
             let ast::TableFactor::Table {
                 name: table_name,
+                alias,
                 args: None,
                 ..
             } = &table.relation
@@ -72,6 +73,7 @@ pub(crate) fn collect_required_row_locks(
                 state
                     .catalog
                     .require_table(&normalize_unqualified_object_name(table_name)?)?,
+                alias.as_ref().map(|alias| &alias.name),
                 update
                     .from
                     .is_none()
@@ -90,6 +92,7 @@ pub(crate) fn collect_required_row_locks(
             }
             let ast::TableFactor::Table {
                 name: table_name,
+                alias,
                 args: None,
                 ..
             } = &from[0].relation
@@ -100,6 +103,7 @@ pub(crate) fn collect_required_row_locks(
                 state
                     .catalog
                     .require_table(&normalize_unqualified_object_name(table_name)?)?,
+                alias.as_ref().map(|alias| &alias.name),
                 delete
                     .using
                     .is_none()
@@ -121,6 +125,7 @@ pub(crate) fn collect_required_row_locks(
             }
             let ast::TableFactor::Table {
                 name: table_name,
+                alias,
                 args: None,
                 ..
             } = &select.from[0].relation
@@ -131,6 +136,7 @@ pub(crate) fn collect_required_row_locks(
                 state
                     .catalog
                     .require_table(&normalize_unqualified_object_name(table_name)?)?,
+                alias.as_ref().map(|alias| &alias.name),
                 select.selection.as_ref(),
                 mode,
                 false,
@@ -173,6 +179,12 @@ pub(crate) fn collect_required_row_locks(
             }),
         }]);
     }
+    let bound_scope = bind_target_scope(schema, alias);
+    let prepared_selection = match selection {
+        Some(selection) => prepared::bind_prepared_expression(selection, &bound_scope, &[])?
+            .filter(|expression| expression.get_data_type() == BaseType::Bool),
+        None => None,
+    };
     table
         .iterate_version_chains()
         .try_fold(Vec::new(), |mut locks, (row_id, chain)| {
@@ -181,7 +193,12 @@ pub(crate) fn collect_required_row_locks(
                 return Ok(locks);
             };
             if let Some(selection) = selection {
-                match evaluate(selection, RowScope::Table(schema), &version.row, context)? {
+                let value = if let Some(prepared_selection) = &prepared_selection {
+                    prepared::evaluate_prepared_expression(prepared_selection, &version.row, &[])?
+                } else {
+                    evaluate(selection, RowScope::Table(schema), &version.row, context)?
+                };
+                match value {
                     Value::Bool(true) => {}
                     Value::Bool(false) | Value::Null => return Ok(locks),
                     _ => return Ok(locks),
