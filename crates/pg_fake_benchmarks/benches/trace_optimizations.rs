@@ -185,6 +185,18 @@ fn benchmark_trace_optimizations(criterion: &mut Criterion) {
     });
     group.finish();
 
+    let mut group = criterion.benchmark_group("trace_update_hit_100_unrelated_tables");
+    group.throughput(Throughput::Elements(1));
+    group.bench_function("generic_execute", |benchmark| {
+        benchmark.iter(|| {
+            execute(
+                &mut catalog_session,
+                "UPDATE catalog_target SET id = id WHERE id = 1",
+            );
+        });
+    });
+    group.finish();
+
     let mut order_session = create_order_session();
     let mut group = criterion.benchmark_group("trace_order_limit_1000");
     group.throughput(Throughput::Elements(10));
