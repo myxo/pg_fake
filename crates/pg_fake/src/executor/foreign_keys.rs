@@ -38,14 +38,9 @@ pub(crate) fn contains_deferred_foreign_keys(
     deferred_constraints: &BTreeSet<String>,
     defer_all: bool,
 ) -> bool {
-    state.catalog.iterate_tables().any(|schema| {
-        schema.constraints.iter().any(|constraint| {
-            let crate::catalog::Constraint::ForeignKey(foreign_key) = constraint else {
-                return false;
-            };
-            is_foreign_key_deferred(foreign_key, deferred_constraints, defer_all)
-        })
-    })
+    state
+        .catalog
+        .contains_deferred_foreign_keys(deferred_constraints, defer_all)
 }
 
 #[cfg_attr(feature = "execution-log", tracing::instrument(skip_all))]
@@ -266,23 +261,7 @@ pub(super) fn apply_referencing_foreign_key_actions(
     context: &StatementExecutionContext,
 ) -> Result<()> {
     let snapshot = snapshot.include_current_command();
-    let foreign_keys = state
-        .catalog
-        .iterate_tables()
-        .flat_map(|schema| {
-            schema
-                .constraints
-                .iter()
-                .filter_map(move |constraint| match constraint {
-                    crate::catalog::Constraint::ForeignKey(foreign_key)
-                        if foreign_key.foreign_table == parent_schema.name =>
-                    {
-                        Some((schema.clone(), foreign_key.clone()))
-                    }
-                    _ => None,
-                })
-        })
-        .collect::<Vec<_>>();
+    let foreign_keys = state.catalog.referencing_foreign_keys(&parent_schema.name);
     for (child_schema, foreign_key) in foreign_keys {
         let referred_columns = if foreign_key.referred_columns.is_empty() {
             parent_schema

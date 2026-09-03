@@ -95,6 +95,8 @@ pub(crate) struct Catalog {
     public: Schema,
     next_table_id: u64,
     next_sequence_id: u64,
+    deferrable_foreign_keys: Vec<(String, bool)>,
+    referencing_foreign_keys: BTreeMap<String, Vec<(String, usize)>>,
 }
 
 impl Default for Catalog {
@@ -115,6 +117,8 @@ impl Catalog {
             },
             next_table_id: 1,
             next_sequence_id: 1,
+            deferrable_foreign_keys: Vec::new(),
+            referencing_foreign_keys: BTreeMap::new(),
         }
     }
 
@@ -143,6 +147,7 @@ impl Catalog {
                 constraints,
             },
         );
+        self.rebuild_foreign_key_metadata();
         Ok(id)
     }
 
@@ -190,18 +195,77 @@ impl Catalog {
                 "cannot drop table {name:?} because constraint {constraint:?} on table {table:?} depends on it"
             ));
         }
-        self.public.tables.remove(name).ok_or_else(|| {
+        let table = self.public.tables.remove(name).ok_or_else(|| {
             PgError::create(
                 SqlState::UndefinedTable,
                 format!("table {name:?} does not exist"),
             )
-        })
+        })?;
+        self.rebuild_foreign_key_metadata();
+        Ok(table)
     }
 
     #[cfg_attr(feature = "execution-log", tracing::instrument(skip_all))]
     pub(crate) fn restore_table(&mut self, table: TableSchema) {
         let previous = self.public.tables.insert(table.name.clone(), table);
         assert!(previous.is_none(), "restored table must not already exist");
+        self.rebuild_foreign_key_metadata();
+    }
+
+    #[cfg_attr(feature = "execution-log", tracing::instrument(skip_all))]
+    pub(crate) fn contains_deferred_foreign_keys(
+        &self,
+        deferred_constraints: &std::collections::BTreeSet<String>,
+        defer_all: bool,
+    ) -> bool {
+        self.deferrable_foreign_keys
+            .iter()
+            .any(|(name, initially_deferred)| {
+                defer_all || *initially_deferred || deferred_constraints.contains(name)
+            })
+    }
+
+    #[cfg_attr(feature = "execution-log", tracing::instrument(skip_all))]
+    pub(crate) fn referencing_foreign_keys(&self, parent: &str) -> Vec<(TableSchema, ForeignKey)> {
+        self.referencing_foreign_keys
+            .get(parent)
+            .into_iter()
+            .flatten()
+            .map(|(table, constraint)| {
+                let schema = self
+                    .public
+                    .tables
+                    .get(table)
+                    .expect("foreign key metadata references an existing table");
+                let Constraint::ForeignKey(foreign_key) = &schema.constraints[*constraint] else {
+                    unreachable!("foreign key metadata references a foreign key")
+                };
+                (schema.clone(), foreign_key.clone())
+            })
+            .collect()
+    }
+
+    #[cfg_attr(feature = "execution-log", tracing::instrument(skip_all))]
+    fn rebuild_foreign_key_metadata(&mut self) {
+        let mut deferrable_foreign_keys = Vec::new();
+        let mut referencing_foreign_keys: BTreeMap<String, Vec<(String, usize)>> = BTreeMap::new();
+        for schema in self.public.tables.values() {
+            for (index, constraint) in schema.constraints.iter().enumerate() {
+                let Constraint::ForeignKey(foreign_key) = constraint else {
+                    continue;
+                };
+                if foreign_key.deferrable {
+                    deferrable_foreign_keys
+                        .push((foreign_key.name.clone(), foreign_key.initially_deferred));
+                }
+                referencing_foreign_keys
+                    .entry(foreign_key.foreign_table.clone())
+                    .or_default()
+                    .push((schema.name.clone(), index));
+            }
+        }
+        self.deferrable_foreign_keys = deferrable_foreign_keys;
+        self.referencing_foreign_keys = referencing_foreign_keys;
     }
 
     #[cfg_attr(feature = "execution-log", tracing::instrument(skip_all))]
