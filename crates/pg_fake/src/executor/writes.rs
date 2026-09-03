@@ -198,6 +198,31 @@ pub(super) fn execute_insert(
             .collect::<Result<Vec<_>>>()?
     };
     let provided = column_indexes.iter().copied().collect::<BTreeSet<_>>();
+    let static_defaults = schema
+        .columns
+        .iter()
+        .map(|column| {
+            let is_static = column.default_sequence.is_none()
+                && column.default.as_ref().is_none_or(|expression| {
+                    matches!(
+                        expression,
+                        ast::Expr::Value(value)
+                            if !matches!(value.value, ast::Value::Placeholder(_))
+                    )
+                });
+            if is_static {
+                evaluate_column_default(column, context).map(Some)
+            } else {
+                Ok(None)
+            }
+        })
+        .collect::<Result<Vec<_>>>()?;
+    let evaluate_default = |index: usize| -> Result<Value> {
+        static_defaults[index].clone().map_or_else(
+            || evaluate_column_default(&schema.columns[index], context),
+            Ok,
+        )
+    };
     let build_row = |expressions: &[ast::Expr]| -> Result<Vec<Value>> {
         if expressions.len() != column_indexes.len() {
             return Err(PgError::create(
@@ -206,9 +231,9 @@ pub(super) fn execute_insert(
             ));
         }
         let mut row = vec![Value::Null; schema.columns.len()];
-        for (index, column) in schema.columns.iter().enumerate() {
+        for index in 0..schema.columns.len() {
             if !provided.contains(&index) {
-                row[index] = evaluate_column_default(column, context)?;
+                row[index] = evaluate_default(index)?;
             }
         }
         let constants = create_constant_expression_schema();
@@ -225,7 +250,7 @@ pub(super) fn execute_insert(
                 ));
             }
             row[*index] = if is_default_expression(expr) {
-                evaluate_column_default(&schema.columns[*index], context)?
+                evaluate_default(*index)?
             } else {
                 evaluate_assignment_expression(
                     expr,
@@ -274,9 +299,9 @@ pub(super) fn execute_insert(
                 .into_iter()
                 .map(|values| {
                     let mut row = vec![Value::Null; schema.columns.len()];
-                    for (index, column) in schema.columns.iter().enumerate() {
+                    for index in 0..schema.columns.len() {
                         if !provided.contains(&index) {
-                            row[index] = evaluate_column_default(column, context)?;
+                            row[index] = evaluate_default(index)?;
                         }
                     }
                     for (((value, source_column), unknown), index) in values
@@ -316,7 +341,8 @@ pub(super) fn execute_insert(
         schema
             .columns
             .iter()
-            .map(|column| evaluate_column_default(column, context))
+            .enumerate()
+            .map(|(index, _)| evaluate_default(index))
             .collect::<Result<Vec<_>>>()
             .and_then(|row| {
                 validate_not_null(&schema, &row)?;
