@@ -1,4 +1,5 @@
 use super::*;
+use crate::catalog::Constraint;
 use sqlparser::ast;
 
 struct ReturningPlan<'a> {
@@ -523,13 +524,19 @@ pub(super) fn execute_update(
     )?;
     let affected = targets.len() as u64;
     let has_referencing_foreign_keys = state.catalog.has_referencing_foreign_keys(&schema.name);
+    let has_foreign_keys = schema
+        .constraints
+        .iter()
+        .any(|constraint| matches!(constraint, Constraint::ForeignKey(_)));
+    let can_move_updated_row =
+        !has_referencing_foreign_keys && !has_foreign_keys && returning.is_none();
     let mut returned_rows = Vec::new();
     for (row_id, version_xmin, row, mut bound_row) in targets {
-        let mut updated = row.clone();
+        let mut assigned_values = Vec::with_capacity(assignments.len());
         for (index, expression, prepared) in &assignments {
             let target = schema.columns[*index].data_type;
             let assignment_row = bound_row.as_deref().unwrap_or(&row);
-            updated[*index] = if is_default_expression(expression) {
+            let value = if is_default_expression(expression) {
                 evaluate_column_default(&schema.columns[*index], context)?
             } else if let Some(prepared) = prepared {
                 prepared::evaluate_prepared_expression(prepared, assignment_row, &[])?
@@ -545,6 +552,15 @@ pub(super) fn execute_update(
                     context,
                 )?
             };
+            assigned_values.push((*index, value));
+        }
+        let (old_row, mut updated) = if has_referencing_foreign_keys {
+            (Some(row.clone()), row)
+        } else {
+            (None, row)
+        };
+        for (index, value) in assigned_values {
+            updated[index] = value;
         }
         validate_not_null(&schema, &updated)?;
         validate_check_constraints(&schema, &updated, context)?;
@@ -568,6 +584,22 @@ pub(super) fn execute_update(
                     schema.name
                 ),
             ));
+        }
+        if can_move_updated_row {
+            state
+                .tables
+                .get_mut(&schema.id)
+                .expect("catalog table must have storage")
+                .append_updated_version(
+                    row_id,
+                    version_xmin,
+                    xid,
+                    context.command_id,
+                    updated,
+                    Some(&assigned),
+                );
+            state.mark_table_touched(xid, schema.id);
+            continue;
         }
         state
             .tables
@@ -595,7 +627,9 @@ pub(super) fn execute_update(
             apply_referencing_foreign_key_actions(
                 state,
                 &schema,
-                &row,
+                old_row
+                    .as_ref()
+                    .expect("referencing foreign keys retain the old row"),
                 Some(&updated),
                 xid,
                 snapshot,

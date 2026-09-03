@@ -59,6 +59,37 @@ fn create_mutation_session() -> Session {
     session
 }
 
+fn create_wide_mutation_session() -> Session {
+    let mut session = Db::create().create_session();
+    let payload = "abcdefghij0123456789ABCDEFGHIJ0123456789";
+    let rows = build_rows(1_000, |id| {
+        format!(
+            "({id}, 0, '{payload}', '{payload}', '{payload}', '{payload}', \
+             '{payload}', '{payload}', '{payload}', '{payload}')"
+        )
+    });
+    execute(
+        &mut session,
+        "CREATE TABLE wide_mutation_rows (
+            id INTEGER PRIMARY KEY,
+            score INTEGER,
+            payload_1 TEXT,
+            payload_2 TEXT,
+            payload_3 TEXT,
+            payload_4 TEXT,
+            payload_5 TEXT,
+            payload_6 TEXT,
+            payload_7 TEXT,
+            payload_8 TEXT
+        )",
+    );
+    execute(
+        &mut session,
+        &format!("INSERT INTO wide_mutation_rows VALUES {rows}"),
+    );
+    session
+}
+
 fn create_join_session() -> Session {
     let mut session = Db::create().create_session();
     let users = build_rows(30, |id| format!("({id}, 'user {id}')"));
@@ -186,6 +217,19 @@ fn benchmark_trace_optimizations(criterion: &mut Criterion) {
             execute(
                 &mut broad_mutation_session,
                 "UPDATE mutation_rows SET score = score + 1 WHERE score >= 0",
+            );
+        });
+    });
+    group.finish();
+
+    let mut wide_mutation_session = create_wide_mutation_session();
+    let mut group = criterion.benchmark_group("trace_update_wide_1000");
+    group.throughput(Throughput::Elements(1_000));
+    group.bench_function("non_indexed", |benchmark| {
+        benchmark.iter(|| {
+            execute(
+                &mut wide_mutation_session,
+                "UPDATE wide_mutation_rows SET score = score + 1 WHERE score >= 0",
             );
         });
     });
