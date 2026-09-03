@@ -257,26 +257,33 @@ impl Table {
                 .chains
                 .remove(&row_id)
                 .expect("reclamation candidate row must exist");
-            let mut removed = Vec::new();
-            chain.versions.retain(|version| {
-                let reclaim = matches!(
-                    version.xmax.and_then(|xmax| transactions.get_status(xmax)),
-                    Some(TransactionStatus::Committed(commit_seq)) if commit_seq <= horizon
-                );
-                if reclaim {
-                    removed.push(version.row.clone());
-                }
-                !reclaim
-            });
+            let reclaim = chain
+                .versions
+                .iter()
+                .map(|version| {
+                    matches!(
+                        version.xmax.and_then(|xmax| transactions.get_status(xmax)),
+                        Some(TransactionStatus::Committed(commit_seq)) if commit_seq <= horizon
+                    )
+                })
+                .collect::<Vec<_>>();
             for index in &mut self.indexes {
                 let retained_keys = chain
                     .versions
                     .iter()
-                    .filter_map(|version| build_row_index_key(&self.schema, index, &version.row))
+                    .zip(&reclaim)
+                    .filter_map(|(version, &reclaim)| {
+                        (!reclaim)
+                            .then(|| build_row_index_key(&self.schema, index, &version.row))?
+                    })
                     .collect::<BTreeSet<_>>();
-                let removed_keys = removed
+                let removed_keys = chain
+                    .versions
                     .iter()
-                    .filter_map(|row| build_row_index_key(&self.schema, index, row))
+                    .zip(&reclaim)
+                    .filter_map(|(version, &reclaim)| {
+                        reclaim.then(|| build_row_index_key(&self.schema, index, &version.row))?
+                    })
                     .collect::<BTreeSet<_>>();
                 for key in removed_keys.difference(&retained_keys) {
                     let remove_key = {
@@ -292,6 +299,12 @@ impl Table {
                     }
                 }
             }
+            chain.versions = chain
+                .versions
+                .into_iter()
+                .zip(reclaim)
+                .filter_map(|(version, reclaim)| (!reclaim).then_some(version))
+                .collect();
             if !chain.versions.is_empty() {
                 let previous = self.version_chains.chains.insert(row_id, chain);
                 assert!(previous.is_none());
