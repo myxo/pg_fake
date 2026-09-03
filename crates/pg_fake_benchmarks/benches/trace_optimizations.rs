@@ -110,6 +110,19 @@ fn benchmark_trace_optimizations(criterion: &mut Criterion) {
     });
     group.finish();
 
+    let mut filter_session = create_expression_session();
+    let mut group = criterion.benchmark_group("trace_select_filter_100");
+    group.throughput(Throughput::Elements(50));
+    group.bench_function("generic_execute", |benchmark| {
+        benchmark.iter(|| {
+            execute(
+                &mut filter_session,
+                "SELECT id, name FROM users WHERE active = true",
+            );
+        });
+    });
+    group.finish();
+
     let mut mutation_session = create_mutation_session();
     let mut group = criterion.benchmark_group("trace_update_point_1000");
     group.throughput(Throughput::Elements(1));
