@@ -4428,6 +4428,11 @@ fn execute_plain_select_rows(
         return rows;
     }
     let mut rows = Vec::new();
+    let remaining_selection = if selection_is_fully_pushed(select, scope) {
+        None
+    } else {
+        select.selection.as_ref()
+    };
     visit_query_source_rows(
         state,
         select,
@@ -4439,7 +4444,7 @@ fn execute_plain_select_rows(
         &mut |row| {
             if !evaluate_where_clause(
                 state,
-                select.selection.as_ref(),
+                remaining_selection,
                 scope,
                 row,
                 xid,
@@ -5967,10 +5972,17 @@ fn collect_pushdown_filters<'a>(
         collect_pushdown_filters(right, scope, start, end, filters);
         return;
     }
+    if pushdown_filter_column(expr, scope).is_some_and(|slot| (start..end).contains(&slot)) {
+        filters.push(expr);
+    }
+}
+
+#[cfg_attr(feature = "execution-log", tracing::instrument(skip_all))]
+fn pushdown_filter_column(expr: &ast::Expr, scope: &BoundScope) -> Option<usize> {
     let ast::Expr::BinaryOp { left, right, .. } = expr else {
-        return;
+        return None;
     };
-    let column = match (left.as_ref(), right.as_ref()) {
+    match (left.as_ref(), right.as_ref()) {
         (ast::Expr::Identifier(column), value) if is_point_lookup_value(value) => scope
             .resolve_column(std::slice::from_ref(column))
             .ok()
@@ -5986,10 +5998,35 @@ fn collect_pushdown_filters<'a>(
             scope.resolve_column(columns).ok().map(|(slot, _)| slot)
         }
         _ => None,
-    };
-    if column.is_some_and(|slot| (start..end).contains(&slot)) {
-        filters.push(expr);
     }
+}
+
+#[cfg_attr(feature = "execution-log", tracing::instrument(skip_all))]
+fn selection_is_fully_pushed(select: &ast::Select, scope: &BoundScope) -> bool {
+    let [table] = select.from.as_slice() else {
+        return false;
+    };
+    if !table.joins.is_empty() || !matches!(table.relation, ast::TableFactor::Table { .. }) {
+        return false;
+    }
+    select
+        .selection
+        .as_ref()
+        .is_some_and(|selection| filter_is_pushable(selection, scope, 0, scope.columns.len()))
+}
+
+#[cfg_attr(feature = "execution-log", tracing::instrument(skip_all))]
+fn filter_is_pushable(expr: &ast::Expr, scope: &BoundScope, start: usize, end: usize) -> bool {
+    if let ast::Expr::BinaryOp {
+        left,
+        op: ast::BinaryOperator::And,
+        right,
+    } = expr
+    {
+        return filter_is_pushable(left, scope, start, end)
+            && filter_is_pushable(right, scope, start, end);
+    }
+    pushdown_filter_column(expr, scope).is_some_and(|slot| (start..end).contains(&slot))
 }
 
 #[cfg_attr(feature = "execution-log", tracing::instrument(skip_all))]
