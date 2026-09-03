@@ -2686,7 +2686,7 @@ pub(super) enum ProjectionSource<'a> {
 }
 enum OrderKey<'a> {
     Output(usize),
-    Input(usize),
+    Input(usize, &'a ast::Expr),
     Expression(&'a ast::Expr),
 }
 enum DistinctPlan<'a> {
@@ -3959,10 +3959,12 @@ fn resolve_order_specs<'a>(
                             None => match &order.expr {
                                 ast::Expr::Identifier(identifier) => OrderKey::Input(
                                     scope.resolve_column(std::slice::from_ref(identifier))?.0,
+                                    &order.expr,
                                 ),
-                                ast::Expr::CompoundIdentifier(identifiers) => {
-                                    OrderKey::Input(scope.resolve_column(identifiers)?.0)
-                                }
+                                ast::Expr::CompoundIdentifier(identifiers) => OrderKey::Input(
+                                    scope.resolve_column(identifiers)?.0,
+                                    &order.expr,
+                                ),
                                 _ => {
                                     infer_query_expression_type(state, &order.expr, scope)?;
                                     OrderKey::Expression(&order.expr)
@@ -3991,9 +3993,7 @@ fn create_order_expression(
 ) -> ast::Expr {
     match order.key {
         OrderKey::Output(index) => create_projection_expression(&projections[index], scope),
-        OrderKey::Input(slot) => {
-            create_projection_expression(&ProjectionSource::Column(slot), scope)
-        }
+        OrderKey::Input(_, expression) => expression.clone(),
         OrderKey::Expression(expression) => expression.clone(),
     }
 }
@@ -4228,7 +4228,7 @@ fn resolve_grouping_plan(
             validate_grouped_expression(state, having, scope, &expressions, &grouped_columns)?;
         }
         for order in order_specs {
-            if let OrderKey::Expression(expression) = order.key {
+            if let OrderKey::Input(_, expression) | OrderKey::Expression(expression) = order.key {
                 validate_grouped_expression(
                     state,
                     expression,
@@ -4394,7 +4394,7 @@ fn evaluate_order_keys(
         .iter()
         .map(|order| match order.key {
             OrderKey::Output(index) => Ok(values[index].clone()),
-            OrderKey::Input(slot) => Ok(row[slot].clone()),
+            OrderKey::Input(slot, _) => Ok(row[slot].clone()),
             OrderKey::Expression(expression) => evaluate_select_expression(
                 state,
                 expression,
