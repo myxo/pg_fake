@@ -57,6 +57,16 @@ impl SequenceExecutionContext {
     }
 
     #[cfg_attr(feature = "execution-log", tracing::instrument(skip_all))]
+    pub(crate) fn create_empty(values: SequenceStorage, session: SequenceSessionStorage) -> Self {
+        SequenceExecutionContext {
+            sequences: BTreeMap::new(),
+            tables: BTreeSet::new(),
+            values,
+            session,
+        }
+    }
+
+    #[cfg_attr(feature = "execution-log", tracing::instrument(skip_all))]
     fn require_sequence(&self, name: &str) -> Result<&SequenceSchema> {
         let name = normalize_sequence_name(name)?;
         if self.tables.contains(&name) {

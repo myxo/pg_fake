@@ -1330,19 +1330,27 @@ impl Session {
                 }
             };
         }
+        let statement_contains_dml = contains_dml(statement);
+        let sequences = if statement_contains_dml || contains_sequence_function(statement) {
+            executor::SequenceExecutionContext::create(
+                &state.catalog,
+                state.sequence_values.clone(),
+                self.sequence_session.clone(),
+            )
+        } else {
+            executor::SequenceExecutionContext::create_empty(
+                state.sequence_values.clone(),
+                self.sequence_session.clone(),
+            )
+        };
         let context = executor::StatementExecutionContext {
             command_id,
             transaction_timestamp: transaction.transaction_timestamp,
             statement_timestamp: self.db.read_clock(),
             clock_timestamp: self.db.read_clock(),
             rng: self.db.rng.clone(),
-            sequences: executor::SequenceExecutionContext::create(
-                &state.catalog,
-                state.sequence_values.clone(),
-                self.sequence_session.clone(),
-            ),
+            sequences,
         };
-        let statement_contains_dml = contains_dml(statement);
         (state, snapshot) = match acquire_row_locks(
             &condvar,
             self.lock_timeout,
@@ -1446,6 +1454,27 @@ fn contains_dml(statement: &ast::Statement) -> bool {
         }
         _ => false,
     }
+}
+
+#[cfg_attr(feature = "execution-log", tracing::instrument(skip_all))]
+fn contains_sequence_function(statement: &ast::Statement) -> bool {
+    let mut found = false;
+    let _ = ast::visit_expressions(statement, |expression| {
+        let ast::Expr::Function(function) = expression else {
+            return std::ops::ControlFlow::Continue(());
+        };
+        if executor::normalize_unqualified_object_name(&function.name).is_ok_and(|name| {
+            matches!(
+                name.as_str(),
+                "nextval" | "currval" | "lastval" | "setval" | "pg_get_serial_sequence"
+            )
+        }) {
+            found = true;
+            return std::ops::ControlFlow::Break(());
+        }
+        std::ops::ControlFlow::Continue(())
+    });
+    found
 }
 
 #[cfg_attr(feature = "execution-log", tracing::instrument(skip_all))]
