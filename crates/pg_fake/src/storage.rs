@@ -362,12 +362,25 @@ impl Table {
         current_xid: Xid,
         transactions: &TransactionRegistry,
     ) -> Option<&Row> {
+        self.find_unique_visible_version(columns, values, snapshot, current_xid, transactions)
+            .map(|(_, version)| &version.row)
+    }
+
+    #[cfg_attr(feature = "execution-log", tracing::instrument(skip_all))]
+    pub(crate) fn find_unique_visible_version(
+        &self,
+        columns: &[usize],
+        values: &[Value],
+        snapshot: &Snapshot,
+        current_xid: Xid,
+        transactions: &TransactionRegistry,
+    ) -> Option<(RowId, &RowVersion)> {
         let row_id = self.find_unique_row(columns, values, snapshot, current_xid, transactions)?;
         self.version_chains
             .chains
             .get(&row_id)
             .and_then(|chain| find_visible_version(chain, snapshot, current_xid, transactions))
-            .map(|version| &version.row)
+            .map(|version| (row_id, version))
     }
 
     #[cfg_attr(feature = "execution-log", tracing::instrument(skip_all))]

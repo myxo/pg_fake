@@ -141,10 +141,32 @@ pub(crate) fn collect_required_row_locks(
             return Ok(Vec::new());
         }
     }
-    state
+    let table = state
         .tables
         .get(&schema.id)
-        .expect("catalog table must have storage")
+        .expect("catalog table must have storage");
+    if let Some((column, value)) =
+        resolve_unique_point_lookup(table, schema, selection, RowScope::Table(schema), context)?
+    {
+        let Some((row_id, version)) = table.find_unique_visible_version(
+            &[column],
+            &[value],
+            snapshot,
+            xid,
+            &state.transactions,
+        ) else {
+            return Ok(Vec::new());
+        };
+        check_concurrent_update(state, version, xid, snapshot)?;
+        return Ok(vec![RequiredRowLock {
+            key: RowLockKey {
+                table_id: schema.id,
+                row_id,
+            },
+            mode,
+        }]);
+    }
+    table
         .iterate_version_chains()
         .try_fold(Vec::new(), |mut locks, (row_id, chain)| {
             let Some(version) = find_visible_version(chain, snapshot, xid, &state.transactions)
@@ -158,19 +180,7 @@ pub(crate) fn collect_required_row_locks(
                     _ => return Ok(locks),
                 }
             }
-            if version.xmax.is_some_and(|xmax| {
-                xmax != xid
-                    && matches!(
-                        state.transactions.get_status(xmax),
-                        Some(TransactionStatus::Committed(commit_seq))
-                            if commit_seq > snapshot.commit_seq
-                    )
-            }) {
-                return Err(PgError::create(
-                    SqlState::SerializationFailure,
-                    "could not serialize access due to concurrent update",
-                ));
-            }
+            check_concurrent_update(state, version, xid, snapshot)?;
             locks.push(RequiredRowLock {
                 key: RowLockKey {
                     table_id: schema.id,
@@ -180,6 +190,93 @@ pub(crate) fn collect_required_row_locks(
             });
             Ok(locks)
         })
+}
+
+#[cfg_attr(feature = "execution-log", tracing::instrument(skip_all))]
+fn check_concurrent_update(
+    state: &DatabaseState,
+    version: &crate::storage::RowVersion,
+    xid: Xid,
+    snapshot: &Snapshot,
+) -> Result<()> {
+    if version.xmax.is_some_and(|xmax| {
+        xmax != xid
+            && matches!(
+                state.transactions.get_status(xmax),
+                Some(TransactionStatus::Committed(commit_seq)) if commit_seq > snapshot.commit_seq
+            )
+    }) {
+        return Err(PgError::create(
+            SqlState::SerializationFailure,
+            "could not serialize access due to concurrent update",
+        ));
+    }
+    Ok(())
+}
+
+#[cfg_attr(feature = "execution-log", tracing::instrument(skip_all))]
+pub(super) fn resolve_unique_point_lookup(
+    table: &Table,
+    schema: &TableSchema,
+    selection: Option<&ast::Expr>,
+    scope: RowScope<'_>,
+    context: &StatementExecutionContext,
+) -> Result<Option<(usize, Value)>> {
+    let Some(ast::Expr::BinaryOp {
+        left,
+        op: ast::BinaryOperator::Eq,
+        right,
+    }) = selection
+    else {
+        return Ok(None);
+    };
+    let (column, value) = match (left.as_ref(), right.as_ref()) {
+        (ast::Expr::Identifier(column), value) if is_point_lookup_value(value) => {
+            (std::slice::from_ref(column), value)
+        }
+        (value, ast::Expr::Identifier(column)) if is_point_lookup_value(value) => {
+            (std::slice::from_ref(column), value)
+        }
+        (ast::Expr::CompoundIdentifier(column), value) if is_point_lookup_value(value) => {
+            (column.as_slice(), value)
+        }
+        (value, ast::Expr::CompoundIdentifier(column)) if is_point_lookup_value(value) => {
+            (column.as_slice(), value)
+        }
+        _ => return Ok(None),
+    };
+    let Ok((column, _)) = scope.resolve_column(column) else {
+        return Ok(None);
+    };
+    if column >= schema.columns.len()
+        || !table.has_unique_index(&[column])
+        || resolve_operator_type(left, right, scope)? != schema.columns[column].data_type.base
+    {
+        return Ok(None);
+    }
+    let value = evaluate_and_coerce(
+        value,
+        schema.columns[column].data_type.base,
+        CastContext::Implicit,
+        scope,
+        &[],
+        context,
+    )?;
+    Ok(Some((column, value)))
+}
+
+#[cfg_attr(feature = "execution-log", tracing::instrument(skip_all))]
+fn is_point_lookup_value(expr: &ast::Expr) -> bool {
+    matches!(expr, ast::Expr::Value(_))
+        || matches!(
+            expr,
+            ast::Expr::Cast {
+                kind: ast::CastKind::Cast | ast::CastKind::DoubleColon,
+                expr,
+                format: None,
+                ..
+            } if matches!(expr.as_ref(), ast::Expr::Value(_))
+        )
 }
 
 #[cfg_attr(feature = "execution-log", tracing::instrument(skip_all))]
