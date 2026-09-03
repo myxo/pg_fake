@@ -331,7 +331,7 @@ pub(super) fn execute_insert(
             .tables
             .get(&schema.id)
             .expect("catalog table must have storage")
-            .has_visible_unique_conflict(&row, snapshot, xid, &state.transactions, None)
+            .has_visible_unique_conflict(&row, snapshot, xid, &state.transactions, None, None)
         {
             return Err(PgError::create(
                 SqlState::UniqueViolation,
@@ -508,7 +508,14 @@ pub(super) fn execute_update(
             .tables
             .get(&schema.id)
             .expect("catalog table must have storage")
-            .has_visible_unique_conflict(&updated, snapshot, xid, &state.transactions, Some(row_id))
+            .has_visible_unique_conflict(
+                &updated,
+                snapshot,
+                xid,
+                &state.transactions,
+                Some(row_id),
+                Some(&assigned),
+            )
         {
             return Err(PgError::create(
                 SqlState::UniqueViolation,
@@ -528,6 +535,7 @@ pub(super) fn execute_update(
                 xid,
                 context.command_id,
                 updated.clone(),
+                Some(&assigned),
             );
         state.mark_table_touched(xid, schema.id);
         validate_row_foreign_keys(

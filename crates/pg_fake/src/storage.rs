@@ -119,7 +119,7 @@ impl Table {
     pub(crate) fn insert(&mut self, xmin: Xid, command_id: CommandId, row: Row) -> RowId {
         let row_id = RowId(self.next_rowid);
         self.next_rowid += 1;
-        self.add_index_entries(row_id, &row);
+        self.add_index_entries(row_id, &row, None);
         let previous = self.version_chains.chains.insert(
             row_id,
             RowVersionChain {
@@ -173,9 +173,10 @@ impl Table {
         xmin: Xid,
         command_id: CommandId,
         row: Row,
+        changed_columns: Option<&BTreeSet<usize>>,
     ) -> RowId {
         self.mark_version_deleted(row_id, version_xmin, xmin, command_id);
-        self.add_index_entries(row_id, &row);
+        self.add_index_entries(row_id, &row, changed_columns);
         self.version_chains
             .chains
             .get_mut(&row_id)
@@ -314,26 +315,37 @@ impl Table {
         current_xid: Xid,
         transactions: &TransactionRegistry,
         excluded_row: Option<RowId>,
+        changed_columns: Option<&BTreeSet<usize>>,
     ) -> bool {
         let snapshot = snapshot.include_current_command();
-        self.indexes.iter().any(|index| {
-            let Some(key) = build_row_index_key(&self.schema, index, row) else {
-                return false;
-            };
-            index.entries.get(&key).is_some_and(|row_ids| {
-                row_ids.iter().any(|row_id| {
-                    if Some(*row_id) == excluded_row {
-                        return false;
-                    }
-                    let Some(version) = self.version_chains.chains.get(row_id).and_then(|chain| {
-                        find_visible_version(chain, &snapshot, current_xid, transactions)
-                    }) else {
-                        return false;
-                    };
-                    build_row_index_key(&self.schema, index, &version.row).as_ref() == Some(&key)
+        self.indexes
+            .iter()
+            .filter(|index| {
+                changed_columns.is_none_or(|columns| {
+                    index.columns.iter().any(|column| columns.contains(column))
                 })
             })
-        })
+            .any(|index| {
+                let Some(key) = build_row_index_key(&self.schema, index, row) else {
+                    return false;
+                };
+                index.entries.get(&key).is_some_and(|row_ids| {
+                    row_ids.iter().any(|row_id| {
+                        if Some(*row_id) == excluded_row {
+                            return false;
+                        }
+                        let Some(version) =
+                            self.version_chains.chains.get(row_id).and_then(|chain| {
+                                find_visible_version(chain, &snapshot, current_xid, transactions)
+                            })
+                        else {
+                            return false;
+                        };
+                        build_row_index_key(&self.schema, index, &version.row).as_ref()
+                            == Some(&key)
+                    })
+                })
+            })
     }
 
     #[cfg_attr(feature = "execution-log", tracing::instrument(skip_all))]
@@ -392,15 +404,30 @@ impl Table {
     }
 
     #[cfg_attr(feature = "execution-log", tracing::instrument(skip_all))]
-    fn add_index_entries(&mut self, row_id: RowId, row: &Row) {
+    fn add_index_entries(
+        &mut self,
+        row_id: RowId,
+        row: &Row,
+        changed_columns: Option<&BTreeSet<usize>>,
+    ) {
         let entries = self
             .indexes
             .iter()
-            .map(|index| build_row_index_key(&self.schema, index, row))
+            .enumerate()
+            .filter(|(_, index)| {
+                changed_columns.is_none_or(|columns| {
+                    index.columns.iter().any(|column| columns.contains(column))
+                })
+            })
+            .map(|(index, unique)| (index, build_row_index_key(&self.schema, unique, row)))
             .collect::<Vec<_>>();
-        for (index, key) in self.indexes.iter_mut().zip(entries) {
+        for (index, key) in entries {
             if let Some(key) = key {
-                index.entries.entry(key).or_default().insert(row_id);
+                self.indexes[index]
+                    .entries
+                    .entry(key)
+                    .or_default()
+                    .insert(row_id);
             }
         }
     }
@@ -618,6 +645,7 @@ mod tests {
                 Xid(11),
                 CommandId(1),
                 vec![Value::Int4(2)],
+                None,
             ),
             row_id
         );
@@ -654,6 +682,7 @@ mod tests {
             Xid(11),
             CommandId(1),
             vec![Value::Int4(3)],
+            None,
         );
 
         table.discard_transaction_versions(Xid(11));
@@ -676,7 +705,14 @@ mod tests {
     fn marks_current_version_deleted() {
         let mut table = create_table();
         let row_id = table.insert(Xid(10), CommandId(0), vec![Value::Int4(1)]);
-        table.append_updated_version(row_id, Xid(10), Xid(11), CommandId(1), vec![Value::Int4(2)]);
+        table.append_updated_version(
+            row_id,
+            Xid(10),
+            Xid(11),
+            CommandId(1),
+            vec![Value::Int4(2)],
+            None,
+        );
 
         assert_eq!(
             table.mark_version_deleted(row_id, Xid(11), Xid(12), CommandId(2)),

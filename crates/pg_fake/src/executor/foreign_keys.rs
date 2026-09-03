@@ -453,7 +453,14 @@ fn apply_cascaded_row_update(
         .tables
         .get(&schema.id)
         .expect("catalog table must have storage")
-        .has_visible_unique_conflict(&updated, snapshot, xid, &state.transactions, Some(row_id))
+        .has_visible_unique_conflict(
+            &updated,
+            snapshot,
+            xid,
+            &state.transactions,
+            Some(row_id),
+            None,
+        )
     {
         return Err(PgError::create(
             SqlState::UniqueViolation,
@@ -473,6 +480,7 @@ fn apply_cascaded_row_update(
             xid,
             context.command_id,
             updated.clone(),
+            None,
         );
     state.mark_table_touched(xid, schema.id);
     validate_row_foreign_keys(
