@@ -131,6 +131,19 @@ fn benchmark_trace_optimizations(criterion: &mut Criterion) {
     });
     group.finish();
 
+    let mut broad_mutation_session = create_mutation_session();
+    let mut group = criterion.benchmark_group("trace_update_many_1000");
+    group.throughput(Throughput::Elements(1_000));
+    group.bench_function("non_indexed", |benchmark| {
+        benchmark.iter(|| {
+            execute(
+                &mut broad_mutation_session,
+                "UPDATE mutation_rows SET score = score + 1 WHERE score >= 0",
+            );
+        });
+    });
+    group.finish();
+
     let mut join_session = create_join_session();
     let mut group = criterion.benchmark_group("trace_join_chain_30");
     group.throughput(Throughput::Elements(30));
