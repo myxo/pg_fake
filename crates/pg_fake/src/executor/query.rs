@@ -5289,8 +5289,16 @@ pub(super) fn build_projection_plan<'a>(
             ast::SelectItem::UnnamedExpr(
                 expression @ ast::Expr::CompoundIdentifier(identifiers),
             ) => {
-                let (_, data_type) = scope.resolve_column(identifiers)?;
-                projections.push(ProjectionSource::Expression(expression));
+                let (slot, data_type) = scope.resolve_column(identifiers)?;
+                if scope
+                    .columns
+                    .iter()
+                    .any(|column| column.slot == slot && column.wildcard)
+                {
+                    projections.push(ProjectionSource::Column(slot));
+                } else {
+                    projections.push(ProjectionSource::Expression(expression));
+                }
                 columns.push(ColumnMeta {
                     name: identifiers
                         .last()
