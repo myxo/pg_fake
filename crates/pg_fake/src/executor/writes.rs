@@ -353,12 +353,22 @@ pub(super) fn execute_insert(
     let affected = rows.len() as u64;
     let mut returned_rows = Vec::new();
     for row in rows {
-        if state
-            .tables
-            .get(&schema.id)
-            .expect("catalog table must have storage")
-            .has_visible_unique_conflict(&row, snapshot, xid, &state.transactions, None, None)
-        {
+        let inserted = {
+            let transactions = &state.transactions;
+            state
+                .tables
+                .get_mut(&schema.id)
+                .expect("catalog table must have storage")
+                .insert_unless_visible_unique_conflict(
+                    xid,
+                    context.command_id,
+                    row.clone(),
+                    snapshot,
+                    xid,
+                    transactions,
+                )
+        };
+        if inserted.is_none() {
             return Err(PgError::create(
                 SqlState::UniqueViolation,
                 format!(
@@ -367,11 +377,6 @@ pub(super) fn execute_insert(
                 ),
             ));
         }
-        state
-            .tables
-            .get_mut(&schema.id)
-            .expect("catalog table must have storage")
-            .insert(xid, context.command_id, row.clone());
         state.mark_table_touched(xid, schema.id);
         validate_row_foreign_keys(
             state,

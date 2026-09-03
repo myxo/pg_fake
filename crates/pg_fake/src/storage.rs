@@ -115,11 +115,57 @@ impl Table {
         }
     }
 
+    #[cfg(test)]
     #[cfg_attr(feature = "execution-log", tracing::instrument(skip_all))]
     pub(crate) fn insert(&mut self, xmin: Xid, command_id: CommandId, row: Row) -> RowId {
+        let index_entries = self.build_index_entries(&row, None);
+        self.insert_with_index_entries(xmin, command_id, row, index_entries)
+    }
+
+    #[cfg_attr(feature = "execution-log", tracing::instrument(skip_all))]
+    pub(crate) fn insert_unless_visible_unique_conflict(
+        &mut self,
+        xmin: Xid,
+        command_id: CommandId,
+        row: Row,
+        snapshot: &Snapshot,
+        current_xid: Xid,
+        transactions: &TransactionRegistry,
+    ) -> Option<RowId> {
+        let index_entries = self.build_index_entries(&row, None);
+        let snapshot = snapshot.include_current_command();
+        let has_conflict = index_entries.iter().any(|(index_position, key)| {
+            let Some(key) = key else {
+                return false;
+            };
+            let index = &self.indexes[*index_position];
+            index.entries.get(key).is_some_and(|row_ids| {
+                row_ids.iter().any(|row_id| {
+                    let Some(version) = self.version_chains.chains.get(row_id).and_then(|chain| {
+                        find_visible_version(chain, &snapshot, current_xid, transactions)
+                    }) else {
+                        return false;
+                    };
+                    build_row_index_key(&self.schema, index, &version.row).as_ref() == Some(key)
+                })
+            })
+        });
+        if has_conflict {
+            return None;
+        }
+        Some(self.insert_with_index_entries(xmin, command_id, row, index_entries))
+    }
+
+    fn insert_with_index_entries(
+        &mut self,
+        xmin: Xid,
+        command_id: CommandId,
+        row: Row,
+        index_entries: Vec<(usize, Option<UniqueIndexKey>)>,
+    ) -> RowId {
         let row_id = RowId(self.next_rowid);
         self.next_rowid += 1;
-        self.add_index_entries(row_id, &row, None);
+        self.add_prepared_index_entries(row_id, index_entries);
         let previous = self.version_chains.chains.insert(
             row_id,
             RowVersionChain {
@@ -410,8 +456,16 @@ impl Table {
         row: &Row,
         changed_columns: Option<&BTreeSet<usize>>,
     ) {
-        let entries = self
-            .indexes
+        let entries = self.build_index_entries(row, changed_columns);
+        self.add_prepared_index_entries(row_id, entries);
+    }
+
+    fn build_index_entries(
+        &self,
+        row: &Row,
+        changed_columns: Option<&BTreeSet<usize>>,
+    ) -> Vec<(usize, Option<UniqueIndexKey>)> {
+        self.indexes
             .iter()
             .enumerate()
             .filter(|(_, index)| {
@@ -420,7 +474,14 @@ impl Table {
                 })
             })
             .map(|(index, unique)| (index, build_row_index_key(&self.schema, unique, row)))
-            .collect::<Vec<_>>();
+            .collect()
+    }
+
+    fn add_prepared_index_entries(
+        &mut self,
+        row_id: RowId,
+        entries: Vec<(usize, Option<UniqueIndexKey>)>,
+    ) {
         for (index, key) in entries {
             if let Some(key) = key {
                 self.indexes[index]
