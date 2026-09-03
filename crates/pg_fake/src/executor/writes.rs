@@ -475,29 +475,16 @@ pub(super) fn execute_update(
         snapshot,
         context,
     )?;
-    let targets = state
-        .tables
-        .get(&schema.id)
-        .expect("catalog table must have storage")
-        .iterate_version_chains()
-        .try_fold(Vec::new(), |mut targets, (row_id, chain)| {
-            let Some(version) = find_visible_version(chain, snapshot, xid, &state.transactions)
-            else {
-                return Ok(targets);
-            };
-            if version.xmax == Some(xid) && version.xmax_command_id == Some(context.command_id) {
-                return Ok(targets);
-            }
-            for source_row in &source_rows {
-                let mut row = source_row.clone();
-                row[..schema.columns.len()].clone_from_slice(&version.row);
-                if matches_mutation_row(state, selection, &scope, &row, xid, snapshot, context)? {
-                    targets.push((row_id, version.xmin, version.row.clone(), row));
-                    break;
-                }
-            }
-            Ok(targets)
-        })?;
+    let targets = collect_mutation_targets(
+        state,
+        &schema,
+        selection,
+        &scope,
+        &source_rows,
+        xid,
+        snapshot,
+        context,
+    )?;
     let affected = targets.len() as u64;
     let mut returned_rows = Vec::new();
     for (row_id, version_xmin, row, mut bound_row) in targets {
@@ -640,37 +627,16 @@ pub(super) fn execute_delete(
         snapshot,
         context,
     )?;
-    let targets = state
-        .tables
-        .get(&schema.id)
-        .expect("catalog table must have storage")
-        .iterate_version_chains()
-        .try_fold(Vec::new(), |mut targets, (row_id, chain)| {
-            let Some(version) = find_visible_version(chain, snapshot, xid, &state.transactions)
-            else {
-                return Ok(targets);
-            };
-            if version.xmax == Some(xid) && version.xmax_command_id == Some(context.command_id) {
-                return Ok(targets);
-            }
-            for source_row in &source_rows {
-                let mut row = source_row.clone();
-                row[..schema.columns.len()].clone_from_slice(&version.row);
-                if matches_mutation_row(
-                    state,
-                    delete.selection.as_ref(),
-                    &scope,
-                    &row,
-                    xid,
-                    snapshot,
-                    context,
-                )? {
-                    targets.push((row_id, version.xmin, version.row.clone(), row));
-                    break;
-                }
-            }
-            Ok(targets)
-        })?;
+    let targets = collect_mutation_targets(
+        state,
+        &schema,
+        delete.selection.as_ref(),
+        &scope,
+        &source_rows,
+        xid,
+        snapshot,
+        context,
+    )?;
     let affected = targets.len() as u64;
     let mut returned_rows = Vec::new();
     for (row_id, version_xmin, row, bound_row) in targets {
@@ -702,4 +668,71 @@ pub(super) fn execute_delete(
         )?;
     }
     Ok(create_write_result(affected, returning, returned_rows))
+}
+
+type MutationTarget = (RowId, Xid, Vec<Value>, Vec<Value>);
+
+#[cfg_attr(feature = "execution-log", tracing::instrument(skip_all))]
+fn collect_mutation_targets(
+    state: &DatabaseState,
+    schema: &TableSchema,
+    selection: Option<&ast::Expr>,
+    scope: &BoundScope,
+    source_rows: &[Vec<Value>],
+    xid: Xid,
+    snapshot: &Snapshot,
+    context: &StatementExecutionContext,
+) -> Result<Vec<MutationTarget>> {
+    let table = state
+        .tables
+        .get(&schema.id)
+        .expect("catalog table must have storage");
+    if let [source_row] = source_rows
+        && let Some((column, value)) = super::locks::resolve_unique_point_lookup(
+            table,
+            schema,
+            selection,
+            RowScope::Bound(scope),
+            context,
+        )?
+    {
+        let Some((row_id, version)) = table.find_unique_visible_version(
+            &[column],
+            &[value],
+            snapshot,
+            xid,
+            &state.transactions,
+        ) else {
+            return Ok(Vec::new());
+        };
+        if version.xmax == Some(xid) && version.xmax_command_id == Some(context.command_id) {
+            return Ok(Vec::new());
+        }
+        let mut row = source_row.clone();
+        row[..schema.columns.len()].clone_from_slice(&version.row);
+        if matches_mutation_row(state, selection, scope, &row, xid, snapshot, context)? {
+            return Ok(vec![(row_id, version.xmin, version.row.clone(), row)]);
+        }
+        return Ok(Vec::new());
+    }
+    table
+        .iterate_version_chains()
+        .try_fold(Vec::new(), |mut targets, (row_id, chain)| {
+            let Some(version) = find_visible_version(chain, snapshot, xid, &state.transactions)
+            else {
+                return Ok(targets);
+            };
+            if version.xmax == Some(xid) && version.xmax_command_id == Some(context.command_id) {
+                return Ok(targets);
+            }
+            for source_row in source_rows {
+                let mut row = source_row.clone();
+                row[..schema.columns.len()].clone_from_slice(&version.row);
+                if matches_mutation_row(state, selection, scope, &row, xid, snapshot, context)? {
+                    targets.push((row_id, version.xmin, version.row.clone(), row));
+                    break;
+                }
+            }
+            Ok(targets)
+        })
 }
