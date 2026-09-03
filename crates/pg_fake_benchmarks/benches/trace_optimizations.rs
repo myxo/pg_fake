@@ -24,6 +24,27 @@ fn create_expression_session() -> Session {
     session
 }
 
+fn create_null_filter_session() -> Session {
+    let mut session = Db::create().create_session();
+    let rows = build_rows(100, |id| {
+        let manager_id = if id % 3 == 0 {
+            (id - 1).to_string()
+        } else {
+            "NULL".into()
+        };
+        format!("({id}, {manager_id})")
+    });
+    execute(
+        &mut session,
+        "CREATE TABLE managed_users (id INTEGER PRIMARY KEY, manager_id INTEGER)",
+    );
+    execute(
+        &mut session,
+        &format!("INSERT INTO managed_users VALUES {rows}"),
+    );
+    session
+}
+
 fn create_mutation_session() -> Session {
     let mut session = Db::create().create_session();
     let rows = build_rows(1_000, |id| format!("({id}, 0)"));
@@ -97,6 +118,19 @@ fn create_insert_database() -> Db {
 }
 
 fn benchmark_trace_optimizations(criterion: &mut Criterion) {
+    let mut null_filter_session = create_null_filter_session();
+    let mut group = criterion.benchmark_group("trace_select_null_100");
+    group.throughput(Throughput::Elements(100));
+    group.bench_function("generic_execute", |benchmark| {
+        benchmark.iter(|| {
+            execute(
+                &mut null_filter_session,
+                "SELECT id FROM managed_users WHERE manager_id IS NULL",
+            );
+        });
+    });
+    group.finish();
+
     let mut expression_session = create_expression_session();
     let mut group = criterion.benchmark_group("trace_select_expression_100");
     group.throughput(Throughput::Elements(100));

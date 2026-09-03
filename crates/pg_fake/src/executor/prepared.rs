@@ -52,6 +52,10 @@ enum PreparedExpression {
         right: Box<PreparedExpression>,
         data_type: BaseType,
     },
+    NullTest {
+        expression: Box<PreparedExpression>,
+        negated: bool,
+    },
 }
 
 impl PreparedExpression {
@@ -61,6 +65,7 @@ impl PreparedExpression {
             | Self::Parameter { data_type, .. }
             | Self::Literal { data_type, .. } => *data_type,
             Self::Binary { data_type, .. } => *data_type,
+            Self::NullTest { .. } => BaseType::Bool,
         }
     }
 
@@ -69,6 +74,7 @@ impl PreparedExpression {
             Self::Column { .. } => true,
             Self::Parameter { .. } | Self::Literal { .. } => false,
             Self::Binary { left, right, .. } => left.has_column() || right.has_column(),
+            Self::NullTest { expression, .. } => expression.has_column(),
         }
     }
 }
@@ -272,6 +278,9 @@ fn is_prepared_expression_candidate(expression: &ast::Expr) -> bool {
     match expression {
         ast::Expr::Identifier(_) | ast::Expr::CompoundIdentifier(_) | ast::Expr::Value(_) => true,
         ast::Expr::Nested(expression) => is_prepared_expression_candidate(expression),
+        ast::Expr::IsNull(expression) | ast::Expr::IsNotNull(expression) => {
+            is_prepared_expression_candidate(expression)
+        }
         ast::Expr::BinaryOp {
             left,
             op:
@@ -330,6 +339,15 @@ fn bind_prepared_expression(
         },
         ast::Expr::Nested(expression) => {
             bind_prepared_expression(expression, scope, parameter_types)
+        }
+        ast::Expr::IsNull(operand) | ast::Expr::IsNotNull(operand) => {
+            let Some(operand) = bind_prepared_expression(operand, scope, parameter_types)? else {
+                return Ok(None);
+            };
+            Ok(Some(PreparedExpression::NullTest {
+                expression: Box::new(operand),
+                negated: matches!(expression, ast::Expr::IsNotNull(_)),
+            }))
         }
         ast::Expr::BinaryOp {
             left,
@@ -554,5 +572,11 @@ fn evaluate_prepared_expression(
                 _ => unreachable!("prepared expression only contains supported operators"),
             }
         }
+        PreparedExpression::NullTest {
+            expression,
+            negated,
+        } => Ok(Value::Bool(
+            evaluate_prepared_expression(expression, row, parameters)?.is_null() != *negated,
+        )),
     }
 }
