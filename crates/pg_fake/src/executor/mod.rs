@@ -55,7 +55,9 @@ use foreign_keys::{
     validate_row_foreign_keys,
 };
 pub(crate) use foreign_keys::{contains_deferred_foreign_keys, validate_deferred_foreign_keys};
-pub(crate) use locks::{collect_required_cte_row_locks, collect_required_row_locks};
+pub(crate) use locks::{
+    collect_required_cte_row_locks, collect_required_row_locks, mutation_locks_cover_targets,
+};
 pub(crate) use prepared::{PreparedQueryPlan, build_prepared_query_plan, execute_prepared_query};
 pub(crate) use scope::infer_query_output_columns;
 use scope::{BoundColumn, bind_select_scope};
@@ -90,6 +92,11 @@ pub(crate) struct DatabaseState {
 pub(crate) struct RequiredRowLock {
     pub(crate) key: RowLockKey,
     pub(crate) mode: RowLockMode,
+    pub(crate) mutation_candidate: Option<MutationCandidate>,
+}
+pub(crate) struct MutationCandidate {
+    pub(crate) version_xmin: Xid,
+    pub(crate) row: Vec<Value>,
 }
 
 pub(crate) use query::describe_query_result_columns;
@@ -120,6 +127,7 @@ pub(crate) fn execute_statement(
     deferred_constraints: &BTreeSet<String>,
     defer_all: bool,
     context: &StatementExecutionContext,
+    mutation_targets: Option<Vec<RequiredRowLock>>,
 ) -> Result<StatementResult> {
     match statement {
         ast::Statement::CreateTable(create) => {
@@ -593,6 +601,7 @@ pub(crate) fn execute_statement(
                 deferred_constraints,
                 defer_all,
                 context,
+                mutation_targets,
             )
         }
         ast::Statement::Delete(delete) => execute_delete(
@@ -603,6 +612,7 @@ pub(crate) fn execute_statement(
             deferred_constraints,
             defer_all,
             context,
+            mutation_targets,
         ),
         ast::Statement::Query(query) => query::execute_query(state, query, xid, snapshot, context),
         _ => reject_unsupported("statement is not implemented"),

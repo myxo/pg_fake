@@ -381,6 +381,7 @@ pub(super) fn execute_update(
     deferred_constraints: &BTreeSet<String>,
     defer_all: bool,
     context: &StatementExecutionContext,
+    mutation_targets: Option<Vec<RequiredRowLock>>,
 ) -> Result<StatementResult> {
     if !update_table.joins.is_empty() {
         return reject_unsupported("UPDATE joins are not implemented");
@@ -484,6 +485,7 @@ pub(super) fn execute_update(
         xid,
         snapshot,
         context,
+        mutation_targets,
     )?;
     let affected = targets.len() as u64;
     let mut returned_rows = Vec::new();
@@ -570,6 +572,7 @@ pub(super) fn execute_delete(
     deferred_constraints: &BTreeSet<String>,
     defer_all: bool,
     context: &StatementExecutionContext,
+    mutation_targets: Option<Vec<RequiredRowLock>>,
 ) -> Result<StatementResult> {
     if !delete.tables.is_empty() || !delete.order_by.is_empty() || delete.limit.is_some() {
         return reject_unsupported("DELETE feature is not implemented");
@@ -636,6 +639,7 @@ pub(super) fn execute_delete(
         xid,
         snapshot,
         context,
+        mutation_targets,
     )?;
     let affected = targets.len() as u64;
     let mut returned_rows = Vec::new();
@@ -682,11 +686,34 @@ fn collect_mutation_targets(
     xid: Xid,
     snapshot: &Snapshot,
     context: &StatementExecutionContext,
+    mutation_targets: Option<Vec<RequiredRowLock>>,
 ) -> Result<Vec<MutationTarget>> {
     let table = state
         .tables
         .get(&schema.id)
         .expect("catalog table must have storage");
+    if let Some(mutation_targets) = mutation_targets {
+        let [source_row] = source_rows else {
+            unreachable!("lock-selected mutations do not have source rows");
+        };
+        return mutation_targets
+            .into_iter()
+            .filter(|required| required.key.table_id == schema.id)
+            .map(|required| {
+                let candidate = required
+                    .mutation_candidate
+                    .expect("mutation target locks retain their selected row");
+                let mut row = source_row.clone();
+                row[..schema.columns.len()].clone_from_slice(&candidate.row);
+                Ok((
+                    required.key.row_id,
+                    candidate.version_xmin,
+                    candidate.row,
+                    row,
+                ))
+            })
+            .collect();
+    }
     if let [source_row] = source_rows
         && let Some((column, value)) = super::locks::resolve_unique_point_lookup(
             table,

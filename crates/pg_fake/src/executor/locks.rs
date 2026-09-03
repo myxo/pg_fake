@@ -54,7 +54,7 @@ pub(crate) fn collect_required_row_locks(
     if let ast::Statement::Insert(insert) = statement {
         return collect_insert_foreign_key_locks(state, insert, xid, snapshot, context);
     }
-    let (schema, selection, mode) = match statement {
+    let (schema, selection, mode, retain_mutation_candidates) = match statement {
         ast::Statement::Update(update) => {
             let table = &update.table;
             if !table.joins.is_empty() {
@@ -78,6 +78,7 @@ pub(crate) fn collect_required_row_locks(
                     .then_some(update.selection.as_ref())
                     .flatten(),
                 RowLockMode::Update,
+                update.from.is_none(),
             )
         }
         ast::Statement::Delete(delete) => {
@@ -105,6 +106,7 @@ pub(crate) fn collect_required_row_locks(
                     .then_some(delete.selection.as_ref())
                     .flatten(),
                 RowLockMode::Update,
+                delete.using.is_none(),
             )
         }
         ast::Statement::Query(query) => {
@@ -131,6 +133,7 @@ pub(crate) fn collect_required_row_locks(
                     .require_table(&normalize_unqualified_object_name(table_name)?)?,
                 select.selection.as_ref(),
                 mode,
+                false,
             )
         }
         _ => return Ok(Vec::new()),
@@ -164,6 +167,10 @@ pub(crate) fn collect_required_row_locks(
                 row_id,
             },
             mode,
+            mutation_candidate: retain_mutation_candidates.then(|| MutationCandidate {
+                version_xmin: version.xmin,
+                row: version.row.clone(),
+            }),
         }]);
     }
     table
@@ -187,9 +194,38 @@ pub(crate) fn collect_required_row_locks(
                     row_id,
                 },
                 mode,
+                mutation_candidate: retain_mutation_candidates.then(|| MutationCandidate {
+                    version_xmin: version.xmin,
+                    row: version.row.clone(),
+                }),
             });
             Ok(locks)
         })
+}
+
+#[cfg_attr(feature = "execution-log", tracing::instrument(skip_all))]
+pub(crate) fn mutation_locks_cover_targets(statement: &ast::Statement) -> bool {
+    match statement {
+        ast::Statement::Update(update) => {
+            update.from.is_none()
+                && update.table.joins.is_empty()
+                && matches!(
+                    update.table.relation,
+                    ast::TableFactor::Table { args: None, .. }
+                )
+        }
+        ast::Statement::Delete(delete) => {
+            delete.using.is_none()
+                && matches!(
+                    &delete.from,
+                    ast::FromTable::WithFromKeyword(from)
+                        if matches!(from.as_slice(), [table]
+                            if table.joins.is_empty()
+                                && matches!(table.relation, ast::TableFactor::Table { args: None, .. }))
+                )
+        }
+        _ => false,
+    }
 }
 
 #[cfg_attr(feature = "execution-log", tracing::instrument(skip_all))]
@@ -404,6 +440,7 @@ fn collect_insert_foreign_key_locks(
                         row_id,
                     },
                     mode: RowLockMode::Share,
+                    mutation_candidate: None,
                 });
             }
         }

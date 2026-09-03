@@ -353,7 +353,11 @@ fn acquire_row_locks<'a>(
     isolation: IsolationLevel,
     mut snapshot: Snapshot,
     context: &executor::StatementExecutionContext,
-) -> Result<(MutexGuard<'a, DatabaseState>, Snapshot)> {
+) -> Result<(
+    MutexGuard<'a, DatabaseState>,
+    Snapshot,
+    Vec<executor::RequiredRowLock>,
+)> {
     let deadline = (timeout != Duration::ZERO).then(|| Instant::now() + timeout);
     loop {
         let required = match target {
@@ -365,7 +369,7 @@ fn acquire_row_locks<'a>(
             }
         };
         let mut blocked = None;
-        for required_lock in required {
+        for required_lock in &required {
             match state
                 .row_locks
                 .acquire(required_lock.key, xid, required_lock.mode)
@@ -386,7 +390,7 @@ fn acquire_row_locks<'a>(
         }
         let Some((key, conflicts)) = blocked else {
             state.wait_for.clear_wait(xid);
-            return Ok((state, snapshot));
+            return Ok((state, snapshot, required));
         };
         if state.wait_for.take_victim(xid) {
             state.row_locks.cancel_wait(key, xid);
@@ -1364,7 +1368,7 @@ impl Session {
             rng: self.db.rng.clone(),
             sequences,
         };
-        (state, snapshot) = match acquire_row_locks(
+        let (acquired_state, acquired_snapshot, _) = match acquire_row_locks(
             &condvar,
             self.lock_timeout,
             state,
@@ -1377,6 +1381,8 @@ impl Session {
             Ok(acquired) => acquired,
             Err(error) => return self.abort_with_error(error),
         };
+        state = acquired_state;
+        snapshot = acquired_snapshot;
         let statement = match executor::materialize_ctes(
             &mut state,
             statement,
@@ -1408,7 +1414,7 @@ impl Session {
             };
             self.ddl_undo.extend(undo);
         }
-        let (mut state, snapshot) = match acquire_row_locks(
+        let (mut state, snapshot, locked_rows) = match acquire_row_locks(
             &condvar,
             self.lock_timeout,
             state,
@@ -1421,6 +1427,8 @@ impl Session {
             Ok(acquired) => acquired,
             Err(error) => return self.abort_with_error(error),
         };
+        let mutation_targets =
+            executor::mutation_locks_cover_targets(&statement).then_some(locked_rows);
         let result = executor::execute_statement(
             &mut state,
             &statement,
@@ -1429,6 +1437,7 @@ impl Session {
             &self.deferred_constraints,
             self.defer_all_constraints,
             &context,
+            mutation_targets,
         );
         match result {
             Ok(result) => {

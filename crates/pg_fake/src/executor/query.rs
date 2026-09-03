@@ -1527,6 +1527,7 @@ fn materialize_recursive_data_modifying_ctes(
                     deferred_constraints,
                     defer_all,
                     context,
+                    None,
                 )? {
                     StatementResult::Query(result) => result,
                     StatementResult::Affected(_) if consumed.contains(name) => {
@@ -1940,6 +1941,7 @@ pub(crate) fn materialize_ctes(
                 deferred_constraints,
                 defer_all,
                 context,
+                None,
             )? {
                 StatementResult::Query(result) => result,
                 StatementResult::Affected(_) if consumed.contains(&name) => {
