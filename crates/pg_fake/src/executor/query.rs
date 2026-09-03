@@ -4454,6 +4454,7 @@ fn execute_plain_select_rows(
     xid: Xid,
     snapshot: &Snapshot,
     context: &StatementExecutionContext,
+    top_k: Option<usize>,
 ) -> Result<Vec<OrderedRow>> {
     if let Some(rows) = execute_correlated_exists_rows(
         state,
@@ -4531,11 +4532,16 @@ fn execute_plain_select_rows(
             let distinct_keys = evaluate_distinct_keys(
                 state, distinct, &values, &keys, scope, row, None, xid, snapshot, context,
             )?;
-            rows.push(OrderedRow {
-                values,
-                keys,
-                distinct_keys,
-            });
+            retain_top_ordered_row(
+                &mut rows,
+                OrderedRow {
+                    values,
+                    keys,
+                    distinct_keys,
+                },
+                top_k,
+                order_specs,
+            );
             Ok(())
         },
     )?;
@@ -4984,6 +4990,58 @@ fn compare_ordered_rows(
         .unwrap_or(Ordering::Equal)
 }
 
+fn retain_top_ordered_row(
+    rows: &mut Vec<OrderedRow>,
+    row: OrderedRow,
+    top_k: Option<usize>,
+    order_specs: &[RowOrderSpec<'_>],
+) {
+    let Some(top_k) = top_k else {
+        rows.push(row);
+        return;
+    };
+    if top_k == 0 {
+        return;
+    }
+    if rows.len() < top_k {
+        rows.push(row);
+        let mut child = rows.len() - 1;
+        while child > 0 {
+            let parent = (child - 1) / 2;
+            if compare_ordered_rows(&rows[parent], &rows[child], order_specs) != Ordering::Less {
+                break;
+            }
+            rows.swap(parent, child);
+            child = parent;
+        }
+        return;
+    }
+    if compare_ordered_rows(&row, &rows[0], order_specs) != Ordering::Less {
+        return;
+    }
+    rows[0] = row;
+    let mut parent = 0;
+    loop {
+        let left = parent * 2 + 1;
+        if left >= rows.len() {
+            break;
+        }
+        let right = left + 1;
+        let worse_child = if right < rows.len()
+            && compare_ordered_rows(&rows[left], &rows[right], order_specs) == Ordering::Less
+        {
+            right
+        } else {
+            left
+        };
+        if compare_ordered_rows(&rows[parent], &rows[worse_child], order_specs) != Ordering::Less {
+            break;
+        }
+        rows.swap(parent, worse_child);
+        parent = worse_child;
+    }
+}
+
 #[cfg_attr(feature = "execution-log", tracing::instrument(skip_all))]
 fn remove_duplicate_rows(
     rows: Vec<OrderedRow>,
@@ -5140,6 +5198,11 @@ pub(super) fn execute_query(
             context,
         )?
     } else {
+        let top_k = if !order_specs.is_empty() && matches!(distinct, DistinctPlan::None) {
+            limit.map(|limit| offset.saturating_add(limit))
+        } else {
+            None
+        };
         execute_plain_select_rows(
             state,
             select,
@@ -5150,6 +5213,7 @@ pub(super) fn execute_query(
             xid,
             snapshot,
             context,
+            top_k,
         )?
     };
     let rows = finalize_select_rows(rows, &order_specs, &distinct, limit, offset)?;

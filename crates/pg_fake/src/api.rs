@@ -3317,6 +3317,16 @@ mod tests {
         );
         assert_eq!(
             session
+                .query(
+                    "SELECT id FROM items ORDER BY id DESC LIMIT 2 OFFSET 1",
+                    &[]
+                )
+                .unwrap()
+                .rows,
+            vec![vec![Value::Int4(4)], vec![Value::Int4(3)]]
+        );
+        assert_eq!(
+            session
                 .query("SELECT id FROM items LIMIT 2", &[])
                 .unwrap()
                 .rows,
