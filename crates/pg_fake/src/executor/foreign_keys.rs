@@ -95,11 +95,29 @@ pub(super) fn validate_foreign_key_definitions(
                 "constraint cannot be initially deferred because it is not deferrable",
             ));
         }
-        let referred = if foreign_key.foreign_table == schema.name {
+        let referred = if foreign_key.foreign_table.name == schema.name
+            && foreign_key
+                .foreign_table
+                .schema
+                .as_deref()
+                .is_none_or(|name| {
+                    catalog
+                        .require_schema(name)
+                        .is_ok_and(|candidate| candidate.id == schema.schema_id)
+                }) {
             schema
         } else {
-            catalog.require_table(&foreign_key.foreign_table)?
+            catalog.require_named_table(&foreign_key.foreign_table)?
         };
+        let local_is_temporary = matches!(schema.persistence, TablePersistence::Temporary { .. });
+        let referred_is_temporary =
+            matches!(referred.persistence, TablePersistence::Temporary { .. });
+        if local_is_temporary != referred_is_temporary {
+            return Err(PgError::create(
+                SqlState::InvalidTableDefinition,
+                "foreign keys between permanent and temporary tables are not implemented",
+            ));
+        }
         let referred_columns = if foreign_key.referred_columns.is_empty() {
             referred
                 .constraints

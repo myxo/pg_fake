@@ -32,6 +32,11 @@ pub fn list_benchmarks() -> Vec<Benchmark> {
             postgres_values(),
             postgres_comparisons(),
         ),
+        build_benchmark(
+            "temporary_table_on_commit_drop",
+            postgres_values(),
+            postgres_comparisons(),
+        ),
         build_benchmark("insert_row", postgres_values(), postgres_comparisons()),
         build_benchmark(
             "insert_row_returning",

@@ -74,7 +74,7 @@ pub(crate) fn collect_required_row_locks(
             (
                 state
                     .catalog
-                    .require_table(&normalize_unqualified_object_name(table_name)?)?,
+                    .require_named_table(&normalize_relation_name(table_name)?)?,
                 alias.as_ref().map(|alias| &alias.name),
                 update
                     .from
@@ -104,7 +104,7 @@ pub(crate) fn collect_required_row_locks(
             };
             let schema = state
                 .catalog
-                .require_table(&normalize_unqualified_object_name(table_name)?)?;
+                .require_named_table(&normalize_relation_name(table_name)?)?;
             (
                 schema,
                 alias.as_ref().map(|alias| &alias.name),
@@ -140,7 +140,7 @@ pub(crate) fn collect_required_row_locks(
             (
                 state
                     .catalog
-                    .require_table(&normalize_unqualified_object_name(table_name)?)?,
+                    .require_named_table(&normalize_relation_name(table_name)?)?,
                 alias.as_ref().map(|alias| &alias.name),
                 select.selection.as_ref(),
                 mode,
@@ -236,7 +236,7 @@ fn collect_insert_conflict_locks(
 ) -> Result<Vec<RequiredRowLock>> {
     let schema = state
         .catalog
-        .require_table(&resolve_insert_table_name(&insert.table)?)?;
+        .require_named_table(&resolve_insert_table_name(&insert.table)?)?;
     let Some(_) = writes::resolve_conflict_arbiter(schema, insert.on.as_ref())? else {
         return Ok(Vec::new());
     };
@@ -482,7 +482,7 @@ fn collect_insert_foreign_key_locks(
 ) -> Result<Vec<RequiredRowLock>> {
     let schema = state
         .catalog
-        .require_table(&resolve_insert_table_name(&insert.table)?)?;
+        .require_named_table(&resolve_insert_table_name(&insert.table)?)?;
     if !schema
         .constraints
         .iter()

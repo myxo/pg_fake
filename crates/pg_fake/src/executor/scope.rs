@@ -1,4 +1,6 @@
-use super::{DatabaseState, normalize_identifier, normalize_unqualified_object_name};
+use super::{
+    DatabaseState, normalize_identifier, normalize_relation_name, normalize_unqualified_object_name,
+};
 use crate::{
     catalog::{Catalog, TableId, TableSchema},
     error::{PgError, Result, SqlState, reject_unsupported},
@@ -435,7 +437,7 @@ fn bind_table_factor(
         return reject_unsupported("table functions are not implemented");
     }
     let table = BoundScope::bind_table(
-        catalog.require_table(&normalize_unqualified_object_name(table_name)?)?,
+        catalog.require_named_table(&normalize_relation_name(table_name)?)?,
         alias.as_ref(),
         scope.columns.len(),
     )?;

@@ -39,6 +39,43 @@ pub struct Scenario {
 
 pub const FEATURES: &[Feature] = &[
     Feature {
+        name: "qualified and temporary relations",
+        cases: &[
+            Case {
+                id: "public_qualified_relation",
+                source: "create_table.sql:29 plus focused qualification",
+                setup: &[
+                    "CREATE TABLE public.phase3_qualified (id INTEGER)",
+                    "INSERT INTO public.phase3_qualified VALUES (1)",
+                ],
+                sql: "SELECT id FROM public.phase3_qualified",
+                blocker: BlockerKind::Implementation,
+            },
+            Case {
+                id: "temporary_shadowing",
+                source: "create_table.sql:28 plus focused shadowing",
+                setup: &[
+                    "CREATE TABLE public.phase3_shadowed (id INTEGER)",
+                    "INSERT INTO public.phase3_shadowed VALUES (1)",
+                    "CREATE TEMP TABLE phase3_shadowed (id INTEGER)",
+                    "INSERT INTO pg_temp.phase3_shadowed VALUES (2)",
+                ],
+                sql: "SELECT id FROM phase3_shadowed",
+                blocker: BlockerKind::Implementation,
+            },
+            Case {
+                id: "temporary_on_commit_drop",
+                source: "temp.sql:55",
+                setup: &[
+                    "BEGIN",
+                    "CREATE TEMP TABLE phase3_on_commit_drop (id INTEGER) ON COMMIT DROP",
+                ],
+                sql: "COMMIT",
+                blocker: BlockerKind::Implementation,
+            },
+        ],
+    },
+    Feature {
         name: "set operations",
         cases: &[Case {
             id: "union_distinct",

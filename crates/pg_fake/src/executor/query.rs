@@ -328,7 +328,12 @@ impl ast::VisitorMut for CteForwardReferenceDetector<'_> {
         let Ok(name) = normalize_unqualified_object_name(name) else {
             return std::ops::ControlFlow::Continue(());
         };
-        if self.names.contains(&name) && self.catalog.require_table(&name).is_err() {
+        if self.names.contains(&name)
+            && self
+                .catalog
+                .require_named_table(&RelationName::create_unqualified(name.clone()))
+                .is_err()
+        {
             self.error = Some(PgError::create(
                 SqlState::UndefinedTable,
                 format!("relation {name:?} does not exist"),
@@ -2319,7 +2324,7 @@ pub(crate) fn materialize_uncorrelated_subqueries(
         ast::Statement::Insert(insert) => {
             let schema = state
                 .catalog
-                .require_table(&resolve_insert_table_name(&insert.table)?)?;
+                .require_named_table(&resolve_insert_table_name(&insert.table)?)?;
             Some(bind_target_scope(
                 schema,
                 insert.table_alias.as_ref().map(|alias| &alias.alias),
@@ -2331,7 +2336,7 @@ pub(crate) fn materialize_uncorrelated_subqueries(
             };
             let schema = state
                 .catalog
-                .require_table(&normalize_unqualified_object_name(name)?)?;
+                .require_named_table(&normalize_relation_name(name)?)?;
             let from = match &update.from {
                 None => &[][..],
                 Some(ast::UpdateTableFromKind::AfterSet(from)) => from.as_slice(),
@@ -2355,7 +2360,7 @@ pub(crate) fn materialize_uncorrelated_subqueries(
             };
             let schema = state
                 .catalog
-                .require_table(&normalize_unqualified_object_name(name)?)?;
+                .require_named_table(&normalize_relation_name(name)?)?;
             Some(combine_bound_scopes(
                 bind_target_scope(schema, alias.as_ref().map(|alias| &alias.name)),
                 bind_from_scope(&state.catalog, delete.using.as_deref().unwrap_or_default())?,
@@ -2582,7 +2587,7 @@ pub(crate) fn describe_query_result_columns(
             };
             let schema = state
                 .catalog
-                .require_table(&resolve_insert_table_name(&insert.table)?)?;
+                .require_named_table(&resolve_insert_table_name(&insert.table)?)?;
             let scope = bind_target_scope(
                 schema,
                 insert.table_alias.as_ref().map(|alias| &alias.alias),
@@ -2605,7 +2610,7 @@ pub(crate) fn describe_query_result_columns(
             }
             let schema = state
                 .catalog
-                .require_table(&normalize_unqualified_object_name(name)?)?;
+                .require_named_table(&normalize_relation_name(name)?)?;
             let from = match &update.from {
                 None => &[][..],
                 Some(ast::UpdateTableFromKind::AfterSet(from)) => from.as_slice(),
@@ -2640,7 +2645,7 @@ pub(crate) fn describe_query_result_columns(
             }
             let schema = state
                 .catalog
-                .require_table(&normalize_unqualified_object_name(name)?)?;
+                .require_named_table(&normalize_relation_name(name)?)?;
             let scope = combine_bound_scopes(
                 bind_target_scope(schema, alias.as_ref().map(|alias| &alias.name)),
                 bind_from_scope(&state.catalog, delete.using.as_deref().unwrap_or_default())?,
@@ -4624,11 +4629,11 @@ fn execute_correlated_exists_rows(
     if inner_type != outer_type {
         return None;
     }
-    let table_name = match normalize_unqualified_object_name(name) {
+    let table_name = match normalize_relation_name(name) {
         Ok(name) => name,
         Err(error) => return Some(Err(error)),
     };
-    let schema = match state.catalog.require_table(&table_name) {
+    let schema = match state.catalog.require_named_table(&table_name) {
         Ok(schema) => schema,
         Err(error) => return Some(Err(error)),
     };
@@ -5534,7 +5539,7 @@ fn visit_streamed_join_rows(
         starts.push(next_slot);
         next_slot += state
             .catalog
-            .require_table(&normalize_unqualified_object_name(table_name)?)?
+            .require_named_table(&normalize_relation_name(table_name)?)?
             .columns
             .len();
     }
@@ -5875,7 +5880,7 @@ fn visit_table_factor_rows(
     }
     let schema = state
         .catalog
-        .require_table(&normalize_unqualified_object_name(table_name)?)?;
+        .require_named_table(&normalize_relation_name(table_name)?)?;
     let mut filters = Vec::new();
     if let Some(selection) = selection {
         collect_pushdown_filters(
@@ -6138,7 +6143,7 @@ fn materialize_table_factor_rows(
     }
     let schema = state
         .catalog
-        .require_table(&normalize_unqualified_object_name(table_name)?)?;
+        .require_named_table(&normalize_relation_name(table_name)?)?;
     let start = *next_slot;
     *next_slot += schema.columns.len();
     let mut filters = Vec::new();

@@ -27,7 +27,7 @@ pub(super) fn evaluate_column_default(
     context: &StatementExecutionContext,
 ) -> Result<Value> {
     if let Some(sequence) = &column.default_sequence {
-        let value = context.sequences.get_next_value(sequence)?;
+        let value = context.sequences.get_next_resolved_value(sequence)?;
         return coercion::coerce(
             Value::Int8(value),
             BaseType::Int8,
@@ -176,6 +176,7 @@ pub(crate) fn create_constant_expression_schema() -> TableSchema {
         name: String::new(),
         columns: Vec::new(),
         constraints: Vec::new(),
+        persistence: crate::catalog::TablePersistence::Permanent,
     }
 }
 

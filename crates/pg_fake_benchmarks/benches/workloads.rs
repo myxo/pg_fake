@@ -236,6 +236,26 @@ fn transactional_ddl_benchmark(
     group.finish();
 }
 
+fn temporary_table_benchmark(
+    criterion: &mut Criterion,
+    runtime: &Runtime,
+    connections: &mut [NamedBenchmarkConnection<'_>],
+) {
+    let mut group = criterion
+        .benchmark_group(benchmarks::find_benchmark("temporary_table_on_commit_drop").name);
+    for (name, connection) in connections.iter_mut() {
+        group.bench_function(*name, |benchmark| {
+            benchmark.iter(|| {
+                connection.execute(
+                    runtime,
+                    "CREATE TEMP TABLE temporary_table_on_commit_drop (id INTEGER) ON COMMIT DROP",
+                );
+            });
+        });
+    }
+    group.finish();
+}
+
 fn sequence_benchmark(
     criterion: &mut Criterion,
     runtime: &Runtime,
@@ -1092,6 +1112,7 @@ fn benchmarks(criterion: &mut Criterion) {
 
         create_table_benchmark(criterion, &runtime, &mut connections);
         transactional_ddl_benchmark(criterion, &runtime, &mut connections);
+        temporary_table_benchmark(criterion, &runtime, &mut connections);
         sequence_benchmark(criterion, &runtime, &mut connections);
         serial_identity_benchmark(criterion, &runtime, &mut connections);
         uuid_temporal_benchmark(criterion, &runtime, &mut connections);

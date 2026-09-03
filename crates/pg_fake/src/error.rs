@@ -66,6 +66,7 @@ pub enum SqlState {
     GroupingError,          // 42803
     WrongObjectType,        // 42809
     GeneratedAlways,        // 428C9
+    InvalidTableDefinition, // 42P16
 
     // 55 — Object Not In Prerequisite State
     ObjectNotInPrerequisiteState, // 55000
@@ -119,6 +120,7 @@ impl SqlState {
             SqlState::GroupingError => "42803",
             SqlState::WrongObjectType => "42809",
             SqlState::GeneratedAlways => "428C9",
+            SqlState::InvalidTableDefinition => "42P16",
             SqlState::ObjectNotInPrerequisiteState => "55000",
             SqlState::LockNotAvailable => "55P03",
             SqlState::InternalError => "XX000",

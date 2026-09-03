@@ -3,7 +3,6 @@ use super::*;
 
 #[derive(Debug, Clone)]
 pub(crate) struct PreparedQueryPlan {
-    table_name: String,
     table_id: TableId,
     projection: Vec<PreparedProjection>,
     selection: Option<PreparedExpression>,
@@ -148,8 +147,8 @@ pub(crate) fn build_prepared_query_plan(
     {
         return Ok(None);
     }
-    let table_name = normalize_unqualified_object_name(name)?;
-    let schema = state.catalog.require_table(&table_name)?;
+    let relation_name = normalize_relation_name(name)?;
+    let schema = state.catalog.require_named_table(&relation_name)?;
     let scope = bind_query_scope(&state.catalog, select)?;
     let mut projection = Vec::new();
     let mut columns = Vec::new();
@@ -265,7 +264,6 @@ pub(crate) fn build_prepared_query_plan(
         .and_then(|selection| find_unique_access(selection, schema))
         .unwrap_or(PreparedAccess::Scan);
     Ok(Some(PreparedQueryPlan {
-        table_name,
         table_id: schema.id,
         projection,
         selection,
@@ -465,13 +463,7 @@ pub(crate) fn execute_prepared_query(
     xid: Xid,
     snapshot: &Snapshot,
 ) -> Result<Vec<Vec<Value>>> {
-    let schema = state.catalog.require_table(&plan.table_name)?;
-    if schema.id != plan.table_id {
-        return Err(PgError::create(
-            SqlState::FeatureNotSupported,
-            "cached plan must be replanned",
-        ));
-    }
+    state.catalog.require_table_by_id(plan.table_id)?;
     let table = state
         .tables
         .get(&plan.table_id)

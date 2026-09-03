@@ -356,7 +356,7 @@ Tasks 10–15 add the bounded migration surface.
 - [x] Run formatting, workspace tests, review, and the 10,000-iteration
   property gate.
 
-### Task 10 — Qualified names, search path, and temporary relations
+### Task 10 — Qualified names, search path, and temporary relations [COMPLETE]
 
 **Goal:** Resolve common migration namespaces and temporary objects.
 

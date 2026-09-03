@@ -42,7 +42,7 @@ fn creates_serial_columns_with_owned_sequences() {
             )
             .unwrap()
             .rows,
-        vec![vec![Value::Text("serial_rows_normal_seq".into())]]
+        vec![vec![Value::Text("public.serial_rows_normal_seq".into())]]
     );
 
     session.execute("DROP TABLE serial_rows").unwrap();
@@ -80,6 +80,80 @@ fn prevents_directly_dropping_owned_sequences() {
             .unwrap_err()
             .sqlstate,
         SqlState::UndefinedTable
+    );
+}
+
+#[test]
+fn quotes_owned_sequence_names_and_preserves_literal_column_case() {
+    let db = Db::create();
+    let mut session = db.create_session();
+    session
+        .execute("CREATE TABLE public.\"Mixed\" (\"ID\" SERIAL)")
+        .unwrap();
+
+    let sequence = session
+        .query(
+            "SELECT pg_get_serial_sequence('public.\"Mixed\"', 'ID')",
+            &[],
+        )
+        .unwrap();
+    assert_eq!(
+        sequence.rows,
+        vec![vec![Value::Text("public.\"Mixed_ID_seq\"".into())]]
+    );
+    let Value::Text(sequence) = &sequence.rows[0][0] else {
+        panic!("serial lookup must return text");
+    };
+    assert_eq!(
+        session
+            .query(&format!("SELECT nextval('{sequence}')"), &[])
+            .unwrap()
+            .rows,
+        vec![vec![Value::Int8(1)]]
+    );
+
+    session
+        .execute(
+            "CREATE TABLE keyword_owner (id INTEGER); \
+             CREATE SEQUENCE public.\"select\" OWNED BY keyword_owner.id",
+        )
+        .unwrap();
+    let keyword_sequence = session
+        .query(
+            "SELECT pg_get_serial_sequence('public.keyword_owner', 'id')",
+            &[],
+        )
+        .unwrap();
+    assert_eq!(
+        keyword_sequence.rows,
+        vec![vec![Value::Text("public.\"select\"".into())]]
+    );
+    let Value::Text(keyword_sequence) = &keyword_sequence.rows[0][0] else {
+        panic!("serial lookup must return text");
+    };
+    assert_eq!(
+        session
+            .query(&format!("SELECT nextval('{keyword_sequence}')"), &[])
+            .unwrap()
+            .rows,
+        vec![vec![Value::Int8(1)]]
+    );
+
+    session
+        .execute(
+            "CREATE TABLE value_owner (id INTEGER); \
+             CREATE SEQUENCE public.value OWNED BY value_owner.id",
+        )
+        .unwrap();
+    assert_eq!(
+        session
+            .query(
+                "SELECT pg_get_serial_sequence('public.value_owner', 'id')",
+                &[],
+            )
+            .unwrap()
+            .rows,
+        vec![vec![Value::Text("public.value".into())]]
     );
 }
 

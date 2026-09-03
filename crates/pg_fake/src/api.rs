@@ -9,7 +9,10 @@ use sqlparser::ast::{self, Visit as _};
 
 use crate::{
     analyzer,
-    catalog::{ConstraintId, SequenceId, TableId, TableSchema},
+    catalog::{
+        ConstraintId, RelationName, ResolvedRelationName, SchemaId, SequenceSchema, TEMP_SCHEMA,
+        TableId, TablePersistence, TableSchema,
+    },
     error::{PgError, Result, SqlState, reject_unsupported},
     executor::{self, DatabaseState},
     parser,
@@ -49,18 +52,29 @@ pub struct PreparedStatement {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum PreparedCatalogDependency {
-    Table(TableSchema),
-    Sequence { name: String, id: SequenceId },
-    Constraint { table: TableId, id: ConstraintId },
+    Table {
+        name: RelationName,
+        schema: TableSchema,
+    },
+    Sequence {
+        name: RelationName,
+        schema: SequenceSchema,
+    },
+    Constraint {
+        table: TableId,
+        id: ConstraintId,
+    },
 }
 
 fn extract_prepared_sequence_name(expression: &ast::Expr) -> Option<&str> {
     match expression {
+        ast::Expr::Cast { expr, .. } | ast::Expr::Nested(expr) => {
+            extract_prepared_sequence_name(expr)
+        }
         ast::Expr::Value(value) => match &value.value {
             ast::Value::SingleQuotedString(value) => Some(value),
             _ => None,
         },
-        ast::Expr::Nested(expression) => extract_prepared_sequence_name(expression),
         _ => None,
     }
 }
@@ -92,9 +106,12 @@ impl PreparedDependencyCollector<'_> {
     }
 
     fn collect_table(&mut self, relation: &ast::ObjectName) -> Result<()> {
-        let name = executor::normalize_unqualified_object_name(relation)?;
-        let table = self.catalog.require_table(&name)?.clone();
-        self.add_dependency(PreparedCatalogDependency::Table(table.clone()));
+        let name = executor::normalize_relation_name(relation)?;
+        let table = self.catalog.require_named_table(&name)?.clone();
+        self.add_dependency(PreparedCatalogDependency::Table {
+            name,
+            schema: table.clone(),
+        });
         for dependency in
             table
                 .constraints
@@ -105,6 +122,25 @@ impl PreparedDependencyCollector<'_> {
                 })
         {
             self.add_dependency(dependency);
+        }
+        for sequence_name in table
+            .columns
+            .iter()
+            .filter_map(|column| column.default_sequence.as_ref())
+        {
+            let name = RelationName::create(
+                Some(
+                    self.catalog
+                        .get_schema_name(sequence_name.schema_id)
+                        .to_owned(),
+                ),
+                sequence_name.name.clone(),
+            );
+            let sequence = self.catalog.require_named_sequence(&name)?.clone();
+            self.add_dependency(PreparedCatalogDependency::Sequence {
+                name,
+                schema: sequence,
+            });
         }
         Ok(())
     }
@@ -152,10 +188,12 @@ impl ast::Visitor for PreparedDependencyCollector<'_> {
                 return std::ops::ControlFlow::Break(());
             }
         };
-        match self.catalog.require_sequence(&name) {
+        match self.catalog.require_named_sequence(&name) {
             Ok(sequence) => {
-                let id = sequence.id;
-                self.add_dependency(PreparedCatalogDependency::Sequence { name, id });
+                self.add_dependency(PreparedCatalogDependency::Sequence {
+                    name,
+                    schema: sequence.clone(),
+                });
                 std::ops::ControlFlow::Continue(())
             }
             Err(error) => {
@@ -189,11 +227,14 @@ fn collect_prepared_catalog_dependencies(
                 ..
             } => {
                 for name in names {
-                    let Ok(name) = executor::normalize_unqualified_object_name(name) else {
+                    let Ok(name) = executor::normalize_relation_name(name) else {
                         continue;
                     };
-                    if let Ok(table) = catalog.require_table(&name) {
-                        collector.add_dependency(PreparedCatalogDependency::Table(table.clone()));
+                    if let Ok(table) = catalog.require_named_table(&name) {
+                        collector.add_dependency(PreparedCatalogDependency::Table {
+                            name,
+                            schema: table.clone(),
+                        });
                     }
                 }
             }
@@ -203,13 +244,13 @@ fn collect_prepared_catalog_dependencies(
                 ..
             } => {
                 for name in names {
-                    let Ok(name) = executor::normalize_unqualified_object_name(name) else {
+                    let Ok(name) = executor::normalize_relation_name(name) else {
                         continue;
                     };
-                    if let Ok(sequence) = catalog.require_sequence(&name) {
+                    if let Ok(sequence) = catalog.require_named_sequence(&name) {
                         collector.add_dependency(PreparedCatalogDependency::Sequence {
                             name,
-                            id: sequence.id,
+                            schema: sequence.clone(),
                         });
                     }
                 }
@@ -226,7 +267,7 @@ fn collect_prepared_catalog_dependencies(
             })) = &insert.on
         {
             let table_name = executor::resolve_insert_table_name(&insert.table)?;
-            let table = catalog.require_table(&table_name)?;
+            let table = catalog.require_named_table(&table_name)?;
             let constraint_name = executor::normalize_unqualified_object_name(name)?;
             let constraint = table
                 .constraints
@@ -276,6 +317,7 @@ enum DatabaseClock {
 }
 pub struct Session {
     db: Db,
+    temporary_schema_id: SchemaId,
     transaction: Option<SessionTransactionState>,
     default_isolation: IsolationLevel,
     lock_timeout: Duration,
@@ -493,8 +535,11 @@ fn collect_ddl_relation_locks(
     let mut locks = std::collections::BTreeMap::new();
     match statement {
         ast::Statement::CreateTable(create) => {
-            let table_name = executor::normalize_unqualified_object_name(&create.name)?;
-            locks.insert(table_name.clone(), RelationLockMode::Exclusive);
+            let relation_name = executor::normalize_relation_name(&create.name)?;
+            let temporary =
+                create.temporary || relation_name.schema.as_deref() == Some(TEMP_SCHEMA);
+            let table_name = catalog.resolve_creation_name(&relation_name, temporary)?;
+            locks.insert(table_name.get_lock_name(), RelationLockMode::Exclusive);
             let mut generated_sequences = Vec::new();
             for column in &create.columns {
                 let column_name = executor::normalize_identifier(&column.name);
@@ -507,7 +552,7 @@ fn collect_ddl_relation_locks(
                     .iter()
                     .any(|option| matches!(option.option, ast::ColumnOption::Generated { .. }));
                 if serial || identity {
-                    let base = format!("{table_name}_{column_name}_seq");
+                    let base = format!("{}_{column_name}_seq", table_name.name);
                     let mut number = 0;
                     loop {
                         let candidate = if number == 0 {
@@ -515,10 +560,19 @@ fn collect_ddl_relation_locks(
                         } else {
                             format!("{base}{number}")
                         };
-                        if !catalog.has_relation(&candidate)
-                            && !generated_sequences.contains(&candidate)
+                        if !catalog.has_resolved_relation(&ResolvedRelationName {
+                            schema_id: table_name.schema_id,
+                            name: candidate.clone(),
+                        }) && !generated_sequences.contains(&candidate)
                         {
-                            locks.insert(candidate.clone(), RelationLockMode::Exclusive);
+                            locks.insert(
+                                ResolvedRelationName {
+                                    schema_id: table_name.schema_id,
+                                    name: candidate.clone(),
+                                }
+                                .get_lock_name(),
+                                RelationLockMode::Exclusive,
+                            );
                             generated_sequences.push(candidate);
                             break;
                         }
@@ -527,35 +581,50 @@ fn collect_ddl_relation_locks(
                 }
                 for option in &column.options {
                     if let ast::ColumnOption::ForeignKey(foreign_key) = &option.option {
+                        let name = catalog.resolve_relation_name(
+                            &executor::normalize_relation_name(&foreign_key.foreign_table)?,
+                        )?;
                         locks
-                            .entry(executor::normalize_unqualified_object_name(
-                                &foreign_key.foreign_table,
-                            )?)
+                            .entry(name.get_lock_name())
                             .or_insert(RelationLockMode::Shared);
                     }
                 }
             }
             for constraint in &create.constraints {
                 if let ast::TableConstraint::ForeignKey(foreign_key) = constraint {
+                    let name = catalog.resolve_relation_name(
+                        &executor::normalize_relation_name(&foreign_key.foreign_table)?,
+                    )?;
                     locks
-                        .entry(executor::normalize_unqualified_object_name(
-                            &foreign_key.foreign_table,
-                        )?)
+                        .entry(name.get_lock_name())
                         .or_insert(RelationLockMode::Shared);
                 }
             }
         }
-        ast::Statement::CreateSequence { name, owned_by, .. } => {
+        ast::Statement::CreateSequence {
+            temporary,
+            name,
+            owned_by,
+            ..
+        } => {
+            let relation_name = executor::normalize_relation_name(name)?;
+            let temporary = *temporary || relation_name.schema.as_deref() == Some(TEMP_SCHEMA);
             locks.insert(
-                executor::normalize_unqualified_object_name(name)?,
+                catalog
+                    .resolve_creation_name(&relation_name, temporary)?
+                    .get_lock_name(),
                 RelationLockMode::Exclusive,
             );
             if let Some(owned_by) = owned_by
-                && owned_by.0.len() == 2
-                && let Some(table) = owned_by.0[0].as_ident()
+                && matches!(owned_by.0.len(), 2 | 3)
             {
+                let table = ast::ObjectName(owned_by.0[..owned_by.0.len() - 1].to_vec());
                 locks
-                    .entry(executor::normalize_identifier(table))
+                    .entry(
+                        catalog
+                            .resolve_relation_name(&executor::normalize_relation_name(&table)?)?
+                            .get_lock_name(),
+                    )
                     .or_insert(RelationLockMode::Shared);
             }
         }
@@ -565,18 +634,43 @@ fn collect_ddl_relation_locks(
             ..
         } => {
             for object in objects {
-                let name = executor::normalize_unqualified_object_name(object)?;
-                locks.insert(name.clone(), RelationLockMode::Exclusive);
-                if let Ok(table) = catalog.require_table(&name) {
+                let name = executor::normalize_relation_name(object)?;
+                locks.insert(
+                    catalog.resolve_relation_name(&name)?.get_lock_name(),
+                    RelationLockMode::Exclusive,
+                );
+                if let Ok(table) = catalog.require_named_table(&name) {
                     for (referencing, _) in catalog.referencing_foreign_keys(table.id) {
                         locks
-                            .entry(referencing.name)
+                            .entry(
+                                ResolvedRelationName {
+                                    schema_id: referencing.schema_id,
+                                    name: referencing.name,
+                                }
+                                .get_lock_name(),
+                            )
                             .or_insert(RelationLockMode::Shared);
                     }
                     for sequence in catalog.iterate_sequences().filter(|sequence| {
                         sequence.owned_by.as_ref().map(|(owner, _)| *owner) == Some(table.id)
                     }) {
-                        locks.insert(sequence.name.clone(), RelationLockMode::Exclusive);
+                        locks.insert(
+                            ResolvedRelationName {
+                                schema_id: sequence.schema_id,
+                                name: sequence.name.clone(),
+                            }
+                            .get_lock_name(),
+                            RelationLockMode::Exclusive,
+                        );
+                    }
+                    for sequence in table
+                        .columns
+                        .iter()
+                        .filter_map(|column| column.default_sequence.as_ref())
+                    {
+                        locks
+                            .entry(sequence.get_lock_name())
+                            .or_insert(RelationLockMode::Shared);
                     }
                 }
             }
@@ -588,7 +682,9 @@ fn collect_ddl_relation_locks(
         } => {
             for object in objects {
                 locks.insert(
-                    executor::normalize_unqualified_object_name(object)?,
+                    catalog
+                        .resolve_relation_name(&executor::normalize_relation_name(object)?)?
+                        .get_lock_name(),
                     RelationLockMode::Exclusive,
                 );
             }
@@ -622,10 +718,18 @@ fn collect_ddl_relation_locks(
             return std::ops::ControlFlow::Break(());
         };
         match executor::normalize_sequence_name(name) {
-            Ok(name) => {
-                locks.entry(name).or_insert(RelationLockMode::Shared);
-                std::ops::ControlFlow::Continue(())
-            }
+            Ok(name) => match catalog.resolve_relation_name(&name) {
+                Ok(name) => {
+                    locks
+                        .entry(name.get_lock_name())
+                        .or_insert(RelationLockMode::Shared);
+                    std::ops::ControlFlow::Continue(())
+                }
+                Err(error) => {
+                    sequence_error = Some(error);
+                    std::ops::ControlFlow::Break(())
+                }
+            },
             Err(error) => {
                 sequence_error = Some(error);
                 std::ops::ControlFlow::Break(())
@@ -669,14 +773,20 @@ fn collect_foreign_key_relation_locks(
             ast::Statement::Insert(insert) => {
                 let table = state
                     .catalog
-                    .require_table(&executor::resolve_insert_table_name(&insert.table)?)?;
+                    .require_named_table(&executor::resolve_insert_table_name(&insert.table)?)?;
                 for constraint in &table.constraints {
                     if let crate::catalog::Constraint::ForeignKey(foreign_key) = constraint {
                         let parent = state
                             .catalog
                             .require_table_by_id(foreign_key.foreign_table_id)?;
                         locks
-                            .entry(parent.name.clone())
+                            .entry(
+                                ResolvedRelationName {
+                                    schema_id: parent.schema_id,
+                                    name: parent.name.clone(),
+                                }
+                                .get_lock_name(),
+                            )
                             .or_insert(RelationLockMode::Shared);
                     }
                 }
@@ -697,7 +807,7 @@ fn collect_foreign_key_relation_locks(
                 };
                 let table = state
                     .catalog
-                    .require_table(&executor::normalize_unqualified_object_name(&name)?)?;
+                    .require_named_table(&executor::normalize_relation_name(&name)?)?;
                 pending.push(ForeignKeyMutation::Update {
                     table: table.id,
                     columns: collect_assignment_columns(&update.assignments)?,
@@ -716,7 +826,7 @@ fn collect_foreign_key_relation_locks(
                 };
                 let table = state
                     .catalog
-                    .require_table(&executor::normalize_unqualified_object_name(name)?)?;
+                    .require_named_table(&executor::normalize_relation_name(name)?)?;
                 pending.push(ForeignKeyMutation::Delete(table.id));
             }
             _ => {}
@@ -746,7 +856,13 @@ fn collect_foreign_key_relation_locks(
                         .catalog
                         .require_table_by_id(foreign_key.foreign_table_id)?;
                     locks
-                        .entry(parent.name.clone())
+                        .entry(
+                            ResolvedRelationName {
+                                schema_id: parent.schema_id,
+                                name: parent.name.clone(),
+                            }
+                            .get_lock_name(),
+                        )
                         .or_insert(RelationLockMode::Shared);
                 }
             }
@@ -773,7 +889,13 @@ fn collect_foreign_key_relation_locks(
                 }
             }
             locks
-                .entry(child.name.clone())
+                .entry(
+                    ResolvedRelationName {
+                        schema_id: child.schema_id,
+                        name: child.name.clone(),
+                    }
+                    .get_lock_name(),
+                )
                 .or_insert(RelationLockMode::Shared);
             let action = if updated_columns.is_some() {
                 foreign_key.on_update
@@ -820,11 +942,27 @@ fn collect_relation_locks(
     let mut locks = std::collections::BTreeMap::new();
     for dependency in dependencies {
         match dependency {
-            PreparedCatalogDependency::Table(table) => {
-                locks.insert(table.name, RelationLockMode::Shared);
+            PreparedCatalogDependency::Table { schema: table, .. } => {
+                locks.insert(
+                    ResolvedRelationName {
+                        schema_id: table.schema_id,
+                        name: table.name,
+                    }
+                    .get_lock_name(),
+                    RelationLockMode::Shared,
+                );
             }
-            PreparedCatalogDependency::Sequence { name, .. } => {
-                locks.insert(name, RelationLockMode::Shared);
+            PreparedCatalogDependency::Sequence {
+                schema: sequence, ..
+            } => {
+                locks.insert(
+                    ResolvedRelationName {
+                        schema_id: sequence.schema_id,
+                        name: sequence.name,
+                    }
+                    .get_lock_name(),
+                    RelationLockMode::Shared,
+                );
             }
             PreparedCatalogDependency::Constraint { .. } => {}
         }
@@ -861,10 +999,16 @@ fn collect_relation_locks(
             return std::ops::ControlFlow::Break(());
         };
         match executor::normalize_sequence_name(name) {
-            Ok(name) => {
-                locks.insert(name, RelationLockMode::Shared);
-                std::ops::ControlFlow::Continue(())
-            }
+            Ok(name) => match state.catalog.resolve_relation_name(&name) {
+                Ok(name) => {
+                    locks.insert(name.get_lock_name(), RelationLockMode::Shared);
+                    std::ops::ControlFlow::Continue(())
+                }
+                Err(error) => {
+                    sequence_error = Some(error);
+                    std::ops::ControlFlow::Break(())
+                }
+            },
             Err(error) => {
                 sequence_error = Some(error);
                 std::ops::ControlFlow::Break(())
@@ -885,6 +1029,7 @@ fn acquire_relation_locks<'a>(
     statement: &ast::Statement,
     prepared_dependencies: Option<&[PreparedCatalogDependency]>,
     xid: Xid,
+    temporary_schema_id: SchemaId,
     isolation: IsolationLevel,
     mut snapshot: Snapshot,
 ) -> Result<(MutexGuard<'a, DatabaseState>, Snapshot)> {
@@ -894,7 +1039,7 @@ fn acquire_relation_locks<'a>(
         if ddl {
             snapshot = Snapshot::create(&state.transactions).use_command(snapshot.command_id);
         }
-        state.load_catalog(Some(xid), snapshot);
+        state.load_catalog(Some(xid), snapshot, Some(temporary_schema_id));
         let locks = collect_relation_locks(&state, statement, prepared_dependencies)?;
         let mut blocked = None;
         for (name, mode) in locks {
@@ -970,6 +1115,7 @@ fn acquire_row_locks<'a>(
     mut state: MutexGuard<'a, DatabaseState>,
     target: RowLockTarget<'_>,
     xid: Xid,
+    temporary_schema_id: SchemaId,
     isolation: IsolationLevel,
     mut snapshot: Snapshot,
     context: &executor::StatementExecutionContext,
@@ -980,7 +1126,7 @@ fn acquire_row_locks<'a>(
 )> {
     let deadline = (timeout != Duration::ZERO).then(|| Instant::now() + timeout);
     loop {
-        state.load_catalog(Some(xid), snapshot);
+        state.load_catalog(Some(xid), snapshot, Some(temporary_schema_id));
         let required = match target {
             RowLockTarget::Ctes(statement) => executor::collect_required_cte_row_locks(
                 &state, statement, xid, &snapshot, context,
@@ -1084,8 +1230,15 @@ impl Db {
     }
     #[cfg_attr(feature = "execution-log", tracing::instrument(skip_all))]
     pub fn create_session(&self) -> Session {
+        let temporary_schema_id = self
+            .state
+            .lock()
+            .expect("database mutex is poisoned")
+            .catalog_history
+            .create_temporary_schema_id();
         Session {
             db: self.clone(),
+            temporary_schema_id,
             transaction: None,
             default_isolation: IsolationLevel::ReadCommitted,
             lock_timeout: self.default_lock_timeout,
@@ -1270,7 +1423,11 @@ impl Session {
             .snapshot
             .unwrap_or_else(|| Snapshot::create(&state.transactions))
             .use_command(crate::txn::CommandId(transaction.next_command_id));
-        state.load_catalog(Some(transaction.xid), snapshot);
+        state.load_catalog(
+            Some(transaction.xid),
+            snapshot,
+            Some(self.temporary_schema_id),
+        );
         let constraints = state
             .catalog
             .iterate_tables()
@@ -1334,7 +1491,11 @@ impl Session {
                 Some(SessionTransactionState::Active(transaction)) => transaction,
                 _ => unreachable!(),
             };
-            state.load_catalog(Some(transaction.xid), snapshot);
+            state.load_catalog(
+                Some(transaction.xid),
+                snapshot,
+                Some(self.temporary_schema_id),
+            );
             if let Err(error) = executor::validate_deferred_foreign_keys(&state, transaction.xid) {
                 drop(state);
                 return Some(self.abort_with_error(error));
@@ -1399,7 +1560,7 @@ impl Session {
                 Some(SessionTransactionState::Aborted { .. }) => unreachable!(),
                 None => (None, Snapshot::create(&state.transactions)),
             };
-            state.load_catalog(xid, snapshot);
+            state.load_catalog(xid, snapshot, Some(self.temporary_schema_id));
             analyzer::count_parameters(&statement)
                 .and_then(|parameter_count| {
                     executor::expand_ctes_for_analysis(&statement, &state)
@@ -1539,7 +1700,6 @@ impl Session {
             )
         };
         let execution_statement = bound_statement.as_ref().unwrap_or(&statement.statement);
-        let read_only_prepared = prepared_query.is_some();
         let started_implicit_transaction = self.transaction.is_none();
         if started_implicit_transaction {
             self.start_transaction(self.default_isolation, true);
@@ -1551,11 +1711,7 @@ impl Session {
         ) {
             Ok(result) => {
                 if started_implicit_transaction && self.is_transaction_implicit_batch() {
-                    if read_only_prepared {
-                        self.commit_read_only_transaction();
-                    } else {
-                        self.commit_transaction()?;
-                    }
+                    self.commit_transaction()?;
                 }
                 Ok(result)
             }
@@ -1613,7 +1769,7 @@ impl Session {
         let Some(transaction) = self.transaction.take() else {
             return Ok(());
         };
-        let SessionTransactionState::Active(transaction) = transaction else {
+        let SessionTransactionState::Active(mut transaction) = transaction else {
             return self.rollback_transaction_state(transaction);
         };
         let state_lock = self.db.state.clone();
@@ -1622,7 +1778,37 @@ impl Session {
             .snapshot
             .unwrap_or_else(|| Snapshot::create(&state.transactions))
             .use_command(crate::txn::CommandId(transaction.next_command_id));
-        state.load_catalog(Some(transaction.xid), snapshot);
+        state.load_catalog(
+            Some(transaction.xid),
+            snapshot,
+            Some(self.temporary_schema_id),
+        );
+        let on_commit_drop = state
+            .catalog
+            .iterate_tables()
+            .filter_map(|table| {
+                matches!(
+                    table.persistence,
+                    TablePersistence::Temporary {
+                        on_commit_drop: true
+                    }
+                )
+                .then_some(table.id)
+            })
+            .collect::<Vec<_>>();
+        if !on_commit_drop.is_empty() {
+            let previous = state.catalog.clone();
+            for table_id in on_commit_drop {
+                state.catalog.drop_table_by_id(table_id)?;
+                state.catalog.drop_owned_sequences(table_id);
+            }
+            state.record_catalog_changes(
+                &previous,
+                transaction.xid,
+                crate::txn::CommandId(transaction.next_command_id),
+            );
+            transaction.read_only = false;
+        }
         if transaction.read_only {
             assert!(!self.deferred_foreign_keys_dirty);
             assert!(!state.has_touched_tables(transaction.xid));
@@ -1679,26 +1865,6 @@ impl Session {
     }
 
     #[cfg_attr(feature = "execution-log", tracing::instrument(skip_all))]
-    fn commit_read_only_transaction(&mut self) {
-        let Some(SessionTransactionState::Active(transaction)) = self.transaction.take() else {
-            unreachable!("a read-only transaction must be active while committing")
-        };
-        assert!(transaction.implicit_batch);
-        let mut state = self.db.state.lock().expect("database mutex is poisoned");
-        state.transactions.finish_read_only(transaction.xid);
-        state
-            .relation_locks
-            .release_transaction_locks(transaction.xid);
-        state.wait_for.remove_transaction(transaction.xid);
-        prune_database_versions(&mut state);
-        self.settings_undo = None;
-        self.deferred_constraints.clear();
-        self.defer_all_constraints = false;
-        self.deferred_foreign_keys_dirty = false;
-        self.db.condvar.notify_all();
-    }
-
-    #[cfg_attr(feature = "execution-log", tracing::instrument(skip_all))]
     fn rollback_transaction(&mut self) -> Result<()> {
         let Some(transaction) = self.transaction.take() else {
             return Ok(());
@@ -1723,7 +1889,7 @@ impl Session {
                 Snapshot::create(&state.transactions).use_command(crate::txn::CommandId(u64::MAX))
             }
         };
-        state.load_catalog(Some(xid), snapshot);
+        state.load_catalog(Some(xid), snapshot, Some(self.temporary_schema_id));
         if let Some((default_isolation, lock_timeout, timezone)) = self.settings_undo.take() {
             self.default_isolation = default_isolation;
             self.lock_timeout = lock_timeout;
@@ -1876,6 +2042,12 @@ impl Session {
                 variable,
                 values,
             }) => {
+                if variable.to_string().eq_ignore_ascii_case("search_path") {
+                    return self.abort_with_error(PgError::create(
+                        SqlState::FeatureNotSupported,
+                        "changing search_path is not implemented",
+                    ));
+                }
                 if variable.to_string().eq_ignore_ascii_case("timezone") {
                     if *hivevar || values.len() != 1 {
                         return self.abort_with_error(PgError::create(
@@ -1967,7 +2139,11 @@ impl Session {
                 .transactions
                 .retain_snapshot(transaction.xid, snapshot);
         }
-        state.load_catalog(Some(transaction.xid), snapshot);
+        state.load_catalog(
+            Some(transaction.xid),
+            snapshot,
+            Some(self.temporary_schema_id),
+        );
         let acquired = match acquire_relation_locks(
             &condvar,
             self.lock_timeout,
@@ -1975,6 +2151,7 @@ impl Session {
             statement,
             prepared_dependencies,
             transaction.xid,
+            self.temporary_schema_id,
             transaction.isolation,
             snapshot,
         ) {
@@ -1985,24 +2162,77 @@ impl Session {
         snapshot = acquired.1;
         let prepared_dependency_error = prepared_dependencies.and_then(|dependencies| {
             dependencies.iter().find_map(|dependency| match dependency {
-                PreparedCatalogDependency::Table(schema) => {
-                    match state.catalog.require_table(&schema.name) {
+                PreparedCatalogDependency::Table { name, schema } => {
+                    match state.catalog.require_named_table(name) {
+                        Ok(table) if table.id == schema.id => {}
+                        Ok(_) => {
+                            return Some(PgError::create(
+                                SqlState::FeatureNotSupported,
+                                "cached plan must be replanned",
+                            ));
+                        }
+                        Err(error) => return Some(error),
+                    }
+                    match state.catalog.require_table_by_id(schema.id) {
                         Ok(table) if table == schema => None,
                         Ok(_) => Some(PgError::create(
                             SqlState::FeatureNotSupported,
                             "cached plan must be replanned",
                         )),
-                        Err(error) => Some(error),
+                        Err(error) => {
+                            let name = ResolvedRelationName {
+                                schema_id: schema.schema_id,
+                                name: schema.name.clone(),
+                            };
+                            if state.catalog.has_resolved_relation(&name) {
+                                Some(PgError::create(
+                                    SqlState::FeatureNotSupported,
+                                    "cached plan must be replanned",
+                                ))
+                            } else {
+                                Some(error)
+                            }
+                        }
                     }
                 }
-                PreparedCatalogDependency::Sequence { name, id } => {
-                    match state.catalog.require_sequence(name) {
-                        Ok(sequence) if sequence.id == *id => None,
-                        Ok(_) => Some(PgError::create(
+                PreparedCatalogDependency::Sequence { name, schema } => {
+                    match state.catalog.require_named_sequence(name) {
+                        Ok(sequence) if sequence.id == schema.id => {}
+                        Ok(_) => {
+                            return Some(PgError::create(
+                                SqlState::FeatureNotSupported,
+                                "cached plan must be replanned",
+                            ));
+                        }
+                        Err(error) => return Some(error),
+                    }
+                    match state
+                        .catalog
+                        .iterate_sequences()
+                        .find(|sequence| sequence.id == schema.id)
+                    {
+                        Some(sequence) if sequence == schema => None,
+                        Some(_) => Some(PgError::create(
                             SqlState::FeatureNotSupported,
                             "cached plan must be replanned",
                         )),
-                        Err(error) => Some(error),
+                        None => {
+                            let name = ResolvedRelationName {
+                                schema_id: schema.schema_id,
+                                name: schema.name.clone(),
+                            };
+                            if state.catalog.has_resolved_relation(&name) {
+                                Some(PgError::create(
+                                    SqlState::FeatureNotSupported,
+                                    "cached plan must be replanned",
+                                ))
+                            } else {
+                                Some(PgError::create(
+                                    SqlState::UndefinedTable,
+                                    format!("relation {:?} does not exist", schema.name),
+                                ))
+                            }
+                        }
                     }
                 }
                 PreparedCatalogDependency::Constraint { table, id } => {
@@ -2094,6 +2324,7 @@ impl Session {
                 state,
                 RowLockTarget::Ctes(statement),
                 transaction.xid,
+                self.temporary_schema_id,
                 transaction.isolation,
                 snapshot,
                 &context,
@@ -2147,6 +2378,7 @@ impl Session {
             state,
             RowLockTarget::Statement(statement),
             transaction.xid,
+            self.temporary_schema_id,
             transaction.isolation,
             snapshot,
             &context,
@@ -2363,6 +2595,24 @@ impl Drop for Session {
         if self.transaction.is_some() {
             let _ = self.rollback_transaction();
         }
+        let mut state = self.db.state.lock().expect("database mutex is poisoned");
+        let reclaimed = state
+            .catalog_history
+            .drop_temporary_schema(self.temporary_schema_id);
+        for table_id in reclaimed.tables {
+            state.tables.remove(&table_id);
+        }
+        let mut sequence_values = state
+            .sequence_values
+            .lock()
+            .expect("sequence storage is poisoned");
+        for sequence_id in reclaimed.sequences {
+            sequence_values.remove(&sequence_id);
+        }
+        drop(sequence_values);
+        let snapshot = Snapshot::create(&state.transactions);
+        state.load_catalog(None, snapshot, None);
+        self.db.condvar.notify_all();
     }
 }
 
@@ -2819,6 +3069,441 @@ mod tests {
         assert_eq!(
             session.execute("DROP TABLE items").unwrap(),
             create_affected_results(0)
+        );
+    }
+
+    #[test]
+    #[cfg_attr(feature = "execution-log", tracing::instrument(skip_all))]
+    fn resolves_qualified_and_temporary_relations_per_session() {
+        let db = Db::create();
+        let mut first = db.create_session();
+        let mut second = db.create_session();
+        first
+            .execute("CREATE TABLE public.items (id INTEGER); INSERT INTO public.items VALUES (1)")
+            .unwrap();
+        first
+            .execute("CREATE TEMP TABLE items (id INTEGER) ON COMMIT PRESERVE ROWS")
+            .unwrap();
+        second
+            .execute("CREATE TEMPORARY TABLE pg_temp.items (id INTEGER)")
+            .unwrap();
+        first.execute("INSERT INTO items VALUES (2)").unwrap();
+        second.execute("INSERT INTO items VALUES (3)").unwrap();
+
+        assert_eq!(
+            first.query("SELECT id FROM items", &[]).unwrap().rows,
+            vec![vec![Value::Int4(2)]]
+        );
+        assert_eq!(
+            first
+                .query("SELECT id FROM public.items", &[])
+                .unwrap()
+                .rows,
+            vec![vec![Value::Int4(1)]]
+        );
+        assert_eq!(
+            second
+                .query("SELECT id FROM pg_temp.items", &[])
+                .unwrap()
+                .rows,
+            vec![vec![Value::Int4(3)]]
+        );
+        assert_eq!(
+            first
+                .query(
+                    "WITH first_value AS (SELECT id FROM items), \
+                     items AS (SELECT 99 AS id) SELECT id FROM first_value",
+                    &[],
+                )
+                .unwrap()
+                .rows,
+            vec![vec![Value::Int4(2)]]
+        );
+    }
+
+    #[test]
+    #[cfg_attr(feature = "execution-log", tracing::instrument(skip_all))]
+    fn applies_temporary_relation_transaction_and_session_lifetimes() {
+        let db = Db::create();
+        let mut session = db.create_session();
+        session
+            .execute("CREATE TEMP TABLE retained (id INTEGER); INSERT INTO retained VALUES (1)")
+            .unwrap();
+        assert_eq!(
+            session.query("SELECT id FROM retained", &[]).unwrap().rows,
+            vec![vec![Value::Int4(1)]]
+        );
+        {
+            let mut transaction = session.begin().unwrap();
+            transaction.execute("DROP TABLE retained").unwrap();
+            transaction.rollback().unwrap();
+        }
+        assert_eq!(
+            session.query("SELECT id FROM retained", &[]).unwrap().rows,
+            vec![vec![Value::Int4(1)]]
+        );
+        {
+            let mut transaction = session.begin().unwrap();
+            transaction
+                .execute("CREATE TEMP TABLE fleeting (id INTEGER) ON COMMIT DROP")
+                .unwrap();
+            transaction
+                .execute("INSERT INTO fleeting VALUES (2)")
+                .unwrap();
+            transaction.commit().unwrap();
+        }
+        assert_eq!(
+            session
+                .query("SELECT * FROM pg_temp.fleeting", &[])
+                .unwrap_err()
+                .sqlstate,
+            SqlState::UndefinedTable
+        );
+        drop(session);
+
+        let mut replacement = db.create_session();
+        assert_eq!(
+            replacement
+                .query("SELECT * FROM pg_temp.retained", &[])
+                .unwrap_err()
+                .sqlstate,
+            SqlState::UndefinedTable
+        );
+        replacement
+            .execute("CREATE TEMP TABLE retained (id INTEGER)")
+            .unwrap();
+    }
+
+    #[test]
+    #[cfg_attr(feature = "execution-log", tracing::instrument(skip_all))]
+    fn keeps_qualified_prepared_relations_and_sequences_stable() {
+        let db = Db::create();
+        let mut session = db.create_session();
+        session
+            .execute(
+                "CREATE TABLE public.items (id INTEGER); \
+                 INSERT INTO public.items VALUES (1); \
+                 CREATE TABLE public.generated (id SERIAL); \
+                 CREATE TABLE public.owned (id SERIAL); \
+                 CREATE SEQUENCE public.ids START WITH 10; \
+                 CREATE TEMP SEQUENCE ids START WITH 20; \
+                 CREATE TEMP SEQUENCE generated_id_seq START WITH 100; \
+                 CREATE TEMP TABLE owned (id SERIAL)",
+            )
+            .unwrap();
+        let prepared = session.prepare("SELECT id FROM public.items").unwrap();
+        session
+            .execute("CREATE TEMP TABLE items (id INTEGER); INSERT INTO items VALUES (2)")
+            .unwrap();
+        assert_eq!(
+            session.query_prepared(&prepared, &[]).unwrap().rows,
+            vec![vec![Value::Int4(1)]]
+        );
+        assert_eq!(
+            session.query("SELECT nextval('ids')", &[]).unwrap().rows,
+            vec![vec![Value::Int8(20)]]
+        );
+        assert_eq!(
+            session
+                .query("SELECT nextval('public.ids')", &[])
+                .unwrap()
+                .rows,
+            vec![vec![Value::Int8(10)]]
+        );
+        session
+            .execute("INSERT INTO public.generated DEFAULT VALUES")
+            .unwrap();
+        assert_eq!(
+            session
+                .query("SELECT id FROM public.generated", &[])
+                .unwrap()
+                .rows,
+            vec![vec![Value::Int4(1)]]
+        );
+        assert_eq!(
+            session
+                .query("SELECT nextval('generated_id_seq')", &[])
+                .unwrap()
+                .rows,
+            vec![vec![Value::Int8(100)]]
+        );
+        assert_eq!(
+            session
+                .query(
+                    "SELECT pg_get_serial_sequence('public.owned', 'id'), \
+                            pg_get_serial_sequence('pg_temp.owned', 'id')",
+                    &[],
+                )
+                .unwrap()
+                .rows,
+            vec![vec![
+                Value::Text("public.owned_id_seq".into()),
+                Value::Text("pg_temp.owned_id_seq".into()),
+            ]]
+        );
+    }
+
+    #[test]
+    #[cfg_attr(feature = "execution-log", tracing::instrument(skip_all))]
+    fn prevents_prepared_statements_from_retargeting_temporary_shadows() {
+        let db = Db::create();
+        let mut session = db.create_session();
+        session
+            .execute(
+                "CREATE TABLE public.items (id INTEGER); \
+                 CREATE TABLE public.dropped (id INTEGER); \
+                 CREATE SEQUENCE public.ids START WITH 10",
+            )
+            .unwrap();
+        let insert = session.prepare("INSERT INTO items VALUES (1)").unwrap();
+        let aggregate = session.prepare("SELECT count(*) FROM items").unwrap();
+        let drop_table = session.prepare("DROP TABLE dropped").unwrap();
+        let next_value = session.prepare("SELECT nextval('ids')").unwrap();
+        let cast_next_value = session.prepare("SELECT nextval('ids'::text)").unwrap();
+        session
+            .execute(
+                "CREATE TEMP TABLE items (id INTEGER); \
+                 CREATE TEMP TABLE dropped (id INTEGER); \
+                 CREATE TEMP SEQUENCE ids START WITH 20",
+            )
+            .unwrap();
+
+        assert_eq!(
+            session.execute_prepared(&insert, &[]).unwrap_err().sqlstate,
+            SqlState::FeatureNotSupported
+        );
+        assert_eq!(
+            session
+                .query_prepared(&aggregate, &[])
+                .unwrap_err()
+                .sqlstate,
+            SqlState::FeatureNotSupported
+        );
+        assert_eq!(
+            session
+                .execute_prepared(&drop_table, &[])
+                .unwrap_err()
+                .sqlstate,
+            SqlState::FeatureNotSupported
+        );
+        assert_eq!(
+            session
+                .query_prepared(&next_value, &[])
+                .unwrap_err()
+                .sqlstate,
+            SqlState::FeatureNotSupported
+        );
+        assert_eq!(
+            session
+                .query_prepared(&cast_next_value, &[])
+                .unwrap_err()
+                .sqlstate,
+            SqlState::FeatureNotSupported
+        );
+        assert!(session.query("SELECT * FROM public.dropped", &[]).is_ok());
+        assert!(session.query("SELECT * FROM pg_temp.dropped", &[]).is_ok());
+    }
+
+    #[test]
+    #[cfg_attr(feature = "execution-log", tracing::instrument(skip_all))]
+    fn binds_explicit_sequence_defaults_before_temporary_shadowing() {
+        let db = Db::create();
+        let mut session = db.create_session();
+        session
+            .execute(
+                "CREATE SEQUENCE public.ids; \
+                 CREATE TABLE public.generated (id BIGINT DEFAULT nextval('ids')); \
+                 CREATE TEMP SEQUENCE ids START WITH 100",
+            )
+            .unwrap();
+        assert_eq!(
+            session
+                .query(
+                    "INSERT INTO public.generated DEFAULT VALUES RETURNING id",
+                    &[]
+                )
+                .unwrap()
+                .rows,
+            vec![vec![Value::Int8(1)]]
+        );
+        assert_eq!(
+            session
+                .execute("DROP SEQUENCE public.ids")
+                .unwrap_err()
+                .sqlstate,
+            SqlState::DependentObjectsStillExist
+        );
+        assert_eq!(
+            session
+                .execute("CREATE TABLE missing_default (id BIGINT DEFAULT nextval('missing'))")
+                .unwrap_err()
+                .sqlstate,
+            SqlState::UndefinedTable
+        );
+        assert_eq!(
+            session
+                .execute("CREATE TABLE wrong_kind (id BIGINT DEFAULT nextval('generated'))")
+                .unwrap_err()
+                .sqlstate,
+            SqlState::FeatureNotSupported
+        );
+        assert_eq!(
+            session
+                .execute("CREATE TABLE permanent_temp_default (id BIGINT DEFAULT nextval('ids'))")
+                .unwrap_err()
+                .sqlstate,
+            SqlState::FeatureNotSupported
+        );
+        assert_eq!(
+            session
+                .execute(
+                    "CREATE TEMP TABLE temporary_public_default \
+                     (id BIGINT DEFAULT nextval('public.ids'))",
+                )
+                .unwrap_err()
+                .sqlstate,
+            SqlState::FeatureNotSupported
+        );
+        assert_eq!(
+            session
+                .execute(
+                    "CREATE TABLE compound_default \
+                     (id BIGINT DEFAULT nextval('public.ids') + 1)",
+                )
+                .unwrap_err()
+                .sqlstate,
+            SqlState::FeatureNotSupported
+        );
+        assert_eq!(
+            session
+                .execute(
+                    "CREATE TABLE cast_default \
+                     (id BIGINT DEFAULT nextval('public.ids')::smallint)",
+                )
+                .unwrap_err()
+                .sqlstate,
+            SqlState::FeatureNotSupported
+        );
+        assert_eq!(
+            session
+                .execute(
+                    "CREATE TABLE currval_default \
+                     (id BIGINT DEFAULT currval('public.ids'))",
+                )
+                .unwrap_err()
+                .sqlstate,
+            SqlState::FeatureNotSupported
+        );
+        assert_eq!(
+            session
+                .execute(
+                    "CREATE TABLE setval_default \
+                     (id BIGINT DEFAULT setval('public.ids', 10))",
+                )
+                .unwrap_err()
+                .sqlstate,
+            SqlState::FeatureNotSupported
+        );
+    }
+
+    #[test]
+    #[cfg_attr(feature = "execution-log", tracing::instrument(skip_all))]
+    fn rejects_unsupported_relation_namespaces_explicitly() {
+        let db = Db::create();
+        let mut session = db.create_session();
+        assert_eq!(
+            session
+                .execute("CREATE TABLE private.items (id INTEGER)")
+                .unwrap_err()
+                .sqlstate,
+            SqlState::InvalidSchemaName
+        );
+        assert_eq!(
+            session
+                .execute("CREATE TEMP TABLE public.items (id INTEGER)")
+                .unwrap_err()
+                .sqlstate,
+            SqlState::InvalidTableDefinition
+        );
+        assert_eq!(
+            session
+                .execute("SET search_path TO public")
+                .unwrap_err()
+                .sqlstate,
+            SqlState::FeatureNotSupported
+        );
+        assert_eq!(
+            session
+                .query("SELECT pg_get_serial_sequence('private.items', 'id')", &[])
+                .unwrap_err()
+                .sqlstate,
+            SqlState::InvalidSchemaName
+        );
+        assert_eq!(
+            session
+                .query("SELECT pg_get_serial_sequence('public.missing', 'id')", &[])
+                .unwrap_err()
+                .sqlstate,
+            SqlState::UndefinedTable
+        );
+        session
+            .execute("CREATE SEQUENCE public.not_a_table")
+            .unwrap();
+        assert_eq!(
+            session
+                .query(
+                    "SELECT pg_get_serial_sequence('public.not_a_table', 'id')",
+                    &[],
+                )
+                .unwrap_err()
+                .sqlstate,
+            SqlState::UndefinedColumn
+        );
+        session
+            .execute("CREATE TEMP TABLE temporary_parent (id INTEGER PRIMARY KEY)")
+            .unwrap();
+        assert_eq!(
+            session
+                .execute(
+                    "CREATE TABLE public.permanent_child \
+                     (parent_id INTEGER REFERENCES temporary_parent(id))",
+                )
+                .unwrap_err()
+                .sqlstate,
+            SqlState::InvalidTableDefinition
+        );
+        session
+            .execute("CREATE TABLE public.permanent_parent (id INTEGER PRIMARY KEY)")
+            .unwrap();
+        assert_eq!(
+            session
+                .execute(
+                    "CREATE TEMP TABLE temporary_child \
+                     (parent_id INTEGER REFERENCES public.permanent_parent(id))",
+                )
+                .unwrap_err()
+                .sqlstate,
+            SqlState::InvalidTableDefinition
+        );
+        assert_eq!(
+            session
+                .execute(
+                    "CREATE SEQUENCE public.cross_owned \
+                     OWNED BY temporary_parent.id",
+                )
+                .unwrap_err()
+                .sqlstate,
+            SqlState::ObjectNotInPrerequisiteState
+        );
+        assert_eq!(
+            session
+                .execute(
+                    "CREATE TEMP SEQUENCE cross_owned \
+                     OWNED BY public.permanent_parent.id",
+                )
+                .unwrap_err()
+                .sqlstate,
+            SqlState::ObjectNotInPrerequisiteState
         );
     }
 
@@ -4552,6 +5237,7 @@ mod tests {
         state.load_catalog(
             Some(writer),
             concurrent_snapshot.use_command(crate::txn::CommandId(0)),
+            None,
         );
         let previous = state.catalog.clone();
         let table_id = state
@@ -4738,7 +5424,7 @@ mod tests {
             let mut state = db.state.lock().unwrap();
             let changer = state.transactions.begin();
             let snapshot = Snapshot::create(&state.transactions);
-            state.load_catalog(Some(changer), snapshot);
+            state.load_catalog(Some(changer), snapshot, None);
             let previous = state.catalog.clone();
             state
                 .catalog
@@ -5824,6 +6510,103 @@ mod tests {
                 .unwrap_err()
                 .sqlstate,
             SqlState::UndefinedTable
+        );
+    }
+
+    #[test]
+    #[cfg_attr(feature = "execution-log", tracing::instrument(skip_all))]
+    fn locks_sequences_used_by_column_defaults() {
+        let db = Db::create_builder()
+            .set_lock_timeout(Duration::from_secs(2))
+            .build();
+        let mut user = db.create_session();
+        let mut dropper = db.create_session();
+        user.execute("CREATE SEQUENCE ids").unwrap();
+        user.execute("CREATE TABLE generated (id BIGINT DEFAULT nextval('ids'))")
+            .unwrap();
+        user.execute("BEGIN").unwrap();
+        user.execute("INSERT INTO generated DEFAULT VALUES")
+            .unwrap();
+
+        let (result_sender, result_receiver) = mpsc::channel();
+        let handle = thread::spawn(move || {
+            result_sender
+                .send(dropper.execute("DROP SEQUENCE ids"))
+                .unwrap();
+        });
+        wait_until_relation_blocked(&db);
+        user.execute("ROLLBACK").unwrap();
+
+        assert_eq!(
+            result_receiver
+                .recv_timeout(Duration::from_secs(1))
+                .unwrap()
+                .unwrap_err()
+                .sqlstate,
+            SqlState::DependentObjectsStillExist
+        );
+        handle.join().unwrap();
+        assert!(user.query("SELECT nextval('ids')", &[]).is_ok());
+    }
+
+    #[test]
+    #[cfg_attr(feature = "execution-log", tracing::instrument(skip_all))]
+    fn locks_sequences_while_creating_column_defaults() {
+        let db = Db::create_builder()
+            .set_lock_timeout(Duration::from_secs(2))
+            .build();
+        let mut creator = db.create_session();
+        let mut dropper = db.create_session();
+        creator.execute("CREATE SEQUENCE ids").unwrap();
+        creator.execute("BEGIN").unwrap();
+        creator
+            .execute("CREATE TABLE generated (id BIGINT DEFAULT nextval('ids'))")
+            .unwrap();
+
+        let (result_sender, result_receiver) = mpsc::channel();
+        let handle = thread::spawn(move || {
+            result_sender
+                .send(dropper.execute("DROP SEQUENCE ids"))
+                .unwrap();
+        });
+        wait_until_relation_blocked(&db);
+        creator.execute("COMMIT").unwrap();
+
+        assert_eq!(
+            result_receiver
+                .recv_timeout(Duration::from_secs(1))
+                .unwrap()
+                .unwrap_err()
+                .sqlstate,
+            SqlState::DependentObjectsStillExist
+        );
+        handle.join().unwrap();
+        assert!(creator.query("SELECT nextval('ids')", &[]).is_ok());
+    }
+
+    #[test]
+    #[cfg_attr(feature = "execution-log", tracing::instrument(skip_all))]
+    fn rejects_cross_session_temporary_default_dependencies() {
+        let db = Db::create();
+        let mut temporary_user = db.create_session();
+        let mut dropper = db.create_session();
+        temporary_user
+            .execute("CREATE SEQUENCE public.shared_ids")
+            .unwrap();
+
+        assert_eq!(
+            temporary_user
+                .execute(
+                    "CREATE TEMP TABLE generated \
+                     (id BIGINT DEFAULT nextval('public.shared_ids'))",
+                )
+                .unwrap_err()
+                .sqlstate,
+            SqlState::FeatureNotSupported
+        );
+        assert_eq!(
+            dropper.execute("DROP SEQUENCE public.shared_ids").unwrap(),
+            create_affected_results(0)
         );
     }
 

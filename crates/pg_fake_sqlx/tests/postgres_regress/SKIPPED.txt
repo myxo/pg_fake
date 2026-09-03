@@ -19,8 +19,8 @@ collate:1
 comments:7
 constraints:3
 conversion:2
-copy2:1
-copy:1
+copy2:2
+copy:2
 copydml:7
 copyencoding:4
 copyselect:13
@@ -45,7 +45,7 @@ enum:1
 errors:2
 expressions:1
 float4:9
-float8:1
+float8:9
 foreign_key:3
 generated_stored:1
 generated_virtual:1
@@ -59,7 +59,7 @@ int2:10
 int4:10
 int8:9
 interval:1
-join:23
+join:30
 join_hash:5
 json:1
 json_encoding:2
@@ -100,7 +100,7 @@ rangetypes:31
 regex:1
 regproc:1
 reloptions:1
-returning:1
+returning:15
 rowsecurity:1
 rowtypes:1
 rules:4
@@ -133,8 +133,8 @@ union:26
 updatable_views:1
 update:8
 uuid:10
-varchar:1
-window:1
+varchar:20
+window:3
 with:2
 without_overlaps:1
 xml:1

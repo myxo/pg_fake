@@ -817,7 +817,7 @@ pub(super) fn execute_insert(
     context: &StatementExecutionContext,
 ) -> Result<StatementResult> {
     let table_name = resolve_insert_table_name(&insert.table)?;
-    let schema = state.catalog.require_table(&table_name)?.clone();
+    let schema = state.catalog.require_named_table(&table_name)?.clone();
     let conflict_arbiter = resolve_conflict_arbiter(&schema, insert.on.as_ref())?;
     let conflict_update = match insert.on.as_ref() {
         Some(ast::OnInsert::OnConflict(ast::OnConflict {
@@ -957,7 +957,7 @@ pub(super) fn execute_update(
     }
     let schema = state
         .catalog
-        .require_table(&normalize_unqualified_object_name(table_name)?)?
+        .require_named_table(&normalize_relation_name(table_name)?)?
         .clone();
     let from = match from {
         None => &[][..],
@@ -1172,7 +1172,7 @@ pub(super) fn execute_delete(
     }
     let schema = state
         .catalog
-        .require_table(&normalize_unqualified_object_name(table_name)?)?
+        .require_named_table(&normalize_relation_name(table_name)?)?
         .clone();
     let using = delete.using.as_deref().unwrap_or_default();
     let scope = create_mutation_scope(

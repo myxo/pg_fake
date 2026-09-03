@@ -2078,3 +2078,57 @@ fn generated_sequence_allocations_follow_the_option_model() {
         }
     })
 }
+
+#[test]
+fn generated_temporary_relation_lifetimes_are_session_local() {
+    check(|src| {
+        let first_value = src.any_of("first_value", int_in(-100_i32..=100));
+        let second_value = src.any_of("second_value", int_in(-100_i32..=100));
+        let db = pg_fake::api::Db::create();
+        let mut first = db.create_session();
+        let mut second = db.create_session();
+        first
+            .execute("CREATE TEMP TABLE property_temp (value INTEGER)")
+            .unwrap();
+        second
+            .execute("CREATE TEMP TABLE property_temp (value INTEGER)")
+            .unwrap();
+        first
+            .execute(&format!(
+                "INSERT INTO pg_temp.property_temp VALUES ({first_value})"
+            ))
+            .unwrap();
+        second
+            .execute(&format!(
+                "INSERT INTO property_temp VALUES ({second_value})"
+            ))
+            .unwrap();
+        assert_eq!(
+            first
+                .query("SELECT value FROM property_temp", &[])
+                .unwrap()
+                .rows,
+            vec![vec![pg_fake::value::Value::Int4(first_value)]]
+        );
+        assert_eq!(
+            second
+                .query("SELECT value FROM pg_temp.property_temp", &[])
+                .unwrap()
+                .rows,
+            vec![vec![pg_fake::value::Value::Int4(second_value)]]
+        );
+
+        let mut transaction = first.begin().unwrap();
+        transaction
+            .execute("CREATE TEMP TABLE property_drop (value INTEGER) ON COMMIT DROP")
+            .unwrap();
+        transaction.commit().unwrap();
+        assert_eq!(
+            first
+                .query("SELECT * FROM pg_temp.property_drop", &[])
+                .unwrap_err()
+                .sqlstate,
+            pg_fake::error::SqlState::UndefinedTable
+        );
+    });
+}

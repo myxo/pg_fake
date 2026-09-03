@@ -446,3 +446,47 @@ async fn sqlx_error_category_matches_postgres() {
         .await
         .unwrap();
 }
+
+#[tokio::test]
+async fn sqlx_isolates_temporary_relations_and_resolves_public_qualification() {
+    let db = Db::create();
+    let mut first = PgFakeConnection::new(db.clone());
+    let mut second = PgFakeConnection::new(db);
+    first
+        .execute("CREATE TABLE public.items (id INTEGER)")
+        .await
+        .unwrap();
+    first
+        .execute("INSERT INTO public.items VALUES (1)")
+        .await
+        .unwrap();
+    first
+        .execute("CREATE TEMP TABLE items (id INTEGER)")
+        .await
+        .unwrap();
+    second
+        .execute("CREATE TEMP TABLE items (id INTEGER)")
+        .await
+        .unwrap();
+    first.execute("INSERT INTO items VALUES (2)").await.unwrap();
+    second
+        .execute("INSERT INTO items VALUES (3)")
+        .await
+        .unwrap();
+
+    let first_temporary = sqlx::query("SELECT id FROM pg_temp.items")
+        .fetch_one(&mut first)
+        .await
+        .unwrap();
+    let second_temporary = sqlx::query("SELECT id FROM items")
+        .fetch_one(&mut second)
+        .await
+        .unwrap();
+    let permanent = sqlx::query("SELECT id FROM public.items")
+        .fetch_one(&mut first)
+        .await
+        .unwrap();
+    assert_eq!(first_temporary.get::<i32, _>("id"), 2);
+    assert_eq!(second_temporary.get::<i32, _>("id"), 3);
+    assert_eq!(permanent.get::<i32, _>("id"), 1);
+}

@@ -372,8 +372,8 @@ fn constrain_statement_parameters(
 ) -> Result<()> {
     match statement {
         ast::Statement::Insert(insert) => {
-            let schema =
-                catalog.require_table(&executor::resolve_insert_table_name(&insert.table)?)?;
+            let schema = catalog
+                .require_named_table(&executor::resolve_insert_table_name(&insert.table)?)?;
             let columns = if insert.columns.is_empty() {
                 (0..schema.columns.len()).collect::<Vec<_>>()
             } else {
@@ -520,8 +520,8 @@ pub(crate) fn substitute_typed_subqueries(
             substitute_scoped_subqueries(source.as_mut(), catalog, &outer)?;
         }
         if let Some(returning) = &mut insert.returning {
-            let schema =
-                catalog.require_table(&executor::resolve_insert_table_name(&insert.table)?)?;
+            let schema = catalog
+                .require_named_table(&executor::resolve_insert_table_name(&insert.table)?)?;
             let outer = executor::bind_target_scope(
                 schema,
                 insert.table_alias.as_ref().map(|alias| &alias.alias),
@@ -766,7 +766,7 @@ fn resolve_table_schema<'a>(
     else {
         return reject_unsupported("table source is not implemented");
     };
-    catalog.require_table(&executor::normalize_unqualified_object_name(name)?)
+    catalog.require_named_table(&executor::normalize_relation_name(name)?)
 }
 
 #[cfg_attr(feature = "execution-log", tracing::instrument(skip_all))]
@@ -975,8 +975,8 @@ fn finalize_parameter_types(types: Vec<Option<BaseType>>) -> Vec<BaseType> {
 fn validate_statement(statement: &ast::Statement, catalog: &Catalog) -> Result<()> {
     match statement {
         ast::Statement::Insert(insert) => {
-            let schema =
-                catalog.require_table(&executor::resolve_insert_table_name(&insert.table)?)?;
+            let schema = catalog
+                .require_named_table(&executor::resolve_insert_table_name(&insert.table)?)?;
             let columns = if insert.columns.is_empty() {
                 (0..schema.columns.len()).collect::<Vec<_>>()
             } else {

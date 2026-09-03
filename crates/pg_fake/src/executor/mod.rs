@@ -5,7 +5,8 @@ use crate::{
     api::{ColumnMeta, QueryResult, StatementResult},
     catalog::{
         Catalog, CatalogHistory, ColumnDef, ConstraintId, ForeignKey, ForeignKeyAction,
-        IdentityKind, SequenceSchema, TableId, TableSchema,
+        IdentityKind, RelationName, ResolvedRelationName, SequenceSchema, TEMP_SCHEMA, TableId,
+        TablePersistence, TableSchema,
     },
     coercion::{self, CastContext},
     error::{PgError, Result, SqlState, reject_unsupported},
@@ -132,10 +133,18 @@ impl DatabaseState {
     }
 
     #[cfg_attr(feature = "execution-log", tracing::instrument(skip_all))]
-    pub(crate) fn load_catalog(&mut self, xid: Option<Xid>, snapshot: Snapshot) {
-        self.catalog = self
-            .catalog_history
-            .materialize(xid, snapshot, &self.transactions);
+    pub(crate) fn load_catalog(
+        &mut self,
+        xid: Option<Xid>,
+        snapshot: Snapshot,
+        temporary_schema_id: Option<crate::catalog::SchemaId>,
+    ) {
+        self.catalog = self.catalog_history.materialize_for_session(
+            xid,
+            snapshot,
+            &self.transactions,
+            temporary_schema_id,
+        );
     }
 
     #[cfg_attr(feature = "execution-log", tracing::instrument(skip_all))]
@@ -206,9 +215,6 @@ pub(crate) fn execute_statement(
 ) -> Result<StatementResult> {
     match statement {
         ast::Statement::CreateTable(create) => {
-            if create.temporary || create.on_commit.is_some() {
-                return reject_unsupported("temporary tables are not implemented");
-            }
             if create.query.is_some() {
                 return reject_unsupported("CREATE TABLE AS is not implemented");
             }
@@ -227,8 +233,32 @@ pub(crate) fn execute_statement(
             if !matches!(create.table_options, ast::CreateTableOptions::None) {
                 return reject_unsupported("CREATE TABLE options are not implemented");
             }
-            let table_name = normalize_unqualified_object_name(&create.name)?;
-            if create.if_not_exists && state.catalog.has_relation(&table_name) {
+            let relation_name = normalize_relation_name(&create.name)?;
+            let temporary =
+                create.temporary || relation_name.schema.as_deref() == Some(TEMP_SCHEMA);
+            if create.on_commit.is_some() && !temporary {
+                return Err(PgError::create(
+                    SqlState::InvalidTableDefinition,
+                    "ON COMMIT can only be used on temporary tables",
+                ));
+            }
+            let on_commit_drop = match create.on_commit {
+                None | Some(ast::OnCommit::PreserveRows) => false,
+                Some(ast::OnCommit::Drop) => true,
+                Some(ast::OnCommit::DeleteRows) => {
+                    return reject_unsupported("ON COMMIT DELETE ROWS is not implemented");
+                }
+            };
+            let resolved_name = state
+                .catalog
+                .resolve_creation_name(&relation_name, temporary)?;
+            let table_name = resolved_name.name.clone();
+            let persistence = if temporary {
+                TablePersistence::Temporary { on_commit_drop }
+            } else {
+                TablePersistence::Permanent
+            };
+            if create.if_not_exists && state.catalog.has_resolved_relation(&resolved_name) {
                 return Ok(StatementResult::Affected(0));
             }
             let mut columns = Vec::new();
@@ -262,6 +292,8 @@ pub(crate) fn execute_statement(
                                 ));
                             }
                             default = Some(expr.clone());
+                            default_sequence =
+                                resolve_default_sequence(&state.catalog, expr, persistence)?;
                         }
                         ast::ColumnOption::PrimaryKey(_) => {
                             let columns = vec![column_name.clone()];
@@ -302,7 +334,7 @@ pub(crate) fn execute_statement(
                                 id: ConstraintId(0),
                                 name,
                                 columns: vec![column_name.clone()],
-                                foreign_table: crate::executor::normalize_unqualified_object_name(
+                                foreign_table: crate::executor::normalize_relation_name(
                                     &foreign_key.foreign_table,
                                 )?,
                                 foreign_table_id: TableId(0),
@@ -366,7 +398,7 @@ pub(crate) fn execute_statement(
                             let sequence_name = create_generated_sequence_name(
                                 &state.catalog,
                                 &sequence_schemas,
-                                &table_name,
+                                &resolved_name,
                                 &column_name,
                             );
                             let sequence = sequences::create_sequence_schema_for_type(
@@ -376,7 +408,10 @@ pub(crate) fn execute_statement(
                             )?;
                             sequence_schemas.push(sequence);
                             nullable = false;
-                            default_sequence = Some(sequence_name);
+                            default_sequence = Some(ResolvedRelationName {
+                                schema_id: resolved_name.schema_id,
+                                name: sequence_name,
+                            });
                             identity = Some(kind);
                         }
                         option => {
@@ -390,7 +425,7 @@ pub(crate) fn execute_statement(
                     let sequence_name = create_generated_sequence_name(
                         &state.catalog,
                         &sequence_schemas,
-                        &table_name,
+                        &resolved_name,
                         &column_name,
                     );
                     let sequence = sequences::create_sequence_schema_for_type(
@@ -400,7 +435,10 @@ pub(crate) fn execute_statement(
                     )?;
                     sequence_schemas.push(sequence);
                     nullable = false;
-                    default_sequence = Some(sequence_name);
+                    default_sequence = Some(ResolvedRelationName {
+                        schema_id: resolved_name.schema_id,
+                        name: sequence_name,
+                    });
                 }
                 let column = ColumnDef {
                     name: column_name,
@@ -467,7 +505,7 @@ pub(crate) fn execute_statement(
                                 .iter()
                                 .map(normalize_identifier)
                                 .collect(),
-                            foreign_table: crate::executor::normalize_unqualified_object_name(
+                            foreign_table: crate::executor::normalize_relation_name(
                                 &foreign_key.foreign_table,
                             )?,
                             foreign_table_id: TableId(0),
@@ -521,25 +559,30 @@ pub(crate) fn execute_statement(
             }
             validate_check_constraint_types(&TableSchema {
                 id: TableId(0),
-                schema_id: crate::catalog::SchemaId(0),
+                schema_id: resolved_name.schema_id,
                 name: table_name.clone(),
                 columns: columns.clone(),
                 constraints: constraints.clone(),
+                persistence,
             })?;
             let proposed = TableSchema {
                 id: TableId(0),
-                schema_id: crate::catalog::SchemaId(0),
+                schema_id: resolved_name.schema_id,
                 name: table_name.clone(),
                 columns: columns.clone(),
                 constraints: constraints.clone(),
+                persistence,
             };
             validate_foreign_key_definitions(&state.catalog, &proposed)?;
-            let id = state
-                .catalog
-                .create_table(table_name.clone(), columns, constraints)?;
+            let id = state.catalog.create_named_table(
+                resolved_name.clone(),
+                columns,
+                constraints,
+                proposed.persistence,
+            )?;
             let table = state
                 .catalog
-                .require_table(&table_name)
+                .require_table_by_id(id)
                 .expect("created table must exist")
                 .clone();
             state.tables.insert(id, Table::create(table.clone()));
@@ -547,14 +590,24 @@ pub(crate) fn execute_statement(
                 let column = table
                     .columns
                     .iter()
-                    .find(|column| column.default_sequence.as_ref() == Some(&sequence.name))
+                    .find(|column| {
+                        column.default_sequence.as_ref().is_some_and(|name| {
+                            name.schema_id == resolved_name.schema_id && name.name == sequence.name
+                        })
+                    })
                     .expect("generated sequence must belong to a table column");
                 sequence.owned_by = Some((id, column.name.clone()));
                 let initial = SequenceValueState {
                     last_value: sequence.start_value,
                     is_called: false,
                 };
-                let id = state.catalog.create_sequence(sequence)?;
+                let id = state.catalog.create_named_sequence(
+                    ResolvedRelationName {
+                        schema_id: resolved_name.schema_id,
+                        name: sequence.name.clone(),
+                    },
+                    sequence,
+                )?;
                 state
                     .sequence_values
                     .lock()
@@ -571,11 +624,12 @@ pub(crate) fn execute_statement(
             sequence_options,
             owned_by,
         } => {
-            if *temporary {
-                return reject_unsupported("temporary sequences are not implemented");
-            }
-            let name = normalize_unqualified_object_name(name)?;
-            if *if_not_exists && state.catalog.has_relation(&name) {
+            let relation_name = normalize_relation_name(name)?;
+            let temporary = *temporary || relation_name.schema.as_deref() == Some(TEMP_SCHEMA);
+            let resolved_name = state
+                .catalog
+                .resolve_creation_name(&relation_name, temporary)?;
+            if *if_not_exists && state.catalog.has_resolved_relation(&resolved_name) {
                 return Ok(StatementResult::Affected(0));
             }
             let owned_by = match owned_by {
@@ -588,16 +642,21 @@ pub(crate) fn execute_statement(
                 {
                     None
                 }
-                Some(owned_by) if owned_by.0.len() == 2 => {
-                    let Some(table) = owned_by.0[0].as_ident() else {
+                Some(owned_by) if matches!(owned_by.0.len(), 2 | 3) => {
+                    let Some(column) = owned_by.0.last().and_then(|part| part.as_ident()) else {
                         return reject_unsupported("sequence ownership is not implemented");
                     };
-                    let Some(column) = owned_by.0[1].as_ident() else {
-                        return reject_unsupported("sequence ownership is not implemented");
-                    };
-                    let table_name = normalize_identifier(table);
                     let column_name = normalize_identifier(column);
-                    let table = state.catalog.require_table(&table_name)?;
+                    let table_name = normalize_relation_name(&ast::ObjectName(
+                        owned_by.0[..owned_by.0.len() - 1].to_vec(),
+                    ))?;
+                    let table = state.catalog.require_named_table(&table_name)?;
+                    if table.schema_id != resolved_name.schema_id {
+                        return Err(PgError::create(
+                            SqlState::ObjectNotInPrerequisiteState,
+                            "sequence must be in the same schema as its owned table",
+                        ));
+                    }
                     if !table
                         .columns
                         .iter()
@@ -606,7 +665,8 @@ pub(crate) fn execute_statement(
                         return Err(PgError::create(
                             SqlState::UndefinedColumn,
                             format!(
-                                "column {column_name:?} of relation {table_name:?} does not exist"
+                                "column {column_name:?} of relation {:?} does not exist",
+                                table.name
                             ),
                         ));
                     }
@@ -614,14 +674,19 @@ pub(crate) fn execute_statement(
                 }
                 Some(_) => return reject_unsupported("sequence ownership is not implemented"),
             };
-            let mut sequence =
-                sequences::create_sequence_schema(name, data_type.as_ref(), sequence_options)?;
+            let mut sequence = sequences::create_sequence_schema(
+                resolved_name.name.clone(),
+                data_type.as_ref(),
+                sequence_options,
+            )?;
             sequence.owned_by = owned_by;
             let initial = SequenceValueState {
                 last_value: sequence.start_value,
                 is_called: false,
             };
-            let id = state.catalog.create_sequence(sequence)?;
+            let id = state
+                .catalog
+                .create_named_sequence(resolved_name, sequence)?;
             state
                 .sequence_values
                 .lock()
@@ -645,15 +710,15 @@ pub(crate) fn execute_statement(
             let mut table_names = Vec::new();
             let mut seen = BTreeSet::new();
             for object in names {
-                let table_name = normalize_unqualified_object_name(object)?;
-                match state.catalog.require_table(&table_name) {
-                    Ok(_) if seen.insert(table_name.clone()) => table_names.push(table_name),
+                let table_name = normalize_relation_name(object)?;
+                match state.catalog.require_named_table(&table_name) {
+                    Ok(table) if seen.insert(table.id) => table_names.push(table_name),
                     Ok(_) => {}
                     Err(error) if *if_exists && error.sqlstate == SqlState::UndefinedTable => {}
                     Err(error) => return Err(error),
                 }
             }
-            for schema in state.catalog.drop_tables(&table_names)? {
+            for schema in state.catalog.drop_named_tables(&table_names)? {
                 state.catalog.drop_owned_sequences(schema.id);
             }
             Ok(StatementResult::Affected(0))
@@ -672,8 +737,8 @@ pub(crate) fn execute_statement(
                 );
             }
             for object in names {
-                let name = normalize_unqualified_object_name(object)?;
-                match state.catalog.drop_sequence(&name) {
+                let name = normalize_relation_name(object)?;
+                match state.catalog.drop_named_sequence(&name) {
                     Ok(_) => {}
                     Err(error) if *if_exists && error.sqlstate == SqlState::UndefinedTable => {}
                     Err(error) => return Err(error),
@@ -728,10 +793,10 @@ pub(crate) fn execute_statement(
 fn create_generated_sequence_name(
     catalog: &Catalog,
     sequences: &[SequenceSchema],
-    table_name: &str,
+    table_name: &ResolvedRelationName,
     column_name: &str,
 ) -> String {
-    let base = format!("{table_name}_{column_name}_seq");
+    let base = format!("{}_{column_name}_seq", table_name.name);
     let mut number = 0;
     loop {
         let name = if number == 0 {
@@ -739,12 +804,96 @@ fn create_generated_sequence_name(
         } else {
             format!("{base}{number}")
         };
-        if !catalog.has_relation(&name) && !sequences.iter().any(|sequence| sequence.name == name) {
+        if !catalog.has_resolved_relation(&ResolvedRelationName {
+            schema_id: table_name.schema_id,
+            name: name.clone(),
+        }) && !sequences.iter().any(|sequence| sequence.name == name)
+        {
             return name;
         }
         number += 1;
     }
 }
+
+fn extract_default_sequence_name(expression: &ast::Expr) -> Option<&str> {
+    match expression {
+        ast::Expr::Nested(expr) => extract_default_sequence_name(expr),
+        ast::Expr::Function(function)
+            if normalize_unqualified_object_name(&function.name).as_deref() == Ok("nextval") =>
+        {
+            let ast::FunctionArguments::List(arguments) = &function.args else {
+                return None;
+            };
+            let [ast::FunctionArg::Unnamed(ast::FunctionArgExpr::Expr(argument))] =
+                arguments.args.as_slice()
+            else {
+                return None;
+            };
+            extract_default_sequence_literal(argument)
+        }
+        _ => None,
+    }
+}
+
+fn extract_default_sequence_literal(expression: &ast::Expr) -> Option<&str> {
+    match expression {
+        ast::Expr::Cast { expr, .. } | ast::Expr::Nested(expr) => {
+            extract_default_sequence_literal(expr)
+        }
+        ast::Expr::Value(value) => match &value.value {
+            ast::Value::SingleQuotedString(value) => Some(value),
+            _ => None,
+        },
+        _ => None,
+    }
+}
+
+fn resolve_default_sequence(
+    catalog: &Catalog,
+    expression: &ast::Expr,
+    persistence: TablePersistence,
+) -> Result<Option<ResolvedRelationName>> {
+    let Some(name) = extract_default_sequence_name(expression) else {
+        let mut contains_sequence_call = false;
+        let _ = ast::visit_expressions(expression, |nested| {
+            let ast::Expr::Function(function) = nested else {
+                return std::ops::ControlFlow::Continue(());
+            };
+            if normalize_unqualified_object_name(&function.name)
+                .is_ok_and(|name| matches!(name.as_str(), "nextval" | "currval" | "setval"))
+            {
+                contains_sequence_call = true;
+                return std::ops::ControlFlow::Break(());
+            }
+            std::ops::ControlFlow::Continue(())
+        });
+        if contains_sequence_call {
+            return reject_unsupported("compound sequence defaults are not implemented");
+        }
+        return Ok(None);
+    };
+    let name = sequences::normalize_sequence_name(name)?;
+    let sequence = catalog.require_named_sequence(&name).map_err(|error| {
+        if error.sqlstate == SqlState::WrongObjectType {
+            PgError::create(
+                SqlState::FeatureNotSupported,
+                "sequence defaults bound to non-sequence relations are not implemented",
+            )
+        } else {
+            error
+        }
+    })?;
+    let temporary_table = matches!(persistence, TablePersistence::Temporary { .. });
+    let temporary_sequence = catalog.get_schema_name(sequence.schema_id) == TEMP_SCHEMA;
+    if temporary_table != temporary_sequence {
+        return reject_unsupported("cross-persistence sequence defaults are not implemented");
+    }
+    Ok(Some(ResolvedRelationName {
+        schema_id: sequence.schema_id,
+        name: sequence.name.clone(),
+    }))
+}
+
 #[cfg_attr(feature = "execution-log", tracing::instrument(skip_all))]
 pub(crate) fn normalize_unqualified_object_name(name: &ast::ObjectName) -> Result<String> {
     if name.0.len() != 1 {
@@ -757,11 +906,36 @@ pub(crate) fn normalize_unqualified_object_name(name: &ast::ObjectName) -> Resul
 }
 
 #[cfg_attr(feature = "execution-log", tracing::instrument(skip_all))]
-pub(crate) fn resolve_insert_table_name(table: &ast::TableObject) -> Result<String> {
+pub(crate) fn normalize_relation_name(name: &ast::ObjectName) -> Result<RelationName> {
+    match name.0.as_slice() {
+        [name] => {
+            let Some(name) = name.as_ident() else {
+                return reject_unsupported("dynamic object names are not implemented");
+            };
+            Ok(RelationName::create_unqualified(normalize_identifier(name)))
+        }
+        [schema, name] => {
+            let Some(schema) = schema.as_ident() else {
+                return reject_unsupported("dynamic object names are not implemented");
+            };
+            let Some(name) = name.as_ident() else {
+                return reject_unsupported("dynamic object names are not implemented");
+            };
+            Ok(RelationName::create(
+                Some(normalize_identifier(schema)),
+                normalize_identifier(name),
+            ))
+        }
+        _ => reject_unsupported("database-qualified relation names are not implemented"),
+    }
+}
+
+#[cfg_attr(feature = "execution-log", tracing::instrument(skip_all))]
+pub(crate) fn resolve_insert_table_name(table: &ast::TableObject) -> Result<RelationName> {
     let ast::TableObject::TableName(table_name) = table else {
         return reject_unsupported("insert target is not a table");
     };
-    normalize_unqualified_object_name(table_name)
+    normalize_relation_name(table_name)
 }
 
 #[cfg_attr(feature = "execution-log", tracing::instrument(skip_all))]

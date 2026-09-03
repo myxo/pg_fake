@@ -9,6 +9,44 @@ use crate::{
 };
 
 pub(crate) const DEFAULT_SCHEMA: &str = "public";
+pub(crate) const TEMP_SCHEMA: &str = "pg_temp";
+
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
+pub(crate) struct RelationName {
+    pub(crate) schema: Option<String>,
+    pub(crate) name: String,
+}
+
+impl RelationName {
+    pub(crate) fn create(schema: Option<String>, name: String) -> Self {
+        RelationName { schema, name }
+    }
+
+    pub(crate) fn create_unqualified(name: impl Into<String>) -> Self {
+        RelationName {
+            schema: None,
+            name: name.into(),
+        }
+    }
+}
+
+impl From<&str> for RelationName {
+    fn from(name: &str) -> Self {
+        RelationName::create_unqualified(name)
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
+pub(crate) struct ResolvedRelationName {
+    pub(crate) schema_id: SchemaId,
+    pub(crate) name: String,
+}
+
+impl ResolvedRelationName {
+    pub(crate) fn get_lock_name(&self) -> String {
+        format!("{}:{}", self.schema_id.0, self.name)
+    }
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub(crate) struct SchemaId(pub(crate) u64);
@@ -49,7 +87,7 @@ pub(crate) struct ColumnDef {
     pub(crate) data_type: PgType,
     pub(crate) nullable: bool,
     pub(crate) default: Option<ast::Expr>,
-    pub(crate) default_sequence: Option<String>,
+    pub(crate) default_sequence: Option<ResolvedRelationName>,
     pub(crate) identity: Option<IdentityKind>,
 }
 
@@ -103,7 +141,7 @@ pub(crate) struct ForeignKey {
     pub(crate) id: ConstraintId,
     pub(crate) name: String,
     pub(crate) columns: Vec<String>,
-    pub(crate) foreign_table: String,
+    pub(crate) foreign_table: RelationName,
     pub(crate) foreign_table_id: TableId,
     pub(crate) referred_columns: Vec<String>,
     pub(crate) on_delete: ForeignKeyAction,
@@ -120,6 +158,13 @@ pub(crate) struct TableSchema {
     pub(crate) name: String,
     pub(crate) columns: Vec<ColumnDef>,
     pub(crate) constraints: Vec<Constraint>,
+    pub(crate) persistence: TablePersistence,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum TablePersistence {
+    Permanent,
+    Temporary { on_commit_drop: bool },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -218,6 +263,104 @@ impl Catalog {
             .expect("catalog object schema must exist")
     }
 
+    fn get_schema_by_id(&self, id: SchemaId) -> &Schema {
+        self.schemas
+            .values()
+            .find(|schema| schema.id == id)
+            .expect("catalog object schema must exist")
+    }
+
+    pub(crate) fn get_schema_name(&self, id: SchemaId) -> &str {
+        &self.get_schema_by_id(id).name
+    }
+
+    pub(crate) fn resolve_relation_name(
+        &self,
+        name: &RelationName,
+    ) -> Result<ResolvedRelationName> {
+        let schema = match &name.schema {
+            Some(schema) => self.require_schema(schema)?,
+            None => self
+                .schemas
+                .get(TEMP_SCHEMA)
+                .filter(|schema| {
+                    schema.tables.contains_key(&name.name)
+                        || schema.sequences.contains_key(&name.name)
+                })
+                .unwrap_or_else(|| self.get_default_schema()),
+        };
+        Ok(ResolvedRelationName {
+            schema_id: schema.id,
+            name: name.name.clone(),
+        })
+    }
+
+    pub(crate) fn resolve_creation_name(
+        &self,
+        name: &RelationName,
+        temporary: bool,
+    ) -> Result<ResolvedRelationName> {
+        let schema = if temporary {
+            match name.schema.as_deref() {
+                None | Some(TEMP_SCHEMA) => self.require_schema(TEMP_SCHEMA)?,
+                Some(schema) => {
+                    return Err(PgError::create(
+                        SqlState::InvalidTableDefinition,
+                        format!("temporary relations cannot specify schema {schema:?}"),
+                    ));
+                }
+            }
+        } else {
+            match name.schema.as_deref() {
+                None => self.get_default_schema(),
+                Some(schema) => self.require_schema(schema)?,
+            }
+        };
+        Ok(ResolvedRelationName {
+            schema_id: schema.id,
+            name: name.name.clone(),
+        })
+    }
+
+    pub(crate) fn has_resolved_relation(&self, name: &ResolvedRelationName) -> bool {
+        let schema = self.get_schema_by_id(name.schema_id);
+        schema.tables.contains_key(&name.name) || schema.sequences.contains_key(&name.name)
+    }
+
+    pub(crate) fn require_named_table(&self, name: &RelationName) -> Result<&TableSchema> {
+        let name = self.resolve_relation_name(name)?;
+        let schema = self.get_schema_by_id(name.schema_id);
+        if schema.sequences.contains_key(&name.name) {
+            return Err(PgError::create(
+                SqlState::WrongObjectType,
+                format!("{:?} is not a table", name.name),
+            ));
+        }
+        schema.tables.get(&name.name).ok_or_else(|| {
+            PgError::create(
+                SqlState::UndefinedTable,
+                format!("relation {:?} does not exist", name.name),
+            )
+        })
+    }
+
+    pub(crate) fn require_named_sequence(&self, name: &RelationName) -> Result<&SequenceSchema> {
+        let name = self.resolve_relation_name(name)?;
+        let schema = self.get_schema_by_id(name.schema_id);
+        if schema.tables.contains_key(&name.name) {
+            return Err(PgError::create(
+                SqlState::WrongObjectType,
+                format!("{:?} is not a sequence", name.name),
+            ));
+        }
+        schema.sequences.get(&name.name).ok_or_else(|| {
+            PgError::create(
+                SqlState::UndefinedTable,
+                format!("relation {:?} does not exist", name.name),
+            )
+        })
+    }
+
     #[cfg_attr(not(test), allow(dead_code))]
     pub(crate) fn create_schema(&mut self, name: String) -> Result<SchemaId> {
         if self.schemas.contains_key(&name) {
@@ -273,6 +416,7 @@ impl Catalog {
         })
     }
 
+    #[cfg(test)]
     #[cfg_attr(feature = "execution-log", tracing::instrument(skip_all))]
     pub(crate) fn create_table(
         &mut self,
@@ -299,10 +443,12 @@ impl Catalog {
                 | Constraint::Check { id, .. } => *id = constraint_id,
                 Constraint::ForeignKey(foreign_key) => {
                     foreign_key.id = constraint_id;
-                    foreign_key.foreign_table_id = if foreign_key.foreign_table == name {
+                    foreign_key.foreign_table_id = if foreign_key.foreign_table.schema.is_none()
+                        && foreign_key.foreign_table.name == name
+                    {
                         id
                     } else {
-                        self.require_table(&foreign_key.foreign_table)?.id
+                        self.require_named_table(&foreign_key.foreign_table)?.id
                     };
                 }
             }
@@ -315,12 +461,72 @@ impl Catalog {
                 name,
                 columns,
                 constraints,
+                persistence: TablePersistence::Permanent,
             },
         );
         self.rebuild_foreign_key_metadata();
         Ok(id)
     }
 
+    #[cfg_attr(feature = "execution-log", tracing::instrument(skip_all))]
+    pub(crate) fn create_named_table(
+        &mut self,
+        name: ResolvedRelationName,
+        columns: Vec<ColumnDef>,
+        mut constraints: Vec<Constraint>,
+        persistence: TablePersistence,
+    ) -> Result<TableId> {
+        if self.has_resolved_relation(&name) {
+            return Err(PgError::create(
+                SqlState::DuplicateTable,
+                format!("relation {:?} already exists", name.name),
+            ));
+        }
+
+        let id = TableId(self.next_table_id);
+        self.next_table_id += 1;
+        for constraint in &mut constraints {
+            let constraint_id = ConstraintId(self.next_constraint_id);
+            self.next_constraint_id += 1;
+            match constraint {
+                Constraint::PrimaryKey { id, .. }
+                | Constraint::Unique { id, .. }
+                | Constraint::Check { id, .. } => *id = constraint_id,
+                Constraint::ForeignKey(foreign_key) => {
+                    foreign_key.id = constraint_id;
+                    foreign_key.foreign_table_id = if foreign_key.foreign_table.name == name.name
+                        && foreign_key
+                            .foreign_table
+                            .schema
+                            .as_deref()
+                            .is_none_or(|schema| {
+                                self.require_schema(schema)
+                                    .is_ok_and(|schema| schema.id == name.schema_id)
+                            }) {
+                        id
+                    } else {
+                        self.require_named_table(&foreign_key.foreign_table)?.id
+                    };
+                }
+            }
+        }
+        let previous = self.get_schema_by_id_mut(name.schema_id).tables.insert(
+            name.name.clone(),
+            TableSchema {
+                id,
+                schema_id: name.schema_id,
+                name: name.name,
+                columns,
+                constraints,
+                persistence,
+            },
+        );
+        assert!(previous.is_none(), "new table must not replace a relation");
+        self.rebuild_foreign_key_metadata();
+        Ok(id)
+    }
+
+    #[cfg(test)]
     #[cfg_attr(feature = "execution-log", tracing::instrument(skip_all))]
     pub(crate) fn require_table(&self, name: &str) -> Result<&TableSchema> {
         let schema = self.get_default_schema();
@@ -385,6 +591,7 @@ impl Catalog {
             .flat_map(|schema| schema.tables.values())
     }
 
+    #[cfg(test)]
     #[cfg_attr(feature = "execution-log", tracing::instrument(skip_all))]
     pub(crate) fn drop_tables(&mut self, names: &[String]) -> Result<Vec<TableSchema>> {
         let targets = names
@@ -406,7 +613,7 @@ impl Catalog {
                 target_ids
                     .contains(&foreign_key.foreign_table_id)
                     .then_some((
-                        foreign_key.foreign_table.as_str(),
+                        foreign_key.foreign_table.name.as_str(),
                         table.name.as_str(),
                         foreign_key.name.as_str(),
                     ))
@@ -428,6 +635,64 @@ impl Catalog {
                     .expect("required table must exist")
             })
             .collect();
+        self.rebuild_foreign_key_metadata();
+        Ok(dropped)
+    }
+
+    #[cfg_attr(feature = "execution-log", tracing::instrument(skip_all))]
+    pub(crate) fn drop_named_tables(&mut self, names: &[RelationName]) -> Result<Vec<TableSchema>> {
+        let targets = names
+            .iter()
+            .map(|name| self.require_named_table(name).cloned())
+            .collect::<Result<Vec<_>>>()?;
+        let target_ids = targets
+            .iter()
+            .map(|table| table.id)
+            .collect::<BTreeSet<_>>();
+        if let Some((target, table, constraint)) = self.iterate_tables().find_map(|table| {
+            if target_ids.contains(&table.id) {
+                return None;
+            }
+            table.constraints.iter().find_map(|constraint| {
+                let Constraint::ForeignKey(foreign_key) = constraint else {
+                    return None;
+                };
+                target_ids
+                    .contains(&foreign_key.foreign_table_id)
+                    .then_some((
+                        foreign_key.foreign_table.name.as_str(),
+                        table.name.as_str(),
+                        foreign_key.name.as_str(),
+                    ))
+            })
+        }) {
+            return Err(PgError::create(
+                SqlState::DependentObjectsStillExist,
+                format!(
+                    "cannot drop table {target:?} because constraint {constraint:?} on table {table:?} depends on it"
+                ),
+            ));
+        }
+        let dropped = targets
+            .into_iter()
+            .map(|table| {
+                self.get_schema_by_id_mut(table.schema_id)
+                    .tables
+                    .remove(&table.name)
+                    .expect("required table must exist")
+            })
+            .collect();
+        self.rebuild_foreign_key_metadata();
+        Ok(dropped)
+    }
+
+    pub(crate) fn drop_table_by_id(&mut self, id: TableId) -> Result<TableSchema> {
+        let table = self.require_table_by_id(id)?.clone();
+        let dropped = self
+            .get_schema_by_id_mut(table.schema_id)
+            .tables
+            .remove(&table.name)
+            .expect("required table must exist");
         self.rebuild_foreign_key_metadata();
         Ok(dropped)
     }
@@ -498,12 +763,14 @@ impl Catalog {
         self.referencing_foreign_keys = referencing_foreign_keys;
     }
 
+    #[cfg(test)]
     #[cfg_attr(feature = "execution-log", tracing::instrument(skip_all))]
     pub(crate) fn has_relation(&self, name: &str) -> bool {
         let schema = self.get_default_schema();
         schema.tables.contains_key(name) || schema.sequences.contains_key(name)
     }
 
+    #[cfg(test)]
     #[cfg_attr(feature = "execution-log", tracing::instrument(skip_all))]
     pub(crate) fn create_sequence(&mut self, mut sequence: SequenceSchema) -> Result<SequenceId> {
         if self.has_relation(&sequence.name) {
@@ -522,6 +789,35 @@ impl Catalog {
         Ok(id)
     }
 
+    #[cfg_attr(feature = "execution-log", tracing::instrument(skip_all))]
+    pub(crate) fn create_named_sequence(
+        &mut self,
+        name: ResolvedRelationName,
+        mut sequence: SequenceSchema,
+    ) -> Result<SequenceId> {
+        if self.has_resolved_relation(&name) {
+            return Err(PgError::create(
+                SqlState::DuplicateTable,
+                format!("relation {:?} already exists", name.name),
+            ));
+        }
+        let id = SequenceId(self.next_sequence_id);
+        self.next_sequence_id += 1;
+        sequence.id = id;
+        sequence.schema_id = name.schema_id;
+        sequence.name = name.name;
+        let previous = self
+            .get_schema_by_id_mut(sequence.schema_id)
+            .sequences
+            .insert(sequence.name.clone(), sequence);
+        assert!(
+            previous.is_none(),
+            "new sequence must not replace a relation"
+        );
+        Ok(id)
+    }
+
+    #[cfg(test)]
     #[cfg_attr(feature = "execution-log", tracing::instrument(skip_all))]
     pub(crate) fn require_sequence(&self, name: &str) -> Result<&SequenceSchema> {
         let schema = self.get_default_schema();
@@ -547,56 +843,61 @@ impl Catalog {
     }
 
     #[cfg_attr(feature = "execution-log", tracing::instrument(skip_all))]
-    pub(crate) fn drop_sequence(&mut self, name: &str) -> Result<SequenceSchema> {
-        if self.get_default_schema().tables.contains_key(name) {
-            return Err(PgError::create(
-                SqlState::WrongObjectType,
-                format!("{name:?} is not a sequence"),
-            ));
-        }
-        if let Some((table, column)) = self
-            .get_default_schema()
-            .sequences
-            .get(name)
-            .and_then(|sequence| sequence.owned_by.as_ref())
-        {
+    pub(crate) fn drop_named_sequence(&mut self, name: &RelationName) -> Result<SequenceSchema> {
+        let sequence = self.require_named_sequence(name)?.clone();
+        if let Some((table, column)) = &sequence.owned_by {
             let table = self
                 .require_table_by_id(*table)
                 .expect("sequence owner must remain visible");
             return Err(PgError::create(
                 SqlState::DependentObjectsStillExist,
                 format!(
-                    "cannot drop sequence {name:?} because column {column:?} of table {:?} requires it",
-                    table.name
+                    "cannot drop sequence {:?} because column {column:?} of table {:?} requires it",
+                    sequence.name, table.name
                 ),
             ));
         }
-        self.get_default_schema_mut()
-            .sequences
-            .remove(name)
-            .ok_or_else(|| {
-                PgError::create(
-                    SqlState::UndefinedTable,
-                    format!("sequence {name:?} does not exist"),
-                )
+        let resolved_name = ResolvedRelationName {
+            schema_id: sequence.schema_id,
+            name: sequence.name.clone(),
+        };
+        if let Some((table, column)) = self.iterate_tables().find_map(|table| {
+            table.columns.iter().find_map(|column| {
+                (column.default_sequence.as_ref() == Some(&resolved_name))
+                    .then_some((table.name.as_str(), column.name.as_str()))
             })
+        }) {
+            return Err(PgError::create(
+                SqlState::DependentObjectsStillExist,
+                format!(
+                    "cannot drop sequence {:?} because column {column:?} of table {table:?} requires it",
+                    sequence.name
+                ),
+            ));
+        }
+        Ok(self
+            .get_schema_by_id_mut(sequence.schema_id)
+            .sequences
+            .remove(&sequence.name)
+            .expect("required sequence must exist"))
     }
 
     #[cfg_attr(feature = "execution-log", tracing::instrument(skip_all))]
     pub(crate) fn drop_owned_sequences(&mut self, table_id: TableId) -> Vec<SequenceSchema> {
         let names = self
-            .get_default_schema()
-            .sequences
-            .iter()
-            .filter_map(|(name, sequence)| {
-                (sequence.owned_by.as_ref().map(|(table, _)| *table) == Some(table_id))
-                    .then_some(name.clone())
+            .schemas
+            .values()
+            .flat_map(|schema| {
+                schema.sequences.iter().filter_map(|(name, sequence)| {
+                    (sequence.owned_by.as_ref().map(|(table, _)| *table) == Some(table_id))
+                        .then_some((schema.id, name.clone()))
+                })
             })
             .collect::<Vec<_>>();
         names
             .into_iter()
-            .map(|name| {
-                self.get_default_schema_mut()
+            .map(|(schema_id, name)| {
+                self.get_schema_by_id_mut(schema_id)
                     .sequences
                     .remove(&name)
                     .expect("owned sequence must exist")
@@ -632,6 +933,12 @@ impl CatalogHistory {
         }
     }
 
+    pub(crate) fn create_temporary_schema_id(&mut self) -> SchemaId {
+        let id = SchemaId(self.next_schema_id);
+        self.next_schema_id += 1;
+        id
+    }
+
     #[cfg_attr(feature = "execution-log", tracing::instrument(skip_all))]
     pub(crate) fn materialize(
         &self,
@@ -639,7 +946,18 @@ impl CatalogHistory {
         snapshot: Snapshot,
         transactions: &TransactionRegistry,
     ) -> Catalog {
-        let schemas = self
+        self.materialize_for_session(xid, snapshot, transactions, None)
+    }
+
+    #[cfg_attr(feature = "execution-log", tracing::instrument(skip_all))]
+    pub(crate) fn materialize_for_session(
+        &self,
+        xid: Option<Xid>,
+        snapshot: Snapshot,
+        transactions: &TransactionRegistry,
+        temporary_schema_id: Option<SchemaId>,
+    ) -> Catalog {
+        let mut schemas = self
             .schemas
             .values()
             .filter_map(|versions| {
@@ -657,6 +975,18 @@ impl CatalogHistory {
                 )
             })
             .collect::<BTreeMap<_, _>>();
+        if let Some(id) = temporary_schema_id {
+            let previous = schemas.insert(
+                TEMP_SCHEMA.into(),
+                Schema {
+                    id,
+                    name: TEMP_SCHEMA.into(),
+                    tables: BTreeMap::new(),
+                    sequences: BTreeMap::new(),
+                },
+            );
+            assert!(previous.is_none(), "temporary schema name must be reserved");
+        }
         assert!(
             schemas.contains_key(DEFAULT_SCHEMA),
             "the public schema must remain visible"
@@ -675,10 +1005,14 @@ impl CatalogHistory {
             else {
                 continue;
             };
-            let previous = catalog
-                .get_schema_by_id_mut(table.schema_id)
-                .tables
-                .insert(table.name.clone(), table.clone());
+            let Some(schema) = catalog
+                .schemas
+                .values_mut()
+                .find(|schema| schema.id == table.schema_id)
+            else {
+                continue;
+            };
+            let previous = schema.tables.insert(table.name.clone(), table.clone());
             assert!(
                 previous.is_none(),
                 "visible catalog relation names must be unique"
@@ -690,8 +1024,14 @@ impl CatalogHistory {
             else {
                 continue;
             };
-            let previous = catalog
-                .get_schema_by_id_mut(sequence.schema_id)
+            let Some(schema) = catalog
+                .schemas
+                .values_mut()
+                .find(|schema| schema.id == sequence.schema_id)
+            else {
+                continue;
+            };
+            let previous = schema
                 .sequences
                 .insert(sequence.name.clone(), sequence.clone());
             assert!(
@@ -713,24 +1053,32 @@ impl CatalogHistory {
     ) {
         record_catalog_changes(
             &mut self.schemas,
-            previous.schemas.values().map(|schema| {
-                (
-                    schema.id,
-                    SchemaIdentity {
-                        id: schema.id,
-                        name: schema.name.clone(),
-                    },
-                )
-            }),
-            current.schemas.values().map(|schema| {
-                (
-                    schema.id,
-                    SchemaIdentity {
-                        id: schema.id,
-                        name: schema.name.clone(),
-                    },
-                )
-            }),
+            previous
+                .schemas
+                .values()
+                .map(|schema| {
+                    (
+                        schema.id,
+                        SchemaIdentity {
+                            id: schema.id,
+                            name: schema.name.clone(),
+                        },
+                    )
+                })
+                .filter(|(_, schema)| schema.name != TEMP_SCHEMA),
+            current
+                .schemas
+                .values()
+                .map(|schema| {
+                    (
+                        schema.id,
+                        SchemaIdentity {
+                            id: schema.id,
+                            name: schema.name.clone(),
+                        },
+                    )
+                })
+                .filter(|(_, schema)| schema.name != TEMP_SCHEMA),
             xid,
             command_id,
         );
@@ -777,6 +1125,39 @@ impl CatalogHistory {
             tables: discard_catalog_transaction(&mut self.tables, xid),
             sequences: discard_catalog_transaction(&mut self.sequences, xid),
         }
+    }
+
+    pub(crate) fn drop_temporary_schema(
+        &mut self,
+        temporary_schema_id: SchemaId,
+    ) -> ReclaimedCatalogObjects {
+        let tables = self
+            .tables
+            .iter()
+            .filter_map(|(id, versions)| {
+                versions
+                    .iter()
+                    .any(|version| version.value.schema_id == temporary_schema_id)
+                    .then_some(*id)
+            })
+            .collect::<Vec<_>>();
+        let sequences = self
+            .sequences
+            .iter()
+            .filter_map(|(id, versions)| {
+                versions
+                    .iter()
+                    .any(|version| version.value.schema_id == temporary_schema_id)
+                    .then_some(*id)
+            })
+            .collect::<Vec<_>>();
+        for id in &tables {
+            self.tables.remove(id);
+        }
+        for id in &sequences {
+            self.sequences.remove(id);
+        }
+        ReclaimedCatalogObjects { tables, sequences }
     }
 
     #[cfg_attr(feature = "execution-log", tracing::instrument(skip_all))]

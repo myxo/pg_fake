@@ -6,7 +6,7 @@ use std::{
 use sqlparser::ast;
 
 use crate::{
-    catalog::{Catalog, SequenceId, SequenceSchema, TableId},
+    catalog::{Catalog, RelationName, ResolvedRelationName, SequenceId, SequenceSchema},
     coercion,
     error::{PgError, Result, SqlState, reject_unsupported},
     value::BaseType,
@@ -29,8 +29,7 @@ pub(crate) struct SequenceSessionState {
 
 #[derive(Clone)]
 pub(crate) struct SequenceExecutionContext {
-    sequences: BTreeMap<String, SequenceSchema>,
-    tables: BTreeMap<String, TableId>,
+    catalog: Catalog,
     values: SequenceStorage,
     session: SequenceSessionStorage,
 }
@@ -43,14 +42,7 @@ impl SequenceExecutionContext {
         session: SequenceSessionStorage,
     ) -> Self {
         SequenceExecutionContext {
-            sequences: catalog
-                .iterate_sequences()
-                .map(|sequence| (sequence.name.clone(), sequence.clone()))
-                .collect(),
-            tables: catalog
-                .iterate_tables()
-                .map(|table| (table.name.clone(), table.id))
-                .collect(),
+            catalog: catalog.clone(),
             values,
             session,
         }
@@ -59,8 +51,7 @@ impl SequenceExecutionContext {
     #[cfg_attr(feature = "execution-log", tracing::instrument(skip_all))]
     pub(crate) fn create_empty(values: SequenceStorage, session: SequenceSessionStorage) -> Self {
         SequenceExecutionContext {
-            sequences: BTreeMap::new(),
-            tables: BTreeMap::new(),
+            catalog: Catalog::create(),
             values,
             session,
         }
@@ -69,23 +60,32 @@ impl SequenceExecutionContext {
     #[cfg_attr(feature = "execution-log", tracing::instrument(skip_all))]
     fn require_sequence(&self, name: &str) -> Result<&SequenceSchema> {
         let name = normalize_sequence_name(name)?;
-        if self.tables.contains_key(&name) {
-            return Err(PgError::create(
-                SqlState::WrongObjectType,
-                format!("{name:?} is not a sequence"),
-            ));
-        }
-        self.sequences.get(&name).ok_or_else(|| {
-            PgError::create(
-                SqlState::UndefinedTable,
-                format!("relation {name:?} does not exist"),
-            )
-        })
+        self.catalog.require_named_sequence(&name)
     }
 
     #[cfg_attr(feature = "execution-log", tracing::instrument(skip_all))]
     pub(crate) fn get_next_value(&self, name: &str) -> Result<i64> {
         let sequence = self.require_sequence(name)?;
+        self.get_next_sequence_value(sequence)
+    }
+
+    #[cfg_attr(feature = "execution-log", tracing::instrument(skip_all))]
+    pub(crate) fn get_next_resolved_value(&self, name: &ResolvedRelationName) -> Result<i64> {
+        let sequence = self
+            .catalog
+            .iterate_sequences()
+            .find(|sequence| sequence.schema_id == name.schema_id && sequence.name == name.name)
+            .ok_or_else(|| {
+                PgError::create(
+                    SqlState::UndefinedTable,
+                    format!("relation {:?} does not exist", name.name),
+                )
+            })?;
+        self.get_next_sequence_value(sequence)
+    }
+
+    #[cfg_attr(feature = "execution-log", tracing::instrument(skip_all))]
+    fn get_next_sequence_value(&self, sequence: &SequenceSchema) -> Result<i64> {
         let value = {
             let mut values = self.values.lock().expect("sequence storage is poisoned");
             let state = values
@@ -144,7 +144,11 @@ impl SequenceExecutionContext {
         let Some(id) = session.last_used else {
             return Err(create_lastval_error());
         };
-        if !self.sequences.values().any(|sequence| sequence.id == id) {
+        if !self
+            .catalog
+            .iterate_sequences()
+            .any(|sequence| sequence.id == id)
+        {
             return Err(create_lastval_error());
         }
         session
@@ -186,13 +190,24 @@ impl SequenceExecutionContext {
     #[cfg_attr(feature = "execution-log", tracing::instrument(skip_all))]
     pub(crate) fn get_owned_sequence(&self, table: &str, column: &str) -> Result<Option<String>> {
         let table = normalize_sequence_name(table)?;
-        let column = normalize_sequence_name(column)?;
-        let Some(table_id) = self.tables.get(&table) else {
-            return Ok(None);
-        };
-        Ok(self.sequences.values().find_map(|sequence| {
-            (sequence.owned_by.as_ref() == Some(&(*table_id, column.clone())))
-                .then(|| sequence.name.clone())
+        let table = self.catalog.require_named_table(&table).map_err(|error| {
+            if error.sqlstate == SqlState::WrongObjectType {
+                PgError::create(
+                    SqlState::UndefinedColumn,
+                    format!("column {column:?} of relation does not exist"),
+                )
+            } else {
+                error
+            }
+        })?;
+        Ok(self.catalog.iterate_sequences().find_map(|sequence| {
+            (sequence.owned_by.as_ref() == Some(&(table.id, column.to_owned()))).then(|| {
+                format!(
+                    "{}.{}",
+                    format_postgres_identifier(self.catalog.get_schema_name(sequence.schema_id)),
+                    format_postgres_identifier(&sequence.name)
+                )
+            })
         }))
     }
 }
@@ -334,7 +349,7 @@ fn extract_unsigned_integer(expression: &ast::Expr) -> Result<&str> {
 }
 
 #[cfg_attr(feature = "execution-log", tracing::instrument(skip_all))]
-pub(crate) fn normalize_sequence_name(name: &str) -> Result<String> {
+pub(crate) fn normalize_sequence_name(name: &str) -> Result<RelationName> {
     let mut parts = Vec::new();
     let mut current = String::new();
     let mut quoted = false;
@@ -375,9 +390,201 @@ pub(crate) fn normalize_sequence_name(name: &str) -> Result<String> {
         }
     };
     match parts.as_slice() {
-        [name] => Ok(normalize(name)),
-        [schema, name] if normalize(schema) == "public" => Ok(normalize(name)),
-        _ => reject_unsupported("schemas are not implemented"),
+        [name] => Ok(RelationName::create_unqualified(normalize(name))),
+        [schema, name] => Ok(RelationName::create(
+            Some(normalize(schema)),
+            normalize(name),
+        )),
+        _ => Err(PgError::create(
+            SqlState::InvalidTextRepresentation,
+            format!("invalid name syntax: {name}"),
+        )),
+    }
+}
+
+fn format_postgres_identifier(identifier: &str) -> String {
+    let mut characters = identifier.chars();
+    let lexical = characters
+        .next()
+        .is_some_and(|character| character == '_' || character.is_ascii_lowercase())
+        && characters.all(|character| {
+            character == '_'
+                || character == '$'
+                || character.is_ascii_lowercase()
+                || character.is_ascii_digit()
+        });
+    // PostgreSQL quotes every keyword category except UNRESERVED_KEYWORD.
+    let keyword = matches!(
+        identifier,
+        "all"
+            | "analyse"
+            | "analyze"
+            | "and"
+            | "any"
+            | "array"
+            | "as"
+            | "asc"
+            | "asymmetric"
+            | "authorization"
+            | "between"
+            | "bigint"
+            | "binary"
+            | "bit"
+            | "boolean"
+            | "both"
+            | "case"
+            | "cast"
+            | "char"
+            | "character"
+            | "check"
+            | "coalesce"
+            | "collate"
+            | "collation"
+            | "column"
+            | "concurrently"
+            | "constraint"
+            | "create"
+            | "cross"
+            | "current_catalog"
+            | "current_date"
+            | "current_role"
+            | "current_schema"
+            | "current_time"
+            | "current_timestamp"
+            | "current_user"
+            | "dec"
+            | "decimal"
+            | "default"
+            | "deferrable"
+            | "desc"
+            | "distinct"
+            | "do"
+            | "else"
+            | "end"
+            | "except"
+            | "exists"
+            | "extract"
+            | "false"
+            | "fetch"
+            | "float"
+            | "for"
+            | "foreign"
+            | "freeze"
+            | "from"
+            | "full"
+            | "grant"
+            | "greatest"
+            | "group"
+            | "grouping"
+            | "having"
+            | "ilike"
+            | "in"
+            | "initially"
+            | "inner"
+            | "inout"
+            | "int"
+            | "integer"
+            | "intersect"
+            | "interval"
+            | "into"
+            | "is"
+            | "isnull"
+            | "join"
+            | "json"
+            | "json_array"
+            | "json_arrayagg"
+            | "json_exists"
+            | "json_object"
+            | "json_objectagg"
+            | "json_query"
+            | "json_scalar"
+            | "json_serialize"
+            | "json_table"
+            | "json_value"
+            | "lateral"
+            | "leading"
+            | "least"
+            | "left"
+            | "like"
+            | "limit"
+            | "localtime"
+            | "localtimestamp"
+            | "merge_action"
+            | "national"
+            | "natural"
+            | "nchar"
+            | "none"
+            | "normalize"
+            | "not"
+            | "notnull"
+            | "null"
+            | "nullif"
+            | "numeric"
+            | "offset"
+            | "on"
+            | "only"
+            | "or"
+            | "order"
+            | "out"
+            | "outer"
+            | "overlaps"
+            | "overlay"
+            | "placing"
+            | "position"
+            | "precision"
+            | "primary"
+            | "real"
+            | "references"
+            | "returning"
+            | "right"
+            | "row"
+            | "select"
+            | "session_user"
+            | "setof"
+            | "similar"
+            | "smallint"
+            | "some"
+            | "substring"
+            | "symmetric"
+            | "system_user"
+            | "table"
+            | "tablesample"
+            | "then"
+            | "time"
+            | "timestamp"
+            | "to"
+            | "trailing"
+            | "treat"
+            | "trim"
+            | "true"
+            | "union"
+            | "unique"
+            | "user"
+            | "using"
+            | "values"
+            | "varchar"
+            | "variadic"
+            | "verbose"
+            | "when"
+            | "where"
+            | "window"
+            | "with"
+            | "xmlattributes"
+            | "xmlconcat"
+            | "xmlelement"
+            | "xmlexists"
+            | "xmlforest"
+            | "xmlnamespaces"
+            | "xmlparse"
+            | "xmlpi"
+            | "xmlroot"
+            | "xmlserialize"
+            | "xmltable"
+    );
+    if lexical && !keyword {
+        identifier.to_owned()
+    } else {
+        format!("\"{}\"", identifier.replace('"', "\"\""))
     }
 }
 
