@@ -618,6 +618,17 @@ fn choose_column<'a>(
 }
 
 fn generate_main_insert(src: &mut Source, table: &TableSchema, next_key: &mut i64) -> String {
+    if *next_key > 1 && src.any("on_conflict") {
+        return generate_on_conflict_insert(src, table, next_key);
+    }
+    generate_conflict_free_main_insert(src, table, next_key)
+}
+
+fn generate_conflict_free_main_insert(
+    src: &mut Source,
+    table: &TableSchema,
+    next_key: &mut i64,
+) -> String {
     let mut sql = src.select(
         "insert_source",
         &["values", "select"],
@@ -709,13 +720,16 @@ fn generate_on_conflict_insert(
     next_key: &mut i64,
 ) -> String {
     let key = src.any_of("key", int_in(1..=*next_key - 1));
+    let update = src.select("action", &["nothing", "update"], |_src, action, _| {
+        action == "update"
+    });
     let columns = table
         .columns
         .iter()
         .map(|column| column.name.as_str())
         .collect::<Vec<_>>();
     let mut rows = Vec::new();
-    src.repeat_n("rows", 1..=3, |src| {
+    src.repeat_n("rows", if update { 1..=1 } else { 1..=3 }, |src| {
         let values = table
             .columns
             .iter()
@@ -731,23 +745,52 @@ fn generate_on_conflict_insert(
         rows.push(format!("({})", values.join(", ")));
         Effect::Success
     });
-    let target = src.select(
-        "target",
-        &["none", "columns", "constraint"],
-        |_src, target, _| match target {
-            "none" => String::new(),
-            "columns" => format!(" ({})", table.key().name),
-            "constraint" => format!(" ON CONSTRAINT {}_pkey", table.name),
-            _ => unreachable!(),
-        },
-    );
+    let target_options: &[&str] = if update {
+        &["columns", "constraint"]
+    } else {
+        &["none", "columns", "constraint"]
+    };
+    let target = src.select("target", target_options, |_src, target, _| match target {
+        "none" => String::new(),
+        "columns" => format!(" ({})", table.key().name),
+        "constraint" => format!(" ON CONSTRAINT {}_pkey", table.name),
+        _ => unreachable!(),
+    });
     let returning = if src.any("returning") {
         " RETURNING *"
     } else {
         ""
     };
+    let (alias, action) = if update {
+        let column = &table.columns[1];
+        let alias = if src.any("alias") { " AS target" } else { "" };
+        let selection = if src.any("where") {
+            format!(
+                " WHERE {}.{} {} excluded.{}",
+                if alias.is_empty() {
+                    &table.name
+                } else {
+                    "target"
+                },
+                table.key().name,
+                if src.any("where_matches") { "=" } else { "<>" },
+                table.key().name,
+            )
+        } else {
+            String::new()
+        };
+        (
+            alias,
+            format!(
+                "DO UPDATE SET {} = excluded.{}{selection}",
+                column.name, column.name
+            ),
+        )
+    } else {
+        ("", "DO NOTHING".to_owned())
+    };
     format!(
-        "INSERT INTO {} ({}) VALUES {} ON CONFLICT{target} DO NOTHING{returning}",
+        "INSERT INTO {}{alias} ({}) VALUES {} ON CONFLICT{target} {action}{returning}",
         table.name,
         columns.join(", "),
         rows.join(", ")
@@ -1561,25 +1604,10 @@ fn generate_statement(
 ) -> (String, RowOrder) {
     let statements: &[&str] = if *in_transaction {
         &[
-            "insert",
-            "on_conflict",
-            "select",
-            "update",
-            "delete",
-            "set",
-            "commit",
-            "rollback",
+            "insert", "select", "update", "delete", "set", "commit", "rollback",
         ]
     } else {
-        &[
-            "insert",
-            "on_conflict",
-            "select",
-            "update",
-            "delete",
-            "set",
-            "begin",
-        ]
+        &["insert", "select", "update", "delete", "set", "begin"]
     };
     src.select(
         "statement",
@@ -1587,10 +1615,6 @@ fn generate_statement(
         |src, statement, _| match statement {
             "insert" => (
                 generate_insert(src, table, foreign_tables, next_key, next_child_key),
-                RowOrder::Unordered,
-            ),
-            "on_conflict" => (
-                generate_on_conflict_insert(src, table, next_key),
                 RowOrder::Unordered,
             ),
             "select" => generate_select(src, table, foreign_tables),
@@ -1664,7 +1688,7 @@ fn generate_snapshot_statement(
         statements,
         |src, statement, _| match statement {
             "insert" => (
-                generate_main_insert(src, table, next_key),
+                generate_conflict_free_main_insert(src, table, next_key),
                 RowOrder::Unordered,
             ),
             "select" => generate_snapshot_select(src, table),

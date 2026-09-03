@@ -234,7 +234,7 @@ its `WITH` clause.
 - [x] Run formatting, focused/workspace tests, and the 10,000-iteration property
   gate.
 
-### Task 7 — `ON CONFLICT DO UPDATE`
+### Task 7 — `ON CONFLICT DO UPDATE` [COMPLETE]
 
 **Goal:** Update the conflicting row using the proposed row exposed through
 `excluded`.
@@ -258,6 +258,18 @@ its `WITH` clause.
   and prepared parameters.
 - The benchmark suite includes conflict-free, `DO NOTHING`, and `DO UPDATE`
   inserts.
+
+**Progress:**
+
+- [x] Bind the target relation, its alias, and `excluded` for assignments and
+  the optional conflict predicate.
+- [x] Update the locked conflicting row through existing coercion, constraint,
+  foreign-key, and `RETURNING` paths.
+- [x] Enforce cardinality violations, secondary unique conflicts, statement
+  atomicity, and READ COMMITTED/REPEATABLE READ conflict outcomes.
+- [x] Extend differential/property, SQLx, controlled multi-session, and
+  benchmark coverage.
+- [x] Run formatting, workspace tests, and the 10,000-iteration property gate.
 
 ---
 

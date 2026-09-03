@@ -387,6 +387,21 @@ async fn sqlx_on_conflict_returns_only_inserted_rows_with_metadata() {
             .await
             .unwrap();
     assert_eq!(skipped.rows_affected(), 0);
+
+    let updated = sqlx::query(
+        "INSERT INTO conflict_items AS target VALUES ($1, $2) \
+         ON CONFLICT (id) DO UPDATE SET label = excluded.label \
+         WHERE target.label <> excluded.label RETURNING target.id, target.label",
+    )
+    .bind(2_i32)
+    .bind("updated")
+    .fetch_one(&mut connection)
+    .await
+    .unwrap();
+    assert_eq!(updated.get::<i32, _>("id"), 2);
+    assert_eq!(updated.get::<String, _>("label"), "updated");
+    assert_eq!(updated.columns()[0].type_info().name(), "INT4");
+    assert_eq!(updated.columns()[1].type_info().name(), "TEXT");
 }
 
 #[tokio::test(flavor = "multi_thread")]

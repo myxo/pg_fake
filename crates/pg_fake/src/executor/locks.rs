@@ -238,9 +238,16 @@ fn collect_insert_conflict_locks(
     let schema = state
         .catalog
         .require_table(&resolve_insert_table_name(&insert.table)?)?;
-    let Some(arbiter) = writes::resolve_conflict_arbiter(schema, insert.on.as_ref())? else {
+    let Some(_) = writes::resolve_conflict_arbiter(schema, insert.on.as_ref())? else {
         return Ok(Vec::new());
     };
+    let updates_conflict = matches!(
+        insert.on,
+        Some(ast::OnInsert::OnConflict(ast::OnConflict {
+            action: ast::OnConflictAction::DoUpdate(_),
+            ..
+        }))
+    );
     let values = insert.source.as_ref().and_then(|source| {
         if let ast::SetExpr::Values(values) = source.body.as_ref() {
             Some(values)
@@ -274,7 +281,7 @@ fn collect_insert_conflict_locks(
         .get(&schema.id)
         .expect("catalog table must have storage");
     let mut locks = Vec::new();
-    let mut needs_fallback = values.is_none();
+    let mut needs_fallback = values.is_none() || updates_conflict;
     for expressions in values.into_iter().flat_map(|values| &values.rows) {
         if expressions.len() != column_indexes.len() {
             continue;
@@ -324,9 +331,7 @@ fn collect_insert_conflict_locks(
             needs_fallback = true;
             continue;
         }
-        if let Some(row_id) =
-            table.find_conflicting_row(&row, xid, &state.transactions, arbiter.get_columns())
-        {
+        if let Some(row_id) = table.find_conflicting_row(&row, xid, &state.transactions, None) {
             locks.push(RequiredRowLock {
                 key: RowLockKey {
                     table_id: schema.id,
@@ -338,9 +343,10 @@ fn collect_insert_conflict_locks(
         }
     }
     if needs_fallback {
+        locks.clear();
         locks.extend(
             table
-                .find_unique_candidate_rows(xid, &state.transactions, arbiter.get_columns())
+                .find_unique_candidate_rows(xid, &state.transactions, None)
                 .into_iter()
                 .map(|row_id| RequiredRowLock {
                     key: RowLockKey {

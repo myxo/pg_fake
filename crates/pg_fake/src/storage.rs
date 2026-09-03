@@ -364,6 +364,30 @@ impl Table {
     }
 
     #[cfg_attr(feature = "execution-log", tracing::instrument(skip_all))]
+    pub(crate) fn find_visible_unique_conflict(
+        &self,
+        row: &Row,
+        snapshot: &Snapshot,
+        current_xid: Xid,
+        transactions: &TransactionRegistry,
+        arbiter_columns: &[usize],
+    ) -> Option<(RowId, &RowVersion)> {
+        let snapshot = snapshot.include_current_command();
+        let index = self
+            .indexes
+            .iter()
+            .find(|index| index.columns == arbiter_columns)?;
+        let key = build_row_index_key(&self.schema, index, row)?;
+        index.entries.get(&key)?.iter().find_map(|row_id| {
+            let version = self.version_chains.chains.get(row_id).and_then(|chain| {
+                find_visible_version(chain, &snapshot, current_xid, transactions)
+            })?;
+            (build_row_index_key(&self.schema, index, &version.row).as_ref() == Some(&key))
+                .then_some((*row_id, version))
+        })
+    }
+
+    #[cfg_attr(feature = "execution-log", tracing::instrument(skip_all))]
     pub(crate) fn find_conflicting_row(
         &self,
         row: &Row,

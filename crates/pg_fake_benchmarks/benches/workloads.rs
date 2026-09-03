@@ -1129,6 +1129,35 @@ fn on_conflict_benchmark(
         });
     }
     group.finish();
+
+    let insert = "INSERT INTO insert_on_conflict_do_nothing VALUES (2, 'new') ON CONFLICT (id) DO UPDATE SET value = excluded.value";
+    let mut group = criterion
+        .benchmark_group(benchmarks::find_benchmark("insert_on_conflict_conflict_free").name);
+    group.throughput(Throughput::Elements(1));
+    for (name, connection) in connections.iter_mut() {
+        group.bench_function(*name, |benchmark| {
+            benchmark.iter(|| {
+                connection.execute(runtime, insert);
+                connection.execute(
+                    runtime,
+                    "DELETE FROM insert_on_conflict_do_nothing WHERE id = 2",
+                );
+            });
+        });
+    }
+    group.finish();
+
+    let update = "INSERT INTO insert_on_conflict_do_nothing VALUES (1, 'proposed') ON CONFLICT (id) DO UPDATE SET value = excluded.value";
+    let mut group =
+        criterion.benchmark_group(benchmarks::find_benchmark("insert_on_conflict_do_update").name);
+    group.throughput(Throughput::Elements(1));
+    for (name, connection) in connections.iter_mut() {
+        group.bench_function(*name, |benchmark| {
+            benchmark.iter(|| connection.execute(runtime, update));
+        });
+    }
+    group.finish();
+
     for (_, connection) in connections.iter_mut() {
         connection.execute(runtime, "DROP TABLE insert_on_conflict_do_nothing");
     }

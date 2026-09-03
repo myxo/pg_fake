@@ -3996,6 +3996,136 @@ mod tests {
 
     #[test]
     #[cfg_attr(feature = "execution-log", tracing::instrument(skip_all))]
+    fn rechecks_concurrent_on_conflict_updates_for_each_isolation_level() {
+        let db = Db::create_builder()
+            .set_lock_timeout(Duration::from_secs(2))
+            .build();
+        let mut first = db.create_session();
+        let mut second = db.create_session();
+        first
+            .execute("CREATE TABLE items (id INTEGER PRIMARY KEY, value TEXT UNIQUE)")
+            .unwrap();
+        first.execute("BEGIN").unwrap();
+        first
+            .execute("INSERT INTO items VALUES (1, 'old')")
+            .unwrap();
+
+        let (result_sender, result_receiver) = mpsc::channel();
+        let handle = thread::spawn(move || {
+            result_sender
+                .send(second.execute(
+                    "INSERT INTO items VALUES (1, 'committed') \
+                     ON CONFLICT (id) DO UPDATE SET value = excluded.value",
+                ))
+                .unwrap();
+        });
+        wait_until_blocked(&db);
+        first.execute("COMMIT").unwrap();
+        assert_eq!(
+            result_receiver
+                .recv_timeout(Duration::from_secs(1))
+                .unwrap(),
+            Ok(create_affected_results(1))
+        );
+        handle.join().unwrap();
+
+        let mut first = db.create_session();
+        let mut second = db.create_session();
+        first.execute("BEGIN").unwrap();
+        first
+            .execute("INSERT INTO items VALUES (2, 'old')")
+            .unwrap();
+        let (result_sender, result_receiver) = mpsc::channel();
+        let handle = thread::spawn(move || {
+            result_sender
+                .send(second.execute(
+                    "INSERT INTO items VALUES (2, 'after rollback') \
+                     ON CONFLICT (id) DO UPDATE SET value = excluded.value",
+                ))
+                .unwrap();
+        });
+        wait_until_blocked(&db);
+        first.execute("ROLLBACK").unwrap();
+        assert_eq!(
+            result_receiver
+                .recv_timeout(Duration::from_secs(1))
+                .unwrap(),
+            Ok(create_affected_results(1))
+        );
+        handle.join().unwrap();
+
+        let mut first = db.create_session();
+        let mut second = db.create_session();
+        second
+            .execute("BEGIN ISOLATION LEVEL REPEATABLE READ")
+            .unwrap();
+        second.query("SELECT * FROM items", &[]).unwrap();
+        first.execute("BEGIN").unwrap();
+        first
+            .execute("UPDATE items SET value = 'holder' WHERE id = 1")
+            .unwrap();
+        let (result_sender, result_receiver) = mpsc::channel();
+        let handle = thread::spawn(move || {
+            let error = second
+                .execute(
+                    "INSERT INTO items VALUES (1, 'repeatable') \
+                     ON CONFLICT (id) DO UPDATE SET value = excluded.value",
+                )
+                .unwrap_err();
+            second.execute("ROLLBACK").unwrap();
+            result_sender.send(error.sqlstate).unwrap();
+        });
+        wait_until_blocked(&db);
+        first.execute("COMMIT").unwrap();
+        assert_eq!(
+            result_receiver
+                .recv_timeout(Duration::from_secs(1))
+                .unwrap(),
+            SqlState::SerializationFailure
+        );
+        handle.join().unwrap();
+
+        let mut first = db.create_session();
+        let mut second = db.create_session();
+        first.execute("BEGIN").unwrap();
+        first
+            .execute("INSERT INTO items VALUES (3, 'reserved')")
+            .unwrap();
+        let (result_sender, result_receiver) = mpsc::channel();
+        let handle = thread::spawn(move || {
+            let error = second
+                .execute(
+                    "INSERT INTO items VALUES (1, 'reserved') \
+                     ON CONFLICT (id) DO UPDATE SET value = excluded.value",
+                )
+                .unwrap_err();
+            result_sender.send(error.sqlstate).unwrap();
+        });
+        wait_until_blocked(&db);
+        first.execute("COMMIT").unwrap();
+        assert_eq!(
+            result_receiver
+                .recv_timeout(Duration::from_secs(1))
+                .unwrap(),
+            SqlState::UniqueViolation
+        );
+        handle.join().unwrap();
+
+        assert_eq!(
+            first
+                .query("SELECT id, value FROM items ORDER BY id", &[])
+                .unwrap()
+                .rows,
+            vec![
+                vec![Value::Int4(1), Value::Text("holder".into())],
+                vec![Value::Int4(2), Value::Text("after rollback".into())],
+                vec![Value::Int4(3), Value::Text("reserved".into())],
+            ]
+        );
+    }
+
+    #[test]
+    #[cfg_attr(feature = "execution-log", tracing::instrument(skip_all))]
     fn aborts_newest_deadlocked_transaction_and_allows_survivor() {
         let db = Db::create_builder()
             .set_lock_timeout(Duration::from_secs(2))

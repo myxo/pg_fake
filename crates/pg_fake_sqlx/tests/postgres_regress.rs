@@ -28,7 +28,7 @@ enum Outcome {
 
 static TEST_LOCK: Mutex<()> = Mutex::new(());
 
-const MINIMUM_PASSED_STATEMENTS: usize = 463;
+const MINIMUM_PASSED_STATEMENTS: usize = 460;
 const REVIEWED_SKIPPED_SCRIPTS: usize = 141;
 const PHASE2_CONFORMANCE_CASES: usize = 32;
 

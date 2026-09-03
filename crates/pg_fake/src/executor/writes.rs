@@ -9,6 +9,25 @@ struct ReturningPlan<'a> {
     columns: Vec<ColumnMeta>,
 }
 
+struct MutationAssignment<'a> {
+    index: usize,
+    expression: &'a ast::Expr,
+    prepared: Option<prepared::PreparedExpression>,
+}
+
+struct ConflictUpdatePlan<'a> {
+    scope: BoundScope,
+    assigned: BTreeSet<usize>,
+    assignments: Vec<MutationAssignment<'a>>,
+    selection: Option<&'a ast::Expr>,
+}
+
+enum InsertConflictOutcome {
+    Insert,
+    Skip,
+    Update { row_id: RowId, row: Vec<Value> },
+}
+
 pub(super) enum ConflictArbiter {
     Any,
     Index(Vec<usize>),
@@ -34,10 +53,13 @@ pub(super) fn resolve_conflict_arbiter(
     let ast::OnInsert::OnConflict(conflict) = on else {
         return reject_unsupported("INSERT conflict action is not implemented");
     };
-    if !matches!(conflict.action, ast::OnConflictAction::DoNothing) {
-        return reject_unsupported("ON CONFLICT DO UPDATE is not implemented");
-    }
     let Some(target) = &conflict.conflict_target else {
+        if matches!(conflict.action, ast::OnConflictAction::DoUpdate(_)) {
+            return Err(PgError::create(
+                SqlState::SyntaxError,
+                "ON CONFLICT DO UPDATE requires inference specification or constraint name",
+            ));
+        }
         return Ok(Some(ConflictArbiter::Any));
     };
     let constraint_columns = match target {
@@ -295,49 +317,137 @@ fn create_write_result(
 }
 
 #[cfg_attr(feature = "execution-log", tracing::instrument(skip_all))]
-pub(super) fn execute_insert(
+fn build_mutation_assignments<'a>(
+    state: &DatabaseState,
+    schema: &TableSchema,
+    scope: &BoundScope,
+    assignments: &'a [ast::Assignment],
+) -> Result<(BTreeSet<usize>, Vec<MutationAssignment<'a>>)> {
+    let mut assigned = BTreeSet::new();
+    let assignments = assignments
+        .iter()
+        .map(|assignment| {
+            let ast::AssignmentTarget::ColumnName(column) = &assignment.target else {
+                return reject_unsupported("UPDATE tuple assignment is not implemented");
+            };
+            let column_name = normalize_unqualified_object_name(column)?;
+            let index = schema
+                .columns
+                .iter()
+                .position(|definition| definition.name == column_name)
+                .ok_or_else(|| {
+                    PgError::create(
+                        SqlState::UndefinedColumn,
+                        format!("column {column_name:?} does not exist"),
+                    )
+                })?;
+            if !assigned.insert(index) {
+                return Err(PgError::create(
+                    SqlState::SyntaxError,
+                    "multiple assignments to the same column",
+                ));
+            }
+            if !is_default_expression(&assignment.value)
+                && !is_null_literal(&assignment.value)
+                && extract_unknown_string_literal(&assignment.value).is_none()
+                && !coercion::can_cast(
+                    query::infer_query_expression_type(state, &assignment.value, scope)?.base,
+                    schema.columns[index].data_type.base,
+                    CastContext::Assignment,
+                )
+            {
+                return Err(PgError::create(
+                    SqlState::DatatypeMismatch,
+                    "column has incompatible type",
+                ));
+            }
+            let prepared = if is_default_expression(&assignment.value) {
+                None
+            } else {
+                prepared::bind_prepared_expression(&assignment.value, scope, &[])?.filter(
+                    |expression| expression.get_data_type() == schema.columns[index].data_type.base,
+                )
+            };
+            Ok(MutationAssignment {
+                index,
+                expression: &assignment.value,
+                prepared,
+            })
+        })
+        .collect::<Result<Vec<_>>>()?;
+    Ok((assigned, assignments))
+}
+
+#[cfg_attr(feature = "execution-log", tracing::instrument(skip_all))]
+fn build_conflict_update_plan<'a>(
+    state: &DatabaseState,
+    schema: &TableSchema,
+    alias: Option<&ast::Ident>,
+    update: &'a ast::DoUpdate,
+) -> Result<ConflictUpdatePlan<'a>> {
+    let target = bind_target_scope(schema, alias);
+    let excluded_name = ast::Ident::new("excluded");
+    let mut excluded = bind_target_scope(schema, Some(&excluded_name));
+    for column in &mut excluded.columns {
+        column.unqualified = false;
+        column.table_id = None;
+    }
+    let scope = combine_bound_scopes(target, excluded);
+    if let Some(selection) = &update.selection {
+        let base = query::infer_query_expression_type(state, selection, &scope)?.base;
+        if base != BaseType::Bool && !is_null_literal(selection) {
+            return Err(PgError::create(
+                SqlState::DatatypeMismatch,
+                "WHERE requires a boolean expression",
+            ));
+        }
+    }
+    let (assigned, assignments) =
+        build_mutation_assignments(state, schema, &scope, &update.assignments)?;
+    Ok(ConflictUpdatePlan {
+        scope,
+        assigned,
+        assignments,
+        selection: update.selection.as_ref(),
+    })
+}
+
+#[cfg_attr(feature = "execution-log", tracing::instrument(skip_all))]
+fn resolve_insert_column_indexes(
+    schema: &TableSchema,
+    columns: &[ast::ObjectName],
+) -> Result<Vec<usize>> {
+    if columns.is_empty() {
+        return Ok((0..schema.columns.len()).collect());
+    }
+    columns
+        .iter()
+        .map(|name| {
+            let name = normalize_unqualified_object_name(name)?;
+            schema
+                .columns
+                .iter()
+                .position(|column| column.name == name)
+                .ok_or_else(|| {
+                    PgError::create(
+                        SqlState::UndefinedColumn,
+                        format!("column {:?} does not exist", name),
+                    )
+                })
+        })
+        .collect()
+}
+
+#[cfg_attr(feature = "execution-log", tracing::instrument(skip_all))]
+fn evaluate_insert_rows(
     state: &mut DatabaseState,
     insert: &ast::Insert,
+    schema: &TableSchema,
+    column_indexes: &[usize],
     xid: Xid,
     snapshot: &Snapshot,
-    deferred_constraints: &BTreeSet<String>,
-    defer_all: bool,
     context: &StatementExecutionContext,
-) -> Result<StatementResult> {
-    let table_name = resolve_insert_table_name(&insert.table)?;
-    let schema = state.catalog.require_table(&table_name)?.clone();
-    let conflict_arbiter = resolve_conflict_arbiter(&schema, insert.on.as_ref())?;
-    let returning_scope = bind_target_scope(
-        &schema,
-        insert.table_alias.as_ref().map(|alias| &alias.alias),
-    );
-    let returning = build_returning_plan(
-        state,
-        returning_scope,
-        schema.columns.len(),
-        insert.returning.as_deref(),
-    )?;
-    let column_indexes = if insert.columns.is_empty() {
-        (0..schema.columns.len()).collect::<Vec<_>>()
-    } else {
-        insert
-            .columns
-            .iter()
-            .map(|name| {
-                let name = crate::executor::normalize_unqualified_object_name(name)?;
-                schema
-                    .columns
-                    .iter()
-                    .position(|column| column.name == name)
-                    .ok_or_else(|| {
-                        PgError::create(
-                            SqlState::UndefinedColumn,
-                            format!("column {:?} does not exist", name),
-                        )
-                    })
-            })
-            .collect::<Result<Vec<_>>>()?
-    };
+) -> Result<Vec<Vec<Value>>> {
     let provided = column_indexes.iter().copied().collect::<BTreeSet<_>>();
     let static_defaults = schema
         .columns
@@ -378,9 +488,9 @@ pub(super) fn execute_insert(
             }
         }
         let constants = create_constant_expression_schema();
-        for (expr, index) in expressions.iter().zip(&column_indexes) {
+        for (expression, index) in expressions.iter().zip(column_indexes) {
             if schema.columns[*index].identity == Some(IdentityKind::Always)
-                && !is_default_expression(expr)
+                && !is_default_expression(expression)
             {
                 return Err(PgError::create(
                     SqlState::GeneratedAlways,
@@ -390,11 +500,11 @@ pub(super) fn execute_insert(
                     ),
                 ));
             }
-            row[*index] = if is_default_expression(expr) {
+            row[*index] = if is_default_expression(expression) {
                 evaluate_default(*index)?
             } else {
                 evaluate_assignment_expression(
-                    expr,
+                    expression,
                     schema.columns[*index].data_type,
                     &constants,
                     &[],
@@ -402,129 +512,392 @@ pub(super) fn execute_insert(
                 )?
             };
         }
-        validate_not_null(&schema, &row)?;
-        validate_check_constraints(&schema, &row, context)?;
+        validate_not_null(schema, &row)?;
+        validate_check_constraints(schema, &row, context)?;
         Ok(row)
     };
-    let rows = if let Some(source) = &insert.source {
-        if let ast::SetExpr::Values(values) = source.body.as_ref() {
-            values
-                .rows
-                .iter()
-                .map(|expressions| build_row(expressions))
-                .collect::<Result<Vec<_>>>()?
-        } else {
-            if column_indexes
-                .iter()
-                .any(|index| schema.columns[*index].identity == Some(IdentityKind::Always))
-            {
-                return Err(PgError::create(
-                    SqlState::GeneratedAlways,
-                    "cannot insert a non-DEFAULT value into an identity column",
-                ));
-            }
-            let unknown_columns = identify_unknown_query_columns(source, column_indexes.len());
-            let StatementResult::Query(source) =
-                query::execute_query(state, source, xid, snapshot, context)?
-            else {
-                unreachable!("query execution returns rows")
-            };
-            if source.columns.len() != column_indexes.len() {
-                return Err(PgError::create(
-                    SqlState::SyntaxError,
-                    "INSERT has wrong number of values",
-                ));
-            }
-            source
-                .rows
-                .into_iter()
-                .map(|values| {
-                    let mut row = vec![Value::Null; schema.columns.len()];
-                    for index in 0..schema.columns.len() {
-                        if !provided.contains(&index) {
-                            row[index] = evaluate_default(index)?;
-                        }
-                    }
-                    for (((value, source_column), unknown), index) in values
-                        .into_iter()
-                        .zip(&source.columns)
-                        .zip(&unknown_columns)
-                        .zip(&column_indexes)
-                    {
-                        row[*index] = if *unknown {
-                            let Value::Text(text) = value else {
-                                unreachable!("unknown string literals evaluate to text")
-                            };
-                            coercion::coerce_unknown(
-                                &text,
-                                schema.columns[*index].data_type,
-                                CastContext::Assignment,
-                            )?
-                        } else {
-                            let source_type = BaseType::resolve_oid(source_column.type_oid)
-                                .expect("query columns use supported PostgreSQL types");
-                            coercion::coerce(
-                                value,
-                                source_type,
-                                schema.columns[*index].data_type,
-                                CastContext::Assignment,
-                            )?
-                        };
-                    }
-                    validate_not_null(&schema, &row)?;
-                    validate_check_constraints(&schema, &row, context)?;
-                    Ok(row)
-                })
-                .collect::<Result<Vec<_>>>()?
-        }
-    } else {
+    let Some(source) = &insert.source else {
         assert!(insert.columns.is_empty());
-        schema
+        let row = schema
             .columns
             .iter()
             .enumerate()
             .map(|(index, _)| evaluate_default(index))
-            .collect::<Result<Vec<_>>>()
-            .and_then(|row| {
-                validate_not_null(&schema, &row)?;
-                validate_check_constraints(&schema, &row, context)?;
-                Ok(vec![row])
-            })?
+            .collect::<Result<Vec<_>>>()?;
+        validate_not_null(schema, &row)?;
+        validate_check_constraints(schema, &row, context)?;
+        return Ok(vec![row]);
     };
-    let can_move_inserted_row = returning.is_none()
-        && !schema
-            .constraints
+    if let ast::SetExpr::Values(values) = source.body.as_ref() {
+        return values
+            .rows
             .iter()
-            .any(|constraint| matches!(constraint, Constraint::ForeignKey(_)));
-    let mut returned_rows = Vec::new();
-    let mut affected = 0;
-    for row in rows {
-        let table = state
-            .tables
-            .get(&schema.id)
-            .expect("catalog table must have storage");
-        if let Some(arbiter) = &conflict_arbiter
-            && table.has_visible_unique_conflict(
-                &row,
+            .map(|expressions| build_row(expressions))
+            .collect();
+    }
+    if column_indexes
+        .iter()
+        .any(|index| schema.columns[*index].identity == Some(IdentityKind::Always))
+    {
+        return Err(PgError::create(
+            SqlState::GeneratedAlways,
+            "cannot insert a non-DEFAULT value into an identity column",
+        ));
+    }
+    let unknown_columns = identify_unknown_query_columns(source, column_indexes.len());
+    let StatementResult::Query(source) =
+        query::execute_query(state, source, xid, snapshot, context)?
+    else {
+        unreachable!("query execution returns rows")
+    };
+    if source.columns.len() != column_indexes.len() {
+        return Err(PgError::create(
+            SqlState::SyntaxError,
+            "INSERT has wrong number of values",
+        ));
+    }
+    source
+        .rows
+        .into_iter()
+        .map(|values| {
+            let mut row = vec![Value::Null; schema.columns.len()];
+            for index in 0..schema.columns.len() {
+                if !provided.contains(&index) {
+                    row[index] = evaluate_default(index)?;
+                }
+            }
+            for (((value, source_column), unknown), index) in values
+                .into_iter()
+                .zip(&source.columns)
+                .zip(&unknown_columns)
+                .zip(column_indexes)
+            {
+                row[*index] = if *unknown {
+                    let Value::Text(text) = value else {
+                        unreachable!("unknown string literals evaluate to text")
+                    };
+                    coercion::coerce_unknown(
+                        &text,
+                        schema.columns[*index].data_type,
+                        CastContext::Assignment,
+                    )?
+                } else {
+                    let source_type = BaseType::resolve_oid(source_column.type_oid)
+                        .expect("query columns use supported PostgreSQL types");
+                    coercion::coerce(
+                        value,
+                        source_type,
+                        schema.columns[*index].data_type,
+                        CastContext::Assignment,
+                    )?
+                };
+            }
+            validate_not_null(schema, &row)?;
+            validate_check_constraints(schema, &row, context)?;
+            Ok(row)
+        })
+        .collect()
+}
+
+#[cfg_attr(feature = "execution-log", tracing::instrument(skip_all))]
+fn execute_insert_conflict(
+    state: &mut DatabaseState,
+    schema: &TableSchema,
+    row: &Vec<Value>,
+    arbiter: Option<&ConflictArbiter>,
+    update: Option<&ConflictUpdatePlan<'_>>,
+    affected_rows: &BTreeSet<RowId>,
+    has_referencing_foreign_keys: bool,
+    xid: Xid,
+    snapshot: &Snapshot,
+    deferred_constraints: &BTreeSet<String>,
+    defer_all: bool,
+    context: &StatementExecutionContext,
+) -> Result<InsertConflictOutcome> {
+    let Some(arbiter) = arbiter else {
+        return Ok(InsertConflictOutcome::Insert);
+    };
+    let table = state
+        .tables
+        .get(&schema.id)
+        .expect("catalog table must have storage");
+    let Some(update) = update else {
+        return Ok(
+            if table.has_visible_unique_conflict(
+                row,
                 snapshot,
                 xid,
                 &state.transactions,
                 None,
                 None,
                 arbiter.get_columns(),
-            )
-        {
-            continue;
-        }
-        if table.has_visible_unique_conflict(
-            &row,
+            ) {
+                InsertConflictOutcome::Skip
+            } else {
+                InsertConflictOutcome::Insert
+            },
+        );
+    };
+    let columns = arbiter
+        .get_columns()
+        .expect("DO UPDATE requires a unique arbiter");
+    let conflict = table
+        .find_visible_unique_conflict(row, snapshot, xid, &state.transactions, columns)
+        .map(|(row_id, version)| (row_id, version.xmin, version.row.clone()));
+    let Some((row_id, version_xmin, current)) = conflict else {
+        return Ok(InsertConflictOutcome::Insert);
+    };
+    let mut bound_row = current.clone();
+    bound_row.extend_from_slice(row);
+    if !matches_mutation_row(
+        state,
+        update.selection,
+        &update.scope,
+        &bound_row,
+        xid,
+        snapshot,
+        context,
+    )? {
+        return Ok(InsertConflictOutcome::Skip);
+    }
+    if affected_rows.contains(&row_id) {
+        return Err(PgError::create(
+            SqlState::CardinalityViolation,
+            "ON CONFLICT DO UPDATE command cannot affect row a second time",
+        ));
+    }
+    let mut updated = current.clone();
+    for assignment in &update.assignments {
+        updated[assignment.index] = if is_default_expression(assignment.expression) {
+            evaluate_column_default(&schema.columns[assignment.index], context)?
+        } else if let Some(prepared) = &assignment.prepared {
+            prepared::evaluate_prepared_expression(prepared, &bound_row, &[])?
+        } else {
+            evaluate_mutation_assignment(
+                state,
+                assignment.expression,
+                schema.columns[assignment.index].data_type,
+                &update.scope,
+                &bound_row,
+                xid,
+                snapshot,
+                context,
+            )?
+        };
+    }
+    validate_not_null(schema, &updated)?;
+    validate_check_constraints(schema, &updated, context)?;
+    if state
+        .tables
+        .get(&schema.id)
+        .expect("catalog table must have storage")
+        .has_visible_unique_conflict(
+            &updated,
             snapshot,
             xid,
             &state.transactions,
+            Some(row_id),
+            Some(&update.assigned),
             None,
-            None,
-            None,
-        ) {
+        )
+    {
+        return Err(PgError::create(
+            SqlState::UniqueViolation,
+            format!(
+                "duplicate key value violates unique constraint on {:?}",
+                schema.name
+            ),
+        ));
+    }
+    state
+        .tables
+        .get_mut(&schema.id)
+        .expect("catalog table must have storage")
+        .append_updated_version(
+            row_id,
+            version_xmin,
+            xid,
+            context.command_id,
+            updated.clone(),
+            Some(&update.assigned),
+        );
+    state.mark_table_touched(xid, schema.id);
+    validate_row_foreign_keys(
+        state,
+        schema,
+        &updated,
+        xid,
+        snapshot,
+        deferred_constraints,
+        defer_all,
+    )?;
+    if has_referencing_foreign_keys {
+        apply_referencing_foreign_key_actions(
+            state,
+            schema,
+            &current,
+            Some(&updated),
+            xid,
+            snapshot,
+            deferred_constraints,
+            defer_all,
+            &mut BTreeSet::new(),
+            context,
+        )?;
+    }
+    Ok(InsertConflictOutcome::Update {
+        row_id,
+        row: updated,
+    })
+}
+
+#[cfg_attr(feature = "execution-log", tracing::instrument(skip_all))]
+fn insert_new_row(
+    state: &mut DatabaseState,
+    schema: &TableSchema,
+    row: Vec<Value>,
+    can_move_row: bool,
+    returning: Option<&ReturningPlan<'_>>,
+    returned_rows: &mut Vec<Vec<Value>>,
+    xid: Xid,
+    snapshot: &Snapshot,
+    deferred_constraints: &BTreeSet<String>,
+    defer_all: bool,
+    context: &StatementExecutionContext,
+) -> Result<RowId> {
+    let retained_row = (!can_move_row).then(|| row.clone());
+    let row_id = state
+        .tables
+        .get_mut(&schema.id)
+        .expect("catalog table must have storage")
+        .insert(xid, context.command_id, row);
+    assert!(matches!(
+        state.row_locks.acquire(
+            RowLockKey {
+                table_id: schema.id,
+                row_id,
+            },
+            xid,
+            RowLockMode::Update,
+        ),
+        RowLockAttempt::Acquired
+    ));
+    state.mark_table_touched(xid, schema.id);
+    if let Some(row) = retained_row {
+        validate_row_foreign_keys(
+            state,
+            schema,
+            &row,
+            xid,
+            snapshot,
+            deferred_constraints,
+            defer_all,
+        )?;
+        evaluate_returning_row(
+            state,
+            returning,
+            &row,
+            returned_rows,
+            xid,
+            snapshot,
+            context,
+        )?;
+    }
+    Ok(row_id)
+}
+
+#[cfg_attr(feature = "execution-log", tracing::instrument(skip_all))]
+pub(super) fn execute_insert(
+    state: &mut DatabaseState,
+    insert: &ast::Insert,
+    xid: Xid,
+    snapshot: &Snapshot,
+    deferred_constraints: &BTreeSet<String>,
+    defer_all: bool,
+    context: &StatementExecutionContext,
+) -> Result<StatementResult> {
+    let table_name = resolve_insert_table_name(&insert.table)?;
+    let schema = state.catalog.require_table(&table_name)?.clone();
+    let conflict_arbiter = resolve_conflict_arbiter(&schema, insert.on.as_ref())?;
+    let conflict_update = match insert.on.as_ref() {
+        Some(ast::OnInsert::OnConflict(ast::OnConflict {
+            action: ast::OnConflictAction::DoUpdate(update),
+            ..
+        })) => Some(build_conflict_update_plan(
+            state,
+            &schema,
+            insert.table_alias.as_ref().map(|alias| &alias.alias),
+            update,
+        )?),
+        _ => None,
+    };
+    let returning_scope = bind_target_scope(
+        &schema,
+        insert.table_alias.as_ref().map(|alias| &alias.alias),
+    );
+    let returning = build_returning_plan(
+        state,
+        returning_scope,
+        schema.columns.len(),
+        insert.returning.as_deref(),
+    )?;
+    let column_indexes = resolve_insert_column_indexes(&schema, &insert.columns)?;
+    let rows = evaluate_insert_rows(
+        state,
+        insert,
+        &schema,
+        &column_indexes,
+        xid,
+        snapshot,
+        context,
+    )?;
+    let can_move_inserted_row = returning.is_none()
+        && !schema
+            .constraints
+            .iter()
+            .any(|constraint| matches!(constraint, Constraint::ForeignKey(_)));
+    let has_referencing_foreign_keys = state.catalog.has_referencing_foreign_keys(&schema.name);
+    let mut returned_rows = Vec::new();
+    let mut affected = 0;
+    let mut affected_rows = BTreeSet::new();
+    for row in rows {
+        match execute_insert_conflict(
+            state,
+            &schema,
+            &row,
+            conflict_arbiter.as_ref(),
+            conflict_update.as_ref(),
+            &affected_rows,
+            has_referencing_foreign_keys,
+            xid,
+            snapshot,
+            deferred_constraints,
+            defer_all,
+            context,
+        )? {
+            InsertConflictOutcome::Skip => continue,
+            InsertConflictOutcome::Update { row_id, row } => {
+                affected += 1;
+                affected_rows.insert(row_id);
+                evaluate_returning_row(
+                    state,
+                    returning.as_ref(),
+                    &row,
+                    &mut returned_rows,
+                    xid,
+                    snapshot,
+                    context,
+                )?;
+                continue;
+            }
+            InsertConflictOutcome::Insert => {}
+        }
+        if state
+            .tables
+            .get(&schema.id)
+            .expect("catalog table must have storage")
+            .has_visible_unique_conflict(&row, snapshot, xid, &state.transactions, None, None, None)
+        {
             return Err(PgError::create(
                 SqlState::UniqueViolation,
                 format!(
@@ -534,61 +907,20 @@ pub(super) fn execute_insert(
             ));
         }
         affected += 1;
-        if can_move_inserted_row {
-            let row_id = state
-                .tables
-                .get_mut(&schema.id)
-                .expect("catalog table must have storage")
-                .insert(xid, context.command_id, row);
-            assert!(matches!(
-                state.row_locks.acquire(
-                    RowLockKey {
-                        table_id: schema.id,
-                        row_id,
-                    },
-                    xid,
-                    RowLockMode::Update,
-                ),
-                RowLockAttempt::Acquired
-            ));
-            state.mark_table_touched(xid, schema.id);
-            continue;
-        }
-        let row_id = state
-            .tables
-            .get_mut(&schema.id)
-            .expect("catalog table must have storage")
-            .insert(xid, context.command_id, row.clone());
-        assert!(matches!(
-            state.row_locks.acquire(
-                RowLockKey {
-                    table_id: schema.id,
-                    row_id,
-                },
-                xid,
-                RowLockMode::Update,
-            ),
-            RowLockAttempt::Acquired
-        ));
-        state.mark_table_touched(xid, schema.id);
-        validate_row_foreign_keys(
+        let row_id = insert_new_row(
             state,
             &schema,
-            &row,
+            row,
+            can_move_inserted_row,
+            returning.as_ref(),
+            &mut returned_rows,
             xid,
             snapshot,
             deferred_constraints,
             defer_all,
-        )?;
-        evaluate_returning_row(
-            state,
-            returning.as_ref(),
-            &row,
-            &mut returned_rows,
-            xid,
-            snapshot,
             context,
         )?;
+        affected_rows.insert(row_id);
     }
     Ok(create_write_result(affected, returning, returned_rows))
 }
@@ -651,54 +983,7 @@ pub(super) fn execute_update(
             ));
         }
     }
-    let mut assigned = BTreeSet::new();
-    let assignments = assignments
-        .iter()
-        .map(|assignment| {
-            let ast::AssignmentTarget::ColumnName(column) = &assignment.target else {
-                return reject_unsupported("UPDATE tuple assignment is not implemented");
-            };
-            let column_name = normalize_unqualified_object_name(column)?;
-            let index = schema
-                .columns
-                .iter()
-                .position(|definition| definition.name == column_name)
-                .ok_or_else(|| {
-                    PgError::create(
-                        SqlState::UndefinedColumn,
-                        format!("column {column_name:?} does not exist"),
-                    )
-                })?;
-            if !assigned.insert(index) {
-                return Err(PgError::create(
-                    SqlState::SyntaxError,
-                    "multiple assignments to the same column",
-                ));
-            }
-            if !is_default_expression(&assignment.value)
-                && !is_null_literal(&assignment.value)
-                && extract_unknown_string_literal(&assignment.value).is_none()
-                && !coercion::can_cast(
-                    query::infer_query_expression_type(state, &assignment.value, &scope)?.base,
-                    schema.columns[index].data_type.base,
-                    CastContext::Assignment,
-                )
-            {
-                return Err(PgError::create(
-                    SqlState::DatatypeMismatch,
-                    "column has incompatible type",
-                ));
-            }
-            let prepared = if is_default_expression(&assignment.value) {
-                None
-            } else {
-                prepared::bind_prepared_expression(&assignment.value, &scope, &[])?.filter(
-                    |expression| expression.get_data_type() == schema.columns[index].data_type.base,
-                )
-            };
-            Ok((index, &assignment.value, prepared))
-        })
-        .collect::<Result<Vec<_>>>()?;
+    let (assigned, assignments) = build_mutation_assignments(state, &schema, &scope, assignments)?;
     let source_rows = materialize_mutation_source_rows(
         state,
         from,
@@ -730,17 +1015,17 @@ pub(super) fn execute_update(
     let mut returned_rows = Vec::new();
     for (row_id, version_xmin, row, mut bound_row) in targets {
         let mut assigned_values = Vec::with_capacity(assignments.len());
-        for (index, expression, prepared) in &assignments {
-            let target = schema.columns[*index].data_type;
+        for assignment in &assignments {
+            let target = schema.columns[assignment.index].data_type;
             let assignment_row = bound_row.as_deref().unwrap_or(&row);
-            let value = if is_default_expression(expression) {
-                evaluate_column_default(&schema.columns[*index], context)?
-            } else if let Some(prepared) = prepared {
+            let value = if is_default_expression(assignment.expression) {
+                evaluate_column_default(&schema.columns[assignment.index], context)?
+            } else if let Some(prepared) = &assignment.prepared {
                 prepared::evaluate_prepared_expression(prepared, assignment_row, &[])?
             } else {
                 evaluate_mutation_assignment(
                     state,
-                    expression,
+                    assignment.expression,
                     target,
                     &scope,
                     assignment_row,
@@ -749,7 +1034,7 @@ pub(super) fn execute_update(
                     context,
                 )?
             };
-            assigned_values.push((*index, value));
+            assigned_values.push((assignment.index, value));
         }
         let (old_row, mut updated) = if has_referencing_foreign_keys {
             (Some(row.clone()), row)

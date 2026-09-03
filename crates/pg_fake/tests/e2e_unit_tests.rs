@@ -1669,6 +1669,47 @@ fn matches_on_conflict_do_nothing() {
 }
 
 #[test]
+fn matches_on_conflict_do_update() {
+    assert_differential(
+        "CREATE TABLE __TABLE__ (
+             id INTEGER PRIMARY KEY,
+             email TEXT UNIQUE,
+             amount INTEGER DEFAULT 5 CHECK (amount >= 0)
+         ); \
+         INSERT INTO __TABLE__ VALUES (1, 'a', 2), (2, 'b', 4); \
+         INSERT INTO __TABLE__ AS target VALUES (1, 'new', 3)
+             ON CONFLICT (id) DO UPDATE
+             SET email = excluded.email, amount = target.amount + excluded.amount
+             RETURNING id, email, amount; \
+         INSERT INTO __TABLE__ AS target VALUES (1, 'new', 20)
+             ON CONFLICT (id) DO UPDATE SET amount = excluded.amount
+             WHERE target.email <> excluded.email RETURNING amount; \
+         INSERT INTO __TABLE__ VALUES (1, 'new', 9)
+             ON CONFLICT (id) DO UPDATE SET amount = DEFAULT RETURNING amount; \
+         INSERT INTO __TABLE__ VALUES (1, 'b', 8)
+             ON CONFLICT (id) DO UPDATE SET email = excluded.email; \
+         INSERT INTO __TABLE__ VALUES (1, 'x', 1), (1, 'y', 2)
+             ON CONFLICT (id) DO UPDATE SET email = excluded.email; \
+         INSERT INTO __TABLE__ VALUES (3, 'c', 1), (3, 'd', 2)
+             ON CONFLICT (id) DO UPDATE SET email = excluded.email; \
+         INSERT INTO __TABLE__ VALUES (1, 'x', 1)
+             ON CONFLICT DO UPDATE SET email = excluded.email; \
+         SELECT id, email, amount FROM __TABLE__ ORDER BY id; \
+         CREATE TABLE __TABLE___parents (id INTEGER PRIMARY KEY, code TEXT UNIQUE); \
+         CREATE TABLE __TABLE___children (
+             id INTEGER PRIMARY KEY,
+             parent_id INTEGER REFERENCES __TABLE___parents (id) ON UPDATE CASCADE
+         ); \
+         INSERT INTO __TABLE___parents VALUES (1, 'parent'); \
+         INSERT INTO __TABLE___children VALUES (1, 1); \
+         INSERT INTO __TABLE___parents VALUES (10, 'parent')
+             ON CONFLICT (code) DO UPDATE SET id = excluded.id RETURNING id; \
+         SELECT parent_id FROM __TABLE___children",
+        RowOrder::Ordered,
+    );
+}
+
+#[test]
 fn matches_check_constraints() {
     assert_differential(
         "CREATE TABLE __TABLE__ (
