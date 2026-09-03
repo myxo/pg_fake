@@ -1386,47 +1386,62 @@ impl Session {
             rng: self.db.rng.clone(),
             sequences,
         };
-        let (acquired_state, acquired_snapshot, _) = match acquire_row_locks(
-            &condvar,
-            self.lock_timeout,
-            state,
-            RowLockTarget::Ctes(statement),
-            transaction.xid,
-            transaction.isolation,
-            snapshot,
-            &context,
-        ) {
-            Ok(acquired) => acquired,
-            Err(error) => return self.abort_with_error(error),
+        let (contains_cte, contains_subquery) = executor::detect_statement_features(statement);
+        let cte_statement = if contains_cte {
+            let (acquired_state, acquired_snapshot, _) = match acquire_row_locks(
+                &condvar,
+                self.lock_timeout,
+                state,
+                RowLockTarget::Ctes(statement),
+                transaction.xid,
+                transaction.isolation,
+                snapshot,
+                &context,
+            ) {
+                Ok(acquired) => acquired,
+                Err(error) => return self.abort_with_error(error),
+            };
+            state = acquired_state;
+            snapshot = acquired_snapshot;
+            Some(
+                match executor::materialize_ctes(
+                    &mut state,
+                    statement,
+                    transaction.xid,
+                    &snapshot,
+                    &self.deferred_constraints,
+                    self.defer_all_constraints,
+                    &context,
+                ) {
+                    Ok(statement) => statement,
+                    Err(error) => return self.abort_with_error(error),
+                },
+            )
+        } else {
+            None
         };
-        state = acquired_state;
-        snapshot = acquired_snapshot;
-        let statement = match executor::materialize_ctes(
-            &mut state,
-            statement,
-            transaction.xid,
-            &snapshot,
-            &self.deferred_constraints,
-            self.defer_all_constraints,
-            &context,
-        ) {
-            Ok(statement) => statement,
-            Err(error) => return self.abort_with_error(error),
+        let statement = cte_statement.as_ref().unwrap_or(statement);
+        let subquery_statement = if contains_subquery {
+            Some(
+                match executor::materialize_uncorrelated_subqueries(
+                    &state,
+                    statement,
+                    transaction.xid,
+                    &snapshot,
+                    &context,
+                ) {
+                    Ok(statement) => statement,
+                    Err(error) => return self.abort_with_error(error),
+                },
+            )
+        } else {
+            None
         };
-        let statement = match executor::materialize_uncorrelated_subqueries(
-            &state,
-            &statement,
-            transaction.xid,
-            &snapshot,
-            &context,
-        ) {
-            Ok(statement) => statement,
-            Err(error) => return self.abort_with_error(error),
-        };
+        let statement = subquery_statement.as_ref().unwrap_or(statement);
         if transaction.implicit_batch
-            && matches!(parser::classify(&statement), parser::StatementKind::Ddl)
+            && matches!(parser::classify(statement), parser::StatementKind::Ddl)
         {
-            let undo = match collect_ddl_undo_for_statement(&state, &statement) {
+            let undo = match collect_ddl_undo_for_statement(&state, statement) {
                 Ok(undo) => undo,
                 Err(error) => return self.abort_with_error(error),
             };
@@ -1436,7 +1451,7 @@ impl Session {
             &condvar,
             self.lock_timeout,
             state,
-            RowLockTarget::Statement(&statement),
+            RowLockTarget::Statement(statement),
             transaction.xid,
             transaction.isolation,
             snapshot,
@@ -1446,10 +1461,10 @@ impl Session {
             Err(error) => return self.abort_with_error(error),
         };
         let mutation_targets =
-            executor::mutation_locks_cover_targets(&statement).then_some(locked_rows);
+            executor::mutation_locks_cover_targets(statement).then_some(locked_rows);
         let result = executor::execute_statement(
             &mut state,
-            &statement,
+            statement,
             transaction.xid,
             &snapshot,
             &self.deferred_constraints,

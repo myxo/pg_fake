@@ -2000,6 +2000,44 @@ struct SubqueryDetector {
     found: bool,
 }
 
+struct StatementFeatureDetector {
+    cte: bool,
+    subquery: bool,
+}
+
+impl ast::Visitor for StatementFeatureDetector {
+    type Break = ();
+
+    #[cfg_attr(feature = "execution-log", tracing::instrument(skip_all))]
+    fn pre_visit_query(&mut self, query: &ast::Query) -> std::ops::ControlFlow<Self::Break> {
+        self.cte |= query.with.is_some();
+        std::ops::ControlFlow::Continue(())
+    }
+
+    #[cfg_attr(feature = "execution-log", tracing::instrument(skip_all))]
+    fn pre_visit_expr(&mut self, expr: &ast::Expr) -> std::ops::ControlFlow<Self::Break> {
+        self.subquery |= matches!(
+            expr,
+            ast::Expr::Subquery(_) | ast::Expr::Exists { .. } | ast::Expr::InSubquery { .. }
+        ) || matches!(
+            expr,
+            ast::Expr::AnyOp { right, .. } | ast::Expr::AllOp { right, .. }
+                if matches!(right.as_ref(), ast::Expr::Subquery(_))
+        );
+        std::ops::ControlFlow::Continue(())
+    }
+}
+
+#[cfg_attr(feature = "execution-log", tracing::instrument(skip_all))]
+pub(crate) fn detect_statement_features(statement: &ast::Statement) -> (bool, bool) {
+    let mut detector = StatementFeatureDetector {
+        cte: false,
+        subquery: false,
+    };
+    let _ = ast::Visit::visit(statement, &mut detector);
+    (detector.cte, detector.subquery)
+}
+
 impl ast::Visitor for SubqueryDetector {
     type Break = ();
 
