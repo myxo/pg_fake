@@ -33,7 +33,7 @@ enum PreparedProjection {
 }
 
 #[derive(Debug, Clone)]
-enum PreparedExpression {
+pub(super) enum PreparedExpression {
     Column {
         slot: usize,
         data_type: BaseType,
@@ -59,7 +59,7 @@ enum PreparedExpression {
 }
 
 impl PreparedExpression {
-    fn get_data_type(&self) -> BaseType {
+    pub(super) fn get_data_type(&self) -> BaseType {
         match self {
             Self::Column { data_type, .. }
             | Self::Parameter { data_type, .. }
@@ -303,7 +303,7 @@ fn is_prepared_expression_candidate(expression: &ast::Expr) -> bool {
     }
 }
 
-fn bind_prepared_expression(
+pub(super) fn bind_prepared_expression(
     expression: &ast::Expr,
     scope: &BoundScope,
     parameter_types: &[BaseType],
@@ -525,7 +525,7 @@ pub(crate) fn execute_prepared_query(
     Ok(rows)
 }
 
-fn evaluate_prepared_expression(
+pub(super) fn evaluate_prepared_expression(
     expression: &PreparedExpression,
     row: &[Value],
     parameters: &[Value],

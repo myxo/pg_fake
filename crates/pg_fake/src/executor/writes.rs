@@ -465,7 +465,14 @@ pub(super) fn execute_update(
                     "column has incompatible type",
                 ));
             }
-            Ok((index, &assignment.value))
+            let prepared = if is_default_expression(&assignment.value) {
+                None
+            } else {
+                prepared::bind_prepared_expression(&assignment.value, &scope, &[])?.filter(
+                    |expression| expression.get_data_type() == schema.columns[index].data_type.base,
+                )
+            };
+            Ok((index, &assignment.value, prepared))
         })
         .collect::<Result<Vec<_>>>()?;
     let source_rows = materialize_mutation_source_rows(
@@ -493,10 +500,12 @@ pub(super) fn execute_update(
     let mut returned_rows = Vec::new();
     for (row_id, version_xmin, row, mut bound_row) in targets {
         let mut updated = row.clone();
-        for (index, expression) in &assignments {
+        for (index, expression, prepared) in &assignments {
             let target = schema.columns[*index].data_type;
             updated[*index] = if is_default_expression(expression) {
                 evaluate_column_default(&schema.columns[*index], context)?
+            } else if let Some(prepared) = prepared {
+                prepared::evaluate_prepared_expression(prepared, &bound_row, &[])?
             } else {
                 evaluate_mutation_assignment(
                     state, expression, target, &scope, &bound_row, xid, snapshot, context,
