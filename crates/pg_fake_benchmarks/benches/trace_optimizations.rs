@@ -148,6 +148,26 @@ fn create_insert_database() -> Db {
     db
 }
 
+fn create_wide_insert_database() -> Db {
+    let db = Db::create();
+    let mut session = db.create_session();
+    execute(
+        &mut session,
+        "CREATE TABLE wide_inserted_rows (
+            id INTEGER PRIMARY KEY,
+            payload_1 TEXT,
+            payload_2 TEXT,
+            payload_3 TEXT,
+            payload_4 TEXT,
+            payload_5 TEXT,
+            payload_6 TEXT,
+            payload_7 TEXT,
+            payload_8 TEXT
+        )",
+    );
+    db
+}
+
 fn benchmark_trace_optimizations(criterion: &mut Criterion) {
     let mut null_filter_session = create_null_filter_session();
     let mut group = criterion.benchmark_group("trace_select_null_100");
@@ -331,6 +351,25 @@ fn benchmark_trace_optimizations(criterion: &mut Criterion) {
         benchmark.iter_batched(
             || create_insert_database().create_session(),
             |mut session| execute(&mut session, &insert),
+            BatchSize::SmallInput,
+        );
+    });
+    group.finish();
+
+    let payload = "abcdefghij0123456789ABCDEFGHIJ0123456789";
+    let wide_insert = format!(
+        "INSERT INTO wide_inserted_rows VALUES {}",
+        build_rows(100, |id| format!(
+            "({id}, '{payload}', '{payload}', '{payload}', '{payload}', \
+             '{payload}', '{payload}', '{payload}', '{payload}')"
+        ))
+    );
+    let mut group = criterion.benchmark_group("trace_insert_wide_100");
+    group.throughput(Throughput::Elements(100));
+    group.bench_function("generic_execute", |benchmark| {
+        benchmark.iter_batched(
+            || create_wide_insert_database().create_session(),
+            |mut session| execute(&mut session, &wide_insert),
             BatchSize::SmallInput,
         );
     });

@@ -352,6 +352,11 @@ pub(super) fn execute_insert(
             })?
     };
     let affected = rows.len() as u64;
+    let can_move_inserted_row = returning.is_none()
+        && !schema
+            .constraints
+            .iter()
+            .any(|constraint| matches!(constraint, Constraint::ForeignKey(_)));
     let mut returned_rows = Vec::new();
     for row in rows {
         if state
@@ -367,6 +372,15 @@ pub(super) fn execute_insert(
                     schema.name
                 ),
             ));
+        }
+        if can_move_inserted_row {
+            state
+                .tables
+                .get_mut(&schema.id)
+                .expect("catalog table must have storage")
+                .insert(xid, context.command_id, row);
+            state.mark_table_touched(xid, schema.id);
+            continue;
         }
         state
             .tables
