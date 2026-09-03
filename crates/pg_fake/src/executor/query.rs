@@ -5787,6 +5787,7 @@ fn visit_nested_loop_join_rows(
     let Some(join) = table.joins.get(index) else {
         return visit(left);
     };
+    let mut matched_left = false;
     for right in &right_sources[index] {
         let row = left
             .iter()
@@ -5810,6 +5811,7 @@ fn visit_nested_loop_join_rows(
             snapshot,
             context,
         )? {
+            matched_left = true;
             visit_nested_loop_join_rows(
                 state,
                 table,
@@ -5824,6 +5826,26 @@ fn visit_nested_loop_join_rows(
                 visit,
             )?;
         }
+    }
+    if !matched_left
+        && matches!(
+            join.join_operator,
+            ast::JoinOperator::Left(_) | ast::JoinOperator::LeftOuter(_)
+        )
+    {
+        visit_nested_loop_join_rows(
+            state,
+            table,
+            scope,
+            xid,
+            snapshot,
+            context,
+            starts,
+            right_sources,
+            index + 1,
+            left,
+            visit,
+        )?;
     }
     Ok(())
 }

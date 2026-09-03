@@ -1289,6 +1289,35 @@ fn preserves_joined_mutation_atomicity_and_transactions() {
 }
 
 #[test]
+fn releases_locks_after_joined_mutations_affect_no_rows() {
+    assert_differential(
+        "CREATE TABLE __TABLE__ (id INTEGER PRIMARY KEY, value TEXT NOT NULL); \
+         INSERT INTO __TABLE__ VALUES (1, ''), (2, ''); \
+         DELETE FROM __TABLE__ AS target USING __TABLE__ AS source
+             WHERE target.id = source.id AND target.id <= 1; \
+         UPDATE __TABLE__ AS target SET value = source.value FROM __TABLE__ AS source
+             WHERE target.id = source.id AND target.id <= 1; \
+         DELETE FROM __TABLE__ AS target USING __TABLE__ AS source
+             WHERE target.id = source.id AND target.id <= 1; \
+         SELECT * FROM __TABLE__ ORDER BY id",
+        RowOrder::Ordered,
+    );
+}
+
+#[test]
+fn preserves_unmatched_rows_in_streamed_left_joins() {
+    assert_differential(
+        "CREATE TABLE __TABLE__ (id BIGINT PRIMARY KEY); \
+         INSERT INTO __TABLE__ VALUES (1); \
+         SELECT left_row.id, right_row.id
+             FROM __TABLE__ AS left_row
+             LEFT JOIN __TABLE__ AS right_row ON left_row.id = right_row.id + 1
+             ORDER BY 1, 2",
+        RowOrder::Ordered,
+    );
+}
+
+#[test]
 fn preserves_returning_statement_atomicity() {
     assert_differential(
         "CREATE TABLE __TABLE__ (id INTEGER PRIMARY KEY, value INTEGER UNIQUE); \

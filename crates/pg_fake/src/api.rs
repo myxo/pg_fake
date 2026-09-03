@@ -1412,8 +1412,9 @@ impl Session {
             sequences,
         };
         let (contains_cte, contains_subquery) = executor::detect_statement_features(statement);
+        let mut acquired_row_locks = false;
         let cte_statement = if contains_cte {
-            let (acquired_state, acquired_snapshot, _) = match acquire_row_locks(
+            let (acquired_state, acquired_snapshot, locked_rows) = match acquire_row_locks(
                 &condvar,
                 self.lock_timeout,
                 state,
@@ -1426,6 +1427,7 @@ impl Session {
                 Ok(acquired) => acquired,
                 Err(error) => return self.abort_with_error(error),
             };
+            acquired_row_locks = !locked_rows.is_empty();
             state = acquired_state;
             snapshot = acquired_snapshot;
             Some(
@@ -1485,6 +1487,7 @@ impl Session {
             Ok(acquired) => acquired,
             Err(error) => return self.abort_with_error(error),
         };
+        acquired_row_locks |= !locked_rows.is_empty();
         let mutation_targets =
             executor::mutation_locks_cover_targets(statement).then_some(locked_rows);
         let result = executor::execute_statement(
@@ -1510,7 +1513,7 @@ impl Session {
                 {
                     self.deferred_foreign_keys_dirty = true;
                 }
-                if statement_contains_dml && was_read_only && !has_writes {
+                if statement_contains_dml && was_read_only && !has_writes && !acquired_row_locks {
                     let Some(SessionTransactionState::Active(transaction)) = &mut self.transaction
                     else {
                         unreachable!("statement transaction remains active")
