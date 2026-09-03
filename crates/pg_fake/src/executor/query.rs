@@ -5450,13 +5450,28 @@ fn visit_streamed_inner_join_rows(
             .columns
             .len();
     }
-    if table.joins.len() == 1
-        && let Some((left_slot, right_slot)) =
-            resolve_hash_join_slots(&table.joins[0].join_operator, scope, starts[0], starts[1])
+    let hash_slots = table
+        .joins
+        .iter()
+        .enumerate()
+        .map(|(index, join)| {
+            resolve_hash_join_slots(&join.join_operator, scope, starts[0], starts[index + 1])
+        })
+        .collect::<Option<Vec<_>>>();
+    if let Some(hash_slots) = hash_slots
+        && !hash_slots.is_empty()
     {
-        return visit_hash_join_rows(
-            state, table, scope, xid, snapshot, context, selection, starts[0], starts[1],
-            left_slot, right_slot, visit,
+        return visit_hash_join_chain_rows(
+            state,
+            table,
+            scope,
+            xid,
+            snapshot,
+            context,
+            selection,
+            &starts,
+            &hash_slots,
+            visit,
         );
     }
     visit_table_factor_rows(
@@ -5539,7 +5554,7 @@ fn resolve_hash_expression_slot(
 }
 
 #[cfg_attr(feature = "execution-log", tracing::instrument(skip_all))]
-fn visit_hash_join_rows(
+fn visit_hash_join_chain_rows(
     state: &DatabaseState,
     table: &ast::TableWithJoins,
     scope: &BoundScope,
@@ -5547,29 +5562,11 @@ fn visit_hash_join_rows(
     snapshot: &Snapshot,
     context: &StatementExecutionContext,
     selection: Option<&ast::Expr>,
-    left_start: usize,
-    right_start: usize,
-    left_slot: usize,
-    right_slot: usize,
+    starts: &[usize],
+    hash_slots: &[(usize, usize)],
     visit: &mut dyn FnMut(&[Value]) -> Result<()>,
 ) -> Result<()> {
-    let mut right_rows = std::collections::HashMap::<JoinKey, Vec<Vec<Value>>>::new();
-    visit_table_factor_rows(
-        state,
-        &table.joins[0].relation,
-        scope,
-        xid,
-        snapshot,
-        context,
-        selection,
-        right_start,
-        &mut |row| {
-            if let Some(key) = create_hash_join_key(&row[right_slot]) {
-                right_rows.entry(key).or_default().push(row.to_vec());
-            }
-            Ok(())
-        },
-    )?;
+    let mut rows = Vec::new();
     visit_table_factor_rows(
         state,
         &table.relation,
@@ -5578,17 +5575,40 @@ fn visit_hash_join_rows(
         snapshot,
         context,
         selection,
-        left_start,
-        &mut |left| {
+        starts[0],
+        &mut |row| {
+            rows.push(row.to_vec());
+            Ok(())
+        },
+    )?;
+    for (index, (left_slot, right_slot)) in hash_slots.iter().copied().enumerate() {
+        let mut right_rows = std::collections::HashMap::<JoinKey, Vec<Vec<Value>>>::new();
+        visit_table_factor_rows(
+            state,
+            &table.joins[index].relation,
+            scope,
+            xid,
+            snapshot,
+            context,
+            selection,
+            starts[index + 1],
+            &mut |row| {
+                if let Some(key) = create_hash_join_key(&row[right_slot]) {
+                    right_rows.entry(key).or_default().push(row.to_vec());
+                }
+                Ok(())
+            },
+        )?;
+        let mut joined = Vec::new();
+        for left in &rows {
             let Some(key) = create_hash_join_key(&left[left_slot]) else {
-                return Ok(());
+                continue;
             };
             let Some(matches) = right_rows.get(&key) else {
-                return Ok(());
+                continue;
             };
-            for right in matches {
-                let row = left
-                    .iter()
+            joined.extend(matches.iter().map(|right| {
+                left.iter()
                     .zip(right)
                     .map(|(left, right)| {
                         if left.is_null() {
@@ -5597,12 +5617,15 @@ fn visit_hash_join_rows(
                             left.clone()
                         }
                     })
-                    .collect::<Vec<_>>();
-                visit(&row)?;
-            }
-            Ok(())
-        },
-    )
+                    .collect::<Vec<_>>()
+            }));
+        }
+        rows = joined;
+    }
+    for row in rows {
+        visit(&row)?;
+    }
+    Ok(())
 }
 
 #[cfg_attr(feature = "execution-log", tracing::instrument(skip_all))]
