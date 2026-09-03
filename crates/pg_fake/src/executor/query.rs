@@ -2686,6 +2686,7 @@ pub(super) enum ProjectionSource<'a> {
 }
 enum OrderKey<'a> {
     Output(usize),
+    Input(usize),
     Expression(&'a ast::Expr),
 }
 enum DistinctPlan<'a> {
@@ -3955,10 +3956,18 @@ fn resolve_order_specs<'a>(
                         }
                         match output {
                             Some(index) => OrderKey::Output(index),
-                            None => {
-                                infer_query_expression_type(state, &order.expr, scope)?;
-                                OrderKey::Expression(&order.expr)
-                            }
+                            None => match &order.expr {
+                                ast::Expr::Identifier(identifier) => OrderKey::Input(
+                                    scope.resolve_column(std::slice::from_ref(identifier))?.0,
+                                ),
+                                ast::Expr::CompoundIdentifier(identifiers) => {
+                                    OrderKey::Input(scope.resolve_column(identifiers)?.0)
+                                }
+                                _ => {
+                                    infer_query_expression_type(state, &order.expr, scope)?;
+                                    OrderKey::Expression(&order.expr)
+                                }
+                            },
                         }
                     };
                     let ascending = order.options.asc.unwrap_or(true);
@@ -3982,6 +3991,9 @@ fn create_order_expression(
 ) -> ast::Expr {
     match order.key {
         OrderKey::Output(index) => create_projection_expression(&projections[index], scope),
+        OrderKey::Input(slot) => {
+            create_projection_expression(&ProjectionSource::Column(slot), scope)
+        }
         OrderKey::Expression(expression) => expression.clone(),
     }
 }
@@ -4001,13 +4013,14 @@ fn resolve_distinct_plan<'a>(
         ast::Distinct::All => Ok(DistinctPlan::None),
         ast::Distinct::Distinct => {
             for order in order_specs {
-                let OrderKey::Expression(order_expression) = order.key else {
+                if matches!(order.key, OrderKey::Output(_)) {
                     continue;
-                };
+                }
+                let order_expression = create_order_expression(order, projections, scope);
                 let mut selected = false;
                 for projection in projections {
                     if compare_bound_expressions(
-                        order_expression,
+                        &order_expression,
                         &create_projection_expression(projection, scope),
                         scope,
                     )? {
@@ -4381,6 +4394,7 @@ fn evaluate_order_keys(
         .iter()
         .map(|order| match order.key {
             OrderKey::Output(index) => Ok(values[index].clone()),
+            OrderKey::Input(slot) => Ok(row[slot].clone()),
             OrderKey::Expression(expression) => evaluate_select_expression(
                 state,
                 expression,
