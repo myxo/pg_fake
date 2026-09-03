@@ -191,6 +191,17 @@ fn benchmark_trace_optimizations(criterion: &mut Criterion) {
     });
     group.finish();
 
+    let mut group = criterion.benchmark_group("trace_delete_many_1000");
+    group.throughput(Throughput::Elements(1_000));
+    group.bench_function("non_indexed", |benchmark| {
+        benchmark.iter_batched(
+            create_mutation_session,
+            |mut session| execute(&mut session, "DELETE FROM mutation_rows WHERE score >= 0"),
+            BatchSize::SmallInput,
+        );
+    });
+    group.finish();
+
     let mut join_session = create_join_session();
     let mut group = criterion.benchmark_group("trace_join_chain_30");
     group.throughput(Throughput::Elements(30));

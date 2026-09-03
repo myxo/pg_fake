@@ -502,13 +502,21 @@ pub(super) fn execute_update(
         let mut updated = row.clone();
         for (index, expression, prepared) in &assignments {
             let target = schema.columns[*index].data_type;
+            let assignment_row = bound_row.as_deref().unwrap_or(&row);
             updated[*index] = if is_default_expression(expression) {
                 evaluate_column_default(&schema.columns[*index], context)?
             } else if let Some(prepared) = prepared {
-                prepared::evaluate_prepared_expression(prepared, &bound_row, &[])?
+                prepared::evaluate_prepared_expression(prepared, assignment_row, &[])?
             } else {
                 evaluate_mutation_assignment(
-                    state, expression, target, &scope, &bound_row, xid, snapshot, context,
+                    state,
+                    expression,
+                    target,
+                    &scope,
+                    assignment_row,
+                    xid,
+                    snapshot,
+                    context,
                 )?
             };
         }
@@ -571,11 +579,13 @@ pub(super) fn execute_update(
                 context,
             )?;
         }
-        bound_row[..schema.columns.len()].clone_from_slice(&updated);
+        if let Some(bound_row) = &mut bound_row {
+            bound_row[..schema.columns.len()].clone_from_slice(&updated);
+        }
         evaluate_returning_row(
             state,
             returning.as_ref(),
-            &bound_row,
+            bound_row.as_deref().unwrap_or(&updated),
             &mut returned_rows,
             xid,
             snapshot,
@@ -690,7 +700,7 @@ pub(super) fn execute_delete(
         evaluate_returning_row(
             state,
             returning.as_ref(),
-            &bound_row,
+            bound_row.as_deref().unwrap_or(&row),
             &mut returned_rows,
             xid,
             snapshot,
@@ -700,7 +710,7 @@ pub(super) fn execute_delete(
     Ok(create_write_result(affected, returning, returned_rows))
 }
 
-type MutationTarget = (RowId, Xid, Vec<Value>, Vec<Value>);
+type MutationTarget = (RowId, Xid, Vec<Value>, Option<Vec<Value>>);
 
 #[cfg_attr(feature = "execution-log", tracing::instrument(skip_all))]
 fn collect_mutation_targets(
@@ -718,6 +728,7 @@ fn collect_mutation_targets(
         .tables
         .get(&schema.id)
         .expect("catalog table must have storage");
+    let needs_bound_row = scope.columns.len() > schema.columns.len();
     if let Some(mutation_targets) = mutation_targets {
         let [source_row] = source_rows else {
             unreachable!("lock-selected mutations do not have source rows");
@@ -729,13 +740,18 @@ fn collect_mutation_targets(
                 let candidate = required
                     .mutation_candidate
                     .expect("mutation target locks retain their selected row");
-                let mut row = source_row.clone();
-                row[..schema.columns.len()].clone_from_slice(&candidate.row);
+                let bound_row = if needs_bound_row {
+                    let mut row = source_row.clone();
+                    row[..schema.columns.len()].clone_from_slice(&candidate.row);
+                    Some(row)
+                } else {
+                    None
+                };
                 Ok((
                     required.key.row_id,
                     candidate.version_xmin,
                     candidate.row,
-                    row,
+                    bound_row,
                 ))
             })
             .collect();
@@ -764,7 +780,12 @@ fn collect_mutation_targets(
         let mut row = source_row.clone();
         row[..schema.columns.len()].clone_from_slice(&version.row);
         if matches_mutation_row(state, selection, scope, &row, xid, snapshot, context)? {
-            return Ok(vec![(row_id, version.xmin, version.row.clone(), row)]);
+            return Ok(vec![(
+                row_id,
+                version.xmin,
+                version.row.clone(),
+                needs_bound_row.then_some(row),
+            )]);
         }
         return Ok(Vec::new());
     }
@@ -782,7 +803,12 @@ fn collect_mutation_targets(
                 let mut row = source_row.clone();
                 row[..schema.columns.len()].clone_from_slice(&version.row);
                 if matches_mutation_row(state, selection, scope, &row, xid, snapshot, context)? {
-                    targets.push((row_id, version.xmin, version.row.clone(), row));
+                    targets.push((
+                        row_id,
+                        version.xmin,
+                        version.row.clone(),
+                        needs_bound_row.then_some(row),
+                    ));
                     break;
                 }
             }
