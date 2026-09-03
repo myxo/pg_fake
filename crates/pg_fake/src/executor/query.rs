@@ -5682,6 +5682,7 @@ fn visit_hash_join_chain_rows(
     visit: &mut dyn FnMut(&[Value]) -> Result<()>,
 ) -> Result<()> {
     let mut rows = Vec::new();
+    let first_end = starts.get(1).copied().unwrap_or(scope.columns.len());
     visit_table_factor_rows(
         state,
         &table.relation,
@@ -5692,11 +5693,16 @@ fn visit_hash_join_chain_rows(
         selection,
         starts[0],
         &mut |row| {
-            rows.push(row.to_vec());
+            rows.push(row[..first_end].to_vec());
             Ok(())
         },
     )?;
     for (index, (left_slot, right_slot, preserve_left)) in hash_slots.iter().copied().enumerate() {
+        let right_start = starts[index + 1];
+        let right_end = starts
+            .get(index + 2)
+            .copied()
+            .unwrap_or(scope.columns.len());
         let mut right_rows = std::collections::HashMap::<JoinKey, Vec<Vec<Value>>>::new();
         visit_table_factor_rows(
             state,
@@ -5706,33 +5712,31 @@ fn visit_hash_join_chain_rows(
             snapshot,
             context,
             selection,
-            starts[index + 1],
+            right_start,
             &mut |row| {
                 if let Some(key) = create_hash_join_key(&row[right_slot]) {
-                    right_rows.entry(key).or_default().push(row.to_vec());
+                    right_rows
+                        .entry(key)
+                        .or_default()
+                        .push(row[right_start..right_end].to_vec());
                 }
                 Ok(())
             },
         )?;
         let mut joined = Vec::new();
-        for left in &rows {
+        for left in rows {
             let matches =
                 create_hash_join_key(&left[left_slot]).and_then(|key| right_rows.get(&key));
             if let Some(matches) = matches {
                 joined.extend(matches.iter().map(|right| {
-                    left.iter()
-                        .zip(right)
-                        .map(|(left, right)| {
-                            if left.is_null() {
-                                right.clone()
-                            } else {
-                                left.clone()
-                            }
-                        })
-                        .collect::<Vec<_>>()
+                    let mut row = left.clone();
+                    row.extend_from_slice(right);
+                    row
                 }));
             } else if preserve_left {
-                joined.push(left.clone());
+                let mut row = left;
+                row.resize(right_end, Value::Null);
+                joined.push(row);
             }
         }
         rows = joined;
