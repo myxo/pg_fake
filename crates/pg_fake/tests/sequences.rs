@@ -254,29 +254,36 @@ fn rolls_back_implicit_batch_ddl_but_not_sequence_values() {
 }
 
 #[test]
-fn rejects_sequence_ddl_in_explicit_transactions() {
+fn runs_sequence_ddl_in_explicit_transactions() {
     let db = Db::create();
     let mut session = db.create_session();
     session.execute("BEGIN").unwrap();
+    session
+        .execute("CREATE SEQUENCE transient START 10")
+        .unwrap();
+    assert_eq!(get_int8(&mut session, "SELECT nextval('transient')"), 10);
+    session.execute("ROLLBACK").unwrap();
     assert_eq!(
         session
-            .execute("CREATE SEQUENCE blocked")
+            .query("SELECT nextval('transient')", &[])
             .unwrap_err()
             .sqlstate,
-        SqlState::FeatureNotSupported
+        SqlState::UndefinedTable
     );
-    session.execute("ROLLBACK").unwrap();
+
     session.execute("CREATE SEQUENCE existing").unwrap();
+    assert_eq!(get_int8(&mut session, "SELECT nextval('existing')"), 1);
     session.execute("BEGIN").unwrap();
+    session.execute("DROP SEQUENCE existing").unwrap();
     assert_eq!(
         session
-            .execute("DROP SEQUENCE existing")
+            .query("SELECT nextval('existing')", &[])
             .unwrap_err()
             .sqlstate,
-        SqlState::FeatureNotSupported
+        SqlState::UndefinedTable
     );
     session.execute("ROLLBACK").unwrap();
-    assert_eq!(get_int8(&mut session, "SELECT nextval('existing')"), 1);
+    assert_eq!(get_int8(&mut session, "SELECT nextval('existing')"), 2);
 }
 
 #[test]

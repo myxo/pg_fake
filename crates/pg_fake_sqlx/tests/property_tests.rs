@@ -74,7 +74,7 @@ impl Drop for PostgresCase<'_, '_> {
             .runtime
             .block_on(sqlx::raw_sql(AssertSqlSafe("ROLLBACK")).execute(&mut *self.connection));
         let sql = format!(
-            "DROP TABLE IF EXISTS {0}_foreign_child, {0}_foreign_parent, {0}",
+            "DROP TABLE IF EXISTS {0}_foreign_child, {0}_foreign_parent, {0}_ddl, {0}",
             self.table
         );
         let _ = self
@@ -1594,6 +1594,22 @@ fn lock_timeout_sql(src: &mut Source) -> String {
     )
 }
 
+struct DdlModel {
+    table: String,
+    exists: bool,
+    transaction_start: Option<bool>,
+}
+
+fn generate_ddl(model: &mut DdlModel) -> String {
+    if model.exists {
+        model.exists = false;
+        format!("DROP TABLE {}", model.table)
+    } else {
+        model.exists = true;
+        format!("CREATE TABLE {} (id INTEGER PRIMARY KEY)", model.table)
+    }
+}
+
 fn generate_statement(
     src: &mut Source,
     table: &TableSchema,
@@ -1601,13 +1617,16 @@ fn generate_statement(
     next_key: &mut i64,
     next_child_key: &mut i64,
     in_transaction: &mut bool,
+    ddl: &mut DdlModel,
 ) -> (String, RowOrder) {
     let statements: &[&str] = if *in_transaction {
         &[
-            "insert", "select", "update", "delete", "set", "commit", "rollback",
+            "insert", "select", "update", "delete", "ddl", "set", "commit", "rollback",
         ]
     } else {
-        &["insert", "select", "update", "delete", "set", "begin"]
+        &[
+            "insert", "select", "update", "delete", "ddl", "set", "begin",
+        ]
     };
     src.select(
         "statement",
@@ -1620,6 +1639,7 @@ fn generate_statement(
             "select" => generate_select(src, table, foreign_tables),
             "update" => (generate_update(src, table), RowOrder::Unordered),
             "delete" => (generate_delete(src, table), RowOrder::Unordered),
+            "ddl" => (generate_ddl(ddl), RowOrder::Unordered),
             "set" => {
                 let settings: &[&str] = if *in_transaction {
                     &["lock_timeout"]
@@ -1638,6 +1658,7 @@ fn generate_statement(
             }
             "begin" => {
                 *in_transaction = true;
+                ddl.transaction_start = Some(ddl.exists);
                 let sql = if src.any("explicit_isolation") {
                     format!("BEGIN ISOLATION LEVEL {}", isolation_level(src))
                 } else {
@@ -1647,10 +1668,15 @@ fn generate_statement(
             }
             "commit" => {
                 *in_transaction = false;
+                ddl.transaction_start = None;
                 ("COMMIT".into(), RowOrder::Unordered)
             }
             "rollback" => {
                 *in_transaction = false;
+                ddl.exists = ddl
+                    .transaction_start
+                    .take()
+                    .expect("transaction start must be recorded");
                 ("ROLLBACK".into(), RowOrder::Unordered)
             }
             _ => unreachable!(),
@@ -1729,6 +1755,11 @@ fn run_generated_sql_case(
     let mut next_key = 1;
     let mut next_child_key = 1;
     let mut in_transaction = false;
+    let mut ddl = DdlModel {
+        table: format!("{}_ddl", table.name),
+        exists: false,
+        transaction_start: None,
+    };
     let create = table.create_sql();
     src.log_value("sql", &create);
     assert_statement(
@@ -1770,6 +1801,7 @@ fn run_generated_sql_case(
             &mut next_key,
             &mut next_child_key,
             &mut in_transaction,
+            &mut ddl,
         );
         src.log_value("sql", &sql);
         assert_statement(runtime, postgres.get_connection(), &mut fake, &sql, order);
@@ -1778,8 +1810,13 @@ fn run_generated_sql_case(
 
     if in_transaction {
         let sql = if src.any("commit_final_transaction") {
+            ddl.transaction_start = None;
             "COMMIT"
         } else {
+            ddl.exists = ddl
+                .transaction_start
+                .take()
+                .expect("transaction start must be recorded");
             "ROLLBACK"
         };
         assert_statement(

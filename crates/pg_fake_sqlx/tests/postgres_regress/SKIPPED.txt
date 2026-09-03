@@ -120,7 +120,7 @@ time:4
 timestamp:3
 timestamptz:3
 timetz:1
-transactions:2
+transactions:11
 triggers:3
 truncate:6
 tsdicts:1

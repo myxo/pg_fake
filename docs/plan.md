@@ -292,7 +292,7 @@ its `WITH` clause.
 
 ## Milestone D — Transactional catalog and migration DDL
 
-### Task 8 — MVCC-versioned catalog foundation
+### Task 8 — MVCC-versioned catalog foundation [COMPLETE]
 
 **Goal:** Make relation metadata obey the same snapshot boundaries as table
 rows without duplicating transaction machinery.
@@ -314,7 +314,7 @@ rows without duplicating transaction machinery.
 - Unit/property and controlled multi-session tests cover visibility, name reuse,
   concurrent snapshots, abort, dependency identity, and GC horizons.
 
-### Task 9 — Transactional DDL for the supported catalog surface
+### Task 9 — Transactional DDL for the supported catalog surface [COMPLETE]
 
 **Goal:** Allow existing DDL operations inside explicit transactions with
 PostgreSQL commit and rollback semantics.
@@ -341,6 +341,20 @@ PostgreSQL commit and rollback semantics.
 
 **Notes:** This task makes the already-supported DDL surface transactional;
 Tasks 10–15 add the bounded migration surface.
+
+**Progress:**
+
+- [x] Execute table and sequence creation/drop through catalog MVCC in explicit
+  and implicit transactions.
+- [x] Preserve table storage, indexes, constraints, sequence ownership, and
+  nontransactional sequence allocations across commit and rollback.
+- [x] Serialize conflicting relation and dependency DDL until transaction end.
+- [x] Keep prepared statements bound to stable catalog identities across
+  rollback and name reuse.
+- [x] Add native, SQLx differential/property, controlled multi-session, and
+  transactional-DDL benchmark coverage.
+- [x] Run formatting, workspace tests, review, and the 10,000-iteration
+  property gate.
 
 ### Task 10 — Qualified names, search path, and temporary relations
 

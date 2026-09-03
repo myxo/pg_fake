@@ -214,6 +214,28 @@ fn create_table_benchmark(
     group.finish();
 }
 
+fn transactional_ddl_benchmark(
+    criterion: &mut Criterion,
+    runtime: &Runtime,
+    connections: &mut [NamedBenchmarkConnection<'_>],
+) {
+    let mut group = criterion
+        .benchmark_group(benchmarks::find_benchmark("transactional_ddl_create_rollback").name);
+    for (name, connection) in connections.iter_mut() {
+        group.bench_function(*name, |benchmark| {
+            benchmark.iter(|| {
+                connection.execute(runtime, "BEGIN");
+                connection.execute(
+                    runtime,
+                    "CREATE TABLE transactional_ddl_create_rollback (id SERIAL PRIMARY KEY, value INTEGER UNIQUE)",
+                );
+                connection.execute(runtime, "ROLLBACK");
+            });
+        });
+    }
+    group.finish();
+}
+
 fn sequence_benchmark(
     criterion: &mut Criterion,
     runtime: &Runtime,
@@ -1069,6 +1091,7 @@ fn benchmarks(criterion: &mut Criterion) {
         ];
 
         create_table_benchmark(criterion, &runtime, &mut connections);
+        transactional_ddl_benchmark(criterion, &runtime, &mut connections);
         sequence_benchmark(criterion, &runtime, &mut connections);
         serial_identity_benchmark(criterion, &runtime, &mut connections);
         uuid_temporal_benchmark(criterion, &runtime, &mut connections);

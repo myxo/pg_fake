@@ -9,14 +9,18 @@ use sqlparser::ast::{self, Visit as _};
 
 use crate::{
     analyzer,
-    catalog::{ConstraintId, SequenceId, SequenceSchema, TableId, TableSchema},
+    catalog::{ConstraintId, SequenceId, TableId, TableSchema},
     error::{PgError, Result, SqlState, reject_unsupported},
     executor::{self, DatabaseState},
     parser,
-    storage::Table,
-    txn::{RowLockAttempt, Snapshot, TransactionStatus, Xid},
+    txn::{
+        RelationLockAttempt, RelationLockMode, RowLockAttempt, Snapshot, TransactionStatus, Xid,
+    },
     value::{Oid, Value},
 };
+
+#[cfg(test)]
+use crate::storage::Table;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ColumnMeta {
@@ -57,6 +61,19 @@ fn extract_prepared_sequence_name(expression: &ast::Expr) -> Option<&str> {
             _ => None,
         },
         ast::Expr::Nested(expression) => extract_prepared_sequence_name(expression),
+        _ => None,
+    }
+}
+
+fn extract_runtime_sequence_name(expression: &ast::Expr) -> Option<&str> {
+    match expression {
+        ast::Expr::Cast { expr, .. } | ast::Expr::Nested(expr) => {
+            extract_runtime_sequence_name(expr)
+        }
+        ast::Expr::Value(value) => match &value.value {
+            ast::Value::SingleQuotedString(value) => Some(value),
+            _ => None,
+        },
         _ => None,
     }
 }
@@ -263,7 +280,6 @@ pub struct Session {
     default_isolation: IsolationLevel,
     lock_timeout: Duration,
     timezone: String,
-    ddl_undo: Vec<DdlUndo>,
     settings_undo: Option<(IsolationLevel, Duration, String)>,
     deferred_constraints: BTreeSet<ConstraintId>,
     defer_all_constraints: bool,
@@ -285,16 +301,6 @@ struct ActiveTransaction {
     next_command_id: u64,
     implicit_batch: bool,
     transaction_timestamp: chrono::DateTime<chrono::Utc>,
-}
-enum DdlUndo {
-    DropCreated(String),
-    RestoreDropped(
-        TableSchema,
-        Table,
-        Vec<(SequenceSchema, executor::SequenceValueState)>,
-    ),
-    DropCreatedSequence(String),
-    RestoreDroppedSequence(SequenceSchema, executor::SequenceValueState),
 }
 pub struct Transaction<'session> {
     session: &'session mut Session,
@@ -323,6 +329,7 @@ fn abort_database_transaction(state: &mut DatabaseState, xid: Xid) {
     }
     prune_database_versions(state);
     state.row_locks.release_transaction_locks(xid);
+    state.relation_locks.release_transaction_locks(xid);
     state.wait_for.remove_transaction(xid);
 }
 
@@ -352,96 +359,6 @@ fn prune_database_versions(state: &mut DatabaseState) {
         .expect("sequence storage is poisoned");
     for sequence_id in reclaimed.sequences {
         sequence_values.remove(&sequence_id);
-    }
-}
-
-#[cfg_attr(feature = "execution-log", tracing::instrument(skip_all))]
-fn collect_ddl_undo_for_statement(
-    state: &DatabaseState,
-    statement: &ast::Statement,
-) -> Result<Vec<DdlUndo>> {
-    match statement {
-        ast::Statement::CreateTable(create) => {
-            let name = executor::normalize_unqualified_object_name(&create.name)?;
-            Ok(state
-                .catalog
-                .require_table(&name)
-                .is_err()
-                .then_some(DdlUndo::DropCreated(name))
-                .into_iter()
-                .collect())
-        }
-        ast::Statement::CreateSequence { name, .. } => {
-            let name = executor::normalize_unqualified_object_name(name)?;
-            Ok((!state.catalog.has_relation(&name))
-                .then_some(DdlUndo::DropCreatedSequence(name))
-                .into_iter()
-                .collect())
-        }
-        ast::Statement::Drop {
-            object_type: ast::ObjectType::Table,
-            names,
-            ..
-        } => names
-            .iter()
-            .filter_map(|name| {
-                let name = match executor::normalize_unqualified_object_name(name) {
-                    Ok(name) => name,
-                    Err(error) => return Some(Err(error)),
-                };
-                let schema = match state.catalog.require_table(&name) {
-                    Ok(schema) => schema.clone(),
-                    Err(_) => return None,
-                };
-                let table = state
-                    .tables
-                    .get(&schema.id)
-                    .expect("catalog table must have storage")
-                    .clone();
-                let sequences = state
-                    .catalog
-                    .iterate_sequences()
-                    .filter(|sequence| {
-                        sequence.owned_by.as_ref().map(|(table, _)| *table) == Some(schema.id)
-                    })
-                    .map(|sequence| {
-                        let value = *state
-                            .sequence_values
-                            .lock()
-                            .expect("sequence storage is poisoned")
-                            .get(&sequence.id)
-                            .expect("catalog sequence must have storage");
-                        (sequence.clone(), value)
-                    })
-                    .collect();
-                Some(Ok(DdlUndo::RestoreDropped(schema, table, sequences)))
-            })
-            .collect(),
-        ast::Statement::Drop {
-            object_type: ast::ObjectType::Sequence,
-            names,
-            ..
-        } => names
-            .iter()
-            .filter_map(|name| {
-                let name = match executor::normalize_unqualified_object_name(name) {
-                    Ok(name) => name,
-                    Err(error) => return Some(Err(error)),
-                };
-                let sequence = match state.catalog.require_sequence(&name) {
-                    Ok(sequence) => sequence.clone(),
-                    Err(_) => return None,
-                };
-                let value = *state
-                    .sequence_values
-                    .lock()
-                    .expect("sequence storage is poisoned")
-                    .get(&sequence.id)
-                    .expect("catalog sequence must have storage");
-                Some(Ok(DdlUndo::RestoreDroppedSequence(sequence, value)))
-            })
-            .collect(),
-        _ => Ok(Vec::new()),
     }
 }
 
@@ -566,6 +483,484 @@ fn parse_isolation_level(modes: &[ast::TransactionMode]) -> Result<Option<Isolat
         }
     }
     Ok(isolation)
+}
+
+#[cfg_attr(feature = "execution-log", tracing::instrument(skip_all))]
+fn collect_ddl_relation_locks(
+    catalog: &crate::catalog::Catalog,
+    statement: &ast::Statement,
+) -> Result<Vec<(String, RelationLockMode)>> {
+    let mut locks = std::collections::BTreeMap::new();
+    match statement {
+        ast::Statement::CreateTable(create) => {
+            let table_name = executor::normalize_unqualified_object_name(&create.name)?;
+            locks.insert(table_name.clone(), RelationLockMode::Exclusive);
+            let mut generated_sequences = Vec::new();
+            for column in &create.columns {
+                let column_name = executor::normalize_identifier(&column.name);
+                let serial = matches!(
+                    column.data_type.to_string().to_ascii_lowercase().as_str(),
+                    "smallserial" | "serial2" | "serial" | "serial4" | "bigserial" | "serial8"
+                );
+                let identity = column
+                    .options
+                    .iter()
+                    .any(|option| matches!(option.option, ast::ColumnOption::Generated { .. }));
+                if serial || identity {
+                    let base = format!("{table_name}_{column_name}_seq");
+                    let mut number = 0;
+                    loop {
+                        let candidate = if number == 0 {
+                            base.clone()
+                        } else {
+                            format!("{base}{number}")
+                        };
+                        if !catalog.has_relation(&candidate)
+                            && !generated_sequences.contains(&candidate)
+                        {
+                            locks.insert(candidate.clone(), RelationLockMode::Exclusive);
+                            generated_sequences.push(candidate);
+                            break;
+                        }
+                        number += 1;
+                    }
+                }
+                for option in &column.options {
+                    if let ast::ColumnOption::ForeignKey(foreign_key) = &option.option {
+                        locks
+                            .entry(executor::normalize_unqualified_object_name(
+                                &foreign_key.foreign_table,
+                            )?)
+                            .or_insert(RelationLockMode::Shared);
+                    }
+                }
+            }
+            for constraint in &create.constraints {
+                if let ast::TableConstraint::ForeignKey(foreign_key) = constraint {
+                    locks
+                        .entry(executor::normalize_unqualified_object_name(
+                            &foreign_key.foreign_table,
+                        )?)
+                        .or_insert(RelationLockMode::Shared);
+                }
+            }
+        }
+        ast::Statement::CreateSequence { name, owned_by, .. } => {
+            locks.insert(
+                executor::normalize_unqualified_object_name(name)?,
+                RelationLockMode::Exclusive,
+            );
+            if let Some(owned_by) = owned_by
+                && owned_by.0.len() == 2
+                && let Some(table) = owned_by.0[0].as_ident()
+            {
+                locks
+                    .entry(executor::normalize_identifier(table))
+                    .or_insert(RelationLockMode::Shared);
+            }
+        }
+        ast::Statement::Drop {
+            object_type: ast::ObjectType::Table,
+            names: objects,
+            ..
+        } => {
+            for object in objects {
+                let name = executor::normalize_unqualified_object_name(object)?;
+                locks.insert(name.clone(), RelationLockMode::Exclusive);
+                if let Ok(table) = catalog.require_table(&name) {
+                    for (referencing, _) in catalog.referencing_foreign_keys(table.id) {
+                        locks
+                            .entry(referencing.name)
+                            .or_insert(RelationLockMode::Shared);
+                    }
+                    for sequence in catalog.iterate_sequences().filter(|sequence| {
+                        sequence.owned_by.as_ref().map(|(owner, _)| *owner) == Some(table.id)
+                    }) {
+                        locks.insert(sequence.name.clone(), RelationLockMode::Exclusive);
+                    }
+                }
+            }
+        }
+        ast::Statement::Drop {
+            object_type: ast::ObjectType::Sequence,
+            names: objects,
+            ..
+        } => {
+            for object in objects {
+                locks.insert(
+                    executor::normalize_unqualified_object_name(object)?,
+                    RelationLockMode::Exclusive,
+                );
+            }
+        }
+        _ => {}
+    }
+    let mut sequence_error = None;
+    let _ = ast::visit_expressions(statement, |expression| -> std::ops::ControlFlow<()> {
+        let ast::Expr::Function(function) = expression else {
+            return std::ops::ControlFlow::Continue(());
+        };
+        let Ok(function_name) = executor::normalize_unqualified_object_name(&function.name) else {
+            return std::ops::ControlFlow::Continue(());
+        };
+        if !matches!(function_name.as_str(), "nextval" | "currval" | "setval") {
+            return std::ops::ControlFlow::Continue(());
+        }
+        let ast::FunctionArguments::List(arguments) = &function.args else {
+            return std::ops::ControlFlow::Continue(());
+        };
+        let Some(ast::FunctionArg::Unnamed(ast::FunctionArgExpr::Expr(argument))) =
+            arguments.args.first()
+        else {
+            return std::ops::ControlFlow::Continue(());
+        };
+        let Some(name) = extract_runtime_sequence_name(argument) else {
+            sequence_error = Some(PgError::create(
+                SqlState::FeatureNotSupported,
+                "computed sequence names are not implemented",
+            ));
+            return std::ops::ControlFlow::Break(());
+        };
+        match executor::normalize_sequence_name(name) {
+            Ok(name) => {
+                locks.entry(name).or_insert(RelationLockMode::Shared);
+                std::ops::ControlFlow::Continue(())
+            }
+            Err(error) => {
+                sequence_error = Some(error);
+                std::ops::ControlFlow::Break(())
+            }
+        }
+    });
+    if let Some(error) = sequence_error {
+        return Err(error);
+    }
+    Ok(locks.into_iter().collect())
+}
+
+#[derive(Clone, PartialEq, Eq, PartialOrd, Ord)]
+enum ForeignKeyMutation {
+    Delete(TableId),
+    Update {
+        table: TableId,
+        columns: Vec<String>,
+    },
+}
+
+fn collect_assignment_columns(assignments: &[ast::Assignment]) -> Result<Vec<String>> {
+    let mut columns = BTreeSet::new();
+    for assignment in assignments {
+        let ast::AssignmentTarget::ColumnName(column) = &assignment.target else {
+            return reject_unsupported("UPDATE tuple assignment is not implemented");
+        };
+        columns.insert(executor::normalize_unqualified_object_name(column)?);
+    }
+    Ok(columns.into_iter().collect())
+}
+
+fn collect_foreign_key_relation_locks(
+    state: &DatabaseState,
+    statements: impl IntoIterator<Item = ast::Statement>,
+    locks: &mut std::collections::BTreeMap<String, RelationLockMode>,
+) -> Result<()> {
+    let mut pending = Vec::new();
+    for statement in statements {
+        match statement {
+            ast::Statement::Insert(insert) => {
+                let table = state
+                    .catalog
+                    .require_table(&executor::resolve_insert_table_name(&insert.table)?)?;
+                for constraint in &table.constraints {
+                    if let crate::catalog::Constraint::ForeignKey(foreign_key) = constraint {
+                        let parent = state
+                            .catalog
+                            .require_table_by_id(foreign_key.foreign_table_id)?;
+                        locks
+                            .entry(parent.name.clone())
+                            .or_insert(RelationLockMode::Shared);
+                    }
+                }
+                if let Some(ast::OnInsert::OnConflict(ast::OnConflict {
+                    action: ast::OnConflictAction::DoUpdate(update),
+                    ..
+                })) = insert.on
+                {
+                    pending.push(ForeignKeyMutation::Update {
+                        table: table.id,
+                        columns: collect_assignment_columns(&update.assignments)?,
+                    });
+                }
+            }
+            ast::Statement::Update(update) => {
+                let ast::TableFactor::Table { name, .. } = update.table.relation else {
+                    continue;
+                };
+                let table = state
+                    .catalog
+                    .require_table(&executor::normalize_unqualified_object_name(&name)?)?;
+                pending.push(ForeignKeyMutation::Update {
+                    table: table.id,
+                    columns: collect_assignment_columns(&update.assignments)?,
+                });
+            }
+            ast::Statement::Delete(delete) => {
+                let ast::FromTable::WithFromKeyword(from) = delete.from else {
+                    continue;
+                };
+                let Some(ast::TableWithJoins {
+                    relation: ast::TableFactor::Table { name, .. },
+                    ..
+                }) = from.first()
+                else {
+                    continue;
+                };
+                let table = state
+                    .catalog
+                    .require_table(&executor::normalize_unqualified_object_name(name)?)?;
+                pending.push(ForeignKeyMutation::Delete(table.id));
+            }
+            _ => {}
+        }
+    }
+    let mut visited = BTreeSet::new();
+    while let Some(mutation) = pending.pop() {
+        if !visited.insert(mutation.clone()) {
+            continue;
+        }
+        let (table_id, updated_columns) = match &mutation {
+            ForeignKeyMutation::Delete(table) => (*table, None),
+            ForeignKeyMutation::Update { table, columns } => (*table, Some(columns.as_slice())),
+        };
+        let table = state.catalog.require_table_by_id(table_id)?;
+        if let Some(updated_columns) = updated_columns {
+            for constraint in &table.constraints {
+                let crate::catalog::Constraint::ForeignKey(foreign_key) = constraint else {
+                    continue;
+                };
+                if foreign_key
+                    .columns
+                    .iter()
+                    .any(|column| updated_columns.contains(column))
+                {
+                    let parent = state
+                        .catalog
+                        .require_table_by_id(foreign_key.foreign_table_id)?;
+                    locks
+                        .entry(parent.name.clone())
+                        .or_insert(RelationLockMode::Shared);
+                }
+            }
+        }
+        for (child, foreign_key) in state.catalog.referencing_foreign_keys(table_id) {
+            if let Some(updated_columns) = updated_columns {
+                let referred_columns = if foreign_key.referred_columns.is_empty() {
+                    table
+                        .constraints
+                        .iter()
+                        .find_map(|constraint| match constraint {
+                            crate::catalog::Constraint::PrimaryKey { columns, .. } => Some(columns),
+                            _ => None,
+                        })
+                        .expect("foreign key definition was validated")
+                } else {
+                    &foreign_key.referred_columns
+                };
+                if !referred_columns
+                    .iter()
+                    .any(|column| updated_columns.contains(column))
+                {
+                    continue;
+                }
+            }
+            locks
+                .entry(child.name.clone())
+                .or_insert(RelationLockMode::Shared);
+            let action = if updated_columns.is_some() {
+                foreign_key.on_update
+            } else {
+                foreign_key.on_delete
+            };
+            match action {
+                crate::catalog::ForeignKeyAction::Cascade if updated_columns.is_none() => {
+                    pending.push(ForeignKeyMutation::Delete(child.id));
+                }
+                crate::catalog::ForeignKeyAction::Cascade
+                | crate::catalog::ForeignKeyAction::SetNull
+                | crate::catalog::ForeignKeyAction::SetDefault => {
+                    pending.push(ForeignKeyMutation::Update {
+                        table: child.id,
+                        columns: foreign_key.columns,
+                    });
+                }
+                crate::catalog::ForeignKeyAction::NoAction
+                | crate::catalog::ForeignKeyAction::Restrict => {}
+            }
+        }
+    }
+    Ok(())
+}
+
+#[cfg_attr(feature = "execution-log", tracing::instrument(skip_all))]
+fn collect_relation_locks(
+    state: &DatabaseState,
+    statement: &ast::Statement,
+    prepared_dependencies: Option<&[PreparedCatalogDependency]>,
+) -> Result<Vec<(String, RelationLockMode)>> {
+    if matches!(parser::classify(statement), parser::StatementKind::Ddl) {
+        return collect_ddl_relation_locks(&state.catalog, statement);
+    }
+    let (expanded_statement, mutations) = executor::expand_ctes_for_analysis(statement, state)?;
+    let dependencies = match prepared_dependencies {
+        Some(dependencies) => dependencies.to_vec(),
+        None => collect_prepared_catalog_dependencies(
+            &state.catalog,
+            std::iter::once(expanded_statement.clone()).chain(mutations.iter().cloned()),
+        )?,
+    };
+    let mut locks = std::collections::BTreeMap::new();
+    for dependency in dependencies {
+        match dependency {
+            PreparedCatalogDependency::Table(table) => {
+                locks.insert(table.name, RelationLockMode::Shared);
+            }
+            PreparedCatalogDependency::Sequence { name, .. } => {
+                locks.insert(name, RelationLockMode::Shared);
+            }
+            PreparedCatalogDependency::Constraint { .. } => {}
+        }
+    }
+    collect_foreign_key_relation_locks(
+        state,
+        std::iter::once(expanded_statement).chain(mutations),
+        &mut locks,
+    )?;
+    let mut sequence_error = None;
+    let _ = ast::visit_expressions(statement, |expression| -> std::ops::ControlFlow<()> {
+        let ast::Expr::Function(function) = expression else {
+            return std::ops::ControlFlow::Continue(());
+        };
+        let Ok(name) = executor::normalize_unqualified_object_name(&function.name) else {
+            return std::ops::ControlFlow::Continue(());
+        };
+        if !matches!(name.as_str(), "nextval" | "currval" | "setval") {
+            return std::ops::ControlFlow::Continue(());
+        }
+        let ast::FunctionArguments::List(arguments) = &function.args else {
+            return std::ops::ControlFlow::Continue(());
+        };
+        let Some(ast::FunctionArg::Unnamed(ast::FunctionArgExpr::Expr(argument))) =
+            arguments.args.first()
+        else {
+            return std::ops::ControlFlow::Continue(());
+        };
+        let Some(name) = extract_runtime_sequence_name(argument) else {
+            sequence_error = Some(PgError::create(
+                SqlState::FeatureNotSupported,
+                "computed sequence names are not implemented",
+            ));
+            return std::ops::ControlFlow::Break(());
+        };
+        match executor::normalize_sequence_name(name) {
+            Ok(name) => {
+                locks.insert(name, RelationLockMode::Shared);
+                std::ops::ControlFlow::Continue(())
+            }
+            Err(error) => {
+                sequence_error = Some(error);
+                std::ops::ControlFlow::Break(())
+            }
+        }
+    });
+    if let Some(error) = sequence_error {
+        return Err(error);
+    }
+    Ok(locks.into_iter().collect())
+}
+
+#[cfg_attr(feature = "execution-log", tracing::instrument(skip_all))]
+fn acquire_relation_locks<'a>(
+    condvar: &Condvar,
+    timeout: Duration,
+    mut state: MutexGuard<'a, DatabaseState>,
+    statement: &ast::Statement,
+    prepared_dependencies: Option<&[PreparedCatalogDependency]>,
+    xid: Xid,
+    isolation: IsolationLevel,
+    mut snapshot: Snapshot,
+) -> Result<(MutexGuard<'a, DatabaseState>, Snapshot)> {
+    let deadline = (timeout != Duration::ZERO).then(|| Instant::now() + timeout);
+    let ddl = matches!(parser::classify(statement), parser::StatementKind::Ddl);
+    loop {
+        if ddl {
+            snapshot = Snapshot::create(&state.transactions).use_command(snapshot.command_id);
+        }
+        state.load_catalog(Some(xid), snapshot);
+        let locks = collect_relation_locks(&state, statement, prepared_dependencies)?;
+        let mut blocked = None;
+        for (name, mode) in locks {
+            match state.relation_locks.acquire(&name, xid, mode) {
+                RelationLockAttempt::Acquired => condvar.notify_all(),
+                RelationLockAttempt::Blocked(conflicts) => {
+                    if state
+                        .wait_for
+                        .register_wait_dependencies(xid, &conflicts)
+                        .is_some()
+                    {
+                        condvar.notify_all();
+                    }
+                    blocked = Some((name, conflicts));
+                    break;
+                }
+            }
+        }
+        let Some((name, conflicts)) = blocked else {
+            state.wait_for.clear_wait(xid);
+            return Ok((state, snapshot));
+        };
+        if state.wait_for.take_victim(xid) {
+            state.relation_locks.cancel_wait(&name, xid);
+            state.wait_for.clear_wait(xid);
+            condvar.notify_all();
+            return Err(create_deadlock_error());
+        }
+        let mut timed_out = false;
+        state = if let Some(deadline) = deadline {
+            let remaining = deadline.saturating_duration_since(Instant::now());
+            if remaining.is_zero() {
+                state.relation_locks.cancel_wait(&name, xid);
+                state.wait_for.clear_wait(xid);
+                condvar.notify_all();
+                return Err(create_lock_timeout_error());
+            }
+            let (state, wait_result) = condvar
+                .wait_timeout(state, remaining)
+                .expect("database mutex is poisoned");
+            timed_out = wait_result.timed_out();
+            state
+        } else {
+            condvar.wait(state).expect("database mutex is poisoned")
+        };
+        state.relation_locks.cancel_wait(&name, xid);
+        state.wait_for.clear_wait(xid);
+        condvar.notify_all();
+        if state.wait_for.take_victim(xid) {
+            return Err(create_deadlock_error());
+        }
+        if timed_out {
+            return Err(create_lock_timeout_error());
+        }
+        if !ddl
+            && isolation == IsolationLevel::ReadCommitted
+            && conflicts.iter().any(|holder| {
+                !matches!(
+                    state.transactions.get_status(*holder),
+                    Some(TransactionStatus::InFlight)
+                )
+            })
+        {
+            snapshot = Snapshot::create(&state.transactions).use_command(snapshot.command_id);
+        }
+    }
 }
 
 #[cfg_attr(feature = "execution-log", tracing::instrument(skip_all))]
@@ -695,7 +1090,6 @@ impl Db {
             default_isolation: IsolationLevel::ReadCommitted,
             lock_timeout: self.default_lock_timeout,
             timezone: "UTC".into(),
-            ddl_undo: Vec::new(),
             settings_undo: None,
             deferred_constraints: BTreeSet::new(),
             defer_all_constraints: false,
@@ -1113,7 +1507,16 @@ impl Session {
                 Err(error) => return self.abort_with_error(error),
             };
             (
-                None,
+                Some(
+                    match analyzer::bind_parameters(
+                        &statement.statement,
+                        &statement.parameter_types,
+                        params,
+                    ) {
+                        Ok(statement) => statement,
+                        Err(error) => return self.abort_with_error(error),
+                    },
+                ),
                 Some((
                     query_plan,
                     parameters.as_slice(),
@@ -1184,7 +1587,6 @@ impl Session {
     }
     #[cfg_attr(feature = "execution-log", tracing::instrument(skip_all))]
     fn start_transaction(&mut self, isolation: IsolationLevel, implicit_batch: bool) {
-        assert!(self.ddl_undo.is_empty());
         assert!(self.settings_undo.is_none());
         self.deferred_constraints.clear();
         self.defer_all_constraints = false;
@@ -1222,20 +1624,23 @@ impl Session {
             .use_command(crate::txn::CommandId(transaction.next_command_id));
         state.load_catalog(Some(transaction.xid), snapshot);
         if transaction.read_only {
-            assert!(self.ddl_undo.is_empty());
             assert!(!self.deferred_foreign_keys_dirty);
             assert!(!state.has_touched_tables(transaction.xid));
             state.transactions.finish_read_only(transaction.xid);
+            state
+                .relation_locks
+                .release_transaction_locks(transaction.xid);
+            state.wait_for.remove_transaction(transaction.xid);
             prune_database_versions(&mut state);
             self.settings_undo = None;
             self.deferred_constraints.clear();
             self.defer_all_constraints = false;
+            self.db.condvar.notify_all();
             return Ok(());
         }
         if self.deferred_foreign_keys_dirty
             && let Err(error) = executor::validate_deferred_foreign_keys(&state, transaction.xid)
         {
-            self.rollback_ddl(&mut state);
             if let Some((default_isolation, lock_timeout, timezone)) = self.settings_undo.take() {
                 self.default_isolation = default_isolation;
                 self.lock_timeout = lock_timeout;
@@ -1261,8 +1666,10 @@ impl Session {
         }
         prune_database_versions(&mut state);
         state.row_locks.release_transaction_locks(transaction.xid);
+        state
+            .relation_locks
+            .release_transaction_locks(transaction.xid);
         state.wait_for.remove_transaction(transaction.xid);
-        self.ddl_undo.clear();
         self.settings_undo = None;
         self.deferred_constraints.clear();
         self.defer_all_constraints = false;
@@ -1279,12 +1686,16 @@ impl Session {
         assert!(transaction.implicit_batch);
         let mut state = self.db.state.lock().expect("database mutex is poisoned");
         state.transactions.finish_read_only(transaction.xid);
+        state
+            .relation_locks
+            .release_transaction_locks(transaction.xid);
+        state.wait_for.remove_transaction(transaction.xid);
         prune_database_versions(&mut state);
-        self.ddl_undo.clear();
         self.settings_undo = None;
         self.deferred_constraints.clear();
         self.defer_all_constraints = false;
         self.deferred_foreign_keys_dirty = false;
+        self.db.condvar.notify_all();
     }
 
     #[cfg_attr(feature = "execution-log", tracing::instrument(skip_all))]
@@ -1313,7 +1724,6 @@ impl Session {
             }
         };
         state.load_catalog(Some(xid), snapshot);
-        self.rollback_ddl(&mut state);
         if let Some((default_isolation, lock_timeout, timezone)) = self.settings_undo.take() {
             self.default_isolation = default_isolation;
             self.lock_timeout = lock_timeout;
@@ -1343,59 +1753,6 @@ impl Session {
             None => false,
         }
     }
-    #[cfg_attr(feature = "execution-log", tracing::instrument(skip_all))]
-    fn rollback_ddl(&mut self, state: &mut DatabaseState) {
-        for undo in self.ddl_undo.drain(..).rev() {
-            match undo {
-                DdlUndo::DropCreated(name) => {
-                    if let Ok(schema) = state.catalog.drop_table(&name) {
-                        state.tables.remove(&schema.id);
-                        for sequence in state.catalog.drop_owned_sequences(schema.id) {
-                            state
-                                .sequence_values
-                                .lock()
-                                .expect("sequence storage is poisoned")
-                                .remove(&sequence.id);
-                        }
-                    }
-                }
-                DdlUndo::RestoreDropped(schema, table, sequences) => {
-                    if !state.catalog.has_relation(&schema.name) {
-                        state.tables.insert(schema.id, table);
-                        state.catalog.restore_table(schema);
-                        for (sequence, value) in sequences {
-                            state
-                                .sequence_values
-                                .lock()
-                                .expect("sequence storage is poisoned")
-                                .insert(sequence.id, value);
-                            state.catalog.restore_sequence(sequence);
-                        }
-                    }
-                }
-                DdlUndo::DropCreatedSequence(name) => {
-                    if let Ok(sequence) = state.catalog.drop_sequence(&name) {
-                        state
-                            .sequence_values
-                            .lock()
-                            .expect("sequence storage is poisoned")
-                            .remove(&sequence.id);
-                    }
-                }
-                DdlUndo::RestoreDroppedSequence(sequence, value) => {
-                    if !state.catalog.has_relation(&sequence.name) {
-                        state
-                            .sequence_values
-                            .lock()
-                            .expect("sequence storage is poisoned")
-                            .insert(sequence.id, value);
-                        state.catalog.restore_sequence(sequence);
-                    }
-                }
-            }
-        }
-    }
-
     #[cfg_attr(feature = "execution-log", tracing::instrument(skip_all))]
     fn abort_with_error<T>(&mut self, error: PgError) -> Result<T> {
         self.mark_transaction_aborted();
@@ -1587,17 +1944,6 @@ impl Session {
                 "current transaction is aborted",
             ));
         }
-        if matches!(
-            self.transaction,
-            Some(SessionTransactionState::Active(transaction)) if !transaction.implicit_batch
-        ) && prepared_query.is_none()
-            && matches!(parser::classify(statement), parser::StatementKind::Ddl)
-        {
-            return self.abort_with_error(PgError::create(
-                SqlState::FeatureNotSupported,
-                "DDL in an explicit transaction is not implemented",
-            ));
-        }
         let Some(SessionTransactionState::Active(mut transaction)) = self.transaction else {
             unreachable!("transaction must be active while executing a statement")
         };
@@ -1622,6 +1968,21 @@ impl Session {
                 .retain_snapshot(transaction.xid, snapshot);
         }
         state.load_catalog(Some(transaction.xid), snapshot);
+        let acquired = match acquire_relation_locks(
+            &condvar,
+            self.lock_timeout,
+            state,
+            statement,
+            prepared_dependencies,
+            transaction.xid,
+            transaction.isolation,
+            snapshot,
+        ) {
+            Ok(acquired) => acquired,
+            Err(error) => return self.abort_with_error(error),
+        };
+        state = acquired.0;
+        snapshot = acquired.1;
         let prepared_dependency_error = prepared_dependencies.and_then(|dependencies| {
             dependencies.iter().find_map(|dependency| match dependency {
                 PreparedCatalogDependency::Table(schema) => {
@@ -1778,15 +2139,6 @@ impl Session {
             None
         };
         let statement = subquery_statement.as_ref().unwrap_or(statement);
-        if transaction.implicit_batch
-            && matches!(parser::classify(statement), parser::StatementKind::Ddl)
-        {
-            let undo = match collect_ddl_undo_for_statement(&state, statement) {
-                Ok(undo) => undo,
-                Err(error) => return self.abort_with_error(error),
-            };
-            self.ddl_undo.extend(undo);
-        }
         let catalog_before = matches!(parser::classify(statement), parser::StatementKind::Ddl)
             .then(|| state.catalog.clone());
         let (mut state, snapshot, locked_rows) = match acquire_row_locks(
@@ -2005,6 +2357,15 @@ impl Drop for Transaction<'_> {
     }
 }
 
+impl Drop for Session {
+    #[cfg_attr(feature = "execution-log", tracing::instrument(skip_all))]
+    fn drop(&mut self) {
+        if self.transaction.is_some() {
+            let _ = self.rollback_transaction();
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use std::{sync::mpsc, thread};
@@ -2021,6 +2382,18 @@ mod tests {
         let deadline = Instant::now() + Duration::from_secs(1);
         loop {
             if db.state.lock().unwrap().row_locks.has_waiters() {
+                return;
+            }
+            assert!(Instant::now() < deadline, "transaction did not block");
+            thread::yield_now();
+        }
+    }
+
+    #[cfg_attr(feature = "execution-log", tracing::instrument(skip_all))]
+    fn wait_until_relation_blocked(db: &Db) {
+        let deadline = Instant::now() + Duration::from_secs(1);
+        loop {
+            if db.state.lock().unwrap().relation_locks.has_waiters() {
                 return;
             }
             assert!(Instant::now() < deadline, "transaction did not block");
@@ -2445,7 +2818,7 @@ mod tests {
         drop(state);
         assert_eq!(
             session.execute("DROP TABLE items").unwrap(),
-            create_affected_results(1)
+            create_affected_results(0)
         );
     }
 
@@ -4123,7 +4496,9 @@ mod tests {
     #[test]
     #[cfg_attr(feature = "execution-log", tracing::instrument(skip_all))]
     fn retains_dropped_table_until_repeatable_read_snapshot_finishes() {
-        let db = Db::create();
+        let db = Db::create_builder()
+            .set_lock_timeout(Duration::from_secs(2))
+            .build();
         let mut reader = db.create_session();
         let mut writer = db.create_session();
         writer.execute("CREATE TABLE items (id INTEGER)").unwrap();
@@ -4144,14 +4519,13 @@ mod tests {
             vec![vec![Value::Int4(1)]]
         );
 
-        writer.execute("DROP TABLE items").unwrap();
-        assert_eq!(
-            writer
-                .query("SELECT * FROM items", &[])
-                .unwrap_err()
-                .sqlstate,
-            SqlState::UndefinedTable
-        );
+        let (result_sender, result_receiver) = mpsc::channel();
+        let handle = thread::spawn(move || {
+            result_sender
+                .send(writer.execute("DROP TABLE items"))
+                .unwrap();
+        });
+        wait_until_relation_blocked(&db);
         assert_eq!(
             reader.query("SELECT * FROM items", &[]).unwrap().rows,
             vec![vec![Value::Int4(1)]]
@@ -4159,6 +4533,13 @@ mod tests {
         assert!(db.state.lock().unwrap().tables.contains_key(&table_id));
 
         reader.execute("ROLLBACK").unwrap();
+        assert_eq!(
+            result_receiver
+                .recv_timeout(Duration::from_secs(1))
+                .unwrap(),
+            Ok(create_affected_results(0))
+        );
+        handle.join().unwrap();
         assert!(!db.state.lock().unwrap().tables.contains_key(&table_id));
     }
 
@@ -4254,7 +4635,9 @@ mod tests {
     #[test]
     #[cfg_attr(feature = "execution-log", tracing::instrument(skip_all))]
     fn retains_dropped_table_while_a_read_committed_writer_uses_it() {
-        let db = Db::create();
+        let db = Db::create_builder()
+            .set_lock_timeout(Duration::from_secs(2))
+            .build();
         let mut writer = db.create_session();
         let mut dropper = db.create_session();
         writer.execute("CREATE TABLE items (id INTEGER)").unwrap();
@@ -4270,13 +4653,26 @@ mod tests {
 
         writer.execute("BEGIN").unwrap();
         writer.execute("UPDATE items SET id = 2").unwrap();
-        dropper.execute("DROP TABLE items").unwrap();
+        let (result_sender, result_receiver) = mpsc::channel();
+        let handle = thread::spawn(move || {
+            result_sender
+                .send(dropper.execute("DROP TABLE items"))
+                .unwrap();
+        });
+        wait_until_relation_blocked(&db);
         assert!(db.state.lock().unwrap().tables.contains_key(&table_id));
 
         writer.execute("COMMIT").unwrap();
+        assert_eq!(
+            result_receiver
+                .recv_timeout(Duration::from_secs(1))
+                .unwrap(),
+            Ok(create_affected_results(0))
+        );
+        handle.join().unwrap();
         assert!(!db.state.lock().unwrap().tables.contains_key(&table_id));
         assert_eq!(
-            dropper
+            writer
                 .query("SELECT * FROM items", &[])
                 .unwrap_err()
                 .sqlstate,
@@ -5134,17 +5530,34 @@ mod tests {
 
     #[test]
     #[cfg_attr(feature = "execution-log", tracing::instrument(skip_all))]
-    fn rejects_ddl_inside_explicit_transactions() {
+    fn rolls_back_created_tables_rows_constraints_and_sequences() {
         let db = Db::create();
         let mut session = db.create_session();
+        let mut reader = db.create_session();
 
         session.execute("BEGIN").unwrap();
         assert_eq!(
             session
-                .execute("CREATE TABLE items (id INTEGER)")
+                .execute("CREATE TABLE items (id SERIAL PRIMARY KEY, value INTEGER UNIQUE)")
+                .unwrap(),
+            create_affected_results(0)
+        );
+        session
+            .execute("INSERT INTO items (value) VALUES (10)")
+            .unwrap();
+        assert_eq!(
+            session
+                .query("SELECT id, value FROM items", &[])
+                .unwrap()
+                .rows,
+            vec![vec![Value::Int4(1), Value::Int4(10)]]
+        );
+        assert_eq!(
+            reader
+                .query("SELECT * FROM items", &[])
                 .unwrap_err()
                 .sqlstate,
-            SqlState::FeatureNotSupported
+            SqlState::UndefinedTable
         );
         session.execute("ROLLBACK").unwrap();
         assert_eq!(
@@ -5153,6 +5566,685 @@ mod tests {
                 .unwrap_err()
                 .sqlstate,
             SqlState::UndefinedTable
+        );
+        assert_eq!(
+            session
+                .query("SELECT nextval('items_id_seq')", &[])
+                .unwrap_err()
+                .sqlstate,
+            SqlState::UndefinedTable
+        );
+    }
+
+    #[test]
+    #[cfg_attr(feature = "execution-log", tracing::instrument(skip_all))]
+    fn rolls_back_dropped_tables_and_keeps_sequence_allocations() {
+        let db = Db::create();
+        let mut session = db.create_session();
+        session
+            .execute("CREATE TABLE items (id SERIAL PRIMARY KEY, value INTEGER UNIQUE)")
+            .unwrap();
+        session
+            .execute("INSERT INTO items (value) VALUES (10)")
+            .unwrap();
+
+        session.execute("BEGIN").unwrap();
+        assert_eq!(
+            session
+                .query("SELECT nextval('items_id_seq')", &[])
+                .unwrap()
+                .rows,
+            vec![vec![Value::Int8(2)]]
+        );
+        session.execute("DROP TABLE items").unwrap();
+        assert_eq!(
+            session
+                .query("SELECT * FROM items", &[])
+                .unwrap_err()
+                .sqlstate,
+            SqlState::UndefinedTable
+        );
+        session.execute("ROLLBACK").unwrap();
+
+        assert_eq!(
+            session
+                .query("SELECT id, value FROM items", &[])
+                .unwrap()
+                .rows,
+            vec![vec![Value::Int4(1), Value::Int4(10)]]
+        );
+        assert_eq!(
+            session
+                .query("SELECT nextval('items_id_seq')", &[])
+                .unwrap()
+                .rows,
+            vec![vec![Value::Int8(3)]]
+        );
+        assert_eq!(
+            session
+                .execute("INSERT INTO items (id, value) VALUES (1, 20)")
+                .unwrap_err()
+                .sqlstate,
+            SqlState::UniqueViolation
+        );
+    }
+
+    #[test]
+    #[cfg_attr(feature = "execution-log", tracing::instrument(skip_all))]
+    fn rolls_back_ddl_after_a_later_statement_failure() {
+        let db = Db::create();
+        let mut session = db.create_session();
+
+        session.execute("BEGIN").unwrap();
+        session
+            .execute("CREATE TABLE transient (id INTEGER)")
+            .unwrap();
+        assert_eq!(
+            session.execute("SELECT 1 / 0").unwrap_err().sqlstate,
+            SqlState::DivisionByZero
+        );
+        assert_eq!(
+            session
+                .query("SELECT * FROM transient", &[])
+                .unwrap_err()
+                .sqlstate,
+            SqlState::InFailedSqlTransaction
+        );
+        session.execute("ROLLBACK").unwrap();
+        assert_eq!(
+            session
+                .query("SELECT * FROM transient", &[])
+                .unwrap_err()
+                .sqlstate,
+            SqlState::UndefinedTable
+        );
+    }
+
+    #[test]
+    #[cfg_attr(feature = "execution-log", tracing::instrument(skip_all))]
+    fn rolls_back_partial_multi_relation_ddl_failure() {
+        let db = Db::create();
+        let mut session = db.create_session();
+        session.execute("CREATE TABLE first (id INTEGER)").unwrap();
+        session.execute("INSERT INTO first VALUES (1)").unwrap();
+
+        session.execute("BEGIN").unwrap();
+        assert_eq!(
+            session
+                .execute("DROP TABLE first, missing")
+                .unwrap_err()
+                .sqlstate,
+            SqlState::UndefinedTable
+        );
+        session.execute("ROLLBACK").unwrap();
+
+        assert_eq!(
+            session.query("SELECT * FROM first", &[]).unwrap().rows,
+            vec![vec![Value::Int4(1)]]
+        );
+    }
+
+    #[test]
+    #[cfg_attr(feature = "execution-log", tracing::instrument(skip_all))]
+    fn serializes_concurrent_relation_creation() {
+        let db = Db::create_builder()
+            .set_lock_timeout(Duration::from_secs(2))
+            .build();
+        let mut creator = db.create_session();
+        let mut contender = db.create_session();
+        creator.execute("BEGIN").unwrap();
+        creator.execute("CREATE TABLE items (id INTEGER)").unwrap();
+
+        let (result_sender, result_receiver) = mpsc::channel();
+        let handle = thread::spawn(move || {
+            contender.execute("BEGIN").unwrap();
+            let result = contender.execute("CREATE TABLE items (id INTEGER)");
+            contender.execute("ROLLBACK").unwrap();
+            result_sender.send(result).unwrap();
+        });
+        wait_until_relation_blocked(&db);
+        creator.execute("COMMIT").unwrap();
+
+        assert_eq!(
+            result_receiver
+                .recv_timeout(Duration::from_secs(1))
+                .unwrap()
+                .unwrap_err()
+                .sqlstate,
+            SqlState::DuplicateTable
+        );
+        handle.join().unwrap();
+        assert!(creator.query("SELECT * FROM items", &[]).is_ok());
+    }
+
+    #[test]
+    #[cfg_attr(feature = "execution-log", tracing::instrument(skip_all))]
+    fn allows_concurrent_creation_after_the_first_creator_rolls_back() {
+        let db = Db::create_builder()
+            .set_lock_timeout(Duration::from_secs(2))
+            .build();
+        let mut creator = db.create_session();
+        let mut contender = db.create_session();
+        creator.execute("BEGIN").unwrap();
+        creator.execute("CREATE SEQUENCE ids START 10").unwrap();
+
+        let (result_sender, result_receiver) = mpsc::channel();
+        let handle = thread::spawn(move || {
+            result_sender
+                .send(contender.execute("CREATE SEQUENCE ids START 20"))
+                .unwrap();
+        });
+        wait_until_relation_blocked(&db);
+        creator.execute("ROLLBACK").unwrap();
+
+        assert_eq!(
+            result_receiver
+                .recv_timeout(Duration::from_secs(1))
+                .unwrap(),
+            Ok(create_affected_results(0))
+        );
+        handle.join().unwrap();
+        assert_eq!(
+            creator.query("SELECT nextval('ids')", &[]).unwrap().rows,
+            vec![vec![Value::Int8(20)]]
+        );
+    }
+
+    #[test]
+    #[cfg_attr(feature = "execution-log", tracing::instrument(skip_all))]
+    fn serializes_dependency_creation_against_table_drop() {
+        let db = Db::create_builder()
+            .set_lock_timeout(Duration::from_secs(2))
+            .build();
+        let mut creator = db.create_session();
+        let mut dropper = db.create_session();
+        creator
+            .execute("CREATE TABLE parents (id INTEGER PRIMARY KEY)")
+            .unwrap();
+        creator.execute("BEGIN").unwrap();
+        creator
+            .execute("CREATE TABLE children (parent_id INTEGER REFERENCES parents)")
+            .unwrap();
+
+        let (result_sender, result_receiver) = mpsc::channel();
+        let handle = thread::spawn(move || {
+            result_sender
+                .send(dropper.execute("DROP TABLE parents"))
+                .unwrap();
+        });
+        wait_until_relation_blocked(&db);
+        creator.execute("COMMIT").unwrap();
+
+        assert_eq!(
+            result_receiver
+                .recv_timeout(Duration::from_secs(1))
+                .unwrap()
+                .unwrap_err()
+                .sqlstate,
+            SqlState::DependentObjectsStillExist
+        );
+        handle.join().unwrap();
+        assert!(creator.query("SELECT * FROM parents", &[]).is_ok());
+        assert!(creator.query("SELECT * FROM children", &[]).is_ok());
+    }
+
+    #[test]
+    #[cfg_attr(feature = "execution-log", tracing::instrument(skip_all))]
+    fn blocks_sequence_drop_while_an_explicit_transaction_uses_it() {
+        let db = Db::create_builder()
+            .set_lock_timeout(Duration::from_secs(2))
+            .build();
+        let mut user = db.create_session();
+        let mut dropper = db.create_session();
+        user.execute("CREATE SEQUENCE ids").unwrap();
+        user.execute("BEGIN").unwrap();
+        assert_eq!(
+            user.query("SELECT nextval('ids')", &[]).unwrap().rows,
+            vec![vec![Value::Int8(1)]]
+        );
+
+        let (result_sender, result_receiver) = mpsc::channel();
+        let handle = thread::spawn(move || {
+            result_sender
+                .send(dropper.execute("DROP SEQUENCE ids"))
+                .unwrap();
+        });
+        wait_until_relation_blocked(&db);
+        user.execute("ROLLBACK").unwrap();
+
+        assert_eq!(
+            result_receiver
+                .recv_timeout(Duration::from_secs(1))
+                .unwrap(),
+            Ok(create_affected_results(0))
+        );
+        handle.join().unwrap();
+        assert_eq!(
+            user.query("SELECT nextval('ids')", &[])
+                .unwrap_err()
+                .sqlstate,
+            SqlState::UndefinedTable
+        );
+    }
+
+    #[test]
+    #[cfg_attr(feature = "execution-log", tracing::instrument(skip_all))]
+    fn blocks_sequence_drop_for_late_bound_sequence_names() {
+        let db = Db::create_builder()
+            .set_lock_timeout(Duration::from_secs(2))
+            .build();
+        let mut user = db.create_session();
+        let mut dropper = db.create_session();
+        user.execute("CREATE SEQUENCE ids").unwrap();
+        user.execute("BEGIN").unwrap();
+        assert_eq!(
+            user.query("SELECT nextval('ids'::text)", &[]).unwrap().rows,
+            vec![vec![Value::Int8(1)]]
+        );
+
+        let (result_sender, result_receiver) = mpsc::channel();
+        let handle = thread::spawn(move || {
+            result_sender
+                .send(dropper.execute("DROP SEQUENCE ids"))
+                .unwrap();
+        });
+        wait_until_relation_blocked(&db);
+        user.execute("ROLLBACK").unwrap();
+
+        assert_eq!(
+            result_receiver
+                .recv_timeout(Duration::from_secs(1))
+                .unwrap(),
+            Ok(create_affected_results(0))
+        );
+        handle.join().unwrap();
+    }
+
+    #[test]
+    #[cfg_attr(feature = "execution-log", tracing::instrument(skip_all))]
+    fn blocks_sequence_drop_for_parameterized_sequence_names() {
+        let db = Db::create_builder()
+            .set_lock_timeout(Duration::from_secs(2))
+            .build();
+        let mut user = db.create_session();
+        let mut dropper = db.create_session();
+        user.execute("CREATE SEQUENCE ids").unwrap();
+        let next_value = user.prepare("SELECT nextval($1)").unwrap();
+        user.execute("BEGIN").unwrap();
+        assert_eq!(
+            user.query_prepared(&next_value, &[Value::Text("ids".into())])
+                .unwrap()
+                .rows,
+            vec![vec![Value::Int8(1)]]
+        );
+
+        let (result_sender, result_receiver) = mpsc::channel();
+        let handle = thread::spawn(move || {
+            result_sender
+                .send(dropper.execute("DROP SEQUENCE ids"))
+                .unwrap();
+        });
+        wait_until_relation_blocked(&db);
+        user.execute("COMMIT").unwrap();
+
+        assert_eq!(
+            result_receiver
+                .recv_timeout(Duration::from_secs(1))
+                .unwrap(),
+            Ok(create_affected_results(0))
+        );
+        handle.join().unwrap();
+    }
+
+    #[test]
+    #[cfg_attr(feature = "execution-log", tracing::instrument(skip_all))]
+    fn blocks_parent_drop_while_child_dml_uses_the_foreign_key() {
+        let db = Db::create_builder()
+            .set_lock_timeout(Duration::from_secs(2))
+            .build();
+        let mut writer = db.create_session();
+        let mut dropper = db.create_session();
+        writer
+            .execute("CREATE TABLE parents (id INTEGER PRIMARY KEY)")
+            .unwrap();
+        writer
+            .execute("CREATE TABLE children (parent_id INTEGER REFERENCES parents)")
+            .unwrap();
+        writer.execute("INSERT INTO parents VALUES (1)").unwrap();
+        writer.execute("BEGIN").unwrap();
+        writer.execute("INSERT INTO children VALUES (1)").unwrap();
+
+        let (result_sender, result_receiver) = mpsc::channel();
+        let handle = thread::spawn(move || {
+            result_sender
+                .send(dropper.execute("DROP TABLE parents"))
+                .unwrap();
+        });
+        wait_until_relation_blocked(&db);
+        writer.execute("ROLLBACK").unwrap();
+
+        assert_eq!(
+            result_receiver
+                .recv_timeout(Duration::from_secs(1))
+                .unwrap()
+                .unwrap_err()
+                .sqlstate,
+            SqlState::DependentObjectsStillExist
+        );
+        handle.join().unwrap();
+    }
+
+    #[test]
+    #[cfg_attr(feature = "execution-log", tracing::instrument(skip_all))]
+    fn blocks_child_drop_while_parent_dml_cascades_to_it() {
+        let db = Db::create_builder()
+            .set_lock_timeout(Duration::from_secs(2))
+            .build();
+        let mut writer = db.create_session();
+        let mut dropper = db.create_session();
+        writer
+            .execute("CREATE TABLE parents (id INTEGER PRIMARY KEY)")
+            .unwrap();
+        writer
+            .execute(
+                "CREATE TABLE children (parent_id INTEGER REFERENCES parents ON DELETE CASCADE)",
+            )
+            .unwrap();
+        writer.execute("INSERT INTO parents VALUES (1)").unwrap();
+        writer.execute("INSERT INTO children VALUES (1)").unwrap();
+        writer.execute("BEGIN").unwrap();
+        writer.execute("DELETE FROM parents WHERE id = 1").unwrap();
+
+        let (result_sender, result_receiver) = mpsc::channel();
+        let handle = thread::spawn(move || {
+            result_sender
+                .send(dropper.execute("DROP TABLE children"))
+                .unwrap();
+        });
+        wait_until_relation_blocked(&db);
+        writer.execute("ROLLBACK").unwrap();
+
+        assert_eq!(
+            result_receiver
+                .recv_timeout(Duration::from_secs(1))
+                .unwrap(),
+            Ok(create_affected_results(0))
+        );
+        handle.join().unwrap();
+    }
+
+    #[test]
+    #[cfg_attr(feature = "execution-log", tracing::instrument(skip_all))]
+    fn does_not_block_child_drop_for_parent_insert() {
+        let db = Db::create_builder()
+            .set_lock_timeout(Duration::from_secs(2))
+            .build();
+        let mut writer = db.create_session();
+        let mut dropper = db.create_session();
+        writer
+            .execute("CREATE TABLE parents (id INTEGER PRIMARY KEY)")
+            .unwrap();
+        writer
+            .execute("CREATE TABLE children (parent_id INTEGER REFERENCES parents)")
+            .unwrap();
+        writer.execute("BEGIN").unwrap();
+        writer.execute("INSERT INTO parents VALUES (1)").unwrap();
+
+        let (result_sender, result_receiver) = mpsc::channel();
+        let handle = thread::spawn(move || {
+            result_sender
+                .send(dropper.execute("DROP TABLE children"))
+                .unwrap();
+        });
+
+        assert_eq!(
+            result_receiver
+                .recv_timeout(Duration::from_secs(1))
+                .unwrap(),
+            Ok(create_affected_results(0))
+        );
+        writer.execute("ROLLBACK").unwrap();
+        handle.join().unwrap();
+    }
+
+    #[test]
+    #[cfg_attr(feature = "execution-log", tracing::instrument(skip_all))]
+    fn does_not_block_child_drop_for_unrelated_parent_update() {
+        let db = Db::create_builder()
+            .set_lock_timeout(Duration::from_secs(2))
+            .build();
+        let mut writer = db.create_session();
+        let mut dropper = db.create_session();
+        writer
+            .execute("CREATE TABLE parents (id INTEGER PRIMARY KEY, value INTEGER)")
+            .unwrap();
+        writer
+            .execute("CREATE TABLE children (parent_id INTEGER REFERENCES parents)")
+            .unwrap();
+        writer
+            .execute("INSERT INTO parents VALUES (1, 10)")
+            .unwrap();
+        writer.execute("BEGIN").unwrap();
+        writer
+            .execute("UPDATE parents SET value = 20 WHERE id = 1")
+            .unwrap();
+
+        let (result_sender, result_receiver) = mpsc::channel();
+        let handle = thread::spawn(move || {
+            result_sender
+                .send(dropper.execute("DROP TABLE children"))
+                .unwrap();
+        });
+
+        assert_eq!(
+            result_receiver
+                .recv_timeout(Duration::from_secs(1))
+                .unwrap(),
+            Ok(create_affected_results(0))
+        );
+        writer.execute("ROLLBACK").unwrap();
+        handle.join().unwrap();
+    }
+
+    #[test]
+    #[cfg_attr(feature = "execution-log", tracing::instrument(skip_all))]
+    fn rejects_computed_sequence_names() {
+        let db = Db::create();
+        let mut session = db.create_session();
+        session.execute("CREATE SEQUENCE first_ids").unwrap();
+        session.execute("CREATE SEQUENCE second_ids").unwrap();
+
+        assert_eq!(
+            session
+                .query(
+                    "SELECT nextval(CASE WHEN true THEN 'first_ids' ELSE 'second_ids' END)",
+                    &[],
+                )
+                .unwrap_err()
+                .sqlstate,
+            SqlState::FeatureNotSupported
+        );
+        session.execute("DROP SEQUENCE second_ids").unwrap();
+    }
+
+    #[test]
+    #[cfg_attr(feature = "execution-log", tracing::instrument(skip_all))]
+    fn lets_parent_drop_continue_after_child_drop_commits() {
+        let db = Db::create_builder()
+            .set_lock_timeout(Duration::from_secs(2))
+            .build();
+        let mut child_dropper = db.create_session();
+        let mut parent_dropper = db.create_session();
+        child_dropper
+            .execute("CREATE TABLE parents (id INTEGER PRIMARY KEY)")
+            .unwrap();
+        child_dropper
+            .execute("CREATE TABLE children (parent_id INTEGER REFERENCES parents)")
+            .unwrap();
+        child_dropper.execute("BEGIN").unwrap();
+        child_dropper.execute("DROP TABLE children").unwrap();
+
+        let (result_sender, result_receiver) = mpsc::channel();
+        let handle = thread::spawn(move || {
+            result_sender
+                .send(parent_dropper.execute("DROP TABLE parents"))
+                .unwrap();
+        });
+        wait_until_relation_blocked(&db);
+        child_dropper.execute("COMMIT").unwrap();
+
+        assert_eq!(
+            result_receiver
+                .recv_timeout(Duration::from_secs(1))
+                .unwrap(),
+            Ok(create_affected_results(0))
+        );
+        handle.join().unwrap();
+    }
+
+    #[test]
+    #[cfg_attr(feature = "execution-log", tracing::instrument(skip_all))]
+    fn preserves_parent_dependency_after_child_drop_rolls_back() {
+        let db = Db::create_builder()
+            .set_lock_timeout(Duration::from_secs(2))
+            .build();
+        let mut child_dropper = db.create_session();
+        let mut parent_dropper = db.create_session();
+        child_dropper
+            .execute("CREATE TABLE parents (id INTEGER PRIMARY KEY)")
+            .unwrap();
+        child_dropper
+            .execute("CREATE TABLE children (parent_id INTEGER REFERENCES parents)")
+            .unwrap();
+        child_dropper.execute("BEGIN").unwrap();
+        child_dropper.execute("DROP TABLE children").unwrap();
+
+        let (result_sender, result_receiver) = mpsc::channel();
+        let handle = thread::spawn(move || {
+            result_sender
+                .send(parent_dropper.execute("DROP TABLE parents"))
+                .unwrap();
+        });
+        wait_until_relation_blocked(&db);
+        child_dropper.execute("ROLLBACK").unwrap();
+
+        assert_eq!(
+            result_receiver
+                .recv_timeout(Duration::from_secs(1))
+                .unwrap()
+                .unwrap_err()
+                .sqlstate,
+            SqlState::DependentObjectsStillExist
+        );
+        handle.join().unwrap();
+    }
+
+    #[test]
+    #[cfg_attr(feature = "execution-log", tracing::instrument(skip_all))]
+    fn wakes_table_drop_after_read_only_commit() {
+        let db = Db::create_builder()
+            .set_lock_timeout(Duration::from_secs(10))
+            .build();
+        let mut reader = db.create_session();
+        let mut dropper = db.create_session();
+        reader.execute("CREATE TABLE items (id INTEGER)").unwrap();
+        reader.execute("BEGIN").unwrap();
+        reader.query("SELECT * FROM items", &[]).unwrap();
+
+        let (result_sender, result_receiver) = mpsc::channel();
+        let handle = thread::spawn(move || {
+            result_sender
+                .send(dropper.execute("DROP TABLE items"))
+                .unwrap();
+        });
+        wait_until_relation_blocked(&db);
+        reader.execute("COMMIT").unwrap();
+
+        assert_eq!(
+            result_receiver
+                .recv_timeout(Duration::from_secs(1))
+                .unwrap(),
+            Ok(create_affected_results(0))
+        );
+        handle.join().unwrap();
+    }
+
+    #[test]
+    #[cfg_attr(feature = "execution-log", tracing::instrument(skip_all))]
+    fn drops_foreign_key_related_tables_as_one_set_in_either_order() {
+        let db = Db::create();
+        let mut session = db.create_session();
+        session
+            .execute("CREATE TABLE parents (id INTEGER PRIMARY KEY)")
+            .unwrap();
+        session
+            .execute("CREATE TABLE children (parent_id INTEGER REFERENCES parents)")
+            .unwrap();
+
+        session.execute("BEGIN").unwrap();
+        session.execute("DROP TABLE parents, children").unwrap();
+        session.execute("ROLLBACK").unwrap();
+        assert!(session.query("SELECT * FROM parents", &[]).is_ok());
+        assert!(session.query("SELECT * FROM children", &[]).is_ok());
+
+        session.execute("DROP TABLE children, parents").unwrap();
+        assert_eq!(
+            session
+                .query("SELECT * FROM parents", &[])
+                .unwrap_err()
+                .sqlstate,
+            SqlState::UndefinedTable
+        );
+        assert_eq!(
+            session
+                .query("SELECT * FROM children", &[])
+                .unwrap_err()
+                .sqlstate,
+            SqlState::UndefinedTable
+        );
+    }
+
+    #[test]
+    #[cfg_attr(feature = "execution-log", tracing::instrument(skip_all))]
+    fn aborts_open_transactions_when_sessions_are_dropped() {
+        let db = Db::create();
+        let mut abandoned = db.create_session();
+        abandoned.execute("BEGIN").unwrap();
+        abandoned
+            .execute("CREATE TABLE abandoned (id INTEGER)")
+            .unwrap();
+        drop(abandoned);
+
+        let mut successor = db.create_session();
+        successor
+            .execute("CREATE TABLE abandoned (id INTEGER)")
+            .unwrap();
+        assert!(successor.query("SELECT * FROM abandoned", &[]).is_ok());
+    }
+
+    #[test]
+    #[cfg_attr(feature = "execution-log", tracing::instrument(skip_all))]
+    fn restores_prepared_relation_identity_after_ddl_rollback() {
+        let db = Db::create();
+        let mut session = db.create_session();
+        session.execute("CREATE TABLE items (id INTEGER)").unwrap();
+        session.execute("INSERT INTO items VALUES (1)").unwrap();
+        let select = session.prepare("SELECT id FROM items").unwrap();
+        let drop = session.prepare("DROP TABLE items").unwrap();
+
+        session.execute("BEGIN").unwrap();
+        session.execute("DROP TABLE items").unwrap();
+        session.execute("CREATE TABLE items (id INTEGER)").unwrap();
+        session.execute("INSERT INTO items VALUES (2)").unwrap();
+        assert_eq!(
+            session.execute_prepared(&drop, &[]).unwrap_err().sqlstate,
+            SqlState::FeatureNotSupported
+        );
+        session.execute("ROLLBACK").unwrap();
+
+        assert_eq!(
+            session.query_prepared(&select, &[]).unwrap().rows,
+            vec![vec![Value::Int4(1)]]
         );
     }
 

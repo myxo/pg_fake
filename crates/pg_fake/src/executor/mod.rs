@@ -11,8 +11,8 @@ use crate::{
     error::{PgError, Result, SqlState, reject_unsupported},
     storage::{RowId, Table},
     txn::{
-        CommandId, RowLockKey, RowLockManager, RowLockMode, Snapshot, TransactionRegistry,
-        TransactionStatus, WaitForGraph, Xid, find_visible_version,
+        CommandId, RelationLockManager, RowLockKey, RowLockManager, RowLockMode, Snapshot,
+        TransactionRegistry, TransactionStatus, WaitForGraph, Xid, find_visible_version,
     },
     value::{BaseType, DAYS_PER_MONTH, MICROSECONDS_PER_DAY, PgType, Value},
 };
@@ -87,6 +87,7 @@ pub(crate) struct DatabaseState {
     pub(crate) tables: BTreeMap<TableId, Table>,
     pub(crate) transactions: TransactionRegistry,
     pub(crate) row_locks: RowLockManager,
+    pub(crate) relation_locks: RelationLockManager,
     pub(crate) wait_for: WaitForGraph,
     pub(crate) sequence_values: SequenceStorage,
     touched_tables: BTreeMap<Xid, Vec<TableId>>,
@@ -122,6 +123,7 @@ impl DatabaseState {
             tables: BTreeMap::new(),
             transactions,
             row_locks: RowLockManager::create(),
+            relation_locks: RelationLockManager::create(),
             wait_for: WaitForGraph::create(),
             sequence_values: Arc::new(Mutex::new(BTreeMap::new())),
             touched_tables: BTreeMap::new(),
@@ -640,19 +642,21 @@ pub(crate) fn execute_statement(
                     "DROP TABLE with CASCADE or RESTRICT is not implemented",
                 );
             }
-            let mut affected = 0;
+            let mut table_names = Vec::new();
+            let mut seen = BTreeSet::new();
             for object in names {
                 let table_name = normalize_unqualified_object_name(object)?;
-                match state.catalog.drop_table(&table_name) {
-                    Ok(schema) => {
-                        state.catalog.drop_owned_sequences(schema.id);
-                        affected += 1;
-                    }
+                match state.catalog.require_table(&table_name) {
+                    Ok(_) if seen.insert(table_name.clone()) => table_names.push(table_name),
+                    Ok(_) => {}
                     Err(error) if *if_exists && error.sqlstate == SqlState::UndefinedTable => {}
                     Err(error) => return Err(error),
                 }
             }
-            Ok(StatementResult::Affected(affected))
+            for schema in state.catalog.drop_tables(&table_names)? {
+                state.catalog.drop_owned_sequences(schema.id);
+            }
+            Ok(StatementResult::Affected(0))
         }
         ast::Statement::Drop {
             object_type: ast::ObjectType::Sequence,

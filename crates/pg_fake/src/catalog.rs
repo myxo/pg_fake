@@ -1,4 +1,4 @@
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 
 use sqlparser::ast;
 
@@ -386,53 +386,55 @@ impl Catalog {
     }
 
     #[cfg_attr(feature = "execution-log", tracing::instrument(skip_all))]
-    pub(crate) fn drop_table(&mut self, name: &str) -> Result<TableSchema> {
-        if self.get_default_schema().sequences.contains_key(name) {
-            return Err(PgError::create(
-                SqlState::WrongObjectType,
-                format!("{name:?} is not a table"),
-            ));
-        }
-        let target = self.get_default_schema().tables.get(name).ok_or_else(|| {
-            PgError::create(
-                SqlState::UndefinedTable,
-                format!("table {name:?} does not exist"),
-            )
-        })?;
-        if let Some((table, constraint)) = self.iterate_tables().find_map(|table| {
-            table
-                .constraints
-                .iter()
-                .find_map(|constraint| match constraint {
-                    Constraint::ForeignKey(foreign_key)
-                        if foreign_key.foreign_table_id == target.id =>
-                    {
-                        Some((table.name.as_str(), foreign_key.name.as_str()))
-                    }
-                    _ => None,
-                })
+    pub(crate) fn drop_tables(&mut self, names: &[String]) -> Result<Vec<TableSchema>> {
+        let targets = names
+            .iter()
+            .map(|name| self.require_table(name).cloned())
+            .collect::<Result<Vec<_>>>()?;
+        let target_ids = targets
+            .iter()
+            .map(|table| table.id)
+            .collect::<BTreeSet<_>>();
+        if let Some((target, table, constraint)) = self.iterate_tables().find_map(|table| {
+            if target_ids.contains(&table.id) {
+                return None;
+            }
+            table.constraints.iter().find_map(|constraint| {
+                let Constraint::ForeignKey(foreign_key) = constraint else {
+                    return None;
+                };
+                target_ids
+                    .contains(&foreign_key.foreign_table_id)
+                    .then_some((
+                        foreign_key.foreign_table.as_str(),
+                        table.name.as_str(),
+                        foreign_key.name.as_str(),
+                    ))
+            })
         }) {
-            return reject_unsupported(format!(
-                "cannot drop table {name:?} because constraint {constraint:?} on table {table:?} depends on it"
+            return Err(PgError::create(
+                SqlState::DependentObjectsStillExist,
+                format!(
+                    "cannot drop table {target:?} because constraint {constraint:?} on table {table:?} depends on it"
+                ),
             ));
         }
-        let table = self
-            .get_default_schema_mut()
-            .tables
-            .remove(name)
-            .expect("required table must exist");
+        let dropped = names
+            .iter()
+            .map(|name| {
+                self.get_default_schema_mut()
+                    .tables
+                    .remove(name)
+                    .expect("required table must exist")
+            })
+            .collect();
         self.rebuild_foreign_key_metadata();
-        Ok(table)
+        Ok(dropped)
     }
 
-    #[cfg_attr(feature = "execution-log", tracing::instrument(skip_all))]
-    pub(crate) fn restore_table(&mut self, table: TableSchema) {
-        let previous = self
-            .get_schema_by_id_mut(table.schema_id)
-            .tables
-            .insert(table.name.clone(), table);
-        assert!(previous.is_none(), "restored table must not already exist");
-        self.rebuild_foreign_key_metadata();
+    #[cfg(test)]
+    pub(crate) fn drop_table(&mut self, name: &str) -> Result<TableSchema> {
+        Ok(self.drop_tables(&[name.to_owned()])?.remove(0))
     }
 
     #[cfg_attr(feature = "execution-log", tracing::instrument(skip_all))]
@@ -600,18 +602,6 @@ impl Catalog {
                     .expect("owned sequence must exist")
             })
             .collect()
-    }
-
-    #[cfg_attr(feature = "execution-log", tracing::instrument(skip_all))]
-    pub(crate) fn restore_sequence(&mut self, sequence: SequenceSchema) {
-        let previous = self
-            .get_schema_by_id_mut(sequence.schema_id)
-            .sequences
-            .insert(sequence.name.clone(), sequence);
-        assert!(
-            previous.is_none(),
-            "restored sequence must not already exist"
-        );
     }
 }
 

@@ -46,8 +46,19 @@ struct RowLock {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+struct RelationLock {
+    holders: BTreeMap<Xid, RelationLockMode>,
+    waiters: VecDeque<(Xid, RelationLockMode)>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct RowLockManager {
     locks: BTreeMap<RowLockKey, RowLock>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct RelationLockManager {
+    locks: BTreeMap<String, RelationLock>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -59,6 +70,17 @@ pub(crate) struct WaitForGraph {
 pub(crate) enum RowLockAttempt {
     Acquired,
     Blocked(Vec<Xid>),
+}
+
+pub(crate) enum RelationLockAttempt {
+    Acquired,
+    Blocked(Vec<Xid>),
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum RelationLockMode {
+    Shared,
+    Exclusive,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -77,6 +99,13 @@ impl Default for TransactionRegistry {
 }
 
 impl Default for RowLockManager {
+    #[cfg_attr(feature = "execution-log", tracing::instrument(skip_all))]
+    fn default() -> Self {
+        Self::create()
+    }
+}
+
+impl Default for RelationLockManager {
     #[cfg_attr(feature = "execution-log", tracing::instrument(skip_all))]
     fn default() -> Self {
         Self::create()
@@ -156,6 +185,88 @@ impl RowLockManager {
         self.locks.retain(|_, lock| {
             lock.holders.remove(&xid);
             lock.waiters.retain(|waiter| *waiter != xid);
+            !lock.holders.is_empty() || !lock.waiters.is_empty()
+        });
+    }
+
+    #[cfg(test)]
+    #[cfg_attr(feature = "execution-log", tracing::instrument(skip_all))]
+    pub(crate) fn has_waiters(&self) -> bool {
+        self.locks.values().any(|lock| !lock.waiters.is_empty())
+    }
+}
+
+impl RelationLockManager {
+    #[cfg_attr(feature = "execution-log", tracing::instrument(skip_all))]
+    pub(crate) fn create() -> Self {
+        RelationLockManager {
+            locks: BTreeMap::new(),
+        }
+    }
+
+    #[cfg_attr(feature = "execution-log", tracing::instrument(skip_all))]
+    pub(crate) fn acquire(
+        &mut self,
+        name: &str,
+        xid: Xid,
+        mode: RelationLockMode,
+    ) -> RelationLockAttempt {
+        let lock = self
+            .locks
+            .entry(name.to_owned())
+            .or_insert_with(|| RelationLock {
+                holders: BTreeMap::new(),
+                waiters: VecDeque::new(),
+            });
+        if let Some(held) = lock.holders.get(&xid)
+            && (*held == RelationLockMode::Exclusive || mode == RelationLockMode::Shared)
+        {
+            return RelationLockAttempt::Acquired;
+        }
+        let holder_conflicts = lock
+            .holders
+            .iter()
+            .filter_map(|(holder, held)| {
+                (*holder != xid
+                    && (*held == RelationLockMode::Exclusive
+                        || mode == RelationLockMode::Exclusive))
+                    .then_some(*holder)
+            })
+            .collect::<Vec<_>>();
+        let first_waiter = lock.waiters.front().copied();
+        if holder_conflicts.is_empty() && first_waiter.is_none_or(|(waiter, _)| waiter == xid) {
+            if first_waiter.is_some_and(|(waiter, _)| waiter == xid) {
+                lock.waiters.pop_front();
+            }
+            lock.holders.insert(xid, mode);
+            return RelationLockAttempt::Acquired;
+        }
+        if !lock.waiters.iter().any(|(waiter, _)| *waiter == xid) {
+            lock.waiters.push_back((xid, mode));
+        }
+        let mut blockers = holder_conflicts.into_iter().collect::<BTreeSet<_>>();
+        if let Some((waiter, _)) = first_waiter.filter(|(waiter, _)| *waiter != xid) {
+            blockers.insert(waiter);
+        }
+        RelationLockAttempt::Blocked(blockers.into_iter().collect())
+    }
+
+    #[cfg_attr(feature = "execution-log", tracing::instrument(skip_all))]
+    pub(crate) fn cancel_wait(&mut self, name: &str, xid: Xid) {
+        let Some(lock) = self.locks.get_mut(name) else {
+            return;
+        };
+        lock.waiters.retain(|(waiter, _)| *waiter != xid);
+        if lock.holders.is_empty() && lock.waiters.is_empty() {
+            self.locks.remove(name);
+        }
+    }
+
+    #[cfg_attr(feature = "execution-log", tracing::instrument(skip_all))]
+    pub(crate) fn release_transaction_locks(&mut self, xid: Xid) {
+        self.locks.retain(|_, lock| {
+            lock.holders.remove(&xid);
+            lock.waiters.retain(|(waiter, _)| *waiter != xid);
             !lock.holders.is_empty() || !lock.waiters.is_empty()
         });
     }
