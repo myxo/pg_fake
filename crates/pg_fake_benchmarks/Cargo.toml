@@ -18,3 +18,7 @@ tokio = { version = "1", features = ["macros", "rt-multi-thread", "sync", "time"
 [[bench]]
 name = "workloads"
 harness = false
+
+[[bench]]
+name = "trace_optimizations"
+harness = false
