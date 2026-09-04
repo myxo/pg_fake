@@ -95,6 +95,42 @@ The Phase 3 surface is intentionally bounded:
   families, extensions, procedures, privileges, server-level database
   management, and wire-protocol support remain later work.
 
+### Required migration workload
+
+Tasks 10–20 must support the SQL forms below. This list is normative and
+self-contained: an implementer does not need to discover any unlisted SQL input
+or external directory. Each form must have a checked-in focused fixture, and
+Task 20 must combine the fixtures into the ordered migration scenarios described
+there.
+
+- catalog and DDL: qualified `public` and `pg_temp` names; temporary tables with
+  `ON COMMIT DROP`; transactional table, column, constraint, sequence, index,
+  view, function, and trigger operations; `COMMENT ON VIEW`; trigger rename;
+  partial and covering indexes; `NOT VALID` foreign keys followed by
+  `VALIDATE CONSTRAINT`; and table locks;
+- procedural SQL: no-argument `RETURNS TRIGGER` PL/pgSQL functions, row-level
+  `BEFORE INSERT`, `BEFORE UPDATE`, and `BEFORE INSERT OR UPDATE` triggers, and
+  anonymous `DO` blocks with the constructs enumerated in Task 15;
+- data transforms: `INSERT ... SELECT`, `UPDATE ... FROM`, correlated scalar
+  subqueries, `EXISTS`/`NOT EXISTS`, materialized and ordinary CTEs, inner and
+  left joins, aggregate and window expressions, ordered limiting, and the
+  exact expressions enumerated in Task 19;
+- types used by the workload: Boolean, integer families, `numeric`, text and
+  `char(3)`, `bytea`, UUID, date, timestamptz, interval, and JSONB, including
+  their existing assignment casts, defaults, constraints, SQLx metadata, and
+  parameter/result encoding;
+- transaction behavior: SQLx migration transactions, `SET LOCAL`, table-lock
+  acquisition and timeout, atomic failure of DDL/DML/procedural statements,
+  rollback of a failed migration, and successful SQLx reapplication without
+  re-executing already recorded versions.
+
+“Unchanged” in Task 20 means that the same checked-in SQL body is passed to both
+PostgreSQL 18 and `pg_fake` through SQLx without deleting, reordering, splitting,
+or rewriting statements. Harness setup and SQLx migration bookkeeping may live
+outside that SQL body. A missing SQL form is a plan defect, not permission to
+silently tolerate or simplify it; update this section and assign the form to a
+task before implementation continues.
+
 ---
 
 ## Milestone A — Conformance baseline and set operations
@@ -367,7 +403,7 @@ Tasks 10–15 add the bounded migration surface.
 - `CREATE TEMP[TEMPORARY] TABLE`, `DROP TABLE`, and transaction cleanup isolate
   temporary relations per session and honor the required `ON COMMIT` forms.
 - Qualified table, sequence, index, view, function, and trigger references used
-  by the migration corpus bind to stable catalog identities.
+  by the required migration workload bind to stable catalog identities.
 - Unsupported schemas and search-path behavior fail explicitly; support is not
   broadened beyond the Phase 3 migration fixtures and SQLx startup requirements.
 - Differential, transaction, and multi-session cases cover qualification,
@@ -434,7 +470,7 @@ common application migrations.
 - Differential/property cases cover duplicate data, one-to-four-column keys,
   ascending and descending keys, included columns, every supported predicate
   form, predicate transitions, rollback, name collisions, arbiter inference,
-  and metadata. The migration-chain gate exercises create, drop, rename,
+  and metadata. The Task 20 scenarios exercise create, drop, rename,
   ordinary partial indexes, partial unique indexes, and covering indexes.
 
 **Notes:** Expression keys, collations, operator classes, non-B-tree methods,
@@ -484,11 +520,19 @@ PostgreSQL scope and metadata behavior.
   transactionally without affecting the view definition or dependencies.
 - Mutations targeting views return a clear unsupported-feature error in this
   phase.
-- `ALTER TRIGGER ... RENAME TO` and related supported catalog-object renames
-  preserve identity and dependencies across commit and rollback.
+- `ALTER TRIGGER name ON table RENAME TO new_name` preserves trigger identity
+  and dependencies across commit and rollback.
 - Differential/property cases cover nested views, replacement, dependencies,
   metadata, name shadowing, transactions, errors, and prepared queries.
 - The benchmark suite includes a nested filtered view query.
+
+**Required migration forms:** The gate specifically requires
+`CREATE VIEW name AS SELECT ...`, `COMMENT ON VIEW name IS <string>`,
+`DROP VIEW IF EXISTS name`, and
+`ALTER TRIGGER name ON table RENAME TO new_name`. Creating and dropping the
+view and renaming the trigger must work in a SQLx migration transaction. The
+workload does not write through the view, so its comment describing compatibility
+does not expand this task to updatable-view semantics.
 
 ### Task 14 — Migration-local settings and table locks
 
@@ -506,6 +550,16 @@ PostgreSQL scope and metadata behavior.
 - Modes or settings outside the bounded migration surface remain explicit
   unsupported features until Tasks 28–29 broaden GUC behavior.
 
+**Required migration forms:** Accept the literal assignments
+`SET LOCAL lock_timeout = '5s'` and
+`SET LOCAL statement_timeout = '30min'`. Support both one-relation
+`LOCK TABLE public.relation IN ACCESS EXCLUSIVE MODE` and comma-separated
+multi-relation `LOCK TABLE public.a, public.b IN EXCLUSIVE MODE`. Acquire a
+multi-relation lock set atomically in deterministic catalog-identity order so
+the statement cannot retain a partial set after timeout or error. Enforce
+`statement_timeout` separately for each subsequent statement, with PostgreSQL's
+per-statement timer reset; it is not merely parsed or stored.
+
 ### Task 15 — Procedural migrations and triggers
 
 **Goal:** Add the procedural execution substrate required by migration
@@ -513,26 +567,39 @@ functions, triggers, and one-off blocks.
 
 **DoD:**
 
-- `CREATE [OR REPLACE] FUNCTION` and `DROP FUNCTION` support the exact SQL and
-  PL/pgSQL signatures, declarations, assignments, conditionals, queries, and
-  return behavior listed in the Phase 3 migration fixtures.
+- `CREATE [OR REPLACE] FUNCTION name() RETURNS TRIGGER ... LANGUAGE plpgsql`
+  and `DROP FUNCTION IF EXISTS name()` support zero-argument trigger functions.
+  Function bodies support `BEGIN`/`END`, `RETURN NEW`, assignment to `NEW`
+  fields with both `:=` and PL/pgSQL's accepted `=` spelling, and nested
+  `IF`/`ELSIF`/`ELSE` blocks whose conditions use comparisons, Boolean logic,
+  and `IS [NOT] NULL`.
 - `DO` blocks execute atomically, and errors abort the surrounding SQLx
   migration transaction.
-- `SELECT ... INTO`, `GET DIAGNOSTICS ... = ROW_COUNT`, `RAISE EXCEPTION` with
-  formatted arguments and `USING HINT`, nested `IF`/`ELSIF`/`ELSE`, and
-  statement-local CTEs work inside supported blocks.
-- `CREATE TRIGGER`, `DROP TRIGGER`, and the required rename form implement
-  `BEFORE` row-trigger timing, `NEW` mutation, return, and invocation
-  semantics.
+- `DO` bodies support an optional `DECLARE` section containing `BIGINT` and
+  `TEXT` locals; SQL statements from Task 19; multi-expression `SELECT ... INTO
+  ...`; `GET DIAGNOSTICS variable = ROW_COUNT`; nested
+  `IF`/`ELSIF`/`ELSE`; and `RAISE EXCEPTION` with a literal format string,
+  `%` substitution arguments, and optional `USING HINT = <text literal>`.
+  Variables bind in expressions and receive PostgreSQL assignment coercion.
+- `CREATE TRIGGER`, `DROP TRIGGER IF EXISTS name ON table`, and the Task 13
+  rename form support row-level `BEFORE INSERT`, `BEFORE UPDATE`, and
+  `BEFORE INSERT OR UPDATE`, with `FOR EACH ROW EXECUTE FUNCTION name()`.
+  Trigger return `NULL` skips the row and return `NEW` continues with any field
+  mutations; other timings, statement triggers, transition tables, arguments,
+  and non-trigger functions remain unsupported.
 - Function and trigger dependencies, replacement, qualification, rollback,
   table/column changes, and drop behavior are represented in the transactional
   catalog.
 - PostgreSQL differential tests cover every supported function, trigger,
-  and `DO` control-flow shape, including observable trigger side effects.
+  and `DO` control-flow shape, including insert/update trigger side effects,
+  skipped rows, affected-row diagnostics, formatted errors, hints, and rollback.
 
 **Notes:** This task is a fixture-bounded procedural interpreter, not complete
-PL/pgSQL. It must never accept an unimplemented construct as a no-op. Tasks
-16–20 add cross-feature expressions and validate complete migration blocks.
+PL/pgSQL. Dollar-quoted bodies using `$$`, local variable references, and the
+syntax above are mandatory; exception handlers, loops, dynamic SQL, records,
+arrays, cursors, and general function calls are outside this task. It must never
+accept an unimplemented construct as a no-op. Tasks 16–20 add cross-feature
+expressions and validate complete migration blocks.
 
 ---
 
@@ -554,6 +621,10 @@ PL/pgSQL. It must never accept an unimplemented construct as a no-op. Tasks
 - Operations PostgreSQL does not define for `json`, including ordinary equality
   and ordering, remain rejected.
 
+**Migration dependency:** The required migration workload does not declare
+`json`; this task remains a Phase 3 type commitment and is not a prerequisite
+hidden behind the Task 20 gate.
+
 ### Task 17 — JSONB representation and comparison
 
 **Goal:** Add normalized `jsonb` values with PostgreSQL equality and ordering.
@@ -569,6 +640,12 @@ PL/pgSQL. It must never accept an unimplemented construct as a no-op. Tasks
 - Casts among `json`, `jsonb`, and text, nesting, metadata, malformed input, and
   normalization have differential/property coverage.
 
+**Required migration forms:** JSONB columns, `NOT NULL`, input through SQLx,
+stored values, and casts from extracted JSONB strings to `numeric` and then
+`bigint` must work. The gate seeds object values containing nested `amount`,
+`currency`, and `value` members and compares their stored and extracted values
+with PostgreSQL.
+
 ### Task 18 — Core JSON and JSONB operators and functions
 
 **Goal:** Cover the planned JSON surface used by application queries and
@@ -579,17 +656,31 @@ migrations.
 - Extraction supports `->`, `->>`, `#>`, and `#>>`; JSONB containment and
   existence support `@>`, `<@`, `?`, `?|`, and `?&` with PostgreSQL SQL-NULL
   versus JSON-null behavior.
-- Concatenation/deletion and the planned builders and mutation functions
-  work, including `json[b]_build_object`, `json[b]_build_array`, `to_json[b]`,
-  and `jsonb_set`.
-- Array/object length, expansion, missing paths, negative indexes, duplicate
-  keys, containment, parameters, and errors have differential/property tests.
+- Concatenation and deletion support JSONB `||`, `-` for a text key or integer
+  array index, and `#-` for a path. Builders and mutation support
+  `json_build_object`, `jsonb_build_object`, `json_build_array`,
+  `jsonb_build_array`, `to_json`, `to_jsonb`, and `jsonb_set`.
+- Length and expansion support `json_array_length`, `jsonb_array_length`,
+  `json_object_keys`, `jsonb_object_keys`, `json_each`, `jsonb_each`,
+  `json_each_text`, `jsonb_each_text`, `json_array_elements`,
+  `jsonb_array_elements`, `json_array_elements_text`, and
+  `jsonb_array_elements_text`. Missing paths, negative indexes, duplicate keys,
+  containment, parameters, and errors have differential/property tests.
 - Set-returning JSON functions are accepted only in executor positions with
   implemented semantics; unsupported placement fails loudly.
 - Benchmarks cover JSONB extraction and containment.
 
 **Notes:** JSONPath, SQL/JSON constructors, `JSON_TABLE`, JSON indexes, and
 record-population functions remain later work.
+
+**Required migration forms:** Only `jsonb #> unknown-path-literal`,
+`jsonb #>> unknown-path-literal`, and `jsonb_typeof(jsonb)` are used by the
+required migration workload. Path literals such as `'{amount,value}'` must
+receive the operator's `text[]` type without requiring the general array feature
+from Tasks 33–34. Missing paths, JSON null, SQL NULL, string versus numeric JSON
+values, and invalid numeric casts require focused differential cases. The other
+operators and functions in this task remain independent Phase 3 commitments;
+they are not prerequisites invented by the migration gate.
 
 ---
 
@@ -602,40 +693,102 @@ backfills and reconciliation blocks.
 
 **DoD:**
 
-- The window substrate supports `row_number()` and aggregate
-  `count(...) OVER (...)` forms with required partitioning, ordering, peer, NULL,
-  and result-type behavior.
-- Pattern matching covers `LIKE`/`ILIKE`, regular-expression
-  operators/functions, escaping, NULLs, and compatible invalid-pattern errors.
-- `string_agg` and every other aggregate or scalar expression uniquely required
-  by migration SQL match PostgreSQL typing, ordering, filtering, and NULL rules.
-- Correlated subqueries, CTEs, temporary-table joins, and data-modifying
-  statements in the migration fixtures compose with Tasks 10–18.
-- Every distinct transform shape has a focused PostgreSQL differential fixture,
-  including empty, duplicate, NULL, and rollback cases.
+- Window expressions support `row_number() OVER (ORDER BY expression)` and
+  `count(*) OVER (PARTITION BY expression)` with PostgreSQL ordering, peer,
+  NULL, and `bigint` result behavior.
+- Aggregate expressions support `count(*)`, `max(expression)`, and
+  `string_agg(expression, delimiter ORDER BY expression)`. They work in a
+  scalar subquery, in a multi-expression `SELECT ... INTO`, and over an empty
+  input with PostgreSQL NULL/count behavior.
+- Query predicates support `IS DISTINCT FROM`/`IS NOT DISTINCT FROM`, `IN`
+  literal lists, `EXISTS`/`NOT EXISTS`, and the `~` regular-expression operator.
+  The required regular expressions are anchored ASCII character classes,
+  bounded repetitions, groups, and optional groups; invalid patterns return
+  PostgreSQL-compatible errors.
+- Scalar expressions support `coalesce`, `btrim(text)`, `jsonb_typeof`, searched
+  `CASE`, casts through `text`, UUID, `numeric`, and `bigint`, integer/numeric
+  multiplication and comparison, `CURRENT_TIMESTAMP + INTERVAL '7 days'`, and
+  `extract(epoch FROM timestamptz)::bigint`, with PostgreSQL coercion, overflow,
+  NULL, and result metadata.
+- DML supports `INSERT INTO ... SELECT`, `UPDATE [AS alias] ... FROM relation`,
+  `UPDATE` from a derived table, and `UPDATE` values computed by a correlated
+  scalar subquery with `LIMIT`. Existing `ON CONFLICT (columns) DO NOTHING`
+  composes with insert-select.
+- Query composition supports ordinary and `AS MATERIALIZED` CTEs, multiple CTEs,
+  nested scalar subqueries, inner and left joins, derived tables, qualified and
+  temporary relations, `ORDER BY`, and `LIMIT`. Correlation and alias binding
+  must match PostgreSQL in every combination named in this task.
+- Every grammar form and built-in named above has a focused PostgreSQL
+  differential fixture covering its positive case plus relevant empty,
+  duplicate, NULL, invalid-input, and rollback behavior. Property generation
+  covers casts, arithmetic, predicates, and the non-procedural query shapes.
+
+**Notes:** `LIKE`/`ILIKE` and regex functions remain Task 21 runtime work; they
+are not used by the required migration workload. Task 19 owns the temporal and
+numeric forms named above because Task 20 depends on them and runs before
+Task 21.
 
 ### Task 20 — Transactional migration-chain gate
 
-**Goal:** Prove that realistic migration chains run unchanged through SQLx.
+**Goal:** Prove that the required migration forms compose into realistic,
+transactional SQLx migration sequences.
 
 **DoD:**
 
-- Starting from an empty `PgFake` database, the Phase 3 migration conformance
-  chains apply in order and unchanged inside SQLx-managed transactions.
-- The resulting schema, constraints, indexes, views, functions, triggers,
-  sequence state, and representative transformed rows match PostgreSQL 18.
+- Add three checked-in SQLx migration scenarios with descriptive names:
+  `schema_evolution`, `procedural_triggers`, and `data_reconciliation`. Their
+  files use only neutral relation and column names and are the sole inputs to
+  both PostgreSQL and `pg_fake`; there is no engine-specific SQL variant.
+- `schema_evolution` starts from an empty database, creates related tables with
+  UUID, text, Boolean, integer, numeric, bytea, date, timestamptz, interval, and
+  JSONB columns, then exercises the Task 11–13 sequence, constraint, index,
+  rename, view, comment, validation, and drop forms. It includes a non-empty
+  sequence backfill using `row_number`, `max`, `setval`, and `nextval`.
+- `procedural_triggers` creates the Task 15 update-timestamp trigger and a
+  conditional insert-or-update compatibility trigger, proves their effects on
+  inserted and updated rows, renames and drops trigger objects, and includes a
+  failing `DO` block that raises a formatted exception with a hint.
+- `data_reconciliation` uses qualified permanent tables and an
+  `ON COMMIT DROP` temporary match table. It exercises materialized CTEs, JSONB
+  extraction and validation, candidate matching with `EXISTS`/`NOT EXISTS`,
+  window counts, ordered `string_agg`, `SELECT ... INTO`, `UPDATE ... FROM`,
+  `GET DIAGNOSTICS`, a `NOT VALID` foreign key followed by validation, and the
+  Task 14 settings and table locks.
+- Each scenario is applied file by file in version order through SQLx's normal
+  migration transactions. After every version, schema objects and seeded rows
+  match PostgreSQL 18 so intermediate objects later renamed or dropped remain
+  observable.
 - Procedural blocks run their complete catalog checks, JSONB parsing,
   reconciliation queries, diagnostics, and error paths without reduced or
   rewritten SQL.
-- Each migration is tested both as part of the full chain and at its recorded
-  pre-migration schema/data boundary; a failure identifies the migration and
-  first mismatching statement.
-- Reapplying through SQLx reports the same already-applied/no-op behavior, and a
-  deliberately failing migration rolls back catalog and data changes.
-- Every statement, procedural construct, expression, object dependency, and
-  index definition in the ordered migration chains is assigned to a completed
-  feature task and executed by the gate; the manifest has no unsupported,
-  unclassified, rewritten, or unresolved migration blocker.
+- Files containing backfills, procedural validation, a
+  `NOT VALID`/validation lifecycle, temporary tables, or locks also have a
+  boundary test that applies the exact preceding scenario prefix, inserts the
+  named legacy dataset, then runs the unchanged migration. A failure reports
+  the scenario, version, and first failing statement index.
+- Boundary cases cover an empty database state where applicable, successful
+  non-empty backfills, rejected unsupported legacy currency values, trigger
+  field propagation, matched and unmatched/ambiguous reconciliation data,
+  JSONB string/numeric/missing-path variants, foreign-key validation failure,
+  timeout while a table lock is held, and statement/transaction rollback after
+  `RAISE EXCEPTION` (including its hint).
+- After a full successful apply, invoking the SQLx migrator again executes no
+  migration bodies and leaves schema, rows, sequences, triggers, and migration
+  metadata unchanged. A test-only failing migration containing both catalog and
+  row changes proves that SQLx and `pg_fake` roll the entire version back.
+- Every item under “Required migration workload” and every SQL form explicitly
+  named in Tasks 13–19 is executed by at least one scenario. Maintain a coverage
+  table mapping each form to its scenario and version; the gate has no
+  unsupported, unclassified, rewritten, or unresolved migration blocker.
+
+**Observable comparison:** Compare catalog objects by semantic fields rather
+than PostgreSQL internal OIDs: relation kind and qualification; ordered columns,
+types, typmods, defaults, and nullability; constraint kind, columns, referenced
+relation/actions, validation state, and predicate; index uniqueness, ordered
+keys/directions, included columns, and predicate; sequence ownership/value;
+view output metadata and definition behavior; function/trigger signature,
+timing/events, dependencies, and side effects. Compare seeded table contents as
+ordered typed rows, plus affected-row counts, SQLSTATE, and transaction outcome.
 
 ---
 
@@ -736,7 +889,7 @@ that isolated SQL parses.
 
 **DoD:**
 
-- The conformance application applies the Task 20 migration chains and runs all
+- The conformance application applies the Task 20 migration scenarios and runs all
   priority SQL families through `pg_fake_sqlx` pools, prepared queries, typed
   rows, and transactions.
 - Representative workflows cover identity/session data, work claiming and
