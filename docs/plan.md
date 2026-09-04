@@ -496,7 +496,7 @@ parsing.
 - [x] Run formatting, workspace tests, review, and the 10,000-iteration
   property gate.
 
-### Task 13 — Ordinary views and catalog-object renames
+### Task 13 — Ordinary views and catalog-object renames [COMPLETE]
 
 **Goal:** Store named query definitions in the catalog and expand them with
 PostgreSQL scope and metadata behavior.
@@ -551,7 +551,7 @@ does not expand this task to updatable-view semantics.
   and nested filtered-view benchmark coverage.
 - [x] Run formatting, workspace tests, subagent review with all findings fixed,
   and the 10,000-iteration property gate.
-- [ ] Publish the parser-fork `ALTER TRIGGER ... RENAME` change, pin its commit
+- [x] Publish the parser-fork `ALTER TRIGGER ... RENAME` change, pin its commit
   in the workspace dependency, and verify without a local path override.
 
 ### Task 14 — Migration-local settings and table locks
