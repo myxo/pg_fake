@@ -31,9 +31,12 @@ pub(crate) fn classify(statement: &ast::Statement) -> StatementKind {
         | ast::Statement::CreateIndex(_)
         | ast::Statement::CreateSchema { .. }
         | ast::Statement::CreateView { .. }
+        | ast::Statement::CreateTrigger(_)
         | ast::Statement::AlterTable { .. }
         | ast::Statement::AlterIndex { .. }
+        | ast::Statement::AlterTrigger { .. }
         | ast::Statement::AlterView { .. }
+        | ast::Statement::Comment { .. }
         | ast::Statement::Drop { .. } => StatementKind::Ddl,
         ast::Statement::Insert(_) | ast::Statement::Update(_) | ast::Statement::Delete(_) => {
             StatementKind::Dml

@@ -63,6 +63,12 @@ pub(crate) struct ConstraintId(pub(crate) u64);
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub(crate) struct IndexId(pub(crate) u64);
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub(crate) struct ViewId(pub(crate) u64);
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub(crate) struct TriggerId(pub(crate) u64);
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct SequenceSchema {
     pub(crate) id: SequenceId,
@@ -174,6 +180,39 @@ pub(crate) struct IndexSchema {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct TriggerSchema {
+    pub(crate) id: TriggerId,
+    pub(crate) name: String,
+    pub(crate) definition: ast::CreateTrigger,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
+pub(crate) enum ViewDependency {
+    Table(TableId),
+    View(ViewId),
+    Sequence(SequenceId),
+    Constraint(ConstraintId),
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct ViewColumn {
+    pub(crate) name: String,
+    pub(crate) data_type: PgType,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct ViewSchema {
+    pub(crate) id: ViewId,
+    pub(crate) schema_id: SchemaId,
+    pub(crate) name: String,
+    pub(crate) columns: Vec<ViewColumn>,
+    pub(crate) query: Box<ast::Query>,
+    pub(crate) comment: Option<String>,
+    pub(crate) dependencies: BTreeSet<ViewDependency>,
+    pub(crate) column_dependencies: BTreeMap<TableId, BTreeSet<String>>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct TableSchema {
     pub(crate) id: TableId,
     pub(crate) schema_id: SchemaId,
@@ -181,6 +220,7 @@ pub(crate) struct TableSchema {
     pub(crate) columns: Vec<ColumnDef>,
     pub(crate) constraints: Vec<Constraint>,
     pub(crate) indexes: Vec<IndexSchema>,
+    pub(crate) triggers: Vec<TriggerSchema>,
     pub(crate) persistence: TablePersistence,
 }
 
@@ -195,6 +235,7 @@ pub(crate) struct Schema {
     pub(crate) id: SchemaId,
     pub(crate) name: String,
     tables: BTreeMap<String, TableSchema>,
+    views: BTreeMap<String, ViewSchema>,
     sequences: BTreeMap<String, SequenceSchema>,
 }
 
@@ -206,6 +247,8 @@ pub(crate) struct Catalog {
     next_sequence_id: u64,
     next_constraint_id: u64,
     next_index_id: u64,
+    next_view_id: u64,
+    next_trigger_id: u64,
     deferrable_foreign_keys: Vec<(ConstraintId, bool)>,
     referencing_foreign_keys: BTreeMap<TableId, Vec<(TableId, usize)>>,
 }
@@ -230,11 +273,14 @@ pub(crate) struct CatalogHistory {
     schemas: BTreeMap<SchemaId, Vec<CatalogVersion<SchemaIdentity>>>,
     tables: BTreeMap<TableId, Vec<CatalogVersion<TableSchema>>>,
     sequences: BTreeMap<SequenceId, Vec<CatalogVersion<SequenceSchema>>>,
+    views: BTreeMap<ViewId, Vec<CatalogVersion<ViewSchema>>>,
     next_schema_id: u64,
     next_table_id: u64,
     next_sequence_id: u64,
     next_constraint_id: u64,
     next_index_id: u64,
+    next_view_id: u64,
+    next_trigger_id: u64,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -257,6 +303,7 @@ impl Catalog {
             id: SchemaId(1),
             name: DEFAULT_SCHEMA.into(),
             tables: BTreeMap::new(),
+            views: BTreeMap::new(),
             sequences: BTreeMap::new(),
         };
         Catalog {
@@ -266,6 +313,8 @@ impl Catalog {
             next_sequence_id: 1,
             next_constraint_id: 1,
             next_index_id: 1,
+            next_view_id: 1,
+            next_trigger_id: 1,
             deferrable_foreign_keys: Vec::new(),
             referencing_foreign_keys: BTreeMap::new(),
         }
@@ -311,6 +360,7 @@ impl Catalog {
                     .get(TEMP_SCHEMA)
                     .filter(|schema| {
                         schema.tables.contains_key(&name.name)
+                            || schema.views.contains_key(&name.name)
                             || schema.sequences.contains_key(&name.name)
                             || schema.tables.values().any(|table| {
                                 table.indexes.iter().any(|index| index.name == name.name)
@@ -355,6 +405,7 @@ impl Catalog {
     pub(crate) fn has_resolved_relation(&self, name: &ResolvedRelationName) -> bool {
         let schema = self.get_schema_by_id(name.schema_id);
         schema.tables.contains_key(&name.name)
+            || schema.views.contains_key(&name.name)
             || schema.sequences.contains_key(&name.name)
             || schema
                 .tables
@@ -365,7 +416,7 @@ impl Catalog {
     pub(crate) fn require_named_table(&self, name: &RelationName) -> Result<&TableSchema> {
         let name = self.resolve_relation_name(name)?;
         let schema = self.get_schema_by_id(name.schema_id);
-        if schema.sequences.contains_key(&name.name) {
+        if schema.sequences.contains_key(&name.name) || schema.views.contains_key(&name.name) {
             return Err(PgError::create(
                 SqlState::WrongObjectType,
                 format!("{:?} is not a table", name.name),
@@ -389,10 +440,33 @@ impl Catalog {
         })
     }
 
+    pub(crate) fn require_named_view(&self, name: &RelationName) -> Result<&ViewSchema> {
+        let name = self.resolve_relation_name(name)?;
+        let schema = self.get_schema_by_id(name.schema_id);
+        if schema.tables.contains_key(&name.name)
+            || schema.sequences.contains_key(&name.name)
+            || schema
+                .tables
+                .values()
+                .any(|table| table.indexes.iter().any(|index| index.name == name.name))
+        {
+            return Err(PgError::create(
+                SqlState::WrongObjectType,
+                format!("{:?} is not a view", name.name),
+            ));
+        }
+        schema.views.get(&name.name).ok_or_else(|| {
+            PgError::create(
+                SqlState::UndefinedTable,
+                format!("relation {:?} does not exist", name.name),
+            )
+        })
+    }
+
     pub(crate) fn require_named_sequence(&self, name: &RelationName) -> Result<&SequenceSchema> {
         let name = self.resolve_relation_name(name)?;
         let schema = self.get_schema_by_id(name.schema_id);
-        if schema.tables.contains_key(&name.name) {
+        if schema.tables.contains_key(&name.name) || schema.views.contains_key(&name.name) {
             return Err(PgError::create(
                 SqlState::WrongObjectType,
                 format!("{:?} is not a sequence", name.name),
@@ -432,6 +506,7 @@ impl Catalog {
                 id,
                 name,
                 tables: BTreeMap::new(),
+                views: BTreeMap::new(),
                 sequences: BTreeMap::new(),
             },
         );
@@ -450,7 +525,7 @@ impl Catalog {
                 format!("schema {name:?} does not exist"),
             )
         })?;
-        if !schema.tables.is_empty() || !schema.sequences.is_empty() {
+        if !schema.tables.is_empty() || !schema.views.is_empty() || !schema.sequences.is_empty() {
             return Err(PgError::create(
                 SqlState::DependentObjectsStillExist,
                 format!("cannot drop schema {name:?} because other objects depend on it"),
@@ -517,6 +592,7 @@ impl Catalog {
                 columns,
                 constraints,
                 indexes: Vec::new(),
+                triggers: Vec::new(),
                 persistence: TablePersistence::Permanent,
             },
         );
@@ -575,6 +651,7 @@ impl Catalog {
                 columns,
                 constraints,
                 indexes: Vec::new(),
+                triggers: Vec::new(),
                 persistence,
             },
         );
@@ -668,6 +745,13 @@ impl Catalog {
     pub(crate) fn allocate_index_id(&mut self) -> IndexId {
         let id = IndexId(self.next_index_id);
         self.next_index_id += 1;
+        id
+    }
+
+    #[cfg(any(test, feature = "test-support"))]
+    pub(crate) fn allocate_trigger_id(&mut self) -> TriggerId {
+        let id = TriggerId(self.next_trigger_id);
+        self.next_trigger_id += 1;
         id
     }
 
@@ -792,6 +876,116 @@ impl Catalog {
             .flat_map(|schema| schema.tables.values())
     }
 
+    pub(crate) fn iterate_views(&self) -> impl Iterator<Item = &ViewSchema> {
+        self.schemas
+            .values()
+            .flat_map(|schema| schema.views.values())
+    }
+
+    pub(crate) fn iterate_views_mut(&mut self) -> impl Iterator<Item = &mut ViewSchema> {
+        self.schemas
+            .values_mut()
+            .flat_map(|schema| schema.views.values_mut())
+    }
+
+    pub(crate) fn create_named_view(
+        &mut self,
+        name: ResolvedRelationName,
+        columns: Vec<ViewColumn>,
+        query: Box<ast::Query>,
+        dependencies: BTreeSet<ViewDependency>,
+        column_dependencies: BTreeMap<TableId, BTreeSet<String>>,
+    ) -> Result<ViewId> {
+        if self.has_resolved_relation(&name) {
+            return Err(PgError::create(
+                SqlState::DuplicateTable,
+                format!("relation {:?} already exists", name.name),
+            ));
+        }
+        let id = ViewId(self.next_view_id);
+        self.next_view_id += 1;
+        let previous = self.get_schema_by_id_mut(name.schema_id).views.insert(
+            name.name.clone(),
+            ViewSchema {
+                id,
+                schema_id: name.schema_id,
+                name: name.name,
+                columns,
+                query,
+                comment: None,
+                dependencies,
+                column_dependencies,
+            },
+        );
+        assert!(previous.is_none(), "new view must not replace a relation");
+        Ok(id)
+    }
+
+    pub(crate) fn replace_view(&mut self, view: ViewSchema) -> Result<()> {
+        let current = self
+            .iterate_views()
+            .find(|candidate| candidate.id == view.id)
+            .cloned()
+            .ok_or_else(|| {
+                PgError::create(
+                    SqlState::UndefinedTable,
+                    format!("relation {:?} does not exist", view.name),
+                )
+            })?;
+        self.get_schema_by_id_mut(current.schema_id)
+            .views
+            .remove(&current.name)
+            .expect("required view must exist");
+        let previous = self
+            .get_schema_by_id_mut(view.schema_id)
+            .views
+            .insert(view.name.clone(), view);
+        assert!(previous.is_none(), "replacement view name must be free");
+        Ok(())
+    }
+
+    pub(crate) fn drop_named_views(&mut self, names: &[RelationName]) -> Result<Vec<ViewSchema>> {
+        let targets = names
+            .iter()
+            .map(|name| self.require_named_view(name).cloned())
+            .collect::<Result<Vec<_>>>()?;
+        let target_ids = targets.iter().map(|view| view.id).collect::<BTreeSet<_>>();
+        if let Some(dependent) = self.iterate_views().find(|view| {
+            !target_ids.contains(&view.id)
+                && view.dependencies.iter().any(
+                    |dependency| matches!(dependency, ViewDependency::View(id) if target_ids.contains(id)),
+                )
+        }) {
+            return Err(PgError::create(
+                SqlState::DependentObjectsStillExist,
+                format!("cannot drop view because view {:?} depends on it", dependent.name),
+            ));
+        }
+        Ok(targets
+            .into_iter()
+            .map(|view| {
+                self.get_schema_by_id_mut(view.schema_id)
+                    .views
+                    .remove(&view.name)
+                    .expect("required view must exist")
+            })
+            .collect())
+    }
+
+    pub(crate) fn has_dependent_views_for_sequence(&self, sequence_id: SequenceId) -> bool {
+        self.iterate_views().any(|view| {
+            view.dependencies
+                .contains(&ViewDependency::Sequence(sequence_id))
+        })
+    }
+
+    pub(crate) fn has_dependent_views_for_constraint(&self, constraint_id: ConstraintId) -> bool {
+        self.iterate_views().any(|view| {
+            view.dependencies
+                .contains(&ViewDependency::Constraint(constraint_id))
+        })
+    }
+
     #[cfg(test)]
     #[cfg_attr(feature = "execution-log", tracing::instrument(skip_all))]
     pub(crate) fn drop_tables(&mut self, names: &[String]) -> Result<Vec<TableSchema>> {
@@ -850,6 +1044,16 @@ impl Catalog {
             .iter()
             .map(|table| table.id)
             .collect::<BTreeSet<_>>();
+        if self.iterate_views().any(|view| {
+            view.dependencies.iter().any(
+                |dependency| matches!(dependency, ViewDependency::Table(id) if target_ids.contains(id)),
+            )
+        }) {
+            return Err(PgError::create(
+                SqlState::DependentObjectsStillExist,
+                "cannot drop table because a view depends on it",
+            ));
+        }
         if let Some((target, table, constraint)) = self.iterate_tables().find_map(|table| {
             if target_ids.contains(&table.id) {
                 return None;
@@ -968,7 +1172,9 @@ impl Catalog {
     #[cfg_attr(feature = "execution-log", tracing::instrument(skip_all))]
     pub(crate) fn has_relation(&self, name: &str) -> bool {
         let schema = self.get_default_schema();
-        schema.tables.contains_key(name) || schema.sequences.contains_key(name)
+        schema.tables.contains_key(name)
+            || schema.views.contains_key(name)
+            || schema.sequences.contains_key(name)
     }
 
     #[cfg(test)]
@@ -1153,11 +1359,14 @@ impl CatalogHistory {
             )]),
             tables: BTreeMap::new(),
             sequences: BTreeMap::new(),
+            views: BTreeMap::new(),
             next_schema_id: 2,
             next_table_id: 1,
             next_sequence_id: 1,
             next_constraint_id: 1,
             next_index_id: 1,
+            next_view_id: 1,
+            next_trigger_id: 1,
         }
     }
 
@@ -1198,6 +1407,7 @@ impl CatalogHistory {
                         id: schema.id,
                         name: schema.name.clone(),
                         tables: BTreeMap::new(),
+                        views: BTreeMap::new(),
                         sequences: BTreeMap::new(),
                     },
                 )
@@ -1210,6 +1420,7 @@ impl CatalogHistory {
                     id,
                     name: TEMP_SCHEMA.into(),
                     tables: BTreeMap::new(),
+                    views: BTreeMap::new(),
                     sequences: BTreeMap::new(),
                 },
             );
@@ -1226,6 +1437,8 @@ impl CatalogHistory {
             next_sequence_id: self.next_sequence_id,
             next_constraint_id: self.next_constraint_id,
             next_index_id: self.next_index_id,
+            next_view_id: self.next_view_id,
+            next_trigger_id: self.next_trigger_id,
             deferrable_foreign_keys: Vec::new(),
             referencing_foreign_keys: BTreeMap::new(),
         };
@@ -1263,6 +1476,24 @@ impl CatalogHistory {
             let previous = schema
                 .sequences
                 .insert(sequence.name.clone(), sequence.clone());
+            assert!(
+                previous.is_none(),
+                "visible catalog relation names must be unique"
+            );
+        }
+        for versions in self.views.values() {
+            let Some(view) = find_visible_catalog_version(versions, xid, snapshot, transactions)
+            else {
+                continue;
+            };
+            let Some(schema) = catalog
+                .schemas
+                .values_mut()
+                .find(|schema| schema.id == view.schema_id)
+            else {
+                continue;
+            };
+            let previous = schema.views.insert(view.name.clone(), view.clone());
             assert!(
                 previous.is_none(),
                 "visible catalog relation names must be unique"
@@ -1327,6 +1558,21 @@ impl CatalogHistory {
             command_id,
         );
         record_catalog_changes(
+            &mut self.views,
+            previous
+                .schemas
+                .values()
+                .flat_map(|schema| schema.views.values())
+                .map(|view| (view.id, view.clone())),
+            current
+                .schemas
+                .values()
+                .flat_map(|schema| schema.views.values())
+                .map(|view| (view.id, view.clone())),
+            xid,
+            command_id,
+        );
+        record_catalog_changes(
             &mut self.sequences,
             previous
                 .schemas
@@ -1346,11 +1592,14 @@ impl CatalogHistory {
         self.next_sequence_id = self.next_sequence_id.max(current.next_sequence_id);
         self.next_constraint_id = self.next_constraint_id.max(current.next_constraint_id);
         self.next_index_id = self.next_index_id.max(current.next_index_id);
+        self.next_view_id = self.next_view_id.max(current.next_view_id);
+        self.next_trigger_id = self.next_trigger_id.max(current.next_trigger_id);
     }
 
     #[cfg_attr(feature = "execution-log", tracing::instrument(skip_all))]
     pub(crate) fn discard_transaction(&mut self, xid: Xid) -> ReclaimedCatalogObjects {
         discard_catalog_transaction(&mut self.schemas, xid);
+        discard_catalog_transaction(&mut self.views, xid);
         ReclaimedCatalogObjects {
             tables: discard_catalog_transaction(&mut self.tables, xid),
             sequences: discard_catalog_transaction(&mut self.sequences, xid),
@@ -1381,11 +1630,24 @@ impl CatalogHistory {
                     .then_some(*id)
             })
             .collect::<Vec<_>>();
+        let views = self
+            .views
+            .iter()
+            .filter_map(|(id, versions)| {
+                versions
+                    .iter()
+                    .any(|version| version.value.schema_id == temporary_schema_id)
+                    .then_some(*id)
+            })
+            .collect::<Vec<_>>();
         for id in &tables {
             self.tables.remove(id);
         }
         for id in &sequences {
             self.sequences.remove(id);
+        }
+        for id in views {
+            self.views.remove(&id);
         }
         ReclaimedCatalogObjects { tables, sequences }
     }
@@ -1399,6 +1661,12 @@ impl CatalogHistory {
     ) -> ReclaimedCatalogObjects {
         prune_catalog_versions(
             &mut self.schemas,
+            horizon,
+            transactions,
+            &std::collections::BTreeSet::new(),
+        );
+        prune_catalog_versions(
+            &mut self.views,
             horizon,
             transactions,
             &std::collections::BTreeSet::new(),

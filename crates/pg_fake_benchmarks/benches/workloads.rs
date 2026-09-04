@@ -760,6 +760,53 @@ fn select_benchmark(
     }
 }
 
+fn nested_filtered_view_benchmark(
+    criterion: &mut Criterion,
+    runtime: &Runtime,
+    connections: &mut [NamedBenchmarkConnection<'_>],
+) {
+    for (_, connection) in connections.iter_mut() {
+        connection.execute(
+            runtime,
+            "CREATE TABLE nested_filtered_view_source_100_rows (id INTEGER, name TEXT)",
+        );
+        connection.execute(
+            runtime,
+            &insert_values_sql("nested_filtered_view_source_100_rows", 100),
+        );
+        connection.execute(
+            runtime,
+            "CREATE VIEW nested_filtered_view_inner_100_rows AS \
+             SELECT id, name FROM nested_filtered_view_source_100_rows WHERE id >= 25",
+        );
+        connection.execute(
+            runtime,
+            "CREATE VIEW nested_filtered_view_outer_100_rows AS \
+             SELECT id, name FROM nested_filtered_view_inner_100_rows WHERE id <= 75",
+        );
+    }
+    let mut group =
+        criterion.benchmark_group(benchmarks::find_benchmark("nested_filtered_view_100_rows").name);
+    for (name, connection) in connections.iter_mut() {
+        group.bench_function(*name, |benchmark| {
+            benchmark.iter(|| {
+                connection.fetch(
+                    runtime,
+                    "SELECT id, name FROM nested_filtered_view_outer_100_rows WHERE id = 50",
+                );
+            });
+        });
+    }
+    group.finish();
+    for (_, connection) in connections.iter_mut() {
+        connection.execute(
+            runtime,
+            "DROP VIEW nested_filtered_view_outer_100_rows, nested_filtered_view_inner_100_rows",
+        );
+        connection.execute(runtime, "DROP TABLE nested_filtered_view_source_100_rows");
+    }
+}
+
 fn order_by_benchmark(
     criterion: &mut Criterion,
     runtime: &Runtime,
@@ -1208,6 +1255,7 @@ fn benchmarks(criterion: &mut Criterion) {
         transaction_benchmark(criterion, &runtime, &mut connections);
         repeatable_read_benchmark(criterion, &runtime, &mut connections);
         select_benchmark(criterion, &runtime, &mut connections);
+        nested_filtered_view_benchmark(criterion, &runtime, &mut connections);
         order_by_benchmark(criterion, &runtime, &mut connections);
         core_vs_sqlx_benchmark(criterion, &runtime);
         parsed_vs_prepared_benchmark(criterion);

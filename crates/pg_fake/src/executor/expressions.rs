@@ -236,6 +236,7 @@ pub(crate) fn create_constant_expression_schema() -> TableSchema {
         columns: Vec::new(),
         constraints: Vec::new(),
         indexes: Vec::new(),
+        triggers: Vec::new(),
         persistence: crate::catalog::TablePersistence::Permanent,
     }
 }

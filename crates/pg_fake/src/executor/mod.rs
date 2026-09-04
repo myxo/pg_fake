@@ -35,6 +35,7 @@ mod prepared;
 mod query;
 mod scope;
 mod sequences;
+mod views;
 mod writes;
 
 use aggregates::{evaluate_aggregate_function, infer_aggregate_return_type, is_aggregate_function};
@@ -72,6 +73,12 @@ pub(crate) use scope::{
 pub(crate) use sequences::{
     SequenceExecutionContext, SequenceSessionState, SequenceSessionStorage, SequenceStorage,
     SequenceValueState,
+};
+#[cfg(any(test, feature = "test-support"))]
+pub(crate) use views::seed_trigger_catalog_for_test;
+use views::{
+    execute_alter_trigger, execute_comment_on_view, execute_create_trigger, execute_create_view,
+    execute_drop_views,
 };
 use writes::{execute_delete, execute_insert, execute_update};
 
@@ -597,6 +604,7 @@ pub(crate) fn execute_statement(
                 columns: columns.clone(),
                 constraints: constraints.clone(),
                 indexes: Vec::new(),
+                triggers: Vec::new(),
                 persistence,
             })?;
             let proposed = TableSchema {
@@ -606,6 +614,7 @@ pub(crate) fn execute_statement(
                 columns: columns.clone(),
                 constraints: constraints.clone(),
                 indexes: Vec::new(),
+                triggers: Vec::new(),
                 persistence,
             };
             validate_foreign_key_definitions(&state.catalog, &proposed)?;
@@ -729,6 +738,19 @@ pub(crate) fn execute_statement(
                 .insert(id, initial);
             Ok(StatementResult::Affected(0))
         }
+        ast::Statement::CreateView(create) => execute_create_view(state, create),
+        ast::Statement::CreateTrigger(create) => execute_create_trigger(state, create),
+        ast::Statement::AlterTrigger {
+            name,
+            table_name,
+            new_name,
+        } => execute_alter_trigger(state, name, table_name, new_name),
+        ast::Statement::Comment {
+            object_type: ast::CommentObject::View,
+            object_name,
+            comment,
+            if_exists: false,
+        } => execute_comment_on_view(state, object_name, comment),
         ast::Statement::AlterTable(alter) => alter_table::execute_alter_table(
             state,
             alter,
@@ -746,6 +768,13 @@ pub(crate) fn execute_statement(
             name,
             operation,
         } => execute_alter_index(state, *if_exists, name, operation),
+        ast::Statement::Drop {
+            object_type: ast::ObjectType::View,
+            names,
+            if_exists,
+            cascade,
+            ..
+        } => execute_drop_views(state, names, *if_exists, *cascade),
         ast::Statement::Drop {
             object_type: ast::ObjectType::Index,
             names,
@@ -798,6 +827,14 @@ pub(crate) fn execute_statement(
             }
             for object in names {
                 let name = normalize_relation_name(object)?;
+                if let Ok(sequence) = state.catalog.require_named_sequence(&name)
+                    && state.catalog.has_dependent_views_for_sequence(sequence.id)
+                {
+                    return Err(PgError::create(
+                        SqlState::DependentObjectsStillExist,
+                        "cannot drop sequence because a view depends on it",
+                    ));
+                }
                 match state.catalog.drop_named_sequence(&name) {
                     Ok(_) => {}
                     Err(error) if *if_exists && error.sqlstate == SqlState::UndefinedTable => {}

@@ -1,4 +1,15 @@
 use super::*;
+
+fn require_mutation_table(state: &DatabaseState, name: &RelationName) -> Result<TableSchema> {
+    if state.catalog.require_named_view(name).is_ok() {
+        return reject_unsupported("mutations targeting views are not implemented");
+    }
+    let table = state.catalog.require_named_table(name)?.clone();
+    if !table.triggers.is_empty() {
+        return reject_unsupported("trigger execution is not implemented");
+    }
+    Ok(table)
+}
 use crate::catalog::Constraint;
 use crate::txn::RowLockAttempt;
 use sqlparser::ast;
@@ -873,7 +884,7 @@ pub(super) fn execute_insert(
     context: &StatementExecutionContext,
 ) -> Result<StatementResult> {
     let table_name = resolve_insert_table_name(&insert.table)?;
-    let schema = state.catalog.require_named_table(&table_name)?.clone();
+    let schema = require_mutation_table(state, &table_name)?;
     let conflict_arbiter = resolve_conflict_arbiter(&schema, insert.on.as_ref())?;
     let conflict_update = match insert.on.as_ref() {
         Some(ast::OnInsert::OnConflict(ast::OnConflict {
@@ -1021,10 +1032,7 @@ pub(super) fn execute_update(
     if args.is_some() {
         return reject_unsupported("UPDATE table functions are not implemented");
     }
-    let schema = state
-        .catalog
-        .require_named_table(&normalize_relation_name(table_name)?)?
-        .clone();
+    let schema = require_mutation_table(state, &normalize_relation_name(table_name)?)?;
     let from = match from {
         None => &[][..],
         Some(ast::UpdateTableFromKind::AfterSet(from)) => from.as_slice(),
@@ -1238,10 +1246,7 @@ pub(super) fn execute_delete(
     if args.is_some() {
         return reject_unsupported("DELETE table functions are not implemented");
     }
-    let schema = state
-        .catalog
-        .require_named_table(&normalize_relation_name(table_name)?)?
-        .clone();
+    let schema = require_mutation_table(state, &normalize_relation_name(table_name)?)?;
     let using = delete.using.as_deref().unwrap_or_default();
     let scope = create_mutation_scope(
         state,

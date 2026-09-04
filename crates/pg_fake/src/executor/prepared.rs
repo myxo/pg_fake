@@ -148,6 +148,9 @@ pub(crate) fn build_prepared_query_plan(
         return Ok(None);
     }
     let relation_name = normalize_relation_name(name)?;
+    if state.catalog.require_named_view(&relation_name).is_ok() {
+        return Ok(None);
+    }
     let schema = state.catalog.require_named_table(&relation_name)?;
     let scope = bind_query_scope(&state.catalog, select)?;
     let mut projection = Vec::new();

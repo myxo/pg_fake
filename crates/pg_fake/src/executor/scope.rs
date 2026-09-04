@@ -2,7 +2,7 @@ use super::{
     DatabaseState, normalize_identifier, normalize_relation_name, normalize_unqualified_object_name,
 };
 use crate::{
-    catalog::{Catalog, TableId, TableSchema},
+    catalog::{Catalog, TableId, TableSchema, ViewSchema},
     error::{PgError, Result, SqlState, reject_unsupported},
     value::{BaseType, PgType},
 };
@@ -210,6 +210,40 @@ impl BoundScope {
             }
         }
         Ok(scope)
+    }
+
+    fn bind_view(view: &ViewSchema, alias: Option<&ast::TableAlias>, slot: usize) -> Result<Self> {
+        if alias.is_some_and(|alias| alias.columns.len() > view.columns.len()) {
+            return Err(PgError::create(
+                SqlState::InvalidColumnReference,
+                "view has fewer columns than specified in the column alias list",
+            ));
+        }
+        let qualifier = alias
+            .map(|alias| normalize_identifier(&alias.name))
+            .unwrap_or_else(|| view.name.clone());
+        Ok(BoundScope {
+            columns: view
+                .columns
+                .iter()
+                .enumerate()
+                .map(|(index, column)| BoundColumn {
+                    name: alias
+                        .and_then(|alias| alias.columns.get(index))
+                        .map(|alias| normalize_identifier(&alias.name))
+                        .unwrap_or_else(|| column.name.clone()),
+                    data_type: column.data_type,
+                    qualifier: qualifier.clone(),
+                    slot: slot + index,
+                    merged: None,
+                    unqualified: true,
+                    wildcard: true,
+                    depth: 0,
+                    table_id: None,
+                    source_name: column.name.clone(),
+                })
+                .collect(),
+        })
     }
 }
 
@@ -436,13 +470,29 @@ fn bind_table_factor(
     if args.is_some() {
         return reject_unsupported("table functions are not implemented");
     }
-    let table = BoundScope::bind_table(
-        catalog.require_named_table(&normalize_relation_name(table_name)?)?,
-        alias.as_ref(),
-        scope.columns.len(),
-    )?;
-    scope.columns.extend(table.columns);
+    let name = normalize_relation_name(table_name)?;
+    let relation = match catalog.require_named_table(&name) {
+        Ok(table) => BoundScope::bind_table(table, alias.as_ref(), scope.columns.len())?,
+        Err(error) if error.sqlstate == SqlState::WrongObjectType => BoundScope::bind_view(
+            catalog.require_named_view(&name)?,
+            alias.as_ref(),
+            scope.columns.len(),
+        )?,
+        Err(error) => return Err(error),
+    };
+    scope.columns.extend(relation.columns);
     Ok(())
+}
+
+pub(crate) fn bind_table_factor_scope(
+    catalog: &Catalog,
+    factor: &ast::TableFactor,
+) -> Result<BoundScope> {
+    let mut scope = BoundScope {
+        columns: Vec::new(),
+    };
+    bind_table_factor(catalog, factor, &mut scope)?;
+    Ok(scope)
 }
 
 #[cfg_attr(feature = "execution-log", tracing::instrument(skip_all))]

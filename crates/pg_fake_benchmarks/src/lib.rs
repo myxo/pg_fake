@@ -118,6 +118,11 @@ pub fn list_benchmarks() -> Vec<Benchmark> {
             postgres_comparisons(),
         ),
         build_benchmark(
+            "nested_filtered_view_100_rows",
+            postgres_values(),
+            postgres_comparisons(),
+        ),
+        build_benchmark(
             "order_by_100_rows",
             postgres_values(),
             postgres_comparisons(),

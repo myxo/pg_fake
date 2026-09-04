@@ -38,7 +38,7 @@ create_view:2
 date:9
 delete:3
 domain:1
-drop_if_exists:4
+drop_if_exists:19
 drop_operator:1
 encoding:8
 enum:1
@@ -50,11 +50,11 @@ foreign_key:3
 generated_stored:1
 generated_virtual:1
 geometry:1
-groupingsets:1
+groupingsets:3
 identity:1
 inherit:2
 insert:6
-insert_conflict:2
+insert_conflict:3
 int2:10
 int4:10
 int8:9
@@ -74,7 +74,7 @@ lock:1
 lseg:1
 macaddr8:1
 macaddr:1
-matview:3
+matview:5
 md5:1
 merge:1
 misc:10
@@ -103,7 +103,7 @@ reloptions:1
 returning:15
 rowsecurity:1
 rowtypes:1
-rules:4
+rules:5
 select:8
 select_distinct:5
 select_distinct_on:5

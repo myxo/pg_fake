@@ -1985,6 +1985,71 @@ fn generated_alter_table_rewrites_match_postgres() {
 }
 
 #[test]
+fn generated_nested_views_match_postgres() {
+    let _test_lock = TEST_LOCK.lock().expect("test mutex must not be poisoned");
+    let server = start_postgres_server();
+    let runtime = tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()
+        .unwrap();
+    let postgres = RefCell::new(
+        runtime
+            .block_on(PgConnection::connect(&server.url))
+            .expect("must connect SQLx to PostgreSQL 18 once"),
+    );
+    check(|src| {
+        let suffix = format!(
+            "{}_{}",
+            std::process::id(),
+            TABLE_NUMBER.fetch_add(1, Ordering::Relaxed)
+        );
+        let table = format!("pg_fake_view_property_source_{suffix}");
+        let inner = format!("pg_fake_view_property_inner_{suffix}");
+        let outer = format!("pg_fake_view_property_outer_{suffix}");
+        let row_count = src.any_of("rows", int_in(1..=6));
+        let values = (1..=row_count)
+            .map(|id| format!("({id}, {})", integer(src, "value")))
+            .collect::<Vec<_>>()
+            .join(", ");
+        let lower = integer(src, "lower");
+        let upper = src.any_of("upper", int_in(1..=6));
+        let replacement_lower = integer(src, "replacement_lower");
+        let mut postgres = postgres.borrow_mut();
+        let mut fake = PgFakeConnection::new(Db::create());
+
+        for sql in [
+            format!("CREATE TABLE {table} (id INTEGER, value INTEGER)"),
+            format!("INSERT INTO {table} VALUES {values}"),
+            format!(
+                "CREATE VIEW {inner} (key, amount) AS \
+                 SELECT id, value FROM {table} WHERE value >= {lower}"
+            ),
+            format!(
+                "CREATE VIEW {outer} AS \
+                 SELECT key, amount FROM {inner} WHERE key <= {upper}"
+            ),
+            format!("SELECT key, amount FROM {outer} ORDER BY key, amount"),
+            format!(
+                "WITH {outer} AS (SELECT 999 AS key, 999 AS amount) \
+                 SELECT key, amount FROM {outer}"
+            ),
+            "BEGIN".to_owned(),
+            format!(
+                "CREATE OR REPLACE VIEW {inner} (key, amount) AS \
+                 SELECT id, value FROM {table} WHERE value >= {replacement_lower}"
+            ),
+            "ROLLBACK".to_owned(),
+            format!("SELECT key, amount FROM {outer} ORDER BY key, amount"),
+            format!("DROP VIEW {outer}, {inner}"),
+            format!("DROP TABLE {table}"),
+        ] {
+            src.log_value("sql", &sql);
+            assert_statement(&runtime, &mut postgres, &mut fake, &sql, RowOrder::Ordered);
+        }
+    });
+}
+
+#[test]
 fn generated_partial_unique_indexes_match_postgres() {
     let _test_lock = TEST_LOCK.lock().expect("test mutex must not be poisoned");
     let server = start_postgres_server();

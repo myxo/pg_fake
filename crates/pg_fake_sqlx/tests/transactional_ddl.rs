@@ -373,3 +373,219 @@ async fn closing_a_connection_aborts_open_ddl() {
         .await
         .unwrap();
 }
+
+#[test]
+fn ordinary_views_match_postgres_through_sqlx() {
+    let server = common::start_postgres_server();
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap();
+    runtime.block_on(async {
+        let mut postgres = PgConnection::connect(&server.url).await.unwrap();
+        let mut fake = PgFakeConnection::new(Db::create());
+        let suffix = std::process::id();
+        let table = format!("pg_fake_view_source_{suffix}");
+        let view = format!("pg_fake_view_{suffix}");
+        let nested = format!("pg_fake_nested_view_{suffix}");
+
+        for sql in [
+            format!("CREATE TABLE public.{table} (id INTEGER, label VARCHAR(12), bucket INTEGER)"),
+            format!("INSERT INTO public.{table} VALUES (1, 'one', 1), (2, 'two', 1), (3, 'three', 2)"),
+            format!(
+                "CREATE VIEW public.{view} (key, name, bucket) AS \
+                 SELECT id, label, bucket FROM public.{table} WHERE id > 1"
+            ),
+            format!(
+                "CREATE VIEW public.{nested} AS \
+                 WITH grouped AS (SELECT bucket, count(*) AS total FROM public.{view} GROUP BY bucket) \
+                 SELECT bucket, total FROM grouped"
+            ),
+            format!("COMMENT ON VIEW public.{view} IS 'compatibility view'"),
+        ] {
+            assert_execution_matches(&mut postgres, &mut fake, &sql).await;
+        }
+
+        let prepared = format!("SELECT name FROM public.{view} WHERE key > $1 ORDER BY key");
+        let expected = sqlx::query(AssertSqlSafe(prepared.as_str()))
+            .bind(1_i32)
+            .fetch_all(&mut postgres)
+            .await
+            .unwrap()
+            .into_iter()
+            .map(|row| row.get::<String, _>(0))
+            .collect::<Vec<_>>();
+        let actual = sqlx::query(AssertSqlSafe(prepared.as_str()))
+            .bind(1_i32)
+            .fetch_all(&mut fake)
+            .await
+            .unwrap()
+            .into_iter()
+            .map(|row| row.get::<String, _>(0))
+            .collect::<Vec<_>>();
+        assert_eq!(actual, expected);
+
+        let aggregate = format!("SELECT bucket, total FROM public.{nested} ORDER BY bucket");
+        let expected = sqlx::raw_sql(AssertSqlSafe(aggregate.as_str()))
+            .fetch_all(&mut postgres)
+            .await
+            .unwrap()
+            .into_iter()
+            .map(|row| (row.get::<i32, _>(0), row.get::<i64, _>(1)))
+            .collect::<Vec<_>>();
+        let actual = sqlx::raw_sql(AssertSqlSafe(aggregate.as_str()))
+            .fetch_all(&mut fake)
+            .await
+            .unwrap()
+            .into_iter()
+            .map(|row| (row.get::<i32, _>(0), row.get::<i64, _>(1)))
+            .collect::<Vec<_>>();
+        assert_eq!(actual, expected);
+
+        for sql in [
+            "BEGIN".to_owned(),
+            format!(
+                "CREATE OR REPLACE VIEW public.{view} (key, name, bucket) AS \
+                 SELECT id, label, bucket FROM public.{table} WHERE id > 99"
+            ),
+            format!("COMMENT ON VIEW public.{view} IS NULL"),
+            "ROLLBACK".to_owned(),
+        ] {
+            assert_execution_matches(&mut postgres, &mut fake, &sql).await;
+        }
+
+        let temporary = format!("CREATE TEMP TABLE {table} (id INTEGER, label VARCHAR(12), bucket INTEGER)");
+        assert_execution_matches(&mut postgres, &mut fake, &temporary).await;
+        let count = format!("SELECT count(*) FROM public.{view}");
+        assert_i64_matches(&mut postgres, &mut fake, &count).await;
+
+        let invalid = format!(
+            "CREATE OR REPLACE VIEW public.{view} AS \
+             SELECT label AS name, id AS key, bucket FROM public.{table}"
+        );
+        assert_execution_matches(&mut postgres, &mut fake, &invalid).await;
+
+        for sql in [
+            format!("DROP VIEW public.{view}"),
+            format!("DROP TABLE public.{table}"),
+            format!("DROP VIEW public.{nested}"),
+            format!("DROP VIEW IF EXISTS public.{nested}"),
+        ] {
+            assert_execution_matches(&mut postgres, &mut fake, &sql).await;
+        }
+    });
+}
+
+#[test]
+fn view_catalog_edge_cases_match_postgres() {
+    let server = common::start_postgres_server();
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap();
+    runtime.block_on(async {
+        let mut postgres = PgConnection::connect(&server.url).await.unwrap();
+        let mut fake = PgFakeConnection::new(Db::create());
+        let suffix = std::process::id();
+        let table = format!("pg_fake_view_edges_{suffix}");
+        let view = format!("{table}_view");
+        let sequence = format!("{table}_sequence");
+        let sequence_view = format!("{table}_sequence_view");
+
+        for sql in [
+            format!("CREATE TABLE {table} (a INTEGER, unused INTEGER)"),
+            format!("INSERT INTO {table} VALUES (1, 8)"),
+            format!("CREATE VIEW {view} AS SELECT * FROM {table}"),
+            format!("ALTER TABLE {table} ADD COLUMN later INTEGER DEFAULT 2"),
+        ] {
+            assert_execution_matches(&mut postgres, &mut fake, &sql).await;
+        }
+        let select = format!("SELECT * FROM {view}");
+        let expected = sqlx::raw_sql(AssertSqlSafe(select.as_str()))
+            .fetch_one(&mut postgres)
+            .await
+            .unwrap();
+        let actual = sqlx::raw_sql(AssertSqlSafe(select.as_str()))
+            .fetch_one(&mut fake)
+            .await
+            .unwrap();
+        assert_eq!(actual.len(), expected.len());
+        assert_eq!(actual.len(), 2);
+
+        for sql in [
+            format!("CREATE SEQUENCE {sequence}"),
+            format!("CREATE VIEW {sequence_view} AS SELECT nextval('{sequence}') AS value"),
+            format!("DROP SEQUENCE {sequence}"),
+            format!("ALTER TABLE {table} DROP COLUMN later"),
+            format!("ALTER TABLE {table} ALTER COLUMN a TYPE BIGINT"),
+        ] {
+            assert_execution_matches(&mut postgres, &mut fake, &sql).await;
+        }
+
+        let prepared_sql = format!("SELECT a FROM {view}");
+        let expected = sqlx::query(AssertSqlSafe(prepared_sql.as_str()))
+            .fetch_one(&mut postgres)
+            .await
+            .unwrap()
+            .get::<i32, _>(0);
+        let actual = sqlx::query(AssertSqlSafe(prepared_sql.as_str()))
+            .fetch_one(&mut fake)
+            .await
+            .unwrap()
+            .get::<i32, _>(0);
+        assert_eq!(actual, expected);
+        let comment = format!("COMMENT ON VIEW {view} IS 'documentation only'");
+        assert_execution_matches(&mut postgres, &mut fake, &comment).await;
+        let expected = sqlx::query(AssertSqlSafe(prepared_sql.as_str()))
+            .fetch_one(&mut postgres)
+            .await
+            .unwrap()
+            .get::<i32, _>(0);
+        let actual = sqlx::query(AssertSqlSafe(prepared_sql.as_str()))
+            .fetch_one(&mut fake)
+            .await
+            .unwrap()
+            .get::<i32, _>(0);
+        assert_eq!(actual, expected);
+    });
+}
+
+#[tokio::test]
+async fn migration_view_and_trigger_renames_execute_through_sqlx() {
+    let db = Db::create();
+    let mut connection = PgFakeConnection::new(db.clone());
+    sqlx::raw_sql(AssertSqlSafe("CREATE TABLE migration_source (id INTEGER)"))
+        .execute(&mut connection)
+        .await
+        .unwrap();
+    db.seed_trigger_catalog_for_test(
+        "CREATE TRIGGER migration_audit BEFORE INSERT ON migration_source \
+           FOR EACH ROW EXECUTE FUNCTION migration_audit()",
+    )
+    .unwrap();
+    sqlx::raw_sql(AssertSqlSafe(
+        "BEGIN; \
+         CREATE VIEW migration_view AS SELECT id FROM migration_source; \
+         COMMENT ON VIEW migration_view IS 'read compatibility'; \
+         DROP VIEW IF EXISTS migration_view; \
+         ALTER TRIGGER migration_audit ON migration_source RENAME TO migration_audit_v2; \
+         COMMIT",
+    ))
+    .execute(&mut connection)
+    .await
+    .unwrap();
+
+    let error = sqlx::raw_sql(AssertSqlSafe(
+        "ALTER TRIGGER migration_audit ON migration_source RENAME TO ignored",
+    ))
+    .execute(&mut connection)
+    .await
+    .unwrap_err();
+    assert_eq!(get_sqlstate(error), "42704");
+    sqlx::raw_sql(AssertSqlSafe(
+        "ALTER TRIGGER migration_audit_v2 ON migration_source RENAME TO migration_audit_v3",
+    ))
+    .execute(&mut connection)
+    .await
+    .unwrap();
+}

@@ -2719,6 +2719,7 @@ struct RowOrderSpec<'a> {
 struct GroupingPlan {
     expressions: Vec<(ast::Expr, PgType)>,
     enabled: bool,
+    primary_key_dependencies: BTreeSet<ConstraintId>,
 }
 struct OrderedRow {
     values: Vec<Value>,
@@ -4106,11 +4107,17 @@ fn resolve_distinct_plan<'a>(
 }
 
 #[cfg_attr(feature = "execution-log", tracing::instrument(skip_all))]
-fn extend_grouped_columns_with_primary_keys(
+struct PrimaryKeyGrouping {
+    constraint_id: ConstraintId,
+    columns: Vec<(usize, PgType)>,
+}
+
+fn collect_grouped_primary_keys(
     state: &DatabaseState,
     scope: &BoundScope,
-    grouped_columns: &mut Vec<(usize, PgType)>,
-) {
+    grouped_columns: &[(usize, PgType)],
+) -> Vec<PrimaryKeyGrouping> {
+    let mut grouped_primary_keys = Vec::new();
     let mut checked_relations = Vec::new();
     for column in scope.columns.iter().filter(|column| column.depth == 0) {
         let Some(table_id) = column.table_id else {
@@ -4126,13 +4133,16 @@ fn extend_grouped_columns_with_primary_keys(
             .iterate_tables()
             .find(|table| table.id == table_id)
             .expect("bound base table remains in the catalog");
-        let Some(primary_key) = table
-            .constraints
-            .iter()
-            .find_map(|constraint| match constraint {
-                crate::catalog::Constraint::PrimaryKey { columns, .. } => Some(columns),
-                _ => None,
-            })
+        let Some((constraint_id, primary_key)) =
+            table
+                .constraints
+                .iter()
+                .find_map(|constraint| match constraint {
+                    crate::catalog::Constraint::PrimaryKey { id, columns, .. } => {
+                        Some((*id, columns))
+                    }
+                    _ => None,
+                })
         else {
             continue;
         };
@@ -4156,13 +4166,56 @@ fn extend_grouped_columns_with_primary_keys(
                     .any(|(slot, _)| *slot == matches[0].slot)
         });
         if primary_key_is_grouped {
-            for column in relation_columns {
-                if !grouped_columns.iter().any(|(slot, _)| *slot == column.slot) {
-                    grouped_columns.push((column.slot, column.data_type));
-                }
-            }
+            grouped_primary_keys.push(PrimaryKeyGrouping {
+                constraint_id,
+                columns: relation_columns
+                    .into_iter()
+                    .filter(|column| !grouped_columns.iter().any(|(slot, _)| *slot == column.slot))
+                    .map(|column| (column.slot, column.data_type))
+                    .collect(),
+            });
         }
     }
+    grouped_primary_keys
+}
+
+fn validate_grouped_outputs(
+    state: &DatabaseState,
+    select: &ast::Select,
+    projections: &[ProjectionSource<'_>],
+    order_specs: &[RowOrderSpec<'_>],
+    distinct: &DistinctPlan<'_>,
+    scope: &BoundScope,
+    expressions: &[(ast::Expr, PgType)],
+    grouped_columns: &[(usize, PgType)],
+) -> Result<()> {
+    for projection in projections {
+        validate_grouped_expression(
+            state,
+            &create_projection_expression(projection, scope),
+            scope,
+            expressions,
+            grouped_columns,
+        )?;
+    }
+    if let Some(having) = &select.having {
+        validate_grouped_expression(state, having, scope, expressions, grouped_columns)?;
+    }
+    for order in order_specs {
+        if let OrderKey::Input(_, expression) | OrderKey::Expression(expression) = order.key {
+            validate_grouped_expression(state, expression, scope, expressions, grouped_columns)?;
+        }
+    }
+    if let DistinctPlan::On {
+        expressions: distinct_expressions,
+        ..
+    } = distinct
+    {
+        for expression in *distinct_expressions {
+            validate_grouped_expression(state, expression, scope, expressions, grouped_columns)?;
+        }
+    }
+    Ok(())
 }
 
 #[cfg_attr(feature = "execution-log", tracing::instrument(skip_all))]
@@ -4177,7 +4230,7 @@ fn resolve_grouping_plan(
     scope: &BoundScope,
 ) -> Result<GroupingPlan> {
     let expressions = resolve_grouping_expressions(state, group_by, projections, columns, scope)?;
-    let mut grouped_columns = expressions
+    let grouped_columns = expressions
         .iter()
         .filter_map(|(expression, _)| match expression {
             ast::Expr::Identifier(identifier) => {
@@ -4187,7 +4240,11 @@ fn resolve_grouping_plan(
             _ => None,
         })
         .collect::<Vec<_>>();
-    extend_grouped_columns_with_primary_keys(state, scope, &mut grouped_columns);
+    let grouped_primary_keys = collect_grouped_primary_keys(state, scope, &grouped_columns);
+    let mut extended_columns = grouped_columns.clone();
+    for primary_key in &grouped_primary_keys {
+        extended_columns.extend(primary_key.columns.iter().copied());
+    }
 
     let mut aggregate_query = false;
     for item in &select.projection {
@@ -4218,49 +4275,127 @@ fn resolve_grouping_plan(
     }
     let enabled = aggregate_query || !expressions.is_empty() || select.having.is_some();
     if enabled {
-        for projection in projections {
-            validate_grouped_expression(
+        validate_grouped_outputs(
+            state,
+            select,
+            projections,
+            order_specs,
+            distinct,
+            scope,
+            &expressions,
+            &extended_columns,
+        )?;
+    }
+    let primary_key_dependencies = grouped_primary_keys
+        .iter()
+        .enumerate()
+        .filter_map(|(excluded, primary_key)| {
+            let mut columns = grouped_columns.clone();
+            for (index, candidate) in grouped_primary_keys.iter().enumerate() {
+                if index != excluded {
+                    columns.extend(candidate.columns.iter().copied());
+                }
+            }
+            validate_grouped_outputs(
                 state,
-                &create_projection_expression(projection, scope),
+                select,
+                projections,
+                order_specs,
+                distinct,
                 scope,
                 &expressions,
-                &grouped_columns,
-            )?;
-        }
-        if let Some(having) = &select.having {
-            validate_grouped_expression(state, having, scope, &expressions, &grouped_columns)?;
-        }
-        for order in order_specs {
-            if let OrderKey::Input(_, expression) | OrderKey::Expression(expression) = order.key {
-                validate_grouped_expression(
-                    state,
-                    expression,
-                    scope,
-                    &expressions,
-                    &grouped_columns,
-                )?;
-            }
-        }
-        if let DistinctPlan::On {
-            expressions: distinct_expressions,
-            ..
-        } = distinct
-        {
-            for expression in *distinct_expressions {
-                validate_grouped_expression(
-                    state,
-                    expression,
-                    scope,
-                    &expressions,
-                    &grouped_columns,
-                )?;
-            }
-        }
-    }
+                &columns,
+            )
+            .is_err()
+            .then_some(primary_key.constraint_id)
+        })
+        .collect();
     Ok(GroupingPlan {
         expressions,
         enabled,
+        primary_key_dependencies,
     })
+}
+
+struct PrimaryKeyDependencyCollector<'a> {
+    state: &'a DatabaseState,
+    dependencies: BTreeSet<ConstraintId>,
+}
+
+impl PrimaryKeyDependencyCollector<'_> {
+    fn collect(&mut self, select: &ast::Select, query: Option<&ast::Query>) {
+        let ast::GroupByExpr::Expressions(group_by, modifiers) = &select.group_by else {
+            return;
+        };
+        if group_by.is_empty() || !modifiers.is_empty() {
+            return;
+        }
+        let Ok(scope) = bind_select_scope(self.state, select) else {
+            return;
+        };
+        let Ok((projections, columns)) =
+            build_projection_plan(self.state, &select.projection, &scope)
+        else {
+            return;
+        };
+        let order_specs = match query {
+            Some(query) => {
+                let Ok(order_specs) =
+                    resolve_order_specs(self.state, query, &projections, &columns, &scope)
+                else {
+                    return;
+                };
+                order_specs
+            }
+            None => Vec::new(),
+        };
+        let Ok(distinct) =
+            resolve_distinct_plan(self.state, select, &projections, &order_specs, &scope)
+        else {
+            return;
+        };
+        if let Ok(plan) = resolve_grouping_plan(
+            self.state,
+            select,
+            group_by,
+            &projections,
+            &columns,
+            &order_specs,
+            &distinct,
+            &scope,
+        ) {
+            self.dependencies.extend(plan.primary_key_dependencies);
+        }
+    }
+}
+
+impl ast::VisitorMut for PrimaryKeyDependencyCollector<'_> {
+    type Break = ();
+
+    fn pre_visit_query(&mut self, query: &mut ast::Query) -> std::ops::ControlFlow<Self::Break> {
+        if let ast::SetExpr::Select(select) = query.body.as_ref() {
+            self.collect(select, Some(query));
+        }
+        std::ops::ControlFlow::Continue(())
+    }
+
+    fn pre_visit_select(&mut self, select: &mut ast::Select) -> std::ops::ControlFlow<Self::Break> {
+        self.collect(select, None);
+        std::ops::ControlFlow::Continue(())
+    }
+}
+
+pub(crate) fn collect_query_primary_key_dependencies(
+    state: &DatabaseState,
+    query: &ast::Query,
+) -> BTreeSet<ConstraintId> {
+    let mut query = query.clone();
+    let mut collector = PrimaryKeyDependencyCollector {
+        state,
+        dependencies: BTreeSet::new(),
+    };
+    let _ = query.visit(&mut collector);
+    collector.dependencies
 }
 
 #[cfg_attr(feature = "execution-log", tracing::instrument(skip_all))]
@@ -5122,9 +5257,13 @@ pub(super) fn execute_query(
     snapshot: &Snapshot,
     context: &StatementExecutionContext,
 ) -> Result<StatementResult> {
-    if query.with.is_some() {
-        let query = materialize_query_ctes(state, query, xid, snapshot, context)?;
-        return execute_query(state, &query, xid, snapshot, context);
+    let expanded = super::views::expand_query_views(&state.catalog, query)?;
+    if &expanded != query {
+        return execute_query(state, &expanded, xid, snapshot, context);
+    }
+    let materialized = materialize_query_ctes(state, query, xid, snapshot, context)?;
+    if &materialized != query {
+        return execute_query(state, &materialized, xid, snapshot, context);
     }
     if query.fetch.is_some() {
         return reject_unsupported("query clause is not implemented");

@@ -361,7 +361,25 @@ fn execute_alter_operation(
                     )
                 })?;
             column.name = new_name.clone();
+            for trigger in &mut schema.triggers {
+                for event in &mut trigger.definition.events {
+                    if let ast::TriggerEvent::Update(columns) = event {
+                        for column in columns
+                            .iter_mut()
+                            .filter(|column| normalize_identifier(column) == old_name)
+                        {
+                            column.value = new_name.clone();
+                        }
+                    }
+                }
+            }
             rename_schema_expressions(schema, &old_name, &new_name);
+            super::views::rename_column_references(
+                &mut state.catalog,
+                schema,
+                &old_name,
+                &new_name,
+            );
             state
                 .catalog
                 .rename_column_dependencies(schema.id, &old_name, &new_name);
@@ -377,6 +395,19 @@ fn execute_alter_operation(
                     SqlState::SyntaxError,
                     "ALTER TABLE RENAME TO does not accept a qualified name",
                 ));
+            }
+            super::views::rename_table_references(&mut state.catalog, schema.id, &new_name.name);
+            for trigger in &mut schema.triggers {
+                let ast::ObjectNamePart::Identifier(name) = trigger
+                    .definition
+                    .table_name
+                    .0
+                    .last_mut()
+                    .expect("trigger table name is non-empty")
+                else {
+                    unreachable!("trigger table name ends in an identifier")
+                };
+                name.value = new_name.name.clone();
             }
             schema.name = new_name.name;
             state
@@ -442,6 +473,15 @@ fn execute_alter_operation(
                     format!("constraint {name:?} does not exist"),
                 ));
             };
+            if state
+                .catalog
+                .has_dependent_views_for_constraint(schema.constraints[index].get_id())
+            {
+                return Err(PgError::create(
+                    SqlState::DependentObjectsStillExist,
+                    "cannot drop constraint because a view depends on it",
+                ));
+            }
             let dependency = match &schema.constraints[index] {
                 crate::catalog::Constraint::PrimaryKey { columns, .. } => {
                     Some((columns.clone(), true))
@@ -704,6 +744,12 @@ fn alter_column(
         ast::AlterColumnOperation::SetDataType {
             data_type, using, ..
         } => {
+            if super::views::has_view_column_dependency(&state.catalog, schema.id, &name) {
+                return Err(PgError::create(
+                    SqlState::FeatureNotSupported,
+                    "cannot alter column type because a view depends on it",
+                ));
+            }
             let target = coercion::convert_ast_data_type(data_type)?;
             let old_schema = schema.clone();
             let source = old_schema.columns[index].data_type.base;
@@ -883,6 +929,13 @@ fn remove_column_dependencies(
     column: &str,
     behavior: Option<ast::DropBehavior>,
 ) -> Result<()> {
+    if super::views::has_view_column_dependency(&state.catalog, schema.id, column) {
+        return Err(PgError::create(
+            SqlState::DependentObjectsStillExist,
+            "cannot drop column because a view depends on it",
+        ));
+    }
+    super::views::preserve_column_drop_references(&mut state.catalog, schema, column);
     let primary_columns = schema
         .constraints
         .iter()

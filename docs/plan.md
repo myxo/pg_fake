@@ -534,6 +534,26 @@ view and renaming the trigger must work in a SQLx migration transaction. The
 workload does not write through the view, so its comment describing compatibility
 does not expand this task to updatable-view semantics.
 
+**Progress:**
+
+- [x] Model transactional ordinary views, comments, stable output metadata,
+  nested expansion, and catalog dependencies for tables, views, sequences,
+  columns, and primary-key grouping behavior.
+- [x] Execute create, replace, drop, comment, read composition, and explicit
+  unsupported view mutations with temporary-schema and prepared-statement
+  behavior.
+- [x] Preserve stored view bindings across table/column renames and unrelated
+  column drops, including correlated scopes, CTE shadowing, merged joins, and
+  positional aliases.
+- [x] Model stable trigger identities and transactional trigger rename while
+  keeping general trigger creation explicitly unsupported until Task 15.
+- [x] Add native, SQLx differential/property, migration, regression-manifest,
+  and nested filtered-view benchmark coverage.
+- [x] Run formatting, workspace tests, subagent review with all findings fixed,
+  and the 10,000-iteration property gate.
+- [ ] Publish the parser-fork `ALTER TRIGGER ... RENAME` change, pin its commit
+  in the workspace dependency, and verify without a local path override.
+
 ### Task 14 — Migration-local settings and table locks
 
 **Goal:** Execute migration coordination statements rather than ignoring them.
@@ -590,6 +610,10 @@ functions, triggers, and one-off blocks.
 - Function and trigger dependencies, replacement, qualification, rollback,
   table/column changes, and drop behavior are represented in the transactional
   catalog.
+- SQLx migration coverage creates trigger fixtures through supported SQL rather
+  than catalog injection; remove the temporary `test-support` Cargo feature,
+  `Db::seed_trigger_catalog_for_test`, and its executor/catalog-only helpers
+  once `CREATE TRIGGER` is implemented.
 - PostgreSQL differential tests cover every supported function, trigger,
   and `DO` control-flow shape, including insert/update trigger side effects,
   skipped rows, affected-row diagnostics, formatted errors, hints, and rollback.

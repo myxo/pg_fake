@@ -11,7 +11,7 @@ use crate::{
     analyzer,
     catalog::{
         ConstraintId, RelationName, ResolvedRelationName, SchemaId, SequenceSchema, TEMP_SCHEMA,
-        TableId, TablePersistence, TableSchema,
+        TableId, TablePersistence, TableSchema, ViewDependency, ViewSchema,
     },
     error::{PgError, Result, SqlState, reject_unsupported},
     executor::{self, DatabaseState},
@@ -64,6 +64,10 @@ enum PreparedCatalogDependency {
         table: TableId,
         id: ConstraintId,
     },
+    View {
+        name: RelationName,
+        schema: ViewSchema,
+    },
 }
 
 fn extract_prepared_sequence_name(expression: &ast::Expr) -> Option<&str> {
@@ -95,7 +99,74 @@ fn extract_runtime_sequence_name(expression: &ast::Expr) -> Option<&str> {
 struct PreparedDependencyCollector<'catalog> {
     catalog: &'catalog crate::catalog::Catalog,
     dependencies: Vec<PreparedCatalogDependency>,
+    cte_scopes: Vec<PreparedCteScope>,
     error: Option<PgError>,
+}
+
+#[derive(Clone)]
+struct PreparedCteScope {
+    body_mask: Vec<String>,
+    cte_queries: Vec<Box<ast::Query>>,
+    cte_masks: Vec<Vec<String>>,
+    next_cte: usize,
+}
+
+fn enter_prepared_cte_scope(stack: &mut Vec<PreparedCteScope>, query: &ast::Query) {
+    let inherited = stack.last_mut().map_or_else(Vec::new, |parent| {
+        if parent
+            .cte_queries
+            .get(parent.next_cte)
+            .is_some_and(|candidate| candidate.as_ref() == query)
+        {
+            let mask = parent.cte_masks[parent.next_cte].clone();
+            parent.next_cte += 1;
+            mask
+        } else {
+            parent.body_mask.clone()
+        }
+    });
+    let cte_queries = query
+        .with
+        .as_ref()
+        .map(|with| {
+            with.cte_tables
+                .iter()
+                .map(|cte| cte.query.clone())
+                .collect::<Vec<_>>()
+        })
+        .unwrap_or_default();
+    let names = query
+        .with
+        .as_ref()
+        .map(|with| {
+            with.cte_tables
+                .iter()
+                .map(|cte| executor::normalize_identifier(&cte.alias.name))
+                .collect::<Vec<_>>()
+        })
+        .unwrap_or_default();
+    let recursive = query.with.as_ref().is_some_and(|with| with.recursive);
+    let cte_masks = names
+        .iter()
+        .enumerate()
+        .map(|(index, _)| {
+            let mut mask = inherited.clone();
+            mask.extend(if recursive {
+                names.iter().cloned()
+            } else {
+                names[..index].iter().cloned()
+            });
+            mask
+        })
+        .collect();
+    let mut body_mask = inherited;
+    body_mask.extend(names);
+    stack.push(PreparedCteScope {
+        body_mask,
+        cte_queries,
+        cte_masks,
+        next_cte: 0,
+    });
 }
 
 impl PreparedDependencyCollector<'_> {
@@ -105,9 +176,24 @@ impl PreparedDependencyCollector<'_> {
         }
     }
 
-    fn collect_table(&mut self, relation: &ast::ObjectName) -> Result<()> {
+    fn collect_relation(&mut self, relation: &ast::ObjectName) -> Result<()> {
         let name = executor::normalize_relation_name(relation)?;
-        let table = self.catalog.require_named_table(&name)?.clone();
+        let table = match self.catalog.require_named_table(&name) {
+            Ok(table) => table.clone(),
+            Err(error) if error.sqlstate == SqlState::WrongObjectType => {
+                let view = self.catalog.require_named_view(&name)?.clone();
+                self.add_dependency(PreparedCatalogDependency::View {
+                    name,
+                    schema: view.clone(),
+                });
+                let _ = view.query.visit(self);
+                if let Some(error) = self.error.take() {
+                    return Err(error);
+                }
+                return Ok(());
+            }
+            Err(error) => return Err(error),
+        };
         self.add_dependency(PreparedCatalogDependency::Table {
             name,
             schema: table.clone(),
@@ -149,11 +235,32 @@ impl PreparedDependencyCollector<'_> {
 impl ast::Visitor for PreparedDependencyCollector<'_> {
     type Break = ();
 
+    fn pre_visit_query(&mut self, query: &ast::Query) -> std::ops::ControlFlow<Self::Break> {
+        enter_prepared_cte_scope(&mut self.cte_scopes, query);
+        std::ops::ControlFlow::Continue(())
+    }
+
+    fn post_visit_query(&mut self, _query: &ast::Query) -> std::ops::ControlFlow<Self::Break> {
+        self.cte_scopes
+            .pop()
+            .expect("visited query pushed a CTE scope");
+        std::ops::ControlFlow::Continue(())
+    }
+
     fn pre_visit_relation(
         &mut self,
         relation: &ast::ObjectName,
     ) -> std::ops::ControlFlow<Self::Break> {
-        if let Err(error) = self.collect_table(relation) {
+        if executor::normalize_relation_name(relation).is_ok_and(|name| {
+            name.schema.is_none()
+                && self
+                    .cte_scopes
+                    .last()
+                    .is_some_and(|scope| scope.body_mask.contains(&name.name))
+        }) {
+            return std::ops::ControlFlow::Continue(());
+        }
+        if let Err(error) = self.collect_relation(relation) {
             self.error = Some(error);
             return std::ops::ControlFlow::Break(());
         }
@@ -211,6 +318,7 @@ fn collect_prepared_catalog_dependencies(
     let mut collector = PreparedDependencyCollector {
         catalog,
         dependencies: Vec::new(),
+        cte_scopes: Vec::new(),
         error: None,
     };
     for statement in statements {
@@ -692,6 +800,28 @@ fn collect_ddl_relation_locks(
                 .get_lock_name(),
                 RelationLockMode::Exclusive,
             );
+            if alter.operations.iter().any(|operation| {
+                matches!(
+                    operation,
+                    ast::AlterTableOperation::RenameColumn { .. }
+                        | ast::AlterTableOperation::RenameTable { .. }
+                        | ast::AlterTableOperation::DropColumn { .. }
+                )
+            }) {
+                for view in catalog
+                    .iterate_views()
+                    .filter(|view| view.dependencies.contains(&ViewDependency::Table(table.id)))
+                {
+                    locks.insert(
+                        ResolvedRelationName {
+                            schema_id: view.schema_id,
+                            name: view.name.clone(),
+                        }
+                        .get_lock_name(),
+                        RelationLockMode::Exclusive,
+                    );
+                }
+            }
             for operation in &alter.operations {
                 if let ast::AlterTableOperation::AddColumn { column_def, .. } = operation {
                     for option in &column_def.options {
@@ -889,6 +1019,90 @@ fn collect_ddl_relation_locks(
                 }
             }
         }
+        ast::Statement::CreateView(create) => {
+            let name = executor::normalize_relation_name(&create.name)?;
+            let temporary = create.temporary || name.schema.as_deref() == Some(TEMP_SCHEMA);
+            locks.insert(
+                catalog
+                    .resolve_creation_name(&name, temporary)?
+                    .get_lock_name(),
+                RelationLockMode::Exclusive,
+            );
+            for dependency in collect_prepared_catalog_dependencies(
+                catalog,
+                [ast::Statement::Query(create.query.clone())],
+            )? {
+                match dependency {
+                    PreparedCatalogDependency::Table { schema, .. } => {
+                        locks
+                            .entry(
+                                ResolvedRelationName {
+                                    schema_id: schema.schema_id,
+                                    name: schema.name,
+                                }
+                                .get_lock_name(),
+                            )
+                            .or_insert(RelationLockMode::Shared);
+                    }
+                    PreparedCatalogDependency::View { schema, .. } => {
+                        locks
+                            .entry(
+                                ResolvedRelationName {
+                                    schema_id: schema.schema_id,
+                                    name: schema.name,
+                                }
+                                .get_lock_name(),
+                            )
+                            .or_insert(RelationLockMode::Shared);
+                    }
+                    PreparedCatalogDependency::Sequence { .. }
+                    | PreparedCatalogDependency::Constraint { .. } => {}
+                }
+            }
+        }
+        ast::Statement::CreateTrigger(_) => {}
+        ast::Statement::AlterTrigger { table_name, .. } => {
+            let table =
+                catalog.require_named_table(&executor::normalize_relation_name(table_name)?)?;
+            locks.insert(
+                ResolvedRelationName {
+                    schema_id: table.schema_id,
+                    name: table.name.clone(),
+                }
+                .get_lock_name(),
+                RelationLockMode::Exclusive,
+            );
+        }
+        ast::Statement::Comment {
+            object_type: ast::CommentObject::View,
+            object_name,
+            ..
+        } => {
+            let view =
+                catalog.require_named_view(&executor::normalize_relation_name(object_name)?)?;
+            locks.insert(
+                ResolvedRelationName {
+                    schema_id: view.schema_id,
+                    name: view.name.clone(),
+                }
+                .get_lock_name(),
+                RelationLockMode::Exclusive,
+            );
+        }
+        ast::Statement::Drop {
+            object_type: ast::ObjectType::View,
+            names,
+            ..
+        } => {
+            for name in names {
+                locks.insert(
+                    catalog
+                        .resolve_relation_name(&executor::normalize_relation_name(name)?)?
+                        .get_lock_name(),
+                    RelationLockMode::Exclusive,
+                );
+            }
+        }
         ast::Statement::Drop {
             object_type: ast::ObjectType::Sequence,
             names: objects,
@@ -985,9 +1199,11 @@ fn collect_foreign_key_relation_locks(
     for statement in statements {
         match statement {
             ast::Statement::Insert(insert) => {
-                let table = state
-                    .catalog
-                    .require_named_table(&executor::resolve_insert_table_name(&insert.table)?)?;
+                let name = executor::resolve_insert_table_name(&insert.table)?;
+                if state.catalog.require_named_view(&name).is_ok() {
+                    continue;
+                }
+                let table = state.catalog.require_named_table(&name)?;
                 for constraint in &table.constraints {
                     if let crate::catalog::Constraint::ForeignKey(foreign_key) = constraint {
                         let parent = state
@@ -1019,9 +1235,11 @@ fn collect_foreign_key_relation_locks(
                 let ast::TableFactor::Table { name, .. } = update.table.relation else {
                     continue;
                 };
-                let table = state
-                    .catalog
-                    .require_named_table(&executor::normalize_relation_name(&name)?)?;
+                let name = executor::normalize_relation_name(&name)?;
+                if state.catalog.require_named_view(&name).is_ok() {
+                    continue;
+                }
+                let table = state.catalog.require_named_table(&name)?;
                 pending.push(ForeignKeyMutation::Update {
                     table: table.id,
                     columns: collect_assignment_columns(&update.assignments)?,
@@ -1038,9 +1256,11 @@ fn collect_foreign_key_relation_locks(
                 else {
                     continue;
                 };
-                let table = state
-                    .catalog
-                    .require_named_table(&executor::normalize_relation_name(name)?)?;
+                let name = executor::normalize_relation_name(name)?;
+                if state.catalog.require_named_view(&name).is_ok() {
+                    continue;
+                }
+                let table = state.catalog.require_named_table(&name)?;
                 pending.push(ForeignKeyMutation::Delete(table.id));
             }
             _ => {}
@@ -1173,6 +1393,16 @@ fn collect_relation_locks(
                     ResolvedRelationName {
                         schema_id: sequence.schema_id,
                         name: sequence.name,
+                    }
+                    .get_lock_name(),
+                    RelationLockMode::Shared,
+                );
+            }
+            PreparedCatalogDependency::View { schema: view, .. } => {
+                locks.insert(
+                    ResolvedRelationName {
+                        schema_id: view.schema_id,
+                        name: view.name,
                     }
                     .get_lock_name(),
                     RelationLockMode::Shared,
@@ -1464,6 +1694,36 @@ impl Db {
             sequence_session: Arc::new(Mutex::new(executor::SequenceSessionState::default())),
         }
     }
+
+    #[cfg(any(test, feature = "test-support"))]
+    #[doc(hidden)]
+    pub fn seed_trigger_catalog_for_test(&self, definition: &str) -> Result<()> {
+        let statements = parser::parse(definition)?;
+        let create = match statements.as_slice() {
+            [ast::Statement::CreateTrigger(create)] => create,
+            _ => {
+                return Err(PgError::create(
+                    SqlState::SyntaxError,
+                    "trigger fixture must be exactly one CREATE TRIGGER statement",
+                ));
+            }
+        };
+        let mut state = self.state.lock().expect("database mutex is poisoned");
+        let xid = state.transactions.begin();
+        let snapshot = Snapshot::create(&state.transactions).use_command(crate::txn::CommandId(0));
+        state.load_catalog(Some(xid), snapshot, None);
+        let previous = state.catalog.clone();
+        if let Err(error) = executor::seed_trigger_catalog_for_test(&mut state, create) {
+            abort_database_transaction(&mut state, xid);
+            self.condvar.notify_all();
+            return Err(error);
+        }
+        state.record_catalog_changes(&previous, xid, crate::txn::CommandId(0));
+        state.transactions.commit(xid);
+        prune_database_versions(&mut state);
+        self.condvar.notify_all();
+        Ok(())
+    }
 }
 impl DbBuilder {
     #[cfg_attr(feature = "execution-log", tracing::instrument(skip_all))]
@@ -1749,6 +2009,16 @@ impl Session {
             ));
         }
         let statement = statements.pop().expect("statement count was checked");
+        let parameter_count = match analyzer::count_parameters(&statement) {
+            Ok(count) => count,
+            Err(error) => return self.abort_with_error(error),
+        };
+        if matches!(statement, ast::Statement::CreateView(_)) && parameter_count != 0 {
+            return self.abort_with_error(PgError::create(
+                SqlState::UndefinedParameter,
+                "there is no parameter in CREATE VIEW",
+            ));
+        }
         if matches!(
             self.transaction,
             Some(SessionTransactionState::Aborted { .. })
@@ -2457,6 +2727,26 @@ impl Session {
                         )
                     })
                 }
+                PreparedCatalogDependency::View { name, schema } => {
+                    match state.catalog.require_named_view(name) {
+                        Ok(view)
+                            if view.id == schema.id
+                                && view.schema_id == schema.schema_id
+                                && view.name == schema.name
+                                && view.columns == schema.columns
+                                && view.query == schema.query
+                                && view.dependencies == schema.dependencies
+                                && view.column_dependencies == schema.column_dependencies =>
+                        {
+                            None
+                        }
+                        Ok(_) => Some(PgError::create(
+                            SqlState::FeatureNotSupported,
+                            "cached plan must be replanned",
+                        )),
+                        Err(error) => Some(error),
+                    }
+                }
             })
         });
         if let Some(error) = prepared_dependency_error {
@@ -2868,6 +3158,67 @@ mod tests {
     #[cfg_attr(feature = "execution-log", tracing::instrument(skip_all))]
     fn create_affected_results(rows: u64) -> Vec<StatementResult> {
         vec![StatementResult::Affected(rows)]
+    }
+
+    #[test]
+    #[cfg_attr(feature = "execution-log", tracing::instrument(skip_all))]
+    fn renames_trigger_catalog_identity_transactionally() {
+        let db = Db::create();
+        let mut session = db.create_session();
+        session
+            .execute("CREATE TABLE accounts (id INTEGER)")
+            .unwrap();
+        db.seed_trigger_catalog_for_test(
+            "CREATE TRIGGER audit_changes BEFORE INSERT ON accounts \
+               FOR EACH ROW EXECUTE FUNCTION audit_changes()",
+        )
+        .unwrap();
+        let trigger_id = db
+            .state
+            .lock()
+            .unwrap()
+            .catalog
+            .require_table("accounts")
+            .unwrap()
+            .triggers[0]
+            .id;
+
+        session
+            .execute(
+                "BEGIN; \
+                 ALTER TRIGGER audit_changes ON accounts RENAME TO audit_accounts; \
+                 ROLLBACK",
+            )
+            .unwrap();
+        session
+            .execute("ALTER TRIGGER audit_changes ON accounts RENAME TO audit_accounts")
+            .unwrap();
+        let (renamed_id, renamed_name, definition_name) = {
+            let state = db.state.lock().unwrap();
+            let trigger = &state.catalog.require_table("accounts").unwrap().triggers[0];
+            (
+                trigger.id,
+                trigger.name.clone(),
+                executor::normalize_unqualified_object_name(&trigger.definition.name).unwrap(),
+            )
+        };
+        assert_eq!(renamed_id, trigger_id);
+        assert_eq!(renamed_name, "audit_accounts");
+        assert_eq!(definition_name, "audit_accounts");
+        assert_eq!(
+            session
+                .execute("ALTER TRIGGER audit_changes ON accounts RENAME TO ignored")
+                .unwrap_err()
+                .sqlstate,
+            SqlState::UndefinedObject
+        );
+        assert_eq!(
+            session
+                .execute("INSERT INTO accounts VALUES (1)")
+                .unwrap_err()
+                .sqlstate,
+            SqlState::FeatureNotSupported
+        );
     }
 
     #[test]

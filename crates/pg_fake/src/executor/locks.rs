@@ -52,6 +52,10 @@ pub(crate) fn collect_required_row_locks(
     context: &StatementExecutionContext,
 ) -> Result<Vec<RequiredRowLock>> {
     if let ast::Statement::Insert(insert) = statement {
+        let name = resolve_insert_table_name(&insert.table)?;
+        if state.catalog.require_named_view(&name).is_ok() {
+            return Ok(Vec::new());
+        }
         let mut locks = collect_insert_foreign_key_locks(state, insert, xid, snapshot, context)?;
         locks.extend(collect_insert_conflict_locks(state, insert, xid, context)?);
         return Ok(locks);
@@ -71,10 +75,12 @@ pub(crate) fn collect_required_row_locks(
             else {
                 return Ok(Vec::new());
             };
+            let name = normalize_relation_name(table_name)?;
+            if state.catalog.require_named_view(&name).is_ok() {
+                return Ok(Vec::new());
+            }
             (
-                state
-                    .catalog
-                    .require_named_table(&normalize_relation_name(table_name)?)?,
+                state.catalog.require_named_table(&name)?,
                 alias.as_ref().map(|alias| &alias.name),
                 update
                     .from
@@ -102,9 +108,11 @@ pub(crate) fn collect_required_row_locks(
             else {
                 return Ok(Vec::new());
             };
-            let schema = state
-                .catalog
-                .require_named_table(&normalize_relation_name(table_name)?)?;
+            let name = normalize_relation_name(table_name)?;
+            if state.catalog.require_named_view(&name).is_ok() {
+                return Ok(Vec::new());
+            }
+            let schema = state.catalog.require_named_table(&name)?;
             (
                 schema,
                 alias.as_ref().map(|alias| &alias.name),

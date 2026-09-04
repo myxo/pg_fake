@@ -420,17 +420,49 @@ pub const FEATURES: &[Feature] = &[
     },
     Feature {
         name: "ordinary views",
-        cases: &[Case {
-            id: "select_from_view",
-            source: "create_view.sql:29",
-            setup: &[
-                "CREATE TABLE phase3_view_source (id INTEGER)",
-                "INSERT INTO phase3_view_source VALUES (1)",
-                "CREATE VIEW phase3_view AS SELECT id FROM phase3_view_source",
-            ],
-            sql: "SELECT id FROM phase3_view",
-            blocker: BlockerKind::Implementation,
-        }],
+        cases: &[
+            Case {
+                id: "select_from_view",
+                source: "create_view.sql:29",
+                setup: &[
+                    "CREATE TABLE phase3_view_source (id INTEGER)",
+                    "INSERT INTO phase3_view_source VALUES (1)",
+                    "CREATE VIEW phase3_view AS SELECT id FROM phase3_view_source",
+                ],
+                sql: "SELECT id FROM phase3_view",
+                blocker: BlockerKind::Implementation,
+            },
+            Case {
+                id: "nested_view_with_explicit_columns",
+                source: "create_view.sql:169 plus focused column aliases",
+                setup: &[
+                    "CREATE TABLE phase3_nested_source (id INTEGER, value TEXT)",
+                    "INSERT INTO phase3_nested_source VALUES (1, 'one'), (2, 'two')",
+                    "CREATE VIEW phase3_inner_view (key, label) AS SELECT id, value FROM phase3_nested_source WHERE id > 1",
+                    "CREATE VIEW phase3_outer_view AS SELECT key, label FROM phase3_inner_view",
+                ],
+                sql: "SELECT key, label FROM phase3_outer_view",
+                blocker: BlockerKind::Implementation,
+            },
+            Case {
+                id: "replace_and_comment_view",
+                source: "create_view.sql:312 plus focused COMMENT ON VIEW",
+                setup: &[
+                    "CREATE TABLE phase3_replace_source (id INTEGER)",
+                    "CREATE VIEW phase3_replace_view AS SELECT id FROM phase3_replace_source",
+                    "COMMENT ON VIEW phase3_replace_view IS 'compatibility view'",
+                ],
+                sql: "CREATE OR REPLACE VIEW phase3_replace_view AS SELECT id FROM phase3_replace_source WHERE id > 0",
+                blocker: BlockerKind::Implementation,
+            },
+            Case {
+                id: "drop_view_if_exists",
+                source: "drop_if_exists.sql plus focused migration fixture",
+                setup: &["CREATE VIEW phase3_drop_view AS SELECT 1 AS id"],
+                sql: "DROP VIEW IF EXISTS phase3_drop_view",
+                blocker: BlockerKind::Implementation,
+            },
+        ],
     },
     Feature {
         name: "savepoints",
