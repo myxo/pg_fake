@@ -46,7 +46,8 @@ pub(crate) fn classify(statement: &ast::Statement) -> StatementKind {
         | ast::Statement::Commit { .. }
         | ast::Statement::Rollback { .. }
         | ast::Statement::Savepoint { .. }
-        | ast::Statement::ReleaseSavepoint { .. } => StatementKind::TransactionControl,
+        | ast::Statement::ReleaseSavepoint { .. }
+        | ast::Statement::Lock(_) => StatementKind::TransactionControl,
         ast::Statement::Set(_) => StatementKind::Set,
         _ => StatementKind::Unsupported,
     }
@@ -151,6 +152,24 @@ mod tests {
     }
 
     #[test]
+    fn preserves_postgres_table_lock_targets_and_mode() {
+        let statement =
+            parse("LOCK TABLE public.first_table, public.second_table IN EXCLUSIVE MODE")
+                .unwrap()
+                .pop()
+                .unwrap();
+        let ast::Statement::Lock(lock) = statement else {
+            panic!("statement should be LOCK TABLE");
+        };
+
+        assert_eq!(lock.tables.len(), 2);
+        assert_eq!(lock.tables[0].name.to_string(), "public.first_table");
+        assert_eq!(lock.tables[1].name.to_string(), "public.second_table");
+        assert_eq!(lock.lock_mode, Some(ast::LockTableMode::Exclusive));
+        assert!(!lock.nowait);
+    }
+
+    #[test]
     #[cfg_attr(feature = "execution-log", tracing::instrument(skip_all))]
     fn classifies_statement_families() {
         let cases = [
@@ -161,6 +180,10 @@ mod tests {
             ("INSERT INTO t VALUES (1)", StatementKind::Dml),
             ("SELECT * FROM t", StatementKind::Query),
             ("BEGIN", StatementKind::TransactionControl),
+            (
+                "LOCK TABLE t IN ACCESS EXCLUSIVE MODE",
+                StatementKind::TransactionControl,
+            ),
             ("SET application_name = 'pg_fake'", StatementKind::Set),
             ("EXPLAIN SELECT * FROM t", StatementKind::Unsupported),
         ];

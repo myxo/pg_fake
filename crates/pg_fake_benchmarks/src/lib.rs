@@ -33,6 +33,11 @@ pub fn list_benchmarks() -> Vec<Benchmark> {
             postgres_comparisons(),
         ),
         build_benchmark(
+            "migration_table_lock_two_relations",
+            postgres_values(),
+            postgres_comparisons(),
+        ),
+        build_benchmark(
             "alter_table_rewrite_100_rows",
             postgres_values(),
             postgres_comparisons(),

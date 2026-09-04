@@ -429,12 +429,21 @@ pub struct Session {
     transaction: Option<SessionTransactionState>,
     default_isolation: IsolationLevel,
     lock_timeout: Duration,
+    statement_timeout: Duration,
     timezone: String,
-    settings_undo: Option<(IsolationLevel, Duration, String)>,
+    settings_undo: Option<SessionSettings>,
+    settings_on_commit: Option<SessionSettings>,
     deferred_constraints: BTreeSet<ConstraintId>,
     defer_all_constraints: bool,
     deferred_foreign_keys_dirty: bool,
     sequence_session: executor::SequenceSessionStorage,
+}
+#[derive(Clone)]
+struct SessionSettings {
+    default_isolation: IsolationLevel,
+    lock_timeout: Duration,
+    statement_timeout: Duration,
+    timezone: String,
 }
 #[derive(Clone, Copy)]
 enum SessionTransactionState {
@@ -513,43 +522,114 @@ fn prune_database_versions(state: &mut DatabaseState) {
 }
 
 #[cfg_attr(feature = "execution-log", tracing::instrument(skip_all))]
-fn create_invalid_lock_timeout_error() -> PgError {
+fn create_invalid_timeout_error(parameter: &str) -> PgError {
     PgError::create(
         SqlState::InvalidParameterValue,
-        "invalid value for parameter lock_timeout",
+        format!("invalid value for parameter {parameter}"),
     )
 }
 
 #[cfg_attr(feature = "execution-log", tracing::instrument(skip_all))]
-fn parse_lock_timeout(expression: &ast::Expr) -> Result<Duration> {
+fn parse_timeout(expression: &ast::Expr, parameter: &str) -> Result<Duration> {
     let text = match expression {
         ast::Expr::Value(value) => match &value.value {
             ast::Value::Number(value, _) => value.as_str(),
             ast::Value::SingleQuotedString(value) => value.trim(),
-            _ => return Err(create_invalid_lock_timeout_error()),
+            _ => return Err(create_invalid_timeout_error(parameter)),
         },
-        _ => return Err(create_invalid_lock_timeout_error()),
+        _ => return Err(create_invalid_timeout_error(parameter)),
     };
-    let lower = text.to_ascii_lowercase();
-    if let Some(milliseconds) = lower.strip_suffix("ms") {
-        return milliseconds
-            .trim()
-            .parse::<u64>()
-            .map(Duration::from_millis)
-            .map_err(|_| create_invalid_lock_timeout_error());
-    }
-    if let Some(seconds) = lower.strip_suffix('s') {
-        return seconds
-            .trim()
-            .parse::<u64>()
-            .map(Duration::from_secs)
-            .map_err(|_| create_invalid_lock_timeout_error());
-    }
-    lower
-        .trim()
-        .parse::<u64>()
-        .map(Duration::from_millis)
-        .map_err(|_| create_invalid_lock_timeout_error())
+    let text = text.trim();
+    let unsigned = text
+        .strip_prefix('-')
+        .or_else(|| text.strip_prefix('+'))
+        .unwrap_or(text);
+    let hexadecimal = unsigned
+        .strip_prefix("0x")
+        .or_else(|| unsigned.strip_prefix("0X"));
+    let (value, unit) = if let Some(hexadecimal) = hexadecimal {
+        let digit_count = hexadecimal
+            .bytes()
+            .take_while(u8::is_ascii_hexdigit)
+            .count();
+        let value_end = text.len() - hexadecimal.len() + digit_count;
+        let unit = text[value_end..].trim();
+        (&text[..value_end], (!unit.is_empty()).then_some(unit))
+    } else if let Some(value) = text.strip_suffix("min") {
+        (value, Some("min"))
+    } else if let Some(value) = text.strip_suffix("ms") {
+        (value, Some("ms"))
+    } else if let Some(value) = text.strip_suffix("us") {
+        (value, Some("us"))
+    } else if let Some(value) = text.strip_suffix('s') {
+        (value, Some("s"))
+    } else if let Some(value) = text.strip_suffix('h') {
+        (value, Some("h"))
+    } else if let Some(value) = text.strip_suffix('d') {
+        (value, Some("d"))
+    } else {
+        (text, None)
+    };
+    let (multiplier, next_smaller_multiplier) = match unit {
+        Some("d") => (86_400_000.0, Some(3_600_000.0)),
+        Some("h") => (3_600_000.0, Some(60_000.0)),
+        Some("min") => (60_000.0, Some(1_000.0)),
+        Some("s") => (1_000.0, Some(1.0)),
+        Some("ms") => (1.0, Some(0.001)),
+        Some("us") => (0.001, None),
+        Some(_) => return Err(create_invalid_timeout_error(parameter)),
+        None => (1.0, None),
+    };
+    let value = value.trim();
+    let (negative, digits) = if let Some(digits) = value.strip_prefix('-') {
+        (true, digits)
+    } else if let Some(digits) = value.strip_prefix('+') {
+        (false, digits)
+    } else {
+        (false, value)
+    };
+    let (digits, radix) = if let Some(digits) = digits
+        .strip_prefix("0x")
+        .or_else(|| digits.strip_prefix("0X"))
+    {
+        (digits, 16)
+    } else if digits.len() > 1 && digits.starts_with('0') {
+        (digits, 8)
+    } else {
+        (digits, 10)
+    };
+    let digit_count = digits
+        .bytes()
+        .take_while(|digit| char::from(*digit).to_digit(radix).is_some())
+        .count();
+    let retry_as_float = radix != 16
+        && digits
+            .as_bytes()
+            .get(digit_count)
+            .is_some_and(|digit| matches!(digit, b'.' | b'e' | b'E'));
+    let integer = (!retry_as_float && digit_count == digits.len() && digit_count != 0)
+        .then(|| u64::from_str_radix(&digits[..digit_count], radix).ok())
+        .flatten()
+        .map(|value| {
+            if negative {
+                -(value as f64)
+            } else {
+                value as f64
+            }
+        });
+    let value = integer.or_else(|| retry_as_float.then(|| value.parse::<f64>().ok()).flatten());
+    let milliseconds = value
+        .filter(|value| value.is_finite())
+        .map(|value| value * multiplier)
+        .map(|value| {
+            next_smaller_multiplier
+                .map(|next| (value / next).round_ties_even() * next)
+                .unwrap_or(value)
+                .round_ties_even()
+        })
+        .filter(|milliseconds| *milliseconds >= 0.0 && *milliseconds <= i32::MAX as f64)
+        .ok_or_else(|| create_invalid_timeout_error(parameter))?;
+    Ok(Duration::from_millis(milliseconds as u64))
 }
 
 #[cfg_attr(feature = "execution-log", tracing::instrument(skip_all))]
@@ -590,6 +670,22 @@ fn create_lock_timeout_error() -> PgError {
         SqlState::LockNotAvailable,
         "canceling statement due to lock timeout",
     )
+}
+
+#[cfg_attr(feature = "execution-log", tracing::instrument(skip_all))]
+fn create_statement_timeout_error() -> PgError {
+    PgError::create(
+        SqlState::QueryCanceled,
+        "canceling statement due to statement timeout",
+    )
+}
+
+fn check_statement_timeout(deadline: Option<Instant>) -> Result<()> {
+    if deadline.is_some_and(|deadline| Instant::now() >= deadline) {
+        Err(create_statement_timeout_error())
+    } else {
+        Ok(())
+    }
 }
 
 #[cfg_attr(feature = "execution-log", tracing::instrument(skip_all))]
@@ -694,7 +790,8 @@ fn collect_ddl_relation_locks(
                         )?;
                         locks
                             .entry(name.get_lock_name())
-                            .or_insert(RelationLockMode::Shared);
+                            .and_modify(|mode| *mode = (*mode).max(RelationLockMode::RowShare))
+                            .or_insert(RelationLockMode::RowShare);
                     }
                 }
             }
@@ -705,7 +802,8 @@ fn collect_ddl_relation_locks(
                     )?;
                     locks
                         .entry(name.get_lock_name())
-                        .or_insert(RelationLockMode::Shared);
+                        .and_modify(|mode| *mode = (*mode).max(RelationLockMode::RowShare))
+                        .or_insert(RelationLockMode::RowShare);
                 }
             }
         }
@@ -1217,7 +1315,8 @@ fn collect_foreign_key_relation_locks(
                                 }
                                 .get_lock_name(),
                             )
-                            .or_insert(RelationLockMode::Shared);
+                            .and_modify(|mode| *mode = (*mode).max(RelationLockMode::RowShare))
+                            .or_insert(RelationLockMode::RowShare);
                     }
                 }
                 if let Some(ast::OnInsert::OnConflict(ast::OnConflict {
@@ -1297,7 +1396,8 @@ fn collect_foreign_key_relation_locks(
                             }
                             .get_lock_name(),
                         )
-                        .or_insert(RelationLockMode::Shared);
+                        .and_modify(|mode| *mode = (*mode).max(RelationLockMode::RowShare))
+                        .or_insert(RelationLockMode::RowShare);
                 }
             }
         }
@@ -1322,6 +1422,18 @@ fn collect_foreign_key_relation_locks(
                     continue;
                 }
             }
+            let action = if updated_columns.is_some() {
+                foreign_key.on_update
+            } else {
+                foreign_key.on_delete
+            };
+            let mode = match action {
+                crate::catalog::ForeignKeyAction::Cascade
+                | crate::catalog::ForeignKeyAction::SetNull
+                | crate::catalog::ForeignKeyAction::SetDefault => RelationLockMode::RowExclusive,
+                crate::catalog::ForeignKeyAction::NoAction
+                | crate::catalog::ForeignKeyAction::Restrict => RelationLockMode::RowShare,
+            };
             locks
                 .entry(
                     ResolvedRelationName {
@@ -1330,12 +1442,8 @@ fn collect_foreign_key_relation_locks(
                     }
                     .get_lock_name(),
                 )
-                .or_insert(RelationLockMode::Shared);
-            let action = if updated_columns.is_some() {
-                foreign_key.on_update
-            } else {
-                foreign_key.on_delete
-            };
+                .and_modify(|held| *held = (*held).max(mode))
+                .or_insert(mode);
             match action {
                 crate::catalog::ForeignKeyAction::Cascade if updated_columns.is_none() => {
                     pending.push(ForeignKeyMutation::Delete(child.id));
@@ -1362,10 +1470,49 @@ fn collect_relation_locks(
     statement: &ast::Statement,
     prepared_dependencies: Option<&[PreparedCatalogDependency]>,
 ) -> Result<Vec<(String, RelationLockMode)>> {
+    if let ast::Statement::Lock(lock) = statement {
+        if lock.nowait {
+            return reject_unsupported("LOCK TABLE NOWAIT is not implemented");
+        }
+        let mode = match lock
+            .lock_mode
+            .as_ref()
+            .unwrap_or(&ast::LockTableMode::AccessExclusive)
+        {
+            ast::LockTableMode::Exclusive => RelationLockMode::TableExclusive,
+            ast::LockTableMode::AccessExclusive => RelationLockMode::Exclusive,
+            _ => return reject_unsupported("LOCK TABLE mode is not implemented"),
+        };
+        let mut locks = Vec::new();
+        let mut seen = BTreeSet::new();
+        for target in &lock.tables {
+            if target.only || target.has_asterisk {
+                return reject_unsupported("LOCK TABLE inheritance targets are not implemented");
+            }
+            let name = executor::normalize_relation_name(&target.name)?;
+            let table = state.catalog.require_named_table(&name)?;
+            if seen.insert(table.id) {
+                locks.push((
+                    table.id,
+                    ResolvedRelationName {
+                        schema_id: table.schema_id,
+                        name: table.name.clone(),
+                    }
+                    .get_lock_name(),
+                ));
+            }
+        }
+        locks.sort_by_key(|(table_id, _)| *table_id);
+        return Ok(locks.into_iter().map(|(_, name)| (name, mode)).collect());
+    }
     if matches!(parser::classify(statement), parser::StatementKind::Ddl) {
         return collect_ddl_relation_locks(&state.catalog, statement);
     }
     let (expanded_statement, mutations) = executor::expand_ctes_for_analysis(statement, state)?;
+    let locking_read = matches!(
+        &expanded_statement,
+        ast::Statement::Query(query) if !query.locks.is_empty()
+    );
     let dependencies = match prepared_dependencies {
         Some(dependencies) => dependencies.to_vec(),
         None => collect_prepared_catalog_dependencies(
@@ -1383,7 +1530,11 @@ fn collect_relation_locks(
                         name: table.name,
                     }
                     .get_lock_name(),
-                    RelationLockMode::Shared,
+                    if locking_read {
+                        RelationLockMode::RowShare
+                    } else {
+                        RelationLockMode::Shared
+                    },
                 );
             }
             PreparedCatalogDependency::Sequence {
@@ -1413,9 +1564,50 @@ fn collect_relation_locks(
     }
     collect_foreign_key_relation_locks(
         state,
-        std::iter::once(expanded_statement).chain(mutations),
+        std::iter::once(expanded_statement.clone()).chain(mutations.iter().cloned()),
         &mut locks,
     )?;
+    for mutation in std::iter::once(expanded_statement).chain(mutations) {
+        let name = match mutation {
+            ast::Statement::Insert(insert) => {
+                Some(executor::resolve_insert_table_name(&insert.table)?)
+            }
+            ast::Statement::Update(update) => match update.table.relation {
+                ast::TableFactor::Table { name, .. } => {
+                    Some(executor::normalize_relation_name(&name)?)
+                }
+                _ => None,
+            },
+            ast::Statement::Delete(delete) => match delete.from {
+                ast::FromTable::WithFromKeyword(from) => from
+                    .first()
+                    .and_then(|table| {
+                        let ast::TableFactor::Table { name, .. } = &table.relation else {
+                            return None;
+                        };
+                        Some(executor::normalize_relation_name(name))
+                    })
+                    .transpose()?,
+                _ => None,
+            },
+            _ => None,
+        };
+        let Some(name) = name else {
+            continue;
+        };
+        if let Ok(table) = state.catalog.require_named_table(&name) {
+            locks
+                .entry(
+                    ResolvedRelationName {
+                        schema_id: table.schema_id,
+                        name: table.name.clone(),
+                    }
+                    .get_lock_name(),
+                )
+                .and_modify(|mode| *mode = (*mode).max(RelationLockMode::RowExclusive))
+                .or_insert(RelationLockMode::RowExclusive);
+        }
+    }
     let mut sequence_error = None;
     let _ = ast::visit_expressions(statement, |expression| -> std::ops::ControlFlow<()> {
         let ast::Expr::Function(function) = expression else {
@@ -1469,6 +1661,7 @@ fn collect_relation_locks(
 fn acquire_relation_locks<'a>(
     condvar: &Condvar,
     timeout: Duration,
+    statement_deadline: Option<Instant>,
     mut state: MutexGuard<'a, DatabaseState>,
     statement: &ast::Statement,
     prepared_dependencies: Option<&[PreparedCatalogDependency]>,
@@ -1477,49 +1670,62 @@ fn acquire_relation_locks<'a>(
     isolation: IsolationLevel,
     mut snapshot: Snapshot,
 ) -> Result<(MutexGuard<'a, DatabaseState>, Snapshot)> {
-    let deadline = (timeout != Duration::ZERO).then(|| Instant::now() + timeout);
+    let lock_deadline = (timeout != Duration::ZERO).then(|| Instant::now() + timeout);
     let ddl = matches!(parser::classify(statement), parser::StatementKind::Ddl);
     loop {
         if ddl {
             snapshot = Snapshot::create(&state.transactions).use_command(snapshot.command_id);
         }
         state.load_catalog(Some(xid), snapshot, Some(temporary_schema_id));
-        let locks = collect_relation_locks(&state, statement, prepared_dependencies)?;
-        let mut blocked = None;
-        for (name, mode) in locks {
-            match state.relation_locks.acquire(&name, xid, mode) {
-                RelationLockAttempt::Acquired => condvar.notify_all(),
-                RelationLockAttempt::Blocked(conflicts) => {
-                    if state
-                        .wait_for
-                        .register_wait_dependencies(xid, &conflicts)
-                        .is_some()
-                    {
-                        condvar.notify_all();
-                    }
-                    blocked = Some((name, conflicts));
-                    break;
-                }
+        let locks = match collect_relation_locks(&state, statement, prepared_dependencies) {
+            Ok(locks) => locks,
+            Err(error) => {
+                state.relation_locks.cancel_transaction_waits(xid);
+                state.wait_for.clear_wait(xid);
+                condvar.notify_all();
+                return Err(error);
             }
-        }
-        let Some((name, conflicts)) = blocked else {
-            state.wait_for.clear_wait(xid);
-            return Ok((state, snapshot));
         };
+        let conflicts = match state.relation_locks.acquire_many(&locks, xid) {
+            RelationLockAttempt::Acquired => {
+                state.wait_for.clear_wait(xid);
+                condvar.notify_all();
+                return Ok((state, snapshot));
+            }
+            RelationLockAttempt::Blocked(conflicts) => conflicts,
+        };
+        if state
+            .wait_for
+            .register_wait_dependencies(xid, &conflicts)
+            .is_some()
+        {
+            condvar.notify_all();
+        }
         if state.wait_for.take_victim(xid) {
-            state.relation_locks.cancel_wait(&name, xid);
+            state.relation_locks.cancel_transaction_waits(xid);
             state.wait_for.clear_wait(xid);
             condvar.notify_all();
             return Err(create_deadlock_error());
         }
         let mut timed_out = false;
+        let deadline = match (lock_deadline, statement_deadline) {
+            (Some(lock), Some(statement)) => Some(lock.min(statement)),
+            (Some(deadline), None) | (None, Some(deadline)) => Some(deadline),
+            (None, None) => None,
+        };
         state = if let Some(deadline) = deadline {
             let remaining = deadline.saturating_duration_since(Instant::now());
             if remaining.is_zero() {
-                state.relation_locks.cancel_wait(&name, xid);
+                state.relation_locks.cancel_transaction_waits(xid);
                 state.wait_for.clear_wait(xid);
                 condvar.notify_all();
-                return Err(create_lock_timeout_error());
+                return Err(
+                    if statement_deadline.is_some_and(|statement| statement <= deadline) {
+                        create_statement_timeout_error()
+                    } else {
+                        create_lock_timeout_error()
+                    },
+                );
             }
             let (state, wait_result) = condvar
                 .wait_timeout(state, remaining)
@@ -1529,14 +1735,24 @@ fn acquire_relation_locks<'a>(
         } else {
             condvar.wait(state).expect("database mutex is poisoned")
         };
-        state.relation_locks.cancel_wait(&name, xid);
         state.wait_for.clear_wait(xid);
-        condvar.notify_all();
         if state.wait_for.take_victim(xid) {
+            state.relation_locks.cancel_transaction_waits(xid);
+            condvar.notify_all();
             return Err(create_deadlock_error());
         }
         if timed_out {
-            return Err(create_lock_timeout_error());
+            state.relation_locks.cancel_transaction_waits(xid);
+            condvar.notify_all();
+            return Err(
+                if statement_deadline.is_some_and(|statement| {
+                    statement <= deadline.expect("timed wait has deadline")
+                }) {
+                    create_statement_timeout_error()
+                } else {
+                    create_lock_timeout_error()
+                },
+            );
         }
         if !ddl
             && isolation == IsolationLevel::ReadCommitted
@@ -1556,6 +1772,7 @@ fn acquire_relation_locks<'a>(
 fn acquire_row_locks<'a>(
     condvar: &Condvar,
     timeout: Duration,
+    statement_deadline: Option<Instant>,
     mut state: MutexGuard<'a, DatabaseState>,
     target: RowLockTarget<'_>,
     xid: Xid,
@@ -1568,7 +1785,7 @@ fn acquire_row_locks<'a>(
     Snapshot,
     Vec<executor::RequiredRowLock>,
 )> {
-    let deadline = (timeout != Duration::ZERO).then(|| Instant::now() + timeout);
+    let lock_deadline = (timeout != Duration::ZERO).then(|| Instant::now() + timeout);
     loop {
         state.load_catalog(Some(xid), snapshot, Some(temporary_schema_id));
         let required = match target {
@@ -1609,12 +1826,23 @@ fn acquire_row_locks<'a>(
             return Err(create_deadlock_error());
         }
         let mut timed_out = false;
+        let deadline = match (lock_deadline, statement_deadline) {
+            (Some(lock), Some(statement)) => Some(lock.min(statement)),
+            (Some(deadline), None) | (None, Some(deadline)) => Some(deadline),
+            (None, None) => None,
+        };
         state = if let Some(deadline) = deadline {
             let remaining = deadline.saturating_duration_since(Instant::now());
             if remaining.is_zero() {
                 state.row_locks.cancel_wait(key, xid);
                 state.wait_for.clear_wait(xid);
-                return Err(create_lock_timeout_error());
+                return Err(
+                    if statement_deadline.is_some_and(|statement| statement <= deadline) {
+                        create_statement_timeout_error()
+                    } else {
+                        create_lock_timeout_error()
+                    },
+                );
             }
             let (state, wait_result) = condvar
                 .wait_timeout(state, remaining)
@@ -1630,7 +1858,15 @@ fn acquire_row_locks<'a>(
             return Err(create_deadlock_error());
         }
         if timed_out {
-            return Err(create_lock_timeout_error());
+            return Err(
+                if statement_deadline.is_some_and(|statement| {
+                    statement <= deadline.expect("timed wait has deadline")
+                }) {
+                    create_statement_timeout_error()
+                } else {
+                    create_lock_timeout_error()
+                },
+            );
         }
         if isolation == IsolationLevel::RepeatableRead
             && conflicts.iter().any(|holder| {
@@ -1686,8 +1922,10 @@ impl Db {
             transaction: None,
             default_isolation: IsolationLevel::ReadCommitted,
             lock_timeout: self.default_lock_timeout,
+            statement_timeout: Duration::ZERO,
             timezone: "UTC".into(),
             settings_undo: None,
+            settings_on_commit: None,
             deferred_constraints: BTreeSet::new(),
             defer_all_constraints: false,
             deferred_foreign_keys_dirty: false,
@@ -2225,17 +2463,30 @@ impl Session {
             finished: false,
         })
     }
+    fn capture_settings(&self) -> SessionSettings {
+        SessionSettings {
+            default_isolation: self.default_isolation,
+            lock_timeout: self.lock_timeout,
+            statement_timeout: self.statement_timeout,
+            timezone: self.timezone.clone(),
+        }
+    }
+    fn restore_settings(&mut self, settings: SessionSettings) {
+        self.default_isolation = settings.default_isolation;
+        self.lock_timeout = settings.lock_timeout;
+        self.statement_timeout = settings.statement_timeout;
+        self.timezone = settings.timezone;
+    }
     #[cfg_attr(feature = "execution-log", tracing::instrument(skip_all))]
     fn start_transaction(&mut self, isolation: IsolationLevel, implicit_batch: bool) {
         assert!(self.settings_undo.is_none());
+        assert!(self.settings_on_commit.is_none());
         self.deferred_constraints.clear();
         self.defer_all_constraints = false;
         self.deferred_foreign_keys_dirty = false;
-        self.settings_undo = Some((
-            self.default_isolation,
-            self.lock_timeout,
-            self.timezone.clone(),
-        ));
+        let settings = self.capture_settings();
+        self.settings_undo = Some(settings.clone());
+        self.settings_on_commit = Some(settings);
         let mut state = self.db.state.lock().expect("database mutex is poisoned");
         self.transaction = Some(SessionTransactionState::Active(ActiveTransaction {
             xid: state.transactions.begin(),
@@ -2303,6 +2554,11 @@ impl Session {
             state.wait_for.remove_transaction(transaction.xid);
             prune_database_versions(&mut state);
             self.settings_undo = None;
+            let settings = self
+                .settings_on_commit
+                .take()
+                .expect("active transaction has commit settings");
+            self.restore_settings(settings);
             self.deferred_constraints.clear();
             self.defer_all_constraints = false;
             self.db.condvar.notify_all();
@@ -2311,11 +2567,12 @@ impl Session {
         if self.deferred_foreign_keys_dirty
             && let Err(error) = executor::validate_deferred_foreign_keys(&state, transaction.xid)
         {
-            if let Some((default_isolation, lock_timeout, timezone)) = self.settings_undo.take() {
-                self.default_isolation = default_isolation;
-                self.lock_timeout = lock_timeout;
-                self.timezone = timezone;
-            }
+            let settings = self
+                .settings_undo
+                .take()
+                .expect("active transaction has rollback settings");
+            self.settings_on_commit = None;
+            self.restore_settings(settings);
             self.deferred_constraints.clear();
             self.defer_all_constraints = false;
             self.deferred_foreign_keys_dirty = false;
@@ -2341,6 +2598,11 @@ impl Session {
             .release_transaction_locks(transaction.xid);
         state.wait_for.remove_transaction(transaction.xid);
         self.settings_undo = None;
+        let settings = self
+            .settings_on_commit
+            .take()
+            .expect("active transaction has commit settings");
+        self.restore_settings(settings);
         self.deferred_constraints.clear();
         self.defer_all_constraints = false;
         self.deferred_foreign_keys_dirty = false;
@@ -2374,11 +2636,12 @@ impl Session {
             }
         };
         state.load_catalog(Some(xid), snapshot, Some(self.temporary_schema_id));
-        if let Some((default_isolation, lock_timeout, timezone)) = self.settings_undo.take() {
-            self.default_isolation = default_isolation;
-            self.lock_timeout = lock_timeout;
-            self.timezone = timezone;
-        }
+        let settings = self
+            .settings_undo
+            .take()
+            .expect("active transaction has rollback settings");
+        self.settings_on_commit = None;
+        self.restore_settings(settings);
         self.deferred_constraints.clear();
         self.defer_all_constraints = false;
         self.deferred_foreign_keys_dirty = false;
@@ -2425,8 +2688,14 @@ impl Session {
             {
                 return Ok(StatementResult::Affected(0));
             }
-            ast::Statement::Set(ast::Set::SetTimeZone { local: _, value }) => {
+            ast::Statement::Set(ast::Set::SetTimeZone { local, value }) => {
                 self.timezone = parse_timezone(value)?;
+                if !local {
+                    self.settings_on_commit
+                        .as_mut()
+                        .expect("SET runs in a transaction")
+                        .timezone = self.timezone.clone();
+                }
                 return Ok(StatementResult::Affected(0));
             }
             ast::Statement::ShowVariable { variable }
@@ -2440,6 +2709,20 @@ impl Session {
                     }],
                     rows: vec![vec![Value::Text(self.timezone.clone())]],
                 }));
+            }
+            ast::Statement::Lock(_)
+                if matches!(
+                    self.transaction,
+                    Some(SessionTransactionState::Active(ActiveTransaction {
+                        implicit_batch: true,
+                        ..
+                    }))
+                ) =>
+            {
+                return self.abort_with_error(PgError::create(
+                    SqlState::NoActiveSqlTransaction,
+                    "LOCK TABLE can only be used in transaction blocks",
+                ));
             }
             ast::Statement::StartTransaction { modes, .. } => {
                 return match self.transaction {
@@ -2504,6 +2787,10 @@ impl Session {
                 };
                 if *session {
                     self.default_isolation = isolation;
+                    self.settings_on_commit
+                        .as_mut()
+                        .expect("SET runs in a transaction")
+                        .default_isolation = isolation;
                     return Ok(StatementResult::Affected(0));
                 }
                 let Some(SessionTransactionState::Active(mut transaction)) = self.transaction
@@ -2540,6 +2827,12 @@ impl Session {
                         ));
                     }
                     self.timezone = parse_timezone(&values[0])?;
+                    if *scope != Some(ast::ContextModifier::Local) {
+                        self.settings_on_commit
+                            .as_mut()
+                            .expect("SET runs in a transaction")
+                            .timezone = self.timezone.clone();
+                    }
                     return Ok(StatementResult::Affected(0));
                 }
                 if variable.to_string().eq_ignore_ascii_case("lock_timeout") {
@@ -2552,14 +2845,45 @@ impl Session {
                             "current transaction is aborted",
                         ));
                     }
-                    if *scope == Some(ast::ContextModifier::Local) || *hivevar || values.len() != 1
-                    {
+                    if *hivevar || values.len() != 1 {
                         return self.abort_with_error(PgError::create(
                             SqlState::FeatureNotSupported,
                             "lock_timeout setting variant is not implemented",
                         ));
                     }
-                    self.lock_timeout = match parse_lock_timeout(&values[0]) {
+                    self.lock_timeout = match parse_timeout(&values[0], "lock_timeout") {
+                        Ok(timeout) => timeout,
+                        Err(error) => return self.abort_with_error(error),
+                    };
+                    if *scope != Some(ast::ContextModifier::Local) {
+                        self.settings_on_commit
+                            .as_mut()
+                            .expect("SET runs in a transaction")
+                            .lock_timeout = self.lock_timeout;
+                    }
+                    return Ok(StatementResult::Affected(0));
+                }
+                if variable
+                    .to_string()
+                    .eq_ignore_ascii_case("statement_timeout")
+                {
+                    if matches!(
+                        self.transaction,
+                        Some(SessionTransactionState::Aborted { .. })
+                    ) {
+                        return Err(PgError::create(
+                            SqlState::InFailedSqlTransaction,
+                            "current transaction is aborted",
+                        ));
+                    }
+                    if *scope != Some(ast::ContextModifier::Local) || *hivevar || values.len() != 1
+                    {
+                        return self.abort_with_error(PgError::create(
+                            SqlState::FeatureNotSupported,
+                            "statement_timeout setting variant is not implemented",
+                        ));
+                    }
+                    self.statement_timeout = match parse_timeout(&values[0], "statement_timeout") {
                         Ok(timeout) => timeout,
                         Err(error) => return self.abort_with_error(error),
                     };
@@ -2603,6 +2927,9 @@ impl Session {
         let Some(SessionTransactionState::Active(mut transaction)) = self.transaction else {
             unreachable!("transaction must be active while executing a statement")
         };
+        let statement_deadline = (self.statement_timeout != Duration::ZERO)
+            .then(|| Instant::now() + self.statement_timeout);
+        let statement_timestamp = self.db.read_clock();
         let was_read_only = transaction.read_only;
         transaction.read_only &=
             prepared_query.is_some() || is_plain_read_only_statement(statement);
@@ -2631,6 +2958,7 @@ impl Session {
         let acquired = match acquire_relation_locks(
             &condvar,
             self.lock_timeout,
+            statement_deadline,
             state,
             statement,
             prepared_dependencies,
@@ -2762,11 +3090,18 @@ impl Session {
                 parameters,
                 transaction.xid,
                 &snapshot,
+                statement_deadline,
             ) {
-                Ok(rows) => Ok(StatementResult::Query(QueryResult {
-                    columns: columns.to_vec(),
-                    rows,
-                })),
+                Ok(rows) => match check_statement_timeout(statement_deadline) {
+                    Ok(()) => Ok(StatementResult::Query(QueryResult {
+                        columns: columns.to_vec(),
+                        rows,
+                    })),
+                    Err(error) => {
+                        drop(state);
+                        self.abort_with_error(error)
+                    }
+                },
                 Err(error) => {
                     drop(state);
                     self.abort_with_error(error)
@@ -2787,11 +3122,18 @@ impl Session {
                 &[],
                 transaction.xid,
                 &snapshot,
+                statement_deadline,
             ) {
-                Ok(rows) => Ok(StatementResult::Query(QueryResult {
-                    columns: plan.columns().to_vec(),
-                    rows,
-                })),
+                Ok(rows) => match check_statement_timeout(statement_deadline) {
+                    Ok(()) => Ok(StatementResult::Query(QueryResult {
+                        columns: plan.columns().to_vec(),
+                        rows,
+                    })),
+                    Err(error) => {
+                        drop(state);
+                        self.abort_with_error(error)
+                    }
+                },
                 Err(error) => {
                     drop(state);
                     self.abort_with_error(error)
@@ -2814,8 +3156,9 @@ impl Session {
         let context = executor::StatementExecutionContext {
             command_id,
             transaction_timestamp: transaction.transaction_timestamp,
-            statement_timestamp: self.db.read_clock(),
+            statement_timestamp,
             clock_timestamp: self.db.read_clock(),
+            deadline: statement_deadline,
             rng: self.db.rng.clone(),
             sequences,
         };
@@ -2825,6 +3168,7 @@ impl Session {
             let (acquired_state, acquired_snapshot, locked_rows) = match acquire_row_locks(
                 &condvar,
                 self.lock_timeout,
+                statement_deadline,
                 state,
                 RowLockTarget::Ctes(statement),
                 transaction.xid,
@@ -2879,6 +3223,7 @@ impl Session {
         let (mut state, snapshot, locked_rows) = match acquire_row_locks(
             &condvar,
             self.lock_timeout,
+            statement_deadline,
             state,
             RowLockTarget::Statement(statement),
             transaction.xid,
@@ -2902,7 +3247,11 @@ impl Session {
             self.defer_all_constraints,
             &context,
             mutation_targets,
-        );
+        )
+        .and_then(|result| {
+            context.check_timeout()?;
+            Ok(result)
+        });
         match result {
             Ok(result) => {
                 if let Some(catalog_before) = catalog_before {
@@ -3158,6 +3507,485 @@ mod tests {
     #[cfg_attr(feature = "execution-log", tracing::instrument(skip_all))]
     fn create_affected_results(rows: u64) -> Vec<StatementResult> {
         vec![StatementResult::Affected(rows)]
+    }
+
+    #[test]
+    fn applies_and_restores_migration_local_timeouts() {
+        let db = Db::create();
+        let mut session = db.create_session();
+        assert_eq!(session.lock_timeout, Duration::from_secs(1));
+        assert_eq!(session.statement_timeout, Duration::ZERO);
+
+        session.execute("BEGIN").unwrap();
+        session.execute("SET LOCAL lock_timeout = '5s'").unwrap();
+        session
+            .execute("SET LOCAL statement_timeout = '30min'")
+            .unwrap();
+        assert_eq!(session.lock_timeout, Duration::from_secs(5));
+        assert_eq!(session.statement_timeout, Duration::from_secs(30 * 60));
+        session.execute("COMMIT").unwrap();
+        assert_eq!(session.lock_timeout, Duration::from_secs(1));
+        assert_eq!(session.statement_timeout, Duration::ZERO);
+
+        session.execute("BEGIN").unwrap();
+        session.execute("SET lock_timeout = '2s'").unwrap();
+        session.execute("SET LOCAL lock_timeout = '20ms'").unwrap();
+        session.execute("COMMIT").unwrap();
+        assert_eq!(session.lock_timeout, Duration::from_secs(2));
+
+        session.execute("BEGIN").unwrap();
+        session.execute("SET lock_timeout = '3s'").unwrap();
+        session
+            .execute("SET LOCAL statement_timeout = '10ms'")
+            .unwrap();
+        session.execute("ROLLBACK").unwrap();
+        assert_eq!(session.lock_timeout, Duration::from_secs(2));
+        assert_eq!(session.statement_timeout, Duration::ZERO);
+
+        session.execute("BEGIN").unwrap();
+        session
+            .execute("SET LOCAL statement_timeout = '1us'")
+            .unwrap();
+        assert_eq!(session.statement_timeout, Duration::ZERO);
+        session
+            .execute("SET LOCAL statement_timeout = '1.5s'")
+            .unwrap();
+        assert_eq!(session.statement_timeout, Duration::from_millis(1500));
+        session
+            .execute("SET LOCAL statement_timeout = '0.5ms'")
+            .unwrap();
+        assert_eq!(session.statement_timeout, Duration::ZERO);
+        session
+            .execute("SET LOCAL statement_timeout = '1.5'")
+            .unwrap();
+        assert_eq!(session.statement_timeout, Duration::from_millis(2));
+        session
+            .execute("SET LOCAL statement_timeout = '1.0001min'")
+            .unwrap();
+        assert_eq!(session.statement_timeout, Duration::from_secs(60));
+        session
+            .execute("SET LOCAL statement_timeout = '-0.5'")
+            .unwrap();
+        assert_eq!(session.statement_timeout, Duration::ZERO);
+        session
+            .execute("SET LOCAL statement_timeout = '0x1d'")
+            .unwrap();
+        assert_eq!(session.statement_timeout, Duration::from_millis(29));
+        session
+            .execute("SET LOCAL statement_timeout = '0x1e'")
+            .unwrap();
+        assert_eq!(session.statement_timeout, Duration::from_millis(30));
+        session.execute("ROLLBACK").unwrap();
+
+        session.execute("BEGIN").unwrap();
+        assert_eq!(
+            session
+                .execute("SET LOCAL statement_timeout = '1MS'")
+                .unwrap_err()
+                .sqlstate,
+            SqlState::InvalidParameterValue
+        );
+        session.execute("ROLLBACK").unwrap();
+
+        for timeout in ["08.5", "09e1"] {
+            session.execute("BEGIN").unwrap();
+            assert_eq!(
+                session
+                    .execute(&format!("SET LOCAL statement_timeout = '{timeout}'"))
+                    .unwrap_err()
+                    .sqlstate,
+                SqlState::InvalidParameterValue
+            );
+            session.execute("ROLLBACK").unwrap();
+        }
+
+        session.execute("BEGIN").unwrap();
+        assert_eq!(
+            session.execute("SELECT 1 / 0").unwrap_err().sqlstate,
+            SqlState::DivisionByZero
+        );
+        assert_eq!(
+            session
+                .execute("SET LOCAL statement_timeout = '1s'")
+                .unwrap_err()
+                .sqlstate,
+            SqlState::InFailedSqlTransaction
+        );
+        session.execute("ROLLBACK").unwrap();
+
+        assert_eq!(
+            session
+                .execute("SET statement_timeout = '1s'")
+                .unwrap_err()
+                .sqlstate,
+            SqlState::FeatureNotSupported
+        );
+        assert_eq!(
+            session
+                .execute("BEGIN; SET LOCAL lock_timeout = '25d'")
+                .unwrap_err()
+                .sqlstate,
+            SqlState::InvalidParameterValue
+        );
+        session.execute("ROLLBACK").unwrap();
+    }
+
+    #[test]
+    fn enforces_explicit_table_lock_compatibility_and_release() {
+        let db = Db::create_builder()
+            .set_lock_timeout(Duration::from_secs(2))
+            .build();
+        let mut holder = db.create_session();
+        let mut reader = db.create_session();
+        let mut writer = db.create_session();
+        holder
+            .execute("CREATE TABLE public.items (id INTEGER)")
+            .unwrap();
+
+        assert_eq!(
+            holder
+                .execute("LOCK TABLE public.items IN EXCLUSIVE MODE")
+                .unwrap_err()
+                .sqlstate,
+            SqlState::NoActiveSqlTransaction
+        );
+        holder.execute("BEGIN").unwrap();
+        assert_eq!(
+            holder
+                .execute("LOCK TABLE public.items IN SHARE MODE")
+                .unwrap_err()
+                .sqlstate,
+            SqlState::FeatureNotSupported
+        );
+        holder.execute("ROLLBACK").unwrap();
+        holder.execute("BEGIN").unwrap();
+        holder
+            .execute("LOCK TABLE public.items IN EXCLUSIVE MODE")
+            .unwrap();
+        assert!(reader.query("SELECT * FROM public.items", &[]).is_ok());
+
+        let (sender, receiver) = mpsc::channel();
+        let handle = thread::spawn(move || {
+            sender
+                .send(writer.execute("INSERT INTO public.items VALUES (1)"))
+                .unwrap();
+        });
+        wait_until_relation_blocked(&db);
+        holder.execute("COMMIT").unwrap();
+        assert_eq!(
+            receiver.recv_timeout(Duration::from_secs(1)).unwrap(),
+            Ok(create_affected_results(1))
+        );
+        handle.join().unwrap();
+
+        let mut holder = db.create_session();
+        let mut reader = db.create_session();
+        holder.execute("BEGIN").unwrap();
+        holder
+            .execute("LOCK TABLE public.items IN ACCESS EXCLUSIVE MODE")
+            .unwrap();
+        let (sender, receiver) = mpsc::channel();
+        let handle = thread::spawn(move || {
+            sender
+                .send(reader.query("SELECT * FROM public.items", &[]))
+                .unwrap();
+        });
+        wait_until_relation_blocked(&db);
+        holder.execute("ROLLBACK").unwrap();
+        assert!(
+            receiver
+                .recv_timeout(Duration::from_secs(1))
+                .unwrap()
+                .is_ok()
+        );
+        handle.join().unwrap();
+    }
+
+    #[test]
+    fn distinguishes_statement_and_lock_timeouts() {
+        let db = Db::create_builder()
+            .set_lock_timeout(Duration::from_secs(2))
+            .build();
+        let mut holder = db.create_session();
+        holder.execute("CREATE TABLE items (id INTEGER)").unwrap();
+        holder.execute("BEGIN").unwrap();
+        holder
+            .execute("LOCK TABLE items IN ACCESS EXCLUSIVE MODE")
+            .unwrap();
+
+        let mut statement_waiter = db.create_session();
+        statement_waiter.execute("BEGIN").unwrap();
+        statement_waiter
+            .execute("SET LOCAL lock_timeout = '200ms'")
+            .unwrap();
+        statement_waiter
+            .execute("SET LOCAL statement_timeout = '20ms'")
+            .unwrap();
+        assert_eq!(
+            statement_waiter
+                .query("SELECT * FROM items", &[])
+                .unwrap_err()
+                .sqlstate,
+            SqlState::QueryCanceled
+        );
+        statement_waiter.execute("ROLLBACK").unwrap();
+
+        let mut lock_waiter = db.create_session();
+        lock_waiter.execute("BEGIN").unwrap();
+        lock_waiter
+            .execute("SET LOCAL lock_timeout = '20ms'")
+            .unwrap();
+        lock_waiter
+            .execute("SET LOCAL statement_timeout = '200ms'")
+            .unwrap();
+        assert_eq!(
+            lock_waiter
+                .query("SELECT * FROM items", &[])
+                .unwrap_err()
+                .sqlstate,
+            SqlState::LockNotAvailable
+        );
+        lock_waiter.execute("ROLLBACK").unwrap();
+        holder.execute("ROLLBACK").unwrap();
+    }
+
+    #[test]
+    fn resets_statement_timeout_for_each_statement() {
+        let db = Db::create_builder()
+            .set_lock_timeout(Duration::ZERO)
+            .build();
+        let mut setup = db.create_session();
+        setup
+            .execute(
+                "CREATE TABLE first_table (id INTEGER); CREATE TABLE second_table (id INTEGER)",
+            )
+            .unwrap();
+        let mut waiter = db.create_session();
+        waiter.execute("BEGIN").unwrap();
+        waiter
+            .execute("SET LOCAL statement_timeout = '250ms'")
+            .unwrap();
+
+        let mut first_holder = db.create_session();
+        first_holder.execute("BEGIN").unwrap();
+        first_holder
+            .execute("LOCK TABLE first_table IN ACCESS EXCLUSIVE MODE")
+            .unwrap();
+        let mut second_holder = db.create_session();
+        second_holder.execute("BEGIN").unwrap();
+        second_holder
+            .execute("LOCK TABLE second_table IN ACCESS EXCLUSIVE MODE")
+            .unwrap();
+
+        let (first_sender, first_receiver) = mpsc::channel();
+        let (second_sender, second_receiver) = mpsc::channel();
+        let handle = thread::spawn(move || {
+            waiter.query("SELECT * FROM first_table", &[]).unwrap();
+            first_sender.send(()).unwrap();
+            let result = waiter.query("SELECT * FROM second_table", &[]);
+            waiter.execute("ROLLBACK").unwrap();
+            second_sender.send(result).unwrap();
+        });
+
+        wait_until_relation_blocked(&db);
+        thread::sleep(Duration::from_millis(150));
+        first_holder.execute("ROLLBACK").unwrap();
+        first_receiver.recv_timeout(Duration::from_secs(1)).unwrap();
+        wait_until_relation_blocked(&db);
+        thread::sleep(Duration::from_millis(150));
+        second_holder.execute("ROLLBACK").unwrap();
+        assert!(
+            second_receiver
+                .recv_timeout(Duration::from_secs(1))
+                .unwrap()
+                .is_ok()
+        );
+        handle.join().unwrap();
+    }
+
+    #[test]
+    fn clears_relation_waits_when_a_waited_relation_is_dropped() {
+        let db = Db::create_builder()
+            .set_lock_timeout(Duration::from_millis(100))
+            .build();
+        let mut dropper = db.create_session();
+        dropper.execute("CREATE TABLE items (id INTEGER)").unwrap();
+        dropper.execute("BEGIN; DROP TABLE items").unwrap();
+
+        let mut waiter = db.create_session();
+        waiter.execute("BEGIN").unwrap();
+        let (result_sender, result_receiver) = mpsc::channel();
+        let (finish_sender, finish_receiver) = mpsc::channel();
+        let handle = thread::spawn(move || {
+            result_sender
+                .send(
+                    waiter
+                        .execute("LOCK TABLE items IN ACCESS EXCLUSIVE MODE")
+                        .unwrap_err()
+                        .sqlstate,
+                )
+                .unwrap();
+            finish_receiver.recv().unwrap();
+            waiter.execute("ROLLBACK").unwrap();
+        });
+
+        wait_until_relation_blocked(&db);
+        dropper.execute("COMMIT").unwrap();
+        assert_eq!(
+            result_receiver
+                .recv_timeout(Duration::from_secs(1))
+                .unwrap(),
+            SqlState::UndefinedTable
+        );
+        let mut creator = db.create_session();
+        creator.execute("CREATE TABLE items (id INTEGER)").unwrap();
+        finish_sender.send(()).unwrap();
+        handle.join().unwrap();
+    }
+
+    #[test]
+    fn interrupts_prepared_scans_at_the_statement_deadline() {
+        let db = Db::create();
+        let mut session = db.create_session();
+        session.execute("CREATE TABLE items (id INTEGER)").unwrap();
+        session.execute("INSERT INTO items VALUES (1)").unwrap();
+        let query = session
+            .prepare("SELECT id / ($1 - id) FROM items WHERE id <= $1")
+            .unwrap();
+        session.execute("BEGIN").unwrap();
+        session.statement_timeout = Duration::from_nanos(1);
+        assert_eq!(
+            session
+                .query_prepared(&query, &[Value::Int4(1)])
+                .unwrap_err()
+                .sqlstate,
+            SqlState::QueryCanceled
+        );
+        session.execute("ROLLBACK").unwrap();
+    }
+
+    #[test]
+    fn acquires_multi_table_lock_sets_atomically() {
+        let db = Db::create_builder()
+            .set_lock_timeout(Duration::from_secs(2))
+            .build();
+        let mut setup = db.create_session();
+        setup
+            .execute(
+                "CREATE TABLE first_table (id INTEGER); CREATE TABLE second_table (id INTEGER)",
+            )
+            .unwrap();
+
+        let mut blocker = db.create_session();
+        blocker.execute("BEGIN").unwrap();
+        blocker
+            .execute("LOCK TABLE second_table IN ACCESS EXCLUSIVE MODE")
+            .unwrap();
+
+        let mut waiter = db.create_session();
+        waiter.execute("BEGIN").unwrap();
+        waiter.execute("SET LOCAL lock_timeout = '100ms'").unwrap();
+        let (sender, receiver) = mpsc::channel();
+        let handle = thread::spawn(move || {
+            let sqlstate = waiter
+                .execute("LOCK TABLE first_table, second_table IN ACCESS EXCLUSIVE MODE")
+                .unwrap_err()
+                .sqlstate;
+            waiter.execute("ROLLBACK").unwrap();
+            sender.send(sqlstate).unwrap();
+        });
+        wait_until_relation_blocked(&db);
+
+        let mut independent = db.create_session();
+        independent.execute("BEGIN").unwrap();
+        independent
+            .execute("LOCK TABLE first_table IN ACCESS EXCLUSIVE MODE")
+            .unwrap();
+        independent.execute("COMMIT").unwrap();
+        assert_eq!(
+            receiver.recv_timeout(Duration::from_secs(1)).unwrap(),
+            SqlState::LockNotAvailable
+        );
+        handle.join().unwrap();
+        blocker.execute("ROLLBACK").unwrap();
+    }
+
+    #[test]
+    fn detects_deadlocks_in_explicit_table_locks() {
+        let db = Db::create_builder()
+            .set_lock_timeout(Duration::from_secs(2))
+            .build();
+        let mut first = db.create_session();
+        let mut second = db.create_session();
+        first
+            .execute(
+                "CREATE TABLE first_table (id INTEGER); CREATE TABLE second_table (id INTEGER)",
+            )
+            .unwrap();
+        first.execute("BEGIN").unwrap();
+        second.execute("BEGIN").unwrap();
+        first
+            .execute("LOCK TABLE first_table IN ACCESS EXCLUSIVE MODE")
+            .unwrap();
+        second
+            .execute("LOCK TABLE second_table IN ACCESS EXCLUSIVE MODE")
+            .unwrap();
+
+        let (sender, receiver) = mpsc::channel();
+        let handle = thread::spawn(move || {
+            let result = first.execute("LOCK TABLE second_table IN ACCESS EXCLUSIVE MODE");
+            sender.send(result).unwrap();
+        });
+        wait_until_relation_blocked(&db);
+        assert_eq!(
+            second
+                .execute("LOCK TABLE first_table IN ACCESS EXCLUSIVE MODE")
+                .unwrap_err()
+                .sqlstate,
+            SqlState::DeadlockDetected
+        );
+        second.execute("ROLLBACK").unwrap();
+        assert!(
+            receiver
+                .recv_timeout(Duration::from_secs(1))
+                .unwrap()
+                .is_ok()
+        );
+        handle.join().unwrap();
+    }
+
+    #[test]
+    fn strengthens_foreign_key_reads_against_explicit_locks() {
+        let db = Db::create_builder()
+            .set_lock_timeout(Duration::from_secs(2))
+            .build();
+        let mut holder = db.create_session();
+        let mut writer = db.create_session();
+        holder
+            .execute(
+                "CREATE TABLE parents (id INTEGER PRIMARY KEY); \
+                 CREATE TABLE children (parent_id INTEGER REFERENCES parents); \
+                 INSERT INTO parents VALUES (1)",
+            )
+            .unwrap();
+        holder.execute("BEGIN").unwrap();
+        holder
+            .execute("LOCK TABLE parents IN EXCLUSIVE MODE")
+            .unwrap();
+
+        let (sender, receiver) = mpsc::channel();
+        let handle = thread::spawn(move || {
+            sender
+                .send(writer.execute("INSERT INTO children SELECT id FROM parents"))
+                .unwrap();
+        });
+        wait_until_relation_blocked(&db);
+        holder.execute("ROLLBACK").unwrap();
+        assert_eq!(
+            receiver.recv_timeout(Duration::from_secs(1)).unwrap(),
+            Ok(create_affected_results(1))
+        );
+        handle.join().unwrap();
     }
 
     #[test]

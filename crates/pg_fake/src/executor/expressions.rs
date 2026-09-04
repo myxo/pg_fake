@@ -815,6 +815,7 @@ pub(super) fn evaluate(
     row: &[Value],
     context: &StatementExecutionContext,
 ) -> Result<Value> {
+    context.check_timeout()?;
     match expr {
         ast::Expr::Identifier(column) => {
             schema.resolve_column_value(std::slice::from_ref(column), row)

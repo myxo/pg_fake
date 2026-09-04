@@ -36,6 +36,7 @@ pub enum SqlState {
 
     // 25 — Invalid Transaction State
     ActiveSqlTransaction,   // 25001
+    NoActiveSqlTransaction, // 25P01
     InFailedSqlTransaction, // 25P02
 
     // 2B — Dependent Objects Still Exist
@@ -47,6 +48,9 @@ pub enum SqlState {
     // 40 — Transaction Rollback
     SerializationFailure, // 40001
     DeadlockDetected,     // 40P01
+
+    // 57 — Operator Intervention
+    QueryCanceled, // 57014
 
     // 42 — Syntax Error / Access Rule
     UndefinedTable,          // 42P01
@@ -101,11 +105,13 @@ impl SqlState {
             SqlState::CheckViolation => "23514",
             SqlState::ForeignKeyViolation => "23503",
             SqlState::ActiveSqlTransaction => "25001",
+            SqlState::NoActiveSqlTransaction => "25P01",
             SqlState::InFailedSqlTransaction => "25P02",
             SqlState::DependentObjectsStillExist => "2BP01",
             SqlState::InvalidSchemaName => "3F000",
             SqlState::SerializationFailure => "40001",
             SqlState::DeadlockDetected => "40P01",
+            SqlState::QueryCanceled => "57014",
             SqlState::UndefinedTable => "42P01",
             SqlState::DuplicateTable => "42P07",
             SqlState::DuplicateSchema => "42P06",

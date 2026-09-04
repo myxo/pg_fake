@@ -1615,6 +1615,28 @@ fn lock_timeout_sql(src: &mut Source) -> String {
     )
 }
 
+fn local_timeout_sql(src: &mut Source) -> String {
+    src.select(
+        "local_timeout",
+        &["lock_milliseconds", "lock_seconds", "statement_minutes"],
+        |src, timeout, _| match timeout {
+            "lock_milliseconds" => format!(
+                "SET LOCAL lock_timeout = '{}ms'",
+                src.any_of("milliseconds", int_in(1000..=5000))
+            ),
+            "lock_seconds" => format!(
+                "SET LOCAL lock_timeout = '{}s'",
+                src.any_of("seconds", int_in(1..=5))
+            ),
+            "statement_minutes" => format!(
+                "SET LOCAL statement_timeout = '{}min'",
+                src.any_of("minutes", int_in(1..=30))
+            ),
+            _ => unreachable!(),
+        },
+    )
+}
+
 struct DdlModel {
     table: String,
     exists: bool,
@@ -1663,7 +1685,7 @@ fn generate_statement(
             "ddl" => (generate_ddl(ddl), RowOrder::Unordered),
             "set" => {
                 let settings: &[&str] = if *in_transaction {
-                    &["lock_timeout"]
+                    &["lock_timeout", "local_timeout"]
                 } else {
                     &["session_characteristics", "lock_timeout"]
                 };
@@ -1673,6 +1695,7 @@ fn generate_statement(
                         isolation_level(src)
                     ),
                     "lock_timeout" => lock_timeout_sql(src),
+                    "local_timeout" => local_timeout_sql(src),
                     _ => unreachable!(),
                 });
                 (sql, RowOrder::Unordered)

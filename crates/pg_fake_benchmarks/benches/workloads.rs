@@ -236,6 +236,36 @@ fn transactional_ddl_benchmark(
     group.finish();
 }
 
+fn migration_table_lock_benchmark(
+    criterion: &mut Criterion,
+    runtime: &Runtime,
+    connections: &mut [NamedBenchmarkConnection<'_>],
+) {
+    for (_, connection) in connections.iter_mut() {
+        connection.execute(runtime, "CREATE TABLE migration_lock_first (id INTEGER)");
+        connection.execute(runtime, "CREATE TABLE migration_lock_second (id INTEGER)");
+    }
+    let mut group = criterion
+        .benchmark_group(benchmarks::find_benchmark("migration_table_lock_two_relations").name);
+    for (name, connection) in connections.iter_mut() {
+        group.bench_function(*name, |benchmark| {
+            benchmark.iter(|| {
+                connection.execute_in_transaction(
+                    runtime,
+                    "LOCK TABLE migration_lock_first, migration_lock_second IN EXCLUSIVE MODE",
+                );
+            });
+        });
+    }
+    group.finish();
+    for (_, connection) in connections.iter_mut() {
+        connection.execute(
+            runtime,
+            "DROP TABLE migration_lock_first, migration_lock_second",
+        );
+    }
+}
+
 fn alter_table_benchmark(
     criterion: &mut Criterion,
     runtime: &Runtime,
@@ -1242,6 +1272,7 @@ fn benchmarks(criterion: &mut Criterion) {
 
         create_table_benchmark(criterion, &runtime, &mut connections);
         transactional_ddl_benchmark(criterion, &runtime, &mut connections);
+        migration_table_lock_benchmark(criterion, &runtime, &mut connections);
         alter_table_benchmark(criterion, &runtime, &mut connections);
         partial_unique_index_benchmark(criterion, &runtime, &mut connections);
         temporary_table_benchmark(criterion, &runtime, &mut connections);

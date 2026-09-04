@@ -554,7 +554,7 @@ does not expand this task to updatable-view semantics.
 - [x] Publish the parser-fork `ALTER TRIGGER ... RENAME` change, pin its commit
   in the workspace dependency, and verify without a local path override.
 
-### Task 14 — Migration-local settings and table locks
+### Task 14 — Migration-local settings and table locks [COMPLETE]
 
 **Goal:** Execute migration coordination statements rather than ignoring them.
 
@@ -579,6 +579,20 @@ multi-relation lock set atomically in deterministic catalog-identity order so
 the statement cannot retain a partial set after timeout or error. Enforce
 `statement_timeout` separately for each subsequent statement, with PostgreSQL's
 per-statement timer reset; it is not merely parsed or stored.
+
+**Progress:**
+
+- [x] Implement transaction-local `lock_timeout` and `statement_timeout` with
+  PostgreSQL unit parsing, restoration, per-statement deadlines, and `57014`
+  cancellation.
+- [x] Implement exclusive and access-exclusive table locks for qualified and
+  multi-relation targets with atomic ordered acquisition.
+- [x] Integrate relation locks with reads, writes, DDL, prepared execution,
+  foreign keys, timeout precedence, deadlock detection, and transaction release.
+- [x] Add native concurrency regressions, PostgreSQL SQLx differential/property
+  coverage, regression-manifest entries, and table-lock benchmarks.
+- [x] Run formatting, workspace tests, Astra review with all findings fixed,
+  and the 10,000-iteration property gate.
 
 ### Task 15 — Procedural migrations and triggers
 

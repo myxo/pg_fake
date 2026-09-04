@@ -77,9 +77,12 @@ pub(crate) enum RelationLockAttempt {
     Blocked(Vec<Xid>),
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 pub(crate) enum RelationLockMode {
     Shared,
+    RowShare,
+    RowExclusive,
+    TableExclusive,
     Exclusive,
 }
 
@@ -205,61 +208,64 @@ impl RelationLockManager {
     }
 
     #[cfg_attr(feature = "execution-log", tracing::instrument(skip_all))]
-    pub(crate) fn acquire(
+    pub(crate) fn acquire_many(
         &mut self,
-        name: &str,
+        requested: &[(String, RelationLockMode)],
         xid: Xid,
-        mode: RelationLockMode,
     ) -> RelationLockAttempt {
-        let lock = self
-            .locks
-            .entry(name.to_owned())
-            .or_insert_with(|| RelationLock {
-                holders: BTreeMap::new(),
-                waiters: VecDeque::new(),
-            });
-        if let Some(held) = lock.holders.get(&xid)
-            && (*held == RelationLockMode::Exclusive || mode == RelationLockMode::Shared)
-        {
-            return RelationLockAttempt::Acquired;
-        }
-        let holder_conflicts = lock
-            .holders
-            .iter()
-            .filter_map(|(holder, held)| {
-                (*holder != xid
-                    && (*held == RelationLockMode::Exclusive
-                        || mode == RelationLockMode::Exclusive))
-                    .then_some(*holder)
-            })
-            .collect::<Vec<_>>();
-        let first_waiter = lock.waiters.front().copied();
-        if holder_conflicts.is_empty() && first_waiter.is_none_or(|(waiter, _)| waiter == xid) {
-            if first_waiter.is_some_and(|(waiter, _)| waiter == xid) {
-                lock.waiters.pop_front();
+        for (name, mode) in requested {
+            let Some(lock) = self.locks.get(name) else {
+                continue;
+            };
+            if lock.holders.get(&xid).is_some_and(|held| held >= mode) {
+                continue;
             }
-            lock.holders.insert(xid, mode);
-            return RelationLockAttempt::Acquired;
+            let mut blockers = lock
+                .holders
+                .iter()
+                .filter_map(|(holder, held)| {
+                    (*holder != xid && held.conflicts_with(*mode)).then_some(*holder)
+                })
+                .collect::<BTreeSet<_>>();
+            for (waiter, _) in lock
+                .waiters
+                .iter()
+                .take_while(|(waiter, _)| *waiter != xid)
+                .filter(|(_, waiter_mode)| waiter_mode.conflicts_with(*mode))
+            {
+                blockers.insert(*waiter);
+            }
+            if !blockers.is_empty() {
+                let lock = self.locks.get_mut(name).expect("lock was inspected");
+                if !lock.waiters.iter().any(|(waiter, _)| *waiter == xid) {
+                    lock.waiters.push_back((xid, *mode));
+                }
+                return RelationLockAttempt::Blocked(blockers.into_iter().collect());
+            }
         }
-        if !lock.waiters.iter().any(|(waiter, _)| *waiter == xid) {
-            lock.waiters.push_back((xid, mode));
+        for (name, mode) in requested {
+            let lock = self
+                .locks
+                .entry(name.clone())
+                .or_insert_with(|| RelationLock {
+                    holders: BTreeMap::new(),
+                    waiters: VecDeque::new(),
+                });
+            lock.waiters.retain(|(waiter, _)| *waiter != xid);
+            lock.holders
+                .entry(xid)
+                .and_modify(|held| *held = (*held).max(*mode))
+                .or_insert(*mode);
         }
-        let mut blockers = holder_conflicts.into_iter().collect::<BTreeSet<_>>();
-        if let Some((waiter, _)) = first_waiter.filter(|(waiter, _)| *waiter != xid) {
-            blockers.insert(waiter);
-        }
-        RelationLockAttempt::Blocked(blockers.into_iter().collect())
+        RelationLockAttempt::Acquired
     }
 
     #[cfg_attr(feature = "execution-log", tracing::instrument(skip_all))]
-    pub(crate) fn cancel_wait(&mut self, name: &str, xid: Xid) {
-        let Some(lock) = self.locks.get_mut(name) else {
-            return;
-        };
-        lock.waiters.retain(|(waiter, _)| *waiter != xid);
-        if lock.holders.is_empty() && lock.waiters.is_empty() {
-            self.locks.remove(name);
-        }
+    pub(crate) fn cancel_transaction_waits(&mut self, xid: Xid) {
+        self.locks.retain(|_, lock| {
+            lock.waiters.retain(|(waiter, _)| *waiter != xid);
+            !lock.holders.is_empty() || !lock.waiters.is_empty()
+        });
     }
 
     #[cfg_attr(feature = "execution-log", tracing::instrument(skip_all))]
@@ -275,6 +281,21 @@ impl RelationLockManager {
     #[cfg_attr(feature = "execution-log", tracing::instrument(skip_all))]
     pub(crate) fn has_waiters(&self) -> bool {
         self.locks.values().any(|lock| !lock.waiters.is_empty())
+    }
+}
+
+impl RelationLockMode {
+    fn conflicts_with(self, requested: Self) -> bool {
+        match (self, requested) {
+            (Self::Shared, Self::Exclusive)
+            | (Self::Exclusive, _)
+            | (_, Self::Exclusive)
+            | (Self::RowShare | Self::RowExclusive, Self::TableExclusive)
+            | (Self::TableExclusive, Self::RowShare | Self::RowExclusive | Self::TableExclusive) => {
+                true
+            }
+            _ => false,
+        }
     }
 }
 
@@ -676,6 +697,36 @@ mod tests {
             find_visible_version(&chain, &snapshot, reader, &manager),
             Some(&chain.versions[0])
         );
+    }
+
+    #[test]
+    fn queues_relation_locks_behind_only_earlier_conflicting_waiters() {
+        let mut locks = RelationLockManager::create();
+        assert!(matches!(
+            locks.acquire_many(&[("items".into(), RelationLockMode::RowExclusive)], Xid(1)),
+            RelationLockAttempt::Acquired
+        ));
+        assert!(matches!(
+            locks.acquire_many(
+                &[("items".into(), RelationLockMode::TableExclusive)],
+                Xid(2)
+            ),
+            RelationLockAttempt::Blocked(_)
+        ));
+        assert!(matches!(
+            locks.acquire_many(&[("items".into(), RelationLockMode::Shared)], Xid(3)),
+            RelationLockAttempt::Acquired
+        ));
+        assert!(matches!(
+            locks.acquire_many(&[("items".into(), RelationLockMode::Exclusive)], Xid(4)),
+            RelationLockAttempt::Blocked(_)
+        ));
+        let RelationLockAttempt::Blocked(blockers) =
+            locks.acquire_many(&[("items".into(), RelationLockMode::Shared)], Xid(5))
+        else {
+            panic!("reader must wait behind an earlier access-exclusive request");
+        };
+        assert_eq!(blockers, vec![Xid(4)]);
     }
 
     #[test]

@@ -22,6 +22,7 @@ use std::{
     cmp::Ordering,
     collections::{BTreeMap, BTreeSet},
     sync::{Arc, Mutex},
+    time::Instant,
 };
 
 mod aggregates;
@@ -88,8 +89,25 @@ pub(crate) struct StatementExecutionContext {
     pub(crate) transaction_timestamp: chrono::DateTime<chrono::Utc>,
     pub(crate) statement_timestamp: chrono::DateTime<chrono::Utc>,
     pub(crate) clock_timestamp: chrono::DateTime<chrono::Utc>,
+    pub(crate) deadline: Option<Instant>,
     pub(crate) rng: Arc<Mutex<ChaCha12Rng>>,
     pub(crate) sequences: SequenceExecutionContext,
+}
+
+impl StatementExecutionContext {
+    pub(crate) fn check_timeout(&self) -> Result<()> {
+        if self
+            .deadline
+            .is_some_and(|deadline| Instant::now() >= deadline)
+        {
+            Err(PgError::create(
+                SqlState::QueryCanceled,
+                "canceling statement due to statement timeout",
+            ))
+        } else {
+            Ok(())
+        }
+    }
 }
 
 pub(crate) struct DatabaseState {
@@ -229,6 +247,7 @@ pub(crate) fn execute_statement(
     context: &StatementExecutionContext,
     mutation_targets: Option<Vec<RequiredRowLock>>,
 ) -> Result<StatementResult> {
+    context.check_timeout()?;
     match statement {
         ast::Statement::CreateTable(create) => {
             if create.query.is_some() {
@@ -882,6 +901,7 @@ pub(crate) fn execute_statement(
             mutation_targets,
         ),
         ast::Statement::Query(query) => query::execute_query(state, query, xid, snapshot, context),
+        ast::Statement::Lock(_) => Ok(StatementResult::Affected(0)),
         _ => reject_unsupported("statement is not implemented"),
     }
 }

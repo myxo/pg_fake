@@ -465,6 +465,7 @@ pub(crate) fn execute_prepared_query(
     parameters: &[Value],
     xid: Xid,
     snapshot: &Snapshot,
+    deadline: Option<Instant>,
 ) -> Result<Vec<Vec<Value>>> {
     state.catalog.require_table_by_id(plan.table_id)?;
     let table = state
@@ -473,9 +474,15 @@ pub(crate) fn execute_prepared_query(
         .expect("prepared table must have storage");
     let mut rows = Vec::new();
     let mut visit = |row: &[Value]| -> Result<()> {
+        if deadline.is_some_and(|deadline| Instant::now() >= deadline) {
+            return Err(PgError::create(
+                SqlState::QueryCanceled,
+                "canceling statement due to statement timeout",
+            ));
+        }
         if let Some(selection) = &plan.selection
             && !matches!(
-                evaluate_prepared_expression(selection, row, parameters)?,
+                evaluate_prepared_expression(selection, row, parameters, deadline)?,
                 Value::Bool(true)
             )
         {
@@ -487,7 +494,7 @@ pub(crate) fn execute_prepared_query(
                 .map(|projection| match projection {
                     PreparedProjection::Column(slot) => Ok(row[*slot].clone()),
                     PreparedProjection::Expression(expression) => {
-                        evaluate_prepared_expression(expression, row, parameters)
+                        evaluate_prepared_expression(expression, row, parameters, deadline)
                     }
                 })
                 .collect::<Result<_>>()?,
@@ -505,7 +512,7 @@ pub(crate) fn execute_prepared_query(
             }
         }
         PreparedAccess::Unique { column, value } => {
-            let value = evaluate_prepared_expression(value, &[], parameters)?;
+            let value = evaluate_prepared_expression(value, &[], parameters, deadline)?;
             if let Some(row) = table.find_unique_visible_row(
                 &[*column],
                 &[value],
@@ -524,7 +531,14 @@ pub(super) fn evaluate_prepared_expression(
     expression: &PreparedExpression,
     row: &[Value],
     parameters: &[Value],
+    deadline: Option<Instant>,
 ) -> Result<Value> {
+    if deadline.is_some_and(|deadline| Instant::now() >= deadline) {
+        return Err(PgError::create(
+            SqlState::QueryCanceled,
+            "canceling statement due to statement timeout",
+        ));
+    }
     match expression {
         PreparedExpression::Column { slot, .. } => Ok(row[*slot].clone()),
         PreparedExpression::Parameter { index, .. } => Ok(parameters[*index].clone()),
@@ -535,8 +549,8 @@ pub(super) fn evaluate_prepared_expression(
             right,
             ..
         } => {
-            let left_value = evaluate_prepared_expression(left, row, parameters)?;
-            let right_value = evaluate_prepared_expression(right, row, parameters)?;
+            let left_value = evaluate_prepared_expression(left, row, parameters, deadline)?;
+            let right_value = evaluate_prepared_expression(right, row, parameters, deadline)?;
             match operator {
                 ast::BinaryOperator::Eq
                 | ast::BinaryOperator::NotEq
@@ -571,7 +585,8 @@ pub(super) fn evaluate_prepared_expression(
             expression,
             negated,
         } => Ok(Value::Bool(
-            evaluate_prepared_expression(expression, row, parameters)?.is_null() != *negated,
+            evaluate_prepared_expression(expression, row, parameters, deadline)?.is_null()
+                != *negated,
         )),
     }
 }

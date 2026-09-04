@@ -510,6 +510,39 @@ pub const FEATURES: &[Feature] = &[
                 sql: "SET LOCAL lock_timeout = '10ms'",
                 blocker: BlockerKind::Implementation,
             },
+            Case {
+                id: "set_local_statement_timeout",
+                source: "focused migration coordination scenario",
+                setup: &["BEGIN"],
+                sql: "SET LOCAL statement_timeout = '30min'",
+                blocker: BlockerKind::Implementation,
+            },
+        ],
+    },
+    Feature {
+        name: "migration table locks",
+        cases: &[
+            Case {
+                id: "access_exclusive_table_lock",
+                source: "lock.sql:32 plus focused qualified migration fixture",
+                setup: &[
+                    "CREATE TABLE public.phase3_access_exclusive_lock (id INTEGER)",
+                    "BEGIN",
+                ],
+                sql: "LOCK TABLE public.phase3_access_exclusive_lock IN ACCESS EXCLUSIVE MODE",
+                blocker: BlockerKind::Implementation,
+            },
+            Case {
+                id: "exclusive_multi_table_lock",
+                source: "lock.sql:31 plus focused multi-relation migration fixture",
+                setup: &[
+                    "CREATE TABLE public.phase3_exclusive_lock_a (id INTEGER)",
+                    "CREATE TABLE public.phase3_exclusive_lock_b (id INTEGER)",
+                    "BEGIN",
+                ],
+                sql: "LOCK TABLE public.phase3_exclusive_lock_a, public.phase3_exclusive_lock_b IN EXCLUSIVE MODE",
+                blocker: BlockerKind::Implementation,
+            },
         ],
     },
     Feature {

@@ -736,7 +736,7 @@ fn execute_insert_conflict(
         updated[assignment.index] = if is_default_expression(assignment.expression) {
             evaluate_column_default(&schema.columns[assignment.index], context)?
         } else if let Some(prepared) = &assignment.prepared {
-            prepared::evaluate_prepared_expression(prepared, &bound_row, &[])?
+            prepared::evaluate_prepared_expression(prepared, &bound_row, &[], context.deadline)?
         } else {
             evaluate_mutation_assignment(
                 state,
@@ -1095,7 +1095,12 @@ pub(super) fn execute_update(
             let value = if is_default_expression(assignment.expression) {
                 evaluate_column_default(&schema.columns[assignment.index], context)?
             } else if let Some(prepared) = &assignment.prepared {
-                prepared::evaluate_prepared_expression(prepared, assignment_row, &[])?
+                prepared::evaluate_prepared_expression(
+                    prepared,
+                    assignment_row,
+                    &[],
+                    context.deadline,
+                )?
             } else {
                 evaluate_mutation_assignment(
                     state,

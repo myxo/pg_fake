@@ -74,6 +74,50 @@ async fn assert_i64_matches(postgres: &mut PgConnection, fake: &mut PgFakeConnec
 }
 
 #[test]
+fn migration_local_settings_and_table_locks_match_postgres() {
+    let server = common::start_postgres_server();
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap();
+    runtime.block_on(async {
+        let mut postgres = PgConnection::connect(&server.url).await.unwrap();
+        let mut fake = PgFakeConnection::new(Db::create());
+        let first = format!("migration_lock_first_{}", std::process::id());
+        let second = format!("migration_lock_second_{}", std::process::id());
+        for sql in [
+            format!("DROP TABLE IF EXISTS public.{first}, public.{second}"),
+            format!("CREATE TABLE public.{first} (id INTEGER)"),
+            format!("CREATE TABLE public.{second} (id INTEGER)"),
+            "BEGIN".into(),
+            "SET LOCAL lock_timeout = '5s'".into(),
+            "SET LOCAL statement_timeout = '30min'".into(),
+            "SET LOCAL statement_timeout = '0.5ms'".into(),
+            "SET LOCAL statement_timeout = '1.5'".into(),
+            "SET LOCAL statement_timeout = '1.0001min'".into(),
+            "SET LOCAL statement_timeout = '0x1d'".into(),
+            "SET LOCAL statement_timeout = '0x1e'".into(),
+            format!("LOCK TABLE public.{first} IN ACCESS EXCLUSIVE MODE"),
+            format!("LOCK TABLE public.{first}, public.{second} IN EXCLUSIVE MODE"),
+            "COMMIT".into(),
+            format!("DROP TABLE public.{first}, public.{second}"),
+        ] {
+            assert_execution_matches(&mut postgres, &mut fake, &sql).await;
+        }
+        for timeout in ["1MS", "08.5", "09e1"] {
+            assert_execution_matches(&mut postgres, &mut fake, "BEGIN").await;
+            assert_execution_matches(
+                &mut postgres,
+                &mut fake,
+                &format!("SET LOCAL statement_timeout = '{timeout}'"),
+            )
+            .await;
+            assert_execution_matches(&mut postgres, &mut fake, "ROLLBACK").await;
+        }
+    });
+}
+
+#[test]
 fn explicit_table_and_sequence_ddl_matches_postgres() {
     let server = common::start_postgres_server();
     let runtime = tokio::runtime::Builder::new_current_thread()

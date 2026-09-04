@@ -209,7 +209,12 @@ pub(crate) fn collect_required_row_locks(
             };
             if let Some(selection) = selection {
                 let value = if let Some(prepared_selection) = &prepared_selection {
-                    prepared::evaluate_prepared_expression(prepared_selection, &version.row, &[])?
+                    prepared::evaluate_prepared_expression(
+                        prepared_selection,
+                        &version.row,
+                        &[],
+                        context.deadline,
+                    )?
                 } else {
                     evaluate(selection, RowScope::Table(schema), &version.row, context)?
                 };
