@@ -33,6 +33,11 @@ pub fn list_benchmarks() -> Vec<Benchmark> {
             postgres_comparisons(),
         ),
         build_benchmark(
+            "alter_table_rewrite_100_rows",
+            postgres_values(),
+            postgres_comparisons(),
+        ),
+        build_benchmark(
             "temporary_table_on_commit_drop",
             postgres_values(),
             postgres_comparisons(),

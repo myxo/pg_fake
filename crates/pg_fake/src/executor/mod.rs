@@ -25,6 +25,7 @@ use std::{
 };
 
 mod aggregates;
+mod alter_table;
 mod arithmetic;
 mod expressions;
 mod foreign_keys;
@@ -145,6 +146,12 @@ impl DatabaseState {
             &self.transactions,
             temporary_schema_id,
         );
+        let schemas = self.catalog.iterate_tables().cloned().collect::<Vec<_>>();
+        for schema in schemas {
+            if let Some(table) = self.tables.get_mut(&schema.id) {
+                table.replace_schema(schema);
+            }
+        }
     }
 
     #[cfg_attr(feature = "execution-log", tracing::instrument(skip_all))]
@@ -322,7 +329,18 @@ pub(crate) fn execute_statement(
                         ast::ColumnOption::Check(check) => {
                             constraints.push(crate::catalog::Constraint::Check {
                                 id: ConstraintId(0),
+                                name: option
+                                    .name
+                                    .as_ref()
+                                    .map(normalize_identifier)
+                                    .unwrap_or_else(|| {
+                                        generate_constraint_name(
+                                            format!("{table_name}_{column_name}_check"),
+                                            &constraints,
+                                        )
+                                    }),
                                 expression: check.expr.clone(),
+                                validated: true,
                             })
                         }
                         ast::ColumnOption::ForeignKey(foreign_key) => {
@@ -355,6 +373,7 @@ pub(crate) fn execute_statement(
                                     },
                                 ),
                                 match_kind: foreign_key.match_kind,
+                                validated: true,
                             }))
                         }
                         ast::ColumnOption::Generated {
@@ -487,24 +506,35 @@ pub(crate) fn execute_statement(
                         })
                     }
                     ast::TableConstraint::Check(check) => {
+                        let base = find_first_referenced_column(&check.expr, &columns).map_or_else(
+                            || format!("{table_name}_check"),
+                            |column| format!("{table_name}_{column}_check"),
+                        );
                         constraints.push(crate::catalog::Constraint::Check {
                             id: ConstraintId(0),
+                            name: check
+                                .name
+                                .as_ref()
+                                .map(normalize_identifier)
+                                .unwrap_or_else(|| generate_constraint_name(base, &constraints)),
                             expression: check.expr.clone(),
+                            validated: true,
                         })
                     }
                     ast::TableConstraint::ForeignKey(foreign_key) => {
+                        let foreign_key_columns = foreign_key
+                            .columns
+                            .iter()
+                            .map(normalize_identifier)
+                            .collect::<Vec<_>>();
                         let name = resolve_foreign_key_name(
                             foreign_key.name.as_ref(),
-                            format!("{}_fkey", table_name),
+                            format!("{}_{}_fkey", table_name, foreign_key_columns.join("_")),
                         );
                         constraints.push(crate::catalog::Constraint::ForeignKey(ForeignKey {
                             id: ConstraintId(0),
                             name,
-                            columns: foreign_key
-                                .columns
-                                .iter()
-                                .map(normalize_identifier)
-                                .collect(),
+                            columns: foreign_key_columns,
                             foreign_table: crate::executor::normalize_relation_name(
                                 &foreign_key.foreign_table,
                             )?,
@@ -526,6 +556,7 @@ pub(crate) fn execute_statement(
                                 },
                             ),
                             match_kind: foreign_key.match_kind,
+                            validated: true,
                         }))
                     }
                     constraint => {
@@ -694,6 +725,15 @@ pub(crate) fn execute_statement(
                 .insert(id, initial);
             Ok(StatementResult::Affected(0))
         }
+        ast::Statement::AlterTable(alter) => alter_table::execute_alter_table(
+            state,
+            alter,
+            xid,
+            snapshot,
+            deferred_constraints,
+            defer_all,
+            context,
+        ),
         ast::Statement::Drop {
             object_type: ast::ObjectType::Table,
             names,
@@ -786,6 +826,45 @@ pub(crate) fn execute_statement(
         ),
         ast::Statement::Query(query) => query::execute_query(state, query, xid, snapshot, context),
         _ => reject_unsupported("statement is not implemented"),
+    }
+}
+
+fn find_first_referenced_column(expression: &ast::Expr, columns: &[ColumnDef]) -> Option<String> {
+    let mut found = None;
+    let _ = ast::visit_expressions(expression, |nested| {
+        let name = match nested {
+            ast::Expr::Identifier(identifier) => Some(normalize_identifier(identifier)),
+            ast::Expr::CompoundIdentifier(identifiers) => {
+                identifiers.last().map(normalize_identifier)
+            }
+            _ => None,
+        };
+        if let Some(name) = name
+            && columns.iter().any(|column| column.name == name)
+        {
+            found = Some(name);
+            return std::ops::ControlFlow::Break(());
+        }
+        std::ops::ControlFlow::Continue(())
+    });
+    found
+}
+
+fn generate_constraint_name(base: String, constraints: &[crate::catalog::Constraint]) -> String {
+    let mut suffix = 0;
+    loop {
+        let name = if suffix == 0 {
+            base.clone()
+        } else {
+            format!("{base}{suffix}")
+        };
+        if !constraints
+            .iter()
+            .any(|constraint| constraint.get_name() == Some(&name))
+        {
+            return name;
+        }
+        suffix += 1;
     }
 }
 

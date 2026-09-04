@@ -236,6 +236,48 @@ fn transactional_ddl_benchmark(
     group.finish();
 }
 
+fn alter_table_benchmark(
+    criterion: &mut Criterion,
+    runtime: &Runtime,
+    connections: &mut [NamedBenchmarkConnection<'_>],
+) {
+    let values = (1..=100)
+        .map(|id| format!("({id}, {id})"))
+        .collect::<Vec<_>>()
+        .join(",");
+    for (_, connection) in connections.iter_mut() {
+        connection.execute(
+            runtime,
+            "CREATE TABLE alter_table_rewrite_100_rows (id INTEGER PRIMARY KEY, value INTEGER)",
+        );
+        connection.execute(
+            runtime,
+            &format!("INSERT INTO alter_table_rewrite_100_rows VALUES {values}"),
+        );
+    }
+    let mut group =
+        criterion.benchmark_group(benchmarks::find_benchmark("alter_table_rewrite_100_rows").name);
+    group.throughput(Throughput::Elements(100));
+    for (name, connection) in connections.iter_mut() {
+        group.bench_function(*name, |benchmark| {
+            benchmark.iter(|| {
+                connection.execute(
+                    runtime,
+                    "ALTER TABLE alter_table_rewrite_100_rows ADD COLUMN marker BIGINT DEFAULT 1 NOT NULL",
+                );
+                connection.execute(
+                    runtime,
+                    "ALTER TABLE alter_table_rewrite_100_rows DROP COLUMN marker",
+                );
+            });
+        });
+    }
+    group.finish();
+    for (_, connection) in connections.iter_mut() {
+        connection.execute(runtime, "DROP TABLE alter_table_rewrite_100_rows");
+    }
+}
+
 fn temporary_table_benchmark(
     criterion: &mut Criterion,
     runtime: &Runtime,
@@ -1112,6 +1154,7 @@ fn benchmarks(criterion: &mut Criterion) {
 
         create_table_benchmark(criterion, &runtime, &mut connections);
         transactional_ddl_benchmark(criterion, &runtime, &mut connections);
+        alter_table_benchmark(criterion, &runtime, &mut connections);
         temporary_table_benchmark(criterion, &runtime, &mut connections);
         sequence_benchmark(criterion, &runtime, &mut connections);
         serial_identity_benchmark(criterion, &runtime, &mut connections);

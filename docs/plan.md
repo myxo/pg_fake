@@ -373,7 +373,7 @@ Tasks 10–15 add the bounded migration surface.
 - Differential, transaction, and multi-session cases cover qualification,
   shadowing, rollback, cleanup, and prepared metadata.
 
-### Task 11 — Migration `ALTER TABLE` families
+### Task 11 — Migration `ALTER TABLE` families [COMPLETE]
 
 **Goal:** Implement the table evolution operations required by the Phase 3
 migration fixtures.
@@ -391,6 +391,18 @@ migration fixtures.
   triggers, views, prepared identity, and row data.
 - Multi-action statements, `IF EXISTS`/`IF NOT EXISTS`, cascades explicitly used
   by the fixtures, rollback, and errors have focused differential coverage.
+
+**Progress:**
+
+- [x] Model named and validated constraints and catalog-preserving renames.
+- [x] Execute supported `ALTER TABLE` operations atomically with row backfills,
+  rewrites, defaults, nullability changes, and constraint validation.
+- [x] Preserve existing sequence and foreign-key dependencies and rebuild unique
+  indexes across schema changes.
+- [x] Add focused native, SQLx differential/property, transactional, manifest,
+  and benchmark coverage.
+- [x] Run formatting, workspace tests, review, and the 10,000-iteration property
+  gate.
 
 ### Task 12 — Index DDL and partial unique indexes
 

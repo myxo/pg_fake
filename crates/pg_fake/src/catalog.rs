@@ -105,7 +105,9 @@ pub(crate) enum Constraint {
     },
     Check {
         id: ConstraintId,
+        name: String,
         expression: Box<ast::Expr>,
+        validated: bool,
     },
     ForeignKey(ForeignKey),
 }
@@ -121,7 +123,7 @@ impl Constraint {
     pub(crate) fn get_name(&self) -> Option<&str> {
         match self {
             Self::PrimaryKey { name, .. } | Self::Unique { name, .. } => Some(name),
-            Self::Check { .. } => None,
+            Self::Check { name, .. } => Some(name),
             Self::ForeignKey(foreign_key) => Some(&foreign_key.name),
         }
     }
@@ -149,6 +151,7 @@ pub(crate) struct ForeignKey {
     pub(crate) deferrable: bool,
     pub(crate) initially_deferred: bool,
     pub(crate) match_kind: Option<ast::ConstraintReferenceMatchKind>,
+    pub(crate) validated: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -575,6 +578,114 @@ impl Catalog {
             })
     }
 
+    pub(crate) fn replace_table(&mut self, table: TableSchema) -> Result<()> {
+        let current = self.require_table_by_id(table.id)?.clone();
+        let target = ResolvedRelationName {
+            schema_id: table.schema_id,
+            name: table.name.clone(),
+        };
+        if (current.schema_id != table.schema_id || current.name != table.name)
+            && self.has_resolved_relation(&target)
+        {
+            return Err(PgError::create(
+                SqlState::DuplicateTable,
+                format!("relation {:?} already exists", table.name),
+            ));
+        }
+        self.get_schema_by_id_mut(current.schema_id)
+            .tables
+            .remove(&current.name)
+            .expect("required table must exist");
+        let previous = self
+            .get_schema_by_id_mut(table.schema_id)
+            .tables
+            .insert(table.name.clone(), table);
+        assert!(previous.is_none(), "replacement table name must be free");
+        self.rebuild_foreign_key_metadata();
+        Ok(())
+    }
+
+    pub(crate) fn allocate_constraint_id(&mut self) -> ConstraintId {
+        let id = ConstraintId(self.next_constraint_id);
+        self.next_constraint_id += 1;
+        id
+    }
+
+    pub(crate) fn rename_column_dependencies(
+        &mut self,
+        table_id: TableId,
+        old_name: &str,
+        new_name: &str,
+    ) {
+        for table in self
+            .schemas
+            .values_mut()
+            .flat_map(|schema| schema.tables.values_mut())
+        {
+            for constraint in &mut table.constraints {
+                match constraint {
+                    Constraint::PrimaryKey { columns, .. } | Constraint::Unique { columns, .. }
+                        if table.id == table_id =>
+                    {
+                        for column in columns {
+                            if column == old_name {
+                                *column = new_name.to_owned();
+                            }
+                        }
+                    }
+                    Constraint::ForeignKey(foreign_key) => {
+                        if table.id == table_id {
+                            for column in &mut foreign_key.columns {
+                                if column == old_name {
+                                    *column = new_name.to_owned();
+                                }
+                            }
+                        }
+                        if foreign_key.foreign_table_id == table_id {
+                            for column in &mut foreign_key.referred_columns {
+                                if column == old_name {
+                                    *column = new_name.to_owned();
+                                }
+                            }
+                        }
+                    }
+                    Constraint::Check { .. }
+                    | Constraint::PrimaryKey { .. }
+                    | Constraint::Unique { .. } => {}
+                }
+            }
+        }
+        for sequence in self
+            .schemas
+            .values_mut()
+            .flat_map(|schema| schema.sequences.values_mut())
+        {
+            if let Some((owner, column)) = &mut sequence.owned_by
+                && *owner == table_id
+                && column == old_name
+            {
+                *column = new_name.to_owned();
+            }
+        }
+        self.rebuild_foreign_key_metadata();
+    }
+
+    pub(crate) fn rename_table_dependencies(&mut self, table_id: TableId, new_name: &str) {
+        for table in self
+            .schemas
+            .values_mut()
+            .flat_map(|schema| schema.tables.values_mut())
+        {
+            for constraint in &mut table.constraints {
+                if let Constraint::ForeignKey(foreign_key) = constraint
+                    && foreign_key.foreign_table_id == table_id
+                {
+                    foreign_key.foreign_table.name = new_name.to_owned();
+                }
+            }
+        }
+    }
+
     pub(crate) fn has_constraint(&self, table_id: TableId, constraint_id: ConstraintId) -> bool {
         self.require_table_by_id(table_id).is_ok_and(|table| {
             table
@@ -890,6 +1001,32 @@ impl Catalog {
             .flat_map(|schema| {
                 schema.sequences.iter().filter_map(|(name, sequence)| {
                     (sequence.owned_by.as_ref().map(|(table, _)| *table) == Some(table_id))
+                        .then_some((schema.id, name.clone()))
+                })
+            })
+            .collect::<Vec<_>>();
+        names
+            .into_iter()
+            .map(|(schema_id, name)| {
+                self.get_schema_by_id_mut(schema_id)
+                    .sequences
+                    .remove(&name)
+                    .expect("owned sequence must exist")
+            })
+            .collect()
+    }
+
+    pub(crate) fn drop_column_owned_sequences(
+        &mut self,
+        table_id: TableId,
+        column_name: &str,
+    ) -> Vec<SequenceSchema> {
+        let names = self
+            .schemas
+            .values()
+            .flat_map(|schema| {
+                schema.sequences.iter().filter_map(|(name, sequence)| {
+                    (sequence.owned_by.as_ref() == Some(&(table_id, column_name.to_owned())))
                         .then_some((schema.id, name.clone()))
                 })
             })
@@ -1747,6 +1884,7 @@ mod tests {
                     deferrable: false,
                     initially_deferred: false,
                     match_kind: None,
+                    validated: true,
                 })],
             )
             .unwrap();
@@ -1899,6 +2037,7 @@ mod tests {
                 deferrable: true,
                 initially_deferred: false,
                 match_kind: None,
+                validated: true,
             })
         };
         catalog

@@ -336,6 +336,44 @@ pub const FEATURES: &[Feature] = &[
         }],
     },
     Feature {
+        name: "migration ALTER TABLE",
+        cases: &[
+            Case {
+                id: "alter_column_rewrite",
+                source: "alter_table.sql:1360 plus focused migration fixture",
+                setup: &[
+                    "CREATE TABLE phase3_alter_columns (id INTEGER, value INTEGER)",
+                    "INSERT INTO phase3_alter_columns VALUES (1, 4)",
+                ],
+                sql: "ALTER TABLE phase3_alter_columns ALTER COLUMN value TYPE BIGINT USING value * 10",
+                blocker: BlockerKind::Implementation,
+            },
+            Case {
+                id: "add_not_valid_check",
+                source: "alter_table.sql:711",
+                setup: &[
+                    "CREATE TABLE phase3_alter_check (value INTEGER)",
+                    "INSERT INTO phase3_alter_check VALUES (-1)",
+                ],
+                sql: "ALTER TABLE phase3_alter_check ADD CONSTRAINT positive CHECK (value > 0) NOT VALID",
+                blocker: BlockerKind::Implementation,
+            },
+            Case {
+                id: "validate_foreign_key",
+                source: "alter_table.sql:987 plus focused migration fixture",
+                setup: &[
+                    "CREATE TABLE phase3_alter_parent (id INTEGER PRIMARY KEY)",
+                    "INSERT INTO phase3_alter_parent VALUES (1)",
+                    "CREATE TABLE phase3_alter_child (parent_id INTEGER)",
+                    "INSERT INTO phase3_alter_child VALUES (1)",
+                    "ALTER TABLE phase3_alter_child ADD CONSTRAINT parent_fk FOREIGN KEY (parent_id) REFERENCES phase3_alter_parent(id) NOT VALID",
+                ],
+                sql: "ALTER TABLE phase3_alter_child VALIDATE CONSTRAINT parent_fk",
+                blocker: BlockerKind::Implementation,
+            },
+        ],
+    },
+    Feature {
         name: "ordinary views",
         cases: &[Case {
             id: "select_from_view",

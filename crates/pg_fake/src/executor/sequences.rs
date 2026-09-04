@@ -57,6 +57,22 @@ impl SequenceExecutionContext {
         }
     }
 
+    pub(crate) fn replace_catalog(&self, catalog: &Catalog) -> Self {
+        SequenceExecutionContext {
+            catalog: catalog.clone(),
+            values: self.values.clone(),
+            session: self.session.clone(),
+        }
+    }
+
+    pub(crate) fn discard_sequences(&self, ids: &std::collections::BTreeSet<SequenceId>) {
+        let mut session = self.session.lock().expect("sequence session is poisoned");
+        session.current_values.retain(|id, _| !ids.contains(id));
+        if session.last_used.is_some_and(|id| ids.contains(&id)) {
+            session.last_used = None;
+        }
+    }
+
     #[cfg_attr(feature = "execution-log", tracing::instrument(skip_all))]
     fn require_sequence(&self, name: &str) -> Result<&SequenceSchema> {
         let name = normalize_sequence_name(name)?;

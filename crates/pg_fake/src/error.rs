@@ -52,6 +52,8 @@ pub enum SqlState {
     UndefinedTable,         // 42P01
     DuplicateTable,         // 42P07
     DuplicateSchema,        // 42P06
+    DuplicateColumn,        // 42701
+    DuplicateObject,        // 42710
     AmbiguousColumn,        // 42702
     SyntaxError,            // 42601
     UndefinedColumn,        // 42703
@@ -106,6 +108,8 @@ impl SqlState {
             SqlState::UndefinedTable => "42P01",
             SqlState::DuplicateTable => "42P07",
             SqlState::DuplicateSchema => "42P06",
+            SqlState::DuplicateColumn => "42701",
+            SqlState::DuplicateObject => "42710",
             SqlState::AmbiguousColumn => "42702",
             SqlState::SyntaxError => "42601",
             SqlState::UndefinedColumn => "42703",

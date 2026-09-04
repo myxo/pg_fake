@@ -419,6 +419,65 @@ fn matches_lock_timeout_and_row_lock_clauses() {
 }
 
 #[test]
+fn matches_migration_alter_table_columns_and_constraints() {
+    assert_differential(
+        "CREATE TABLE __TABLE__ (id INTEGER PRIMARY KEY, amount INTEGER); \
+         INSERT INTO __TABLE__ VALUES (1, 4), (2, 5); \
+         ALTER TABLE __TABLE__ RENAME COLUMN amount TO value; \
+         ALTER TABLE __TABLE__ \
+           ADD COLUMN doubled INTEGER DEFAULT 8 NOT NULL, \
+           ALTER COLUMN value TYPE BIGINT USING value * 10, \
+           ALTER COLUMN doubled SET DEFAULT 9; \
+         SELECT id, value, doubled FROM __TABLE__ ORDER BY id; \
+         INSERT INTO __TABLE__ (id, value) VALUES (3, 60); \
+         ALTER TABLE __TABLE__ ADD CONSTRAINT positive CHECK (value > 0) NOT VALID; \
+         INSERT INTO __TABLE__ VALUES (4, -1, 9); \
+         ALTER TABLE __TABLE__ VALIDATE CONSTRAINT positive; \
+         UPDATE __TABLE__ SET value = 1 WHERE value < 0; \
+         ALTER TABLE __TABLE__ VALIDATE CONSTRAINT positive; \
+         ALTER TABLE __TABLE__ ADD CONSTRAINT doubled_key UNIQUE (doubled); \
+         ALTER TABLE __TABLE__ DROP COLUMN value; \
+         ALTER TABLE __TABLE__ ADD COLUMN generated_id SERIAL; \
+         SELECT id, doubled, generated_id FROM __TABLE__ ORDER BY id; \
+         ALTER TABLE __TABLE__ DROP COLUMN generated_id; \
+         SELECT * FROM __TABLE__ ORDER BY id",
+        RowOrder::Ordered,
+    );
+}
+
+#[test]
+fn matches_alter_table_foreign_keys_cascade_and_rollback() {
+    assert_differential(
+        "CREATE TABLE __TABLE___parent (id INTEGER PRIMARY KEY, value INTEGER UNIQUE); \
+         CREATE TABLE __TABLE___child (parent_id INTEGER, parent_value INTEGER); \
+         INSERT INTO __TABLE___parent VALUES (1, 10); \
+         INSERT INTO __TABLE___child VALUES (1, 10), (99, 10); \
+         ALTER TABLE __TABLE___child ADD CONSTRAINT parent_fk \
+           FOREIGN KEY (parent_id) REFERENCES __TABLE___parent(id) NOT VALID; \
+         ALTER TABLE __TABLE___child ADD CONSTRAINT parent_value_fk \
+           FOREIGN KEY (parent_value) REFERENCES __TABLE___parent(value) NOT VALID; \
+         ALTER TABLE __TABLE___child VALIDATE CONSTRAINT parent_fk; \
+         UPDATE __TABLE___child SET parent_id = 1 WHERE parent_id = 99; \
+         ALTER TABLE __TABLE___child VALIDATE CONSTRAINT parent_fk; \
+         ALTER TABLE __TABLE___child VALIDATE CONSTRAINT parent_value_fk; \
+         BEGIN; \
+         ALTER TABLE __TABLE___parent RENAME TO __TABLE___renamed; \
+         ALTER TABLE __TABLE___renamed RENAME COLUMN value TO amount; \
+         ALTER TABLE __TABLE___renamed ADD COLUMN extra INTEGER DEFAULT 7; \
+         ROLLBACK; \
+         SELECT id, value FROM __TABLE___parent; \
+         ALTER TABLE __TABLE___parent RENAME TO __TABLE___renamed; \
+         INSERT INTO __TABLE___child VALUES (1, 10); \
+         ALTER TABLE __TABLE___renamed RENAME TO __TABLE___parent; \
+         ALTER TABLE __TABLE___parent DROP COLUMN id CASCADE; \
+         INSERT INTO __TABLE___child VALUES (999, 10); \
+         INSERT INTO __TABLE___child VALUES (NULL, 999); \
+         SELECT * FROM __TABLE___child ORDER BY parent_id",
+        RowOrder::Ordered,
+    );
+}
+
+#[test]
 fn matches_set_operations() {
     assert_differential(
         "SELECT 1 AS value UNION SELECT 1 UNION SELECT 2 ORDER BY value; \

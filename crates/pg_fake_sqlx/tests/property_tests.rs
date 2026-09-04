@@ -1901,6 +1901,69 @@ fn generated_set_operations_match_postgres() {
 }
 
 #[test]
+fn generated_alter_table_rewrites_match_postgres() {
+    let _test_lock = TEST_LOCK.lock().expect("test mutex must not be poisoned");
+    let server = start_postgres_server();
+    let runtime = tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()
+        .unwrap();
+    let postgres = RefCell::new(
+        runtime
+            .block_on(PgConnection::connect(&server.url))
+            .expect("must connect SQLx to PostgreSQL 18 once"),
+    );
+    check(|src| {
+        let table = format!(
+            "pg_fake_alter_property_{}_{}",
+            std::process::id(),
+            TABLE_NUMBER.fetch_add(1, Ordering::Relaxed)
+        );
+        let mut postgres_connection = postgres.borrow_mut();
+        let mut postgres = PostgresCase {
+            connection: &mut postgres_connection,
+            runtime: &runtime,
+            table: table.clone(),
+        };
+        let mut fake = PgFakeConnection::new(Db::create());
+        let values = (0..src.any_of("rows", int_in(1..=6)))
+            .map(|id| {
+                let value = integer(src, "value");
+                format!("({id}, {value})")
+            })
+            .collect::<Vec<_>>()
+            .join(",");
+        let default = integer(src, "default");
+        let multiplier = src.any_of("multiplier", int_in(1..=5));
+        for sql in [
+            format!("CREATE TABLE {table} (id INTEGER PRIMARY KEY, value INTEGER)"),
+            format!("INSERT INTO {table} VALUES {values}"),
+            format!("ALTER TABLE {table} RENAME COLUMN value TO amount"),
+            format!(
+                "ALTER TABLE {table} ADD COLUMN marker INTEGER DEFAULT {default} NOT NULL, \
+                 ALTER COLUMN amount TYPE BIGINT USING amount * {multiplier}"
+            ),
+            format!(
+                "ALTER TABLE {table} ADD CONSTRAINT marker_floor CHECK (marker >= {default}) NOT VALID"
+            ),
+            format!("ALTER TABLE {table} VALIDATE CONSTRAINT marker_floor"),
+            format!("SELECT id, amount, marker FROM {table} ORDER BY id"),
+            format!("ALTER TABLE {table} DROP COLUMN marker"),
+            format!("SELECT * FROM {table} ORDER BY id"),
+        ] {
+            src.log_value("sql", &sql);
+            assert_statement(
+                &runtime,
+                postgres.get_connection(),
+                &mut fake,
+                &sql,
+                RowOrder::Ordered,
+            );
+        }
+    });
+}
+
+#[test]
 fn generated_interleaved_transaction_snapshots_match_postgres() {
     let _test_lock = TEST_LOCK.lock().expect("test mutex must not be poisoned");
     let server = start_postgres_server();

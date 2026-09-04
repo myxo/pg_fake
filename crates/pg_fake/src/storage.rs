@@ -115,6 +115,52 @@ impl Table {
         }
     }
 
+    pub(crate) fn replace_schema(&mut self, schema: TableSchema) {
+        assert_eq!(self.schema.id, schema.id);
+        self.schema = schema;
+        self.indexes = self
+            .schema
+            .constraints
+            .iter()
+            .filter_map(|constraint| match constraint {
+                Constraint::PrimaryKey { columns, .. } | Constraint::Unique { columns, .. } => {
+                    Some(UniqueIndex {
+                        columns: columns
+                            .iter()
+                            .map(|name| {
+                                self.schema
+                                    .columns
+                                    .iter()
+                                    .position(|column| &column.name == name)
+                                    .expect("constraint columns must exist")
+                            })
+                            .collect(),
+                        entries: BTreeMap::new(),
+                    })
+                }
+                Constraint::Check { .. } | Constraint::ForeignKey(_) => None,
+            })
+            .collect();
+        self.rebuild_indexes();
+    }
+
+    pub(crate) fn collect_visible_versions(
+        &self,
+        snapshot: &Snapshot,
+        xid: Xid,
+        transactions: &TransactionRegistry,
+    ) -> Vec<(RowId, RowVersion)> {
+        self.version_chains
+            .chains
+            .iter()
+            .filter_map(|(row_id, chain)| {
+                find_visible_version(chain, snapshot, xid, transactions)
+                    .cloned()
+                    .map(|version| (*row_id, version))
+            })
+            .collect()
+    }
+
     #[cfg_attr(feature = "execution-log", tracing::instrument(skip_all))]
     pub(crate) fn insert(&mut self, xmin: Xid, command_id: CommandId, row: Row) -> RowId {
         let row_id = RowId(self.next_rowid);
@@ -587,6 +633,9 @@ fn build_row_index_key(
     index: &UniqueIndex,
     row: &Row,
 ) -> Option<UniqueIndexKey> {
+    if index.columns.iter().any(|column| *column >= row.len()) {
+        return None;
+    }
     let values = index
         .columns
         .iter()
@@ -658,7 +707,7 @@ fn normalize_index_value(value: &Value, base: BaseType) -> Option<NormalizedInde
         (Value::Interval(value), BaseType::Interval) => {
             Some(NormalizedIndexValue::Interval(*value))
         }
-        _ => unreachable!("row values must match declared column types"),
+        _ => None,
     }
 }
 

@@ -675,6 +675,116 @@ fn collect_ddl_relation_locks(
                 }
             }
         }
+        ast::Statement::AlterTable(alter) => {
+            let name = executor::normalize_relation_name(&alter.name)?;
+            let table = match catalog.require_named_table(&name) {
+                Ok(table) => table,
+                Err(error) if alter.if_exists && error.sqlstate == SqlState::UndefinedTable => {
+                    return Ok(Vec::new());
+                }
+                Err(error) => return Err(error),
+            };
+            locks.insert(
+                ResolvedRelationName {
+                    schema_id: table.schema_id,
+                    name: table.name.clone(),
+                }
+                .get_lock_name(),
+                RelationLockMode::Exclusive,
+            );
+            for operation in &alter.operations {
+                if let ast::AlterTableOperation::AddColumn { column_def, .. } = operation {
+                    for option in &column_def.options {
+                        if let ast::ColumnOption::ForeignKey(foreign_key) = &option.option {
+                            let parent = catalog.resolve_relation_name(
+                                &executor::normalize_relation_name(&foreign_key.foreign_table)?,
+                            )?;
+                            locks
+                                .entry(parent.get_lock_name())
+                                .or_insert(RelationLockMode::Shared);
+                        }
+                    }
+                    let serial = matches!(
+                        column_def
+                            .data_type
+                            .to_string()
+                            .to_ascii_lowercase()
+                            .as_str(),
+                        "smallserial" | "serial2" | "serial" | "serial4" | "bigserial" | "serial8"
+                    );
+                    let identity = column_def
+                        .options
+                        .iter()
+                        .any(|option| matches!(option.option, ast::ColumnOption::Generated { .. }));
+                    if serial || identity {
+                        let column_name = executor::normalize_identifier(&column_def.name);
+                        let base = format!("{}_{column_name}_seq", table.name);
+                        let mut number = 0;
+                        loop {
+                            let candidate = if number == 0 {
+                                base.clone()
+                            } else {
+                                format!("{base}{number}")
+                            };
+                            let candidate = ResolvedRelationName {
+                                schema_id: table.schema_id,
+                                name: candidate,
+                            };
+                            if !catalog.has_resolved_relation(&candidate) {
+                                locks
+                                    .insert(candidate.get_lock_name(), RelationLockMode::Exclusive);
+                                break;
+                            }
+                            number += 1;
+                        }
+                    }
+                }
+                if let ast::AlterTableOperation::AddConstraint {
+                    constraint: ast::TableConstraint::ForeignKey(foreign_key),
+                    ..
+                } = operation
+                {
+                    let parent = catalog.resolve_relation_name(
+                        &executor::normalize_relation_name(&foreign_key.foreign_table)?,
+                    )?;
+                    locks
+                        .entry(parent.get_lock_name())
+                        .or_insert(RelationLockMode::Shared);
+                }
+                if let ast::AlterTableOperation::RenameTable { table_name } = operation {
+                    let target = match table_name {
+                        ast::RenameTableNameKind::To(name) | ast::RenameTableNameKind::As(name) => {
+                            name
+                        }
+                    };
+                    let target = executor::normalize_relation_name(target)?;
+                    let temporary = matches!(table.persistence, TablePersistence::Temporary { .. });
+                    let resolved = catalog.resolve_creation_name(&target, temporary)?;
+                    locks.insert(resolved.get_lock_name(), RelationLockMode::Exclusive);
+                }
+                if matches!(
+                    operation,
+                    ast::AlterTableOperation::DropColumn {
+                        drop_behavior: Some(ast::DropBehavior::Cascade),
+                        ..
+                    } | ast::AlterTableOperation::DropConstraint {
+                        drop_behavior: Some(ast::DropBehavior::Cascade),
+                        ..
+                    }
+                ) {
+                    for (referencing, _) in catalog.referencing_foreign_keys(table.id) {
+                        locks.insert(
+                            ResolvedRelationName {
+                                schema_id: referencing.schema_id,
+                                name: referencing.name,
+                            }
+                            .get_lock_name(),
+                            RelationLockMode::Exclusive,
+                        );
+                    }
+                }
+            }
+        }
         ast::Statement::Drop {
             object_type: ast::ObjectType::Sequence,
             names: objects,
@@ -6950,6 +7060,50 @@ mod tests {
             Ok(create_affected_results(0))
         );
         handle.join().unwrap();
+    }
+
+    #[test]
+    #[cfg_attr(feature = "execution-log", tracing::instrument(skip_all))]
+    fn serializes_alter_table_with_active_readers() {
+        let db = Db::create_builder()
+            .set_lock_timeout(Duration::from_secs(10))
+            .build();
+        let mut reader = db.create_session();
+        let mut changer = db.create_session();
+        reader
+            .execute("CREATE TABLE alter_items (id INTEGER)")
+            .unwrap();
+        reader
+            .execute("INSERT INTO alter_items VALUES (1)")
+            .unwrap();
+        reader.execute("BEGIN").unwrap();
+        reader.query("SELECT * FROM alter_items", &[]).unwrap();
+
+        let (result_sender, result_receiver) = mpsc::channel();
+        let handle = thread::spawn(move || {
+            result_sender
+                .send(changer.execute(
+                    "ALTER TABLE alter_items ADD COLUMN marker INTEGER DEFAULT 7 NOT NULL",
+                ))
+                .unwrap();
+        });
+        wait_until_relation_blocked(&db);
+        reader.execute("COMMIT").unwrap();
+
+        assert_eq!(
+            result_receiver
+                .recv_timeout(Duration::from_secs(1))
+                .unwrap(),
+            Ok(create_affected_results(0))
+        );
+        handle.join().unwrap();
+        assert_eq!(
+            reader
+                .query("SELECT id, marker FROM alter_items", &[])
+                .unwrap()
+                .rows,
+            vec![vec![Value::Int4(1), Value::Int4(7)]]
+        );
     }
 
     #[test]
