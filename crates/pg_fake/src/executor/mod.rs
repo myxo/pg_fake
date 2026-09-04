@@ -5,8 +5,8 @@ use crate::{
     api::{ColumnMeta, QueryResult, StatementResult},
     catalog::{
         Catalog, CatalogHistory, ColumnDef, ConstraintId, ForeignKey, ForeignKeyAction,
-        IdentityKind, RelationName, ResolvedRelationName, SequenceSchema, TEMP_SCHEMA, TableId,
-        TablePersistence, TableSchema,
+        IdentityKind, IndexColumnDefinition, IndexSchema, RelationName, ResolvedRelationName,
+        SequenceSchema, TEMP_SCHEMA, TableId, TablePersistence, TableSchema,
     },
     coercion::{self, CastContext},
     error::{PgError, Result, SqlState, reject_unsupported},
@@ -29,6 +29,7 @@ mod alter_table;
 mod arithmetic;
 mod expressions;
 mod foreign_keys;
+mod indexes;
 mod locks;
 mod prepared;
 mod query;
@@ -48,8 +49,8 @@ use expressions::{
     validate_column_default, validate_not_null,
 };
 pub(crate) use expressions::{
-    create_constant_expression_schema, extract_unknown_string_literal, infer_expression_data_type,
-    infer_expression_type, is_null_literal,
+    create_constant_expression_schema, evaluate_index_predicate, extract_unknown_string_literal,
+    infer_expression_data_type, infer_expression_type, is_null_literal, validate_index_predicate,
 };
 use foreign_keys::{
     apply_referencing_foreign_key_actions, convert_referential_action,
@@ -57,6 +58,7 @@ use foreign_keys::{
     validate_row_foreign_keys,
 };
 pub(crate) use foreign_keys::{contains_deferred_foreign_keys, validate_deferred_foreign_keys};
+use indexes::{execute_alter_index, execute_create_index, execute_drop_indexes};
 pub(crate) use locks::{
     collect_required_cte_row_locks, collect_required_row_locks, mutation_locks_cover_targets,
 };
@@ -594,6 +596,7 @@ pub(crate) fn execute_statement(
                 name: table_name.clone(),
                 columns: columns.clone(),
                 constraints: constraints.clone(),
+                indexes: Vec::new(),
                 persistence,
             })?;
             let proposed = TableSchema {
@@ -602,6 +605,7 @@ pub(crate) fn execute_statement(
                 name: table_name.clone(),
                 columns: columns.clone(),
                 constraints: constraints.clone(),
+                indexes: Vec::new(),
                 persistence,
             };
             validate_foreign_key_definitions(&state.catalog, &proposed)?;
@@ -734,6 +738,22 @@ pub(crate) fn execute_statement(
             defer_all,
             context,
         ),
+        ast::Statement::CreateIndex(create) => {
+            execute_create_index(state, create, xid, snapshot, context)
+        }
+        ast::Statement::AlterIndex {
+            if_exists,
+            name,
+            operation,
+        } => execute_alter_index(state, *if_exists, name, operation),
+        ast::Statement::Drop {
+            object_type: ast::ObjectType::Index,
+            names,
+            if_exists,
+            cascade,
+            restrict,
+            ..
+        } => execute_drop_indexes(state, names, *if_exists, *cascade, *restrict),
         ast::Statement::Drop {
             object_type: ast::ObjectType::Table,
             names,
@@ -1023,6 +1043,15 @@ pub(crate) fn normalize_identifier(identifier: &ast::Ident) -> String {
         identifier.value.clone()
     } else {
         identifier.value.to_ascii_lowercase()
+    }
+}
+
+#[cfg_attr(feature = "execution-log", tracing::instrument(skip_all))]
+fn resolve_order_ascending(options: &ast::OrderByOptions) -> Result<bool> {
+    match &options.sort {
+        None | Some(ast::OrderBySort::Asc) => Ok(true),
+        Some(ast::OrderBySort::Desc) => Ok(false),
+        Some(ast::OrderBySort::Using(_)) => reject_unsupported("ORDER BY USING is not implemented"),
     }
 }
 

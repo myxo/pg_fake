@@ -96,11 +96,65 @@ mod tests {
     }
 
     #[test]
+    fn preserves_alter_index_if_exists() {
+        let statement = parse("ALTER INDEX IF EXISTS public.old_name RENAME TO new_name")
+            .unwrap()
+            .pop()
+            .unwrap();
+        let ast::Statement::AlterIndex {
+            if_exists,
+            name,
+            operation,
+        } = statement
+        else {
+            panic!("statement should be ALTER INDEX");
+        };
+
+        assert!(if_exists);
+        assert_eq!(name.to_string(), "public.old_name");
+        assert!(matches!(
+            operation,
+            ast::AlterIndexOperation::RenameIndex { index_name }
+                if index_name.to_string() == "new_name"
+        ));
+    }
+
+    #[test]
+    fn preserves_on_conflict_arbiter_predicate() {
+        let statement = parse(
+            "INSERT INTO values_table VALUES (1, true) \
+             ON CONFLICT (id) WHERE active DO NOTHING",
+        )
+        .unwrap()
+        .pop()
+        .unwrap();
+        let ast::Statement::Insert(insert) = statement else {
+            panic!("statement should be INSERT");
+        };
+        let Some(ast::OnInsert::OnConflict(conflict)) = insert.on else {
+            panic!("statement should have ON CONFLICT");
+        };
+        let Some(ast::ConflictTarget::Columns { columns, predicate }) = conflict.conflict_target
+        else {
+            panic!("conflict target should contain columns");
+        };
+
+        assert_eq!(columns.len(), 1);
+        assert_eq!(columns[0].value, "id");
+        assert!(matches!(
+            predicate,
+            Some(ast::Expr::Identifier(identifier)) if identifier.value == "active"
+        ));
+    }
+
+    #[test]
     #[cfg_attr(feature = "execution-log", tracing::instrument(skip_all))]
     fn classifies_statement_families() {
         let cases = [
             ("CREATE TABLE t (id INTEGER)", StatementKind::Ddl),
             ("CREATE SEQUENCE s", StatementKind::Ddl),
+            ("CREATE INDEX i ON t (id)", StatementKind::Ddl),
+            ("ALTER INDEX IF EXISTS i RENAME TO j", StatementKind::Ddl),
             ("INSERT INTO t VALUES (1)", StatementKind::Dml),
             ("SELECT * FROM t", StatementKind::Query),
             ("BEGIN", StatementKind::TransactionControl),

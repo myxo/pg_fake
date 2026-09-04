@@ -129,6 +129,65 @@ pub(super) fn validate_check_constraint_types(schema: &TableSchema) -> Result<()
     Ok(())
 }
 
+pub(crate) fn validate_index_predicate(expression: &ast::Expr, schema: &TableSchema) -> Result<()> {
+    let mut supported = true;
+    let _ = ast::visit_expressions(expression, |nested| {
+        let valid = match nested {
+            ast::Expr::Identifier(_) | ast::Expr::Value(_) | ast::Expr::Nested(_) => true,
+            ast::Expr::IsNull(_) | ast::Expr::IsNotNull(_) => true,
+            ast::Expr::InList { negated, .. } => !negated,
+            ast::Expr::BinaryOp { op, .. } => matches!(
+                op,
+                ast::BinaryOperator::And
+                    | ast::BinaryOperator::Or
+                    | ast::BinaryOperator::Eq
+                    | ast::BinaryOperator::NotEq
+                    | ast::BinaryOperator::Gt
+                    | ast::BinaryOperator::GtEq
+                    | ast::BinaryOperator::Lt
+                    | ast::BinaryOperator::LtEq
+            ),
+            _ => false,
+        };
+        if valid {
+            std::ops::ControlFlow::Continue(())
+        } else {
+            supported = false;
+            std::ops::ControlFlow::Break(())
+        }
+    });
+    if !supported {
+        return reject_unsupported("partial-index predicate form is not implemented");
+    }
+    if infer_expression_type(expression, RowScope::Table(schema))? != BaseType::Bool {
+        return Err(PgError::create(
+            SqlState::DatatypeMismatch,
+            "index predicate must be a boolean expression",
+        ));
+    }
+    Ok(())
+}
+
+pub(crate) fn evaluate_index_predicate(
+    expression: &ast::Expr,
+    schema: &TableSchema,
+    row: &[Value],
+    context: &StatementExecutionContext,
+) -> Result<bool> {
+    match evaluate_and_coerce(
+        expression,
+        BaseType::Bool,
+        CastContext::Implicit,
+        RowScope::Table(schema),
+        row,
+        context,
+    )? {
+        Value::Bool(value) => Ok(value),
+        Value::Null => Ok(false),
+        _ => unreachable!("index predicate was type-checked"),
+    }
+}
+
 #[cfg_attr(feature = "execution-log", tracing::instrument(skip_all))]
 pub(super) fn validate_check_constraints(
     schema: &TableSchema,
@@ -176,6 +235,7 @@ pub(crate) fn create_constant_expression_schema() -> TableSchema {
         name: String::new(),
         columns: Vec::new(),
         constraints: Vec::new(),
+        indexes: Vec::new(),
         persistence: crate::catalog::TablePersistence::Permanent,
     }
 }

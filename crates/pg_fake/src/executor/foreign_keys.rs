@@ -488,6 +488,8 @@ fn apply_cascaded_row_update(
             Some(row_id),
             None,
             None,
+            None,
+            context,
         )
     {
         return Err(PgError::create(

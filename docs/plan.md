@@ -404,23 +404,61 @@ migration fixtures.
 - [x] Run formatting, workspace tests, review, and the 10,000-iteration property
   gate.
 
-### Task 12 — Index DDL and partial unique indexes
+### Task 12 — Index DDL and partial unique indexes [COMPLETE]
 
 **Goal:** Model the indexes created, dropped, renamed, and used as arbiters by
 common application migrations.
 
 **DoD:**
 
-- `CREATE [UNIQUE] INDEX`, `DROP INDEX`, and `ALTER INDEX ...
-  RENAME TO` forms support qualification and `IF EXISTS`/`IF NOT EXISTS`.
-- Multi-column keys, sort direction, and partial-index predicates used by the
-  migrations are stored and validated with PostgreSQL NULL behavior.
+- `CREATE [UNIQUE] INDEX [IF NOT EXISTS]`, `DROP INDEX [IF EXISTS]`, and
+  `ALTER INDEX [IF EXISTS] ... RENAME TO` support qualified index and table
+  names with PostgreSQL relation-namespace collision and missing-object
+  behavior.
+- Default B-tree indexes support one through four simple column keys, implicit
+  or explicit `ASC`/`DESC` direction per key, and non-key `INCLUDE` columns.
+  Included columns participate in dependency tracking but not uniqueness or
+  conflict-arbiter identity.
+- Partial-index predicates support the migration forms built from Boolean
+  columns, `IS NULL`/`IS NOT NULL`, comparisons with typed literals, `IN`
+  literal lists, parentheses, `AND`, and `OR`. Predicate evaluation uses
+  PostgreSQL three-valued logic, so only rows for which the predicate is true
+  belong to the index.
 - Partial unique indexes enforce writes and participate in `ON CONFLICT`
-  inference only when PostgreSQL would select them.
+  inference, including `ON CONFLICT (columns) WHERE predicate`, only when the
+  key columns and predicate satisfy PostgreSQL inference rules.
 - Index objects and dependencies follow transactional catalog visibility and
-  table/column rename and drop behavior.
-- Differential/property cases cover duplicate data, predicate transitions,
-  rollback, name collisions, arbiter inference, and metadata.
+  table/column rename and drop behavior. Creating a unique index validates
+  existing qualifying rows atomically; inserts and updates maintain membership
+  when a row enters, leaves, or changes within a predicate.
+- Differential/property cases cover duplicate data, one-to-four-column keys,
+  ascending and descending keys, included columns, every supported predicate
+  form, predicate transitions, rollback, name collisions, arbiter inference,
+  and metadata. The migration-chain gate exercises create, drop, rename,
+  ordinary partial indexes, partial unique indexes, and covering indexes.
+
+**Notes:** Expression keys, collations, operator classes, non-B-tree methods,
+`CONCURRENTLY`, storage parameters, tablespaces, and explicit NULL-ordering
+options remain unsupported because the migration surface does not require
+them. The parser dependency must expose `IF EXISTS` on `ALTER INDEX` and the
+optional arbiter predicate in `ON CONFLICT (columns) WHERE predicate` in its
+AST; valid PostgreSQL syntax must not be recovered by project-local SQL
+parsing.
+
+**Progress:**
+
+- [x] Extend the parser AST for `ALTER INDEX IF EXISTS` and partial
+  `ON CONFLICT` arbiter predicates.
+- [x] Model named index identities, key directions, included columns, and
+  predicates in the transactional catalog.
+- [x] Execute create, drop, and rename operations with namespace, validation,
+  dependency, and rollback behavior.
+- [x] Enforce full and partial unique indexes on existing and changed rows and
+  use them for supported `ON CONFLICT` inference.
+- [x] Add focused native, SQLx differential/property, manifest, and benchmark
+  coverage.
+- [x] Run formatting, workspace tests, review, and the 10,000-iteration
+  property gate.
 
 ### Task 13 — Ordinary views and catalog-object renames
 
@@ -442,6 +480,8 @@ PostgreSQL scope and metadata behavior.
   dangling definition.
 - Recursive view dependencies are detected, and parameters or temporary
   caller-only names cannot leak into stored definitions.
+- `COMMENT ON VIEW ... IS ...` stores, replaces, and clears view comments
+  transactionally without affecting the view definition or dependencies.
 - Mutations targeting views return a clear unsupported-feature error in this
   phase.
 - `ALTER TRIGGER ... RENAME TO` and related supported catalog-object renames
@@ -592,7 +632,10 @@ backfills and reconciliation blocks.
   first mismatching statement.
 - Reapplying through SQLx reports the same already-applied/no-op behavior, and a
   deliberately failing migration rolls back catalog and data changes.
-- The manifest has no unresolved migration blocker.
+- Every statement, procedural construct, expression, object dependency, and
+  index definition in the ordered migration chains is assigned to a completed
+  feature task and executed by the gate; the manifest has no unsupported,
+  unclassified, rewritten, or unresolved migration blocker.
 
 ---
 

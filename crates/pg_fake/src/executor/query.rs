@@ -3456,7 +3456,7 @@ fn execute_values_query(
                         "ORDER BY position is not in select list",
                     ));
                 }
-                let ascending = order.options.asc.unwrap_or(true);
+                let ascending = resolve_order_ascending(&order.options)?;
                 Ok((
                     index,
                     ascending,
@@ -3793,13 +3793,11 @@ fn sort_set_rows(
                     "ORDER BY position is not in select list",
                 )
             })?;
+            let ascending = resolve_order_ascending(&order.options)?;
             Ok((
                 index,
-                order.options.asc.unwrap_or(true),
-                order
-                    .options
-                    .nulls_first
-                    .unwrap_or(!order.options.asc.unwrap_or(true)),
+                ascending,
+                order.options.nulls_first.unwrap_or(!ascending),
             ))
         })
         .collect::<Result<Vec<_>>>()?;
@@ -3977,7 +3975,7 @@ fn resolve_order_specs<'a>(
                             },
                         }
                     };
-                    let ascending = order.options.asc.unwrap_or(true);
+                    let ascending = resolve_order_ascending(&order.options)?;
                     Ok(RowOrderSpec {
                         key,
                         ascending,

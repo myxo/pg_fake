@@ -330,7 +330,9 @@ fn collect_insert_conflict_locks(
             needs_fallback = true;
             continue;
         }
-        if let Some(row_id) = table.find_conflicting_row(&row, xid, &state.transactions, None) {
+        if let Some(row_id) =
+            table.find_conflicting_row(&row, xid, &state.transactions, None, None, context)
+        {
             locks.push(RequiredRowLock {
                 key: RowLockKey {
                     table_id: schema.id,
@@ -345,7 +347,7 @@ fn collect_insert_conflict_locks(
         locks.clear();
         locks.extend(
             table
-                .find_unique_candidate_rows(xid, &state.transactions, None)
+                .find_unique_candidate_rows(xid, &state.transactions, None, None, context)
                 .into_iter()
                 .map(|row_id| RequiredRowLock {
                     key: RowLockKey {

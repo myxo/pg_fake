@@ -1,13 +1,15 @@
 use std::collections::{BTreeMap, BTreeSet};
 
 use crate::{
-    catalog::{Constraint, TableSchema},
+    catalog::{Constraint, IndexSchema, TableSchema},
+    executor::StatementExecutionContext,
     txn::{
         CommandId, CommitSeq, Snapshot, TransactionRegistry, TransactionStatus, Xid,
         find_visible_version,
     },
     value::{BaseType, Value},
 };
+use sqlparser::ast;
 
 pub(crate) type Row = Vec<Value>;
 
@@ -64,6 +66,7 @@ struct UniqueIndexKey(Vec<NormalizedIndexValue>);
 #[derive(Debug, Clone, PartialEq)]
 struct UniqueIndex {
     columns: Vec<usize>,
+    predicate: Option<ast::Expr>,
     entries: BTreeMap<UniqueIndexKey, BTreeSet<RowId>>,
 }
 
@@ -95,11 +98,18 @@ impl Table {
                                     .expect("constraint columns must exist")
                             })
                             .collect(),
+                        predicate: None,
                         entries: BTreeMap::new(),
                     })
                 }
                 Constraint::Check { .. } | Constraint::ForeignKey(_) => None,
             })
+            .chain(
+                schema
+                    .indexes
+                    .iter()
+                    .filter_map(|index| index.unique.then(|| create_unique_index(&schema, index))),
+            )
             .collect();
         Table {
             schema,
@@ -135,11 +145,17 @@ impl Table {
                                     .expect("constraint columns must exist")
                             })
                             .collect(),
+                        predicate: None,
                         entries: BTreeMap::new(),
                     })
                 }
                 Constraint::Check { .. } | Constraint::ForeignKey(_) => None,
             })
+            .chain(self.schema.indexes.iter().filter_map(|index| {
+                index
+                    .unique
+                    .then(|| create_unique_index(&self.schema, index))
+            }))
             .collect();
         self.rebuild_indexes();
     }
@@ -376,17 +392,22 @@ impl Table {
         excluded_row: Option<RowId>,
         changed_columns: Option<&BTreeSet<usize>>,
         arbiter_columns: Option<&[usize]>,
+        arbiter_predicate: Option<&ast::Expr>,
+        context: &StatementExecutionContext,
     ) -> bool {
         let snapshot = snapshot.include_current_command();
         self.indexes
             .iter()
             .filter(|index| {
-                arbiter_columns.is_none_or(|columns| index.columns == columns)
-                    && changed_columns.is_none_or(|columns| {
-                        index.columns.iter().any(|column| columns.contains(column))
-                    })
+                let _ = changed_columns;
+                arbiter_columns.is_none_or(|columns| {
+                    index.columns == columns && index.predicate.as_ref() == arbiter_predicate
+                })
             })
             .any(|index| {
+                if !matches_index_predicate(&self.schema, index, row, context) {
+                    return false;
+                }
                 let Some(key) = build_row_index_key(&self.schema, index, row) else {
                     return false;
                 };
@@ -402,8 +423,9 @@ impl Table {
                         else {
                             return false;
                         };
-                        build_row_index_key(&self.schema, index, &version.row).as_ref()
-                            == Some(&key)
+                        matches_index_predicate(&self.schema, index, &version.row, context)
+                            && build_row_index_key(&self.schema, index, &version.row).as_ref()
+                                == Some(&key)
                     })
                 })
             })
@@ -417,19 +439,23 @@ impl Table {
         current_xid: Xid,
         transactions: &TransactionRegistry,
         arbiter_columns: &[usize],
+        arbiter_predicate: Option<&ast::Expr>,
+        context: &StatementExecutionContext,
     ) -> Option<(RowId, &RowVersion)> {
         let snapshot = snapshot.include_current_command();
-        let index = self
-            .indexes
-            .iter()
-            .find(|index| index.columns == arbiter_columns)?;
+        let index = self.indexes.iter().find(|index| {
+            index.columns == arbiter_columns
+                && index.predicate.as_ref() == arbiter_predicate
+                && matches_index_predicate(&self.schema, index, row, context)
+        })?;
         let key = build_row_index_key(&self.schema, index, row)?;
         index.entries.get(&key)?.iter().find_map(|row_id| {
             let version = self.version_chains.chains.get(row_id).and_then(|chain| {
                 find_visible_version(chain, &snapshot, current_xid, transactions)
             })?;
-            (build_row_index_key(&self.schema, index, &version.row).as_ref() == Some(&key))
-                .then_some((*row_id, version))
+            (matches_index_predicate(&self.schema, index, &version.row, context)
+                && build_row_index_key(&self.schema, index, &version.row).as_ref() == Some(&key))
+            .then_some((*row_id, version))
         })
     }
 
@@ -440,10 +466,16 @@ impl Table {
         current_xid: Xid,
         transactions: &TransactionRegistry,
         arbiter_columns: Option<&[usize]>,
+        arbiter_predicate: Option<&ast::Expr>,
+        context: &StatementExecutionContext,
     ) -> Option<RowId> {
         self.indexes
             .iter()
-            .filter(|index| arbiter_columns.is_none_or(|columns| index.columns == columns))
+            .filter(|index| {
+                arbiter_columns.is_none_or(|columns| {
+                    index.columns == columns && index.predicate.as_ref() == arbiter_predicate
+                }) && matches_index_predicate(&self.schema, index, row, context)
+            })
             .find_map(|index| {
                 let key = build_row_index_key(&self.schema, index, row)?;
                 index.entries.get(&key)?.iter().find_map(|row_id| {
@@ -465,6 +497,12 @@ impl Table {
                                         Some(TransactionStatus::Committed(_))
                                     )
                                 })
+                                && matches_index_predicate(
+                                    &self.schema,
+                                    index,
+                                    &version.row,
+                                    context,
+                                )
                                 && build_row_index_key(&self.schema, index, &version.row).as_ref()
                                     == Some(&key)
                         })
@@ -479,6 +517,8 @@ impl Table {
         current_xid: Xid,
         transactions: &TransactionRegistry,
         arbiter_columns: Option<&[usize]>,
+        arbiter_predicate: Option<&ast::Expr>,
+        context: &StatementExecutionContext,
     ) -> Vec<RowId> {
         self.version_chains
             .chains
@@ -503,8 +543,15 @@ impl Table {
                     })
                     .is_some_and(|version| {
                         self.indexes.iter().any(|index| {
-                            arbiter_columns.is_none_or(|columns| index.columns == columns)
-                                && build_row_index_key(&self.schema, index, &version.row).is_some()
+                            arbiter_columns.is_none_or(|columns| {
+                                index.columns == columns
+                                    && index.predicate.as_ref() == arbiter_predicate
+                            }) && matches_index_predicate(
+                                &self.schema,
+                                index,
+                                &version.row,
+                                context,
+                            ) && build_row_index_key(&self.schema, index, &version.row).is_some()
                         })
                     })
                     .then_some(*row_id)
@@ -521,7 +568,10 @@ impl Table {
         current_xid: Xid,
         transactions: &TransactionRegistry,
     ) -> Option<RowId> {
-        let index = self.indexes.iter().find(|index| index.columns == columns)?;
+        let index = self
+            .indexes
+            .iter()
+            .find(|index| index.columns == columns && index.predicate.is_none())?;
         let key = build_index_key(&self.schema, columns, values)?;
         index.entries.get(&key)?.iter().find_map(|row_id| {
             let version = self.version_chains.chains.get(row_id).and_then(|chain| {
@@ -534,7 +584,9 @@ impl Table {
 
     #[cfg_attr(feature = "execution-log", tracing::instrument(skip_all))]
     pub(crate) fn has_unique_index(&self, columns: &[usize]) -> bool {
-        self.indexes.iter().any(|index| index.columns == columns)
+        self.indexes
+            .iter()
+            .any(|index| index.columns == columns && index.predicate.is_none())
     }
 
     #[cfg_attr(feature = "execution-log", tracing::instrument(skip_all))]
@@ -625,6 +677,36 @@ impl Table {
                 .insert(row_id);
         }
     }
+}
+
+fn create_unique_index(schema: &TableSchema, index: &IndexSchema) -> UniqueIndex {
+    UniqueIndex {
+        columns: index
+            .columns
+            .iter()
+            .map(|definition| {
+                schema
+                    .columns
+                    .iter()
+                    .position(|column| column.name == definition.name)
+                    .expect("index columns must exist")
+            })
+            .collect(),
+        predicate: index.predicate.clone(),
+        entries: BTreeMap::new(),
+    }
+}
+
+fn matches_index_predicate(
+    schema: &TableSchema,
+    index: &UniqueIndex,
+    row: &Row,
+    context: &StatementExecutionContext,
+) -> bool {
+    index.predicate.as_ref().is_none_or(|predicate| {
+        crate::executor::evaluate_index_predicate(predicate, schema, row, context)
+            .expect("validated index predicate must evaluate")
+    })
 }
 
 #[cfg_attr(feature = "execution-log", tracing::instrument(skip_all))]

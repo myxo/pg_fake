@@ -785,6 +785,110 @@ fn collect_ddl_relation_locks(
                 }
             }
         }
+        ast::Statement::CreateIndex(create) => {
+            let table_name = executor::normalize_relation_name(&create.table_name)?;
+            let table = catalog.require_named_table(&table_name)?;
+            locks.insert(
+                ResolvedRelationName {
+                    schema_id: table.schema_id,
+                    name: table.name.clone(),
+                }
+                .get_lock_name(),
+                RelationLockMode::Exclusive,
+            );
+            let Some(name) = &create.name else {
+                return Err(PgError::create(
+                    SqlState::SyntaxError,
+                    "index name is required",
+                ));
+            };
+            let name = executor::normalize_relation_name(name)?;
+            let schema_id = match name.schema.as_deref() {
+                Some(schema) => catalog.require_schema(schema)?.id,
+                None => table.schema_id,
+            };
+            locks.insert(
+                ResolvedRelationName {
+                    schema_id,
+                    name: name.name,
+                }
+                .get_lock_name(),
+                RelationLockMode::Exclusive,
+            );
+        }
+        ast::Statement::AlterIndex {
+            if_exists,
+            name,
+            operation,
+        } => {
+            let name = executor::normalize_relation_name(name)?;
+            match catalog.require_named_index(&name) {
+                Ok((table, index)) => {
+                    locks.insert(
+                        ResolvedRelationName {
+                            schema_id: table.schema_id,
+                            name: table.name.clone(),
+                        }
+                        .get_lock_name(),
+                        RelationLockMode::Exclusive,
+                    );
+                    locks.insert(
+                        ResolvedRelationName {
+                            schema_id: table.schema_id,
+                            name: index.name.clone(),
+                        }
+                        .get_lock_name(),
+                        RelationLockMode::Exclusive,
+                    );
+                    let ast::AlterIndexOperation::RenameIndex { index_name } = operation;
+                    let target_name = executor::normalize_relation_name(index_name)?;
+                    if target_name.schema.is_none() {
+                        locks.insert(
+                            ResolvedRelationName {
+                                schema_id: table.schema_id,
+                                name: target_name.name,
+                            }
+                            .get_lock_name(),
+                            RelationLockMode::Exclusive,
+                        );
+                    }
+                }
+                Err(error) if *if_exists && error.sqlstate == SqlState::UndefinedObject => {}
+                Err(error) => return Err(error),
+            }
+        }
+        ast::Statement::Drop {
+            object_type: ast::ObjectType::Index,
+            names,
+            if_exists,
+            ..
+        } => {
+            for name in names {
+                let name = executor::normalize_relation_name(name)?;
+                match catalog.require_named_index(&name) {
+                    Ok((table, index)) => {
+                        locks.insert(
+                            ResolvedRelationName {
+                                schema_id: table.schema_id,
+                                name: table.name.clone(),
+                            }
+                            .get_lock_name(),
+                            RelationLockMode::Exclusive,
+                        );
+                        locks.insert(
+                            ResolvedRelationName {
+                                schema_id: table.schema_id,
+                                name: index.name.clone(),
+                            }
+                            .get_lock_name(),
+                            RelationLockMode::Exclusive,
+                        );
+                    }
+                    Err(error) if *if_exists && error.sqlstate == SqlState::UndefinedObject => {}
+                    Err(error) => return Err(error),
+                }
+            }
+        }
         ast::Statement::Drop {
             object_type: ast::ObjectType::Sequence,
             names: objects,
@@ -2626,7 +2730,7 @@ fn is_tolerated_planner_setting(variable: &ast::ObjectName) -> bool {
 #[cfg_attr(feature = "execution-log", tracing::instrument(skip_all))]
 fn is_tolerated_planner_reset(reset: &ast::Reset) -> bool {
     match reset {
-        ast::Reset::ALL => false,
+        ast::Reset::ALL | ast::Reset::SessionAuthorization => false,
         ast::Reset::ConfigurationParameter(variable) => is_tolerated_planner_setting(variable),
     }
 }

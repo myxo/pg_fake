@@ -60,6 +60,9 @@ pub(crate) struct SequenceId(pub(crate) u64);
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub(crate) struct ConstraintId(pub(crate) u64);
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub(crate) struct IndexId(pub(crate) u64);
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct SequenceSchema {
     pub(crate) id: SequenceId,
@@ -155,12 +158,29 @@ pub(crate) struct ForeignKey {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct IndexColumnDefinition {
+    pub(crate) name: String,
+    pub(crate) descending: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct IndexSchema {
+    pub(crate) id: IndexId,
+    pub(crate) name: String,
+    pub(crate) unique: bool,
+    pub(crate) columns: Vec<IndexColumnDefinition>,
+    pub(crate) include: Vec<String>,
+    pub(crate) predicate: Option<ast::Expr>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct TableSchema {
     pub(crate) id: TableId,
     pub(crate) schema_id: SchemaId,
     pub(crate) name: String,
     pub(crate) columns: Vec<ColumnDef>,
     pub(crate) constraints: Vec<Constraint>,
+    pub(crate) indexes: Vec<IndexSchema>,
     pub(crate) persistence: TablePersistence,
 }
 
@@ -185,6 +205,7 @@ pub(crate) struct Catalog {
     next_table_id: u64,
     next_sequence_id: u64,
     next_constraint_id: u64,
+    next_index_id: u64,
     deferrable_foreign_keys: Vec<(ConstraintId, bool)>,
     referencing_foreign_keys: BTreeMap<TableId, Vec<(TableId, usize)>>,
 }
@@ -213,6 +234,7 @@ pub(crate) struct CatalogHistory {
     next_table_id: u64,
     next_sequence_id: u64,
     next_constraint_id: u64,
+    next_index_id: u64,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -243,6 +265,7 @@ impl Catalog {
             next_table_id: 1,
             next_sequence_id: 1,
             next_constraint_id: 1,
+            next_index_id: 1,
             deferrable_foreign_keys: Vec::new(),
             referencing_foreign_keys: BTreeMap::new(),
         }
@@ -283,14 +306,18 @@ impl Catalog {
     ) -> Result<ResolvedRelationName> {
         let schema = match &name.schema {
             Some(schema) => self.require_schema(schema)?,
-            None => self
-                .schemas
-                .get(TEMP_SCHEMA)
-                .filter(|schema| {
-                    schema.tables.contains_key(&name.name)
-                        || schema.sequences.contains_key(&name.name)
-                })
-                .unwrap_or_else(|| self.get_default_schema()),
+            None => {
+                self.schemas
+                    .get(TEMP_SCHEMA)
+                    .filter(|schema| {
+                        schema.tables.contains_key(&name.name)
+                            || schema.sequences.contains_key(&name.name)
+                            || schema.tables.values().any(|table| {
+                                table.indexes.iter().any(|index| index.name == name.name)
+                            })
+                    })
+                    .unwrap_or_else(|| self.get_default_schema())
+            }
         };
         Ok(ResolvedRelationName {
             schema_id: schema.id,
@@ -327,13 +354,28 @@ impl Catalog {
 
     pub(crate) fn has_resolved_relation(&self, name: &ResolvedRelationName) -> bool {
         let schema = self.get_schema_by_id(name.schema_id);
-        schema.tables.contains_key(&name.name) || schema.sequences.contains_key(&name.name)
+        schema.tables.contains_key(&name.name)
+            || schema.sequences.contains_key(&name.name)
+            || schema
+                .tables
+                .values()
+                .any(|table| table.indexes.iter().any(|index| index.name == name.name))
     }
 
     pub(crate) fn require_named_table(&self, name: &RelationName) -> Result<&TableSchema> {
         let name = self.resolve_relation_name(name)?;
         let schema = self.get_schema_by_id(name.schema_id);
         if schema.sequences.contains_key(&name.name) {
+            return Err(PgError::create(
+                SqlState::WrongObjectType,
+                format!("{:?} is not a table", name.name),
+            ));
+        }
+        if schema
+            .tables
+            .values()
+            .any(|table| table.indexes.iter().any(|index| index.name == name.name))
+        {
             return Err(PgError::create(
                 SqlState::WrongObjectType,
                 format!("{:?} is not a table", name.name),
@@ -351,6 +393,16 @@ impl Catalog {
         let name = self.resolve_relation_name(name)?;
         let schema = self.get_schema_by_id(name.schema_id);
         if schema.tables.contains_key(&name.name) {
+            return Err(PgError::create(
+                SqlState::WrongObjectType,
+                format!("{:?} is not a sequence", name.name),
+            ));
+        }
+        if schema
+            .tables
+            .values()
+            .any(|table| table.indexes.iter().any(|index| index.name == name.name))
+        {
             return Err(PgError::create(
                 SqlState::WrongObjectType,
                 format!("{:?} is not a sequence", name.name),
@@ -464,6 +516,7 @@ impl Catalog {
                 name,
                 columns,
                 constraints,
+                indexes: Vec::new(),
                 persistence: TablePersistence::Permanent,
             },
         );
@@ -521,6 +574,7 @@ impl Catalog {
                 name: name.name,
                 columns,
                 constraints,
+                indexes: Vec::new(),
                 persistence,
             },
         );
@@ -609,6 +663,42 @@ impl Catalog {
         let id = ConstraintId(self.next_constraint_id);
         self.next_constraint_id += 1;
         id
+    }
+
+    pub(crate) fn allocate_index_id(&mut self) -> IndexId {
+        let id = IndexId(self.next_index_id);
+        self.next_index_id += 1;
+        id
+    }
+
+    pub(crate) fn require_named_index(
+        &self,
+        name: &RelationName,
+    ) -> Result<(&TableSchema, &IndexSchema)> {
+        let name = self.resolve_relation_name(name)?;
+        let schema = self.get_schema_by_id(name.schema_id);
+        if schema.tables.contains_key(&name.name) || schema.sequences.contains_key(&name.name) {
+            return Err(PgError::create(
+                SqlState::WrongObjectType,
+                format!("{:?} is not an index", name.name),
+            ));
+        }
+        schema
+            .tables
+            .values()
+            .find_map(|table| {
+                table
+                    .indexes
+                    .iter()
+                    .find(|index| index.name == name.name)
+                    .map(|index| (table, index))
+            })
+            .ok_or_else(|| {
+                PgError::create(
+                    SqlState::UndefinedObject,
+                    format!("index {:?} does not exist", name.name),
+                )
+            })
     }
 
     pub(crate) fn rename_column_dependencies(
@@ -1067,6 +1157,7 @@ impl CatalogHistory {
             next_table_id: 1,
             next_sequence_id: 1,
             next_constraint_id: 1,
+            next_index_id: 1,
         }
     }
 
@@ -1134,6 +1225,7 @@ impl CatalogHistory {
             next_table_id: self.next_table_id,
             next_sequence_id: self.next_sequence_id,
             next_constraint_id: self.next_constraint_id,
+            next_index_id: self.next_index_id,
             deferrable_foreign_keys: Vec::new(),
             referencing_foreign_keys: BTreeMap::new(),
         };
@@ -1253,6 +1345,7 @@ impl CatalogHistory {
         self.next_table_id = self.next_table_id.max(current.next_table_id);
         self.next_sequence_id = self.next_sequence_id.max(current.next_sequence_id);
         self.next_constraint_id = self.next_constraint_id.max(current.next_constraint_id);
+        self.next_index_id = self.next_index_id.max(current.next_index_id);
     }
 
     #[cfg_attr(feature = "execution-log", tracing::instrument(skip_all))]

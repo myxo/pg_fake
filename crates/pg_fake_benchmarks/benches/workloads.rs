@@ -278,6 +278,47 @@ fn alter_table_benchmark(
     }
 }
 
+fn partial_unique_index_benchmark(
+    criterion: &mut Criterion,
+    runtime: &Runtime,
+    connections: &mut [NamedBenchmarkConnection<'_>],
+) {
+    let values = (1..=100)
+        .map(|id| format!("({id}, {}, 'benchmark')", id % 2 == 0))
+        .collect::<Vec<_>>()
+        .join(",");
+    for (_, connection) in connections.iter_mut() {
+        connection.execute(
+            runtime,
+            "CREATE TABLE partial_unique_index_100_rows \
+             (id INTEGER, active BOOLEAN, payload TEXT)",
+        );
+        connection.execute(
+            runtime,
+            &format!("INSERT INTO partial_unique_index_100_rows VALUES {values}"),
+        );
+    }
+    let mut group =
+        criterion.benchmark_group(benchmarks::find_benchmark("partial_unique_index_100_rows").name);
+    group.throughput(Throughput::Elements(100));
+    for (name, connection) in connections.iter_mut() {
+        group.bench_function(*name, |benchmark| {
+            benchmark.iter(|| {
+                connection.execute(
+                    runtime,
+                    "CREATE UNIQUE INDEX partial_unique_index_100_rows_key \
+                     ON partial_unique_index_100_rows (id DESC) INCLUDE (payload) WHERE active",
+                );
+                connection.execute(runtime, "DROP INDEX partial_unique_index_100_rows_key");
+            });
+        });
+    }
+    group.finish();
+    for (_, connection) in connections.iter_mut() {
+        connection.execute(runtime, "DROP TABLE partial_unique_index_100_rows");
+    }
+}
+
 fn temporary_table_benchmark(
     criterion: &mut Criterion,
     runtime: &Runtime,
@@ -1155,6 +1196,7 @@ fn benchmarks(criterion: &mut Criterion) {
         create_table_benchmark(criterion, &runtime, &mut connections);
         transactional_ddl_benchmark(criterion, &runtime, &mut connections);
         alter_table_benchmark(criterion, &runtime, &mut connections);
+        partial_unique_index_benchmark(criterion, &runtime, &mut connections);
         temporary_table_benchmark(criterion, &runtime, &mut connections);
         sequence_benchmark(criterion, &runtime, &mut connections);
         serial_identity_benchmark(criterion, &runtime, &mut connections);

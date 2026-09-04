@@ -30,14 +30,24 @@ enum InsertConflictOutcome {
 
 pub(super) enum ConflictArbiter {
     Any,
-    Index(Vec<usize>),
+    Index {
+        columns: Vec<usize>,
+        predicate: Option<ast::Expr>,
+    },
 }
 
 impl ConflictArbiter {
     pub(super) fn get_columns(&self) -> Option<&[usize]> {
         match self {
             ConflictArbiter::Any => None,
-            ConflictArbiter::Index(columns) => Some(columns),
+            ConflictArbiter::Index { columns, .. } => Some(columns),
+        }
+    }
+
+    pub(super) fn get_predicate(&self) -> Option<&ast::Expr> {
+        match self {
+            ConflictArbiter::Any => None,
+            ConflictArbiter::Index { predicate, .. } => predicate.as_ref(),
         }
     }
 }
@@ -63,7 +73,7 @@ pub(super) fn resolve_conflict_arbiter(
         return Ok(Some(ConflictArbiter::Any));
     };
     let constraint_columns = match target {
-        ast::ConflictTarget::Columns(columns) => {
+        ast::ConflictTarget::Columns { columns, predicate } => {
             let requested = columns
                 .iter()
                 .map(|column| {
@@ -86,7 +96,13 @@ pub(super) fn resolve_conflict_arbiter(
                     "there is no unique or exclusion constraint matching the ON CONFLICT specification",
                 ));
             }
-            schema.constraints.iter().find_map(|constraint| {
+            if let Some(predicate) = predicate {
+                validate_index_predicate(predicate, schema)?;
+            }
+            let constraint = schema.constraints.iter().find_map(|constraint| {
+                if predicate.is_some() {
+                    return None;
+                }
                 let columns = match constraint {
                     Constraint::PrimaryKey { columns, .. } | Constraint::Unique { columns, .. } => {
                         columns
@@ -105,7 +121,34 @@ pub(super) fn resolve_conflict_arbiter(
                     .collect::<Vec<_>>();
                 (indexes.len() == requested.len()
                     && indexes.iter().all(|index| requested.contains(index)))
-                .then_some(indexes)
+                .then_some((indexes, None))
+            });
+            constraint.or_else(|| {
+                schema.indexes.iter().find_map(|index| {
+                    if !index.unique {
+                        return None;
+                    }
+                    let indexes = index
+                        .columns
+                        .iter()
+                        .map(|column| {
+                            schema
+                                .columns
+                                .iter()
+                                .position(|definition| definition.name == column.name)
+                                .expect("index columns must exist")
+                        })
+                        .collect::<Vec<_>>();
+                    let predicate_matches = match (&index.predicate, predicate) {
+                        (None, _) => true,
+                        (Some(index), Some(target)) => index == target,
+                        (Some(_), None) => false,
+                    };
+                    (predicate_matches
+                        && indexes.len() == requested.len()
+                        && indexes.iter().all(|column| requested.contains(column)))
+                    .then(|| (indexes, index.predicate.clone()))
+                })
             })
         }
         ast::ConflictTarget::OnConstraint(name) => {
@@ -136,7 +179,7 @@ pub(super) fn resolve_conflict_arbiter(
             };
             match constraint {
                 Constraint::PrimaryKey { columns, .. } | Constraint::Unique { columns, .. } => {
-                    Some(
+                    Some((
                         columns
                             .iter()
                             .map(|name| {
@@ -147,7 +190,8 @@ pub(super) fn resolve_conflict_arbiter(
                                     .expect("constraint columns must exist")
                             })
                             .collect(),
-                    )
+                        None,
+                    ))
                 }
                 Constraint::Check { .. } | Constraint::ForeignKey(_) => {
                     return Err(PgError::create(
@@ -159,7 +203,7 @@ pub(super) fn resolve_conflict_arbiter(
         }
     };
     constraint_columns
-        .map(ConflictArbiter::Index)
+        .map(|(columns, predicate)| ConflictArbiter::Index { columns, predicate })
         .map(Some)
         .ok_or_else(|| {
             PgError::create(
@@ -631,6 +675,8 @@ fn execute_insert_conflict(
                 None,
                 None,
                 arbiter.get_columns(),
+                arbiter.get_predicate(),
+                context,
             ) {
                 InsertConflictOutcome::Skip
             } else {
@@ -642,7 +688,15 @@ fn execute_insert_conflict(
         .get_columns()
         .expect("DO UPDATE requires a unique arbiter");
     let conflict = table
-        .find_visible_unique_conflict(row, snapshot, xid, &state.transactions, columns)
+        .find_visible_unique_conflict(
+            row,
+            snapshot,
+            xid,
+            &state.transactions,
+            columns,
+            arbiter.get_predicate(),
+            context,
+        )
         .map(|(row_id, version)| (row_id, version.xmin, version.row.clone()));
     let Some((row_id, version_xmin, current)) = conflict else {
         return Ok(InsertConflictOutcome::Insert);
@@ -699,6 +753,8 @@ fn execute_insert_conflict(
             Some(row_id),
             Some(&update.assigned),
             None,
+            None,
+            context,
         )
     {
         return Err(PgError::create(
@@ -896,7 +952,17 @@ pub(super) fn execute_insert(
             .tables
             .get(&schema.id)
             .expect("catalog table must have storage")
-            .has_visible_unique_conflict(&row, snapshot, xid, &state.transactions, None, None, None)
+            .has_visible_unique_conflict(
+                &row,
+                snapshot,
+                xid,
+                &state.transactions,
+                None,
+                None,
+                None,
+                None,
+                context,
+            )
         {
             return Err(PgError::create(
                 SqlState::UniqueViolation,
@@ -1058,6 +1124,8 @@ pub(super) fn execute_update(
                 Some(row_id),
                 Some(&assigned),
                 None,
+                None,
+                context,
             )
         {
             return Err(PgError::create(

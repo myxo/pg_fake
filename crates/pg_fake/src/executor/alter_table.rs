@@ -192,6 +192,8 @@ fn execute_alter_table_inner(
                 Some(altered.row_id),
                 None,
                 None,
+                None,
+                context,
             )
         {
             return Err(PgError::create(
@@ -896,6 +898,14 @@ fn remove_column_dependencies(
     remove_local_referencing_foreign_keys(schema, usize::MAX, &dependency, behavior)?;
     remove_referencing_foreign_keys(state, schema.id, dependency, behavior)?;
     state.catalog.drop_column_owned_sequences(schema.id, column);
+    schema.indexes.retain(|index| {
+        !index.columns.iter().any(|key| key.name == column)
+            && !index.include.iter().any(|included| included == column)
+            && !index
+                .predicate
+                .as_ref()
+                .is_some_and(|predicate| expression_references_column(predicate, column))
+    });
     schema.constraints.retain(|constraint| match constraint {
         crate::catalog::Constraint::PrimaryKey { columns, .. }
         | crate::catalog::Constraint::Unique { columns, .. } => {
@@ -1027,6 +1037,21 @@ fn rename_schema_expressions(schema: &mut TableSchema, old_name: &str, new_name:
     for constraint in &mut schema.constraints {
         if let crate::catalog::Constraint::Check { expression, .. } = constraint {
             rename_expression_column(expression, old_name, new_name);
+        }
+    }
+    for index in &mut schema.indexes {
+        for column in &mut index.columns {
+            if column.name == old_name {
+                column.name = new_name.to_owned();
+            }
+        }
+        for column in &mut index.include {
+            if column == old_name {
+                *column = new_name.to_owned();
+            }
+        }
+        if let Some(predicate) = &mut index.predicate {
+            rename_expression_column(predicate, old_name, new_name);
         }
     }
 }

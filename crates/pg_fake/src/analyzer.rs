@@ -1258,7 +1258,6 @@ pub(crate) fn create_typed_literal(value: Value, data_type: PgType) -> ast::Expr
         kind: ast::CastKind::Cast,
         expr: Box::new(ast::Expr::Value(literal.into())),
         data_type: convert_to_ast_data_type(data_type),
-        array: false,
         format: None,
     }
 }

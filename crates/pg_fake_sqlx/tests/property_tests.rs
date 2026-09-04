@@ -204,6 +204,27 @@ fn assert_statement(
     sql: &str,
     row_order: RowOrder,
 ) {
+    assert_statement_outcome(runtime, postgres, fake, sql, row_order, false);
+}
+
+fn assert_statement_allow_error(
+    runtime: &Runtime,
+    postgres: &mut PgConnection,
+    fake: &mut PgFakeConnection,
+    sql: &str,
+    row_order: RowOrder,
+) {
+    assert_statement_outcome(runtime, postgres, fake, sql, row_order, true);
+}
+
+fn assert_statement_outcome(
+    runtime: &Runtime,
+    postgres: &mut PgConnection,
+    fake: &mut PgFakeConnection,
+    sql: &str,
+    row_order: RowOrder,
+    allow_error: bool,
+) {
     let mut statements = parser::parse(sql)
         .unwrap_or_else(|error| panic!("generated SQL must parse: {sql}\n{error}"));
     assert_eq!(
@@ -217,7 +238,7 @@ fn assert_statement(
         TestConnection::Fake(fake),
     ]
     .map(|mut connection| connection.execute(runtime, &statement, sql));
-    if let Outcome::Error(sqlstate) = &expected {
+    if !allow_error && let Outcome::Error(sqlstate) = &expected {
         panic!("generator produced invalid SQL ({sqlstate}): {sql}");
     }
     match (expected, actual) {
@@ -1959,6 +1980,126 @@ fn generated_alter_table_rewrites_match_postgres() {
                 &sql,
                 RowOrder::Ordered,
             );
+        }
+    });
+}
+
+#[test]
+fn generated_partial_unique_indexes_match_postgres() {
+    let _test_lock = TEST_LOCK.lock().expect("test mutex must not be poisoned");
+    let server = start_postgres_server();
+    let runtime = tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()
+        .unwrap();
+    let postgres = RefCell::new(
+        runtime
+            .block_on(PgConnection::connect(&server.url))
+            .expect("must connect SQLx to PostgreSQL 18 once"),
+    );
+    check(|src| {
+        let table = format!(
+            "pg_fake_index_property_{}_{}",
+            std::process::id(),
+            TABLE_NUMBER.fetch_add(1, Ordering::Relaxed)
+        );
+        let mut postgres_connection = postgres.borrow_mut();
+        let mut postgres = PostgresCase {
+            connection: &mut postgres_connection,
+            runtime: &runtime,
+            table: table.clone(),
+        };
+        let mut fake = PgFakeConnection::new(Db::create());
+        let key_count = src.any_of("key_count", int_in(1_usize..=4));
+        let keys = (1..=key_count)
+            .map(|index| {
+                let direction = if src.any("descending") { "DESC" } else { "ASC" };
+                format!("key_{index} {direction}")
+            })
+            .collect::<Vec<_>>()
+            .join(", ");
+        let key_values = "1, 1, 1, 1";
+        let predicates = [
+            ("active", "true, 1, 1", "false, 1, 1"),
+            ("deleted_at IS NULL", "true, NULL, 1", "true, 1, 1"),
+            ("deleted_at IS NOT NULL", "true, 1, 1", "true, NULL, 1"),
+            ("state = 1", "true, 1, 1", "true, 1, 2"),
+            ("state != 2", "true, 1, 1", "true, 1, 2"),
+            ("state IN (1, 2, 3)", "true, 1, 1", "true, 1, 4"),
+            (
+                "(active AND state >= 0) OR deleted_at IS NULL",
+                "true, 1, 0",
+                "false, 1, -1",
+            ),
+        ];
+        let ((predicate, qualifying, non_qualifying), _) =
+            src.choose("predicate", &predicates).unwrap();
+        let definitions = (1..=4)
+            .map(|index| format!("key_{index} INTEGER"))
+            .collect::<Vec<_>>()
+            .join(", ");
+        let statements = [
+            (
+                format!(
+                    "CREATE TABLE {table} ({definitions}, active BOOLEAN, deleted_at INTEGER, state INTEGER, payload INTEGER)"
+                ),
+                false,
+            ),
+            (
+                format!(
+                    "INSERT INTO {table} VALUES ({key_values}, {qualifying}, 10), ({key_values}, {non_qualifying}, 20)"
+                ),
+                false,
+            ),
+            (
+                format!(
+                    "CREATE UNIQUE INDEX {table}_key ON {table} ({keys}) INCLUDE (payload) WHERE {predicate}"
+                ),
+                false,
+            ),
+            (
+                format!("INSERT INTO {table} VALUES ({key_values}, {qualifying}, 30)"),
+                true,
+            ),
+            (
+                format!("INSERT INTO {table} VALUES ({key_values}, {non_qualifying}, 40)"),
+                false,
+            ),
+            (
+                format!(
+                    "INSERT INTO {table} VALUES ({key_values}, {qualifying}, 50) \
+                 ON CONFLICT ({}) WHERE {predicate} DO UPDATE SET payload = excluded.payload",
+                    (1..=key_count)
+                        .map(|index| format!("key_{index}"))
+                        .collect::<Vec<_>>()
+                        .join(", ")
+                ),
+                false,
+            ),
+            (
+                format!("SELECT payload FROM {table} ORDER BY payload"),
+                false,
+            ),
+        ];
+        for (sql, allow_error) in statements {
+            src.log_value("sql", &sql);
+            if allow_error {
+                assert_statement_allow_error(
+                    &runtime,
+                    postgres.get_connection(),
+                    &mut fake,
+                    &sql,
+                    RowOrder::Ordered,
+                );
+            } else {
+                assert_statement(
+                    &runtime,
+                    postgres.get_connection(),
+                    &mut fake,
+                    &sql,
+                    RowOrder::Ordered,
+                );
+            }
         }
     });
 }

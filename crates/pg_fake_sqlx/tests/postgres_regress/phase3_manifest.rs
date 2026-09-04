@@ -374,6 +374,51 @@ pub const FEATURES: &[Feature] = &[
         ],
     },
     Feature {
+        name: "index DDL and partial unique indexes",
+        cases: &[
+            Case {
+                id: "covering_partial_index",
+                source: "focused migration index fixture",
+                setup: &[
+                    "CREATE TABLE phase3_index_covering (tenant_id INTEGER, state TEXT, deleted_at INTEGER, payload TEXT)",
+                ],
+                sql: "CREATE INDEX phase3_index_covering_idx ON phase3_index_covering (tenant_id ASC, state DESC) INCLUDE (payload) WHERE deleted_at IS NULL",
+                blocker: BlockerKind::Implementation,
+            },
+            Case {
+                id: "partial_unique_arbiter",
+                source: "focused migration partial-unique fixture",
+                setup: &[
+                    "CREATE TABLE phase3_index_arbiter (account_id INTEGER, active BOOLEAN, value INTEGER)",
+                    "CREATE UNIQUE INDEX phase3_index_arbiter_idx ON phase3_index_arbiter (account_id) WHERE active",
+                    "INSERT INTO phase3_index_arbiter VALUES (1, true, 10)",
+                ],
+                sql: "INSERT INTO phase3_index_arbiter VALUES (1, true, 20) ON CONFLICT (account_id) WHERE active DO UPDATE SET value = excluded.value",
+                blocker: BlockerKind::Implementation,
+            },
+            Case {
+                id: "rename_index_if_exists",
+                source: "focused migration index-rename fixture",
+                setup: &[
+                    "CREATE TABLE phase3_index_rename (id INTEGER)",
+                    "CREATE INDEX phase3_index_old_name ON phase3_index_rename (id)",
+                ],
+                sql: "ALTER INDEX IF EXISTS phase3_index_old_name RENAME TO phase3_index_new_name",
+                blocker: BlockerKind::Implementation,
+            },
+            Case {
+                id: "drop_index_if_exists",
+                source: "drop_if_exists.sql:31 plus focused migration fixture",
+                setup: &[
+                    "CREATE TABLE phase3_index_drop (id INTEGER)",
+                    "CREATE INDEX phase3_index_drop_idx ON phase3_index_drop (id)",
+                ],
+                sql: "DROP INDEX IF EXISTS phase3_index_drop_idx",
+                blocker: BlockerKind::Implementation,
+            },
+        ],
+    },
+    Feature {
         name: "ordinary views",
         cases: &[Case {
             id: "select_from_view",
