@@ -12,6 +12,7 @@ use futures_util::{TryStreamExt, stream};
 use hashlink::LinkedHashMap;
 use log::LevelFilter;
 use pg_fake::api::{Db, PreparedStatement as CoreStatement, Session, StatementResult};
+use pg_fake::error::SqlState;
 use pg_fake::value::BaseType;
 use sqlx::{
     ColumnIndex, ConnectOptions, Connection, Database, Execute, Executor, SqlStr, Statement,
@@ -236,6 +237,7 @@ impl PgFakeConnection {
                     state.session.execute("ROLLBACK").map_err(database_error)?;
                 }
                 let results = if let Some(arguments) = arguments {
+                    let is_explicit_statement = statement.is_some();
                     let prepared = if let Some(statement) = statement {
                         statement.statement
                     } else if persistent {
@@ -253,12 +255,28 @@ impl PgFakeConnection {
                     } else {
                         state.session.prepare(&sql).map_err(database_error)?
                     };
-                    vec![
+                    let result = state
+                        .session
+                        .execute_prepared_statement(&prepared, &arguments.values);
+                    let result = if persistent
+                        && !is_explicit_statement
+                        && matches!(
+                            &result,
+                            Err(error)
+                                if error.sqlstate == SqlState::FeatureNotSupported
+                                    && error.message == "cached plan must be replanned"
+                        ) {
+                        let prepared = state.session.prepare(&sql).map_err(database_error)?;
+                        if sql.len() <= state.statement_cache_limit_bytes {
+                            state.statements.insert(sql.clone(), prepared.clone());
+                        }
                         state
                             .session
                             .execute_prepared_statement(&prepared, &arguments.values)
-                            .map_err(database_error)?,
-                    ]
+                    } else {
+                        result
+                    };
+                    vec![result.map_err(database_error)?]
                 } else {
                     state.session.execute(&sql).map_err(database_error)?
                 };

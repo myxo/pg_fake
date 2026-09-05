@@ -70,6 +70,22 @@ async fn sqlx_queries_map_all_phase_one_types() {
 }
 
 #[tokio::test]
+async fn cached_ddl_statements_reprepare_after_recreating_a_table() {
+    let mut connection = PgFakeConnection::new(Db::create());
+
+    for _ in 0..2 {
+        sqlx::query("CREATE TABLE cached_ddl (id INTEGER)")
+            .execute(&mut connection)
+            .await
+            .unwrap();
+        sqlx::query("DROP TABLE cached_ddl")
+            .execute(&mut connection)
+            .await
+            .unwrap();
+    }
+}
+
+#[tokio::test]
 async fn sqlx_uuid_values_round_trip() {
     let mut connection = PgFakeConnection::new(Db::create());
     let value = uuid::Uuid::parse_str("a0eebc99-9c0b-4ef8-bba9-6a6c0f3b0af7").unwrap();
