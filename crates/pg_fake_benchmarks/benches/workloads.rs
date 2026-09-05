@@ -560,6 +560,16 @@ fn benchmark_jsonb(
     }
     for (name, query, cleanup) in [
         (
+            "jsonb_extraction",
+            "SELECT payload #>> '{value}' FROM jsonb_join_group",
+            None,
+        ),
+        (
+            "jsonb_containment",
+            "SELECT id FROM jsonb_join_group WHERE payload @> '{\"value\":1}'",
+            None,
+        ),
+        (
             "jsonb_insert_returning",
             r#"INSERT INTO jsonb_insert_returning VALUES ('{"amount":{"value":"12.50","currency":"USD"},"tags":[1,2,3]}') RETURNING payload"#,
             Some("DELETE FROM jsonb_insert_returning"),

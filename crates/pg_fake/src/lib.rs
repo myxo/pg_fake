@@ -7,6 +7,7 @@ mod executor;
 pub mod jsonb;
 pub mod parser;
 mod storage;
+mod text_array;
 mod txn;
 pub mod value;
 

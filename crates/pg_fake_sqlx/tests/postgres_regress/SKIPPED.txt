@@ -40,7 +40,7 @@ delete:3
 domain:1
 drop_if_exists:19
 drop_operator:1
-encoding:8
+encoding:11
 enum:1
 errors:2
 expressions:1
@@ -62,7 +62,7 @@ interval:1
 join:30
 join_hash:5
 json:8
-json_encoding:7
+json_encoding:27
 jsonb:36
 jsonb_jsonpath:1
 jsonpath:1

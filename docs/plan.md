@@ -741,7 +741,45 @@ measurements ran without concurrent tests and are indicative, not a recorded
 baseline; the join/group workload currently misses the project's speed target.
 
 
-### Task 18 — Core JSON and JSONB operators and functions
+### Task 18 — Core JSON and JSONB operators and functions [COMPLETE]
+
+**Progress:**
+
+- Implemented extraction, containment/existence, concatenation/deletion,
+  builders, conversion, mutation, length, and type inspection.
+- Added `FROM` expansion with aliases, ordinality, preceding-table references,
+  inner/outer joins, and scalar-subquery arguments. `SELECT`-list expansion
+  remains explicitly unsupported, as agreed.
+- Added the bounded `text[]` argument representation needed by JSON paths and
+  key lists, including native/SQLx parameters. Other element types, dimensions,
+  explicit bounds, and general array operations remain Tasks 33–34.
+- Added focused and generated PostgreSQL differential coverage, prepared-query
+  metadata checks, mutation atomicity tests, conformance fixtures, and JSONB
+  extraction/containment benchmarks.
+- Fixed JSON differential cases live in `json_differential.rs`; the 12
+  generated tests remain in `property_tests.rs`. Both suites share the
+  PostgreSQL comparison and isolated-database harness in `common/differential.rs`.
+  After the split, all four differential tests and all 12 property tests pass
+  with `CHAOS_THEORY_CHECK_ITERS=100 CHAOS_THEORY_CHECK_TIME=30s`; review is clean.
+- Subagent review is clean, including nested/outer joins, merged `USING`
+  columns, qualified aliases, and grouped wildcard projections.
+- Formatting and all 404 workspace tests pass (`--skip generated`; generated
+  cases run in the separate required property gate). Clippy completes with the
+  same 79 existing warnings. The regression audit reports 675 matching
+  statements, 141 skipped scripts, 32/32 Phase 2 cases, and 50/60 Phase 3 cases.
+- The required `CHAOS_THEORY_CHECK_ITERS=10000
+  CHAOS_THEORY_CHECK_TIME=600s cargo test -p pg_fake_sqlx --test property_tests`
+  gate passed all 16 tests before separating the four fixed differential tests. A preceding attempt hit
+  PostgreSQL disk-full error `53100`; removing generated Rust incremental build
+  caches resolved it, and the full rerun passed in 619 seconds.
+- Both JSONB benchmarks execute against a 100-row fixture. A short 10-sample
+  run without concurrent tests measured extraction at approximately 95 µs for
+  `pg_fake` versus 66 µs for PostgreSQL, and containment at 213 versus 42 µs.
+  Both currently miss the project's speed target. These are indicative timings,
+  not a recorded baseline; Criterion's Gnuplot chart generation failed, but
+  timing measurements completed.
+- Implementation and review are finished; the user approved committing the task.
+
 
 **Goal:** Cover the planned JSON surface used by application queries and
 migrations.
@@ -761,8 +799,9 @@ migrations.
   `jsonb_array_elements`, `json_array_elements_text`, and
   `jsonb_array_elements_text`. Missing paths, negative indexes, duplicate keys,
   containment, parameters, and errors have differential/property tests.
-- Set-returning JSON functions are accepted only in executor positions with
-  implemented semantics; unsupported placement fails loudly.
+- Set-returning JSON functions are supported in `FROM`, including references
+  to preceding tables and functions. Expansion in the `SELECT` list and other
+  unsupported placements fail loudly.
 - Benchmarks cover JSONB extraction and containment.
 
 **Notes:** JSONPath, SQL/JSON constructors, `JSON_TABLE`, JSON indexes, and

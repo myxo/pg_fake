@@ -393,6 +393,24 @@ pub(crate) fn infer_expression_type(expr: &ast::Expr, schema: RowScope<'_>) -> R
                 ))
             }
         }
+        ast::Expr::BinaryOp { left, op, right }
+            if super::json::infer_json_operator(op, left, right, schema)?.is_some() =>
+        {
+            Ok(super::json::infer_json_operator(op, left, right, schema)?
+                .expect("resolved JSON operator")
+                .2)
+        }
+        ast::Expr::Array(array) => {
+            for element in &array.elem {
+                validate_function_argument(element, BaseType::Text, schema, &|| {
+                    PgError::create(
+                        SqlState::DatatypeMismatch,
+                        "text array element has incompatible type",
+                    )
+                })?;
+            }
+            Ok(BaseType::TextArray)
+        }
         ast::Expr::BinaryOp { left, op, right } => match op {
             ast::BinaryOperator::Plus
             | ast::BinaryOperator::Minus
@@ -740,7 +758,7 @@ fn resolve_expression_list_type(
 }
 
 #[cfg_attr(feature = "execution-log", tracing::instrument(skip_all))]
-fn extract_function_arguments(function: &ast::Function) -> Result<Vec<&ast::Expr>> {
+pub(super) fn extract_function_arguments(function: &ast::Function) -> Result<Vec<&ast::Expr>> {
     if function.uses_odbc_syntax
         || !matches!(function.parameters, ast::FunctionArguments::None)
         || function.filter.is_some()
@@ -782,6 +800,9 @@ fn infer_function_return_type(function: &ast::Function, schema: RowScope<'_>) ->
             format!("function {function_name} does not exist"),
         )
     };
+    if let Some(base) = super::json::infer_json_function(&function_name, &arguments, schema)? {
+        return Ok(base);
+    }
     match function_name.as_str() {
         "coalesce" if !arguments.is_empty() => resolve_expression_list_type(&arguments, schema),
         "greatest" | "least" if !arguments.is_empty() => {
@@ -862,7 +883,7 @@ fn infer_function_return_type(function: &ast::Function, schema: RowScope<'_>) ->
 }
 
 #[cfg_attr(feature = "execution-log", tracing::instrument(skip_all))]
-fn validate_function_argument(
+pub(super) fn validate_function_argument(
     argument: &ast::Expr,
     target: BaseType,
     schema: RowScope<'_>,
@@ -903,7 +924,38 @@ pub(super) fn evaluate(
             }
             evaluate_unary_operator(*op, evaluate(expr, schema, row, context)?)
         }
+        ast::Expr::Array(array) => {
+            let values = array
+                .elem
+                .iter()
+                .map(|element| {
+                    let value = evaluate_and_coerce(
+                        element,
+                        BaseType::Text,
+                        CastContext::Implicit,
+                        schema,
+                        row,
+                        context,
+                    )?;
+                    Ok(match value {
+                        Value::Null => None,
+                        Value::Text(value) => Some(value),
+                        _ => unreachable!(),
+                    })
+                })
+                .collect::<Result<Vec<_>>>()?;
+            Ok(Value::TextArray(values))
+        }
         ast::Expr::BinaryOp { left, op, right } => {
+            if let Some((l, r, result)) = super::json::infer_json_operator(op, left, right, schema)?
+            {
+                return super::json::evaluate_json_operator(
+                    op,
+                    evaluate_and_coerce(left, l, CastContext::Implicit, schema, row, context)?,
+                    evaluate_and_coerce(right, r, CastContext::Implicit, schema, row, context)?,
+                    result,
+                );
+            }
             let left_type = infer_expression_type(left, schema)?;
             let right_type = infer_expression_type(right, schema)?;
             if matches!(
@@ -1319,6 +1371,16 @@ fn evaluate_function(
     let function_name = normalize_unqualified_object_name(&function.name)?;
     let arguments = extract_function_arguments(function)?;
     let result_type = infer_function_return_type(function, schema)?;
+    if super::json::infer_json_function(&function_name, &arguments, schema)?.is_some() {
+        return super::json::evaluate_json_function(
+            &function_name,
+            &arguments,
+            result_type,
+            schema,
+            row,
+            context,
+        );
+    }
     match function_name.as_str() {
         "gen_random_uuid" | "uuidv4" => {
             let mut bytes = [0; 16];

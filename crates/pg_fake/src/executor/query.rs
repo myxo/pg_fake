@@ -2494,7 +2494,12 @@ impl ast::VisitorMut for SubqueryMaterializer<'_> {
                     ) =>
             {
                 match self.scopes.last().map(|outer| {
-                    references_outer_scope(&self.state.catalog, &correlation_candidate, outer)
+                    collect_outer_reference_slots(
+                        &self.state.catalog,
+                        &correlation_candidate,
+                        outer,
+                    )
+                    .map(|slots| !slots.is_empty())
                 }) {
                     Some(Ok(true)) => {}
                     Some(Err(scope_error)) => self.error = Some(scope_error),
@@ -2603,6 +2608,7 @@ fn materialize_subqueries<V: ast::VisitMut>(
 }
 
 struct OuterReferenceSubstituter<'a> {
+    referenced_slots: BTreeSet<usize>,
     catalog: &'a Catalog,
     outer_scope: &'a BoundScope,
     outer_row: &'a [Value],
@@ -2765,7 +2771,8 @@ impl ast::VisitorMut for OuterReferenceSubstituter<'_> {
             }
         }
         match self.outer_scope.resolve_column(identifiers) {
-            Ok((_, data_type)) => {
+            Ok((slot, data_type)) => {
+                self.referenced_slots.insert(slot);
                 match RowScope::Bound(self.outer_scope)
                     .resolve_column_value(identifiers, self.outer_row)
                 {
@@ -2804,14 +2811,15 @@ impl ast::VisitorMut for OuterReferenceSubstituter<'_> {
 }
 
 #[cfg_attr(feature = "execution-log", tracing::instrument(skip_all))]
-fn references_outer_scope(
+pub(super) fn collect_outer_reference_slots(
     catalog: &Catalog,
     expression: &ast::Expr,
     outer_scope: &BoundScope,
-) -> Result<bool> {
+) -> Result<BTreeSet<usize>> {
     let mut expression = expression.clone();
     let outer_row = vec![Value::Null; outer_scope.columns.len()];
     let mut substituter = OuterReferenceSubstituter {
+        referenced_slots: BTreeSet::new(),
         catalog,
         outer_scope,
         outer_row: &outer_row,
@@ -2825,7 +2833,9 @@ fn references_outer_scope(
         reject_ambiguous_unqualified: false,
     };
     let _ = expression.visit(&mut substituter);
-    substituter.error.map_or(Ok(substituter.substituted), Err)
+    substituter
+        .error
+        .map_or(Ok(substituter.referenced_slots), Err)
 }
 
 #[cfg_attr(feature = "execution-log", tracing::instrument(skip_all))]
@@ -2843,6 +2853,7 @@ pub(super) fn evaluate_query_expression(
     }
     let mut expression = expression.clone();
     let mut substituter = OuterReferenceSubstituter {
+        referenced_slots: BTreeSet::new(),
         catalog: &state.catalog,
         outer_scope: scope,
         outer_row: row,
@@ -2934,6 +2945,7 @@ pub(crate) fn substitute_procedural_references(
         _ => Vec::new(),
     };
     let mut substituter = OuterReferenceSubstituter {
+        referenced_slots: BTreeSet::new(),
         catalog: &state.catalog,
         outer_scope: scope,
         outer_row: row,
@@ -3084,7 +3096,7 @@ fn describe_set_expression_columns(
 }
 pub(super) enum ProjectionSource<'a> {
     Column(usize),
-    Merged(usize, usize, PgType),
+    Merged(Vec<usize>, PgType, Option<String>),
     Expression(&'a ast::Expr),
 }
 enum OrderKey<'a> {
@@ -3970,20 +3982,32 @@ fn create_projection_expression(
             let column = scope
                 .columns
                 .iter()
-                .find(|column| column.slot == *slot && column.wildcard)
+                .find(|column| column.slot == *slot)
                 .expect("projected column is present in the bound scope");
             ast::Expr::CompoundIdentifier(vec![
                 ast::Ident::new(column.qualifier.clone()),
                 ast::Ident::new(column.name.clone()),
             ])
         }
-        ProjectionSource::Merged(left, right, _) => {
+        ProjectionSource::Merged(slots, _, qualifier) => {
             let column = scope
                 .columns
                 .iter()
-                .find(|column| column.merged == Some((*left, *right)) && column.wildcard)
+                .find(|column| match qualifier {
+                    Some(qualifier) => {
+                        column.qualifier == *qualifier
+                            && column.qualified_merged.as_ref() == Some(slots)
+                    }
+                    None => column.merged.as_ref() == Some(slots) && column.wildcard,
+                })
                 .expect("projected merged column is present in the bound scope");
-            ast::Expr::Identifier(ast::Ident::new(column.name.clone()))
+            match qualifier {
+                Some(qualifier) => ast::Expr::CompoundIdentifier(vec![
+                    ast::Ident::new(qualifier.clone()),
+                    ast::Ident::new(column.name.clone()),
+                ]),
+                None => ast::Expr::Identifier(ast::Ident::new(column.name.clone())),
+            }
         }
     }
 }
@@ -4125,6 +4149,9 @@ fn bind_values_scope(values: &ast::Values) -> Result<BoundScope> {
                 data_type,
                 qualifier: String::new(),
                 slot,
+                output_order: slot,
+                qualified_order: slot,
+                qualified_merged: None,
                 merged: None,
                 unqualified: true,
                 wildcard: true,
@@ -5414,12 +5441,13 @@ fn evaluate_projection_value(
 ) -> Result<Value> {
     match projection {
         ProjectionSource::Column(index) => Ok(row[*index].clone()),
-        ProjectionSource::Merged(left, right, data_type) => {
-            let value = if row[*left].is_null() {
-                row[*right].clone()
-            } else {
-                row[*left].clone()
-            };
+        ProjectionSource::Merged(slots, data_type, _) => {
+            let value = slots
+                .iter()
+                .map(|slot| &row[*slot])
+                .find(|value| !value.is_null())
+                .cloned()
+                .unwrap_or(Value::Null);
             if value.is_null() {
                 Ok(value)
             } else {
@@ -7207,11 +7235,11 @@ pub(super) fn build_projection_plan<'a>(
     for item in projection {
         match item {
             ast::SelectItem::Wildcard(_) => {
-                for column in &scope.columns {
+                for column in scope.select_wildcard_columns(None) {
                     if column.wildcard {
-                        projections.push(match column.merged {
-                            Some((left, right)) => {
-                                ProjectionSource::Merged(left, right, column.data_type)
+                        projections.push(match &column.merged {
+                            Some(slots) => {
+                                ProjectionSource::Merged(slots.clone(), column.data_type, None)
                             }
                             None => ProjectionSource::Column(column.slot),
                         });
@@ -7228,11 +7256,7 @@ pub(super) fn build_projection_plan<'a>(
                 _,
             ) => {
                 let qualifier = normalize_unqualified_object_name(object_name)?;
-                let matching = scope
-                    .columns
-                    .iter()
-                    .filter(|column| column.qualifier == qualifier && column.wildcard)
-                    .collect::<Vec<_>>();
+                let matching = scope.select_wildcard_columns(Some(&qualifier));
                 if matching.is_empty()
                     && !scope
                         .columns
@@ -7245,7 +7269,15 @@ pub(super) fn build_projection_plan<'a>(
                     ));
                 }
                 for column in matching {
-                    projections.push(ProjectionSource::Column(column.slot));
+                    projections.push(if let Some(slots) = &column.qualified_merged {
+                        ProjectionSource::Merged(
+                            slots.clone(),
+                            column.data_type,
+                            Some(column.qualifier.clone()),
+                        )
+                    } else {
+                        ProjectionSource::Column(column.slot)
+                    });
                     columns.push(ColumnMeta {
                         name: column.name.clone(),
                         type_oid: column.data_type.map_to_oid(),
@@ -7266,11 +7298,9 @@ pub(super) fn build_projection_plan<'a>(
                 expression @ ast::Expr::CompoundIdentifier(identifiers),
             ) => {
                 let (slot, data_type) = scope.resolve_column(identifiers)?;
-                if scope
-                    .columns
-                    .iter()
-                    .any(|column| column.slot == slot && column.wildcard)
-                {
+                if scope.columns.iter().any(|column| {
+                    column.slot == slot && column.wildcard && column.qualified_merged.is_none()
+                }) {
                     projections.push(ProjectionSource::Column(slot));
                 } else {
                     projections.push(ProjectionSource::Expression(expression));
@@ -7414,6 +7444,24 @@ pub(super) fn materialize_from_rows(
     let mut next_slot = start_slot;
     let mut rows = vec![vec![Value::Null; scope.columns.len()]];
     for table in from {
+        let functions = super::json::contains_json_expansion(&table.relation)
+            || table
+                .joins
+                .iter()
+                .any(|join| super::json::contains_json_expansion(&join.relation));
+        if functions {
+            let start = next_slot;
+            let mut expanded = Vec::new();
+            for prefix in &rows {
+                let mut slot = start;
+                expanded.extend(materialize_table_with_joins_rows(
+                    state, table, scope, xid, snapshot, context, selection, &mut slot, prefix,
+                )?);
+                next_slot = slot;
+            }
+            rows = expanded;
+            continue;
+        }
         let source = materialize_table_with_joins_rows(
             state,
             table,
@@ -7423,6 +7471,7 @@ pub(super) fn materialize_from_rows(
             context,
             selection,
             &mut next_slot,
+            &vec![Value::Null; scope.columns.len()],
         )?;
         rows = rows
             .into_iter()
@@ -7471,9 +7520,9 @@ fn visit_query_source_rows(
 
 #[cfg_attr(feature = "execution-log", tracing::instrument(skip_all))]
 fn can_stream_join(table: &ast::TableWithJoins) -> bool {
-    matches!(table.relation, ast::TableFactor::Table { .. })
+    matches!(table.relation, ast::TableFactor::Table { args: None, .. })
         && table.joins.iter().all(|join| {
-            matches!(join.relation, ast::TableFactor::Table { .. })
+            matches!(join.relation, ast::TableFactor::Table { args: None, .. })
                 && matches!(
                     join.join_operator,
                     ast::JoinOperator::Join(_)
@@ -7965,6 +8014,7 @@ fn materialize_table_with_joins_rows(
     context: &StatementExecutionContext,
     selection: Option<&ast::Expr>,
     next_slot: &mut usize,
+    prefix: &[Value],
 ) -> Result<Vec<Vec<Value>>> {
     let left_start = *next_slot;
     let mut rows = materialize_table_factor_rows(
@@ -7976,9 +8026,72 @@ fn materialize_table_with_joins_rows(
         context,
         selection,
         next_slot,
+        prefix,
     )?;
+    for row in &mut rows {
+        for (value, prefix) in row.iter_mut().zip(prefix) {
+            if value.is_null() {
+                *value = prefix.clone();
+            }
+        }
+    }
     for join in &table.joins {
         let right_start = *next_slot;
+        if super::json::contains_json_expansion(&join.relation)
+            && !matches!(
+                join.join_operator,
+                ast::JoinOperator::Right(_)
+                    | ast::JoinOperator::RightOuter(_)
+                    | ast::JoinOperator::FullOuter(_)
+            )
+        {
+            let mut bound = BoundScope {
+                columns: scope.columns[..right_start].to_vec(),
+            };
+            super::scope::bind_table_factor(&state.catalog, &join.relation, &mut bound)?;
+            *next_slot = bound.columns.len();
+            let mut joined = Vec::new();
+            for left in rows {
+                let mut matched = false;
+                let mut slot = right_start;
+                for row in materialize_table_factor_rows(
+                    state,
+                    &join.relation,
+                    scope,
+                    xid,
+                    snapshot,
+                    context,
+                    selection,
+                    &mut slot,
+                    &left,
+                )? {
+                    if evaluate_join_condition(
+                        state,
+                        &join.join_operator,
+                        &row,
+                        scope,
+                        left_start,
+                        right_start,
+                        xid,
+                        snapshot,
+                        context,
+                    )? {
+                        matched = true;
+                        joined.push(row);
+                    }
+                }
+                if !matched
+                    && matches!(
+                        join.join_operator,
+                        ast::JoinOperator::Left(_) | ast::JoinOperator::LeftOuter(_)
+                    )
+                {
+                    joined.push(left);
+                }
+            }
+            rows = joined;
+            continue;
+        }
         let right_rows = materialize_table_factor_rows(
             state,
             &join.relation,
@@ -7988,6 +8101,7 @@ fn materialize_table_with_joins_rows(
             context,
             selection,
             next_slot,
+            prefix,
         )?;
         let mut joined = Vec::new();
         let mut matched_right = vec![false; right_rows.len()];
@@ -8060,20 +8174,74 @@ fn materialize_table_factor_rows(
     context: &StatementExecutionContext,
     selection: Option<&ast::Expr>,
     next_slot: &mut usize,
+    prefix: &[Value],
 ) -> Result<Vec<Vec<Value>>> {
+    if let Some(super::json::JsonTableFunction {
+        name,
+        argument,
+        ordinality,
+        ..
+    }) = super::json::extract_json_table_function(factor)?
+    {
+        let start = *next_slot;
+        *next_slot += super::json::describe_json_expansion(&name, ordinality).len();
+        let base = super::json::resolve_json_function_arguments(&name).expect("JSON expansion")[0];
+        let argument_scope = BoundScope {
+            columns: scope.columns[..start].to_vec(),
+        };
+        let value = if let Some(text) = extract_unknown_string_literal(argument) {
+            coercion::coerce_unknown(text, PgType::create(base), CastContext::Implicit)?
+        } else {
+            let source = super::scope::infer_expression_data_type(
+                &state.catalog,
+                argument,
+                &argument_scope,
+            )?
+            .base;
+            let value = evaluate_query_expression(
+                state,
+                argument,
+                &argument_scope,
+                prefix,
+                xid,
+                snapshot,
+                context,
+            )?;
+            coercion::coerce(value, source, PgType::create(base), CastContext::Implicit)?
+        };
+        return Ok(
+            super::json::evaluate_json_expansion(&name, value, ordinality)?
+                .into_iter()
+                .map(|values| {
+                    let mut row = prefix.to_vec();
+                    row[start..*next_slot].clone_from_slice(&values);
+                    row
+                })
+                .collect(),
+        );
+    }
     if let ast::TableFactor::NestedJoin {
         table_with_joins, ..
     } = factor
     {
+        let mut nested_scope = BoundScope {
+            columns: scope.columns[..*next_slot].to_vec(),
+        };
+        super::scope::bind_table_with_joins(&state.catalog, table_with_joins, &mut nested_scope)?;
+        let end = nested_scope.columns.len();
+        nested_scope
+            .columns
+            .extend_from_slice(&scope.columns[end..]);
         return materialize_table_with_joins_rows(
             state,
             table_with_joins,
-            scope,
+            &nested_scope,
             xid,
             snapshot,
             context,
             selection,
             next_slot,
+            prefix,
         );
     }
     if let ast::TableFactor::Derived {
@@ -8205,7 +8373,9 @@ fn selection_is_fully_pushed(select: &ast::Select, scope: &BoundScope) -> bool {
     let [table] = select.from.as_slice() else {
         return false;
     };
-    if !table.joins.is_empty() || !matches!(table.relation, ast::TableFactor::Table { .. }) {
+    if !table.joins.is_empty()
+        || !matches!(table.relation, ast::TableFactor::Table { args: None, .. })
+    {
         return false;
     }
     select
@@ -8319,13 +8489,30 @@ fn evaluate_using_join_condition(
         let data_type = coercion::resolve_common_type(left.data_type.base, right.data_type.base)
             .expect("bound USING columns must have a common type");
         let left = coercion::coerce(
-            row[left.slot].clone(),
+            left.merged
+                .as_deref()
+                .unwrap_or(std::slice::from_ref(&left.slot))
+                .iter()
+                .filter(|slot| **slot < right_start)
+                .map(|slot| &row[*slot])
+                .find(|v| !v.is_null())
+                .cloned()
+                .unwrap_or(Value::Null),
             left.data_type.base,
             PgType::create(data_type),
             CastContext::Implicit,
         )?;
         let right = coercion::coerce(
-            row[right.slot].clone(),
+            right
+                .merged
+                .as_deref()
+                .unwrap_or(std::slice::from_ref(&right.slot))
+                .iter()
+                .filter(|slot| **slot >= right_start)
+                .map(|slot| &row[*slot])
+                .find(|v| !v.is_null())
+                .cloned()
+                .unwrap_or(Value::Null),
             right.data_type.base,
             PgType::create(data_type),
             CastContext::Implicit,

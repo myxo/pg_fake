@@ -1,103 +1,28 @@
-use std::str::FromStr;
-
 #[cfg(test)]
 use std::{
     cell::RefCell,
     sync::atomic::{AtomicU64, Ordering},
 };
 
-use bigdecimal::BigDecimal;
 #[cfg(test)]
 use chaos_theory::check;
 use chaos_theory::{Effect, Source, make::int_in};
-use pg_fake::parser::{self, Statement};
-use pg_fake_sqlx::{Db, PgFake, PgFakeConnection};
-use sqlx::{
-    AssertSqlSafe, Column, ColumnIndex, Connection, Database, Decode, Executor, Row, Type,
-    TypeInfo, ValueRef,
-};
-use sqlx_postgres::{PgConnection, Postgres};
+use pg_fake_sqlx::{Db, PgFakeConnection};
+use sqlx::{AssertSqlSafe, Connection};
+use sqlx_postgres::PgConnection;
 use tokio::runtime::Runtime;
 
 #[cfg(test)]
 mod common;
+#[path = "common/differential.rs"]
+mod differential;
 
-#[derive(Debug, PartialEq, Eq)]
-enum Outcome {
-    Affected(u64),
-    Rows(Vec<Vec<Option<String>>>),
-    Error(String),
-}
-
-#[derive(Clone, Copy)]
-enum RowOrder {
-    Unordered,
-    Ordered,
-}
-
-fn returns_rows(statement: &Statement) -> bool {
-    match statement {
-        Statement::Query(_) => true,
-        Statement::Insert(insert) => insert.returning.is_some(),
-        Statement::Update(update) => update.returning.is_some(),
-        Statement::Delete(delete) => delete.returning.is_some(),
-        _ => false,
-    }
-}
+use differential::{RowOrder, assert_statement};
+#[cfg(test)]
+use differential::{assert_statement_allow_error, start_isolated_postgres_server};
 
 #[cfg(test)]
 static TABLE_NUMBER: AtomicU64 = AtomicU64::new(1);
-
-#[cfg(test)]
-struct PropertyPostgresServer {
-    url: String,
-    database: String,
-    connection: PgConnection,
-    runtime: Runtime,
-    _server: common::PostgresServer,
-}
-
-#[cfg(test)]
-impl Drop for PropertyPostgresServer {
-    fn drop(&mut self) {
-        let sql = format!("DROP DATABASE {} WITH (FORCE)", self.database);
-        let _ = self
-            .runtime
-            .block_on(sqlx::raw_sql(AssertSqlSafe(sql.as_str())).execute(&mut self.connection));
-    }
-}
-
-#[cfg(test)]
-fn start_property_postgres_server() -> PropertyPostgresServer {
-    let server = common::start_postgres_server();
-    let runtime = tokio::runtime::Builder::new_current_thread()
-        .enable_all()
-        .build()
-        .expect("must create PostgreSQL setup runtime");
-    let mut connection = runtime
-        .block_on(PgConnection::connect(&server.url))
-        .expect("must connect to PostgreSQL for property-test setup");
-    let backend = runtime
-        .block_on(
-            sqlx::query_scalar::<_, i32>(AssertSqlSafe("SELECT pg_backend_pid()"))
-                .fetch_one(&mut connection),
-        )
-        .expect("must identify property-test setup connection");
-    let database = format!("pg_fake_property_{}_{backend}", std::process::id());
-    let mut url = url::Url::parse(&server.url).expect("must parse PostgreSQL test URL");
-    url.set_path(&database);
-    let sql = format!("CREATE DATABASE {database} TEMPLATE template0");
-    runtime
-        .block_on(sqlx::raw_sql(AssertSqlSafe(sql.as_str())).execute(&mut connection))
-        .expect("must create isolated property-test database");
-    PropertyPostgresServer {
-        url: url.into(),
-        database,
-        connection,
-        runtime,
-        _server: server,
-    }
-}
 
 struct PostgresCase<'connection, 'runtime> {
     connection: &'connection mut PgConnection,
@@ -149,174 +74,6 @@ impl Drop for PostgresSessionsCase<'_, '_> {
         let _ = self
             .runtime
             .block_on(sqlx::raw_sql(AssertSqlSafe(sql.as_str())).execute(&mut self.connections[0]));
-    }
-}
-
-enum TestConnection<'connection> {
-    Fake(&'connection mut PgFakeConnection),
-    Postgres(&'connection mut PgConnection),
-}
-
-impl TestConnection<'_> {
-    fn execute(&mut self, runtime: &Runtime, statement: &Statement, sql: &str) -> Outcome {
-        match self {
-            Self::Fake(connection) => runtime.block_on(execute_sqlx::<PgFake>(
-                connection,
-                statement,
-                sql,
-                |result| result.rows_affected(),
-            )),
-            Self::Postgres(connection) => runtime.block_on(execute_sqlx::<Postgres>(
-                connection,
-                statement,
-                sql,
-                |result| result.rows_affected(),
-            )),
-        }
-    }
-}
-
-async fn execute_sqlx<DB>(
-    connection: &mut DB::Connection,
-    statement: &Statement,
-    sql: &str,
-    rows_affected: impl FnOnce(DB::QueryResult) -> u64,
-) -> Outcome
-where
-    DB: Database,
-    for<'connection> &'connection mut DB::Connection: Executor<'connection, Database = DB>,
-    for<'row> String: Decode<'row, DB> + Type<DB>,
-    usize: ColumnIndex<DB::Row>,
-{
-    if returns_rows(statement) {
-        match sqlx::raw_sql(AssertSqlSafe(sql))
-            .fetch_all(&mut *connection)
-            .await
-        {
-            Ok(rows) => {
-                let column_types = rows
-                    .first()
-                    .map(|row| {
-                        row.columns()
-                            .iter()
-                            .map(|column| column.type_info().name().to_owned())
-                            .collect::<Vec<_>>()
-                    })
-                    .unwrap_or_default();
-                let mut values = rows
-                    .iter()
-                    .map(|row| {
-                        (0..row.len())
-                            .map(|index| {
-                                let value = row.try_get_raw(index).unwrap();
-                                if value.is_null() {
-                                    None
-                                } else {
-                                    Some(row.try_get_unchecked::<String, _>(index).unwrap())
-                                }
-                            })
-                            .collect()
-                    })
-                    .collect::<Vec<_>>();
-                normalize_rows(&mut values, &column_types);
-                Outcome::Rows(values)
-            }
-            Err(error) => make_error_outcome(error),
-        }
-    } else {
-        match sqlx::raw_sql(AssertSqlSafe(sql))
-            .execute(&mut *connection)
-            .await
-        {
-            Ok(result) => Outcome::Affected(rows_affected(result)),
-            Err(error) => make_error_outcome(error),
-        }
-    }
-}
-
-fn make_error_outcome(error: sqlx::Error) -> Outcome {
-    Outcome::Error(
-        error
-            .as_database_error()
-            .and_then(|error| error.code())
-            .expect("database execution errors must have a SQLSTATE")
-            .into_owned(),
-    )
-}
-
-fn assert_statement(
-    runtime: &Runtime,
-    postgres: &mut PgConnection,
-    fake: &mut PgFakeConnection,
-    sql: &str,
-    row_order: RowOrder,
-) {
-    assert_statement_outcome(runtime, postgres, fake, sql, row_order, false);
-}
-
-fn assert_statement_allow_error(
-    runtime: &Runtime,
-    postgres: &mut PgConnection,
-    fake: &mut PgFakeConnection,
-    sql: &str,
-    row_order: RowOrder,
-) {
-    assert_statement_outcome(runtime, postgres, fake, sql, row_order, true);
-}
-
-fn assert_statement_outcome(
-    runtime: &Runtime,
-    postgres: &mut PgConnection,
-    fake: &mut PgFakeConnection,
-    sql: &str,
-    row_order: RowOrder,
-    allow_error: bool,
-) {
-    let mut statements = parser::parse(sql)
-        .unwrap_or_else(|error| panic!("generated SQL must parse: {sql}\n{error}"));
-    assert_eq!(
-        statements.len(),
-        1,
-        "generated operation must be one statement"
-    );
-    let statement = statements.pop().expect("statement count was checked");
-    let [expected, actual] = [
-        TestConnection::Postgres(postgres),
-        TestConnection::Fake(fake),
-    ]
-    .map(|mut connection| connection.execute(runtime, &statement, sql));
-    if !allow_error && let Outcome::Error(sqlstate) = &expected {
-        panic!("generator produced invalid SQL ({sqlstate}): {sql}");
-    }
-    match (expected, actual) {
-        (Outcome::Rows(mut expected), Outcome::Rows(mut actual)) => {
-            if matches!(row_order, RowOrder::Unordered) {
-                expected.sort();
-                actual.sort();
-            }
-            assert_eq!(actual, expected, "generated SQL: {sql}");
-        }
-        (expected, actual) => assert_eq!(actual, expected, "generated SQL: {sql}"),
-    }
-}
-
-fn normalize_rows(rows: &mut [Vec<Option<String>>], column_types: &[String]) {
-    for row in rows {
-        assert_eq!(row.len(), column_types.len());
-        for (value, column_type) in row.iter_mut().zip(column_types) {
-            let Some(value) = value else {
-                continue;
-            };
-            *value = match column_type.as_str() {
-                "FLOAT4" => format!("{:08x}", value.parse::<f32>().unwrap().to_bits()),
-                "FLOAT8" => format!("{:016x}", value.parse::<f64>().unwrap().to_bits()),
-                "NUMERIC" => BigDecimal::from_str(value)
-                    .unwrap()
-                    .normalized()
-                    .to_plain_string(),
-                _ => continue,
-            };
-        }
     }
 }
 
@@ -2070,7 +1827,7 @@ pub fn fuzz_generated_sql_matches_postgres(src: &mut Source) {
 
 #[test]
 fn generated_sql_matches_postgres() {
-    let server = start_property_postgres_server();
+    let server = start_isolated_postgres_server();
     let runtime = tokio::runtime::Builder::new_current_thread()
         .enable_all()
         .build()
@@ -2092,7 +1849,7 @@ fn generated_sql_matches_postgres() {
 
 #[test]
 fn generated_set_operations_match_postgres() {
-    let server = start_property_postgres_server();
+    let server = start_isolated_postgres_server();
     let runtime = tokio::runtime::Builder::new_current_thread()
         .enable_all()
         .build()
@@ -2117,248 +1874,8 @@ fn generated_set_operations_match_postgres() {
 }
 
 #[test]
-fn matches_json_storage_parameters_metadata_and_unsupported_operations() {
-    let server = start_property_postgres_server();
-    let runtime = tokio::runtime::Builder::new_current_thread()
-        .enable_all()
-        .build()
-        .expect("must create tokio runtime");
-    let mut postgres = runtime
-        .block_on(PgConnection::connect(&server.url))
-        .expect("must connect SQLx to PostgreSQL 18");
-    let mut fake = PgFakeConnection::new(Db::create());
-    let table = format!(
-        "pg_fake_json_differential_{}_{}",
-        std::process::id(),
-        TABLE_NUMBER.fetch_add(1, Ordering::Relaxed)
-    );
-    let cleanup = format!("DROP TABLE IF EXISTS {table}");
-    assert_statement(
-        &runtime,
-        &mut postgres,
-        &mut fake,
-        &cleanup,
-        RowOrder::Unordered,
-    );
-    let create = format!(
-        "CREATE TABLE {table} (id INTEGER, payload JSON NOT NULL CHECK (payload IS NOT NULL), fallback JSON DEFAULT '{{ \"default\" : [1, 2] }}')"
-    );
-    assert_statement(
-        &runtime,
-        &mut postgres,
-        &mut fake,
-        &create,
-        RowOrder::Unordered,
-    );
-
-    let document = r#"{ "z" : 1e+02, "z" : -0.00, "unicode" : "Привет 🌍" }"#;
-    let insert = format!(
-        "INSERT INTO {table} (id, payload) VALUES (1, $1::json) RETURNING payload, fallback"
-    );
-    let postgres_row = runtime
-        .block_on(
-            sqlx::query(AssertSqlSafe(insert.as_str()))
-                .bind(document)
-                .fetch_one(&mut postgres),
-        )
-        .unwrap();
-    let fake_row = runtime
-        .block_on(
-            sqlx::query(AssertSqlSafe(insert.as_str()))
-                .bind(document)
-                .fetch_one(&mut fake),
-        )
-        .unwrap();
-    let postgres_payload = postgres_row.get_unchecked::<String, _>(0);
-    let fake_payload = fake_row.get_unchecked::<String, _>(0);
-    assert_eq!(fake_payload, postgres_payload);
-    assert_eq!(fake_payload, document);
-    assert_eq!(
-        fake_row.try_get_unchecked::<&str, _>(0).unwrap(),
-        postgres_row.try_get_unchecked::<&str, _>(0).unwrap(),
-    );
-    assert_eq!(
-        fake_row.try_get_unchecked::<Option<&str>, _>(0).unwrap(),
-        postgres_row
-            .try_get_unchecked::<Option<&str>, _>(0)
-            .unwrap(),
-    );
-    assert_eq!(
-        fake_row.columns()[0].type_info().name(),
-        postgres_row.columns()[0].type_info().name(),
-    );
-    assert_eq!(fake_row.columns()[0].type_info().name(), "JSON");
-
-    let nested = format!("{}0{}", "[".repeat(512), "]".repeat(512));
-    let nested_sql = format!("SELECT '{nested}'::json");
-    assert_statement(
-        &runtime,
-        &mut postgres,
-        &mut fake,
-        &nested_sql,
-        RowOrder::Ordered,
-    );
-
-    for sql in [
-        "SELECT JSON '{\"typed\": true}'",
-        "SELECT '{}'::pg_catalog.json",
-        "SELECT '{\"$serde_json::private::Number\":null}'::json",
-        "SELECT ' {\"a\":1} '::json UNION ALL SELECT '[2]'",
-        "SELECT NULL UNION ALL SELECT '{}'::json",
-        "(SELECT '{}' AS payload, 1 AS position ORDER BY position) UNION ALL SELECT '{}'::json, 1",
-    ] {
-        assert_statement(&runtime, &mut postgres, &mut fake, sql, RowOrder::Ordered);
-    }
-
-    for sql in [
-        format!("INSERT INTO {table} (id, payload) VALUES (2, '[1,]')"),
-        format!("INSERT INTO {table} (id, payload) VALUES (2, '{{}}'::text)"),
-        format!("SELECT payload = payload FROM {table}"),
-        format!("SELECT payload FROM {table} ORDER BY payload"),
-        format!("SELECT payload FROM {table} GROUP BY payload"),
-        format!("SELECT DISTINCT payload FROM {table}"),
-        format!("SELECT count(DISTINCT payload) FROM {table}"),
-        "SELECT nullif('{}'::json, NULL::json)".into(),
-        "SELECT greatest('{}'::json, '{}'::json)".into(),
-        "SELECT CASE NULL::json WHEN '{}'::json THEN 1 ELSE 2 END".into(),
-        format!("SELECT '{{}}'::json = ANY (SELECT payload FROM {table} WHERE false)"),
-        format!("CREATE INDEX {table}_payload_idx ON {table} (payload)"),
-        format!("ALTER TABLE {table} ADD UNIQUE (payload)"),
-        "SELECT '{}'::json UNION SELECT '{}'::json".into(),
-        "VALUES ('{}'::json) ORDER BY 1".into(),
-        "VALUES ('{}'::json), ('[]'::json) ORDER BY 1".into(),
-        "SELECT least('{}'::json)".into(),
-        "SELECT * FROM (VALUES ('{}'::json)) AS left_side(payload) JOIN (VALUES ('{}'::json)) AS right_side(payload) USING (payload)".into(),
-        "WITH RECURSIVE documents(payload) AS (SELECT '{}'::json UNION SELECT payload FROM documents WHERE false) SELECT * FROM documents".into(),
-        "SELECT true OR ('['::json IS NULL)".into(),
-        "SELECT '[' WHERE false UNION ALL SELECT '{}'::json".into(),
-        "SELECT '{}'::json UNION ALL SELECT '[' WHERE false".into(),
-        "(SELECT '[' LIMIT 0) UNION ALL SELECT '{}'::json".into(),
-    ] {
-        assert_statement_allow_error(&runtime, &mut postgres, &mut fake, &sql, RowOrder::Ordered);
-    }
-    let drop = format!("DROP TABLE {table}");
-    assert_statement(
-        &runtime,
-        &mut postgres,
-        &mut fake,
-        &drop,
-        RowOrder::Unordered,
-    );
-}
-
-#[test]
-fn matches_jsonb_normalization_comparison_and_storage() {
-    let server = start_property_postgres_server();
-    let runtime = tokio::runtime::Builder::new_current_thread()
-        .enable_all()
-        .build()
-        .unwrap();
-    let mut postgres = runtime
-        .block_on(PgConnection::connect(&server.url))
-        .unwrap();
-    let mut fake = PgFakeConnection::new(Db::create());
-    for sql in [
-        "SELECT JSONB '{\"b\":2,\"aa\":1,\"b\":1.00}'",
-        "SELECT '{}'::pg_catalog.jsonb, 'null'::jsonb, NULL::jsonb",
-        r#"SELECT '{"$serde_json::private::Number":null}'::jsonb"#,
-        r#"SELECT '{"$serde_json::private::Number":"not a number"}'::jsonb"#,
-        r#"SELECT '{"a":1.230e-5,"b":-0.00,"c":1e+30}'::jsonb"#,
-        r#"SELECT '{"\u0061":"\ud83c\udf0d", "a":"last", "z":"\b\f\n\r\t"}'::jsonb"#,
-        "SELECT '{\"a\":1}'::json::jsonb::json::text, '[true]'::text::jsonb::varchar(4)",
-        "SELECT '{}'::jsonb UNION ALL SELECT '[]'",
-        "SELECT NULL UNION ALL SELECT '{}'::jsonb",
-        "SELECT '1.00'::jsonb = '1e0'::jsonb, '1.00'::jsonb <= '1e0'::jsonb",
-        "SELECT '[]'::jsonb < 'null'::jsonb, '[[]]'::jsonb > '[null]'::jsonb",
-        "SELECT DISTINCT payload FROM (VALUES ('1'::jsonb), ('1.0'::jsonb), ('null'::jsonb), (NULL::jsonb)) AS d(payload) ORDER BY payload",
-        "SELECT count(DISTINCT payload) FROM (VALUES ('1'::jsonb), ('1.0'::jsonb), ('null'::jsonb), (NULL::jsonb)) AS d(payload)",
-        "SELECT payload::text, count(*) FROM (VALUES ('1'::jsonb), ('1.0'::jsonb), ('{}'::jsonb)) AS d(payload) GROUP BY payload ORDER BY payload",
-        "SELECT '1'::jsonb UNION SELECT '1.0'::jsonb",
-        "SELECT '1'::jsonb INTERSECT ALL SELECT '1.0'::jsonb",
-        "SELECT '1'::jsonb EXCEPT SELECT '1.0'::jsonb",
-        "CREATE TABLE jsonb_documents (id INT PRIMARY KEY, payload JSONB NOT NULL UNIQUE, fallback JSONB DEFAULT '{}')",
-        "INSERT INTO jsonb_documents (id, payload) VALUES (1, '{\"amount\":{\"currency\":\"USD\",\"value\":\"12.50\"}}'::json), (2, '1.00') RETURNING *",
-        "INSERT INTO jsonb_documents (id, payload) VALUES (3, '1') ON CONFLICT (payload) DO UPDATE SET id = excluded.id RETURNING *",
-        "CREATE TABLE jsonb_other (payload JSONB)",
-        "INSERT INTO jsonb_other VALUES ('1e0'), (NULL), ('{\"amount\":{\"value\":\"12.50\",\"currency\":\"USD\"}}')",
-        "SELECT d.id FROM jsonb_documents d JOIN jsonb_other o ON d.payload = o.payload ORDER BY d.id",
-        "CREATE TABLE jsonb_child (payload JSONB REFERENCES jsonb_documents(payload))",
-        "INSERT INTO jsonb_child VALUES ('1.0')",
-        "BEGIN",
-        "UPDATE jsonb_documents SET payload = 'false' WHERE id = 1 RETURNING payload",
-        "ROLLBACK",
-        "SELECT * FROM jsonb_documents ORDER BY id",
-    ] {
-        assert_statement(&runtime, &mut postgres, &mut fake, sql, RowOrder::Ordered);
-    }
-    let documents = [
-        "[]",
-        "null",
-        "\"a\"",
-        "\"z\"",
-        "0",
-        "1",
-        "1.00",
-        "false",
-        "true",
-        "[null]",
-        "[[]]",
-        "[1,2]",
-        "[2]",
-        "{}",
-        "{\"aa\":0}",
-        "{\"b\":0}",
-        "{\"a\":1,\"b\":2}",
-    ];
-    let values = documents
-        .iter()
-        .enumerate()
-        .map(|(index, doc)| format!("({index}, '{doc}'::jsonb)"))
-        .collect::<Vec<_>>()
-        .join(",");
-    let sql = format!(
-        "SELECT a.id, b.id, a.payload = b.payload, a.payload < b.payload, a.payload > b.payload FROM (VALUES {values}) a(id,payload) CROSS JOIN (VALUES {values}) b(id,payload) ORDER BY a.id,b.id"
-    );
-    assert_statement(&runtime, &mut postgres, &mut fake, &sql, RowOrder::Ordered);
-    for sql in [
-        r#"SELECT '"\u0000"'::jsonb"#,
-        r#"SELECT '"\ud800"'::jsonb"#,
-        r#"SELECT '"\udc00"'::jsonb"#,
-        r#"SELECT '{"a":"\u0000","a":1}'::jsonb"#,
-        r#"SELECT '{"a":1e131072,"a":1}'::jsonb"#,
-        "SELECT '1e131072'::jsonb",
-        "SELECT '1e-16384'::jsonb",
-        "SELECT '0e131072'::jsonb",
-        "SELECT '0e-16384'::jsonb",
-        "SELECT '0e1073741823'::jsonb",
-        "SELECT '0e1073741824'::jsonb",
-        "SELECT '[1,]'::jsonb",
-        "SELECT true OR ('['::jsonb IS NULL)",
-        "SELECT '[' WHERE false UNION ALL SELECT '{}'::jsonb",
-        "SELECT 1::jsonb",
-        "SELECT '{}'::jsonb = '{}'::json",
-        "INSERT INTO jsonb_documents (id, payload) VALUES (5, '1.0')",
-        "INSERT INTO jsonb_documents (id, payload) VALUES (5, NULL)",
-        "INSERT INTO jsonb_documents (id, payload) VALUES (5, '{}'::text)",
-        "INSERT INTO jsonb_documents (id, payload) VALUES (5, '2'), (6, '[1,]')",
-        "INSERT INTO jsonb_child VALUES ('2')",
-        "DELETE FROM jsonb_documents WHERE id = 3",
-    ] {
-        assert_statement_allow_error(&runtime, &mut postgres, &mut fake, sql, RowOrder::Ordered);
-    }
-    let nested = format!("{}0{}", "[".repeat(512), "]".repeat(512));
-    assert_statement(
-        &runtime,
-        &mut postgres,
-        &mut fake,
-        &format!("SELECT '{nested}'::jsonb"),
-        RowOrder::Ordered,
-    );
-}
-
-#[test]
 fn matches_generated_jsonb_normalization_and_comparison() {
-    let server = start_property_postgres_server();
+    let server = start_isolated_postgres_server();
     let runtime = tokio::runtime::Builder::new_current_thread()
         .enable_all()
         .build()
@@ -2388,7 +1905,7 @@ fn matches_generated_jsonb_normalization_and_comparison() {
 
 #[test]
 fn matches_generated_json_text_and_errors() {
-    let server = start_property_postgres_server();
+    let server = start_isolated_postgres_server();
     let runtime = tokio::runtime::Builder::new_current_thread()
         .enable_all()
         .build()
@@ -2442,7 +1959,7 @@ fn matches_generated_json_text_and_errors() {
 
 #[test]
 fn generated_procedural_trees_match_postgres() {
-    let server = start_property_postgres_server();
+    let server = start_isolated_postgres_server();
     let runtime = tokio::runtime::Builder::new_current_thread()
         .enable_all()
         .build()
@@ -2500,7 +2017,7 @@ fn generated_procedural_trees_match_postgres() {
 
 #[test]
 fn generated_alter_table_rewrites_match_postgres() {
-    let server = start_property_postgres_server();
+    let server = start_isolated_postgres_server();
     let runtime = tokio::runtime::Builder::new_current_thread()
         .enable_all()
         .build()
@@ -2562,7 +2079,7 @@ fn generated_alter_table_rewrites_match_postgres() {
 
 #[test]
 fn generated_nested_views_match_postgres() {
-    let server = start_property_postgres_server();
+    let server = start_isolated_postgres_server();
     let runtime = tokio::runtime::Builder::new_current_thread()
         .enable_all()
         .build()
@@ -2626,7 +2143,7 @@ fn generated_nested_views_match_postgres() {
 
 #[test]
 fn generated_partial_unique_indexes_match_postgres() {
-    let server = start_property_postgres_server();
+    let server = start_isolated_postgres_server();
     let runtime = tokio::runtime::Builder::new_current_thread()
         .enable_all()
         .build()
@@ -2745,7 +2262,7 @@ fn generated_partial_unique_indexes_match_postgres() {
 
 #[test]
 fn generated_interleaved_transaction_snapshots_match_postgres() {
-    let server = start_property_postgres_server();
+    let server = start_isolated_postgres_server();
     let runtime = tokio::runtime::Builder::new_current_thread()
         .enable_all()
         .build()
@@ -2971,6 +2488,55 @@ fn generated_temporary_relation_lifetimes_are_session_local() {
                 .unwrap_err()
                 .sqlstate,
             pg_fake::error::SqlState::UndefinedTable
+        );
+    });
+}
+
+#[test]
+fn matches_generated_json_operations() {
+    let server = start_isolated_postgres_server();
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap();
+    let postgres = RefCell::new(
+        runtime
+            .block_on(PgConnection::connect(&server.url))
+            .unwrap(),
+    );
+    let fake = RefCell::new(PgFakeConnection::new(Db::create()));
+    check(|src| {
+        let left = generate_json_document(src, 3);
+        let right = generate_json_document(src, 2);
+        let index: i32 = src.any_of("index", int_in(-5..=5));
+        let sql = match src.any_of("json_operation", int_in(0..=6)) {
+            0 => format!(
+                "SELECT '{left}'::jsonb @> '{right}', '{left}'::jsonb <@ '{right}', '{left}'::jsonb || '{right}'"
+            ),
+            1 => format!(
+                "SELECT '{left}'::json -> {index}, '{left}'::json ->> 'a', '{left}'::jsonb #> '{{a,{index}}}', '{left}'::jsonb #>> '{{}}'"
+            ),
+            2 => format!(
+                "SELECT '{left}'::jsonb - {index}, '{left}'::jsonb - 'a', '{left}'::jsonb #- '{{a,{index}}}'"
+            ),
+            3 => format!(
+                "SELECT jsonb_set('{left}','{{a,{index}}}','{right}'), jsonb_typeof('{left}'), '{left}'::jsonb ?| '{{a,b,NULL}}', '{left}'::jsonb ?& '{{a,b,NULL}}'"
+            ),
+            4 => format!("SELECT * FROM json_each_text('{left}') AS e ORDER BY key,value"),
+            5 => format!(
+                "SELECT * FROM jsonb_array_elements('{left}') WITH ORDINALITY AS e ORDER BY ordinality"
+            ),
+            _ => format!(
+                "SELECT json_build_array('{left}'::json,{index},NULL), jsonb_build_object('a','{left}'::jsonb,'b','{right}'::jsonb), json_array_length('{left}')"
+            ),
+        };
+        src.log_value("sql", &sql);
+        assert_statement_allow_error(
+            &runtime,
+            &mut postgres.borrow_mut(),
+            &mut fake.borrow_mut(),
+            &sql,
+            RowOrder::Ordered,
         );
     });
 }

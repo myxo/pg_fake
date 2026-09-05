@@ -37,11 +37,17 @@ mod arithmetic;
 mod expressions;
 mod foreign_keys;
 mod indexes;
+mod json;
+pub(crate) use json::{
+    JsonTableFunction, extract_json_table_function, resolve_json_function_arguments,
+    resolve_json_operator_types,
+};
 mod locks;
 mod prepared;
 mod procedural;
 mod query;
 mod scope;
+pub(crate) use scope::{bind_join, bind_table_factor};
 mod sequences;
 mod views;
 mod writes;

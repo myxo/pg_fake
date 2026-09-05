@@ -64,6 +64,7 @@ impl TypeInfo for PgFakeTypeInfo {
             Some(BaseType::Interval) => "INTERVAL",
             Some(BaseType::Json) => "JSON",
             Some(BaseType::Jsonb) => "JSONB",
+            Some(BaseType::TextArray) => "TEXT[]",
             None => "NULL",
         }
     }
@@ -422,5 +423,44 @@ impl<'r> Decode<'r, PgFake> for &'r [u8] {
 impl<'r> Decode<'r, PgFake> for Vec<u8> {
     fn decode(value: PgFakeValueRef<'r>) -> Result<Self, BoxDynError> {
         <&[u8] as Decode<PgFake>>::decode(value).map(<[u8]>::to_vec)
+    }
+}
+
+impl Type<PgFake> for Vec<Option<String>> {
+    fn type_info() -> PgFakeTypeInfo {
+        PgFakeTypeInfo::new(BaseType::TextArray)
+    }
+}
+impl<'q> Encode<'q, PgFake> for Vec<Option<String>> {
+    fn encode_by_ref(&self, buf: &mut Vec<Value>) -> Result<IsNull, BoxDynError> {
+        buf.push(Value::TextArray(self.clone()));
+        Ok(IsNull::No)
+    }
+}
+impl<'r> Decode<'r, PgFake> for Vec<Option<String>> {
+    fn decode(value: PgFakeValueRef<'r>) -> Result<Self, BoxDynError> {
+        match value.value {
+            Value::TextArray(values) => Ok(values.clone()),
+            _ => Err("expected text array".into()),
+        }
+    }
+}
+impl Type<PgFake> for Vec<String> {
+    fn type_info() -> PgFakeTypeInfo {
+        PgFakeTypeInfo::new(BaseType::TextArray)
+    }
+}
+impl<'q> Encode<'q, PgFake> for Vec<String> {
+    fn encode_by_ref(&self, buf: &mut Vec<Value>) -> Result<IsNull, BoxDynError> {
+        buf.push(Value::TextArray(self.iter().cloned().map(Some).collect()));
+        Ok(IsNull::No)
+    }
+}
+impl<'r> Decode<'r, PgFake> for Vec<String> {
+    fn decode(value: PgFakeValueRef<'r>) -> Result<Self, BoxDynError> {
+        <Vec<Option<String>> as Decode<PgFake>>::decode(value)?
+            .into_iter()
+            .map(|v| v.ok_or_else(|| "unexpected null array element".into()))
+            .collect()
     }
 }

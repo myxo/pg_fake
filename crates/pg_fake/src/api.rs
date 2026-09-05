@@ -98,6 +98,7 @@ fn extract_runtime_sequence_name(expression: &ast::Expr) -> Option<&str> {
 }
 
 struct PreparedDependencyCollector<'catalog> {
+    skip_function_name: bool,
     catalog: &'catalog crate::catalog::Catalog,
     dependencies: Vec<PreparedCatalogDependency>,
     cte_scopes: Vec<PreparedCteScope>,
@@ -248,10 +249,22 @@ impl ast::Visitor for PreparedDependencyCollector<'_> {
         std::ops::ControlFlow::Continue(())
     }
 
+    fn pre_visit_table_factor(
+        &mut self,
+        factor: &ast::TableFactor,
+    ) -> std::ops::ControlFlow<Self::Break> {
+        if matches!(factor, ast::TableFactor::Table { args: Some(_), .. }) {
+            self.skip_function_name = true;
+        }
+        std::ops::ControlFlow::Continue(())
+    }
     fn pre_visit_relation(
         &mut self,
         relation: &ast::ObjectName,
     ) -> std::ops::ControlFlow<Self::Break> {
+        if std::mem::take(&mut self.skip_function_name) {
+            return std::ops::ControlFlow::Continue(());
+        }
         if executor::normalize_relation_name(relation).is_ok_and(|name| {
             name.schema.is_none()
                 && self
@@ -317,6 +330,7 @@ fn collect_prepared_catalog_dependencies(
     statements: impl IntoIterator<Item = ast::Statement>,
 ) -> Result<Vec<PreparedCatalogDependency>> {
     let mut collector = PreparedDependencyCollector {
+        skip_function_name: false,
         catalog,
         dependencies: Vec::new(),
         cte_scopes: Vec::new(),

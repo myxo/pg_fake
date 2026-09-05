@@ -326,13 +326,29 @@ pub const FEATURES: &[Feature] = &[
     },
     Feature {
         name: "json and jsonb operators",
-        cases: &[Case {
-            id: "jsonb_extraction",
-            source: "jsonb.sql:215",
-            setup: &[],
-            sql: "SELECT '{\"value\": 1}'::jsonb ->> 'value'",
-            blocker: BlockerKind::Implementation,
-        }],
+        cases: &[
+            Case {
+                id: "jsonb_extraction",
+                source: "jsonb.sql:215",
+                setup: &[],
+                sql: "SELECT '{\"value\": 1}'::jsonb ->> 'value'",
+                blocker: BlockerKind::Implementation,
+            },
+            Case {
+                id: "jsonb_migration_paths",
+                source: "local:jsonb_migration_paths",
+                setup: &[],
+                sql: "SELECT ('{\"amount\":{\"value\":\"12.50\",\"currency\":\"USD\"}}'::jsonb #>> '{amount,value}')::numeric::bigint, jsonb_typeof('{}')",
+                blocker: BlockerKind::Implementation,
+            },
+            Case {
+                id: "jsonb_expansion",
+                source: "local:jsonb_expansion",
+                setup: &[],
+                sql: "SELECT e.key,e.value FROM (VALUES ('{\"a\":1}'::jsonb), ('{}'::jsonb)) d(payload) LEFT JOIN jsonb_each(d.payload) e ON true ORDER BY e.key",
+                blocker: BlockerKind::Implementation,
+            },
+        ],
     },
     Feature {
         name: "array type and I/O",

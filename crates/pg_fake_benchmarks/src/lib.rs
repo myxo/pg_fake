@@ -112,6 +112,16 @@ pub fn list_benchmarks() -> Vec<Benchmark> {
             postgres_comparisons(),
         ),
         build_benchmark(
+            "jsonb_extraction",
+            postgres_values(),
+            postgres_comparisons(),
+        ),
+        build_benchmark(
+            "jsonb_containment",
+            postgres_values(),
+            postgres_comparisons(),
+        ),
+        build_benchmark(
             "jsonb_join_group",
             postgres_values(),
             postgres_comparisons(),

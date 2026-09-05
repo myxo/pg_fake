@@ -64,6 +64,11 @@ pub(crate) fn convert_ast_data_type(data_type: &ast::DataType) -> Result<PgType>
         ast::DataType::Interval { .. } => (BaseType::Interval, PgType::NO_TYPEMOD),
         ast::DataType::JSON => (BaseType::Json, PgType::NO_TYPEMOD),
         ast::DataType::JSONB => (BaseType::Jsonb, PgType::NO_TYPEMOD),
+        ast::DataType::Array(ast::ArrayElemTypeDef::SquareBracket(element, None))
+            if matches!(element.as_ref(), ast::DataType::Text) =>
+        {
+            (BaseType::TextArray, PgType::NO_TYPEMOD)
+        }
         ast::DataType::Custom(name, _) => {
             let identifiers = name
                 .0
@@ -178,6 +183,10 @@ fn resolve_required_cast_context(source: BaseType, target: BaseType) -> Option<C
     ) {
         return Some(CastContext::Assignment);
     }
+    if source == BaseType::Jsonb && (target == BaseType::Bool || get_numeric_rank(target).is_some())
+    {
+        return Some(CastContext::Explicit);
+    }
     if source == target || is_string_type(source) && is_string_type(target) {
         return Some(CastContext::Implicit);
     }
@@ -262,7 +271,33 @@ pub(crate) fn coerce(
         }
         return Err(create_cannot_cast_error(source, target.base));
     }
-    let value = if source == BaseType::Bpchar
+    let value = if source == BaseType::Jsonb
+        && (target.base == BaseType::Bool || get_numeric_rank(target.base).is_some())
+    {
+        let text = value.format_postgres_text();
+        if text == "null" {
+            Value::Null
+        } else if target.base == BaseType::Bool && matches!(text.as_str(), "true" | "false") {
+            Value::Bool(text == "true")
+        } else if target.base != BaseType::Bool
+            && text
+                .as_bytes()
+                .first()
+                .is_some_and(|c| c.is_ascii_digit() || *c == b'-')
+        {
+            coerce(
+                Value::parse(BaseType::Numeric, &text)?,
+                BaseType::Numeric,
+                target,
+                CastContext::Explicit,
+            )?
+        } else {
+            return Err(PgError::create(
+                SqlState::InvalidParameterValue,
+                "cannot cast JSONB value to target type",
+            ));
+        }
+    } else if source == BaseType::Bpchar
         && target.base != BaseType::Bpchar
         && is_string_type(target.base)
     {

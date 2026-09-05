@@ -73,6 +73,7 @@ pub enum BaseType {
     Interval,
     Json,
     Jsonb,
+    TextArray,
 }
 
 impl BaseType {
@@ -99,6 +100,7 @@ impl BaseType {
             BaseType::Interval => 1186,
             BaseType::Json => 114,
             BaseType::Jsonb => 3802,
+            BaseType::TextArray => 1009,
         }
     }
 
@@ -125,6 +127,7 @@ impl BaseType {
             BaseType::Interval => "interval",
             BaseType::Json => "json",
             BaseType::Jsonb => "jsonb",
+            BaseType::TextArray => "_text",
         }
     }
 
@@ -151,6 +154,7 @@ impl BaseType {
             1186 => Some(BaseType::Interval),
             114 => Some(BaseType::Json),
             3802 => Some(BaseType::Jsonb),
+            1009 => Some(BaseType::TextArray),
             _ => None,
         }
     }
@@ -179,6 +183,7 @@ impl BaseType {
             "interval" => Some(BaseType::Interval),
             "json" => Some(BaseType::Json),
             "jsonb" => Some(BaseType::Jsonb),
+            "text[]" | "_text" => Some(BaseType::TextArray),
             _ => None,
         }
     }
@@ -242,6 +247,7 @@ pub enum Value {
     Interval(PgInterval),
     Json(String),
     Jsonb(crate::jsonb::Jsonb),
+    TextArray(Vec<Option<String>>),
 }
 
 impl Value {
@@ -275,6 +281,7 @@ impl Value {
             Value::Interval(_) => Some(BaseType::Interval),
             Value::Json(_) => Some(BaseType::Json),
             Value::Jsonb(_) => Some(BaseType::Jsonb),
+            Value::TextArray(_) => Some(BaseType::TextArray),
         }
     }
 
@@ -345,6 +352,7 @@ impl Value {
             Value::Interval(value) => format_interval(*value),
             Value::Json(value) => value.clone(),
             Value::Jsonb(value) => value.get_postgres_text().to_owned(),
+            Value::TextArray(values) => crate::text_array::format_array(values),
         }
     }
 
@@ -379,6 +387,7 @@ impl Value {
                 .map(|()| Value::Json(input.to_owned()))
                 .map_err(|()| create_invalid_text_error(input, "json")),
             BaseType::Jsonb => crate::jsonb::Jsonb::parse(input).map(Value::Jsonb),
+            BaseType::TextArray => crate::text_array::parse_array(input).map(Value::TextArray),
         }
     }
 }

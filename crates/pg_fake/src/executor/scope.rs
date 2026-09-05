@@ -16,7 +16,10 @@ pub(super) struct BoundColumn {
     pub(super) data_type: PgType,
     pub(super) qualifier: String,
     pub(super) slot: usize,
-    pub(super) merged: Option<(usize, usize)>,
+    pub(super) output_order: usize,
+    pub(super) qualified_order: usize,
+    pub(super) qualified_merged: Option<Vec<usize>>,
+    pub(super) merged: Option<Vec<usize>>,
     pub(super) unqualified: bool,
     pub(super) wildcard: bool,
     pub(super) depth: usize,
@@ -158,14 +161,18 @@ impl RowScope<'_> {
             RowScope::Table(_) => Ok(row[self.resolve_column(identifiers)?.0].clone()),
             RowScope::Bound(scope) => {
                 let column = resolve_bound_column(scope, identifiers)?;
-                if identifiers.len() == 1
-                    && let Some((left, right)) = column.merged
-                {
-                    let value = if row[left].is_null() {
-                        row[right].clone()
-                    } else {
-                        row[left].clone()
-                    };
+                let merged = if identifiers.len() == 1 {
+                    &column.merged
+                } else {
+                    &column.qualified_merged
+                };
+                if let Some(slots) = merged {
+                    let value = slots
+                        .iter()
+                        .map(|slot| &row[*slot])
+                        .find(|value| !value.is_null())
+                        .cloned()
+                        .unwrap_or(crate::value::Value::Null);
                     if value.is_null() {
                         return Ok(value);
                     }
@@ -185,6 +192,27 @@ impl RowScope<'_> {
 }
 
 impl BoundScope {
+    pub(super) fn select_wildcard_columns(&self, qualifier: Option<&str>) -> Vec<&BoundColumn> {
+        let mut columns = self
+            .columns
+            .iter()
+            .filter(|column| match qualifier {
+                Some(qualifier) => column.qualifier == qualifier && column.depth == 0,
+                None => column.wildcard,
+            })
+            .collect::<Vec<_>>();
+        columns.sort_by_key(|column| {
+            if qualifier.is_some() {
+                column.qualified_order
+            } else {
+                column.output_order
+            }
+        });
+        columns
+    }
+    pub(crate) fn count_columns(&self) -> usize {
+        self.columns.len()
+    }
     #[cfg_attr(feature = "execution-log", tracing::instrument(skip_all))]
     pub(super) fn resolve_column(&self, identifiers: &[ast::Ident]) -> Result<(usize, PgType)> {
         RowScope::Bound(self).resolve_column(identifiers)
@@ -205,6 +233,8 @@ impl BoundScope {
         let mut scope = bind_target_scope(schema, alias.map(|alias| &alias.name));
         for (index, column) in scope.columns.iter_mut().enumerate() {
             column.slot += slot;
+            column.output_order += slot;
+            column.qualified_order += slot;
             if let Some(alias) = alias.and_then(|alias| alias.columns.get(index)) {
                 column.name = normalize_identifier(&alias.name);
             }
@@ -235,6 +265,9 @@ impl BoundScope {
                     data_type: column.data_type,
                     qualifier: qualifier.clone(),
                     slot: slot + index,
+                    output_order: slot + index,
+                    qualified_order: slot + index,
+                    qualified_merged: None,
                     merged: None,
                     unqualified: true,
                     wildcard: true,
@@ -262,6 +295,9 @@ pub(crate) fn bind_target_scope(schema: &TableSchema, alias: Option<&ast::Ident>
                 data_type: column.data_type,
                 qualifier: qualifier.clone(),
                 slot: index,
+                output_order: index,
+                qualified_order: index,
+                qualified_merged: None,
                 merged: None,
                 unqualified: true,
                 wildcard: true,
@@ -283,6 +319,9 @@ pub(crate) fn create_value_scope(columns: impl Iterator<Item = (String, PgType)>
                 data_type,
                 qualifier: String::new(),
                 slot,
+                output_order: slot,
+                qualified_order: slot,
+                qualified_merged: None,
                 merged: None,
                 unqualified: true,
                 wildcard: false,
@@ -317,6 +356,16 @@ pub(crate) fn combine_bound_scopes(mut target: BoundScope, mut source: BoundScop
     let start = target.columns.len();
     for column in &mut source.columns {
         column.slot += start;
+        for slots in [&mut column.merged, &mut column.qualified_merged]
+            .into_iter()
+            .flatten()
+        {
+            for slot in slots {
+                *slot += start;
+            }
+        }
+        column.output_order += start;
+        column.qualified_order += start;
     }
     target.columns.extend(source.columns);
     target
@@ -430,6 +479,16 @@ pub(crate) fn bind_query_scope_with_outer(
     scope.columns.extend(outer.columns.iter().map(|column| {
         let mut column = column.clone();
         column.slot += start;
+        for slots in [&mut column.merged, &mut column.qualified_merged]
+            .into_iter()
+            .flatten()
+        {
+            for slot in slots {
+                *slot += start;
+            }
+        }
+        column.output_order += start;
+        column.qualified_order += start;
         column.depth += 1;
         column.unqualified = true;
         column.wildcard = false;
@@ -439,7 +498,7 @@ pub(crate) fn bind_query_scope_with_outer(
 }
 
 #[cfg_attr(feature = "execution-log", tracing::instrument(skip_all))]
-fn bind_table_with_joins(
+pub(super) fn bind_table_with_joins(
     catalog: &Catalog,
     table: &ast::TableWithJoins,
     scope: &mut BoundScope,
@@ -447,32 +506,118 @@ fn bind_table_with_joins(
     let left_start = scope.columns.len();
     bind_table_factor(catalog, &table.relation, scope)?;
     for join in &table.joins {
-        let right_start = scope.columns.len();
-        bind_table_factor(catalog, &join.relation, scope)?;
-        let constraint = match &join.join_operator {
-            ast::JoinOperator::Join(constraint)
-            | ast::JoinOperator::Inner(constraint)
-            | ast::JoinOperator::CrossJoin(constraint)
-            | ast::JoinOperator::Left(constraint)
-            | ast::JoinOperator::LeftOuter(constraint)
-            | ast::JoinOperator::Right(constraint)
-            | ast::JoinOperator::RightOuter(constraint)
-            | ast::JoinOperator::FullOuter(constraint) => constraint,
-            _ => {
-                return reject_unsupported("join type is not implemented");
-            }
-        };
-        bind_join_constraint(catalog, scope, join, constraint, left_start, right_start)?;
+        bind_join(catalog, join, scope, left_start)?;
     }
     Ok(())
 }
 
+pub(crate) fn bind_join(
+    catalog: &Catalog,
+    join: &ast::Join,
+    scope: &mut BoundScope,
+    left_start: usize,
+) -> Result<()> {
+    let right_start = scope.columns.len();
+    if matches!(
+        join.join_operator,
+        ast::JoinOperator::Right(_)
+            | ast::JoinOperator::RightOuter(_)
+            | ast::JoinOperator::FullOuter(_)
+    ) {
+        validate_json_join_references(catalog, &join.relation, scope, left_start..right_start)?;
+    }
+    bind_table_factor(catalog, &join.relation, scope)?;
+    let constraint = match &join.join_operator {
+        ast::JoinOperator::Join(constraint)
+        | ast::JoinOperator::Inner(constraint)
+        | ast::JoinOperator::CrossJoin(constraint)
+        | ast::JoinOperator::Left(constraint)
+        | ast::JoinOperator::LeftOuter(constraint)
+        | ast::JoinOperator::Right(constraint)
+        | ast::JoinOperator::RightOuter(constraint)
+        | ast::JoinOperator::FullOuter(constraint) => constraint,
+        _ => {
+            return reject_unsupported("join type is not implemented");
+        }
+    };
+    bind_join_constraint(catalog, scope, join, constraint, left_start, right_start)?;
+    Ok(())
+}
+
 #[cfg_attr(feature = "execution-log", tracing::instrument(skip_all))]
-fn bind_table_factor(
+pub(crate) fn bind_table_factor(
     catalog: &Catalog,
     factor: &ast::TableFactor,
     scope: &mut BoundScope,
 ) -> Result<()> {
+    if let Some(super::json::JsonTableFunction {
+        name,
+        argument,
+        alias,
+        ordinality,
+    }) = super::json::extract_json_table_function(factor)?
+    {
+        let base = super::json::resolve_json_function_arguments(&name).expect("JSON expansion")[0];
+        let mut parameterized = false;
+        let _ = ast::visit_expressions(argument, |expr| {
+            if matches!(expr, ast::Expr::Value(value) if matches!(value.value, ast::Value::Placeholder(_)))
+            {
+                parameterized = true;
+            }
+            ControlFlow::<()>::Continue(())
+        });
+        if !parameterized
+            && !super::is_null_literal(argument)
+            && super::extract_unknown_string_literal(argument).is_none()
+        {
+            let source = infer_expression_data_type(catalog, argument, scope)?.base;
+            if !crate::coercion::can_cast(source, base, crate::coercion::CastContext::Implicit) {
+                return Err(PgError::create(
+                    SqlState::UndefinedFunction,
+                    "JSON table function argument has incompatible type",
+                ));
+            }
+        }
+        let columns = super::json::describe_json_expansion(&name, ordinality);
+        if alias.is_some_and(|alias| alias.columns.len() > columns.len()) {
+            return Err(PgError::create(
+                SqlState::InvalidColumnReference,
+                "function has fewer columns than its alias list",
+            ));
+        }
+        let qualifier = alias
+            .map(|a| normalize_identifier(&a.name))
+            .unwrap_or_else(|| name.clone());
+        let start = scope.columns.len();
+        for (index, (mut column_name, base)) in columns.into_iter().enumerate() {
+            if index == 0
+                && name.ends_with("object_keys")
+                && let Some(alias) = alias
+            {
+                column_name = normalize_identifier(&alias.name);
+            }
+            let source_name = column_name.clone();
+            if let Some(alias) = alias.and_then(|a| a.columns.get(index)) {
+                column_name = normalize_identifier(&alias.name);
+            }
+            scope.columns.push(BoundColumn {
+                name: column_name,
+                data_type: PgType::create(base),
+                qualifier: qualifier.clone(),
+                slot: start + index,
+                output_order: start + index,
+                qualified_order: start + index,
+                qualified_merged: None,
+                merged: None,
+                unqualified: true,
+                wildcard: true,
+                depth: 0,
+                table_id: None,
+                source_name,
+            });
+        }
+        return Ok(());
+    }
     if let ast::TableFactor::NestedJoin {
         table_with_joins,
         alias,
@@ -492,13 +637,18 @@ fn bind_table_factor(
                 ));
             }
             let qualifier = normalize_identifier(&alias.name);
+            let mut order = (start..scope.columns.len()).collect::<Vec<_>>();
+            order.sort_by_key(|i| scope.columns[*i].output_order);
             let mut output_index = 0;
-            for column in &mut scope.columns[start..] {
+            for index in order {
+                let column = &mut scope.columns[index];
                 if column.wildcard {
                     if let Some(alias) = alias.columns.get(output_index) {
                         column.name = normalize_identifier(&alias.name);
                     }
                     column.qualifier = qualifier.clone();
+                    column.qualified_order = output_index;
+                    column.qualified_merged = column.merged.clone();
                     output_index += 1;
                 } else {
                     column.qualifier.clear();
@@ -542,6 +692,9 @@ fn bind_table_factor(
                     data_type: column.data_type,
                     qualifier: qualifier.clone(),
                     slot: start + index,
+                    output_order: start + index,
+                    qualified_order: start + index,
+                    qualified_merged: None,
                     merged: None,
                     unqualified: true,
                     wildcard: true,
@@ -619,9 +772,8 @@ fn describe_bound_query_columns(
                 .iter()
                 .flat_map(|item| match item {
                     ast::SelectItem::Wildcard(_) => scope
-                        .columns
-                        .iter()
-                        .filter(|column| column.wildcard)
+                        .select_wildcard_columns(None)
+                        .into_iter()
                         .map(|column| Ok((column.name.clone(), column.data_type)))
                         .collect::<Vec<_>>(),
                     ast::SelectItem::QualifiedWildcard(
@@ -633,9 +785,8 @@ fn describe_bound_query_columns(
                             Err(error) => return vec![Err(error)],
                         };
                         let columns = scope
-                            .columns
-                            .iter()
-                            .filter(|column| column.qualifier == qualifier && column.wildcard)
+                            .select_wildcard_columns(Some(&qualifier))
+                            .into_iter()
                             .map(|column| Ok((column.name.clone(), column.data_type)))
                             .collect::<Vec<_>>();
                         if columns.is_empty()
@@ -692,6 +843,9 @@ fn describe_bound_query_columns(
                             data_type,
                             qualifier: String::new(),
                             slot,
+                            output_order: slot,
+                            qualified_order: slot,
+                            qualified_merged: None,
                             merged: None,
                             unqualified: true,
                             wildcard: true,
@@ -757,6 +911,9 @@ fn describe_bound_query_columns(
                         data_type,
                         qualifier: String::new(),
                         slot,
+                        output_order: slot,
+                        qualified_order: slot,
+                        qualified_merged: None,
                         merged: None,
                         unqualified: true,
                         wildcard: true,
@@ -1118,9 +1275,26 @@ fn bind_join_columns(
                 })?;
         super::validate_equality_type(data_type)?;
         left.data_type = PgType::create(data_type);
-        left.merged = Some((left.slot, right.slot));
+        let slots = left.merged.get_or_insert_with(|| vec![left.slot]);
+        slots.extend(right.merged.clone().unwrap_or_else(|| vec![right.slot]));
         right.unqualified = false;
         right.wildcard = false;
+    }
+    let mut output = (left_start..scope.columns.len())
+        .filter(|i| scope.columns[*i].wildcard)
+        .collect::<Vec<_>>();
+    output.sort_by_key(|i| {
+        let column = &scope.columns[*i];
+        (
+            names
+                .iter()
+                .position(|name| column.name == *name)
+                .unwrap_or(names.len()),
+            column.output_order,
+        )
+    });
+    for (index, slot) in output.into_iter().enumerate() {
+        scope.columns[slot].output_order = left_start + index;
     }
     Ok(())
 }
@@ -1128,4 +1302,38 @@ fn bind_join_columns(
 #[cfg_attr(feature = "execution-log", tracing::instrument(skip_all))]
 pub(super) fn bind_select_scope(state: &DatabaseState, select: &ast::Select) -> Result<BoundScope> {
     bind_query_scope(&state.catalog, select)
+}
+
+fn validate_json_join_references(
+    catalog: &Catalog,
+    factor: &ast::TableFactor,
+    scope: &BoundScope,
+    forbidden: std::ops::Range<usize>,
+) -> Result<()> {
+    if let Some(super::json::JsonTableFunction { argument, .. }) =
+        super::json::extract_json_table_function(factor)?
+    {
+        let referenced = super::query::collect_outer_reference_slots(catalog, argument, scope)?
+            .iter()
+            .any(|slot| forbidden.contains(slot));
+        if referenced {
+            return Err(PgError::create(
+                SqlState::InvalidColumnReference,
+                "invalid lateral reference in RIGHT or FULL JOIN",
+            ));
+        }
+    }
+    if let ast::TableFactor::NestedJoin {
+        table_with_joins, ..
+    } = factor
+    {
+        let mut visible = scope.clone();
+        for source in std::iter::once(&table_with_joins.relation)
+            .chain(table_with_joins.joins.iter().map(|j| &j.relation))
+        {
+            validate_json_join_references(catalog, source, &visible, forbidden.clone())?;
+            bind_table_factor(catalog, source, &mut visible)?;
+        }
+    }
+    Ok(())
 }

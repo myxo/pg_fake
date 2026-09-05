@@ -247,24 +247,67 @@ fn infer_from_parameters(
             infer_table_factor_parameters(&join.relation, catalog, types)?;
         }
     }
-    let bound = executor::bind_from_scope(catalog, from)?;
-    let scope = executor::RowScope::Bound(&bound);
+    let mut visible = executor::create_value_scope(std::iter::empty());
     for table in from {
-        for join in &table.joins {
-            let constraint = match &join.join_operator {
-                ast::JoinOperator::Join(constraint)
-                | ast::JoinOperator::Inner(constraint)
-                | ast::JoinOperator::CrossJoin(constraint)
-                | ast::JoinOperator::Left(constraint)
-                | ast::JoinOperator::LeftOuter(constraint)
-                | ast::JoinOperator::Right(constraint)
-                | ast::JoinOperator::RightOuter(constraint)
-                | ast::JoinOperator::FullOuter(constraint) => constraint,
-                _ => continue,
-            };
-            if let ast::JoinConstraint::On(expression) = constraint {
-                infer_expression_parameters(expression, scope, Some(BaseType::Bool), types)?;
-            }
+        infer_join_expression_parameters(table, catalog, &mut visible, types)?;
+    }
+    Ok(())
+}
+
+fn infer_join_expression_parameters(
+    table: &ast::TableWithJoins,
+    catalog: &Catalog,
+    visible: &mut executor::BoundScope,
+    types: &mut [Option<BaseType>],
+) -> Result<()> {
+    let left_start = visible.count_columns();
+    for (index, factor) in std::iter::once(&table.relation)
+        .chain(table.joins.iter().map(|j| &j.relation))
+        .enumerate()
+    {
+        if let ast::TableFactor::NestedJoin {
+            table_with_joins, ..
+        } = factor
+        {
+            infer_join_expression_parameters(
+                table_with_joins,
+                catalog,
+                &mut visible.clone(),
+                types,
+            )?;
+        }
+        if let Some(executor::JsonTableFunction { name, argument, .. }) =
+            executor::extract_json_table_function(factor)?
+        {
+            let base = executor::resolve_json_function_arguments(&name).expect("JSON expansion")[0];
+            infer_expression_parameters(
+                argument,
+                executor::RowScope::Bound(visible),
+                Some(base),
+                types,
+            )?;
+        }
+        if index == 0 {
+            executor::bind_table_factor(catalog, factor, visible)?;
+        } else {
+            executor::bind_join(catalog, &table.joins[index - 1], visible, left_start)?;
+        }
+    }
+    let scope = executor::RowScope::Bound(visible);
+    for join in &table.joins {
+        let constraint = match &join.join_operator {
+            ast::JoinOperator::Join(c)
+            | ast::JoinOperator::Inner(c)
+            | ast::JoinOperator::CrossJoin(c)
+            | ast::JoinOperator::Left(c)
+            | ast::JoinOperator::LeftOuter(c)
+            | ast::JoinOperator::Right(c)
+            | ast::JoinOperator::RightOuter(c)
+            | ast::JoinOperator::FullOuter(c) => c,
+            _ => continue,
+        };
+        if let ast::JoinConstraint::On(expression) = constraint {
+            infer_expression_parameters(expression, scope, Some(BaseType::Bool), types)?;
         }
     }
     Ok(())
@@ -276,13 +319,25 @@ fn infer_table_factor_parameters(
     catalog: &Catalog,
     types: &mut [Option<BaseType>],
 ) -> Result<()> {
+    if let Some(executor::JsonTableFunction { name, argument, .. }) =
+        executor::extract_json_table_function(factor)?
+    {
+        let base = executor::resolve_json_function_arguments(&name).expect("JSON expansion")[0];
+        constrain_parameter_type(argument, Some(base), types)?;
+    }
     match factor {
         ast::TableFactor::Derived { subquery, .. } => {
             infer_query_parameters(subquery, catalog, None, types)
         }
         ast::TableFactor::NestedJoin {
             table_with_joins, ..
-        } => infer_from_parameters(std::slice::from_ref(table_with_joins), catalog, types),
+        } => {
+            infer_table_factor_parameters(&table_with_joins.relation, catalog, types)?;
+            for join in &table_with_joins.joins {
+                infer_table_factor_parameters(&join.relation, catalog, types)?;
+            }
+            Ok(())
+        }
         _ => Ok(()),
     }
 }
@@ -859,6 +914,44 @@ fn infer_expression_parameters(
                 types,
             ),
             ast::Expr::BinaryOp { left, op, right } => {
+                if executor::resolve_json_operator_types(
+                    op,
+                    Some(BaseType::Jsonb),
+                    Some(BaseType::Jsonb),
+                )
+                .is_some()
+                {
+                    let left_type = infer_parameter_expression_type(left, schema, types);
+                    let right_type = infer_parameter_expression_type(right, schema, types);
+                    if left_type.is_none()
+                        && matches!(
+                            op,
+                            ast::BinaryOperator::Arrow
+                                | ast::BinaryOperator::LongArrow
+                                | ast::BinaryOperator::HashArrow
+                                | ast::BinaryOperator::HashLongArrow
+                        )
+                    {
+                        error = Some(PgError::create(
+                            SqlState::AmbiguousFunction,
+                            "operator is not unique",
+                        ));
+                        return ControlFlow::Break(());
+                    }
+                    if let Some((l, r, _)) =
+                        executor::resolve_json_operator_types(op, left_type, right_type)
+                    {
+                        return match constrain_parameter_type(left, Some(l), types)
+                            .and_then(|()| constrain_parameter_type(right, Some(r), types))
+                        {
+                            Ok(()) => ControlFlow::Continue(()),
+                            Err(e) => {
+                                error = Some(e);
+                                ControlFlow::Break(())
+                            }
+                        };
+                    }
+                }
                 let boolean = matches!(op, ast::BinaryOperator::And | ast::BinaryOperator::Or);
                 let left_expected = if boolean {
                     Some(BaseType::Bool)
@@ -939,6 +1032,23 @@ fn infer_expression_parameters(
     error.map_or(Ok(()), Err)
 }
 
+fn infer_parameter_expression_type(
+    expression: &ast::Expr,
+    scope: executor::RowScope<'_>,
+    types: &[Option<BaseType>],
+) -> Option<BaseType> {
+    match expression {
+        ast::Expr::Nested(inner) => infer_parameter_expression_type(inner, scope, types),
+        ast::Expr::Value(value) => match &value.value {
+            ast::Value::Placeholder(placeholder) => {
+                types[parse_placeholder_index(placeholder).expect("parameter index was validated")]
+            }
+            _ => executor::infer_expression_type(expression, scope).ok(),
+        },
+        _ => executor::infer_expression_type(expression, scope).ok(),
+    }
+}
+
 #[cfg_attr(feature = "execution-log", tracing::instrument(skip_all))]
 fn infer_function_parameters(
     function: &ast::Function,
@@ -957,6 +1067,23 @@ fn infer_function_parameters(
         })
         .collect::<Vec<_>>();
     let name = executor::normalize_unqualified_object_name(&function.name)?;
+    if let Some(targets) = executor::resolve_json_function_arguments(&name) {
+        for (argument, target) in arguments.iter().zip(targets) {
+            constrain_parameter_type(argument, Some(target), types)?;
+        }
+        return Ok(());
+    }
+    if matches!(
+        name.as_str(),
+        "json_build_object"
+            | "jsonb_build_object"
+            | "json_build_array"
+            | "jsonb_build_array"
+            | "to_json"
+            | "to_jsonb"
+    ) {
+        return Ok(());
+    }
     if matches!(name.as_str(), "nextval" | "currval") {
         for argument in arguments {
             constrain_parameter_type(argument, Some(BaseType::Text), types)?;
@@ -1319,6 +1446,9 @@ pub(crate) fn create_typed_literal(value: Value, data_type: PgType) -> ast::Expr
         }
         Value::Json(value) => ast::Value::SingleQuotedString(value),
         Value::Jsonb(value) => ast::Value::SingleQuotedString(value.get_postgres_text().to_owned()),
+        Value::TextArray(values) => {
+            ast::Value::SingleQuotedString(crate::text_array::format_array(&values))
+        }
     };
     create_typed_cast(ast::Expr::Value(literal.into()), data_type)
 }
@@ -1388,5 +1518,9 @@ fn convert_to_ast_data_type(data_type: PgType) -> ast::DataType {
         },
         BaseType::Json => ast::DataType::JSON,
         BaseType::Jsonb => ast::DataType::JSONB,
+        BaseType::TextArray => ast::DataType::Array(ast::ArrayElemTypeDef::SquareBracket(
+            Box::new(ast::DataType::Text),
+            None,
+        )),
     }
 }
