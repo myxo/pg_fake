@@ -23,6 +23,12 @@ struct AggregateCall<'a> {
     result_type: BaseType,
 }
 
+#[derive(Clone)]
+pub(super) struct AggregateInput {
+    included: bool,
+    argument: Option<Value>,
+}
+
 #[cfg_attr(feature = "execution-log", tracing::instrument(skip_all))]
 pub(super) fn is_aggregate_function(function: &ast::Function) -> bool {
     function
@@ -196,40 +202,72 @@ fn parse_aggregate_call<'a>(
     })
 }
 
-#[cfg_attr(feature = "execution-log", tracing::instrument(skip_all))]
-pub(super) fn evaluate_aggregate_function<F>(
+pub(super) fn prepare_aggregate_function_input<F>(
     function: &ast::Function,
     schema: RowScope<'_>,
-    rows: &[Vec<Value>],
-    mut evaluate_expression: F,
-) -> Result<(Value, BaseType)>
+    evaluate_expression: F,
+) -> Result<AggregateInput>
 where
-    F: FnMut(&ast::Expr, &[Value]) -> Result<Value>,
+    F: FnMut(&ast::Expr) -> Result<Value>,
 {
     let call = parse_aggregate_call(function, schema)?;
-    let mut filtered_rows = Vec::with_capacity(rows.len());
-    for row in rows {
-        if let Some(filter) = call.filter {
-            match evaluate_expression(filter, row)? {
-                Value::Bool(true) => {}
-                Value::Bool(false) | Value::Null => continue,
-                _ => unreachable!("aggregate FILTER expression was type-checked"),
+    prepare_aggregate_input(&call, evaluate_expression)
+}
+
+pub(super) fn evaluate_prepared_aggregate_function(
+    function: &ast::Function,
+    schema: RowScope<'_>,
+    inputs: &[AggregateInput],
+) -> Result<(Value, BaseType)> {
+    let call = parse_aggregate_call(function, schema)?;
+    evaluate_aggregate_inputs(call, inputs)
+}
+
+fn prepare_aggregate_input<F>(
+    call: &AggregateCall<'_>,
+    mut evaluate_expression: F,
+) -> Result<AggregateInput>
+where
+    F: FnMut(&ast::Expr) -> Result<Value>,
+{
+    if let Some(filter) = call.filter {
+        match evaluate_expression(filter)? {
+            Value::Bool(true) => {}
+            Value::Bool(false) | Value::Null => {
+                return Ok(AggregateInput {
+                    included: false,
+                    argument: None,
+                });
             }
+            _ => unreachable!("aggregate FILTER expression was type-checked"),
         }
-        filtered_rows.push(row);
     }
-    let Some(argument) = call.argument else {
+    Ok(AggregateInput {
+        included: true,
+        argument: call.argument.map(evaluate_expression).transpose()?,
+    })
+}
+
+fn evaluate_aggregate_inputs(
+    call: AggregateCall<'_>,
+    inputs: &[AggregateInput],
+) -> Result<(Value, BaseType)> {
+    let Some(_argument) = call.argument else {
+        let count = inputs.iter().filter(|input| input.included).count();
         return Ok((
-            Value::Int8(i64::try_from(filtered_rows.len()).expect("row count must fit in int8")),
+            Value::Int8(i64::try_from(count).expect("row count must fit in int8")),
             call.result_type,
         ));
     };
     let argument_type = call
         .argument_type
         .expect("aggregate expression has an argument type");
-    let mut values = Vec::with_capacity(filtered_rows.len());
-    for row in filtered_rows {
-        let value = evaluate_expression(argument, row)?;
+    let mut values = Vec::with_capacity(inputs.len());
+    for input in inputs.iter().filter(|input| input.included) {
+        let value = input
+            .argument
+            .clone()
+            .expect("included aggregate input has an argument");
         if !value.is_null() {
             let duplicate = call.distinct
                 && values.iter().try_fold(false, |duplicate, existing| {

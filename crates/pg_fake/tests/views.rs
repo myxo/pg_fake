@@ -111,26 +111,38 @@ fn follows_table_and_column_renames() {
 }
 
 #[test]
-fn rejects_create_trigger_until_trigger_execution_is_supported() {
+fn rejects_unsupported_or_unresolved_trigger_definitions() {
     let db = Db::create();
     let mut session = db.create_session();
     session
         .execute("CREATE TABLE accounts (id INTEGER)")
         .unwrap();
 
-    for sql in [
-        "CREATE TRIGGER audit_changes BEFORE INSERT ON accounts \
-           FOR EACH ROW EXECUTE FUNCTION missing()",
-        "CREATE TRIGGER row_truncate AFTER TRUNCATE ON accounts \
-           FOR EACH ROW EXECUTE FUNCTION missing()",
-        "CREATE TRIGGER missing_column BEFORE UPDATE OF unknown ON accounts \
-           FOR EACH ROW EXECUTE FUNCTION missing()",
-        "CREATE TRIGGER missing_table BEFORE INSERT ON unknown \
-           FOR EACH ROW EXECUTE FUNCTION missing()",
+    for (sql, expected) in [
+        (
+            "CREATE TRIGGER audit_changes BEFORE INSERT ON accounts \
+             FOR EACH ROW EXECUTE FUNCTION missing()",
+            SqlState::UndefinedFunction,
+        ),
+        (
+            "CREATE TRIGGER row_truncate AFTER TRUNCATE ON accounts \
+             FOR EACH ROW EXECUTE FUNCTION missing()",
+            SqlState::FeatureNotSupported,
+        ),
+        (
+            "CREATE TRIGGER missing_column BEFORE UPDATE OF unknown ON accounts \
+             FOR EACH ROW EXECUTE FUNCTION missing()",
+            SqlState::FeatureNotSupported,
+        ),
+        (
+            "CREATE TRIGGER missing_table BEFORE INSERT ON unknown \
+             FOR EACH ROW EXECUTE FUNCTION missing()",
+            SqlState::UndefinedTable,
+        ),
     ] {
         assert_eq!(
             session.execute(sql).unwrap_err().sqlstate,
-            SqlState::FeatureNotSupported,
+            expected,
             "SQL: {sql}"
         );
     }

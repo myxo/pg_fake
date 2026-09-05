@@ -639,6 +639,20 @@ arrays, cursors, and general function calls are outside this task. It must never
 accept an unimplemented construct as a no-op. Tasks 16–20 add cross-feature
 expressions and validate complete migration blocks.
 
+**Progress:**
+
+- [x] Add sqlparser AST and PostgreSQL parsing for trigger functions, triggers,
+  `DO` blocks, procedural statements, and `INSERT ... SELECT ... ON CONFLICT`.
+- [x] Implement transactional function and trigger catalogs, dependencies,
+  replacement, rename/drop behavior, and row-level execution.
+- [x] Execute the bounded PL/pgSQL statements, locals, diagnostics, branching,
+  assignments, formatted exceptions, and trigger row control required here.
+- [x] Replace catalog-injected trigger fixtures with supported SQL and add
+  native, SQLx, PostgreSQL differential, property, manifest, and benchmark
+  coverage.
+- [x] Pass formatting, workspace checks/tests, Astra review, PostgreSQL 18
+  differential matrices, and the exact 10,000-iteration property gate.
+
 ---
 
 ## Milestone E — JSON and JSONB

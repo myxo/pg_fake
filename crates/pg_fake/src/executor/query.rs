@@ -1,6 +1,7 @@
 use super::*;
 use ast::VisitMut as _;
 use sqlparser::ast;
+use std::cell::Cell;
 
 struct MaterializedCte {
     name: String,
@@ -220,7 +221,7 @@ impl ast::VisitorMut for QueryAggregateDetector {
 }
 
 #[cfg_attr(feature = "execution-log", tracing::instrument(skip_all))]
-fn contains_query_aggregate(query: &ast::Query) -> bool {
+pub(super) fn contains_query_aggregate(query: &ast::Query) -> bool {
     let mut query = query.clone();
     let mut detector = QueryAggregateDetector {
         query_depth: 0,
@@ -920,7 +921,7 @@ impl ast::VisitorMut for CteReferenceCollector<'_> {
 }
 
 #[cfg_attr(feature = "execution-log", tracing::instrument(skip_all))]
-fn collect_cte_references(query: &ast::Query, names: &[String]) -> BTreeSet<String> {
+pub(super) fn collect_cte_references(query: &ast::Query, names: &[String]) -> BTreeSet<String> {
     let mut query = query.clone();
     let mut collector = CteReferenceCollector {
         names,
@@ -964,6 +965,173 @@ pub(super) fn collect_reachable_cte_names(query: &ast::Query) -> BTreeSet<String
         }
     }
     reachable
+}
+
+pub(super) fn prepare_cte_mutation_for_locking(
+    state: &DatabaseState,
+    query: &ast::Query,
+    target_index: usize,
+    xid: Xid,
+    snapshot: &Snapshot,
+    context: &StatementExecutionContext,
+) -> Result<Option<ast::Statement>> {
+    let with = query
+        .with
+        .as_ref()
+        .expect("CTE lock preparation requires WITH");
+    let names = with
+        .cte_tables
+        .iter()
+        .map(|cte| normalize_identifier(&cte.alias.name))
+        .collect::<Vec<_>>();
+    let target = &with.cte_tables[target_index];
+    if !is_data_modifying_query(&target.query) {
+        return Ok(None);
+    }
+    let target_name = &names[target_index];
+    let mut required = collect_cte_references(&target.query, &names);
+    required.remove(target_name);
+    let reachable = collect_reachable_cte_names(query);
+    for (index, name) in names.iter().enumerate().take(target_index) {
+        if !reachable.contains(name) || is_data_modifying_query(&with.cte_tables[index].query) {
+            continue;
+        }
+        let mut dependencies = collect_cte_references(&with.cte_tables[index].query, &names);
+        loop {
+            let mut expanded = dependencies.clone();
+            for (dependency_index, dependency) in names.iter().enumerate() {
+                if dependencies.contains(dependency) {
+                    expanded.extend(collect_cte_references(
+                        &with.cte_tables[dependency_index].query,
+                        &names,
+                    ));
+                }
+            }
+            if expanded == dependencies {
+                break;
+            }
+            dependencies = expanded;
+        }
+        if !dependencies.contains(target_name) {
+            required.insert(name.clone());
+        }
+    }
+    loop {
+        let mut expanded = required.clone();
+        for (index, cte) in with.cte_tables.iter().enumerate() {
+            if required.contains(&names[index]) {
+                expanded.extend(collect_cte_references(&cte.query, &names));
+            }
+        }
+        expanded.remove(target_name);
+        if expanded == required {
+            break;
+        }
+        required = expanded;
+    }
+    let mut materialized = Vec::new();
+    while materialized.len() < required.len() {
+        let mut progressed = false;
+        for (index, cte) in with.cte_tables.iter().enumerate() {
+            if !required.contains(&names[index])
+                || materialized
+                    .iter()
+                    .any(|prepared: &MaterializedCte| prepared.name == names[index])
+            {
+                continue;
+            }
+            let dependencies = collect_cte_references(&cte.query, &names);
+            if dependencies.iter().any(|dependency| {
+                required.contains(dependency)
+                    && !materialized
+                        .iter()
+                        .any(|prepared: &MaterializedCte| &prepared.name == dependency)
+            }) {
+                continue;
+            }
+            let mut cte_query = cte.query.as_ref().clone();
+            let _ = cte_query.visit(&mut CteReferenceReplacer {
+                ctes: &materialized,
+                masked: Vec::new(),
+            });
+            let occurrence = cte.alias.name.span;
+            let mut result = match context.get_prepared_cte_result(occurrence, &names[index]) {
+                Some(result) => result,
+                None => {
+                    let result = if is_data_modifying_query(&cte_query) {
+                        let statement = convert_query_to_statement(cte_query.clone());
+                        context.set_prepares_subquery_results(true);
+                        let statement = materialize_uncorrelated_subqueries(
+                            state, &statement, xid, snapshot, context,
+                        )?;
+                        context.set_prepares_subquery_results(false);
+                        context.defer_cte_mutation(occurrence, names[index].clone(), statement);
+                        return Ok(None);
+                    } else {
+                        let StatementResult::Query(result) =
+                            execute_query(state, &cte_query, xid, snapshot, context)?
+                        else {
+                            unreachable!("read CTE returns query rows")
+                        };
+                        result
+                    };
+                    context.set_prepared_cte_result(
+                        occurrence,
+                        names[index].clone(),
+                        result.clone(),
+                    );
+                    result
+                }
+            };
+            if cte.alias.columns.len() > result.columns.len() {
+                return Err(PgError::create(
+                    SqlState::InvalidColumnReference,
+                    "WITH query has fewer columns than specified in column list",
+                ));
+            }
+            for (column, alias) in result.columns.iter_mut().zip(&cte.alias.columns) {
+                column.name = normalize_identifier(&alias.name);
+            }
+            materialized.push(MaterializedCte {
+                name: names[index].clone(),
+                alias: cte.alias.clone(),
+                result,
+            });
+            progressed = true;
+        }
+        if !progressed {
+            return Ok(None);
+        }
+    }
+    let mut target_query = target.query.as_ref().clone();
+    let _ = target_query.visit(&mut CteReferenceReplacer {
+        ctes: &materialized,
+        masked: Vec::new(),
+    });
+    let statement = convert_query_to_statement(target_query);
+    context.set_prepares_subquery_results(true);
+    let prepared = materialize_uncorrelated_subqueries(state, &statement, xid, snapshot, context);
+    context.set_prepares_subquery_results(false);
+    prepared.map(Some)
+}
+
+fn execute_prepared_cte_query(
+    state: &DatabaseState,
+    occurrence: Span,
+    name: &str,
+    query: &ast::Query,
+    xid: Xid,
+    snapshot: &Snapshot,
+    context: &StatementExecutionContext,
+) -> Result<QueryResult> {
+    if let Some(result) = context.get_prepared_cte_result(occurrence, name) {
+        return Ok(result);
+    }
+    let StatementResult::Query(result) = execute_query(state, query, xid, snapshot, context)?
+    else {
+        unreachable!("CTE query produces query rows")
+    };
+    Ok(result)
 }
 
 #[cfg_attr(feature = "execution-log", tracing::instrument(skip_all))]
@@ -1244,12 +1412,15 @@ fn materialize_query_ctes(
                 rows: Vec::new(),
             }
         } else {
-            let StatementResult::Query(result) =
-                execute_query(state, &cte_query, xid, snapshot, context)?
-            else {
-                unreachable!("CTE query produces query rows");
-            };
-            result
+            execute_prepared_cte_query(
+                state,
+                cte.alias.name.span,
+                &name,
+                &cte_query,
+                xid,
+                snapshot,
+                context,
+            )?
         };
         if cte.alias.columns.len() > result.columns.len() {
             return Err(PgError::create(
@@ -1367,12 +1538,15 @@ fn materialize_recursive_query_ctes(
                     state, &cte_query, &cte.alias, name, demand, xid, snapshot, context,
                 )?
             } else {
-                let StatementResult::Query(result) =
-                    execute_query(state, &cte_query, xid, snapshot, context)?
-                else {
-                    unreachable!("CTE query produces query rows");
-                };
-                result
+                execute_prepared_cte_query(
+                    state,
+                    cte.alias.name.span,
+                    name,
+                    &cte_query,
+                    xid,
+                    snapshot,
+                    context,
+                )?
             };
             if cte.alias.columns.len() > result.columns.len() {
                 return Err(PgError::create(
@@ -1515,36 +1689,40 @@ fn materialize_recursive_data_modifying_ctes(
                 None
             };
             let mut result = if modifying {
-                cte_query = materialize_query_ctes(state, &cte_query, xid, snapshot, context)?;
-                let cte_statement = convert_query_to_statement(cte_query);
-                let cte_statement = materialize_uncorrelated_subqueries(
-                    state,
-                    &cte_statement,
-                    xid,
-                    snapshot,
-                    context,
-                )?;
-                match execute_statement(
-                    state,
-                    &cte_statement,
-                    xid,
-                    snapshot,
-                    deferred_constraints,
-                    defer_all,
-                    context,
-                    None,
-                )? {
-                    StatementResult::Query(result) => result,
-                    StatementResult::Affected(_) if consumed.contains(name) => {
-                        return Err(PgError::create(
-                            SqlState::FeatureNotSupported,
-                            "WITH query does not have a RETURNING clause",
-                        ));
+                if let Some(result) = context.get_executed_cte_result(cte.alias.name.span, name) {
+                    result
+                } else {
+                    cte_query = materialize_query_ctes(state, &cte_query, xid, snapshot, context)?;
+                    let cte_statement = convert_query_to_statement(cte_query);
+                    let cte_statement = materialize_uncorrelated_subqueries(
+                        state,
+                        &cte_statement,
+                        xid,
+                        snapshot,
+                        context,
+                    )?;
+                    match execute_statement(
+                        state,
+                        &cte_statement,
+                        xid,
+                        snapshot,
+                        deferred_constraints,
+                        defer_all,
+                        context,
+                        None,
+                    )? {
+                        StatementResult::Query(result) => result,
+                        StatementResult::Affected(_) if consumed.contains(name) => {
+                            return Err(PgError::create(
+                                SqlState::FeatureNotSupported,
+                                "WITH query does not have a RETURNING clause",
+                            ));
+                        }
+                        StatementResult::Affected(_) => QueryResult {
+                            columns: Vec::new(),
+                            rows: Vec::new(),
+                        },
                     }
-                    StatementResult::Affected(_) => QueryResult {
-                        columns: Vec::new(),
-                        rows: Vec::new(),
-                    },
                 }
             } else if skips_rows && !mutation_required.contains(name) {
                 QueryResult {
@@ -1563,12 +1741,15 @@ fn materialize_recursive_data_modifying_ctes(
                     state, &cte_query, &cte.alias, name, demand, xid, snapshot, context,
                 )?
             } else {
-                let StatementResult::Query(result) =
-                    execute_query(state, &cte_query, xid, snapshot, context)?
-                else {
-                    unreachable!("CTE query produces query rows");
-                };
-                result
+                execute_prepared_cte_query(
+                    state,
+                    cte.alias.name.span,
+                    name,
+                    &cte_query,
+                    xid,
+                    snapshot,
+                    context,
+                )?
             };
             if cte.alias.columns.len() > result.columns.len() {
                 return Err(PgError::create(
@@ -1934,31 +2115,40 @@ pub(crate) fn materialize_ctes(
             masked: Vec::new(),
         });
         let result = if modifying {
-            cte_query = materialize_query_ctes(state, &cte_query, xid, snapshot, context)?;
-            let cte_statement = convert_query_to_statement(cte_query);
-            let cte_statement =
-                materialize_uncorrelated_subqueries(state, &cte_statement, xid, snapshot, context)?;
-            match execute_statement(
-                state,
-                &cte_statement,
-                xid,
-                snapshot,
-                deferred_constraints,
-                defer_all,
-                context,
-                None,
-            )? {
-                StatementResult::Query(result) => result,
-                StatementResult::Affected(_) if consumed.contains(&name) => {
-                    return Err(PgError::create(
-                        SqlState::FeatureNotSupported,
-                        "WITH query does not have a RETURNING clause",
-                    ));
+            if let Some(result) = context.get_executed_cte_result(cte.alias.name.span, &name) {
+                result
+            } else {
+                cte_query = materialize_query_ctes(state, &cte_query, xid, snapshot, context)?;
+                let cte_statement = convert_query_to_statement(cte_query);
+                let cte_statement = materialize_uncorrelated_subqueries(
+                    state,
+                    &cte_statement,
+                    xid,
+                    snapshot,
+                    context,
+                )?;
+                match execute_statement(
+                    state,
+                    &cte_statement,
+                    xid,
+                    snapshot,
+                    deferred_constraints,
+                    defer_all,
+                    context,
+                    None,
+                )? {
+                    StatementResult::Query(result) => result,
+                    StatementResult::Affected(_) if consumed.contains(&name) => {
+                        return Err(PgError::create(
+                            SqlState::FeatureNotSupported,
+                            "WITH query does not have a RETURNING clause",
+                        ));
+                    }
+                    StatementResult::Affected(_) => QueryResult {
+                        columns: Vec::new(),
+                        rows: Vec::new(),
+                    },
                 }
-                StatementResult::Affected(_) => QueryResult {
-                    columns: Vec::new(),
-                    rows: Vec::new(),
-                },
             }
         } else if skips_rows && !mutation_required.contains(&name) {
             QueryResult {
@@ -1969,12 +2159,15 @@ pub(crate) fn materialize_ctes(
                 rows: Vec::new(),
             }
         } else {
-            let StatementResult::Query(result) =
-                execute_query(state, &cte_query, xid, snapshot, context)?
-            else {
-                unreachable!("CTE query produces query rows");
-            };
-            result
+            execute_prepared_cte_query(
+                state,
+                cte.alias.name.span,
+                &name,
+                &cte_query,
+                xid,
+                snapshot,
+                context,
+            )?
         };
         if cte.alias.columns.len() > result.columns.len() {
             return Err(PgError::create(
@@ -2073,6 +2266,10 @@ struct SubqueryMaterializer<'a> {
 impl SubqueryMaterializer<'_> {
     #[cfg_attr(feature = "execution-log", tracing::instrument(skip_all))]
     fn execute(&self, query: &ast::Query) -> Result<QueryResult> {
+        if let Some(result) = self.context.get_prepared_subquery_result(query) {
+            return Ok(result);
+        }
+        let original = query.clone();
         let query = materialize_uncorrelated_subqueries(
             self.state,
             &ast::Statement::Query(Box::new(query.clone())),
@@ -2088,6 +2285,10 @@ impl SubqueryMaterializer<'_> {
         else {
             unreachable!("subquery execution returns query rows");
         };
+        if self.context.prepares_subquery_results() {
+            self.context
+                .set_prepared_subquery_result(&original, result.clone());
+        }
         Ok(result)
     }
 }
@@ -2412,8 +2613,13 @@ struct OuterReferenceSubstituter<'a> {
     outer_scope: &'a BoundScope,
     outer_row: &'a [Value],
     scopes: Vec<BoundScope>,
+    output_aliases: Vec<BTreeSet<String>>,
+    protected_order_identifiers: Vec<bool>,
+    group_by_depth: usize,
+    group_expression_depth: usize,
     error: Option<PgError>,
     substituted: bool,
+    reject_ambiguous_unqualified: bool,
 }
 
 impl ast::VisitorMut for OuterReferenceSubstituter<'_> {
@@ -2425,31 +2631,112 @@ impl ast::VisitorMut for OuterReferenceSubstituter<'_> {
             self.scopes.push(BoundScope {
                 columns: Vec::new(),
             });
+            self.output_aliases.push(BTreeSet::new());
             return std::ops::ControlFlow::Continue(());
         };
-        match bind_query_scope(self.catalog, select) {
+        let output_aliases = select
+            .projection
+            .iter()
+            .filter_map(|item| match item {
+                ast::SelectItem::ExprWithAlias { alias, .. } => Some(normalize_identifier(alias)),
+                _ => None,
+            })
+            .collect();
+        let mut analysis = select.as_ref().clone();
+        let _ = ast::visit_expressions_mut(&mut analysis, |expression| {
+            let ast::Expr::Identifier(identifier) = expression else {
+                return std::ops::ControlFlow::<()>::Continue(());
+            };
+            let identifiers = std::slice::from_ref(identifier);
+            let Ok((_, data_type)) = self.outer_scope.resolve_column(identifiers) else {
+                return std::ops::ControlFlow::Continue(());
+            };
+            let Ok(value) =
+                RowScope::Bound(self.outer_scope).resolve_column_value(identifiers, self.outer_row)
+            else {
+                return std::ops::ControlFlow::Continue(());
+            };
+            *expression = crate::analyzer::create_typed_literal(value, data_type);
+            std::ops::ControlFlow::Continue(())
+        });
+        match bind_query_scope(self.catalog, &analysis) {
             Ok(scope) => self.scopes.push(scope),
             Err(error) => {
                 self.error = Some(error);
                 return std::ops::ControlFlow::Break(());
             }
         }
+        self.output_aliases.push(output_aliases);
         std::ops::ControlFlow::Continue(())
     }
 
     #[cfg_attr(feature = "execution-log", tracing::instrument(skip_all))]
     fn post_visit_query(&mut self, _query: &mut ast::Query) -> std::ops::ControlFlow<Self::Break> {
         self.scopes.pop().expect("visited query pushed a scope");
+        self.output_aliases
+            .pop()
+            .expect("visited query pushed output aliases");
+        std::ops::ControlFlow::Continue(())
+    }
+
+    fn pre_visit_order_by_expr(
+        &mut self,
+        order_by: &mut ast::OrderByExpr,
+    ) -> std::ops::ControlFlow<Self::Break> {
+        self.protected_order_identifiers.push(
+            matches!(&order_by.expr, ast::Expr::Identifier(identifier)
+                if self.output_aliases.last().is_some_and(|aliases| aliases.contains(&normalize_identifier(identifier)))),
+        );
+        std::ops::ControlFlow::Continue(())
+    }
+
+    fn post_visit_order_by_expr(
+        &mut self,
+        _order_by: &mut ast::OrderByExpr,
+    ) -> std::ops::ControlFlow<Self::Break> {
+        self.protected_order_identifiers
+            .pop()
+            .expect("visited ORDER BY expression pushed alias protection");
+        std::ops::ControlFlow::Continue(())
+    }
+
+    fn pre_visit_group_by(
+        &mut self,
+        _group_by: &mut ast::GroupByExpr,
+    ) -> std::ops::ControlFlow<Self::Break> {
+        self.group_by_depth += 1;
+        std::ops::ControlFlow::Continue(())
+    }
+
+    fn post_visit_group_by(
+        &mut self,
+        _group_by: &mut ast::GroupByExpr,
+    ) -> std::ops::ControlFlow<Self::Break> {
+        self.group_by_depth -= 1;
         std::ops::ControlFlow::Continue(())
     }
 
     #[cfg_attr(feature = "execution-log", tracing::instrument(skip_all))]
     fn pre_visit_expr(&mut self, expression: &mut ast::Expr) -> std::ops::ControlFlow<Self::Break> {
+        let protected_group_identifier =
+            self.group_by_depth != 0 && self.group_expression_depth == 0;
+        if self.group_by_depth != 0 {
+            self.group_expression_depth += 1;
+        }
         let identifiers = match expression {
             ast::Expr::Identifier(identifier) => std::slice::from_ref(identifier),
             ast::Expr::CompoundIdentifier(identifiers) => identifiers.as_slice(),
             _ => return std::ops::ControlFlow::Continue(()),
         };
+        if (self.protected_order_identifiers.last() == Some(&true) || protected_group_identifier)
+            && identifiers.len() == 1
+            && self
+                .output_aliases
+                .last()
+                .is_some_and(|aliases| aliases.contains(&normalize_identifier(&identifiers[0])))
+        {
+            return std::ops::ControlFlow::Continue(());
+        }
         for scope in self.scopes.iter().rev() {
             if identifiers.len() == 2 {
                 let qualifier = normalize_identifier(&identifiers[0]);
@@ -2462,7 +2749,19 @@ impl ast::VisitorMut for OuterReferenceSubstituter<'_> {
                 }
             }
             match scope.resolve_column(identifiers) {
-                Ok(_) => return std::ops::ControlFlow::Continue(()),
+                Ok(_) => {
+                    if self.reject_ambiguous_unqualified
+                        && identifiers.len() == 1
+                        && self.outer_scope.resolve_column(identifiers).is_ok()
+                    {
+                        self.error = Some(PgError::create(
+                            SqlState::AmbiguousColumn,
+                            "column reference is ambiguous",
+                        ));
+                        return std::ops::ControlFlow::Break(());
+                    }
+                    return std::ops::ControlFlow::Continue(());
+                }
                 Err(error)
                     if identifiers.len() == 1 && error.sqlstate == SqlState::UndefinedColumn => {}
                 Err(error) => {
@@ -2498,6 +2797,16 @@ impl ast::VisitorMut for OuterReferenceSubstituter<'_> {
         }
         std::ops::ControlFlow::Continue(())
     }
+
+    fn post_visit_expr(
+        &mut self,
+        _expression: &mut ast::Expr,
+    ) -> std::ops::ControlFlow<Self::Break> {
+        if self.group_by_depth != 0 {
+            self.group_expression_depth -= 1;
+        }
+        std::ops::ControlFlow::Continue(())
+    }
 }
 
 #[cfg_attr(feature = "execution-log", tracing::instrument(skip_all))]
@@ -2513,8 +2822,13 @@ fn references_outer_scope(
         outer_scope,
         outer_row: &outer_row,
         scopes: Vec::new(),
+        output_aliases: Vec::new(),
+        protected_order_identifiers: Vec::new(),
+        group_by_depth: 0,
+        group_expression_depth: 0,
         error: None,
         substituted: false,
+        reject_ambiguous_unqualified: false,
     };
     let _ = expression.visit(&mut substituter);
     substituter.error.map_or(Ok(substituter.substituted), Err)
@@ -2539,8 +2853,13 @@ pub(super) fn evaluate_query_expression(
         outer_scope: scope,
         outer_row: row,
         scopes: Vec::new(),
+        output_aliases: Vec::new(),
+        protected_order_identifiers: Vec::new(),
+        group_by_depth: 0,
+        group_expression_depth: 0,
         error: None,
         substituted: false,
+        reject_ambiguous_unqualified: false,
     };
     let _ = expression.visit(&mut substituter);
     if let Some(error) = substituter.error {
@@ -2556,6 +2875,85 @@ pub(super) fn evaluate_query_expression(
         Vec::new(),
     )?;
     evaluate(&expression, RowScope::Bound(scope), row, context)
+}
+
+pub(crate) fn substitute_procedural_references(
+    state: &DatabaseState,
+    statement: &mut ast::Statement,
+    scope: &BoundScope,
+    row: &[Value],
+) -> Result<()> {
+    let scopes = match statement {
+        ast::Statement::Update(update) => {
+            let ast::TableFactor::Table {
+                name, alias, args, ..
+            } = &update.table.relation
+            else {
+                return reject_unsupported("UPDATE target is not implemented");
+            };
+            if args.is_some() {
+                return reject_unsupported("UPDATE table functions are not implemented");
+            }
+            let schema = state
+                .catalog
+                .require_named_table(&normalize_relation_name(name)?)?;
+            let from = match &update.from {
+                None => &[][..],
+                Some(ast::UpdateTableFromKind::AfterSet(from)) => from.as_slice(),
+                Some(ast::UpdateTableFromKind::BeforeSet(_)) => {
+                    return reject_unsupported("UPDATE FROM before SET is not implemented");
+                }
+            };
+            vec![writes::create_mutation_scope(
+                state,
+                schema,
+                alias.as_ref().map(|alias| &alias.name),
+                from,
+            )?]
+        }
+        ast::Statement::Delete(delete) => {
+            let ast::FromTable::WithFromKeyword(from) = &delete.from else {
+                return reject_unsupported("DELETE without FROM is not implemented");
+            };
+            let Some(target) = from.first() else {
+                return reject_unsupported("DELETE target is not implemented");
+            };
+            let ast::TableFactor::Table {
+                name, alias, args, ..
+            } = &target.relation
+            else {
+                return reject_unsupported("DELETE target is not implemented");
+            };
+            if args.is_some() {
+                return reject_unsupported("DELETE table functions are not implemented");
+            }
+            let schema = state
+                .catalog
+                .require_named_table(&normalize_relation_name(name)?)?;
+            vec![writes::create_mutation_scope(
+                state,
+                schema,
+                alias.as_ref().map(|alias| &alias.name),
+                delete.using.as_deref().unwrap_or_default(),
+            )?]
+        }
+        _ => Vec::new(),
+    };
+    let mut substituter = OuterReferenceSubstituter {
+        catalog: &state.catalog,
+        outer_scope: scope,
+        outer_row: row,
+        scopes,
+        output_aliases: Vec::new(),
+        protected_order_identifiers: Vec::new(),
+        group_by_depth: 0,
+        group_expression_depth: 0,
+        error: None,
+        substituted: false,
+        reject_ambiguous_unqualified: true,
+    };
+    let _ = statement.visit(&mut substituter);
+    substituter.error.map_or(Ok(()), Err)
 }
 
 #[cfg_attr(feature = "execution-log", tracing::instrument(skip_all))]
@@ -2721,10 +3119,57 @@ struct GroupingPlan {
     enabled: bool,
     primary_key_dependencies: BTreeSet<ConstraintId>,
 }
-struct OrderedRow {
+#[derive(Clone)]
+pub(super) struct OrderedRow {
     values: Vec<Value>,
     keys: Vec<Value>,
     distinct_keys: Vec<Value>,
+    deferred_source: Option<Vec<Value>>,
+    evaluated_projections: Option<Vec<bool>>,
+}
+
+#[derive(Clone)]
+pub(super) struct GroupedStreamRow {
+    values: Vec<Value>,
+    keys: Vec<Value>,
+    source: Vec<Value>,
+    evaluated_projections: Vec<bool>,
+    deferred_projection_expressions: Vec<Option<ast::Expr>>,
+}
+
+#[derive(Clone)]
+pub(super) enum PreparedQueryStream {
+    Unordered {
+        query: ast::Query,
+        visited: usize,
+        eligible: usize,
+    },
+    Ordered {
+        query: ast::Query,
+        rows: Vec<OrderedRow>,
+        next: usize,
+    },
+    Grouped {
+        query: ast::Query,
+        rows: Vec<GroupedStreamRow>,
+        next: usize,
+    },
+    UnionAll {
+        query: ast::Query,
+        left: ast::Query,
+        right: ast::Query,
+        left_state: Option<Box<PreparedQueryStream>>,
+        right_state: Option<Box<PreparedQueryStream>>,
+        reads_right: bool,
+        produced: usize,
+        limit: Option<usize>,
+        offset: usize,
+        columns: Vec<ColumnMeta>,
+    },
+    Materialized {
+        result: QueryResult,
+        next: usize,
+    },
 }
 #[derive(Default)]
 struct AggregateUsage {
@@ -2739,14 +3184,45 @@ struct AggregateValidator<'a> {
     error: Option<PgError>,
 }
 struct AggregateMaterializer<'a> {
-    state: &'a DatabaseState,
-    scope: &'a BoundScope,
-    rows: &'a [Vec<Value>],
-    xid: Xid,
-    snapshot: &'a Snapshot,
-    context: &'a StatementExecutionContext,
+    values: &'a GroupedAggregateValues,
+    owner: AggregateOwner,
     query_depth: usize,
     error: Option<PgError>,
+}
+struct AggregateCollector {
+    functions: Vec<CollectedAggregateFunction>,
+    owner: AggregateOwner,
+    query_depth: usize,
+}
+struct ConstantCasePruner<'a> {
+    type_context: Option<(&'a DatabaseState, &'a BoundScope)>,
+    error: Option<PgError>,
+}
+#[derive(Clone, Copy, Eq, PartialEq)]
+enum AggregateOwner {
+    Projection(usize),
+    Having,
+    Order(usize),
+    Distinct(usize),
+}
+struct CollectedAggregateFunction {
+    function: ast::Function,
+    owner: AggregateOwner,
+    volatile: bool,
+}
+pub(super) struct GroupedAggregateValue {
+    function: ast::Function,
+    owner: AggregateOwner,
+    volatile: bool,
+    value: Value,
+    data_type: BaseType,
+    used: Cell<bool>,
+}
+pub(super) type GroupedAggregateValues = Vec<GroupedAggregateValue>;
+struct CollectedGroup {
+    key: Vec<Value>,
+    rows: Vec<Vec<Value>>,
+    aggregate_inputs: Vec<Vec<AggregateInput>>,
 }
 struct GroupedExpressionSubstituter<'a> {
     catalog: &'a crate::catalog::Catalog,
@@ -2861,63 +3337,130 @@ impl ast::VisitorMut for AggregateMaterializer<'_> {
         if !is_aggregate_function(function) {
             return std::ops::ControlFlow::Continue(());
         }
-        let original_argument = match &function.args {
-            ast::FunctionArguments::List(arguments) => match arguments.args.as_slice() {
-                [ast::FunctionArg::Unnamed(ast::FunctionArgExpr::Expr(argument))] => Some(argument),
-                _ => None,
-            },
-            _ => None,
-        };
-        let original_filter = function.filter.as_deref();
-        let typed_expression = match super::scope::substitute_typed_subqueries(
-            &self.state.catalog,
-            &ast::Expr::Function(function.clone()),
-            self.scope,
-        ) {
-            Ok(expression) => expression,
-            Err(error) => {
-                self.error = Some(error);
-                return std::ops::ControlFlow::Break(());
-            }
-        };
-        let ast::Expr::Function(typed_function) = typed_expression else {
-            unreachable!("typed aggregate expression remains a function")
-        };
-        match evaluate_aggregate_function(
-            &typed_function,
-            RowScope::Bound(self.scope),
-            self.rows,
-            |typed_expression, row| {
-                let expression = if typed_function
-                    .filter
-                    .as_deref()
-                    .is_some_and(|filter| std::ptr::eq(filter, typed_expression))
-                {
-                    original_filter.expect("aggregate FILTER expression was validated")
+        let prepared = self.values.iter().find(|prepared| {
+            prepared.function == *function
+                && if prepared.volatile {
+                    prepared.owner == self.owner && !prepared.used.get()
                 } else {
-                    original_argument.expect("aggregate expression argument was validated")
-                };
-                evaluate_query_expression(
-                    self.state,
-                    expression,
-                    self.scope,
-                    row,
-                    self.xid,
-                    self.snapshot,
-                    self.context,
-                )
-            },
-        ) {
-            Ok((value, data_type)) => {
-                *expression =
-                    crate::analyzer::create_typed_literal(value, PgType::create(data_type));
-                std::ops::ControlFlow::Continue(())
-            }
-            Err(error) => {
-                self.error = Some(error);
-                std::ops::ControlFlow::Break(())
+                    true
+                }
+        });
+        let Some(prepared) = prepared else {
+            self.error = Some(PgError::create(
+                SqlState::InternalError,
+                "aggregate value was not prepared",
+            ));
+            return std::ops::ControlFlow::Break(());
+        };
+        prepared.used.set(true);
+        *expression = crate::analyzer::create_typed_literal(
+            prepared.value.clone(),
+            PgType::create(prepared.data_type),
+        );
+        std::ops::ControlFlow::Continue(())
+    }
+}
+
+impl ast::VisitorMut for AggregateCollector {
+    type Break = ();
+
+    fn pre_visit_query(&mut self, _query: &mut ast::Query) -> std::ops::ControlFlow<Self::Break> {
+        self.query_depth += 1;
+        std::ops::ControlFlow::Continue(())
+    }
+
+    fn post_visit_query(&mut self, _query: &mut ast::Query) -> std::ops::ControlFlow<Self::Break> {
+        self.query_depth -= 1;
+        std::ops::ControlFlow::Continue(())
+    }
+
+    fn pre_visit_expr(&mut self, expression: &mut ast::Expr) -> std::ops::ControlFlow<Self::Break> {
+        if self.query_depth != 0 {
+            return std::ops::ControlFlow::Continue(());
+        }
+        let ast::Expr::Function(function) = expression else {
+            return std::ops::ControlFlow::Continue(());
+        };
+        if is_aggregate_function(function) {
+            let volatile = contains_volatile_expression(&ast::Expr::Function(function.clone()));
+            if volatile
+                || !self
+                    .functions
+                    .iter()
+                    .any(|collected| collected.function == *function)
+            {
+                self.functions.push(CollectedAggregateFunction {
+                    function: function.clone(),
+                    owner: self.owner,
+                    volatile,
+                });
             }
         }
+        std::ops::ControlFlow::Continue(())
+    }
+}
+
+impl ast::VisitorMut for ConstantCasePruner<'_> {
+    type Break = ();
+
+    fn pre_visit_expr(&mut self, expression: &mut ast::Expr) -> std::ops::ControlFlow<Self::Break> {
+        loop {
+            if !matches!(expression, ast::Expr::Case { operand: None, .. }) {
+                break;
+            }
+            let data_type = if let Some((state, scope)) = self.type_context {
+                match infer_query_expression_type(state, expression, scope) {
+                    Ok(data_type) => Some(data_type),
+                    Err(error) => {
+                        self.error = Some(error);
+                        return std::ops::ControlFlow::Break(());
+                    }
+                }
+            } else {
+                None
+            };
+            let ast::Expr::Case {
+                operand: None,
+                conditions,
+                else_result,
+                ..
+            } = expression
+            else {
+                break;
+            };
+            if conditions.is_empty() {
+                break;
+            }
+            let mut retained = Vec::new();
+            let mut terminal = None;
+            for condition in std::mem::take(conditions) {
+                match &condition.condition {
+                    ast::Expr::Value(value)
+                        if matches!(value.value, ast::Value::Boolean(false) | ast::Value::Null) => {
+                    }
+                    ast::Expr::Value(value) if value.value == ast::Value::Boolean(true) => {
+                        terminal = Some(condition.result);
+                        break;
+                    }
+                    _ => retained.push(condition),
+                }
+            }
+            if retained.is_empty() {
+                let replacement = terminal
+                    .or_else(|| else_result.take().map(|result| *result))
+                    .unwrap_or_else(|| ast::Expr::Value(ast::Value::Null.into()));
+                *expression = data_type.map_or(replacement.clone(), |data_type| {
+                    crate::analyzer::create_typed_cast(replacement, data_type)
+                });
+                continue;
+            }
+            *conditions = retained;
+            if let Some(terminal) = terminal {
+                *else_result = Some(Box::new(terminal));
+            }
+            break;
+        }
+        std::ops::ControlFlow::Continue(())
     }
 }
 
@@ -3143,24 +3686,108 @@ fn materialize_aggregate_expression(
     state: &DatabaseState,
     expression: &ast::Expr,
     scope: &BoundScope,
-    rows: &[Vec<Value>],
-    xid: Xid,
-    snapshot: &Snapshot,
-    context: &StatementExecutionContext,
+    values: &GroupedAggregateValues,
+    owner: AggregateOwner,
 ) -> Result<ast::Expr> {
     let mut expression = expression.clone();
+    let mut pruner = ConstantCasePruner {
+        type_context: Some((state, scope)),
+        error: None,
+    };
+    let _ = expression.visit(&mut pruner);
+    if let Some(error) = pruner.error {
+        return Err(error);
+    }
     let mut materializer = AggregateMaterializer {
-        state,
-        scope,
-        rows,
-        xid,
-        snapshot,
-        context,
+        values,
+        owner,
         query_depth: 0,
         error: None,
     };
     let _ = expression.visit(&mut materializer);
     materializer.error.map_or(Ok(expression), Err)
+}
+
+fn collect_group_aggregate_functions(
+    state: &DatabaseState,
+    select: &ast::Select,
+    projections: &[ProjectionSource<'_>],
+    order_specs: &[RowOrderSpec<'_>],
+    distinct: &DistinctPlan<'_>,
+    scope: &BoundScope,
+) -> Result<Vec<CollectedAggregateFunction>> {
+    let mut collector = AggregateCollector {
+        functions: Vec::new(),
+        owner: AggregateOwner::Having,
+        query_depth: 0,
+    };
+    let mut visit = |owner, expression: &ast::Expr| {
+        collector.owner = owner;
+        let mut expression = expression.clone();
+        let mut pruner = ConstantCasePruner {
+            type_context: Some((state, scope)),
+            error: None,
+        };
+        let _ = expression.visit(&mut pruner);
+        if let Some(error) = pruner.error {
+            return Err(error);
+        }
+        let _ = expression.visit(&mut collector);
+        Ok(())
+    };
+    for (index, projection) in projections.iter().enumerate() {
+        if let ProjectionSource::Expression(expression) = projection {
+            visit(AggregateOwner::Projection(index), expression)?;
+        }
+    }
+    if let Some(having) = &select.having {
+        visit(AggregateOwner::Having, having)?;
+    }
+    for (index, order) in order_specs.iter().enumerate() {
+        if let OrderKey::Expression(expression) = order.key {
+            visit(AggregateOwner::Order(index), expression)?;
+        }
+    }
+    if let DistinctPlan::On { keys, .. } = distinct {
+        for (index, key) in keys.iter().enumerate() {
+            if let DistinctKey::Expression(expression) = key {
+                visit(AggregateOwner::Distinct(index), expression)?;
+            }
+        }
+    }
+    Ok(collector.functions)
+}
+
+fn prepare_group_aggregate_input(
+    state: &DatabaseState,
+    original: &ast::Function,
+    typed: &ast::Function,
+    scope: &BoundScope,
+    row: &[Value],
+    xid: Xid,
+    snapshot: &Snapshot,
+    context: &StatementExecutionContext,
+) -> Result<AggregateInput> {
+    let original_argument = match &original.args {
+        ast::FunctionArguments::List(arguments) => match arguments.args.as_slice() {
+            [ast::FunctionArg::Unnamed(ast::FunctionArgExpr::Expr(argument))] => Some(argument),
+            _ => None,
+        },
+        _ => None,
+    };
+    let original_filter = original.filter.as_deref();
+    prepare_aggregate_function_input(typed, RowScope::Bound(scope), |typed_expression| {
+        let expression = if typed
+            .filter
+            .as_deref()
+            .is_some_and(|filter| std::ptr::eq(filter, typed_expression))
+        {
+            original_filter.expect("aggregate FILTER expression was validated")
+        } else {
+            original_argument.expect("aggregate expression argument was validated")
+        };
+        evaluate_query_expression(state, expression, scope, row, xid, snapshot, context)
+    })
 }
 
 #[cfg_attr(feature = "execution-log", tracing::instrument(skip_all))]
@@ -3208,6 +3835,127 @@ fn compare_group_keys(left: &[Value], right: &[Value]) -> Result<bool> {
         }
     }
     Ok(true)
+}
+
+fn compare_group_visitation(left: &[Value], right: &[Value]) -> Ordering {
+    assert_eq!(left.len(), right.len());
+    left.iter()
+        .zip(right)
+        .find_map(|(left, right)| {
+            let ordering = match (left, right) {
+                (Value::Null, Value::Null) => Ordering::Equal,
+                (Value::Null, _) => Ordering::Greater,
+                (_, Value::Null) => Ordering::Less,
+                _ => compare_values(left, right).expect("GROUP BY expression type was checked"),
+            };
+            (ordering != Ordering::Equal).then_some(ordering)
+        })
+        .unwrap_or(Ordering::Equal)
+}
+
+fn hash_postgres_uint32(key: u32) -> u32 {
+    let mut a = 0x9e37_79b9_u32.wrapping_add(4).wrapping_add(3_923_095);
+    let mut b = a;
+    let mut c = a;
+    a = a.wrapping_add(key);
+    c ^= b;
+    c = c.wrapping_sub(b.rotate_left(14));
+    a ^= c;
+    a = a.wrapping_sub(c.rotate_left(11));
+    b ^= a;
+    b = b.wrapping_sub(a.rotate_left(25));
+    c ^= b;
+    c = c.wrapping_sub(b.rotate_left(16));
+    a ^= c;
+    a = a.wrapping_sub(c.rotate_left(4));
+    b ^= a;
+    b = b.wrapping_sub(a.rotate_left(14));
+    c ^= b;
+    c.wrapping_sub(b.rotate_left(24))
+}
+
+fn hash_postgres_murmur32(mut value: u32) -> u32 {
+    value ^= value >> 16;
+    value = value.wrapping_mul(0x85eb_ca6b);
+    value ^= value >> 13;
+    value = value.wrapping_mul(0xc2b2_ae35);
+    value ^ (value >> 16)
+}
+
+fn create_postgres_group_hash(key: &[Value]) -> Option<u32> {
+    let [value] = key else {
+        return None;
+    };
+    let hash = match value {
+        Value::Null => 0,
+        Value::Bool(value) => hash_postgres_uint32(u32::from(*value)),
+        Value::Int2(value) => {
+            hash_postgres_uint32(u32::from_ne_bytes(i32::from(*value).to_ne_bytes()))
+        }
+        Value::Int4(value) => hash_postgres_uint32(u32::from_ne_bytes(value.to_ne_bytes())),
+        Value::Int8(value) => {
+            let high = (*value >> 32) as u32;
+            let low = *value as u32;
+            hash_postgres_uint32(low ^ if *value >= 0 { high } else { !high })
+        }
+        _ => return None,
+    };
+    Some(hash_postgres_murmur32(hash))
+}
+
+fn sort_groups_by_postgres_visitation(mut groups: Vec<CollectedGroup>) -> Vec<CollectedGroup> {
+    if groups.len() > 230 {
+        groups.sort_by(|left, right| compare_group_visitation(&right.key, &left.key));
+        return groups;
+    }
+    let Some(hashes) = groups
+        .iter()
+        .map(|group| create_postgres_group_hash(&group.key))
+        .collect::<Option<Vec<_>>>()
+    else {
+        groups.sort_by(|left, right| compare_group_visitation(&right.key, &left.key));
+        return groups;
+    };
+    let mut buckets = vec![None; 256];
+    let mask = buckets.len() - 1;
+    for (index, hash) in hashes.iter().copied().enumerate() {
+        let mut candidate = index;
+        let mut position = hash as usize & mask;
+        let mut distance = 0;
+        loop {
+            let Some(current) = buckets[position] else {
+                buckets[position] = Some(candidate);
+                break;
+            };
+            let current_optimal = hashes[current] as usize & mask;
+            let current_distance = position.wrapping_sub(current_optimal) & mask;
+            if distance > current_distance {
+                buckets[position] = Some(candidate);
+                candidate = current;
+                distance = current_distance;
+            }
+            position = position.wrapping_add(1) & mask;
+            distance += 1;
+            assert!(distance < buckets.len());
+        }
+    }
+    let start = buckets
+        .iter()
+        .position(Option::is_none)
+        .expect("group hash table retains an empty bucket");
+    let mut order = Vec::with_capacity(groups.len());
+    let mut position = start;
+    for _ in 0..buckets.len() {
+        if let Some(index) = buckets[position] {
+            order.push(index);
+        }
+        position = position.wrapping_sub(1) & mask;
+    }
+    let mut groups = groups.drain(..).map(Some).collect::<Vec<_>>();
+    order
+        .into_iter()
+        .map(|index| groups[index].take().expect("group is visited once"))
+        .collect()
 }
 
 #[cfg_attr(feature = "execution-log", tracing::instrument(skip_all))]
@@ -3534,6 +4282,18 @@ fn execute_values_query(
 }
 
 #[cfg_attr(feature = "execution-log", tracing::instrument(skip_all))]
+fn create_set_operand_query(query: &ast::Query, expression: &ast::SetExpr) -> ast::Query {
+    let mut operand = query.clone();
+    operand.with = None;
+    operand.body = Box::new(expression.clone());
+    operand.order_by = None;
+    operand.limit_clause = None;
+    operand.fetch = None;
+    operand.locks.clear();
+    operand
+}
+
+#[cfg_attr(feature = "execution-log", tracing::instrument(skip_all))]
 fn execute_set_expression(
     state: &DatabaseState,
     query: &ast::Query,
@@ -3562,13 +4322,7 @@ fn execute_set_expression(
             execute_set_operation(*op, *set_quantifier, left, right)
         }
         ast::SetExpr::Select(_) | ast::SetExpr::Values(_) => {
-            let mut operand = query.clone();
-            operand.with = None;
-            operand.body = Box::new(expression.clone());
-            operand.order_by = None;
-            operand.limit_clause = None;
-            operand.fetch = None;
-            operand.locks.clear();
+            let operand = create_set_operand_query(query, expression);
             let StatementResult::Query(result) =
                 execute_query(state, &operand, xid, snapshot, context)?
             else {
@@ -4426,16 +5180,14 @@ fn evaluate_select_expression(
     expression: &ast::Expr,
     scope: &BoundScope,
     row: &[Value],
-    aggregate_rows: Option<&[Vec<Value>]>,
+    aggregate_values: Option<(&GroupedAggregateValues, AggregateOwner)>,
     xid: Xid,
     snapshot: &Snapshot,
     context: &StatementExecutionContext,
 ) -> Result<Value> {
     let materialized;
-    let expression = if let Some(rows) = aggregate_rows {
-        materialized = materialize_aggregate_expression(
-            state, expression, scope, rows, xid, snapshot, context,
-        )?;
+    let expression = if let Some((values, owner)) = aggregate_values {
+        materialized = materialize_aggregate_expression(state, expression, scope, values, owner)?;
         &materialized
     } else {
         expression
@@ -4449,7 +5201,7 @@ fn evaluate_projection_value(
     projection: &ProjectionSource<'_>,
     scope: &BoundScope,
     row: &[Value],
-    aggregate_rows: Option<&[Vec<Value>]>,
+    aggregate_values: Option<(&GroupedAggregateValues, AggregateOwner)>,
     xid: Xid,
     snapshot: &Snapshot,
     context: &StatementExecutionContext,
@@ -4480,12 +5232,48 @@ fn evaluate_projection_value(
             expression,
             scope,
             row,
-            aggregate_rows,
+            aggregate_values,
             xid,
             snapshot,
             context,
         ),
     }
+}
+
+fn contains_volatile_expression(expression: &ast::Expr) -> bool {
+    let mut expression = expression.clone();
+    let _ = expression.visit(&mut ConstantCasePruner {
+        type_context: None,
+        error: None,
+    });
+    let mut found = false;
+    let _ = ast::visit_expressions(&expression, |nested| {
+        let ast::Expr::Function(function) = nested else {
+            return std::ops::ControlFlow::Continue(());
+        };
+        if normalize_unqualified_object_name(&function.name).is_ok_and(|name| {
+            matches!(
+                name.as_str(),
+                "gen_random_uuid"
+                    | "uuidv4"
+                    | "uuidv7"
+                    | "clock_timestamp"
+                    | "nextval"
+                    | "currval"
+                    | "lastval"
+                    | "setval"
+            )
+        }) {
+            found = true;
+            return std::ops::ControlFlow::Break(());
+        }
+        std::ops::ControlFlow::Continue(())
+    });
+    found
+}
+
+fn contains_volatile_projection(projection: &ProjectionSource<'_>) -> bool {
+    matches!(projection, ProjectionSource::Expression(expression) if contains_volatile_expression(expression))
 }
 
 #[cfg_attr(feature = "execution-log", tracing::instrument(skip_all))]
@@ -4494,20 +5282,21 @@ pub(super) fn evaluate_projection_values(
     projections: &[ProjectionSource<'_>],
     scope: &BoundScope,
     row: &[Value],
-    aggregate_rows: Option<&[Vec<Value>]>,
+    aggregate_values: Option<&GroupedAggregateValues>,
     xid: Xid,
     snapshot: &Snapshot,
     context: &StatementExecutionContext,
 ) -> Result<Vec<Value>> {
     projections
         .iter()
-        .map(|projection| {
+        .enumerate()
+        .map(|(index, projection)| {
             evaluate_projection_value(
                 state,
                 projection,
                 scope,
                 row,
-                aggregate_rows,
+                aggregate_values.map(|values| (values, AggregateOwner::Projection(index))),
                 xid,
                 snapshot,
                 context,
@@ -4523,14 +5312,15 @@ fn evaluate_order_keys(
     values: &[Value],
     scope: &BoundScope,
     row: &[Value],
-    aggregate_rows: Option<&[Vec<Value>]>,
+    aggregate_values: Option<&GroupedAggregateValues>,
     xid: Xid,
     snapshot: &Snapshot,
     context: &StatementExecutionContext,
 ) -> Result<Vec<Value>> {
     order_specs
         .iter()
-        .map(|order| match order.key {
+        .enumerate()
+        .map(|(index, order)| match order.key {
             OrderKey::Output(index) => Ok(values[index].clone()),
             OrderKey::Input(slot, _) => Ok(row[slot].clone()),
             OrderKey::Expression(expression) => evaluate_select_expression(
@@ -4538,7 +5328,7 @@ fn evaluate_order_keys(
                 expression,
                 scope,
                 row,
-                aggregate_rows,
+                aggregate_values.map(|values| (values, AggregateOwner::Order(index))),
                 xid,
                 snapshot,
                 context,
@@ -4555,7 +5345,7 @@ fn evaluate_distinct_keys(
     order_keys: &[Value],
     scope: &BoundScope,
     row: &[Value],
-    aggregate_rows: Option<&[Vec<Value>]>,
+    aggregate_values: Option<&GroupedAggregateValues>,
     xid: Xid,
     snapshot: &Snapshot,
     context: &StatementExecutionContext,
@@ -4564,7 +5354,8 @@ fn evaluate_distinct_keys(
         return Ok(Vec::new());
     };
     keys.iter()
-        .map(|key| match key {
+        .enumerate()
+        .map(|(index, key)| match key {
             DistinctKey::Output(index) => Ok(values[*index].clone()),
             DistinctKey::Order(index) => Ok(order_keys[*index].clone()),
             DistinctKey::Expression(expression) => evaluate_select_expression(
@@ -4572,7 +5363,7 @@ fn evaluate_distinct_keys(
                 expression,
                 scope,
                 row,
-                aggregate_rows,
+                aggregate_values.map(|values| (values, AggregateOwner::Distinct(index))),
                 xid,
                 snapshot,
                 context,
@@ -4621,6 +5412,7 @@ fn execute_plain_select_rows(
         return rows;
     }
     let mut rows = Vec::new();
+    let defer_projection = !order_specs.is_empty() && matches!(distinct, DistinctPlan::None);
     let remaining_selection = if selection_is_fully_pushed(select, scope) {
         None
     } else {
@@ -4635,6 +5427,9 @@ fn execute_plain_select_rows(
         context,
         select.selection.as_ref(),
         &mut |row| {
+            if order_specs.is_empty() && top_k.is_some_and(|top_k| rows.len() >= top_k) {
+                return Ok(());
+            }
             if !evaluate_where_clause(
                 state,
                 remaining_selection,
@@ -4644,6 +5439,52 @@ fn execute_plain_select_rows(
                 snapshot,
                 context,
             )? {
+                return Ok(());
+            }
+            if defer_projection {
+                let mut values = vec![Value::Null; projections.len()];
+                let mut evaluated = vec![false; projections.len()];
+                for index in order_specs.iter().filter_map(|order| match order.key {
+                    OrderKey::Output(index) => Some(index),
+                    OrderKey::Input(_, _) | OrderKey::Expression(_) => None,
+                }) {
+                    if !evaluated[index] {
+                        values[index] = evaluate_projection_value(
+                            state,
+                            &projections[index],
+                            scope,
+                            row,
+                            None,
+                            xid,
+                            snapshot,
+                            context,
+                        )?;
+                        evaluated[index] = true;
+                    }
+                }
+                let keys = evaluate_order_keys(
+                    state,
+                    order_specs,
+                    &values,
+                    scope,
+                    row,
+                    None,
+                    xid,
+                    snapshot,
+                    context,
+                )?;
+                retain_top_ordered_row(
+                    &mut rows,
+                    OrderedRow {
+                        values,
+                        keys,
+                        distinct_keys: Vec::new(),
+                        deferred_source: Some(row.to_vec()),
+                        evaluated_projections: Some(evaluated),
+                    },
+                    top_k,
+                    order_specs,
+                );
                 return Ok(());
             }
             let values = evaluate_projection_values(
@@ -4676,6 +5517,8 @@ fn execute_plain_select_rows(
                     values,
                     keys,
                     distinct_keys,
+                    deferred_source: None,
+                    evaluated_projections: None,
                 },
                 top_k,
                 order_specs,
@@ -4683,6 +5526,26 @@ fn execute_plain_select_rows(
             Ok(())
         },
     )?;
+    if defer_projection {
+        sort_ordered_rows(&mut rows, order_specs);
+        for row in &mut rows {
+            let source = row
+                .deferred_source
+                .take()
+                .expect("deferred projection retains its source row");
+            let evaluated = row
+                .evaluated_projections
+                .take()
+                .expect("deferred projection tracks evaluated outputs");
+            for (index, projection) in projections.iter().enumerate() {
+                if !evaluated[index] {
+                    row.values[index] = evaluate_projection_value(
+                        state, projection, scope, &source, None, xid, snapshot, context,
+                    )?;
+                }
+            }
+        }
+    }
     Ok(rows)
 }
 
@@ -4827,6 +5690,8 @@ fn execute_correlated_exists_rows(
                 values,
                 keys,
                 distinct_keys,
+                deferred_source: None,
+                evaluated_projections: None,
             });
             Ok(())
         },
@@ -4951,6 +5816,8 @@ fn execute_any_membership_rows(
                 values,
                 keys,
                 distinct_keys,
+                deferred_source: None,
+                evaluated_projections: None,
             });
             Ok(())
         },
@@ -4959,20 +5826,36 @@ fn execute_any_membership_rows(
 }
 
 #[cfg_attr(feature = "execution-log", tracing::instrument(skip_all))]
-fn execute_grouped_select_rows(
+fn collect_grouped_select_rows(
     state: &DatabaseState,
     select: &ast::Select,
     scope: &BoundScope,
-    projections: &[ProjectionSource<'_>],
-    order_specs: &[RowOrderSpec<'_>],
-    distinct: &DistinctPlan<'_>,
     grouped_expressions: &[(ast::Expr, PgType)],
+    aggregate_functions: &[CollectedAggregateFunction],
     xid: Xid,
     snapshot: &Snapshot,
     context: &StatementExecutionContext,
-) -> Result<Vec<OrderedRow>> {
+) -> Result<Vec<(Vec<Value>, Vec<Vec<Value>>, GroupedAggregateValues)>> {
+    let typed_aggregate_functions = aggregate_functions
+        .iter()
+        .map(|collected| {
+            let expression = super::scope::substitute_typed_subqueries(
+                &state.catalog,
+                &ast::Expr::Function(collected.function.clone()),
+                scope,
+            )?;
+            let ast::Expr::Function(function) = expression else {
+                unreachable!("typed aggregate expression remains a function")
+            };
+            Ok(function)
+        })
+        .collect::<Result<Vec<_>>>()?;
     let mut groups = if grouped_expressions.is_empty() {
-        vec![(Vec::new(), Vec::new())]
+        vec![CollectedGroup {
+            key: Vec::new(),
+            rows: Vec::new(),
+            aggregate_inputs: vec![Vec::new(); aggregate_functions.len()],
+        }]
     } else {
         Vec::new()
     };
@@ -5003,47 +5886,160 @@ fn execute_grouped_select_rows(
                 })
                 .collect::<Result<Vec<_>>>()?;
             let mut matching = None;
-            for (index, (group_key, _)) in groups.iter().enumerate() {
-                if compare_group_keys(group_key, &key)? {
+            for (index, group) in groups.iter().enumerate() {
+                if compare_group_keys(&group.key, &key)? {
                     matching = Some(index);
                     break;
                 }
             }
-            match matching {
-                Some(index) => groups[index].1.push(row.to_vec()),
-                None => groups.push((key, vec![row.to_vec()])),
+            let index = match matching {
+                Some(index) => index,
+                None => {
+                    groups.push(CollectedGroup {
+                        key,
+                        rows: Vec::new(),
+                        aggregate_inputs: vec![Vec::new(); aggregate_functions.len()],
+                    });
+                    groups.len() - 1
+                }
+            };
+            let inputs = aggregate_functions
+                .iter()
+                .zip(&typed_aggregate_functions)
+                .map(|(collected, typed)| {
+                    prepare_group_aggregate_input(
+                        state,
+                        &collected.function,
+                        typed,
+                        scope,
+                        row,
+                        xid,
+                        snapshot,
+                        context,
+                    )
+                })
+                .collect::<Result<Vec<_>>>()?;
+            let group = &mut groups[index];
+            group.rows.push(row.to_vec());
+            for (prepared, inputs) in group.aggregate_inputs.iter_mut().zip(inputs) {
+                prepared.push(inputs);
             }
             Ok(())
         },
     )?;
 
+    let groups = sort_groups_by_postgres_visitation(groups);
+    Ok(groups
+        .into_iter()
+        .map(|group| {
+            let source = group
+                .rows
+                .first()
+                .cloned()
+                .unwrap_or_else(|| vec![Value::Null; scope.columns.len()]);
+            let aggregate_values = aggregate_functions
+                .iter()
+                .zip(&typed_aggregate_functions)
+                .zip(group.aggregate_inputs)
+                .map(|((collected, typed), inputs)| {
+                    let (value, data_type) = evaluate_prepared_aggregate_function(
+                        typed,
+                        RowScope::Bound(scope),
+                        &inputs,
+                    )?;
+                    Ok(GroupedAggregateValue {
+                        function: collected.function.clone(),
+                        owner: collected.owner,
+                        volatile: collected.volatile,
+                        value,
+                        data_type,
+                        used: Cell::new(false),
+                    })
+                })
+                .collect::<Result<Vec<_>>>()?;
+            Ok((source, group.rows, aggregate_values))
+        })
+        .collect::<Result<Vec<_>>>()?)
+}
+
+fn evaluate_group_having(
+    state: &DatabaseState,
+    select: &ast::Select,
+    scope: &BoundScope,
+    source: &[Value],
+    aggregate_values: &GroupedAggregateValues,
+    xid: Xid,
+    snapshot: &Snapshot,
+    context: &StatementExecutionContext,
+) -> Result<bool> {
+    let Some(having) = &select.having else {
+        return Ok(true);
+    };
+    let expression = materialize_aggregate_expression(
+        state,
+        having,
+        scope,
+        aggregate_values,
+        AggregateOwner::Having,
+    )?;
+    match evaluate_query_expression(state, &expression, scope, source, xid, snapshot, context)? {
+        Value::Bool(value) => Ok(value),
+        Value::Null => Ok(false),
+        _ => unreachable!("HAVING expression was type-checked"),
+    }
+}
+
+#[cfg_attr(feature = "execution-log", tracing::instrument(skip_all))]
+fn execute_grouped_select_rows(
+    state: &DatabaseState,
+    select: &ast::Select,
+    scope: &BoundScope,
+    projections: &[ProjectionSource<'_>],
+    order_specs: &[RowOrderSpec<'_>],
+    distinct: &DistinctPlan<'_>,
+    grouped_expressions: &[(ast::Expr, PgType)],
+    xid: Xid,
+    snapshot: &Snapshot,
+    context: &StatementExecutionContext,
+) -> Result<Vec<OrderedRow>> {
+    let aggregate_functions = collect_group_aggregate_functions(
+        state,
+        select,
+        projections,
+        order_specs,
+        distinct,
+        scope,
+    )?;
+    let groups = collect_grouped_select_rows(
+        state,
+        select,
+        scope,
+        grouped_expressions,
+        &aggregate_functions,
+        xid,
+        snapshot,
+        context,
+    )?;
     let mut rows = Vec::new();
-    for (_, group_rows) in groups {
-        let empty_row = vec![Value::Null; scope.columns.len()];
-        let row = group_rows.first().unwrap_or(&empty_row);
-        if let Some(having) = &select.having {
-            let expression = materialize_aggregate_expression(
-                state,
-                having,
-                scope,
-                &group_rows,
-                xid,
-                snapshot,
-                context,
-            )?;
-            match evaluate_query_expression(state, &expression, scope, row, xid, snapshot, context)?
-            {
-                Value::Bool(true) => {}
-                Value::Bool(false) | Value::Null => continue,
-                _ => unreachable!("HAVING expression was type-checked"),
-            }
+    for (row, _group_rows, aggregate_values) in groups {
+        if !evaluate_group_having(
+            state,
+            select,
+            scope,
+            &row,
+            &aggregate_values,
+            xid,
+            snapshot,
+            context,
+        )? {
+            continue;
         }
         let values = evaluate_projection_values(
             state,
             projections,
             scope,
-            row,
-            Some(&group_rows),
+            &row,
+            Some(&aggregate_values),
             xid,
             snapshot,
             context,
@@ -5053,8 +6049,8 @@ fn execute_grouped_select_rows(
             order_specs,
             &values,
             scope,
-            row,
-            Some(&group_rows),
+            &row,
+            Some(&aggregate_values),
             xid,
             snapshot,
             context,
@@ -5065,8 +6061,8 @@ fn execute_grouped_select_rows(
             &values,
             &keys,
             scope,
-            row,
-            Some(&group_rows),
+            &row,
+            Some(&aggregate_values),
             xid,
             snapshot,
             context,
@@ -5075,6 +6071,8 @@ fn execute_grouped_select_rows(
             values,
             keys,
             distinct_keys,
+            deferred_source: None,
+            evaluated_projections: None,
         });
     }
     Ok(rows)
@@ -5093,9 +6091,17 @@ fn compare_ordered_rows(
     right: &OrderedRow,
     order_specs: &[RowOrderSpec<'_>],
 ) -> Ordering {
+    compare_order_keys(&left.keys, &right.keys, order_specs)
+}
+
+fn compare_order_keys(
+    left: &[Value],
+    right: &[Value],
+    order_specs: &[RowOrderSpec<'_>],
+) -> Ordering {
     order_specs
         .iter()
-        .zip(left.keys.iter().zip(&right.keys))
+        .zip(left.iter().zip(right))
         .find_map(|(spec, (left, right))| {
             let ordering = match (left, right) {
                 (Value::Null, Value::Null) => Ordering::Equal,
@@ -5214,6 +6220,22 @@ fn remove_duplicate_rows(
     Ok(selected)
 }
 
+fn compare_distinct_keys(left: &OrderedRow, right: &OrderedRow) -> Ordering {
+    left.distinct_keys
+        .iter()
+        .zip(&right.distinct_keys)
+        .find_map(|(left, right)| {
+            let ordering = match (left, right) {
+                (Value::Null, Value::Null) => Ordering::Equal,
+                (Value::Null, _) => Ordering::Greater,
+                (_, Value::Null) => Ordering::Less,
+                _ => compare_values(left, right).expect("DISTINCT expressions were type-checked"),
+            };
+            (ordering != Ordering::Equal).then_some(ordering)
+        })
+        .unwrap_or(Ordering::Equal)
+}
+
 #[cfg_attr(feature = "execution-log", tracing::instrument(skip_all))]
 fn finalize_select_rows(
     mut rows: Vec<OrderedRow>,
@@ -5237,7 +6259,11 @@ fn finalize_select_rows(
             rows.truncate(required);
         }
     }
-    sort_ordered_rows(&mut rows, order_specs);
+    if order_specs.is_empty() && matches!(distinct, DistinctPlan::On { .. }) {
+        rows.sort_by(compare_distinct_keys);
+    } else {
+        sort_ordered_rows(&mut rows, order_specs);
+    }
     if matches!(distinct, DistinctPlan::On { .. }) {
         rows = remove_duplicate_rows(rows, distinct)?;
     }
@@ -5340,7 +6366,7 @@ pub(super) fn execute_query(
             context,
         )?
     } else {
-        let top_k = if !order_specs.is_empty() && matches!(distinct, DistinctPlan::None) {
+        let top_k = if matches!(distinct, DistinctPlan::None) {
             limit.map(|limit| offset.saturating_add(limit))
         } else {
             None
@@ -5360,6 +6386,607 @@ pub(super) fn execute_query(
     };
     let rows = finalize_select_rows(rows, &order_specs, &distinct, limit, offset)?;
     Ok(StatementResult::Query(QueryResult { columns, rows }))
+}
+
+const STREAM_ROW_LIMIT_REACHED: &str = "pg_fake stream row limit reached";
+
+pub(super) fn stream_plain_query_rows(
+    state: &DatabaseState,
+    query: &ast::Query,
+    xid: Xid,
+    snapshot: &Snapshot,
+    context: &StatementExecutionContext,
+    maximum_rows: Option<usize>,
+    prepared: &mut Option<PreparedQueryStream>,
+    consume: &mut dyn FnMut(Vec<Value>, &[ColumnMeta]) -> Result<()>,
+) -> Result<Option<Vec<ColumnMeta>>> {
+    if matches!(prepared, Some(PreparedQueryStream::Materialized { .. })) {
+        return Ok(None);
+    }
+    let cached_query = match prepared.as_ref() {
+        Some(PreparedQueryStream::Unordered { query, .. })
+        | Some(PreparedQueryStream::Ordered { query, .. })
+        | Some(PreparedQueryStream::Grouped { query, .. })
+        | Some(PreparedQueryStream::UnionAll { query, .. }) => Some(query.clone()),
+        Some(PreparedQueryStream::Materialized { .. }) => unreachable!("handled above"),
+        None => None,
+    };
+    let query = cached_query.as_ref().unwrap_or(query);
+    let expanded = super::views::expand_query_views(&state.catalog, query)?;
+    if &expanded != query {
+        return stream_plain_query_rows(
+            state,
+            &expanded,
+            xid,
+            snapshot,
+            context,
+            maximum_rows,
+            prepared,
+            consume,
+        );
+    }
+    let materialized = materialize_query_ctes(state, query, xid, snapshot, context)?;
+    if &materialized != query {
+        return stream_plain_query_rows(
+            state,
+            &materialized,
+            xid,
+            snapshot,
+            context,
+            maximum_rows,
+            prepared,
+            consume,
+        );
+    }
+    if let ast::SetExpr::Query(nested) = query.body.as_ref()
+        && query.with.is_none()
+        && query.order_by.is_none()
+        && query.limit_clause.is_none()
+        && query.fetch.is_none()
+        && query.locks.is_empty()
+        && query.for_clause.is_none()
+    {
+        return stream_plain_query_rows(
+            state,
+            nested,
+            xid,
+            snapshot,
+            context,
+            maximum_rows,
+            prepared,
+            consume,
+        );
+    }
+    if let ast::SetExpr::SetOperation {
+        op: ast::SetOperator::Union,
+        set_quantifier: ast::SetQuantifier::All,
+        left,
+        right,
+    } = query.body.as_ref()
+        && query.order_by.is_none()
+        && query.fetch.is_none()
+        && query.locks.is_empty()
+    {
+        if prepared.is_none() {
+            let (limit, offset) = resolve_select_limit(query, context)?;
+            let columns = describe_query_result_columns(
+                state,
+                &ast::Statement::Query(Box::new(query.clone())),
+            )?;
+            *prepared = Some(PreparedQueryStream::UnionAll {
+                query: query.clone(),
+                left: create_set_operand_query(query, left),
+                right: create_set_operand_query(query, right),
+                left_state: None,
+                right_state: None,
+                reads_right: false,
+                produced: 0,
+                limit,
+                offset,
+                columns,
+            });
+        }
+        let mut emitted = 0;
+        loop {
+            let Some(PreparedQueryStream::UnionAll {
+                left,
+                right,
+                left_state,
+                right_state,
+                reads_right,
+                produced,
+                limit,
+                offset,
+                columns,
+                ..
+            }) = prepared.as_mut()
+            else {
+                unreachable!("UNION ALL query has union stream state")
+            };
+            if limit.is_some_and(|limit| *produced >= offset.saturating_add(limit))
+                || maximum_rows.is_some_and(|maximum| emitted >= maximum)
+            {
+                return Ok(Some(columns.clone()));
+            }
+            let operand = if *reads_right { right } else { left };
+            let operand_state = if *reads_right {
+                right_state
+            } else {
+                left_state
+            };
+            let mut nested = operand_state.take().map(|state| *state);
+            let own_remaining =
+                limit.map(|limit| offset.saturating_add(limit).saturating_sub(*produced));
+            let caller_remaining = maximum_rows.map(|maximum| {
+                offset
+                    .saturating_sub(*produced)
+                    .saturating_add(maximum.saturating_sub(emitted))
+            });
+            let nested_maximum = match (own_remaining, caller_remaining) {
+                (Some(left), Some(right)) => Some(left.min(right)),
+                (Some(remaining), None) | (None, Some(remaining)) => Some(remaining),
+                (None, None) => None,
+            };
+            let result = stream_plain_query_rows(
+                state,
+                operand,
+                xid,
+                snapshot,
+                context,
+                nested_maximum,
+                &mut nested,
+                &mut |row, source_columns| {
+                    let selected = *produced >= *offset
+                        && !limit.is_some_and(|limit| *produced >= offset.saturating_add(limit));
+                    *produced += 1;
+                    if !selected {
+                        return Ok(());
+                    }
+                    emitted += 1;
+                    let mut rows = coerce_set_rows(vec![row], source_columns, columns)?;
+                    consume(rows.pop().expect("set operand produces one row"), columns)
+                },
+            );
+            if matches!(result, Ok(None)) {
+                let drain = (|| {
+                    let Some(PreparedQueryStream::Materialized { result, next }) = nested.as_mut()
+                    else {
+                        unreachable!("non-streamable UNION ALL operand is materialized")
+                    };
+                    while *next < result.rows.len() {
+                        if limit.is_some_and(|limit| *produced >= offset.saturating_add(limit))
+                            || maximum_rows.is_some_and(|maximum| emitted >= maximum)
+                        {
+                            break;
+                        }
+                        let row = result.rows[*next].clone();
+                        *next += 1;
+                        let selected = *produced >= *offset
+                            && !limit
+                                .is_some_and(|limit| *produced >= offset.saturating_add(limit));
+                        *produced += 1;
+                        if !selected {
+                            continue;
+                        }
+                        emitted += 1;
+                        let mut rows = coerce_set_rows(vec![row], &result.columns, columns)?;
+                        consume(rows.pop().expect("set operand produces one row"), columns)?;
+                    }
+                    Ok(())
+                })();
+                *operand_state = nested.map(Box::new);
+                drain?;
+                if limit.is_some_and(|limit| *produced >= offset.saturating_add(limit))
+                    || maximum_rows.is_some_and(|maximum| emitted >= maximum)
+                {
+                    return Ok(Some(columns.clone()));
+                }
+                if *reads_right {
+                    return Ok(Some(columns.clone()));
+                }
+                *reads_right = true;
+                continue;
+            }
+            *operand_state = nested.map(Box::new);
+            let result = match result {
+                Err(error) => return Err(error),
+                Ok(result) => result,
+            };
+            if limit.is_some_and(|limit| *produced >= offset.saturating_add(limit))
+                || maximum_rows.is_some_and(|maximum| emitted >= maximum)
+            {
+                return Ok(Some(columns.clone()));
+            }
+            match result {
+                Some(_) if *reads_right => return Ok(Some(columns.clone())),
+                Some(_) => *reads_right = true,
+                None => unreachable!("materialized UNION ALL operand was drained"),
+            }
+        }
+    }
+    let ast::SetExpr::Select(select) = query.body.as_ref() else {
+        let StatementResult::Query(result) = execute_query(state, query, xid, snapshot, context)?
+        else {
+            unreachable!("query execution returns rows")
+        };
+        *prepared = Some(PreparedQueryStream::Materialized { result, next: 0 });
+        return Ok(None);
+    };
+    let ast::GroupByExpr::Expressions(group_by, modifiers) = &select.group_by else {
+        let StatementResult::Query(result) = execute_query(state, query, xid, snapshot, context)?
+        else {
+            unreachable!("query execution returns rows")
+        };
+        *prepared = Some(PreparedQueryStream::Materialized { result, next: 0 });
+        return Ok(None);
+    };
+    if query.fetch.is_some()
+        || !query.locks.is_empty()
+        || select.distinct.is_some()
+        || !modifiers.is_empty()
+    {
+        let StatementResult::Query(result) = execute_query(state, query, xid, snapshot, context)?
+        else {
+            unreachable!("query execution returns rows")
+        };
+        *prepared = Some(PreparedQueryStream::Materialized { result, next: 0 });
+        return Ok(None);
+    }
+    let scope = bind_select_scope(state, select)?;
+    let (limit, offset) = resolve_select_limit(query, context)?;
+    validate_select_predicates(state, select, &scope)?;
+    let (projections, columns) = build_projection_plan(state, &select.projection, &scope)?;
+    let order_specs = resolve_order_specs(state, query, &projections, &columns, &scope)?;
+    if limit == Some(0) || maximum_rows == Some(0) {
+        return Ok(Some(columns));
+    }
+    let grouped =
+        !group_by.is_empty() || select.having.is_some() || contains_query_aggregate(query);
+    if grouped {
+        let distinct = DistinctPlan::None;
+        let grouping = resolve_grouping_plan(
+            state,
+            select,
+            group_by,
+            &projections,
+            &columns,
+            &order_specs,
+            &distinct,
+            &scope,
+        )?;
+        assert!(grouping.enabled);
+        if prepared.is_none() {
+            let aggregate_functions = collect_group_aggregate_functions(
+                state,
+                select,
+                &projections,
+                &order_specs,
+                &distinct,
+                &scope,
+            )?;
+            let groups = collect_grouped_select_rows(
+                state,
+                select,
+                &scope,
+                &grouping.expressions,
+                &aggregate_functions,
+                xid,
+                snapshot,
+                context,
+            )?;
+            let mut rows = Vec::new();
+            for (source, _group_rows, aggregate_values) in groups {
+                if !evaluate_group_having(
+                    state,
+                    select,
+                    &scope,
+                    &source,
+                    &aggregate_values,
+                    xid,
+                    snapshot,
+                    context,
+                )? {
+                    continue;
+                }
+                let mut values = vec![Value::Null; projections.len()];
+                let mut evaluated_projections = vec![false; projections.len()];
+                let mut deferred_projection_expressions = vec![None; projections.len()];
+                for (index, projection) in projections.iter().enumerate() {
+                    let required_by_order = order_specs.iter().any(
+                        |order| matches!(order.key, OrderKey::Output(output) if output == index),
+                    );
+                    match projection {
+                        ProjectionSource::Expression(expression) => {
+                            let expression = materialize_aggregate_expression(
+                                state,
+                                expression,
+                                &scope,
+                                &aggregate_values,
+                                AggregateOwner::Projection(index),
+                            )?;
+                            if required_by_order
+                                || (!order_specs.is_empty()
+                                    && !contains_volatile_expression(&expression))
+                            {
+                                values[index] = evaluate_query_expression(
+                                    state,
+                                    &expression,
+                                    &scope,
+                                    &source,
+                                    xid,
+                                    snapshot,
+                                    context,
+                                )?;
+                                evaluated_projections[index] = true;
+                            } else {
+                                deferred_projection_expressions[index] = Some(expression);
+                            }
+                        }
+                        ProjectionSource::Column(_) | ProjectionSource::Merged(_, _, _) => {
+                            values[index] = evaluate_projection_value(
+                                state,
+                                projection,
+                                &scope,
+                                &source,
+                                Some((&aggregate_values, AggregateOwner::Projection(index))),
+                                xid,
+                                snapshot,
+                                context,
+                            )?;
+                            evaluated_projections[index] = true;
+                        }
+                    }
+                }
+                let keys = evaluate_order_keys(
+                    state,
+                    &order_specs,
+                    &values,
+                    &scope,
+                    &source,
+                    Some(&aggregate_values),
+                    xid,
+                    snapshot,
+                    context,
+                )?;
+                rows.push(GroupedStreamRow {
+                    values,
+                    keys,
+                    source,
+                    evaluated_projections,
+                    deferred_projection_expressions,
+                });
+            }
+            if !order_specs.is_empty() {
+                rows.sort_by(|left, right| {
+                    compare_order_keys(&left.keys, &right.keys, &order_specs)
+                });
+            }
+            rows.truncate(
+                limit
+                    .map(|limit| offset.saturating_add(limit))
+                    .unwrap_or(usize::MAX),
+            );
+            *prepared = Some(PreparedQueryStream::Grouped {
+                query: query.clone(),
+                rows,
+                next: 0,
+            });
+        }
+        let Some(PreparedQueryStream::Grouped { rows, next, .. }) = prepared.as_mut() else {
+            unreachable!("grouped query has grouped stream state")
+        };
+        let mut emitted = 0;
+        while *next < rows.len() && !maximum_rows.is_some_and(|maximum| emitted >= maximum) {
+            let index = *next;
+            let row = &mut rows[index];
+            for projection_index in 0..projections.len() {
+                if !row.evaluated_projections[projection_index] {
+                    let expression = row.deferred_projection_expressions[projection_index]
+                        .as_ref()
+                        .expect("deferred grouped projection retains its expression");
+                    row.values[projection_index] = evaluate_query_expression(
+                        state,
+                        expression,
+                        &scope,
+                        &row.source,
+                        xid,
+                        snapshot,
+                        context,
+                    )?;
+                    row.evaluated_projections[projection_index] = true;
+                }
+            }
+            *next += 1;
+            if index >= offset {
+                emitted += 1;
+                consume(row.values.clone(), &columns)?;
+            }
+        }
+        return Ok(Some(columns));
+    }
+    let remaining_selection = if selection_is_fully_pushed(select, &scope) {
+        None
+    } else {
+        select.selection.as_ref()
+    };
+    if !order_specs.is_empty() {
+        if prepared.is_none() {
+            let mut rows = Vec::new();
+            visit_query_source_rows(
+                state,
+                select,
+                &scope,
+                xid,
+                snapshot,
+                context,
+                select.selection.as_ref(),
+                &mut |row| {
+                    if !evaluate_where_clause(
+                        state,
+                        remaining_selection,
+                        &scope,
+                        row,
+                        xid,
+                        snapshot,
+                        context,
+                    )? {
+                        return Ok(());
+                    }
+                    let mut values = vec![Value::Null; projections.len()];
+                    let mut evaluated = vec![false; projections.len()];
+                    for (index, projection) in projections.iter().enumerate() {
+                        let required_by_order = order_specs.iter().any(|order| {
+                            matches!(order.key, OrderKey::Output(output) if output == index)
+                        });
+                        if required_by_order || !contains_volatile_projection(projection) {
+                            values[index] = evaluate_projection_value(
+                                state, projection, &scope, row, None, xid, snapshot, context,
+                            )?;
+                            evaluated[index] = true;
+                        }
+                    }
+                    let keys = evaluate_order_keys(
+                        state,
+                        &order_specs,
+                        &values,
+                        &scope,
+                        row,
+                        None,
+                        xid,
+                        snapshot,
+                        context,
+                    )?;
+                    rows.push(OrderedRow {
+                        values,
+                        keys,
+                        distinct_keys: Vec::new(),
+                        deferred_source: Some(row.to_vec()),
+                        evaluated_projections: Some(evaluated),
+                    });
+                    Ok(())
+                },
+            )?;
+            sort_ordered_rows(&mut rows, &order_specs);
+            rows.truncate(
+                limit
+                    .map(|limit| offset.saturating_add(limit))
+                    .unwrap_or(usize::MAX),
+            );
+            *prepared = Some(PreparedQueryStream::Ordered {
+                query: query.clone(),
+                rows,
+                next: 0,
+            });
+        }
+        let Some(PreparedQueryStream::Ordered { rows, next, .. }) = prepared.as_mut() else {
+            unreachable!("ordered query has ordered stream state")
+        };
+        let mut emitted = 0;
+        while *next < rows.len() && !maximum_rows.is_some_and(|maximum| emitted >= maximum) {
+            let index = *next;
+            let row = &mut rows[index];
+            let source = row
+                .deferred_source
+                .as_ref()
+                .expect("deferred projection retains its source row");
+            let evaluated = row
+                .evaluated_projections
+                .as_mut()
+                .expect("deferred projection tracks evaluated outputs");
+            for (index, projection) in projections.iter().enumerate() {
+                if !evaluated[index] {
+                    row.values[index] = evaluate_projection_value(
+                        state, projection, &scope, &source, None, xid, snapshot, context,
+                    )?;
+                    evaluated[index] = true;
+                }
+            }
+            *next += 1;
+            if index >= offset {
+                emitted += 1;
+                consume(row.values.clone(), &columns)?;
+            }
+        }
+        return Ok(Some(columns));
+    }
+    if prepared.is_none() {
+        *prepared = Some(PreparedQueryStream::Unordered {
+            query: query.clone(),
+            visited: 0,
+            eligible: 0,
+        });
+    }
+    let Some(PreparedQueryStream::Unordered {
+        visited, eligible, ..
+    }) = prepared.as_mut()
+    else {
+        unreachable!("unordered query has unordered stream state")
+    };
+    let already_visited = *visited;
+    let mut seen = 0;
+    let mut next_visited = already_visited;
+    let mut emitted = 0;
+    let result = visit_query_source_rows(
+        state,
+        select,
+        &scope,
+        xid,
+        snapshot,
+        context,
+        select.selection.as_ref(),
+        &mut |row| {
+            if seen < already_visited {
+                seen += 1;
+                return Ok(());
+            }
+            if maximum_rows.is_some_and(|maximum| emitted >= maximum) {
+                return Err(PgError::create(
+                    SqlState::InternalError,
+                    STREAM_ROW_LIMIT_REACHED,
+                ));
+            }
+            seen += 1;
+            next_visited += 1;
+            if limit.is_some_and(|limit| *eligible >= offset.saturating_add(limit)) {
+                return Ok(());
+            }
+            if !evaluate_where_clause(
+                state,
+                remaining_selection,
+                &scope,
+                row,
+                xid,
+                snapshot,
+                context,
+            )? {
+                return Ok(());
+            }
+            let selected = *eligible >= offset;
+            *eligible += 1;
+            let values = evaluate_projection_values(
+                state,
+                &projections,
+                &scope,
+                row,
+                None,
+                xid,
+                snapshot,
+                context,
+            )?;
+            if selected {
+                emitted += 1;
+                consume(values, &columns)?;
+            }
+            Ok(())
+        },
+    );
+    *visited = next_visited;
+    if let Err(error) = result {
+        if error.sqlstate != SqlState::InternalError || error.message != STREAM_ROW_LIMIT_REACHED {
+            return Err(error);
+        }
+    }
+    Ok(Some(columns))
 }
 
 #[cfg_attr(feature = "execution-log", tracing::instrument(skip_all))]

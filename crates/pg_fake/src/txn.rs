@@ -172,6 +172,22 @@ impl RowLockManager {
         RowLockAttempt::Blocked(blockers.into_iter().collect())
     }
 
+    pub(crate) fn is_held(&self, key: RowLockKey, xid: Xid, mode: RowLockMode) -> bool {
+        self.locks
+            .get(&key)
+            .and_then(|lock| lock.holders.get(&xid))
+            .is_some_and(|held| *held == RowLockMode::Update || mode == RowLockMode::Share)
+    }
+
+    pub(crate) fn would_block(&self, key: RowLockKey, xid: Xid, mode: RowLockMode) -> bool {
+        let Some(lock) = self.locks.get(&key) else {
+            return false;
+        };
+        lock.holders.iter().any(|(holder, held)| {
+            *holder != xid && (*held == RowLockMode::Update || mode == RowLockMode::Update)
+        }) || lock.waiters.front().is_some_and(|waiter| *waiter != xid)
+    }
+
     #[cfg_attr(feature = "execution-log", tracing::instrument(skip_all))]
     pub(crate) fn cancel_wait(&mut self, key: RowLockKey, xid: Xid) {
         let Some(lock) = self.locks.get_mut(&key) else {

@@ -12,16 +12,22 @@ use crate::{
     error::{PgError, Result, SqlState, reject_unsupported},
     storage::{RowId, Table},
     txn::{
-        CommandId, RelationLockManager, RowLockKey, RowLockManager, RowLockMode, Snapshot,
-        TransactionRegistry, TransactionStatus, WaitForGraph, Xid, find_visible_version,
+        CommandId, CommitSeq, RelationLockManager, RowLockKey, RowLockManager, RowLockMode,
+        Snapshot, TransactionRegistry, TransactionStatus, WaitForGraph, Xid, find_visible_version,
     },
     value::{BaseType, DAYS_PER_MONTH, MICROSECONDS_PER_DAY, PgType, Value},
 };
-use sqlparser::ast;
+use sqlparser::{
+    ast::{self, Spanned as _},
+    tokenizer::Span,
+};
 use std::{
     cmp::Ordering,
     collections::{BTreeMap, BTreeSet},
-    sync::{Arc, Mutex},
+    sync::{
+        Arc, Mutex,
+        atomic::{AtomicBool, Ordering as AtomicOrdering},
+    },
     time::Instant,
 };
 
@@ -33,13 +39,17 @@ mod foreign_keys;
 mod indexes;
 mod locks;
 mod prepared;
+mod procedural;
 mod query;
 mod scope;
 mod sequences;
 mod views;
 mod writes;
 
-use aggregates::{evaluate_aggregate_function, infer_aggregate_return_type, is_aggregate_function};
+use aggregates::{
+    AggregateInput, evaluate_prepared_aggregate_function, infer_aggregate_return_type,
+    is_aggregate_function, prepare_aggregate_function_input,
+};
 use arithmetic::{
     evaluate_boolean_operator, evaluate_distinctness, evaluate_numeric_operator,
     evaluate_temporal_arithmetic, evaluate_unary_operator, infer_interval_arithmetic_type,
@@ -65,21 +75,20 @@ pub(crate) use locks::{
     collect_required_cte_row_locks, collect_required_row_locks, mutation_locks_cover_targets,
 };
 pub(crate) use prepared::{PreparedQueryPlan, build_prepared_query_plan, execute_prepared_query};
+pub(crate) use procedural::coerce_procedural_value;
 pub(crate) use scope::infer_query_output_columns;
 use scope::{BoundColumn, bind_select_scope};
 pub(crate) use scope::{
     BoundScope, RowScope, bind_from_scope, bind_query_scope, bind_target_scope,
-    combine_bound_scopes, identify_unknown_query_columns, substitute_typed_subqueries,
+    combine_bound_scopes, create_value_scope, identify_unknown_query_columns,
+    substitute_typed_subqueries,
 };
 pub(crate) use sequences::{
     SequenceExecutionContext, SequenceSessionState, SequenceSessionStorage, SequenceStorage,
     SequenceValueState,
 };
-#[cfg(any(test, feature = "test-support"))]
-pub(crate) use views::seed_trigger_catalog_for_test;
 use views::{
-    execute_alter_trigger, execute_comment_on_view, execute_create_trigger, execute_create_view,
-    execute_drop_views,
+    execute_alter_trigger, execute_comment_on_view, execute_create_view, execute_drop_views,
 };
 use writes::{execute_delete, execute_insert, execute_update};
 
@@ -92,6 +101,89 @@ pub(crate) struct StatementExecutionContext {
     pub(crate) deadline: Option<Instant>,
     pub(crate) rng: Arc<Mutex<ChaCha12Rng>>,
     pub(crate) sequences: SequenceExecutionContext,
+    pub(crate) source_state: Option<Arc<DatabaseState>>,
+    pub(crate) source_snapshot: Snapshot,
+    pub(crate) prepared_trigger_inserts: Arc<Mutex<PreparedTriggerInserts>>,
+    pub(crate) prepared_trigger_updates: Arc<Mutex<PreparedTriggerUpdates>>,
+    pub(crate) prepared_mutation_targets: Arc<Mutex<PreparedMutationTargets>>,
+    pub(crate) prepared_cte_results: Arc<Mutex<Vec<(Span, String, QueryResult)>>>,
+    pub(crate) executed_ctes: Arc<Mutex<Vec<(Span, String)>>>,
+    pub(crate) pending_cte_mutations: Arc<Mutex<Vec<PendingCteMutation>>>,
+    pub(crate) prepared_subquery_results: Arc<Mutex<PreparedSubqueryResults>>,
+    pub(crate) prepares_subquery_results: Arc<AtomicBool>,
+    pub(crate) trigger_lock_recheck: Arc<AtomicBool>,
+    pub(crate) trigger_lock_recheck_locks: Arc<Mutex<Vec<RequiredRowLock>>>,
+}
+
+#[derive(Clone, Default)]
+pub(crate) struct PreparedTriggerInserts {
+    entries: Vec<(PreparedAstKey, ast::Insert, PreparedTriggerInsert)>,
+}
+
+#[derive(Clone)]
+pub(crate) struct PreparedTriggerInsert {
+    pub(crate) source_state: Option<Arc<DatabaseState>>,
+    pub(crate) source_snapshot: Option<Snapshot>,
+    source_query: Option<query::PreparedQueryStream>,
+    pub(crate) source_rows: Vec<Option<Vec<Value>>>,
+    pub(crate) rows: Vec<Vec<Value>>,
+    pub(crate) conflicts: Vec<Option<PreparedConflictUpdate>>,
+    pub(crate) returned_rows: Option<Vec<Option<Vec<Value>>>>,
+    pub(crate) error: Option<PgError>,
+    pub(crate) complete: bool,
+}
+
+#[derive(Clone, PartialEq, Eq)]
+struct PreparedAstKey {
+    occurrence: Span,
+    sql: String,
+}
+
+#[derive(Clone)]
+pub(crate) struct PendingCteMutation {
+    pub(crate) occurrence: Span,
+    pub(crate) name: String,
+    pub(crate) statement: ast::Statement,
+}
+
+#[derive(Clone, Default)]
+pub(crate) struct PreparedSubqueryResults {
+    entries: Vec<(Span, String, QueryResult)>,
+}
+
+#[derive(Clone)]
+pub(crate) struct PreparedConflictUpdate {
+    pub(crate) row_id: RowId,
+    pub(crate) version_xmin: Xid,
+    pub(crate) current: Vec<Value>,
+    pub(crate) updated: Option<Vec<Value>>,
+}
+
+#[derive(Clone)]
+pub(crate) struct PreparedMutationTarget {
+    pub(crate) row_id: RowId,
+    pub(crate) version_xmin: Xid,
+    pub(crate) current: Vec<Value>,
+    pub(crate) bound_row: Option<Vec<Value>>,
+}
+
+#[derive(Clone, Default)]
+pub(crate) struct PreparedMutationTargets {
+    entries: Vec<(PreparedAstKey, CommitSeq, Vec<PreparedMutationTarget>)>,
+}
+
+#[derive(Clone, Default)]
+pub(crate) struct PreparedTriggerUpdates {
+    entries: Vec<(PreparedAstKey, ast::Update, Vec<PreparedTriggerUpdate>)>,
+}
+
+#[derive(Clone)]
+pub(crate) struct PreparedTriggerUpdate {
+    pub(crate) row_id: RowId,
+    pub(crate) version_xmin: Xid,
+    pub(crate) current: Vec<Value>,
+    pub(crate) bound_row: Option<Vec<Value>>,
+    pub(crate) updated: Option<Vec<Value>>,
 }
 
 impl StatementExecutionContext {
@@ -108,8 +200,377 @@ impl StatementExecutionContext {
             Ok(())
         }
     }
+
+    pub(super) fn request_trigger_lock_recheck(&self) {
+        self.trigger_lock_recheck
+            .store(true, AtomicOrdering::Relaxed);
+    }
+
+    pub(super) fn request_trigger_lock_recheck_with_locks(&self, locks: Vec<RequiredRowLock>) {
+        self.trigger_lock_recheck_locks
+            .lock()
+            .expect("trigger lock recheck mutex is poisoned")
+            .extend(locks);
+        self.request_trigger_lock_recheck();
+    }
+
+    pub(super) fn requires_trigger_lock_recheck(&self) -> bool {
+        self.trigger_lock_recheck.load(AtomicOrdering::Relaxed)
+    }
+
+    pub(super) fn get_prepared_cte_result(
+        &self,
+        occurrence: Span,
+        name: &str,
+    ) -> Option<QueryResult> {
+        self.prepared_cte_results
+            .lock()
+            .expect("prepared CTE results mutex is poisoned")
+            .iter()
+            .find_map(|(cached, cached_name, result)| {
+                (*cached == occurrence && cached_name == name).then(|| result.clone())
+            })
+    }
+
+    pub(super) fn set_prepared_cte_result(
+        &self,
+        occurrence: Span,
+        name: String,
+        result: QueryResult,
+    ) {
+        let mut prepared = self
+            .prepared_cte_results
+            .lock()
+            .expect("prepared CTE results mutex is poisoned");
+        assert!(
+            prepared
+                .iter()
+                .all(|(cached, cached_name, _)| *cached != occurrence || cached_name != &name)
+        );
+        prepared.push((occurrence, name, result));
+    }
+
+    pub(super) fn get_executed_cte_result(
+        &self,
+        occurrence: Span,
+        name: &str,
+    ) -> Option<QueryResult> {
+        if !self
+            .executed_ctes
+            .lock()
+            .expect("executed CTE mutex is poisoned")
+            .iter()
+            .any(|(cached, cached_name)| *cached == occurrence && cached_name == name)
+        {
+            return None;
+        }
+        self.get_prepared_cte_result(occurrence, name)
+    }
+
+    pub(super) fn defer_cte_mutation(
+        &self,
+        occurrence: Span,
+        name: String,
+        statement: ast::Statement,
+    ) {
+        let mut pending = self
+            .pending_cte_mutations
+            .lock()
+            .expect("pending CTE mutations mutex is poisoned");
+        if pending
+            .iter()
+            .any(|cached| cached.occurrence == occurrence && cached.name == name)
+        {
+            return;
+        }
+        pending.push(PendingCteMutation {
+            occurrence,
+            name,
+            statement,
+        });
+    }
+
+    pub(super) fn get_pending_cte_mutation(&self) -> Option<PendingCteMutation> {
+        self.pending_cte_mutations
+            .lock()
+            .expect("pending CTE mutations mutex is poisoned")
+            .first()
+            .cloned()
+    }
+
+    pub(crate) fn take_pending_cte_mutation(&self) -> Option<PendingCteMutation> {
+        let mut pending = self
+            .pending_cte_mutations
+            .lock()
+            .expect("pending CTE mutations mutex is poisoned");
+        (!pending.is_empty()).then(|| pending.remove(0))
+    }
+
+    pub(crate) fn set_executed_cte_result(
+        &self,
+        occurrence: Span,
+        name: String,
+        result: QueryResult,
+    ) {
+        self.set_prepared_cte_result(occurrence, name.clone(), result);
+        let mut executed = self
+            .executed_ctes
+            .lock()
+            .expect("executed CTE mutex is poisoned");
+        assert!(
+            executed
+                .iter()
+                .all(|(cached, cached_name)| *cached != occurrence || cached_name != &name)
+        );
+        executed.push((occurrence, name));
+    }
+
+    pub(super) fn get_prepared_subquery_result(&self, query: &ast::Query) -> Option<QueryResult> {
+        let occurrence = query.span();
+        let sql = query.to_string();
+        self.prepared_subquery_results
+            .lock()
+            .expect("prepared subquery results mutex is poisoned")
+            .entries
+            .iter()
+            .find_map(|(cached, cached_sql, result)| {
+                (*cached == occurrence && cached_sql == &sql).then(|| result.clone())
+            })
+    }
+
+    pub(super) fn set_prepared_subquery_result(&self, query: &ast::Query, result: QueryResult) {
+        let occurrence = query.span();
+        let sql = query.to_string();
+        let mut prepared = self
+            .prepared_subquery_results
+            .lock()
+            .expect("prepared subquery results mutex is poisoned");
+        assert!(
+            prepared
+                .entries
+                .iter()
+                .all(|(cached, cached_sql, _)| { *cached != occurrence || cached_sql != &sql })
+        );
+        prepared.entries.push((occurrence, sql, result));
+    }
+
+    pub(super) fn set_prepares_subquery_results(&self, enabled: bool) {
+        self.prepares_subquery_results
+            .store(enabled, AtomicOrdering::Relaxed);
+    }
+
+    pub(super) fn prepares_subquery_results(&self) -> bool {
+        self.prepares_subquery_results.load(AtomicOrdering::Relaxed)
+    }
+
+    pub(crate) fn take_trigger_lock_recheck(&self) -> bool {
+        self.trigger_lock_recheck
+            .swap(false, AtomicOrdering::Relaxed)
+    }
+
+    pub(super) fn take_trigger_lock_recheck_locks(&self) -> Vec<RequiredRowLock> {
+        std::mem::take(
+            &mut *self
+                .trigger_lock_recheck_locks
+                .lock()
+                .expect("trigger lock recheck mutex is poisoned"),
+        )
+    }
+
+    pub(super) fn get_prepared_trigger_insert(
+        &self,
+        insert: &ast::Insert,
+    ) -> Option<PreparedTriggerInsert> {
+        let key = PreparedAstKey {
+            occurrence: insert.span(),
+            sql: insert.to_string(),
+        };
+        self.prepared_trigger_inserts
+            .lock()
+            .expect("prepared trigger INSERT mutex is poisoned")
+            .entries
+            .iter()
+            .find_map(|(cached, _, prepared)| (cached == &key).then(|| prepared.clone()))
+    }
+
+    pub(super) fn get_prior_prepared_trigger_inserts(
+        &self,
+        insert: &ast::Insert,
+    ) -> Vec<(ast::Insert, PreparedTriggerInsert)> {
+        let key = PreparedAstKey {
+            occurrence: insert.span(),
+            sql: insert.to_string(),
+        };
+        self.prepared_trigger_inserts
+            .lock()
+            .expect("prepared trigger INSERT mutex is poisoned")
+            .entries
+            .iter()
+            .take_while(|(cached, _, _)| cached != &key)
+            .map(|(_, insert, prepared)| (insert.clone(), prepared.clone()))
+            .collect()
+    }
+
+    pub(super) fn set_prepared_trigger_insert(
+        &self,
+        insert: &ast::Insert,
+        value: PreparedTriggerInsert,
+    ) {
+        let key = PreparedAstKey {
+            occurrence: insert.span(),
+            sql: insert.to_string(),
+        };
+        let mut prepared = self
+            .prepared_trigger_inserts
+            .lock()
+            .expect("prepared trigger INSERT mutex is poisoned");
+        match prepared
+            .entries
+            .iter_mut()
+            .find(|(cached, _, _)| cached == &key)
+        {
+            Some((_, _, cached)) => *cached = value,
+            None => prepared.entries.push((key, insert.clone(), value)),
+        }
+    }
+
+    pub(super) fn take_prepared_trigger_insert(
+        &self,
+        insert: &ast::Insert,
+    ) -> Option<PreparedTriggerInsert> {
+        let mut prepared = self
+            .prepared_trigger_inserts
+            .lock()
+            .expect("prepared trigger INSERT mutex is poisoned");
+        let position = prepared
+            .entries
+            .iter()
+            .position(|(cached, _, _)| cached.occurrence == insert.span())?;
+        let (_, _, value) = prepared.entries.remove(position);
+        value.complete.then_some(value)
+    }
+
+    pub(super) fn get_prepared_trigger_update(
+        &self,
+        update: &ast::Update,
+    ) -> (usize, Option<Vec<PreparedTriggerUpdate>>) {
+        let prepared = self
+            .prepared_trigger_updates
+            .lock()
+            .expect("prepared trigger rows mutex is poisoned");
+        let key = PreparedAstKey {
+            occurrence: update.span(),
+            sql: update.to_string(),
+        };
+        let index = prepared
+            .entries
+            .iter()
+            .position(|(cached, _, _)| cached == &key)
+            .unwrap_or(prepared.entries.len());
+        let rows = prepared.entries.get(index).map(|(_, _, rows)| rows.clone());
+        (index, rows)
+    }
+
+    pub(super) fn get_prepared_mutation_targets(
+        &self,
+        occurrence: Span,
+        snapshot: CommitSeq,
+    ) -> Option<Vec<PreparedMutationTarget>> {
+        let mut prepared = self
+            .prepared_mutation_targets
+            .lock()
+            .expect("prepared mutation targets mutex is poisoned");
+        let index = prepared
+            .entries
+            .iter()
+            .position(|(key, _, _)| key.occurrence == occurrence)?;
+        if prepared.entries[index].1 != snapshot {
+            prepared.entries.remove(index);
+            return None;
+        }
+        Some(prepared.entries[index].2.clone())
+    }
+
+    pub(super) fn set_prepared_mutation_targets(
+        &self,
+        occurrence: Span,
+        sql: String,
+        snapshot: CommitSeq,
+        targets: Vec<PreparedMutationTarget>,
+    ) {
+        let mut prepared = self
+            .prepared_mutation_targets
+            .lock()
+            .expect("prepared mutation targets mutex is poisoned");
+        assert!(
+            prepared
+                .entries
+                .iter()
+                .all(|(key, _, _)| key.occurrence != occurrence)
+        );
+        prepared
+            .entries
+            .push((PreparedAstKey { occurrence, sql }, snapshot, targets));
+    }
+
+    pub(super) fn take_prepared_mutation_targets(
+        &self,
+        occurrence: Span,
+        snapshot: CommitSeq,
+    ) -> Option<Vec<PreparedMutationTarget>> {
+        let mut prepared = self
+            .prepared_mutation_targets
+            .lock()
+            .expect("prepared mutation targets mutex is poisoned");
+        let index = prepared
+            .entries
+            .iter()
+            .position(|(key, _, _)| key.occurrence == occurrence)?;
+        let (_, cached_snapshot, targets) = prepared.entries.remove(index);
+        (cached_snapshot == snapshot).then_some(targets)
+    }
+
+    pub(super) fn set_prepared_trigger_update(
+        &self,
+        index: usize,
+        update: ast::Update,
+        rows: Vec<PreparedTriggerUpdate>,
+    ) {
+        let mut prepared = self
+            .prepared_trigger_updates
+            .lock()
+            .expect("prepared trigger rows mutex is poisoned");
+        assert_eq!(index, prepared.entries.len());
+        prepared.entries.push((
+            PreparedAstKey {
+                occurrence: update.span(),
+                sql: update.to_string(),
+            },
+            update,
+            rows,
+        ));
+    }
+
+    pub(super) fn take_prepared_trigger_update(
+        &self,
+        update: &ast::Update,
+    ) -> Option<Vec<PreparedTriggerUpdate>> {
+        let mut prepared = self
+            .prepared_trigger_updates
+            .lock()
+            .expect("prepared trigger rows mutex is poisoned");
+        if prepared.entries.is_empty() {
+            return None;
+        }
+        let position = prepared
+            .entries
+            .iter()
+            .position(|(cached, _, _)| cached.occurrence == update.span())?;
+        Some(prepared.entries.remove(position).2)
+    }
 }
 
+#[derive(Clone)]
 pub(crate) struct DatabaseState {
     pub(crate) catalog: Catalog,
     pub(crate) catalog_history: CatalogHistory,
@@ -122,11 +583,13 @@ pub(crate) struct DatabaseState {
     touched_tables: BTreeMap<Xid, Vec<TableId>>,
     reclaimable_tables: Vec<TableId>,
 }
+#[derive(Clone)]
 pub(crate) struct RequiredRowLock {
     pub(crate) key: RowLockKey,
     pub(crate) mode: RowLockMode,
     pub(crate) mutation_candidate: Option<MutationCandidate>,
 }
+#[derive(Clone)]
 pub(crate) struct MutationCandidate {
     pub(crate) version_xmin: Xid,
     pub(crate) row: Option<Vec<Value>>,
@@ -137,6 +600,7 @@ pub(crate) use query::detect_statement_features;
 pub(crate) use query::expand_ctes_for_analysis;
 pub(crate) use query::materialize_ctes;
 pub(crate) use query::materialize_uncorrelated_subqueries;
+pub(crate) use query::substitute_procedural_references;
 pub(crate) use sequences::normalize_sequence_name;
 
 impl DatabaseState {
@@ -758,7 +1222,14 @@ pub(crate) fn execute_statement(
             Ok(StatementResult::Affected(0))
         }
         ast::Statement::CreateView(create) => execute_create_view(state, create),
-        ast::Statement::CreateTrigger(create) => execute_create_trigger(state, create),
+        ast::Statement::CreateFunction(create) => {
+            procedural::execute_create_function(state, create)
+        }
+        ast::Statement::DropFunction(drop) => {
+            procedural::execute_drop_function(state, drop, xid, snapshot)
+        }
+        ast::Statement::CreateTrigger(create) => procedural::execute_create_trigger(state, create),
+        ast::Statement::DropTrigger(drop) => procedural::execute_drop_trigger(state, drop),
         ast::Statement::AlterTrigger {
             name,
             table_name,
@@ -877,11 +1348,7 @@ pub(crate) fn execute_statement(
             }
             execute_update(
                 state,
-                &update.table,
-                &update.assignments,
-                update.from.as_ref(),
-                update.selection.as_ref(),
-                update.returning.as_deref(),
+                update,
                 xid,
                 snapshot,
                 deferred_constraints,

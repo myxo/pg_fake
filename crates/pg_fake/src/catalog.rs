@@ -69,6 +69,9 @@ pub(crate) struct ViewId(pub(crate) u64);
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub(crate) struct TriggerId(pub(crate) u64);
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub(crate) struct FunctionId(pub(crate) u64);
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct SequenceSchema {
     pub(crate) id: SequenceId,
@@ -183,7 +186,17 @@ pub(crate) struct IndexSchema {
 pub(crate) struct TriggerSchema {
     pub(crate) id: TriggerId,
     pub(crate) name: String,
+    pub(crate) function_id: FunctionId,
     pub(crate) definition: ast::CreateTrigger,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct FunctionSchema {
+    pub(crate) id: FunctionId,
+    pub(crate) schema_id: SchemaId,
+    pub(crate) name: String,
+    pub(crate) definition: ast::CreateFunction,
+    pub(crate) body: ast::PlPgSqlBlock,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
@@ -237,6 +250,7 @@ pub(crate) struct Schema {
     tables: BTreeMap<String, TableSchema>,
     views: BTreeMap<String, ViewSchema>,
     sequences: BTreeMap<String, SequenceSchema>,
+    functions: BTreeMap<String, FunctionSchema>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -249,6 +263,7 @@ pub(crate) struct Catalog {
     next_index_id: u64,
     next_view_id: u64,
     next_trigger_id: u64,
+    next_function_id: u64,
     deferrable_foreign_keys: Vec<(ConstraintId, bool)>,
     referencing_foreign_keys: BTreeMap<TableId, Vec<(TableId, usize)>>,
 }
@@ -274,6 +289,7 @@ pub(crate) struct CatalogHistory {
     tables: BTreeMap<TableId, Vec<CatalogVersion<TableSchema>>>,
     sequences: BTreeMap<SequenceId, Vec<CatalogVersion<SequenceSchema>>>,
     views: BTreeMap<ViewId, Vec<CatalogVersion<ViewSchema>>>,
+    functions: BTreeMap<FunctionId, Vec<CatalogVersion<FunctionSchema>>>,
     next_schema_id: u64,
     next_table_id: u64,
     next_sequence_id: u64,
@@ -281,6 +297,7 @@ pub(crate) struct CatalogHistory {
     next_index_id: u64,
     next_view_id: u64,
     next_trigger_id: u64,
+    next_function_id: u64,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -305,6 +322,7 @@ impl Catalog {
             tables: BTreeMap::new(),
             views: BTreeMap::new(),
             sequences: BTreeMap::new(),
+            functions: BTreeMap::new(),
         };
         Catalog {
             schemas: BTreeMap::from([(public.name.clone(), public)]),
@@ -315,6 +333,7 @@ impl Catalog {
             next_index_id: 1,
             next_view_id: 1,
             next_trigger_id: 1,
+            next_function_id: 1,
             deferrable_foreign_keys: Vec::new(),
             referencing_foreign_keys: BTreeMap::new(),
         }
@@ -508,6 +527,7 @@ impl Catalog {
                 tables: BTreeMap::new(),
                 views: BTreeMap::new(),
                 sequences: BTreeMap::new(),
+                functions: BTreeMap::new(),
             },
         );
         assert!(previous.is_none(), "new schema must not replace a schema");
@@ -525,7 +545,11 @@ impl Catalog {
                 format!("schema {name:?} does not exist"),
             )
         })?;
-        if !schema.tables.is_empty() || !schema.views.is_empty() || !schema.sequences.is_empty() {
+        if !schema.tables.is_empty()
+            || !schema.views.is_empty()
+            || !schema.sequences.is_empty()
+            || !schema.functions.is_empty()
+        {
             return Err(PgError::create(
                 SqlState::DependentObjectsStillExist,
                 format!("cannot drop schema {name:?} because other objects depend on it"),
@@ -748,11 +772,96 @@ impl Catalog {
         id
     }
 
-    #[cfg(any(test, feature = "test-support"))]
     pub(crate) fn allocate_trigger_id(&mut self) -> TriggerId {
         let id = TriggerId(self.next_trigger_id);
         self.next_trigger_id += 1;
         id
+    }
+
+    pub(crate) fn resolve_function_name(
+        &self,
+        name: &RelationName,
+    ) -> Result<ResolvedRelationName> {
+        let schema = match name.schema.as_deref() {
+            Some(schema) => self.require_schema(schema)?,
+            None => self.get_default_schema(),
+        };
+        Ok(ResolvedRelationName {
+            schema_id: schema.id,
+            name: name.name.clone(),
+        })
+    }
+
+    pub(crate) fn require_named_function(&self, name: &RelationName) -> Result<&FunctionSchema> {
+        let name = self.resolve_function_name(name)?;
+        self.get_schema_by_id(name.schema_id)
+            .functions
+            .get(&name.name)
+            .ok_or_else(|| {
+                PgError::create(
+                    SqlState::UndefinedFunction,
+                    format!("function {}() does not exist", name.name),
+                )
+            })
+    }
+
+    pub(crate) fn require_function_by_id(&self, id: FunctionId) -> Result<&FunctionSchema> {
+        self.schemas
+            .values()
+            .flat_map(|schema| schema.functions.values())
+            .find(|function| function.id == id)
+            .ok_or_else(|| {
+                PgError::create(
+                    SqlState::UndefinedFunction,
+                    format!("function with id {} does not exist", id.0),
+                )
+            })
+    }
+
+    pub(crate) fn create_or_replace_function(
+        &mut self,
+        name: ResolvedRelationName,
+        definition: ast::CreateFunction,
+        body: ast::PlPgSqlBlock,
+        replace: bool,
+    ) -> Result<FunctionId> {
+        let existing = self
+            .get_schema_by_id(name.schema_id)
+            .functions
+            .get(&name.name)
+            .cloned();
+        if existing.is_some() && !replace {
+            return Err(PgError::create(
+                SqlState::DuplicateFunction,
+                format!("function {}() already exists", name.name),
+            ));
+        }
+        let id = existing.map_or_else(
+            || {
+                let id = FunctionId(self.next_function_id);
+                self.next_function_id += 1;
+                id
+            },
+            |function| function.id,
+        );
+        self.get_schema_by_id_mut(name.schema_id).functions.insert(
+            name.name.clone(),
+            FunctionSchema {
+                id,
+                schema_id: name.schema_id,
+                name: name.name,
+                definition,
+                body,
+            },
+        );
+        Ok(id)
+    }
+
+    pub(crate) fn drop_function(&mut self, function: &FunctionSchema) {
+        self.get_schema_by_id_mut(function.schema_id)
+            .functions
+            .remove(&function.name)
+            .expect("required function must exist");
     }
 
     pub(crate) fn require_named_index(
@@ -1367,6 +1476,8 @@ impl CatalogHistory {
             next_index_id: 1,
             next_view_id: 1,
             next_trigger_id: 1,
+            next_function_id: 1,
+            functions: BTreeMap::new(),
         }
     }
 
@@ -1409,6 +1520,7 @@ impl CatalogHistory {
                         tables: BTreeMap::new(),
                         views: BTreeMap::new(),
                         sequences: BTreeMap::new(),
+                        functions: BTreeMap::new(),
                     },
                 )
             })
@@ -1422,6 +1534,7 @@ impl CatalogHistory {
                     tables: BTreeMap::new(),
                     views: BTreeMap::new(),
                     sequences: BTreeMap::new(),
+                    functions: BTreeMap::new(),
                 },
             );
             assert!(previous.is_none(), "temporary schema name must be reserved");
@@ -1439,6 +1552,7 @@ impl CatalogHistory {
             next_index_id: self.next_index_id,
             next_view_id: self.next_view_id,
             next_trigger_id: self.next_trigger_id,
+            next_function_id: self.next_function_id,
             deferrable_foreign_keys: Vec::new(),
             referencing_foreign_keys: BTreeMap::new(),
         };
@@ -1499,8 +1613,51 @@ impl CatalogHistory {
                 "visible catalog relation names must be unique"
             );
         }
+        for versions in self.functions.values() {
+            let Some(function) =
+                find_visible_catalog_version(versions, xid, snapshot, transactions)
+            else {
+                continue;
+            };
+            let Some(schema) = catalog
+                .schemas
+                .values_mut()
+                .find(|schema| schema.id == function.schema_id)
+            else {
+                continue;
+            };
+            let previous = schema
+                .functions
+                .insert(function.name.clone(), function.clone());
+            assert!(
+                previous.is_none(),
+                "visible catalog function names must be unique"
+            );
+        }
         catalog.rebuild_foreign_key_metadata();
         catalog
+    }
+
+    pub(crate) fn find_trigger_dependencies(
+        &self,
+        function_id: FunctionId,
+        xid: Xid,
+        snapshot: Snapshot,
+        transactions: &TransactionRegistry,
+    ) -> Vec<TableId> {
+        self.tables
+            .iter()
+            .filter_map(|(id, versions)| {
+                find_visible_catalog_version(versions, Some(xid), snapshot, transactions)
+                    .is_some_and(|table| {
+                        table
+                            .triggers
+                            .iter()
+                            .any(|trigger| trigger.function_id == function_id)
+                    })
+                    .then_some(*id)
+            })
+            .collect()
     }
 
     #[cfg_attr(feature = "execution-log", tracing::instrument(skip_all))]
@@ -1587,6 +1744,21 @@ impl CatalogHistory {
             xid,
             command_id,
         );
+        record_catalog_changes(
+            &mut self.functions,
+            previous
+                .schemas
+                .values()
+                .flat_map(|schema| schema.functions.values())
+                .map(|function| (function.id, function.clone())),
+            current
+                .schemas
+                .values()
+                .flat_map(|schema| schema.functions.values())
+                .map(|function| (function.id, function.clone())),
+            xid,
+            command_id,
+        );
         self.next_schema_id = self.next_schema_id.max(current.next_schema_id);
         self.next_table_id = self.next_table_id.max(current.next_table_id);
         self.next_sequence_id = self.next_sequence_id.max(current.next_sequence_id);
@@ -1594,12 +1766,14 @@ impl CatalogHistory {
         self.next_index_id = self.next_index_id.max(current.next_index_id);
         self.next_view_id = self.next_view_id.max(current.next_view_id);
         self.next_trigger_id = self.next_trigger_id.max(current.next_trigger_id);
+        self.next_function_id = self.next_function_id.max(current.next_function_id);
     }
 
     #[cfg_attr(feature = "execution-log", tracing::instrument(skip_all))]
     pub(crate) fn discard_transaction(&mut self, xid: Xid) -> ReclaimedCatalogObjects {
         discard_catalog_transaction(&mut self.schemas, xid);
         discard_catalog_transaction(&mut self.views, xid);
+        discard_catalog_transaction(&mut self.functions, xid);
         ReclaimedCatalogObjects {
             tables: discard_catalog_transaction(&mut self.tables, xid),
             sequences: discard_catalog_transaction(&mut self.sequences, xid),
@@ -1640,6 +1814,16 @@ impl CatalogHistory {
                     .then_some(*id)
             })
             .collect::<Vec<_>>();
+        let functions = self
+            .functions
+            .iter()
+            .filter_map(|(id, versions)| {
+                versions
+                    .iter()
+                    .any(|version| version.value.schema_id == temporary_schema_id)
+                    .then_some(*id)
+            })
+            .collect::<Vec<_>>();
         for id in &tables {
             self.tables.remove(id);
         }
@@ -1648,6 +1832,9 @@ impl CatalogHistory {
         }
         for id in views {
             self.views.remove(&id);
+        }
+        for id in functions {
+            self.functions.remove(&id);
         }
         ReclaimedCatalogObjects { tables, sequences }
     }
@@ -1667,6 +1854,12 @@ impl CatalogHistory {
         );
         prune_catalog_versions(
             &mut self.views,
+            horizon,
+            transactions,
+            &std::collections::BTreeSet::new(),
+        );
+        prune_catalog_versions(
+            &mut self.functions,
             horizon,
             transactions,
             &std::collections::BTreeSet::new(),

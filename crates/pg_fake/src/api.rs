@@ -1,11 +1,11 @@
 use std::{
-    collections::BTreeSet,
+    collections::{BTreeMap, BTreeSet},
     sync::{Arc, Condvar, Mutex, MutexGuard},
     time::{Duration, Instant},
 };
 
 use rand_chacha::{ChaCha12Rng, rand_core::SeedableRng};
-use sqlparser::ast::{self, Visit as _};
+use sqlparser::ast::{self, Visit as _, VisitMut as _};
 
 use crate::{
     analyzer,
@@ -13,13 +13,14 @@ use crate::{
         ConstraintId, RelationName, ResolvedRelationName, SchemaId, SequenceSchema, TEMP_SCHEMA,
         TableId, TablePersistence, TableSchema, ViewDependency, ViewSchema,
     },
+    coercion::{self, CastContext},
     error::{PgError, Result, SqlState, reject_unsupported},
     executor::{self, DatabaseState},
     parser,
     txn::{
         RelationLockAttempt, RelationLockMode, RowLockAttempt, Snapshot, TransactionStatus, Xid,
     },
-    value::{Oid, Value},
+    value::{BaseType, Oid, PgType, Value},
 };
 
 #[cfg(test)]
@@ -398,6 +399,16 @@ fn collect_prepared_catalog_dependencies(
     }
     Ok(collector.dependencies)
 }
+
+fn does_prepared_table_match(current: &TableSchema, prepared: &TableSchema) -> bool {
+    current.id == prepared.id
+        && current.schema_id == prepared.schema_id
+        && current.name == prepared.name
+        && current.columns == prepared.columns
+        && current.constraints == prepared.constraints
+        && current.indexes == prepared.indexes
+        && current.persistence == prepared.persistence
+}
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum IsolationLevel {
     ReadCommitted,
@@ -738,6 +749,41 @@ fn collect_ddl_relation_locks(
 ) -> Result<Vec<(String, RelationLockMode)>> {
     let mut locks = std::collections::BTreeMap::new();
     match statement {
+        ast::Statement::CreateFunction(create) => {
+            let name =
+                catalog.resolve_function_name(&executor::normalize_relation_name(&create.name)?)?;
+            locks.insert(
+                format!("function:{}:{}", name.schema_id.0, name.name),
+                RelationLockMode::Exclusive,
+            );
+        }
+        ast::Statement::DropFunction(drop) => {
+            for description in &drop.func_desc {
+                let name = executor::normalize_relation_name(&description.name)?;
+                let resolved = catalog.resolve_function_name(&name)?;
+                locks.insert(
+                    format!("function:{}:{}", resolved.schema_id.0, resolved.name),
+                    RelationLockMode::Exclusive,
+                );
+                if let Ok(function) = catalog.require_named_function(&name) {
+                    for table in catalog.iterate_tables().filter(|table| {
+                        table
+                            .triggers
+                            .iter()
+                            .any(|trigger| trigger.function_id == function.id)
+                    }) {
+                        locks.insert(
+                            ResolvedRelationName {
+                                schema_id: table.schema_id,
+                                name: table.name.clone(),
+                            }
+                            .get_lock_name(),
+                            RelationLockMode::Exclusive,
+                        );
+                    }
+                }
+            }
+        }
         ast::Statement::CreateTable(create) => {
             let relation_name = executor::normalize_relation_name(&create.name)?;
             let temporary =
@@ -1158,7 +1204,46 @@ fn collect_ddl_relation_locks(
                 }
             }
         }
-        ast::Statement::CreateTrigger(_) => {}
+        ast::Statement::CreateTrigger(create) => {
+            let table = catalog
+                .require_named_table(&executor::normalize_relation_name(&create.table_name)?)?;
+            locks.insert(
+                ResolvedRelationName {
+                    schema_id: table.schema_id,
+                    name: table.name.clone(),
+                }
+                .get_lock_name(),
+                RelationLockMode::Exclusive,
+            );
+            if let Some(body) = &create.exec_body {
+                let name = executor::normalize_relation_name(&body.func_desc.name)?;
+                let resolved = catalog.resolve_function_name(&name)?;
+                locks.insert(
+                    format!("function:{}:{}", resolved.schema_id.0, resolved.name),
+                    RelationLockMode::Shared,
+                );
+            }
+        }
+        ast::Statement::DropTrigger(drop) => {
+            if let Some(table_name) = &drop.table_name {
+                let table_name = executor::normalize_relation_name(table_name)?;
+                let table = match catalog.require_named_table(&table_name) {
+                    Ok(table) => table,
+                    Err(error) if drop.if_exists && error.sqlstate == SqlState::UndefinedTable => {
+                        return Ok(Vec::new());
+                    }
+                    Err(error) => return Err(error),
+                };
+                locks.insert(
+                    ResolvedRelationName {
+                        schema_id: table.schema_id,
+                        name: table.name.clone(),
+                    }
+                    .get_lock_name(),
+                    RelationLockMode::Exclusive,
+                );
+            }
+        }
         ast::Statement::AlterTrigger { table_name, .. } => {
             let table =
                 catalog.require_named_table(&executor::normalize_relation_name(table_name)?)?;
@@ -1326,7 +1411,15 @@ fn collect_foreign_key_relation_locks(
                 {
                     pending.push(ForeignKeyMutation::Update {
                         table: table.id,
-                        columns: collect_assignment_columns(&update.assignments)?,
+                        columns: if table.triggers.is_empty() {
+                            collect_assignment_columns(&update.assignments)?
+                        } else {
+                            table
+                                .columns
+                                .iter()
+                                .map(|column| column.name.clone())
+                                .collect()
+                        },
                     });
                 }
             }
@@ -1341,7 +1434,15 @@ fn collect_foreign_key_relation_locks(
                 let table = state.catalog.require_named_table(&name)?;
                 pending.push(ForeignKeyMutation::Update {
                     table: table.id,
-                    columns: collect_assignment_columns(&update.assignments)?,
+                    columns: if table.triggers.is_empty() {
+                        collect_assignment_columns(&update.assignments)?
+                    } else {
+                        table
+                            .columns
+                            .iter()
+                            .map(|column| column.name.clone())
+                            .collect()
+                    },
                 });
             }
             ast::Statement::Delete(delete) => {
@@ -1427,6 +1528,20 @@ fn collect_foreign_key_relation_locks(
             } else {
                 foreign_key.on_delete
             };
+            if matches!(
+                action,
+                crate::catalog::ForeignKeyAction::Cascade
+                    | crate::catalog::ForeignKeyAction::SetNull
+                    | crate::catalog::ForeignKeyAction::SetDefault
+            ) {
+                for trigger in &child.triggers {
+                    let function = state.catalog.require_function_by_id(trigger.function_id)?;
+                    locks.insert(
+                        format!("function:{}:{}", function.schema_id.0, function.name),
+                        RelationLockMode::Shared,
+                    );
+                }
+            }
             let mode = match action {
                 crate::catalog::ForeignKeyAction::Cascade
                 | crate::catalog::ForeignKeyAction::SetNull
@@ -1453,7 +1568,15 @@ fn collect_foreign_key_relation_locks(
                 | crate::catalog::ForeignKeyAction::SetDefault => {
                     pending.push(ForeignKeyMutation::Update {
                         table: child.id,
-                        columns: foreign_key.columns,
+                        columns: if child.triggers.is_empty() {
+                            foreign_key.columns
+                        } else {
+                            child
+                                .columns
+                                .iter()
+                                .map(|column| column.name.clone())
+                                .collect()
+                        },
                     });
                 }
                 crate::catalog::ForeignKeyAction::NoAction
@@ -1596,6 +1719,13 @@ fn collect_relation_locks(
             continue;
         };
         if let Ok(table) = state.catalog.require_named_table(&name) {
+            for trigger in &table.triggers {
+                let function = state.catalog.require_function_by_id(trigger.function_id)?;
+                locks.insert(
+                    format!("function:{}:{}", function.schema_id.0, function.name),
+                    RelationLockMode::Shared,
+                );
+            }
             locks
                 .entry(
                     ResolvedRelationName {
@@ -1780,12 +1910,15 @@ fn acquire_row_locks<'a>(
     isolation: IsolationLevel,
     mut snapshot: Snapshot,
     context: &executor::StatementExecutionContext,
+    deferred_constraints: &BTreeSet<ConstraintId>,
+    defer_all: bool,
 ) -> Result<(
     MutexGuard<'a, DatabaseState>,
     Snapshot,
     Vec<executor::RequiredRowLock>,
 )> {
     let lock_deadline = (timeout != Duration::ZERO).then(|| Instant::now() + timeout);
+    let mut acquired = Vec::<executor::RequiredRowLock>::new();
     loop {
         state.load_catalog(Some(xid), snapshot, Some(temporary_schema_id));
         let required = match target {
@@ -1802,7 +1935,18 @@ fn acquire_row_locks<'a>(
                 .row_locks
                 .acquire(required_lock.key, xid, required_lock.mode)
             {
-                RowLockAttempt::Acquired => condvar.notify_all(),
+                RowLockAttempt::Acquired => {
+                    match acquired.iter_mut().find(|acquired| {
+                        acquired.key == required_lock.key && acquired.mode == required_lock.mode
+                    }) {
+                        Some(acquired) if acquired.mutation_candidate.is_none() => {
+                            acquired.mutation_candidate = required_lock.mutation_candidate.clone();
+                        }
+                        Some(_) => {}
+                        None => acquired.push(required_lock.clone()),
+                    }
+                    condvar.notify_all();
+                }
                 RowLockAttempt::Blocked(conflicts) => {
                     if state
                         .wait_for
@@ -1817,8 +1961,31 @@ fn acquire_row_locks<'a>(
             }
         }
         let Some((key, conflicts)) = blocked else {
+            if context.take_trigger_lock_recheck() {
+                continue;
+            }
+            if let Some(pending) = context.take_pending_cte_mutation() {
+                let result = executor::execute_statement(
+                    &mut state,
+                    &pending.statement,
+                    xid,
+                    &snapshot,
+                    deferred_constraints,
+                    defer_all,
+                    context,
+                    None,
+                )?;
+                let StatementResult::Query(result) = result else {
+                    return Err(PgError::create(
+                        SqlState::FeatureNotSupported,
+                        "WITH query does not have a RETURNING clause",
+                    ));
+                };
+                context.set_executed_cte_result(pending.occurrence, pending.name, result);
+                continue;
+            }
             state.wait_for.clear_wait(xid);
-            return Ok((state, snapshot, required));
+            return Ok((state, snapshot, acquired));
         };
         if state.wait_for.take_victim(xid) {
             state.row_locks.cancel_wait(key, xid);
@@ -1932,36 +2099,6 @@ impl Db {
             sequence_session: Arc::new(Mutex::new(executor::SequenceSessionState::default())),
         }
     }
-
-    #[cfg(any(test, feature = "test-support"))]
-    #[doc(hidden)]
-    pub fn seed_trigger_catalog_for_test(&self, definition: &str) -> Result<()> {
-        let statements = parser::parse(definition)?;
-        let create = match statements.as_slice() {
-            [ast::Statement::CreateTrigger(create)] => create,
-            _ => {
-                return Err(PgError::create(
-                    SqlState::SyntaxError,
-                    "trigger fixture must be exactly one CREATE TRIGGER statement",
-                ));
-            }
-        };
-        let mut state = self.state.lock().expect("database mutex is poisoned");
-        let xid = state.transactions.begin();
-        let snapshot = Snapshot::create(&state.transactions).use_command(crate::txn::CommandId(0));
-        state.load_catalog(Some(xid), snapshot, None);
-        let previous = state.catalog.clone();
-        if let Err(error) = executor::seed_trigger_catalog_for_test(&mut state, create) {
-            abort_database_transaction(&mut state, xid);
-            self.condvar.notify_all();
-            return Err(error);
-        }
-        state.record_catalog_changes(&previous, xid, crate::txn::CommandId(0));
-        state.transactions.commit(xid);
-        prune_database_versions(&mut state);
-        self.condvar.notify_all();
-        Ok(())
-    }
 }
 impl DbBuilder {
     #[cfg_attr(feature = "execution-log", tracing::instrument(skip_all))]
@@ -2056,7 +2193,690 @@ impl Db {
         }
     }
 }
+
+#[derive(Clone)]
+struct ProceduralLocal {
+    data_type: PgType,
+    value: Value,
+}
+
+#[derive(Clone, Copy)]
+struct ProceduralStatementContext {
+    deadline: Option<Instant>,
+    statement_timestamp: chrono::DateTime<chrono::Utc>,
+}
+
+struct ProceduralLocalSubstituter<'a> {
+    locals: &'a BTreeMap<String, ProceduralLocal>,
+    output_aliases: Vec<BTreeSet<String>>,
+    protected_order_identifiers: Vec<bool>,
+    group_by_depth: usize,
+    group_expression_depth: usize,
+}
+
+impl ast::VisitorMut for ProceduralLocalSubstituter<'_> {
+    type Break = ();
+
+    fn pre_visit_query(&mut self, query: &mut ast::Query) -> std::ops::ControlFlow<Self::Break> {
+        self.output_aliases.push(match query.body.as_ref() {
+            ast::SetExpr::Select(select) => select
+                .projection
+                .iter()
+                .filter_map(|item| match item {
+                    ast::SelectItem::ExprWithAlias { alias, .. } => {
+                        Some(executor::normalize_identifier(alias))
+                    }
+                    _ => None,
+                })
+                .collect(),
+            _ => BTreeSet::new(),
+        });
+        std::ops::ControlFlow::Continue(())
+    }
+
+    fn post_visit_query(&mut self, _query: &mut ast::Query) -> std::ops::ControlFlow<Self::Break> {
+        self.output_aliases
+            .pop()
+            .expect("visited query pushed output aliases");
+        std::ops::ControlFlow::Continue(())
+    }
+
+    fn pre_visit_order_by_expr(
+        &mut self,
+        order_by: &mut ast::OrderByExpr,
+    ) -> std::ops::ControlFlow<Self::Break> {
+        self.protected_order_identifiers.push(
+            matches!(&order_by.expr, ast::Expr::Identifier(identifier)
+                if self.output_aliases.last().is_some_and(|aliases| aliases.contains(&executor::normalize_identifier(identifier)))),
+        );
+        std::ops::ControlFlow::Continue(())
+    }
+
+    fn post_visit_order_by_expr(
+        &mut self,
+        _order_by: &mut ast::OrderByExpr,
+    ) -> std::ops::ControlFlow<Self::Break> {
+        self.protected_order_identifiers
+            .pop()
+            .expect("visited ORDER BY expression pushed alias protection");
+        std::ops::ControlFlow::Continue(())
+    }
+
+    fn pre_visit_group_by(
+        &mut self,
+        _group_by: &mut ast::GroupByExpr,
+    ) -> std::ops::ControlFlow<Self::Break> {
+        self.group_by_depth += 1;
+        std::ops::ControlFlow::Continue(())
+    }
+
+    fn post_visit_group_by(
+        &mut self,
+        _group_by: &mut ast::GroupByExpr,
+    ) -> std::ops::ControlFlow<Self::Break> {
+        self.group_by_depth -= 1;
+        std::ops::ControlFlow::Continue(())
+    }
+
+    fn pre_visit_expr(&mut self, expression: &mut ast::Expr) -> std::ops::ControlFlow<Self::Break> {
+        let protected_group_identifier =
+            self.group_by_depth != 0 && self.group_expression_depth == 0;
+        if self.group_by_depth != 0 {
+            self.group_expression_depth += 1;
+        }
+        let ast::Expr::Identifier(identifier) = expression else {
+            return std::ops::ControlFlow::Continue(());
+        };
+        let name = executor::normalize_identifier(identifier);
+        if (self.protected_order_identifiers.last() == Some(&true) || protected_group_identifier)
+            && self
+                .output_aliases
+                .last()
+                .is_some_and(|aliases| aliases.contains(&name))
+        {
+            return std::ops::ControlFlow::Continue(());
+        }
+        let Some(local) = self.locals.get(&name) else {
+            return std::ops::ControlFlow::Continue(());
+        };
+        *expression = analyzer::create_typed_literal(local.value.clone(), local.data_type);
+        std::ops::ControlFlow::Continue(())
+    }
+
+    fn post_visit_expr(
+        &mut self,
+        _expression: &mut ast::Expr,
+    ) -> std::ops::ControlFlow<Self::Break> {
+        if self.group_by_depth != 0 {
+            self.group_expression_depth -= 1;
+        }
+        std::ops::ControlFlow::Continue(())
+    }
+}
+
+fn substitute_procedural_statement_locals(
+    statement: &mut ast::Statement,
+    locals: &BTreeMap<String, ProceduralLocal>,
+) {
+    let mut substituter = ProceduralLocalSubstituter {
+        locals,
+        output_aliases: Vec::new(),
+        protected_order_identifiers: Vec::new(),
+        group_by_depth: 0,
+        group_expression_depth: 0,
+    };
+    let _ = statement.visit(&mut substituter);
+}
+
+fn format_procedural_exception(format: &str, arguments: &[Value]) -> Result<String> {
+    let mut result = String::new();
+    let mut arguments = arguments.iter();
+    let mut characters = format.chars();
+    while let Some(character) = characters.next() {
+        if character != '%' {
+            result.push(character);
+            continue;
+        }
+        if characters.clone().next() == Some('%') {
+            characters.next();
+            result.push('%');
+            continue;
+        }
+        let argument = arguments.next().ok_or_else(|| {
+            PgError::create(
+                SqlState::SyntaxError,
+                "too few parameters specified for RAISE",
+            )
+        })?;
+        if argument.is_null() {
+            result.push_str("<NULL>");
+        } else {
+            result.push_str(&argument.format_postgres_text());
+        }
+    }
+    if arguments.next().is_some() {
+        return Err(PgError::create(
+            SqlState::SyntaxError,
+            "too many parameters specified for RAISE",
+        ));
+    }
+    Ok(result)
+}
+
+fn validate_procedural_raise_arity(statements: &[ast::PlPgSqlStatement]) -> Result<()> {
+    for statement in statements {
+        match statement {
+            ast::PlPgSqlStatement::If {
+                branches,
+                else_statements,
+            } => {
+                for branch in branches {
+                    validate_procedural_raise_arity(&branch.statements)?;
+                }
+                if let Some(statements) = else_statements {
+                    validate_procedural_raise_arity(statements)?;
+                }
+            }
+            ast::PlPgSqlStatement::RaiseException {
+                format, arguments, ..
+            } => {
+                let format = format.clone().into_string().ok_or_else(|| {
+                    PgError::create(SqlState::SyntaxError, "RAISE format must be a string")
+                })?;
+                format_procedural_exception(&format, &vec![Value::Null; arguments.len()])?;
+            }
+            _ => {}
+        }
+    }
+    Ok(())
+}
+
+fn validate_procedural_targets(
+    statements: &[ast::PlPgSqlStatement],
+    locals: &BTreeSet<String>,
+) -> Result<()> {
+    for statement in statements {
+        match statement {
+            ast::PlPgSqlStatement::Assignment { target, .. } => {
+                let [ast::ObjectNamePart::Identifier(identifier)] = target.0.as_slice() else {
+                    return reject_unsupported("DO assignment target is not implemented");
+                };
+                let name = executor::normalize_identifier(identifier);
+                if !locals.contains(&name) {
+                    return Err(PgError::create(
+                        SqlState::SyntaxError,
+                        format!("variable {name:?} does not exist"),
+                    ));
+                }
+            }
+            ast::PlPgSqlStatement::GetRowCount { target } => {
+                let name = executor::normalize_identifier(target);
+                if !locals.contains(&name) {
+                    return Err(PgError::create(
+                        SqlState::SyntaxError,
+                        format!("variable {name:?} does not exist"),
+                    ));
+                }
+            }
+            ast::PlPgSqlStatement::Sql(statement) => {
+                if let ast::Statement::Query(query) = statement.as_ref()
+                    && let ast::SetExpr::Select(select) = query.body.as_ref()
+                    && let Some(into) = &select.into
+                {
+                    for target in &into.targets {
+                        let ast::Expr::Identifier(identifier) = target else {
+                            return reject_unsupported("SELECT INTO target is not implemented");
+                        };
+                        let name = executor::normalize_identifier(identifier);
+                        if !locals.contains(&name) {
+                            return Err(PgError::create(
+                                SqlState::SyntaxError,
+                                format!("variable {name:?} does not exist"),
+                            ));
+                        }
+                    }
+                }
+            }
+            ast::PlPgSqlStatement::If {
+                branches,
+                else_statements,
+            } => {
+                for branch in branches {
+                    validate_procedural_targets(&branch.statements, locals)?;
+                }
+                if let Some(statements) = else_statements {
+                    validate_procedural_targets(statements, locals)?;
+                }
+            }
+            ast::PlPgSqlStatement::Return(_) => {
+                return Err(PgError::create(
+                    SqlState::DatatypeMismatch,
+                    "cannot return a value from an anonymous block",
+                ));
+            }
+            ast::PlPgSqlStatement::RaiseException { .. } => {}
+        }
+    }
+    Ok(())
+}
+
+fn does_procedural_query_return_rows(expression: &ast::SetExpr) -> bool {
+    match expression {
+        ast::SetExpr::Insert(statement)
+        | ast::SetExpr::Update(statement)
+        | ast::SetExpr::Delete(statement) => does_procedural_statement_return_rows(statement),
+        ast::SetExpr::Query(query) => does_procedural_query_return_rows(&query.body),
+        _ => true,
+    }
+}
+
+fn does_procedural_statement_return_rows(statement: &ast::Statement) -> bool {
+    match statement {
+        ast::Statement::Query(query) => does_procedural_query_return_rows(&query.body),
+        ast::Statement::Insert(insert) => insert.returning.is_some(),
+        ast::Statement::Update(update) => update.returning.is_some(),
+        ast::Statement::Delete(delete) => delete.returning.is_some(),
+        _ => false,
+    }
+}
+
 impl Session {
+    fn substitute_scoped_procedural_locals(
+        &self,
+        statement: &mut ast::Statement,
+        locals: &BTreeMap<String, ProceduralLocal>,
+    ) -> Result<()> {
+        let scope = executor::create_value_scope(
+            locals
+                .iter()
+                .map(|(name, local)| (name.clone(), local.data_type)),
+        );
+        let row = locals
+            .values()
+            .map(|local| local.value.clone())
+            .collect::<Vec<_>>();
+        let mut state = self.db.state.lock().expect("database mutex is poisoned");
+        let transaction = match self.transaction {
+            Some(SessionTransactionState::Active(transaction)) => transaction,
+            _ => unreachable!("procedural SQL executes in an active transaction"),
+        };
+        let snapshot = transaction
+            .snapshot
+            .unwrap_or_else(|| Snapshot::create(&state.transactions))
+            .use_command(crate::txn::CommandId(transaction.next_command_id));
+        state.load_catalog(
+            Some(transaction.xid),
+            snapshot,
+            Some(self.temporary_schema_id),
+        );
+        executor::substitute_procedural_references(&state, statement, &scope, &row)
+    }
+
+    fn evaluate_procedural_expression(
+        &mut self,
+        expression: &ast::Expr,
+        locals: &BTreeMap<String, ProceduralLocal>,
+        procedural: ProceduralStatementContext,
+    ) -> Result<Value> {
+        let mut statements = parser::parse(&format!("SELECT {expression}"))?;
+        let mut statement = statements
+            .pop()
+            .expect("generated expression query contains one statement");
+        assert!(
+            statements.is_empty(),
+            "generated expression query is singular"
+        );
+        self.substitute_scoped_procedural_locals(&mut statement, locals)?;
+        let StatementResult::Query(query) =
+            self.execute_statement(&statement, None, None, Some(procedural))?
+        else {
+            unreachable!("generated expression query returns rows")
+        };
+        Ok(query.rows[0][0].clone())
+    }
+
+    fn coerce_procedural_expression(
+        &mut self,
+        expression: &ast::Expr,
+        target: PgType,
+        locals: &BTreeMap<String, ProceduralLocal>,
+        procedural: ProceduralStatementContext,
+    ) -> Result<Value> {
+        if let Some(text) = executor::extract_unknown_string_literal(expression) {
+            return coercion::coerce_unknown(text, target, CastContext::Assignment);
+        }
+        let value = self.evaluate_procedural_expression(expression, locals, procedural)?;
+        let Some(source) = value.get_base_type() else {
+            return Ok(Value::Null);
+        };
+        executor::coerce_procedural_value(value, source, target)
+    }
+
+    fn execute_procedural_sql(
+        &mut self,
+        statement: &ast::Statement,
+        locals: &mut BTreeMap<String, ProceduralLocal>,
+        row_count: &mut u64,
+        procedural: ProceduralStatementContext,
+    ) -> Result<()> {
+        let mut statement = statement.clone();
+        let into = match &mut statement {
+            ast::Statement::Query(query) => match query.body.as_mut() {
+                ast::SetExpr::Select(select) => select.into.take(),
+                _ => None,
+            },
+            _ => None,
+        };
+        let query_with_ctes =
+            matches!(&statement, ast::Statement::Query(query) if query.with.is_some());
+        let uses_scoped_substitution = !query_with_ctes;
+        if into.is_none() && does_procedural_statement_return_rows(&statement) {
+            return Err(PgError::create(
+                SqlState::SyntaxError,
+                "query has no destination for result data",
+            ));
+        }
+        if uses_scoped_substitution {
+            self.substitute_scoped_procedural_locals(&mut statement, locals)?;
+        } else if query_with_ctes {
+            let (mut expanded, mut mutations) = {
+                let state = self.db.state.lock().expect("database mutex is poisoned");
+                executor::expand_ctes_for_analysis(&statement, &state)?
+            };
+            self.substitute_scoped_procedural_locals(&mut expanded, locals)?;
+            for mutation in &mut mutations {
+                self.substitute_scoped_procedural_locals(mutation, locals)?;
+            }
+            substitute_procedural_statement_locals(&mut statement, locals);
+        }
+        if into.is_some() {
+            let ast::Statement::Query(query) = &mut statement else {
+                unreachable!("SELECT INTO is represented by a query")
+            };
+            let current_limit = match &query.limit_clause {
+                Some(ast::LimitClause::LimitOffset { limit, .. }) => limit.clone(),
+                Some(ast::LimitClause::OffsetCommaLimit { .. }) => {
+                    return reject_unsupported("SELECT INTO limit form is not implemented");
+                }
+                None => None,
+            };
+            let limit = match current_limit {
+                Some(limit) => {
+                    let value =
+                        self.evaluate_procedural_expression(&limit, &BTreeMap::new(), procedural)?;
+                    let value = match value.get_base_type() {
+                        Some(source) => executor::coerce_procedural_value(
+                            value,
+                            source,
+                            PgType::create(BaseType::Int8),
+                        )?,
+                        None => Value::Null,
+                    };
+                    match value {
+                        Value::Int2(value) => Value::Int2(value.min(1)),
+                        Value::Int4(value) => Value::Int4(value.min(1)),
+                        Value::Int8(value) => Value::Int8(value.min(1)),
+                        Value::Null => Value::Int8(1),
+                        _ => {
+                            return Err(PgError::create(
+                                SqlState::DatatypeMismatch,
+                                "LIMIT must be an integer",
+                            ));
+                        }
+                    }
+                }
+                None => Value::Int8(1),
+            };
+            match &mut query.limit_clause {
+                Some(ast::LimitClause::LimitOffset { limit: target, .. }) => {
+                    *target = Some(analyzer::create_typed_literal(
+                        limit.clone(),
+                        PgType::create(
+                            limit
+                                .get_base_type()
+                                .expect("SELECT INTO limit is a typed integer"),
+                        ),
+                    ));
+                }
+                None => {
+                    query.limit_clause = Some(ast::LimitClause::LimitOffset {
+                        limit: Some(analyzer::create_typed_literal(
+                            Value::Int8(1),
+                            PgType::create(BaseType::Int8),
+                        )),
+                        offset: None,
+                        limit_by: Vec::new(),
+                    });
+                }
+                Some(ast::LimitClause::OffsetCommaLimit { .. }) => unreachable!(),
+            }
+        }
+        let result = self.execute_statement(&statement, None, None, Some(procedural))?;
+        let Some(into) = into else {
+            *row_count = match &result {
+                StatementResult::Affected(affected) => *affected,
+                StatementResult::Query(query) => query.rows.len() as u64,
+            };
+            return Ok(());
+        };
+        if into.temporary || into.unlogged || into.table {
+            return reject_unsupported("SELECT INTO table is not implemented in PL/pgSQL");
+        }
+        let StatementResult::Query(query) = result else {
+            unreachable!("SELECT returns a query result")
+        };
+        *row_count = u64::from(!query.rows.is_empty());
+        for (index, target) in into.targets.iter().enumerate() {
+            let ast::Expr::Identifier(identifier) = target else {
+                return reject_unsupported("SELECT INTO target is not implemented");
+            };
+            let name = executor::normalize_identifier(identifier);
+            let local = locals.get_mut(&name).ok_or_else(|| {
+                PgError::create(
+                    SqlState::UndefinedColumn,
+                    format!("variable {name:?} does not exist"),
+                )
+            })?;
+            let value = query
+                .rows
+                .first()
+                .and_then(|row| row.get(index))
+                .cloned()
+                .unwrap_or(Value::Null);
+            local.value = if value.is_null() {
+                Value::Null
+            } else {
+                let source = BaseType::resolve_oid(
+                    query
+                        .columns
+                        .get(index)
+                        .expect("a non-NULL SELECT INTO value has column metadata")
+                        .type_oid,
+                )
+                .expect("query results use supported PostgreSQL types");
+                executor::coerce_procedural_value(value, source, local.data_type)?
+            };
+        }
+        Ok(())
+    }
+
+    fn execute_procedural_statements(
+        &mut self,
+        statements: &[ast::PlPgSqlStatement],
+        locals: &mut BTreeMap<String, ProceduralLocal>,
+        row_count: &mut u64,
+        procedural: ProceduralStatementContext,
+    ) -> Result<()> {
+        for statement in statements {
+            match statement {
+                ast::PlPgSqlStatement::Sql(statement) => {
+                    self.execute_procedural_sql(statement, locals, row_count, procedural)?;
+                }
+                ast::PlPgSqlStatement::GetRowCount { target } => {
+                    let name = executor::normalize_identifier(target);
+                    let local = locals.get_mut(&name).ok_or_else(|| {
+                        PgError::create(
+                            SqlState::UndefinedColumn,
+                            format!("variable {name:?} does not exist"),
+                        )
+                    })?;
+                    local.value = executor::coerce_procedural_value(
+                        Value::Int8(*row_count as i64),
+                        BaseType::Int8,
+                        local.data_type,
+                    )?;
+                }
+                ast::PlPgSqlStatement::If {
+                    branches,
+                    else_statements,
+                } => {
+                    let mut selected = None;
+                    for branch in branches {
+                        match self.evaluate_procedural_expression(
+                            &branch.condition,
+                            locals,
+                            procedural,
+                        )? {
+                            Value::Bool(true) => {
+                                selected = Some(branch.statements.as_slice());
+                                break;
+                            }
+                            Value::Bool(false) | Value::Null => {}
+                            _ => {
+                                return Err(PgError::create(
+                                    SqlState::DatatypeMismatch,
+                                    "IF condition must be type boolean",
+                                ));
+                            }
+                        }
+                    }
+                    if let Some(statements) = selected.or(else_statements.as_deref()) {
+                        self.execute_procedural_statements(
+                            statements, locals, row_count, procedural,
+                        )?;
+                    }
+                }
+                ast::PlPgSqlStatement::RaiseException {
+                    format,
+                    arguments,
+                    hint,
+                } => {
+                    let format = format.clone().into_string().ok_or_else(|| {
+                        PgError::create(SqlState::SyntaxError, "RAISE format must be a string")
+                    })?;
+                    let arguments = arguments
+                        .iter()
+                        .map(|argument| {
+                            self.evaluate_procedural_expression(argument, locals, procedural)
+                        })
+                        .collect::<Result<Vec<_>>>()?;
+                    let message = format_procedural_exception(&format, &arguments)?;
+                    let mut error = PgError::create(SqlState::RaiseException, message);
+                    if let Some(hint) = hint {
+                        let hint = self.evaluate_procedural_expression(hint, locals, procedural)?;
+                        if hint.is_null() {
+                            return self.abort_with_error(PgError::create(
+                                SqlState::NullValueNotAllowed,
+                                "RAISE statement option cannot be null",
+                            ));
+                        }
+                        error.hint = Some(hint.format_postgres_text());
+                    }
+                    return self.abort_with_error(error);
+                }
+                ast::PlPgSqlStatement::Assignment { target, value } => {
+                    let [ast::ObjectNamePart::Identifier(identifier)] = target.0.as_slice() else {
+                        return reject_unsupported("DO assignment target is not implemented");
+                    };
+                    let name = executor::normalize_identifier(identifier);
+                    let target_type = locals
+                        .get(&name)
+                        .ok_or_else(|| {
+                            PgError::create(
+                                SqlState::UndefinedColumn,
+                                format!("variable {name:?} does not exist"),
+                            )
+                        })?
+                        .data_type;
+                    let value =
+                        self.coerce_procedural_expression(value, target_type, locals, procedural)?;
+                    locals.get_mut(&name).expect("required local exists").value = value;
+                }
+                ast::PlPgSqlStatement::Return(_) => {
+                    return reject_unsupported("DO statement is not implemented");
+                }
+            }
+        }
+        Ok(())
+    }
+
+    fn execute_do(
+        &mut self,
+        statement: &ast::DoStatement,
+        procedural: ProceduralStatementContext,
+    ) -> Result<StatementResult> {
+        if let Some(language) = &statement.language
+            && !language.value.eq_ignore_ascii_case("plpgsql")
+        {
+            return self.abort_with_error(if language.value.eq_ignore_ascii_case("sql") {
+                PgError::create(
+                    SqlState::FeatureNotSupported,
+                    "language does not support inline code execution",
+                )
+            } else {
+                PgError::create(
+                    SqlState::UndefinedObject,
+                    format!("language {:?} does not exist", language.value),
+                )
+            });
+        }
+        let body = statement.body.clone().into_string().ok_or_else(|| {
+            PgError::create(SqlState::SyntaxError, "DO body must be a string literal")
+        })?;
+        let mut parser = sqlparser::parser::Parser::new(&sqlparser::dialect::PostgreSqlDialect {})
+            .try_with_sql(&body)
+            .map_err(|error| PgError::create(SqlState::SyntaxError, error.to_string()))?;
+        let block = parser
+            .parse_plpgsql()
+            .map_err(|error| PgError::create(SqlState::SyntaxError, error.to_string()))?;
+        validate_procedural_raise_arity(&block.statements)?;
+        let local_names = block
+            .declarations
+            .iter()
+            .map(|declaration| executor::normalize_identifier(&declaration.name))
+            .collect::<BTreeSet<_>>();
+        validate_procedural_targets(&block.statements, &local_names)?;
+        let mut locals = BTreeMap::new();
+        for declaration in block.declarations {
+            let data_type = coercion::convert_ast_data_type(&declaration.data_type)?;
+            if !matches!(data_type.base, BaseType::Int8 | BaseType::Text) {
+                return reject_unsupported("DO variable type is not implemented");
+            }
+            let name = executor::normalize_identifier(&declaration.name);
+            if locals.contains_key(&name) {
+                return Err(PgError::create(
+                    SqlState::SyntaxError,
+                    format!("duplicate declaration of variable {name:?}"),
+                ));
+            }
+            let value = match declaration.initializer {
+                Some(expression) => {
+                    self.coerce_procedural_expression(&expression, data_type, &locals, procedural)?
+                }
+                None => Value::Null,
+            };
+            locals.insert(name, ProceduralLocal { data_type, value });
+        }
+        let mut row_count = 0;
+        self.execute_procedural_statements(
+            &block.statements,
+            &mut locals,
+            &mut row_count,
+            procedural,
+        )?;
+        Ok(StatementResult::Affected(0))
+    }
+
     #[cfg_attr(feature = "execution-log", tracing::instrument(skip_all))]
     pub fn execute(&mut self, sql: &str) -> Result<Vec<StatementResult>> {
         if let Some(result) = self.try_execute_set_constraints(sql) {
@@ -2071,7 +2891,7 @@ impl Session {
             if self.transaction.is_none() {
                 self.start_transaction(self.default_isolation, true);
             }
-            match self.execute_statement(&statement, None, None) {
+            match self.execute_statement(&statement, None, None, None) {
                 Ok(result) => results.push(result),
                 Err(error) => {
                     if self.is_transaction_implicit_batch() {
@@ -2238,7 +3058,9 @@ impl Session {
     pub fn prepare(&mut self, sql: &str) -> Result<PreparedStatement> {
         let mut statements = match parser::parse(sql) {
             Ok(statements) => statements,
-            Err(error) => return self.abort_with_error(error),
+            Err(error) => {
+                return self.abort_with_error(error);
+            }
         };
         if statements.len() != 1 {
             return self.abort_with_error(PgError::create(
@@ -2430,6 +3252,7 @@ impl Session {
             execution_statement,
             prepared_query,
             Some(&statement.catalog_dependencies),
+            None,
         ) {
             Ok(result) => {
                 if started_implicit_transaction && self.is_transaction_implicit_batch() {
@@ -2678,6 +3501,7 @@ impl Session {
         statement: &ast::Statement,
         prepared_query: Option<(&executor::PreparedQueryPlan, &[Value], &[ColumnMeta])>,
         prepared_dependencies: Option<&[PreparedCatalogDependency]>,
+        procedural: Option<ProceduralStatementContext>,
     ) -> Result<StatementResult> {
         match statement {
             ast::Statement::Analyze(_) if !self.db.strict => {
@@ -2924,12 +3748,34 @@ impl Session {
                 "current transaction is aborted",
             ));
         }
+        if let ast::Statement::Do(statement) = statement {
+            let procedural = procedural.unwrap_or_else(|| ProceduralStatementContext {
+                deadline: (self.statement_timeout != Duration::ZERO)
+                    .then(|| Instant::now() + self.statement_timeout),
+                statement_timestamp: self.db.read_clock(),
+            });
+            return match self.execute_do(statement, procedural) {
+                Ok(result) => match check_statement_timeout(procedural.deadline) {
+                    Ok(()) => Ok(result),
+                    Err(error) => self.abort_with_error(error),
+                },
+                Err(error) => self.abort_with_error(error),
+            };
+        }
         let Some(SessionTransactionState::Active(mut transaction)) = self.transaction else {
             unreachable!("transaction must be active while executing a statement")
         };
-        let statement_deadline = (self.statement_timeout != Duration::ZERO)
-            .then(|| Instant::now() + self.statement_timeout);
-        let statement_timestamp = self.db.read_clock();
+        let statement_deadline = procedural.map_or_else(
+            || {
+                (self.statement_timeout != Duration::ZERO)
+                    .then(|| Instant::now() + self.statement_timeout)
+            },
+            |procedural| procedural.deadline,
+        );
+        let statement_timestamp = procedural.map_or_else(
+            || self.db.read_clock(),
+            |procedural| procedural.statement_timestamp,
+        );
         let was_read_only = transaction.read_only;
         transaction.read_only &=
             prepared_query.is_some() || is_plain_read_only_statement(statement);
@@ -2986,7 +3832,7 @@ impl Session {
                         Err(error) => return Some(error),
                     }
                     match state.catalog.require_table_by_id(schema.id) {
-                        Ok(table) if table == schema => None,
+                        Ok(table) if does_prepared_table_match(table, schema) => None,
                         Ok(_) => Some(PgError::create(
                             SqlState::FeatureNotSupported,
                             "cached plan must be replanned",
@@ -3161,6 +4007,19 @@ impl Session {
             deadline: statement_deadline,
             rng: self.db.rng.clone(),
             sequences,
+            source_state: contains_triggered_insert(&state, statement)
+                .then(|| Arc::new(state.clone())),
+            source_snapshot: snapshot,
+            prepared_trigger_inserts: Arc::new(Mutex::new(Default::default())),
+            prepared_trigger_updates: Arc::new(Mutex::new(Default::default())),
+            prepared_mutation_targets: Arc::new(Mutex::new(Default::default())),
+            prepared_cte_results: Arc::new(Mutex::new(Vec::new())),
+            executed_ctes: Arc::new(Mutex::new(Vec::new())),
+            pending_cte_mutations: Arc::new(Mutex::new(Vec::new())),
+            prepared_subquery_results: Arc::new(Mutex::new(Default::default())),
+            prepares_subquery_results: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            trigger_lock_recheck: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            trigger_lock_recheck_locks: Arc::new(Mutex::new(Vec::new())),
         };
         let (contains_cte, contains_subquery) = executor::detect_statement_features(statement);
         let mut acquired_row_locks = false;
@@ -3176,6 +4035,8 @@ impl Session {
                 transaction.isolation,
                 snapshot,
                 &context,
+                &self.deferred_constraints,
+                self.defer_all_constraints,
             ) {
                 Ok(acquired) => acquired,
                 Err(error) => return self.abort_with_error(error),
@@ -3231,6 +4092,8 @@ impl Session {
             transaction.isolation,
             snapshot,
             &context,
+            &self.deferred_constraints,
+            self.defer_all_constraints,
         ) {
             Ok(acquired) => acquired,
             Err(error) => return self.abort_with_error(error),
@@ -3301,6 +4164,37 @@ fn contains_dml(statement: &ast::Statement) -> bool {
                 with.cte_tables
                     .iter()
                     .any(|cte| contains_dml(&ast::Statement::Query(cte.query.clone())))
+            })
+        }
+        _ => false,
+    }
+}
+
+fn contains_triggered_insert(state: &executor::DatabaseState, statement: &ast::Statement) -> bool {
+    match statement {
+        ast::Statement::Insert(insert) => executor::resolve_insert_table_name(&insert.table)
+            .ok()
+            .and_then(|name| state.catalog.require_named_table(&name).ok())
+            .is_some_and(|table| {
+                table.triggers.iter().any(|trigger| {
+                    trigger
+                        .definition
+                        .events
+                        .iter()
+                        .any(|event| matches!(event, ast::TriggerEvent::Insert))
+                })
+            }),
+        ast::Statement::Query(query) => {
+            matches!(
+                query.body.as_ref(),
+                ast::SetExpr::Insert(statement) if contains_triggered_insert(state, statement)
+            ) || query.with.as_ref().is_some_and(|with| {
+                with.cte_tables.iter().any(|cte| {
+                    contains_triggered_insert(
+                        state,
+                        &ast::Statement::Query(Box::new((*cte.query).clone())),
+                    )
+                })
             })
         }
         _ => false,
@@ -3628,6 +4522,13 @@ mod tests {
             SqlState::InvalidParameterValue
         );
         session.execute("ROLLBACK").unwrap();
+        session.execute("BEGIN").unwrap();
+        session.statement_timeout = Duration::from_nanos(1);
+        assert_eq!(
+            session.execute("DO $$ BEGIN END; $$").unwrap_err().sqlstate,
+            SqlState::QueryCanceled
+        );
+        session.execute("ROLLBACK").unwrap();
     }
 
     #[test]
@@ -3865,6 +4766,25 @@ mod tests {
     }
 
     #[test]
+    fn applies_one_statement_deadline_to_a_do_block() {
+        let db = Db::create();
+        let mut session = db.create_session();
+        session.execute("BEGIN").unwrap();
+        session.statement_timeout = Duration::from_nanos(1);
+        assert_eq!(
+            session
+                .execute(
+                    "DO $$ DECLARE value BIGINT := 1; \
+                     BEGIN value := value + 1; END; $$"
+                )
+                .unwrap_err()
+                .sqlstate,
+            SqlState::QueryCanceled
+        );
+        session.execute("ROLLBACK").unwrap();
+    }
+
+    #[test]
     fn acquires_multi_table_lock_sets_atomically() {
         let db = Db::create_builder()
             .set_lock_timeout(Duration::from_secs(2))
@@ -3994,13 +4914,14 @@ mod tests {
         let db = Db::create();
         let mut session = db.create_session();
         session
-            .execute("CREATE TABLE accounts (id INTEGER)")
+            .execute(
+                "CREATE TABLE accounts (id INTEGER); \
+                 CREATE FUNCTION audit_changes() RETURNS TRIGGER AS $$ \
+                 BEGIN RETURN NEW; END; $$ LANGUAGE plpgsql; \
+                 CREATE TRIGGER audit_changes BEFORE INSERT ON accounts \
+                 FOR EACH ROW EXECUTE FUNCTION audit_changes()",
+            )
             .unwrap();
-        db.seed_trigger_catalog_for_test(
-            "CREATE TRIGGER audit_changes BEFORE INSERT ON accounts \
-               FOR EACH ROW EXECUTE FUNCTION audit_changes()",
-        )
-        .unwrap();
         let trigger_id = db
             .state
             .lock()
@@ -4041,11 +4962,8 @@ mod tests {
             SqlState::UndefinedObject
         );
         assert_eq!(
-            session
-                .execute("INSERT INTO accounts VALUES (1)")
-                .unwrap_err()
-                .sqlstate,
-            SqlState::FeatureNotSupported
+            session.execute("INSERT INTO accounts VALUES (1)").unwrap(),
+            create_affected_results(1)
         );
     }
 
@@ -7112,6 +8030,2365 @@ mod tests {
     }
 
     #[test]
+    fn locks_conflicts_after_before_insert_triggers() {
+        let db = Db::create_builder()
+            .set_lock_timeout(Duration::from_secs(2))
+            .build();
+        let mut holder = db.create_session();
+        let mut writer = db.create_session();
+        holder
+            .execute(
+                r#"
+                CREATE TABLE triggered_conflicts (
+                    id INTEGER PRIMARY KEY,
+                    action TEXT NOT NULL
+                );
+                CREATE FUNCTION rewrite_conflict_key() RETURNS TRIGGER AS $$
+                BEGIN
+                    IF NEW.action = 'skip' THEN
+                        RETURN NULL;
+                    ELSIF NEW.action = 'conflict' THEN
+                        NEW.id := 1;
+                    END IF;
+                    RETURN NEW;
+                END;
+                $$ LANGUAGE plpgsql;
+                CREATE TRIGGER rewrite_conflict_key BEFORE INSERT ON triggered_conflicts
+                    FOR EACH ROW EXECUTE FUNCTION rewrite_conflict_key();
+                "#,
+            )
+            .unwrap();
+        holder.execute("BEGIN").unwrap();
+        holder
+            .execute("INSERT INTO triggered_conflicts VALUES (1, 'held')")
+            .unwrap();
+
+        assert_eq!(
+            writer
+                .execute(
+                    "INSERT INTO triggered_conflicts VALUES (2, 'keep') \
+                     ON CONFLICT (id) DO NOTHING",
+                )
+                .unwrap(),
+            create_affected_results(1)
+        );
+        assert_eq!(
+            writer
+                .execute(
+                    "INSERT INTO triggered_conflicts VALUES (3, 'skip') \
+                     ON CONFLICT (id) DO NOTHING",
+                )
+                .unwrap(),
+            create_affected_results(0)
+        );
+
+        let (sender, receiver) = mpsc::channel();
+        let handle = thread::spawn(move || {
+            sender
+                .send(writer.execute(
+                    "INSERT INTO triggered_conflicts VALUES (4, 'conflict') \
+                     ON CONFLICT (id) DO NOTHING",
+                ))
+                .unwrap();
+        });
+        wait_until_blocked(&db);
+        holder.execute("COMMIT").unwrap();
+        assert_eq!(
+            receiver.recv_timeout(Duration::from_secs(1)).unwrap(),
+            Ok(create_affected_results(0))
+        );
+        handle.join().unwrap();
+    }
+
+    #[test]
+    fn preserves_before_insert_values_across_conflict_waits() {
+        for commits in [true, false] {
+            let db = Db::create_builder()
+                .set_lock_timeout(Duration::from_secs(2))
+                .build();
+            let mut holder = db.create_session();
+            let mut writer = db.create_session();
+            let mut observer = db.create_session();
+            holder
+                .execute(
+                    r#"
+                    CREATE SEQUENCE waited_trigger_values;
+                    CREATE TABLE waited_trigger_rows (
+                        id BIGINT PRIMARY KEY,
+                        value BIGINT NOT NULL
+                    );
+                    INSERT INTO waited_trigger_rows VALUES (1, 0);
+                    CREATE FUNCTION allocate_waited_trigger_value() RETURNS TRIGGER AS $$
+                    BEGIN NEW.value := nextval('waited_trigger_values'); RETURN NEW; END;
+                    $$ LANGUAGE plpgsql;
+                    CREATE TRIGGER allocate_waited_trigger_value
+                        BEFORE INSERT ON waited_trigger_rows
+                        FOR EACH ROW EXECUTE FUNCTION allocate_waited_trigger_value();
+                    "#,
+                )
+                .unwrap();
+            holder.execute("BEGIN").unwrap();
+            holder
+                .execute("UPDATE waited_trigger_rows SET value = 10 WHERE id = 1")
+                .unwrap();
+
+            let (sender, receiver) = mpsc::channel();
+            let handle = thread::spawn(move || {
+                sender
+                    .send(writer.query(
+                        "INSERT INTO waited_trigger_rows VALUES (1, 0) \
+                         ON CONFLICT (id) DO UPDATE SET value = excluded.value \
+                         RETURNING value",
+                        &[],
+                    ))
+                    .unwrap();
+            });
+            wait_until_blocked(&db);
+            assert_eq!(
+                observer
+                    .query("SELECT nextval('waited_trigger_values')", &[])
+                    .unwrap()
+                    .rows,
+                vec![vec![Value::Int8(2)]]
+            );
+            holder
+                .execute(if commits { "COMMIT" } else { "ROLLBACK" })
+                .unwrap();
+            assert_eq!(
+                receiver
+                    .recv_timeout(Duration::from_secs(1))
+                    .unwrap()
+                    .unwrap()
+                    .rows,
+                vec![vec![Value::Int8(1)]]
+            );
+            handle.join().unwrap();
+            assert_eq!(
+                observer
+                    .query("SELECT value FROM waited_trigger_rows", &[])
+                    .unwrap()
+                    .rows,
+                vec![vec![Value::Int8(1)]]
+            );
+        }
+    }
+
+    #[test]
+    fn preserves_before_insert_values_across_select_conflict_waits() {
+        for commits in [true, false] {
+            let db = Db::create_builder()
+                .set_lock_timeout(Duration::from_secs(2))
+                .build();
+            let mut holder = db.create_session();
+            let mut writer = db.create_session();
+            let mut observer = db.create_session();
+            holder
+                .execute(
+                    r#"
+                    CREATE SEQUENCE waited_select_trigger_values;
+                    CREATE TABLE waited_select_trigger_rows (
+                        id BIGINT PRIMARY KEY,
+                        value BIGINT NOT NULL
+                    );
+                    INSERT INTO waited_select_trigger_rows VALUES (1, 0);
+                    CREATE FUNCTION allocate_waited_select_trigger_value() RETURNS TRIGGER AS $$
+                    BEGIN NEW.value := nextval('waited_select_trigger_values'); RETURN NEW; END;
+                    $$ LANGUAGE plpgsql;
+                    CREATE TRIGGER allocate_waited_select_trigger_value
+                        BEFORE INSERT ON waited_select_trigger_rows
+                        FOR EACH ROW EXECUTE FUNCTION allocate_waited_select_trigger_value();
+                    "#,
+                )
+                .unwrap();
+            holder.execute("BEGIN").unwrap();
+            holder
+                .execute("UPDATE waited_select_trigger_rows SET value = 10 WHERE id = 1")
+                .unwrap();
+
+            let (sender, receiver) = mpsc::channel();
+            let handle = thread::spawn(move || {
+                sender
+                    .send(writer.query(
+                        "INSERT INTO waited_select_trigger_rows \
+                         SELECT nextval('waited_select_trigger_values') * 0 + 1, 0 WHERE TRUE \
+                         ON CONFLICT (id) DO UPDATE SET value = excluded.value \
+                         RETURNING value, nextval('waited_select_trigger_values')",
+                        &[],
+                    ))
+                    .unwrap();
+            });
+            wait_until_blocked(&db);
+            assert_eq!(
+                observer
+                    .query("SELECT nextval('waited_select_trigger_values')", &[])
+                    .unwrap()
+                    .rows,
+                vec![vec![Value::Int8(3)]]
+            );
+            holder
+                .execute(if commits { "COMMIT" } else { "ROLLBACK" })
+                .unwrap();
+            assert_eq!(
+                receiver
+                    .recv_timeout(Duration::from_secs(1))
+                    .unwrap()
+                    .unwrap()
+                    .rows,
+                vec![vec![Value::Int8(2), Value::Int8(4)]]
+            );
+            handle.join().unwrap();
+        }
+    }
+
+    #[test]
+    fn preserves_insert_select_offset_and_source_snapshot() {
+        let db = Db::create_builder()
+            .set_lock_timeout(Duration::from_secs(2))
+            .build();
+        let mut session = db.create_session();
+        session
+            .execute(
+                r#"
+                CREATE SEQUENCE offset_projection_values;
+                CREATE TABLE offset_projection_source (id BIGINT PRIMARY KEY);
+                CREATE TABLE offset_projection_rows (id BIGINT, value BIGINT);
+                INSERT INTO offset_projection_source VALUES (1), (2), (3);
+                CREATE FUNCTION preserve_insert_select_row() RETURNS TRIGGER AS $$
+                BEGIN RETURN NEW; END;
+                $$ LANGUAGE plpgsql;
+                CREATE TRIGGER preserve_offset_projection_row
+                    BEFORE INSERT ON offset_projection_rows
+                    FOR EACH ROW EXECUTE FUNCTION preserve_insert_select_row();
+                "#,
+            )
+            .unwrap();
+        assert!(
+            session
+                .query(
+                    "INSERT INTO offset_projection_rows \
+                     SELECT id, nextval('offset_projection_values') \
+                     FROM offset_projection_source LIMIT 0 OFFSET 1 \
+                     RETURNING id, value",
+                    &[],
+                )
+                .unwrap()
+                .rows
+                .is_empty()
+        );
+        assert_eq!(
+            session
+                .query("SELECT nextval('offset_projection_values')", &[])
+                .unwrap()
+                .rows,
+            vec![vec![Value::Int8(1)]]
+        );
+        session
+            .execute("SELECT setval('offset_projection_values', 1, false)")
+            .unwrap();
+        assert_eq!(
+            session
+                .query(
+                    "INSERT INTO offset_projection_rows \
+                     SELECT id, nextval('offset_projection_values') \
+                     FROM offset_projection_source OFFSET 1 \
+                     RETURNING id, value, nextval('offset_projection_values')",
+                    &[],
+                )
+                .unwrap()
+                .rows,
+            vec![
+                vec![Value::Int8(2), Value::Int8(2), Value::Int8(3)],
+                vec![Value::Int8(3), Value::Int8(4), Value::Int8(5)],
+            ]
+        );
+        assert_eq!(
+            session
+                .query("SELECT nextval('offset_projection_values')", &[])
+                .unwrap()
+                .rows,
+            vec![vec![Value::Int8(6)]]
+        );
+
+        session
+            .execute(
+                r#"
+                CREATE SEQUENCE snapshot_trigger_values;
+                CREATE TABLE snapshot_trigger_source (id BIGINT PRIMARY KEY);
+                CREATE TABLE snapshot_trigger_rows (
+                    id BIGINT PRIMARY KEY,
+                    value BIGINT NOT NULL
+                );
+                INSERT INTO snapshot_trigger_source VALUES (1), (2), (3);
+                INSERT INTO snapshot_trigger_rows VALUES (1, 0);
+                CREATE FUNCTION allocate_snapshot_trigger_value() RETURNS TRIGGER AS $$
+                BEGIN NEW.value := nextval('snapshot_trigger_values'); RETURN NEW; END;
+                $$ LANGUAGE plpgsql;
+                CREATE TRIGGER allocate_snapshot_trigger_value
+                    BEFORE INSERT ON snapshot_trigger_rows
+                    FOR EACH ROW EXECUTE FUNCTION allocate_snapshot_trigger_value();
+                "#,
+            )
+            .unwrap();
+        let mut holder = db.create_session();
+        let mut writer = db.create_session();
+        holder.execute("BEGIN").unwrap();
+        holder
+            .execute("UPDATE snapshot_trigger_rows SET value = 10 WHERE id = 1")
+            .unwrap();
+        holder
+            .execute("DELETE FROM snapshot_trigger_source WHERE id = 1")
+            .unwrap();
+        let (sender, receiver) = mpsc::channel();
+        let handle = thread::spawn(move || {
+            sender
+                .send(writer.query(
+                    "INSERT INTO snapshot_trigger_rows \
+                     SELECT id, 0 FROM snapshot_trigger_source WHERE TRUE \
+                     ON CONFLICT (id) DO UPDATE SET value = excluded.value \
+                     RETURNING id, value, nextval('snapshot_trigger_values')",
+                    &[],
+                ))
+                .unwrap();
+        });
+        wait_until_blocked(&db);
+        assert_eq!(
+            session
+                .query("SELECT nextval('snapshot_trigger_values')", &[])
+                .unwrap()
+                .rows,
+            vec![vec![Value::Int8(2)]]
+        );
+        holder.execute("COMMIT").unwrap();
+        assert_eq!(
+            receiver
+                .recv_timeout(Duration::from_secs(1))
+                .unwrap()
+                .unwrap()
+                .rows,
+            vec![
+                vec![Value::Int8(1), Value::Int8(1), Value::Int8(3)],
+                vec![Value::Int8(2), Value::Int8(4), Value::Int8(5)],
+                vec![Value::Int8(3), Value::Int8(6), Value::Int8(7)],
+            ]
+        );
+        handle.join().unwrap();
+    }
+
+    #[test]
+    fn preserves_statement_source_snapshot_across_insert_ctes() {
+        let db = Db::create_builder()
+            .set_lock_timeout(Duration::from_secs(2))
+            .build();
+        let mut setup = db.create_session();
+        let mut holder = db.create_session();
+        let mut writer = db.create_session();
+        setup
+            .execute(
+                r#"
+                CREATE TABLE cte_snapshot_source (id BIGINT PRIMARY KEY);
+                CREATE TABLE cte_snapshot_rows (id BIGINT PRIMARY KEY, value BIGINT);
+                INSERT INTO cte_snapshot_source VALUES (1), (2), (3);
+                INSERT INTO cte_snapshot_rows VALUES (1, 0);
+                CREATE FUNCTION preserve_cte_snapshot_row() RETURNS TRIGGER AS $$
+                BEGIN RETURN NEW; END;
+                $$ LANGUAGE plpgsql;
+                CREATE TRIGGER preserve_cte_snapshot_row
+                    BEFORE INSERT ON cte_snapshot_rows
+                    FOR EACH ROW EXECUTE FUNCTION preserve_cte_snapshot_row();
+                "#,
+            )
+            .unwrap();
+        holder.execute("BEGIN").unwrap();
+        holder
+            .execute("UPDATE cte_snapshot_rows SET value = 10 WHERE id = 1")
+            .unwrap();
+
+        let (sender, receiver) = mpsc::channel();
+        let handle = thread::spawn(move || {
+            sender
+                .send(writer.query(
+                    "WITH first_insert AS (\
+                         INSERT INTO cte_snapshot_rows VALUES (1, 0) \
+                         ON CONFLICT (id) DO UPDATE SET value = excluded.value \
+                         RETURNING id\
+                     ), later_insert AS (\
+                         INSERT INTO cte_snapshot_rows \
+                         SELECT id + 10, 0 FROM cte_snapshot_source \
+                         RETURNING id\
+                     ) \
+                     SELECT first_insert.id, later_insert.id \
+                     FROM first_insert CROSS JOIN later_insert \
+                     ORDER BY later_insert.id",
+                    &[],
+                ))
+                .unwrap();
+        });
+        wait_until_blocked(&db);
+        holder
+            .execute("INSERT INTO cte_snapshot_source VALUES (4)")
+            .unwrap();
+        holder.execute("COMMIT").unwrap();
+        assert_eq!(
+            receiver
+                .recv_timeout(Duration::from_secs(1))
+                .unwrap()
+                .unwrap()
+                .rows,
+            vec![
+                vec![Value::Int8(1), Value::Int8(11)],
+                vec![Value::Int8(1), Value::Int8(12)],
+                vec![Value::Int8(1), Value::Int8(13)],
+            ]
+        );
+        handle.join().unwrap();
+    }
+
+    #[test]
+    fn preserves_before_insert_values_across_materialized_select_waits() {
+        for source in [
+            "SELECT id, 0 FROM materialized_trigger_source ORDER BY id",
+            "SELECT DISTINCT id, 0 FROM materialized_trigger_source",
+            "SELECT max(id), 0 FROM materialized_trigger_source",
+            "SELECT id, 0 FROM materialized_trigger_source WHERE abs(id) = 1",
+        ] {
+            for commits in [true, false] {
+                let db = Db::create_builder()
+                    .set_lock_timeout(Duration::from_secs(2))
+                    .build();
+                let mut holder = db.create_session();
+                let mut writer = db.create_session();
+                let mut observer = db.create_session();
+                holder
+                    .execute(
+                        r#"
+                        CREATE SEQUENCE materialized_trigger_values;
+                        CREATE TABLE materialized_trigger_source (id BIGINT);
+                        CREATE TABLE materialized_trigger_rows (
+                            id BIGINT PRIMARY KEY,
+                            value BIGINT NOT NULL
+                        );
+                        INSERT INTO materialized_trigger_source VALUES (1);
+                        INSERT INTO materialized_trigger_rows VALUES (1, 0);
+                        CREATE FUNCTION allocate_materialized_trigger_value() RETURNS TRIGGER AS $$
+                        BEGIN
+                            NEW.value := nextval('materialized_trigger_values');
+                            RETURN NEW;
+                        END;
+                        $$ LANGUAGE plpgsql;
+                        CREATE TRIGGER allocate_materialized_trigger_value
+                            BEFORE INSERT ON materialized_trigger_rows
+                            FOR EACH ROW EXECUTE FUNCTION allocate_materialized_trigger_value();
+                        "#,
+                    )
+                    .unwrap();
+                holder.execute("BEGIN").unwrap();
+                holder
+                    .execute("UPDATE materialized_trigger_rows SET value = 10 WHERE id = 1")
+                    .unwrap();
+
+                let query = format!(
+                    "INSERT INTO materialized_trigger_rows {source} \
+                     ON CONFLICT (id) DO UPDATE SET value = excluded.value \
+                     RETURNING value"
+                );
+                let (sender, receiver) = mpsc::channel();
+                let handle = thread::spawn(move || {
+                    sender.send(writer.query(&query, &[])).unwrap();
+                });
+                wait_until_blocked(&db);
+                assert_eq!(
+                    observer
+                        .query("SELECT nextval('materialized_trigger_values')", &[])
+                        .unwrap()
+                        .rows,
+                    vec![vec![Value::Int8(2)]],
+                    "source: {source}, commits: {commits}"
+                );
+                holder
+                    .execute(if commits { "COMMIT" } else { "ROLLBACK" })
+                    .unwrap();
+                assert_eq!(
+                    receiver
+                        .recv_timeout(Duration::from_secs(1))
+                        .unwrap()
+                        .unwrap()
+                        .rows,
+                    vec![vec![Value::Int8(1)]],
+                    "source: {source}, commits: {commits}"
+                );
+                handle.join().unwrap();
+            }
+        }
+    }
+
+    #[test]
+    fn resumes_volatile_insert_select_stream_state() {
+        let cases = [
+            (
+                "SELECT DISTINCT id, 0 FROM stream_resume_source ORDER BY id",
+                "(1), (2)",
+                2,
+                vec![
+                    vec![Value::Int8(1), Value::Int8(1), Value::Int8(3)],
+                    vec![Value::Int8(2), Value::Int8(4), Value::Int8(5)],
+                ],
+            ),
+            (
+                "SELECT id, max(id) * 0 FROM stream_resume_source GROUP BY id ORDER BY id",
+                "(1), (2)",
+                2,
+                vec![
+                    vec![Value::Int8(1), Value::Int8(1), Value::Int8(3)],
+                    vec![Value::Int8(2), Value::Int8(4), Value::Int8(5)],
+                ],
+            ),
+            (
+                "SELECT id, nextval('stream_resume_values') \
+                 FROM stream_resume_source GROUP BY id ORDER BY id",
+                "(1), (2)",
+                3,
+                vec![
+                    vec![Value::Int8(1), Value::Int8(2), Value::Int8(4)],
+                    vec![Value::Int8(2), Value::Int8(6), Value::Int8(7)],
+                ],
+            ),
+            (
+                "SELECT id, nextval('stream_resume_values') \
+                 FROM stream_resume_source WHERE id = 1 \
+                 UNION ALL \
+                 SELECT id, nextval('stream_resume_values') \
+                 FROM stream_resume_source WHERE id = 2",
+                "(1), (2)",
+                3,
+                vec![
+                    vec![Value::Int8(1), Value::Int8(2), Value::Int8(4)],
+                    vec![Value::Int8(2), Value::Int8(6), Value::Int8(7)],
+                ],
+            ),
+            (
+                "SELECT id, nextval('stream_resume_values') \
+                 FROM stream_resume_source WHERE id = 1 \
+                 UNION ALL \
+                 SELECT id, nextval('stream_resume_values') \
+                 FROM stream_resume_source WHERE id = 2 \
+                 UNION ALL \
+                 SELECT id + 2, nextval('stream_resume_values') \
+                 FROM stream_resume_source WHERE id = 1",
+                "(1), (2)",
+                3,
+                vec![
+                    vec![Value::Int8(1), Value::Int8(2), Value::Int8(4)],
+                    vec![Value::Int8(2), Value::Int8(6), Value::Int8(7)],
+                    vec![Value::Int8(3), Value::Int8(9), Value::Int8(10)],
+                ],
+            ),
+            (
+                "((SELECT id, nextval('stream_resume_values') \
+                    FROM stream_resume_source WHERE id = 1 LIMIT 1) \
+                  UNION ALL \
+                  SELECT id, nextval('stream_resume_values') \
+                  FROM stream_resume_source WHERE id = 2) \
+                 UNION ALL \
+                 SELECT id + 2, nextval('stream_resume_values') \
+                 FROM stream_resume_source WHERE id = 1",
+                "(1), (2)",
+                3,
+                vec![
+                    vec![Value::Int8(1), Value::Int8(2), Value::Int8(4)],
+                    vec![Value::Int8(2), Value::Int8(6), Value::Int8(7)],
+                    vec![Value::Int8(3), Value::Int8(9), Value::Int8(10)],
+                ],
+            ),
+            (
+                "SELECT id, nextval('stream_resume_values') \
+                 FROM stream_resume_source WHERE id = 1 \
+                 UNION ALL (\
+                     SELECT id, nextval('stream_resume_values') \
+                     FROM stream_resume_source WHERE id = 2 \
+                     UNION ALL \
+                     SELECT id + 2, nextval('stream_resume_values') \
+                     FROM stream_resume_source WHERE id = 1 \
+                     LIMIT 2\
+                 )",
+                "(1), (2)",
+                3,
+                vec![
+                    vec![Value::Int8(1), Value::Int8(2), Value::Int8(4)],
+                    vec![Value::Int8(2), Value::Int8(6), Value::Int8(7)],
+                    vec![Value::Int8(3), Value::Int8(9), Value::Int8(10)],
+                ],
+            ),
+            (
+                "SELECT id, nextval('stream_resume_values') \
+                 FROM stream_resume_source WHERE id = 1 \
+                 UNION ALL (\
+                     SELECT id, nextval('stream_resume_values') \
+                     FROM stream_resume_source WHERE id = 2 \
+                     UNION ALL \
+                     SELECT id + 2, nextval('stream_resume_values') \
+                     FROM stream_resume_source WHERE id = 1 \
+                     OFFSET 0\
+                 )",
+                "(1), (2)",
+                3,
+                vec![
+                    vec![Value::Int8(1), Value::Int8(2), Value::Int8(4)],
+                    vec![Value::Int8(2), Value::Int8(6), Value::Int8(7)],
+                    vec![Value::Int8(3), Value::Int8(9), Value::Int8(10)],
+                ],
+            ),
+            (
+                "SELECT id, nextval('stream_resume_values') \
+                 FROM stream_resume_source WHERE id = 1 \
+                 UNION ALL (\
+                     SELECT id, nextval('stream_resume_values') \
+                     FROM stream_resume_source WHERE id = 2 \
+                     UNION ALL \
+                     SELECT id + 2, nextval('stream_resume_values') \
+                     FROM stream_resume_source WHERE id = 1\
+                 )",
+                "(1), (2)",
+                3,
+                vec![
+                    vec![Value::Int8(1), Value::Int8(2), Value::Int8(4)],
+                    vec![Value::Int8(2), Value::Int8(6), Value::Int8(7)],
+                    vec![Value::Int8(3), Value::Int8(9), Value::Int8(10)],
+                ],
+            ),
+            (
+                "SELECT id, nextval('stream_resume_values') \
+                 FROM stream_resume_source WHERE id = 1 \
+                 UNION ALL (\
+                     SELECT id, nextval('stream_resume_values') \
+                     FROM stream_resume_source WHERE id = 2 \
+                     UNION ALL \
+                     SELECT id + 2, nextval('stream_resume_values') \
+                     FROM stream_resume_source WHERE id = 1 \
+                     ORDER BY id\
+                 )",
+                "(1), (2)",
+                3,
+                vec![
+                    vec![Value::Int8(1), Value::Int8(2), Value::Int8(4)],
+                    vec![Value::Int8(2), Value::Int8(7), Value::Int8(8)],
+                    vec![Value::Int8(3), Value::Int8(9), Value::Int8(10)],
+                ],
+            ),
+            (
+                "SELECT id, nextval('stream_resume_values') \
+                 FROM stream_resume_source ORDER BY 2",
+                "(1), (2)",
+                4,
+                vec![
+                    vec![Value::Int8(1), Value::Int8(3), Value::Int8(5)],
+                    vec![Value::Int8(2), Value::Int8(6), Value::Int8(7)],
+                ],
+            ),
+            (
+                "SELECT id, 0 FROM stream_resume_source WHERE id = 1 \
+                 UNION ALL \
+                 SELECT id + 1, 1 / (2 - id) FROM stream_resume_source \
+                 LIMIT 2",
+                "(1), (2)",
+                2,
+                vec![
+                    vec![Value::Int8(1), Value::Int8(1), Value::Int8(3)],
+                    vec![Value::Int8(2), Value::Int8(4), Value::Int8(5)],
+                ],
+            ),
+            (
+                "SELECT id, 0 FROM stream_resume_source \
+                 WHERE nextval('stream_resume_values') > 0",
+                "(1), (2)",
+                3,
+                vec![
+                    vec![Value::Int8(1), Value::Int8(2), Value::Int8(4)],
+                    vec![Value::Int8(2), Value::Int8(6), Value::Int8(7)],
+                ],
+            ),
+            (
+                "SELECT id, nextval('stream_resume_values') \
+                 FROM stream_resume_source ORDER BY id LIMIT 2 OFFSET 1",
+                "(0), (1), (2), (3), (4)",
+                4,
+                vec![
+                    vec![Value::Int8(1), Value::Int8(3), Value::Int8(5)],
+                    vec![Value::Int8(2), Value::Int8(7), Value::Int8(8)],
+                ],
+            ),
+        ];
+        for (source, source_values, observed, expected) in cases {
+            for commits in [true, false] {
+                let db = Db::create_builder()
+                    .set_lock_timeout(Duration::from_secs(2))
+                    .build();
+                let mut holder = db.create_session();
+                let mut writer = db.create_session();
+                let mut observer = db.create_session();
+                holder
+                    .execute(&format!(
+                        r#"
+                        CREATE SEQUENCE stream_resume_values;
+                        CREATE TABLE stream_resume_source (id BIGINT);
+                        CREATE TABLE stream_resume_rows (
+                            id BIGINT PRIMARY KEY,
+                            value BIGINT NOT NULL
+                        );
+                        INSERT INTO stream_resume_source VALUES {source_values};
+                        INSERT INTO stream_resume_rows VALUES (1, 0);
+                        CREATE FUNCTION allocate_stream_resume_value() RETURNS TRIGGER AS $$
+                        BEGIN
+                            NEW.value := nextval('stream_resume_values');
+                            RETURN NEW;
+                        END;
+                        $$ LANGUAGE plpgsql;
+                        CREATE TRIGGER allocate_stream_resume_value
+                            BEFORE INSERT ON stream_resume_rows
+                            FOR EACH ROW EXECUTE FUNCTION allocate_stream_resume_value();
+                        "#
+                    ))
+                    .unwrap();
+                holder.execute("BEGIN").unwrap();
+                holder
+                    .execute("UPDATE stream_resume_rows SET value = 10 WHERE id = 1")
+                    .unwrap();
+
+                let query = format!(
+                    "INSERT INTO stream_resume_rows {source} \
+                     ON CONFLICT (id) DO UPDATE SET value = excluded.value \
+                     RETURNING id, value, nextval('stream_resume_values')"
+                );
+                let (sender, receiver) = mpsc::channel();
+                let handle = thread::spawn(move || {
+                    sender.send(writer.query(&query, &[])).unwrap();
+                });
+                wait_until_blocked(&db);
+                assert_eq!(
+                    observer
+                        .query("SELECT nextval('stream_resume_values')", &[])
+                        .unwrap()
+                        .rows,
+                    vec![vec![Value::Int8(observed)]],
+                    "source: {source}, commits: {commits}"
+                );
+                holder
+                    .execute(if commits { "COMMIT" } else { "ROLLBACK" })
+                    .unwrap();
+                assert_eq!(
+                    receiver
+                        .recv_timeout(Duration::from_secs(1))
+                        .unwrap()
+                        .unwrap()
+                        .rows,
+                    expected,
+                    "source: {source}, commits: {commits}"
+                );
+                handle.join().unwrap();
+            }
+        }
+    }
+
+    #[test]
+    fn evaluates_immutable_ordered_insert_projections_before_trigger_waits() {
+        for (projection, groupings) in [
+            ("1 / (2 - id)", &["", " GROUP BY id"][..]),
+            (
+                "CASE WHEN FALSE THEN nextval('ordered_error_values') ELSE 1 / (2 - id) END",
+                &[""][..],
+            ),
+            (
+                "(CASE WHEN FALSE THEN nextval('ordered_error_values') ELSE 1 / (2 - id) END) + 0",
+                &[""][..],
+            ),
+            (
+                "CAST(CASE WHEN FALSE THEN nextval('ordered_error_values') ELSE 1 / (2 - id) END AS BIGINT)",
+                &[""][..],
+            ),
+            (
+                "(CASE WHEN FALSE THEN nextval('ordered_error_values') WHEN id = 1 THEN 1 ELSE 1 / (2 - id) END) + 0",
+                &[""][..],
+            ),
+        ] {
+            for grouping in groupings {
+                let db = Db::create_builder()
+                    .set_lock_timeout(Duration::from_secs(2))
+                    .build();
+                let mut setup = db.create_session();
+                let mut holder = db.create_session();
+                let mut writer = db.create_session();
+                setup
+                    .execute(
+                        r#"
+                    CREATE SEQUENCE ordered_error_values;
+                    CREATE TABLE ordered_error_source (id BIGINT);
+                    CREATE TABLE ordered_error_rows (
+                        id BIGINT PRIMARY KEY,
+                        value BIGINT NOT NULL
+                    );
+                    INSERT INTO ordered_error_source VALUES (1), (2);
+                    INSERT INTO ordered_error_rows VALUES (1, 0);
+                    CREATE FUNCTION allocate_ordered_error_value() RETURNS TRIGGER AS $$
+                    BEGIN
+                        NEW.value := nextval('ordered_error_values');
+                        RETURN NEW;
+                    END;
+                    $$ LANGUAGE plpgsql;
+                    CREATE TRIGGER allocate_ordered_error_value
+                        BEFORE INSERT ON ordered_error_rows
+                        FOR EACH ROW EXECUTE FUNCTION allocate_ordered_error_value();
+                    "#,
+                    )
+                    .unwrap();
+                holder.execute("BEGIN").unwrap();
+                holder
+                    .execute("UPDATE ordered_error_rows SET value = 10 WHERE id = 1")
+                    .unwrap();
+
+                let query = format!(
+                    "INSERT INTO ordered_error_rows \
+                 SELECT id, {projection} FROM ordered_error_source{grouping} ORDER BY id \
+                 ON CONFLICT (id) DO UPDATE SET value = excluded.value \
+                 RETURNING id, value, nextval('ordered_error_values')"
+                );
+                let (sender, receiver) = mpsc::channel();
+                let handle = thread::spawn(move || {
+                    sender.send(writer.execute(&query)).unwrap();
+                });
+                assert_eq!(
+                    receiver
+                        .recv_timeout(Duration::from_secs(1))
+                        .unwrap()
+                        .unwrap_err()
+                        .sqlstate,
+                    SqlState::DivisionByZero,
+                    "grouping: {grouping:?}"
+                );
+                holder.execute("ROLLBACK").unwrap();
+                handle.join().unwrap();
+                assert_eq!(
+                    setup
+                        .query("SELECT nextval('ordered_error_values')", &[])
+                        .unwrap()
+                        .rows,
+                    vec![vec![Value::Int8(1)]],
+                    "projection: {projection}, grouping: {grouping:?}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn interleaves_group_having_and_volatile_order_projections() {
+        for source_values in ["(1), (2)", "(2), (1)"] {
+            let db = Db::create();
+            let mut session = db.create_session();
+            session
+                .execute(&format!(
+                    r#"
+                CREATE SEQUENCE grouped_having_values;
+                CREATE TABLE grouped_having_source (id BIGINT);
+                CREATE TABLE grouped_having_rows (
+                    id BIGINT PRIMARY KEY,
+                    value BIGINT NOT NULL
+                );
+                INSERT INTO grouped_having_source VALUES {source_values};
+                INSERT INTO grouped_having_rows VALUES (1, 0);
+                CREATE FUNCTION allocate_grouped_having_value() RETURNS TRIGGER AS $$
+                BEGIN
+                    NEW.value := nextval('grouped_having_values');
+                    RETURN NEW;
+                END;
+                $$ LANGUAGE plpgsql;
+                CREATE TRIGGER allocate_grouped_having_value
+                    BEFORE INSERT ON grouped_having_rows
+                    FOR EACH ROW EXECUTE FUNCTION allocate_grouped_having_value();
+                "#
+                ))
+                .unwrap();
+            assert_eq!(
+                session
+                    .query(
+                        "INSERT INTO grouped_having_rows \
+                     SELECT id, nextval('grouped_having_values') AS z \
+                     FROM grouped_having_source GROUP BY id \
+                     HAVING nextval('grouped_having_values') % 2 = 1 \
+                     ORDER BY z \
+                     ON CONFLICT (id) DO UPDATE SET value = excluded.value \
+                     RETURNING id, value, nextval('grouped_having_values')",
+                        &[],
+                    )
+                    .unwrap()
+                    .rows,
+                vec![
+                    vec![Value::Int8(2), Value::Int8(5), Value::Int8(6)],
+                    vec![Value::Int8(1), Value::Int8(7), Value::Int8(8)],
+                ],
+                "source values: {source_values}"
+            );
+        }
+    }
+
+    #[test]
+    fn visits_integer_groups_in_postgres_hash_table_order() {
+        let db = Db::create();
+        let mut session = db.create_session();
+        session
+            .execute(
+                r#"
+                CREATE SEQUENCE group_hash_values;
+                CREATE TABLE group_hash_source (id BIGINT);
+                CREATE TABLE group_hash_rows (id BIGINT PRIMARY KEY, value BIGINT NOT NULL);
+                INSERT INTO group_hash_source VALUES (1), (2), (3), (4);
+                INSERT INTO group_hash_rows VALUES (1, 0);
+                CREATE FUNCTION allocate_group_hash_value() RETURNS TRIGGER AS $$
+                BEGIN
+                    NEW.value := nextval('group_hash_values');
+                    RETURN NEW;
+                END;
+                $$ LANGUAGE plpgsql;
+                CREATE TRIGGER allocate_group_hash_value
+                    BEFORE INSERT ON group_hash_rows
+                    FOR EACH ROW EXECUTE FUNCTION allocate_group_hash_value();
+                "#,
+            )
+            .unwrap();
+
+        assert_eq!(
+            session
+                .query(
+                    "INSERT INTO group_hash_rows \
+                     SELECT id, nextval('group_hash_values') AS z \
+                     FROM group_hash_source GROUP BY id \
+                     HAVING nextval('group_hash_values') % 2 = 1 \
+                     ORDER BY z \
+                     ON CONFLICT (id) DO UPDATE SET value = excluded.value \
+                     RETURNING id, value, nextval('group_hash_values')",
+                    &[],
+                )
+                .unwrap()
+                .rows,
+            vec![
+                vec![Value::Int8(3), Value::Int8(9), Value::Int8(10)],
+                vec![Value::Int8(4), Value::Int8(11), Value::Int8(12)],
+                vec![Value::Int8(2), Value::Int8(13), Value::Int8(14)],
+                vec![Value::Int8(1), Value::Int8(15), Value::Int8(16)],
+            ]
+        );
+    }
+
+    #[test]
+    fn evaluates_aggregate_inputs_in_source_row_order() {
+        for (source, expected_rows, next_value) in [
+            (
+                "(1), (2)",
+                vec![
+                    vec![Value::Int8(1), Value::Int8(1)],
+                    vec![Value::Int8(2), Value::Int8(2)],
+                ],
+                3,
+            ),
+            (
+                "(1), (2), (1)",
+                vec![vec![Value::Int8(1), Value::Int8(4)]],
+                4,
+            ),
+        ] {
+            let db = Db::create();
+            let mut session = db.create_session();
+            session
+                .execute(&format!(
+                    r#"
+                    CREATE SEQUENCE aggregate_source_values;
+                    CREATE TABLE aggregate_source_rows (id BIGINT);
+                    CREATE TABLE aggregate_result_rows (
+                        id BIGINT PRIMARY KEY,
+                        value BIGINT NOT NULL
+                    );
+                    INSERT INTO aggregate_source_rows VALUES {source};
+                    INSERT INTO aggregate_result_rows VALUES (1, 0);
+                    CREATE FUNCTION preserve_aggregate_value() RETURNS TRIGGER AS $$
+                    BEGIN
+                        RETURN NEW;
+                    END;
+                    $$ LANGUAGE plpgsql;
+                    CREATE TRIGGER preserve_aggregate_value
+                        BEFORE INSERT ON aggregate_result_rows
+                        FOR EACH ROW EXECUTE FUNCTION preserve_aggregate_value();
+                    "#
+                ))
+                .unwrap();
+            let having = if source == "(1), (2)" {
+                ""
+            } else {
+                " HAVING count(*) > 1"
+            };
+            session
+                .execute(&format!(
+                    "INSERT INTO aggregate_result_rows \
+                     SELECT id, sum(nextval('aggregate_source_values'))::BIGINT \
+                     FROM aggregate_source_rows GROUP BY id{having} ORDER BY id \
+                     ON CONFLICT (id) DO UPDATE SET value = excluded.value"
+                ))
+                .unwrap();
+            assert_eq!(
+                session
+                    .query(
+                        "SELECT id, value FROM aggregate_result_rows ORDER BY id",
+                        &[],
+                    )
+                    .unwrap()
+                    .rows,
+                expected_rows
+            );
+            assert_eq!(
+                session
+                    .query("SELECT nextval('aggregate_source_values')", &[])
+                    .unwrap()
+                    .rows,
+                vec![vec![Value::Int8(next_value)]]
+            );
+        }
+    }
+
+    #[test]
+    fn preserves_volatile_aggregate_occurrences_and_prunes_dead_ones() {
+        for (projection, expected_rows, next_value) in [
+            (
+                "(sum(nextval('aggregate_occurrence_values')) + \
+                 sum(nextval('aggregate_occurrence_values')))::BIGINT",
+                vec![
+                    vec![Value::Int8(1), Value::Int8(3)],
+                    vec![Value::Int8(2), Value::Int8(7)],
+                ],
+                5,
+            ),
+            (
+                "(CASE WHEN FALSE THEN sum(1 / (2 - id)) ELSE 0 END)::BIGINT",
+                vec![
+                    vec![Value::Int8(1), Value::Int8(0)],
+                    vec![Value::Int8(2), Value::Int8(0)],
+                ],
+                1,
+            ),
+        ] {
+            let db = Db::create();
+            let mut session = db.create_session();
+            session
+                .execute(
+                    r#"
+                    CREATE SEQUENCE aggregate_occurrence_values;
+                    CREATE TABLE aggregate_occurrence_source (id BIGINT);
+                    CREATE TABLE aggregate_occurrence_rows (
+                        id BIGINT PRIMARY KEY,
+                        value BIGINT NOT NULL
+                    );
+                    INSERT INTO aggregate_occurrence_source VALUES (1), (2);
+                    INSERT INTO aggregate_occurrence_rows VALUES (1, 0);
+                    CREATE FUNCTION preserve_aggregate_occurrence() RETURNS TRIGGER AS $$
+                    BEGIN
+                        RETURN NEW;
+                    END;
+                    $$ LANGUAGE plpgsql;
+                    CREATE TRIGGER preserve_aggregate_occurrence
+                        BEFORE INSERT ON aggregate_occurrence_rows
+                        FOR EACH ROW EXECUTE FUNCTION preserve_aggregate_occurrence();
+                    "#,
+                )
+                .unwrap();
+            session
+                .execute(&format!(
+                    "INSERT INTO aggregate_occurrence_rows \
+                     SELECT id, {projection} FROM aggregate_occurrence_source \
+                     GROUP BY id ORDER BY id \
+                     ON CONFLICT (id) DO UPDATE SET value = excluded.value"
+                ))
+                .unwrap();
+            assert_eq!(
+                session
+                    .query(
+                        "SELECT id, value FROM aggregate_occurrence_rows ORDER BY id",
+                        &[],
+                    )
+                    .unwrap()
+                    .rows,
+                expected_rows
+            );
+            assert_eq!(
+                session
+                    .query("SELECT nextval('aggregate_occurrence_values')", &[])
+                    .unwrap()
+                    .rows,
+                vec![vec![Value::Int8(next_value)]]
+            );
+        }
+    }
+
+    #[test]
+    fn preserves_aggregate_occurrence_ownership_and_case_null_semantics() {
+        let db = Db::create();
+        let mut session = db.create_session();
+        session
+            .execute(
+                r#"
+                CREATE SEQUENCE aggregate_owner_values;
+                CREATE TABLE aggregate_owner_source (id BIGINT);
+                INSERT INTO aggregate_owner_source VALUES (1), (2);
+                "#,
+            )
+            .unwrap();
+
+        assert_eq!(
+            session
+                .query(
+                    "SELECT id, sum(nextval('aggregate_owner_values'))::BIGINT \
+                     FROM aggregate_owner_source GROUP BY id \
+                     HAVING sum(nextval('aggregate_owner_values')) > 0 ORDER BY id",
+                    &[],
+                )
+                .unwrap()
+                .rows,
+            vec![
+                vec![Value::Int8(1), Value::Int8(1)],
+                vec![Value::Int8(2), Value::Int8(3)],
+            ]
+        );
+        assert_eq!(
+            session
+                .query("SELECT nextval('aggregate_owner_values')", &[])
+                .unwrap()
+                .rows,
+            vec![vec![Value::Int8(5)]]
+        );
+        assert_eq!(
+            session
+                .query(
+                    "SELECT id, \
+                     coalesce(CASE WHEN FALSE THEN sum(id) END, 7)::BIGINT, \
+                     (CASE WHEN NULL THEN sum(1 / (2 - id)) ELSE 0 END)::BIGINT, \
+                     ((CASE WHEN FALSE THEN sum(id) ELSE 1 END) / 2)::BIGINT, \
+                     (coalesce(CASE WHEN FALSE THEN sum(id) END, 1) / 2)::BIGINT \
+                     FROM aggregate_owner_source GROUP BY id ORDER BY id",
+                    &[],
+                )
+                .unwrap()
+                .rows,
+            vec![
+                vec![
+                    Value::Int8(1),
+                    Value::Int8(7),
+                    Value::Int8(0),
+                    Value::Int8(1),
+                    Value::Int8(1),
+                ],
+                vec![
+                    Value::Int8(2),
+                    Value::Int8(7),
+                    Value::Int8(0),
+                    Value::Int8(1),
+                    Value::Int8(1),
+                ],
+            ]
+        );
+        session
+            .execute("CREATE SEQUENCE aggregate_distinct_values")
+            .unwrap();
+        assert_eq!(
+            session
+                .query(
+                    "SELECT DISTINCT ON (max(nextval('aggregate_distinct_values'))) \
+                     id, max(nextval('aggregate_distinct_values')) \
+                     FROM aggregate_owner_source GROUP BY id \
+                     ORDER BY max(nextval('aggregate_distinct_values'))",
+                    &[],
+                )
+                .unwrap()
+                .rows,
+            vec![
+                vec![Value::Int8(1), Value::Int8(1)],
+                vec![Value::Int8(2), Value::Int8(2)],
+            ]
+        );
+        assert_eq!(
+            session
+                .query("SELECT nextval('aggregate_distinct_values')", &[])
+                .unwrap()
+                .rows,
+            vec![vec![Value::Int8(3)]]
+        );
+        session
+            .execute("CREATE SEQUENCE aggregate_unordered_distinct_values")
+            .unwrap();
+        assert_eq!(
+            session
+                .query(
+                    "SELECT DISTINCT ON (max(nextval('aggregate_unordered_distinct_values'))) \
+                     id, max(nextval('aggregate_unordered_distinct_values')) \
+                     FROM aggregate_owner_source GROUP BY id",
+                    &[],
+                )
+                .unwrap()
+                .rows,
+            vec![
+                vec![Value::Int8(1), Value::Int8(1)],
+                vec![Value::Int8(2), Value::Int8(2)],
+            ]
+        );
+        assert_eq!(
+            session
+                .query("SELECT nextval('aggregate_unordered_distinct_values')", &[])
+                .unwrap()
+                .rows,
+            vec![vec![Value::Int8(3)]]
+        );
+    }
+
+    #[test]
+    fn propagates_limited_union_errors_and_skips_unread_group_projections() {
+        let db = Db::create();
+        let mut session = db.create_session();
+        session
+            .execute(
+                r#"
+                CREATE TABLE limited_union_source (id BIGINT);
+                CREATE TABLE limited_union_rows (id BIGINT PRIMARY KEY, value BIGINT NOT NULL);
+                INSERT INTO limited_union_source VALUES (1), (2);
+                CREATE FUNCTION keep_limited_union_row() RETURNS TRIGGER AS $$
+                BEGIN
+                    RETURN NEW;
+                END;
+                $$ LANGUAGE plpgsql;
+                CREATE TRIGGER keep_limited_union_row
+                    BEFORE INSERT ON limited_union_rows
+                    FOR EACH ROW EXECUTE FUNCTION keep_limited_union_row();
+                "#,
+            )
+            .unwrap();
+
+        assert_eq!(
+            session
+                .query(
+                    "INSERT INTO limited_union_rows \
+                     SELECT id, 1 / (id - 1) FROM limited_union_source GROUP BY id \
+                     UNION ALL SELECT 3, 0 LIMIT 1 RETURNING id, value",
+                    &[],
+                )
+                .unwrap()
+                .rows,
+            vec![vec![Value::Int8(2), Value::Int8(1)]]
+        );
+
+        session
+            .execute(
+                r#"
+                CREATE FUNCTION reject_limited_union_row() RETURNS TRIGGER AS $$
+                BEGIN
+                    NEW.value := 1 / 0;
+                    RETURN NEW;
+                END;
+                $$ LANGUAGE plpgsql;
+                CREATE TRIGGER reject_limited_union_row
+                    BEFORE INSERT ON limited_union_rows
+                    FOR EACH ROW EXECUTE FUNCTION reject_limited_union_row();
+                "#,
+            )
+            .unwrap();
+        assert_eq!(
+            session
+                .execute(
+                    "INSERT INTO limited_union_rows \
+                     SELECT id, 0 FROM limited_union_source \
+                     UNION ALL SELECT 3, 0 LIMIT 1"
+                )
+                .unwrap_err()
+                .sqlstate,
+            SqlState::DivisionByZero
+        );
+
+        let db = Db::create();
+        let mut session = db.create_session();
+        session
+            .execute(
+                r#"
+                CREATE SEQUENCE limited_conflict_values;
+                CREATE TABLE limited_conflict_source (id BIGINT);
+                CREATE TABLE limited_conflict_rows (
+                    id BIGINT PRIMARY KEY,
+                    value BIGINT NOT NULL
+                );
+                INSERT INTO limited_conflict_source VALUES (1), (2);
+                INSERT INTO limited_conflict_rows VALUES (1, 0);
+                CREATE FUNCTION allocate_limited_conflict_value() RETURNS TRIGGER AS $$
+                BEGIN
+                    NEW.value := nextval('limited_conflict_values');
+                    RETURN NEW;
+                END;
+                $$ LANGUAGE plpgsql;
+                CREATE TRIGGER allocate_limited_conflict_value
+                    BEFORE INSERT ON limited_conflict_rows
+                    FOR EACH ROW EXECUTE FUNCTION allocate_limited_conflict_value();
+                "#,
+            )
+            .unwrap();
+        assert_eq!(
+            session
+                .execute(
+                    "INSERT INTO limited_conflict_rows \
+                     SELECT id, 0 FROM limited_conflict_source \
+                     UNION ALL SELECT 3, 0 LIMIT 1 \
+                     ON CONFLICT (id) DO UPDATE SET value = 1 / 0"
+                )
+                .unwrap_err()
+                .sqlstate,
+            SqlState::DivisionByZero
+        );
+        assert_eq!(
+            session
+                .query("SELECT nextval('limited_conflict_values')", &[])
+                .unwrap()
+                .rows,
+            vec![vec![Value::Int8(1)]]
+        );
+    }
+
+    #[test]
+    fn evaluates_volatile_aggregate_inputs_before_trigger_waits() {
+        for commits in [true, false] {
+            let db = Db::create_builder()
+                .set_lock_timeout(Duration::from_secs(2))
+                .build();
+            let mut holder = db.create_session();
+            let mut writer = db.create_session();
+            let mut observer = db.create_session();
+            holder
+                .execute(
+                    r#"
+                    CREATE SEQUENCE aggregate_input_values;
+                    CREATE TABLE aggregate_input_source (id BIGINT);
+                    CREATE TABLE aggregate_input_rows (
+                        id BIGINT PRIMARY KEY,
+                        value BIGINT NOT NULL
+                    );
+                    INSERT INTO aggregate_input_source VALUES (1), (2);
+                    INSERT INTO aggregate_input_rows VALUES (1, 0);
+                    CREATE FUNCTION allocate_aggregate_input_value() RETURNS TRIGGER AS $$
+                    BEGIN
+                        NEW.value := nextval('aggregate_input_values');
+                        RETURN NEW;
+                    END;
+                    $$ LANGUAGE plpgsql;
+                    CREATE TRIGGER allocate_aggregate_input_value
+                        BEFORE INSERT ON aggregate_input_rows
+                        FOR EACH ROW EXECUTE FUNCTION allocate_aggregate_input_value();
+                    "#,
+                )
+                .unwrap();
+            holder.execute("BEGIN").unwrap();
+            holder
+                .execute("UPDATE aggregate_input_rows SET value = 10 WHERE id = 1")
+                .unwrap();
+
+            let (sender, receiver) = mpsc::channel();
+            let handle = thread::spawn(move || {
+                sender
+                    .send(writer.query(
+                        "INSERT INTO aggregate_input_rows \
+                         SELECT id, sum(nextval('aggregate_input_values')) \
+                         FROM aggregate_input_source GROUP BY id ORDER BY id \
+                         ON CONFLICT (id) DO UPDATE SET value = excluded.value \
+                         RETURNING id, value, nextval('aggregate_input_values')",
+                        &[],
+                    ))
+                    .unwrap();
+            });
+            wait_until_blocked(&db);
+            assert_eq!(
+                observer
+                    .query("SELECT nextval('aggregate_input_values')", &[])
+                    .unwrap()
+                    .rows,
+                vec![vec![Value::Int8(4)]],
+                "commits: {commits}"
+            );
+            holder
+                .execute(if commits { "COMMIT" } else { "ROLLBACK" })
+                .unwrap();
+            assert_eq!(
+                receiver
+                    .recv_timeout(Duration::from_secs(1))
+                    .unwrap()
+                    .unwrap()
+                    .rows,
+                vec![
+                    vec![Value::Int8(1), Value::Int8(3), Value::Int8(5)],
+                    vec![Value::Int8(2), Value::Int8(6), Value::Int8(7)],
+                ],
+                "commits: {commits}"
+            );
+            handle.join().unwrap();
+        }
+    }
+
+    #[test]
+    fn stops_insert_select_evaluation_at_limit() {
+        for (selection, expected, next) in [
+            (
+                "1 / (2 - id) > 0",
+                vec![vec![Value::Int8(1), Value::Int8(1), Value::Int8(2)]],
+                3,
+            ),
+            (
+                "nextval('limited_insert_values') > 0",
+                vec![vec![Value::Int8(1), Value::Int8(2), Value::Int8(3)]],
+                4,
+            ),
+        ] {
+            let db = Db::create();
+            let mut session = db.create_session();
+            session
+                .execute(
+                    r#"
+                    CREATE SEQUENCE limited_insert_values;
+                    CREATE TABLE limited_insert_source (id BIGINT);
+                    CREATE TABLE limited_insert_rows (
+                        id BIGINT PRIMARY KEY,
+                        value BIGINT NOT NULL
+                    );
+                    INSERT INTO limited_insert_source VALUES (1), (2);
+                    INSERT INTO limited_insert_rows VALUES (1, 0);
+                    CREATE FUNCTION allocate_limited_insert_value() RETURNS TRIGGER AS $$
+                    BEGIN
+                        NEW.value := nextval('limited_insert_values');
+                        RETURN NEW;
+                    END;
+                    $$ LANGUAGE plpgsql;
+                    CREATE TRIGGER allocate_limited_insert_value
+                        BEFORE INSERT ON limited_insert_rows
+                        FOR EACH ROW EXECUTE FUNCTION allocate_limited_insert_value();
+                    "#,
+                )
+                .unwrap();
+            assert_eq!(
+                session
+                    .query(
+                        &format!(
+                            "INSERT INTO limited_insert_rows \
+                             SELECT id, 0 FROM limited_insert_source \
+                             WHERE {selection} LIMIT 1 \
+                             ON CONFLICT (id) DO UPDATE SET value = excluded.value \
+                             RETURNING id, value, nextval('limited_insert_values')"
+                        ),
+                        &[],
+                    )
+                    .unwrap()
+                    .rows,
+                expected
+            );
+            assert_eq!(
+                session
+                    .query("SELECT nextval('limited_insert_values')", &[])
+                    .unwrap()
+                    .rows,
+                vec![vec![Value::Int8(next)]]
+            );
+        }
+    }
+
+    #[test]
+    fn waits_before_later_union_insert_source_errors() {
+        for commits in [true, false] {
+            let db = Db::create_builder()
+                .set_lock_timeout(Duration::from_secs(2))
+                .build();
+            let mut holder = db.create_session();
+            let mut writer = db.create_session();
+            let mut observer = db.create_session();
+            holder
+                .execute(
+                    r#"
+                    CREATE SEQUENCE union_error_trigger_values;
+                    CREATE TABLE union_error_source (id BIGINT);
+                    CREATE TABLE union_error_rows (
+                        id BIGINT PRIMARY KEY,
+                        value BIGINT NOT NULL
+                    );
+                    INSERT INTO union_error_source VALUES (1), (2);
+                    INSERT INTO union_error_rows VALUES (1, 0);
+                    CREATE FUNCTION allocate_union_error_trigger_value() RETURNS TRIGGER AS $$
+                    BEGIN
+                        NEW.value := nextval('union_error_trigger_values');
+                        RETURN NEW;
+                    END;
+                    $$ LANGUAGE plpgsql;
+                    CREATE TRIGGER allocate_union_error_trigger_value
+                        BEFORE INSERT ON union_error_rows
+                        FOR EACH ROW EXECUTE FUNCTION allocate_union_error_trigger_value();
+                    "#,
+                )
+                .unwrap();
+            holder.execute("BEGIN").unwrap();
+            holder
+                .execute("UPDATE union_error_rows SET value = 10 WHERE id = 1")
+                .unwrap();
+
+            let (sender, receiver) = mpsc::channel();
+            let handle = thread::spawn(move || {
+                sender
+                    .send(writer.execute(
+                        "INSERT INTO union_error_rows \
+                         SELECT id, 1 / (2 - id) FROM union_error_source WHERE id = 1 \
+                         UNION ALL \
+                         SELECT id, 1 / (2 - id) FROM union_error_source WHERE id = 2 \
+                         ON CONFLICT (id) DO UPDATE SET value = excluded.value",
+                    ))
+                    .unwrap();
+            });
+            wait_until_blocked(&db);
+            assert_eq!(
+                observer
+                    .query("SELECT nextval('union_error_trigger_values')", &[])
+                    .unwrap()
+                    .rows,
+                vec![vec![Value::Int8(2)]]
+            );
+            holder
+                .execute(if commits { "COMMIT" } else { "ROLLBACK" })
+                .unwrap();
+            assert_eq!(
+                receiver
+                    .recv_timeout(Duration::from_secs(1))
+                    .unwrap()
+                    .unwrap_err()
+                    .sqlstate,
+                SqlState::DivisionByZero
+            );
+            handle.join().unwrap();
+        }
+    }
+
+    #[test]
+    fn resumes_multirow_trigger_effects_after_conflict_waits() {
+        let db = Db::create_builder()
+            .set_lock_timeout(Duration::from_secs(2))
+            .build();
+        let mut holder = db.create_session();
+        let mut writer = db.create_session();
+        let mut observer = db.create_session();
+        holder
+            .execute(
+                r#"
+                CREATE SEQUENCE resumed_trigger_values;
+                CREATE TABLE resumed_trigger_rows (
+                    id BIGINT PRIMARY KEY,
+                    value BIGINT NOT NULL
+                );
+                INSERT INTO resumed_trigger_rows VALUES (1, 0);
+                CREATE FUNCTION allocate_resumed_trigger_value() RETURNS TRIGGER AS $$
+                BEGIN NEW.value := nextval('resumed_trigger_values'); RETURN NEW; END;
+                $$ LANGUAGE plpgsql;
+                CREATE TRIGGER allocate_resumed_trigger_value
+                    BEFORE INSERT ON resumed_trigger_rows
+                    FOR EACH ROW EXECUTE FUNCTION allocate_resumed_trigger_value();
+                "#,
+            )
+            .unwrap();
+        holder.execute("BEGIN").unwrap();
+        holder
+            .execute("UPDATE resumed_trigger_rows SET value = 10 WHERE id = 1")
+            .unwrap();
+
+        let (sender, receiver) = mpsc::channel();
+        let handle = thread::spawn(move || {
+            sender
+                .send(writer.query(
+                    "INSERT INTO resumed_trigger_rows VALUES (1, 0), (2, 0) \
+                     ON CONFLICT DO NOTHING \
+                     RETURNING id, value, nextval('resumed_trigger_values')",
+                    &[],
+                ))
+                .unwrap();
+        });
+        wait_until_blocked(&db);
+        assert_eq!(
+            observer
+                .query("SELECT nextval('resumed_trigger_values')", &[])
+                .unwrap()
+                .rows,
+            vec![vec![Value::Int8(2)]]
+        );
+        holder.execute("COMMIT").unwrap();
+        assert_eq!(
+            receiver
+                .recv_timeout(Duration::from_secs(1))
+                .unwrap()
+                .unwrap()
+                .rows,
+            vec![vec![Value::Int8(2), Value::Int8(3), Value::Int8(4)]]
+        );
+        handle.join().unwrap();
+    }
+
+    #[test]
+    fn resumes_after_skipped_trigger_rows_and_default_values() {
+        let db = Db::create_builder()
+            .set_lock_timeout(Duration::from_secs(2))
+            .build();
+        let mut holder = db.create_session();
+        let mut writer = db.create_session();
+        let mut observer = db.create_session();
+        holder
+            .execute(
+                r#"
+                CREATE SEQUENCE skipped_trigger_values;
+                CREATE TABLE skipped_trigger_rows (
+                    id BIGINT PRIMARY KEY,
+                    action TEXT NOT NULL,
+                    value BIGINT NOT NULL
+                );
+                INSERT INTO skipped_trigger_rows VALUES (2, 'held', 0);
+                CREATE FUNCTION allocate_or_skip_trigger_value() RETURNS TRIGGER AS $$
+                BEGIN
+                    NEW.value := nextval('skipped_trigger_values');
+                    IF NEW.action = 'skip' THEN RETURN NULL; END IF;
+                    RETURN NEW;
+                END;
+                $$ LANGUAGE plpgsql;
+                CREATE TRIGGER allocate_or_skip_trigger_value
+                    BEFORE INSERT ON skipped_trigger_rows
+                    FOR EACH ROW EXECUTE FUNCTION allocate_or_skip_trigger_value();
+                "#,
+            )
+            .unwrap();
+        holder.execute("BEGIN").unwrap();
+        holder
+            .execute("UPDATE skipped_trigger_rows SET value = 10 WHERE id = 2")
+            .unwrap();
+
+        let (sender, receiver) = mpsc::channel();
+        let handle = thread::spawn(move || {
+            sender
+                .send(writer.query(
+                    "INSERT INTO skipped_trigger_rows VALUES \
+                         (1, 'skip', 0), (2, 'keep', 0), (3, 'keep', 0) \
+                     ON CONFLICT DO NOTHING RETURNING id, value",
+                    &[],
+                ))
+                .unwrap();
+        });
+        wait_until_blocked(&db);
+        assert_eq!(
+            observer
+                .query("SELECT nextval('skipped_trigger_values')", &[])
+                .unwrap()
+                .rows,
+            vec![vec![Value::Int8(3)]]
+        );
+        holder.execute("COMMIT").unwrap();
+        assert_eq!(
+            receiver
+                .recv_timeout(Duration::from_secs(1))
+                .unwrap()
+                .unwrap()
+                .rows,
+            vec![vec![Value::Int8(3), Value::Int8(4)]]
+        );
+        handle.join().unwrap();
+
+        observer
+            .execute(
+                r#"
+                CREATE SEQUENCE default_trigger_values;
+                CREATE TABLE default_trigger_rows (
+                    id BIGINT PRIMARY KEY DEFAULT 1,
+                    value BIGINT NOT NULL DEFAULT 0
+                );
+                INSERT INTO default_trigger_rows VALUES (1, 0);
+                CREATE FUNCTION allocate_default_trigger_value() RETURNS TRIGGER AS $$
+                BEGIN NEW.value := nextval('default_trigger_values'); RETURN NEW; END;
+                $$ LANGUAGE plpgsql;
+                CREATE TRIGGER allocate_default_trigger_value
+                    BEFORE INSERT ON default_trigger_rows
+                    FOR EACH ROW EXECUTE FUNCTION allocate_default_trigger_value();
+                "#,
+            )
+            .unwrap();
+        let mut holder = db.create_session();
+        let mut writer = db.create_session();
+        holder.execute("BEGIN").unwrap();
+        holder
+            .execute("UPDATE default_trigger_rows SET value = 10 WHERE id = 1")
+            .unwrap();
+        let (sender, receiver) = mpsc::channel();
+        let handle = thread::spawn(move || {
+            sender
+                .send(writer.query(
+                    "INSERT INTO default_trigger_rows DEFAULT VALUES \
+                     ON CONFLICT (id) DO UPDATE SET value = excluded.value \
+                     RETURNING value",
+                    &[],
+                ))
+                .unwrap();
+        });
+        wait_until_blocked(&db);
+        assert_eq!(
+            observer
+                .query("SELECT nextval('default_trigger_values')", &[])
+                .unwrap()
+                .rows,
+            vec![vec![Value::Int8(2)]]
+        );
+        holder.execute("ROLLBACK").unwrap();
+        assert_eq!(
+            receiver
+                .recv_timeout(Duration::from_secs(1))
+                .unwrap()
+                .unwrap()
+                .rows,
+            vec![vec![Value::Int8(1)]]
+        );
+        handle.join().unwrap();
+    }
+
+    #[test]
+    fn preserves_trigger_order_across_insert_cte_foreign_key_waits() {
+        for (source_kind, commits) in [
+            (0, true),
+            (0, false),
+            (1, true),
+            (1, false),
+            (2, true),
+            (2, false),
+        ] {
+            let db = Db::create_builder()
+                .set_lock_timeout(Duration::from_secs(2))
+                .build();
+            let mut holder = db.create_session();
+            let mut writer = db.create_session();
+            let mut observer = db.create_session();
+            holder
+                .execute(
+                    r#"
+                    CREATE SEQUENCE cte_parent_values;
+                    CREATE TABLE cte_trigger_parents (id BIGINT PRIMARY KEY);
+                    CREATE TABLE cte_trigger_children (
+                        id BIGINT PRIMARY KEY,
+                        parent_id BIGINT REFERENCES cte_trigger_parents
+                    );
+                    CREATE TABLE cte_trigger_source (id BIGINT PRIMARY KEY);
+                    INSERT INTO cte_trigger_parents VALUES (1), (2);
+                    INSERT INTO cte_trigger_source VALUES (1), (2);
+                    CREATE FUNCTION allocate_cte_parent() RETURNS TRIGGER AS $$
+                    BEGIN NEW.parent_id := nextval('cte_parent_values'); RETURN NEW; END;
+                    $$ LANGUAGE plpgsql;
+                    CREATE TRIGGER allocate_cte_parent
+                        BEFORE INSERT ON cte_trigger_children
+                        FOR EACH ROW EXECUTE FUNCTION allocate_cte_parent();
+                    "#,
+                )
+                .unwrap();
+            holder.execute("BEGIN").unwrap();
+            holder
+                .execute("DELETE FROM cte_trigger_parents WHERE id = 2")
+                .unwrap();
+
+            let (sender, receiver) = mpsc::channel();
+            let handle = thread::spawn(move || {
+                let query = if source_kind == 1 {
+                    "WITH first_insert AS ( \
+                         INSERT INTO cte_trigger_children SELECT 1, 0 \
+                         RETURNING id, parent_id \
+                     ), second_insert AS ( \
+                         INSERT INTO cte_trigger_children SELECT 2, 0 \
+                         RETURNING id, parent_id \
+                     ) \
+                     SELECT * FROM first_insert UNION ALL SELECT * FROM second_insert"
+                } else if source_kind == 2 {
+                    "WITH first_insert AS ( \
+                         INSERT INTO cte_trigger_children \
+                         SELECT id, 0 FROM cte_trigger_source WHERE id = 1 \
+                         RETURNING id, parent_id \
+                     ), second_insert AS ( \
+                         INSERT INTO cte_trigger_children \
+                         SELECT id, 0 FROM cte_trigger_source WHERE id = 2 \
+                         RETURNING id, parent_id \
+                     ) \
+                     SELECT * FROM first_insert UNION ALL SELECT * FROM second_insert"
+                } else {
+                    "WITH first_insert AS ( \
+                         INSERT INTO cte_trigger_children VALUES (1, 0) \
+                         RETURNING id, parent_id \
+                     ), second_insert AS ( \
+                         INSERT INTO cte_trigger_children VALUES (2, 0) \
+                         RETURNING id, parent_id \
+                     ) \
+                     SELECT * FROM first_insert UNION ALL SELECT * FROM second_insert"
+                };
+                sender.send(writer.query(query, &[])).unwrap();
+            });
+            wait_until_blocked(&db);
+            assert_eq!(
+                observer
+                    .query("SELECT nextval('cte_parent_values')", &[])
+                    .unwrap()
+                    .rows,
+                vec![vec![Value::Int8(3)]]
+            );
+            holder
+                .execute(if commits { "COMMIT" } else { "ROLLBACK" })
+                .unwrap();
+            let result = receiver.recv_timeout(Duration::from_secs(1)).unwrap();
+            if commits {
+                assert_eq!(result.unwrap_err().sqlstate, SqlState::ForeignKeyViolation);
+                assert!(
+                    observer
+                        .query("SELECT * FROM cte_trigger_children", &[])
+                        .unwrap()
+                        .rows
+                        .is_empty()
+                );
+            } else {
+                assert_eq!(
+                    result.unwrap().rows,
+                    vec![
+                        vec![Value::Int8(1), Value::Int8(1)],
+                        vec![Value::Int8(2), Value::Int8(2)],
+                    ]
+                );
+            }
+            handle.join().unwrap();
+        }
+    }
+
+    #[test]
+    fn does_not_lock_trigger_functions_for_reads() {
+        let db = Db::create_builder()
+            .set_lock_timeout(Duration::from_millis(50))
+            .build();
+        let mut replacer = db.create_session();
+        let mut reader = db.create_session();
+        replacer
+            .execute(
+                r#"
+                CREATE TABLE trigger_read_items (id INTEGER);
+                CREATE FUNCTION trigger_read_function() RETURNS TRIGGER AS $$
+                BEGIN RETURN NEW; END;
+                $$ LANGUAGE plpgsql;
+                CREATE TRIGGER trigger_read BEFORE INSERT ON trigger_read_items
+                    FOR EACH ROW EXECUTE FUNCTION trigger_read_function();
+                INSERT INTO trigger_read_items VALUES (1);
+                "#,
+            )
+            .unwrap();
+        replacer.execute("BEGIN").unwrap();
+        replacer
+            .execute(
+                r#"CREATE OR REPLACE FUNCTION trigger_read_function() RETURNS TRIGGER AS $$
+                BEGIN RETURN NULL; END;
+                $$ LANGUAGE plpgsql"#,
+            )
+            .unwrap();
+        assert_eq!(
+            reader
+                .query("SELECT id FROM trigger_read_items", &[])
+                .unwrap()
+                .rows,
+            vec![vec![Value::Int4(1)]]
+        );
+        replacer.execute("ROLLBACK").unwrap();
+    }
+
+    #[test]
+    fn locks_foreign_keys_after_before_insert_triggers() {
+        let db = Db::create_builder()
+            .set_lock_timeout(Duration::from_secs(2))
+            .build();
+        let mut holder = db.create_session();
+        let mut writer = db.create_session();
+        holder
+            .execute(
+                r#"
+                CREATE TABLE triggered_parents (id INTEGER PRIMARY KEY);
+                CREATE TABLE triggered_children (
+                    id INTEGER PRIMARY KEY,
+                    parent_id INTEGER REFERENCES triggered_parents,
+                    action TEXT NOT NULL
+                );
+                CREATE FUNCTION rewrite_parent_key() RETURNS TRIGGER AS $$
+                BEGIN
+                    IF NEW.action = 'skip' THEN
+                        RETURN NULL;
+                    ELSIF NEW.action = 'one' THEN
+                        NEW.parent_id := 1;
+                    ELSIF NEW.action = 'three' THEN
+                        NEW.parent_id := 3;
+                    ELSIF NEW.action = 'four' THEN
+                        NEW.parent_id := 4;
+                    END IF;
+                    RETURN NEW;
+                END;
+                $$ LANGUAGE plpgsql;
+                CREATE TRIGGER rewrite_parent_key BEFORE INSERT ON triggered_children
+                    FOR EACH ROW EXECUTE FUNCTION rewrite_parent_key();
+                INSERT INTO triggered_parents VALUES (1), (2);
+                "#,
+            )
+            .unwrap();
+        holder.execute("BEGIN").unwrap();
+        holder
+            .execute("UPDATE triggered_parents SET id = id WHERE id = 1")
+            .unwrap();
+        assert_eq!(
+            writer
+                .execute("INSERT INTO triggered_children VALUES (1, 2, 'two')")
+                .unwrap(),
+            create_affected_results(1)
+        );
+        assert_eq!(
+            writer
+                .execute("INSERT INTO triggered_children VALUES (2, 1, 'skip')")
+                .unwrap(),
+            create_affected_results(0)
+        );
+
+        let (sender, receiver) = mpsc::channel();
+        let handle = thread::spawn(move || {
+            sender
+                .send(writer.execute("INSERT INTO triggered_children VALUES (3, 2, 'one')"))
+                .unwrap();
+        });
+        wait_until_blocked(&db);
+        holder.execute("COMMIT").unwrap();
+        assert_eq!(
+            receiver.recv_timeout(Duration::from_secs(1)).unwrap(),
+            Ok(create_affected_results(1))
+        );
+        handle.join().unwrap();
+
+        let mut holder = db.create_session();
+        let mut writer = db.create_session();
+        holder.execute("BEGIN").unwrap();
+        holder
+            .execute("INSERT INTO triggered_parents VALUES (3)")
+            .unwrap();
+        let (sender, receiver) = mpsc::channel();
+        let handle = thread::spawn(move || {
+            sender
+                .send(writer.execute("INSERT INTO triggered_children VALUES (4, 2, 'three')"))
+                .unwrap();
+        });
+        wait_until_blocked(&db);
+        holder.execute("COMMIT").unwrap();
+        assert_eq!(
+            receiver.recv_timeout(Duration::from_secs(1)).unwrap(),
+            Ok(create_affected_results(1))
+        );
+        handle.join().unwrap();
+
+        let mut holder = db.create_session();
+        let mut writer = db.create_session();
+        holder.execute("BEGIN").unwrap();
+        holder
+            .execute("INSERT INTO triggered_parents VALUES (4)")
+            .unwrap();
+        let (sender, receiver) = mpsc::channel();
+        let handle = thread::spawn(move || {
+            sender
+                .send(
+                    writer
+                        .execute("INSERT INTO triggered_children VALUES (5, 2, 'four')")
+                        .unwrap_err()
+                        .sqlstate,
+                )
+                .unwrap();
+        });
+        wait_until_blocked(&db);
+        holder.execute("ROLLBACK").unwrap();
+        assert_eq!(
+            receiver.recv_timeout(Duration::from_secs(1)).unwrap(),
+            SqlState::ForeignKeyViolation
+        );
+        handle.join().unwrap();
+    }
+
+    #[test]
+    fn locks_foreign_keys_after_before_update_triggers() {
+        let db = Db::create_builder()
+            .set_lock_timeout(Duration::from_secs(2))
+            .build();
+        let mut holder = db.create_session();
+        let mut writer = db.create_session();
+        holder
+            .execute(
+                r#"
+                CREATE TABLE update_trigger_parents (id INTEGER PRIMARY KEY);
+                CREATE TABLE update_trigger_children (
+                    id INTEGER PRIMARY KEY,
+                    parent_id INTEGER REFERENCES update_trigger_parents,
+                    action TEXT NOT NULL
+                );
+                CREATE FUNCTION rewrite_updated_parent() RETURNS TRIGGER AS $$
+                BEGIN
+                    IF NEW.action = 'skip' THEN
+                        RETURN NULL;
+                    ELSIF NEW.action = 'move' THEN
+                        NEW.parent_id := 2;
+                    END IF;
+                    RETURN NEW;
+                END;
+                $$ LANGUAGE plpgsql;
+                CREATE TRIGGER rewrite_updated_parent
+                    BEFORE UPDATE ON update_trigger_children
+                    FOR EACH ROW EXECUTE FUNCTION rewrite_updated_parent();
+                INSERT INTO update_trigger_parents VALUES (1), (2);
+                INSERT INTO update_trigger_children VALUES (1, 1, 'keep');
+                "#,
+            )
+            .unwrap();
+        holder.execute("BEGIN").unwrap();
+        holder
+            .execute("DELETE FROM update_trigger_parents WHERE id = 2")
+            .unwrap();
+
+        assert_eq!(
+            writer
+                .execute("UPDATE update_trigger_children SET action = 'skip' WHERE id = 1",)
+                .unwrap(),
+            create_affected_results(0)
+        );
+
+        let (sender, receiver) = mpsc::channel();
+        let handle = thread::spawn(move || {
+            sender
+                .send(
+                    writer
+                        .execute("UPDATE update_trigger_children SET action = 'move' WHERE id = 1")
+                        .unwrap_err()
+                        .sqlstate,
+                )
+                .unwrap();
+        });
+        wait_until_blocked(&db);
+        holder.execute("COMMIT").unwrap();
+        assert_eq!(
+            receiver.recv_timeout(Duration::from_secs(1)).unwrap(),
+            SqlState::ForeignKeyViolation
+        );
+        handle.join().unwrap();
+
+        let mut holder = db.create_session();
+        let mut writer = db.create_session();
+        holder
+            .execute("INSERT INTO update_trigger_parents VALUES (2)")
+            .unwrap();
+        holder.execute("BEGIN").unwrap();
+        holder
+            .execute("DELETE FROM update_trigger_parents WHERE id = 2")
+            .unwrap();
+        let (sender, receiver) = mpsc::channel();
+        let handle = thread::spawn(move || {
+            sender
+                .send(
+                    writer
+                        .execute("UPDATE update_trigger_children SET action = 'move' WHERE id = 1"),
+                )
+                .unwrap();
+        });
+        wait_until_blocked(&db);
+        holder.execute("ROLLBACK").unwrap();
+        assert_eq!(
+            receiver.recv_timeout(Duration::from_secs(1)).unwrap(),
+            Ok(create_affected_results(1))
+        );
+        handle.join().unwrap();
+    }
+
+    #[test]
+    fn recomputes_before_update_triggers_after_target_lock_waits() {
+        let db = Db::create_builder()
+            .set_lock_timeout(Duration::from_secs(2))
+            .build();
+        let mut holder = db.create_session();
+        let mut writer = db.create_session();
+        holder
+            .execute(
+                r#"
+                CREATE TABLE stale_update_parents (id INTEGER PRIMARY KEY);
+                CREATE TABLE stale_update_children (
+                    id INTEGER PRIMARY KEY,
+                    parent_id INTEGER REFERENCES stale_update_parents,
+                    value INTEGER NOT NULL
+                );
+                CREATE FUNCTION preserve_updated_row() RETURNS TRIGGER AS $$
+                BEGIN RETURN NEW; END;
+                $$ LANGUAGE plpgsql;
+                CREATE TRIGGER preserve_updated_row BEFORE UPDATE ON stale_update_children
+                    FOR EACH ROW EXECUTE FUNCTION preserve_updated_row();
+                INSERT INTO stale_update_parents VALUES (1);
+                INSERT INTO stale_update_children VALUES (1, 1, 0);
+                "#,
+            )
+            .unwrap();
+        holder.execute("BEGIN").unwrap();
+        holder
+            .execute("UPDATE stale_update_children SET value = 10 WHERE id = 1")
+            .unwrap();
+
+        let (sender, receiver) = mpsc::channel();
+        let handle = thread::spawn(move || {
+            sender
+                .send(
+                    writer
+                        .execute("UPDATE stale_update_children SET value = value + 1 WHERE id = 1"),
+                )
+                .unwrap();
+        });
+        wait_until_blocked(&db);
+        holder.execute("COMMIT").unwrap();
+        assert_eq!(
+            receiver.recv_timeout(Duration::from_secs(1)).unwrap(),
+            Ok(create_affected_results(1))
+        );
+        handle.join().unwrap();
+        assert_eq!(
+            holder
+                .query("SELECT value FROM stale_update_children", &[])
+                .unwrap()
+                .rows,
+            vec![vec![Value::Int4(11)]]
+        );
+    }
+
+    #[test]
+    fn locks_foreign_keys_after_on_conflict_update_triggers() {
+        let db = Db::create_builder()
+            .set_lock_timeout(Duration::from_secs(2))
+            .build();
+        let mut holder = db.create_session();
+        let mut writer = db.create_session();
+        holder
+            .execute(
+                r#"
+                CREATE TABLE conflict_trigger_parents (id INTEGER PRIMARY KEY);
+                CREATE TABLE conflict_trigger_children (
+                    id INTEGER PRIMARY KEY,
+                    parent_id INTEGER REFERENCES conflict_trigger_parents,
+                    action TEXT NOT NULL
+                );
+                CREATE FUNCTION rewrite_conflict_parent() RETURNS TRIGGER AS $$
+                BEGIN
+                    IF NEW.action = 'skip' THEN
+                        RETURN NULL;
+                    ELSIF NEW.action = 'move' THEN
+                        NEW.parent_id := 2;
+                    END IF;
+                    RETURN NEW;
+                END;
+                $$ LANGUAGE plpgsql;
+                CREATE TRIGGER rewrite_conflict_parent
+                    BEFORE UPDATE ON conflict_trigger_children
+                    FOR EACH ROW EXECUTE FUNCTION rewrite_conflict_parent();
+                INSERT INTO conflict_trigger_parents VALUES (1), (2);
+                INSERT INTO conflict_trigger_children VALUES (1, 1, 'keep');
+                "#,
+            )
+            .unwrap();
+        holder.execute("BEGIN").unwrap();
+        holder
+            .execute("DELETE FROM conflict_trigger_parents WHERE id = 2")
+            .unwrap();
+
+        assert_eq!(
+            writer
+                .execute(
+                    "INSERT INTO conflict_trigger_children VALUES (1, 1, 'skip') \
+                     ON CONFLICT (id) DO UPDATE SET action = excluded.action",
+                )
+                .unwrap(),
+            create_affected_results(0)
+        );
+
+        let (sender, receiver) = mpsc::channel();
+        let handle = thread::spawn(move || {
+            sender
+                .send(
+                    writer
+                        .execute(
+                            "INSERT INTO conflict_trigger_children VALUES (1, 1, 'move') \
+                             ON CONFLICT (id) DO UPDATE SET action = excluded.action",
+                        )
+                        .unwrap_err()
+                        .sqlstate,
+                )
+                .unwrap();
+        });
+        wait_until_blocked(&db);
+        holder.execute("COMMIT").unwrap();
+        assert_eq!(
+            receiver.recv_timeout(Duration::from_secs(1)).unwrap(),
+            SqlState::ForeignKeyViolation
+        );
+        handle.join().unwrap();
+
+        let mut holder = db.create_session();
+        let mut writer = db.create_session();
+        holder
+            .execute("INSERT INTO conflict_trigger_parents VALUES (2)")
+            .unwrap();
+        holder.execute("BEGIN").unwrap();
+        holder
+            .execute("DELETE FROM conflict_trigger_parents WHERE id = 2")
+            .unwrap();
+        let (sender, receiver) = mpsc::channel();
+        let handle = thread::spawn(move || {
+            sender
+                .send(writer.execute(
+                    "INSERT INTO conflict_trigger_children VALUES (1, 1, 'move') \
+                     ON CONFLICT (id) DO UPDATE SET action = excluded.action",
+                ))
+                .unwrap();
+        });
+        wait_until_blocked(&db);
+        holder.execute("ROLLBACK").unwrap();
+        assert_eq!(
+            receiver.recv_timeout(Duration::from_secs(1)).unwrap(),
+            Ok(create_affected_results(1))
+        );
+        handle.join().unwrap();
+    }
+
+    #[test]
+    fn locks_triggered_update_from_keys_without_false_upsert_waits() {
+        let db = Db::create_builder()
+            .set_lock_timeout(Duration::from_secs(2))
+            .build();
+        let mut holder = db.create_session();
+        let mut writer = db.create_session();
+        holder
+            .execute(
+                r#"
+                CREATE TABLE joined_trigger_parents (id INTEGER PRIMARY KEY);
+                CREATE TABLE joined_trigger_children (
+                    id INTEGER PRIMARY KEY,
+                    parent_id INTEGER REFERENCES joined_trigger_parents,
+                    value INTEGER NOT NULL
+                );
+                CREATE FUNCTION rewrite_joined_parent() RETURNS TRIGGER AS $$
+                BEGIN
+                    IF NEW.value = 9 THEN RETURN NULL; END IF;
+                    NEW.parent_id := 2;
+                    RETURN NEW;
+                END;
+                $$ LANGUAGE plpgsql;
+                CREATE TRIGGER rewrite_joined_parent BEFORE UPDATE ON joined_trigger_children
+                    FOR EACH ROW EXECUTE FUNCTION rewrite_joined_parent();
+                INSERT INTO joined_trigger_parents VALUES (1), (2);
+                INSERT INTO joined_trigger_children VALUES (1, 1, 0);
+                "#,
+            )
+            .unwrap();
+        holder.execute("BEGIN").unwrap();
+        holder
+            .execute("DELETE FROM joined_trigger_parents WHERE id = 2")
+            .unwrap();
+
+        assert_eq!(
+            writer
+                .execute(
+                    "INSERT INTO joined_trigger_children VALUES (1, 2, 9) \
+                     ON CONFLICT (id) DO UPDATE SET value = excluded.value",
+                )
+                .unwrap(),
+            create_affected_results(0)
+        );
+
+        let (sender, receiver) = mpsc::channel();
+        let handle = thread::spawn(move || {
+            sender
+                .send(
+                    writer
+                        .execute(
+                            "UPDATE joined_trigger_children SET value = 1 \
+                             FROM (VALUES (1)) source(id) \
+                             WHERE joined_trigger_children.id = source.id",
+                        )
+                        .unwrap_err()
+                        .sqlstate,
+                )
+                .unwrap();
+        });
+        wait_until_blocked(&db);
+        holder.execute("COMMIT").unwrap();
+        assert_eq!(
+            receiver.recv_timeout(Duration::from_secs(1)).unwrap(),
+            SqlState::ForeignKeyViolation
+        );
+        handle.join().unwrap();
+    }
+
+    #[test]
+    fn rechecks_upsert_trigger_keys_after_uncommitted_conflicts() {
+        let db = Db::create_builder()
+            .set_lock_timeout(Duration::from_secs(2))
+            .build();
+        let mut conflict_holder = db.create_session();
+        let mut parent_holder = db.create_session();
+        let mut writer = db.create_session();
+        conflict_holder
+            .execute(
+                r#"
+                CREATE TABLE delayed_conflict_parents (id INTEGER PRIMARY KEY);
+                CREATE TABLE delayed_conflict_children (
+                    id INTEGER PRIMARY KEY,
+                    parent_id INTEGER REFERENCES delayed_conflict_parents,
+                    value INTEGER NOT NULL
+                );
+                CREATE FUNCTION rewrite_delayed_conflict_parent() RETURNS TRIGGER AS $$
+                BEGIN NEW.parent_id := 2; RETURN NEW; END;
+                $$ LANGUAGE plpgsql;
+                CREATE TRIGGER rewrite_delayed_conflict_parent
+                    BEFORE UPDATE ON delayed_conflict_children
+                    FOR EACH ROW EXECUTE FUNCTION rewrite_delayed_conflict_parent();
+                INSERT INTO delayed_conflict_parents VALUES (1), (2);
+                "#,
+            )
+            .unwrap();
+        conflict_holder.execute("BEGIN").unwrap();
+        conflict_holder
+            .execute("INSERT INTO delayed_conflict_children VALUES (1, 1, 0)")
+            .unwrap();
+        parent_holder.execute("BEGIN").unwrap();
+        parent_holder
+            .execute("DELETE FROM delayed_conflict_parents WHERE id = 2")
+            .unwrap();
+
+        let (sender, receiver) = mpsc::channel();
+        let handle = thread::spawn(move || {
+            sender
+                .send(
+                    writer
+                        .execute(
+                            "INSERT INTO delayed_conflict_children VALUES (1, 1, 0) \
+                             ON CONFLICT (id) DO UPDATE SET value = delayed_conflict_children.value + 1",
+                        )
+                        .unwrap_err()
+                        .sqlstate,
+                )
+                .unwrap();
+        });
+        wait_until_blocked(&db);
+        conflict_holder.execute("COMMIT").unwrap();
+        assert!(matches!(
+            receiver.recv_timeout(Duration::from_millis(50)),
+            Err(mpsc::RecvTimeoutError::Timeout)
+        ));
+        parent_holder.execute("COMMIT").unwrap();
+        assert_eq!(
+            receiver.recv_timeout(Duration::from_secs(1)).unwrap(),
+            SqlState::ForeignKeyViolation
+        );
+        handle.join().unwrap();
+    }
+
+    #[test]
     #[cfg_attr(feature = "execution-log", tracing::instrument(skip_all))]
     fn rechecks_concurrent_on_conflict_updates_for_each_isolation_level() {
         let db = Db::create_builder()
@@ -9239,6 +12516,357 @@ mod tests {
 
     #[test]
     #[cfg_attr(feature = "execution-log", tracing::instrument(skip_all))]
+    fn locks_only_referenced_foreign_keys_for_triggered_insert_ctes() {
+        let db = Db::create_builder()
+            .set_lock_timeout(Duration::from_millis(40))
+            .build();
+        let mut holder = db.create_session();
+        let mut writer = db.create_session();
+        holder
+            .execute(
+                r#"
+                CREATE TABLE cte_lock_parents (id INTEGER PRIMARY KEY);
+                CREATE TABLE cte_lock_children (
+                    id INTEGER PRIMARY KEY,
+                    parent_id INTEGER REFERENCES cte_lock_parents,
+                    value INTEGER
+                );
+                CREATE TABLE cte_lock_helper (id INTEGER PRIMARY KEY);
+                CREATE FUNCTION preserve_cte_lock_child() RETURNS TRIGGER AS $$
+                BEGIN RETURN NEW; END;
+                $$ LANGUAGE plpgsql;
+                CREATE TRIGGER preserve_cte_lock_child
+                    BEFORE INSERT OR UPDATE ON cte_lock_children
+                    FOR EACH ROW EXECUTE FUNCTION preserve_cte_lock_child();
+                INSERT INTO cte_lock_parents VALUES (1), (2);
+                "#,
+            )
+            .unwrap();
+        holder.execute("BEGIN").unwrap();
+        holder
+            .execute("DELETE FROM cte_lock_parents WHERE id = 2")
+            .unwrap();
+
+        assert_eq!(
+            writer
+                .query(
+                    "WITH inserted AS (INSERT INTO cte_lock_children SELECT 2, 1, 0 RETURNING id) SELECT id FROM inserted",
+                    &[],
+                )
+                .unwrap()
+                .rows,
+            vec![vec![Value::Int4(2)]]
+        );
+        assert_eq!(
+            writer
+                .query(
+                    "WITH source AS (SELECT 3 AS id, 1 AS parent_id, 0 AS value), inserted AS (INSERT INTO cte_lock_children SELECT id, parent_id, value FROM source RETURNING id) SELECT id FROM inserted",
+                    &[],
+                )
+                .unwrap()
+                .rows,
+            vec![vec![Value::Int4(3)]]
+        );
+        assert_eq!(
+            writer
+                .execute(
+                    "WITH inserted AS (INSERT INTO cte_lock_children VALUES ((SELECT 4), 1, 0) RETURNING id) SELECT id FROM inserted",
+                )
+                .unwrap()
+                .into_iter()
+                .next(),
+            Some(StatementResult::Query(QueryResult {
+                columns: vec![ColumnMeta {
+                    name: "id".into(),
+                    type_oid: BaseType::Int4.map_to_oid(),
+                    typmod: -1,
+                }],
+                rows: vec![vec![Value::Int4(4)]],
+            }))
+        );
+        assert_eq!(
+            writer
+                .query(
+                    "WITH source AS (SELECT 3 AS id), updated AS (UPDATE cte_lock_children SET value = 1 FROM source WHERE cte_lock_children.id = source.id RETURNING cte_lock_children.id) SELECT id FROM updated",
+                    &[],
+                )
+                .unwrap()
+                .rows,
+            vec![vec![Value::Int4(3)]]
+        );
+        assert_eq!(
+            writer
+                .query(
+                    "WITH source AS (INSERT INTO cte_lock_helper VALUES (1) RETURNING id), inserted AS (INSERT INTO cte_lock_children SELECT 5, source.id, 0 FROM source RETURNING id) SELECT id FROM inserted",
+                    &[],
+                )
+                .unwrap()
+                .rows,
+            vec![vec![Value::Int4(5)]]
+        );
+        assert_eq!(
+            writer
+                .query(
+                    "WITH source AS (INSERT INTO cte_lock_helper VALUES (3) RETURNING id), updated AS (UPDATE cte_lock_children SET value = 2 FROM source WHERE cte_lock_children.id = source.id RETURNING cte_lock_children.id) SELECT id FROM updated",
+                    &[],
+                )
+                .unwrap()
+                .rows,
+            vec![vec![Value::Int4(3)]]
+        );
+        writer
+            .execute(
+                "WITH source AS (INSERT INTO cte_lock_helper VALUES ((SELECT 6)) RETURNING id), inserted AS (INSERT INTO cte_lock_children SELECT source.id, 1, 0 FROM source RETURNING id) SELECT id FROM inserted",
+            )
+            .unwrap();
+        assert_eq!(
+            writer
+                .query("SELECT id FROM cte_lock_children WHERE id = 6", &[])
+                .unwrap()
+                .rows,
+            vec![vec![Value::Int4(6)]]
+        );
+        for (query, expected) in [
+            (
+                "WITH source AS (INSERT INTO cte_lock_helper VALUES (7) RETURNING id - 6 AS parent_id), inserted AS (INSERT INTO cte_lock_children SELECT 7, source.parent_id, 0 FROM source RETURNING id) SELECT id FROM inserted",
+                7,
+            ),
+            (
+                "WITH source AS (INSERT INTO cte_lock_helper VALUES (10) RETURNING abs(id - 9) AS parent_id), inserted AS (INSERT INTO cte_lock_children SELECT 10, source.parent_id, 0 FROM source RETURNING id) SELECT id FROM inserted",
+                10,
+            ),
+            (
+                "WITH source AS (UPDATE cte_lock_helper SET id = id WHERE id = 6 RETURNING id - 5 AS parent_id), inserted AS (INSERT INTO cte_lock_children SELECT 8, source.parent_id, 0 FROM source RETURNING id) SELECT id FROM inserted",
+                8,
+            ),
+            (
+                "WITH source AS (DELETE FROM cte_lock_helper WHERE id = 7 RETURNING id - 6 AS parent_id), inserted AS (INSERT INTO cte_lock_children SELECT 9, source.parent_id, 0 FROM source RETURNING id) SELECT id FROM inserted",
+                9,
+            ),
+        ] {
+            assert_eq!(
+                writer
+                    .query(query, &[])
+                    .unwrap_or_else(|error| panic!("{query}: {error:?}"))
+                    .rows,
+                vec![vec![Value::Int4(expected)]],
+                "{query}"
+            );
+        }
+        holder.execute("ROLLBACK").unwrap();
+    }
+
+    #[test]
+    #[cfg_attr(feature = "execution-log", tracing::instrument(skip_all))]
+    fn acquires_forward_and_unprepared_cte_mutation_locks() {
+        let db = Db::create();
+        let mut session = db.create_session();
+        session
+            .execute(
+                r#"
+                CREATE SEQUENCE cte_source_ids;
+                CREATE TABLE cte_source (id INTEGER PRIMARY KEY, value INTEGER);
+                CREATE TABLE cte_parents (id INTEGER PRIMARY KEY);
+                CREATE TABLE cte_children (
+                    id INTEGER PRIMARY KEY,
+                    parent_id INTEGER REFERENCES cte_parents,
+                    value INTEGER
+                );
+                CREATE FUNCTION preserve_cte_child() RETURNS TRIGGER AS $$
+                BEGIN RETURN NEW; END;
+                $$ LANGUAGE plpgsql;
+                CREATE TRIGGER preserve_cte_child
+                    BEFORE INSERT OR UPDATE ON cte_children
+                    FOR EACH ROW EXECUTE FUNCTION preserve_cte_child();
+                INSERT INTO cte_parents VALUES (1);
+                INSERT INTO cte_source VALUES (1, 0), (4, 0);
+                INSERT INTO cte_children VALUES (1, 1, 0), (3, 1, 0), (4, 1, 0);
+                "#,
+            )
+            .unwrap();
+        session
+            .execute("BEGIN; SET LOCAL statement_timeout = '1s'")
+            .unwrap();
+
+        assert_eq!(
+            session
+                .query(
+                    "WITH RECURSIVE inserted AS (INSERT INTO cte_children SELECT source.id + 1, 1, 0 FROM source RETURNING id), source AS (UPDATE cte_source SET value = value + 1 WHERE id = 1 RETURNING id) SELECT id FROM inserted",
+                    &[],
+                )
+                .unwrap()
+                .rows,
+            vec![vec![Value::Int4(2)]]
+        );
+        assert_eq!(
+            session
+                .query(
+                    "WITH source AS (INSERT INTO cte_source VALUES (2, 0) RETURNING nextval('cte_source_ids')::INTEGER AS id), updated AS (UPDATE cte_children SET value = value + 1 FROM source WHERE cte_children.id = source.id RETURNING cte_children.id) SELECT id FROM updated",
+                    &[],
+                )
+                .unwrap()
+                .rows,
+            vec![vec![Value::Int4(1)]]
+        );
+        assert_eq!(
+            session
+                .query(
+                    "WITH source AS (INSERT INTO cte_source VALUES (3, 0) ON CONFLICT DO NOTHING RETURNING id), updated AS (UPDATE cte_children SET value = value + 1 FROM source WHERE cte_children.id = source.id RETURNING cte_children.id) SELECT id FROM updated",
+                    &[],
+                )
+                .unwrap()
+                .rows,
+            vec![vec![Value::Int4(3)]]
+        );
+        assert_eq!(
+            session
+                .query(
+                    "WITH source AS (INSERT INTO cte_source VALUES (6, 0) RETURNING nextval('cte_source_ids')::INTEGER AS id), first_update AS (UPDATE cte_children SET value = 5 FROM source WHERE cte_children.id = source.id RETURNING cte_children.id), second_update AS (UPDATE cte_children SET value = 10 WHERE id = 4 RETURNING id) SELECT first_update.id, second_update.id FROM first_update CROSS JOIN second_update",
+                    &[],
+                )
+                .unwrap()
+                .rows,
+            vec![vec![Value::Int4(2), Value::Int4(4)]]
+        );
+        assert_eq!(
+            session
+                .query(
+                    "WITH RECURSIVE inserted AS (INSERT INTO cte_children SELECT source.id + 1, 1, 0 FROM source RETURNING id), source AS (DELETE FROM cte_source WHERE id = 4 RETURNING id) SELECT id FROM inserted",
+                    &[],
+                )
+                .unwrap()
+                .rows,
+            vec![vec![Value::Int4(5)]]
+        );
+        session.execute("COMMIT").unwrap();
+    }
+
+    #[test]
+    #[cfg_attr(feature = "execution-log", tracing::instrument(skip_all))]
+    fn keeps_prepared_trigger_rows_bound_to_their_cte_occurrence() {
+        let db = Db::create();
+        let mut session = db.create_session();
+        session
+            .execute(
+                r#"
+                CREATE SEQUENCE update_source_ids;
+                CREATE SEQUENCE insert_source_ids;
+                CREATE TABLE cache_parents (id INTEGER PRIMARY KEY);
+                CREATE TABLE cache_source (id INTEGER PRIMARY KEY);
+                CREATE TABLE cache_children (
+                    id INTEGER PRIMARY KEY,
+                    parent_id INTEGER REFERENCES cache_parents,
+                    value INTEGER
+                );
+                CREATE FUNCTION preserve_cache_child() RETURNS TRIGGER AS $$
+                BEGIN RETURN NEW; END;
+                $$ LANGUAGE plpgsql;
+                CREATE TRIGGER preserve_cache_child
+                    BEFORE INSERT OR UPDATE ON cache_children
+                    FOR EACH ROW EXECUTE FUNCTION preserve_cache_child();
+                INSERT INTO cache_parents VALUES (1);
+                INSERT INTO cache_children VALUES (1, 1, 0), (2, 1, 0);
+                "#,
+            )
+            .unwrap();
+
+        assert_eq!(
+            session
+                .query(
+                    "WITH source AS (INSERT INTO cache_source VALUES (1) RETURNING nextval('update_source_ids')::INTEGER AS id), first_update AS (UPDATE cache_children SET value = 5 FROM source WHERE cache_children.id = source.id RETURNING cache_children.id), second_update AS (UPDATE cache_children SET value = 10 WHERE id = 2 RETURNING id) SELECT first_update.id, second_update.id FROM first_update CROSS JOIN second_update",
+                    &[],
+                )
+                .unwrap()
+                .rows,
+            vec![vec![Value::Int4(1), Value::Int4(2)]]
+        );
+        session
+            .execute("DELETE FROM cache_children; DELETE FROM cache_source")
+            .unwrap();
+        assert_eq!(
+            session
+                .query(
+                    "WITH source AS (INSERT INTO cache_source VALUES (2) RETURNING nextval('insert_source_ids')::INTEGER AS id), first_insert AS (INSERT INTO cache_children SELECT source.id, 1, 5 FROM source RETURNING id), second_insert AS (INSERT INTO cache_children VALUES (2, 1, 10) RETURNING id) SELECT first_insert.id, second_insert.id FROM first_insert CROSS JOIN second_insert",
+                    &[],
+                )
+                .unwrap()
+                .rows,
+            vec![vec![Value::Int4(1), Value::Int4(2)]]
+        );
+    }
+
+    #[test]
+    #[cfg_attr(feature = "execution-log", tracing::instrument(skip_all))]
+    fn locks_only_rows_resolved_by_staged_cte_mutations() {
+        let db = Db::create_builder()
+            .set_lock_timeout(Duration::from_millis(40))
+            .build();
+        let mut holder = db.create_session();
+        let mut writer = db.create_session();
+        holder
+            .execute(
+                r#"
+                CREATE SEQUENCE staged_parent_ids;
+                CREATE TABLE staged_parents (id INTEGER PRIMARY KEY, value INTEGER);
+                CREATE TABLE staged_source (id INTEGER PRIMARY KEY);
+                CREATE TABLE staged_children (
+                    id INTEGER PRIMARY KEY,
+                    parent_id INTEGER REFERENCES staged_parents,
+                    value INTEGER
+                );
+                CREATE FUNCTION preserve_staged_child() RETURNS TRIGGER AS $$
+                BEGIN RETURN NEW; END;
+                $$ LANGUAGE plpgsql;
+                CREATE TRIGGER preserve_staged_child
+                    BEFORE INSERT OR UPDATE ON staged_children
+                    FOR EACH ROW EXECUTE FUNCTION preserve_staged_child();
+                INSERT INTO staged_parents VALUES (1, 0), (2, 0);
+                INSERT INTO staged_children VALUES (1, 1, 0), (2, 1, 0);
+                "#,
+            )
+            .unwrap();
+        holder.execute("BEGIN").unwrap();
+        holder
+            .execute(
+                "UPDATE staged_parents SET value = 1 WHERE id = 2; UPDATE staged_children SET value = 1 WHERE id = 2",
+            )
+            .unwrap();
+
+        assert_eq!(
+            writer
+                .query(
+                    "WITH source AS (INSERT INTO staged_source VALUES (10) RETURNING nextval('staged_parent_ids')::INTEGER AS parent_id), inserted AS (INSERT INTO staged_children SELECT 3, source.parent_id, 0 FROM source RETURNING id) SELECT id FROM inserted",
+                    &[],
+                )
+                .unwrap()
+                .rows,
+            vec![vec![Value::Int4(3)]]
+        );
+        assert_eq!(
+            writer
+                .query(
+                    "WITH source AS (INSERT INTO staged_source VALUES (1) ON CONFLICT DO NOTHING RETURNING id), updated AS (UPDATE staged_children SET parent_id = 1 FROM source WHERE staged_children.id = source.id RETURNING staged_children.id) SELECT id FROM updated",
+                    &[],
+                )
+                .unwrap()
+                .rows,
+            vec![vec![Value::Int4(1)]]
+        );
+        assert_eq!(
+            writer
+                .query(
+                    "WITH source AS (INSERT INTO staged_source VALUES (11) RETURNING id - 10 AS id, nextval('staged_parent_ids') AS consumed), deleted AS (DELETE FROM staged_children USING source WHERE staged_children.id = source.id RETURNING staged_children.id) SELECT id FROM deleted",
+                    &[],
+                )
+                .unwrap()
+                .rows,
+            vec![vec![Value::Int4(1)]]
+        );
+        holder.execute("ROLLBACK").unwrap();
+    }
+
+    #[test]
+    #[cfg_attr(feature = "execution-log", tracing::instrument(skip_all))]
     fn resolves_a_cte_self_name_to_an_existing_table() {
         let db = Db::create();
         let mut session = db.create_session();
@@ -9384,6 +13012,751 @@ mod tests {
             vec![vec![Value::Int4(3), Value::Int4(2)]]
         );
         handle.join().unwrap();
+    }
+
+    #[test]
+    #[cfg_attr(feature = "execution-log", tracing::instrument(skip_all))]
+    fn executes_cte_mutation_dependencies_before_later_returning_expressions() {
+        let db = Db::create();
+        let mut session = db.create_session();
+        session
+            .execute(
+                r#"
+                CREATE SEQUENCE dependency_order_ids;
+                CREATE TABLE dependency_order_source (
+                    id INTEGER PRIMARY KEY,
+                    value INTEGER CHECK (value > 0)
+                );
+                CREATE TABLE dependency_order_middle (id INTEGER);
+                CREATE TABLE dependency_order_target (id BIGINT, value INTEGER);
+                INSERT INTO dependency_order_source VALUES (1, 1);
+                "#,
+            )
+            .unwrap();
+
+        assert_eq!(
+            session
+                .execute(
+                    "WITH bad AS (UPDATE dependency_order_source SET value = 0 WHERE id = 1 RETURNING id), source AS (INSERT INTO dependency_order_middle SELECT id FROM bad RETURNING 1 / 0 AS id), inserted AS (INSERT INTO dependency_order_target SELECT id, 0 FROM source RETURNING id) SELECT * FROM inserted",
+                )
+                .unwrap_err()
+                .sqlstate,
+            SqlState::CheckViolation
+        );
+        assert_eq!(
+            session
+                .execute(
+                    "WITH bad AS (UPDATE dependency_order_source SET value = 0 WHERE id = 1 RETURNING id), source AS (INSERT INTO dependency_order_middle SELECT id FROM bad RETURNING nextval('dependency_order_ids') AS id), inserted AS (INSERT INTO dependency_order_target SELECT id, 0 FROM source RETURNING id) SELECT * FROM inserted",
+                )
+                .unwrap_err()
+                .sqlstate,
+            SqlState::CheckViolation
+        );
+        assert_eq!(
+            session
+                .query("SELECT nextval('dependency_order_ids')", &[])
+                .unwrap()
+                .rows,
+            vec![vec![Value::Int8(1)]]
+        );
+    }
+
+    #[test]
+    #[cfg_attr(feature = "execution-log", tracing::instrument(skip_all))]
+    fn skips_cte_targets_already_mutated_by_the_same_command() {
+        let db = Db::create();
+        let mut session = db.create_session();
+        session
+            .execute("CREATE TABLE repeated_cte_rows (id INTEGER PRIMARY KEY, value INTEGER); INSERT INTO repeated_cte_rows VALUES (1, 1)")
+            .unwrap();
+
+        assert_eq!(
+            session
+                .query(
+                    "WITH first_update AS (UPDATE repeated_cte_rows SET value = 2 WHERE id = 1 RETURNING value), second_update AS (UPDATE repeated_cte_rows SET value = 3 WHERE id = 1 RETURNING value) SELECT first_update.value, (SELECT count(*) FROM second_update) FROM first_update",
+                    &[],
+                )
+                .unwrap()
+                .rows,
+            vec![vec![Value::Int4(2), Value::Int8(0)]]
+        );
+        assert_eq!(
+            session
+                .query(
+                    "WITH first_delete AS (DELETE FROM repeated_cte_rows WHERE id = 1 RETURNING id), second_delete AS (DELETE FROM repeated_cte_rows WHERE id = 1 RETURNING id) SELECT first_delete.id, (SELECT count(*) FROM second_delete) FROM first_delete",
+                    &[],
+                )
+                .unwrap()
+                .rows,
+            vec![vec![Value::Int4(1), Value::Int8(0)]]
+        );
+
+        session
+            .execute(
+                "CREATE TABLE transaction_cte_rows (id BIGINT PRIMARY KEY, value BIGINT); BEGIN; INSERT INTO transaction_cte_rows VALUES (1, 1); UPDATE transaction_cte_rows SET value = 2 WHERE id = 1",
+            )
+            .unwrap();
+        assert_eq!(
+            session
+                .query(
+                    "WITH first_update AS (UPDATE transaction_cte_rows SET value = 3 WHERE id = 1 RETURNING value), second_update AS (UPDATE transaction_cte_rows SET value = 4 WHERE id = 1 RETURNING value) SELECT first_update.value, (SELECT count(*) FROM second_update) FROM first_update",
+                    &[],
+                )
+                .unwrap()
+                .rows,
+            vec![vec![Value::Int8(3), Value::Int8(0)]]
+        );
+        session.execute("COMMIT").unwrap();
+    }
+
+    #[test]
+    #[cfg_attr(feature = "execution-log", tracing::instrument(skip_all))]
+    fn evaluates_volatile_cte_mutation_targets_once() {
+        let db = Db::create();
+        let mut session = db.create_session();
+        session
+            .execute(
+                r#"
+                CREATE SEQUENCE update_target_ids;
+                CREATE SEQUENCE delete_target_ids;
+                CREATE SEQUENCE dependent_target_ids;
+                CREATE TABLE volatile_update_rows (id BIGINT PRIMARY KEY, value BIGINT);
+                CREATE TABLE volatile_delete_rows (id BIGINT PRIMARY KEY, value BIGINT);
+                CREATE TABLE volatile_dependent_rows (id BIGINT PRIMARY KEY, value BIGINT);
+                CREATE TABLE volatile_copies (id BIGINT, value BIGINT);
+                INSERT INTO volatile_update_rows VALUES (1, 0);
+                INSERT INTO volatile_delete_rows VALUES (1, 0);
+                INSERT INTO volatile_dependent_rows VALUES (1, 0);
+                "#,
+            )
+            .unwrap();
+
+        assert_eq!(
+            session
+                .query(
+                    "WITH updated AS (UPDATE volatile_update_rows SET value = 7 WHERE id = nextval('update_target_ids') RETURNING id, value) SELECT * FROM updated",
+                    &[],
+                )
+                .unwrap()
+                .rows,
+            vec![vec![Value::Int8(1), Value::Int8(7)]]
+        );
+        assert_eq!(
+            session
+                .query("SELECT nextval('update_target_ids')", &[])
+                .unwrap()
+                .rows,
+            vec![vec![Value::Int8(2)]]
+        );
+        assert_eq!(
+            session
+                .query(
+                    "UPDATE volatile_update_rows SET value = 8 WHERE id = 1 RETURNING value",
+                    &[],
+                )
+                .unwrap()
+                .rows,
+            vec![vec![Value::Int8(8)]]
+        );
+
+        assert_eq!(
+            session
+                .query(
+                    "WITH deleted AS (DELETE FROM volatile_delete_rows WHERE id = nextval('delete_target_ids') RETURNING id) SELECT * FROM deleted",
+                    &[],
+                )
+                .unwrap()
+                .rows,
+            vec![vec![Value::Int8(1)]]
+        );
+        assert_eq!(
+            session
+                .query("SELECT nextval('delete_target_ids')", &[])
+                .unwrap()
+                .rows,
+            vec![vec![Value::Int8(2)]]
+        );
+
+        assert_eq!(
+            session
+                .query(
+                    "WITH source AS (UPDATE volatile_dependent_rows SET value = 9 WHERE id = nextval('dependent_target_ids') RETURNING id, value), inserted AS (INSERT INTO volatile_copies SELECT * FROM source RETURNING id, value) SELECT * FROM inserted",
+                    &[],
+                )
+                .unwrap()
+                .rows,
+            vec![vec![Value::Int8(1), Value::Int8(9)]]
+        );
+        assert_eq!(
+            session
+                .query("SELECT nextval('dependent_target_ids')", &[])
+                .unwrap()
+                .rows,
+            vec![vec![Value::Int8(2)]]
+        );
+    }
+
+    #[test]
+    #[cfg_attr(feature = "execution-log", tracing::instrument(skip_all))]
+    fn retains_volatile_targets_through_trigger_and_foreign_key_lock_passes() {
+        let db = Db::create();
+        let mut session = db.create_session();
+        session
+            .execute(
+                r#"
+                CREATE SEQUENCE direct_update_targets;
+                CREATE SEQUENCE cte_update_targets;
+                CREATE TABLE volatile_target_parents (id BIGINT PRIMARY KEY);
+                CREATE TABLE volatile_trigger_rows (
+                    id BIGINT PRIMARY KEY,
+                    parent_id BIGINT REFERENCES volatile_target_parents,
+                    value BIGINT
+                );
+                CREATE FUNCTION preserve_volatile_target() RETURNS TRIGGER AS $$
+                BEGIN RETURN NEW; END;
+                $$ LANGUAGE plpgsql;
+                CREATE TRIGGER preserve_volatile_target
+                    BEFORE UPDATE ON volatile_trigger_rows
+                    FOR EACH ROW EXECUTE FUNCTION preserve_volatile_target();
+                INSERT INTO volatile_target_parents VALUES (1);
+                INSERT INTO volatile_trigger_rows VALUES (1, 1, 0);
+                "#,
+            )
+            .unwrap();
+
+        assert_eq!(
+            session
+                .query(
+                    "UPDATE volatile_trigger_rows SET value = 7 WHERE id = nextval('direct_update_targets') RETURNING id, value",
+                    &[],
+                )
+                .unwrap()
+                .rows,
+            vec![vec![Value::Int8(1), Value::Int8(7)]]
+        );
+        assert_eq!(
+            session
+                .query("SELECT nextval('direct_update_targets')", &[])
+                .unwrap()
+                .rows,
+            vec![vec![Value::Int8(2)]]
+        );
+        assert_eq!(
+            session
+                .query(
+                    "WITH updated AS (UPDATE volatile_trigger_rows SET value = 8 WHERE id = nextval('cte_update_targets') RETURNING id, value) SELECT * FROM updated",
+                    &[],
+                )
+                .unwrap()
+                .rows,
+            vec![vec![Value::Int8(1), Value::Int8(8)]]
+        );
+        assert_eq!(
+            session
+                .query("SELECT nextval('cte_update_targets')", &[])
+                .unwrap()
+                .rows,
+            vec![vec![Value::Int8(2)]]
+        );
+    }
+
+    #[test]
+    #[cfg_attr(feature = "execution-log", tracing::instrument(skip_all))]
+    fn evaluates_prepared_trigger_checks_once() {
+        let db = Db::create();
+        let mut session = db.create_session();
+        session
+            .execute(
+                r#"
+                CREATE SEQUENCE prepared_insert_check_values;
+                CREATE SEQUENCE prepared_update_check_values;
+                CREATE TABLE prepared_check_parents (id BIGINT PRIMARY KEY);
+                CREATE TABLE prepared_insert_checks (
+                    id BIGINT CHECK (nextval('prepared_insert_check_values') = 1)
+                );
+                CREATE TABLE prepared_update_checks (
+                    id BIGINT PRIMARY KEY,
+                    parent_id BIGINT REFERENCES prepared_check_parents,
+                    value BIGINT CHECK (nextval('prepared_update_check_values') = 1)
+                );
+                CREATE FUNCTION preserve_prepared_check() RETURNS TRIGGER AS $$
+                BEGIN RETURN NEW; END;
+                $$ LANGUAGE plpgsql;
+                CREATE TRIGGER preserve_prepared_insert_check
+                    BEFORE INSERT ON prepared_insert_checks
+                    FOR EACH ROW EXECUTE FUNCTION preserve_prepared_check();
+                CREATE TRIGGER preserve_prepared_update_check
+                    BEFORE UPDATE ON prepared_update_checks
+                    FOR EACH ROW EXECUTE FUNCTION preserve_prepared_check();
+                INSERT INTO prepared_check_parents VALUES (1);
+                INSERT INTO prepared_update_checks VALUES (1, 1, 0);
+                SELECT setval('prepared_update_check_values', 1, false);
+                "#,
+            )
+            .unwrap();
+
+        session
+            .execute("INSERT INTO prepared_insert_checks VALUES (1)")
+            .unwrap();
+        assert_eq!(
+            session
+                .query("SELECT nextval('prepared_insert_check_values')", &[])
+                .unwrap()
+                .rows,
+            vec![vec![Value::Int8(2)]]
+        );
+        assert_eq!(
+            session
+                .query(
+                    "WITH updated AS (UPDATE prepared_update_checks SET value = 1 RETURNING value) SELECT * FROM updated",
+                    &[],
+                )
+                .unwrap()
+                .rows,
+            vec![vec![Value::Int8(1)]]
+        );
+        assert_eq!(
+            session
+                .query("SELECT nextval('prepared_update_check_values')", &[])
+                .unwrap()
+                .rows,
+            vec![vec![Value::Int8(2)]]
+        );
+    }
+
+    #[test]
+    #[cfg_attr(feature = "execution-log", tracing::instrument(skip_all))]
+    fn evaluates_plain_insert_checks_once() {
+        let db = Db::create();
+        let mut session = db.create_session();
+        session
+            .execute(
+                r#"
+                CREATE SEQUENCE plain_insert_check_values;
+                CREATE TABLE plain_insert_checks (
+                    id BIGINT CHECK (nextval('plain_insert_check_values') = 1)
+                );
+                "#,
+            )
+            .unwrap();
+
+        session
+            .execute("INSERT INTO plain_insert_checks VALUES (1)")
+            .unwrap();
+        assert_eq!(
+            session
+                .query("SELECT nextval('plain_insert_check_values')", &[])
+                .unwrap()
+                .rows,
+            vec![vec![Value::Int8(2)]]
+        );
+    }
+
+    #[test]
+    #[cfg_attr(feature = "execution-log", tracing::instrument(skip_all))]
+    fn interleaves_before_insert_triggers_with_returning() {
+        let db = Db::create();
+        let mut session = db.create_session();
+        session
+            .execute(
+                r#"
+                CREATE SEQUENCE returning_trigger_values;
+                CREATE TABLE returning_trigger_rows (id BIGINT, value BIGINT);
+                CREATE FUNCTION allocate_returning_trigger_value() RETURNS TRIGGER AS $$
+                BEGIN
+                    NEW.value := nextval('returning_trigger_values');
+                    RETURN NEW;
+                END;
+                $$ LANGUAGE plpgsql;
+                CREATE TRIGGER allocate_returning_trigger_value
+                    BEFORE INSERT ON returning_trigger_rows
+                    FOR EACH ROW EXECUTE FUNCTION allocate_returning_trigger_value();
+                "#,
+            )
+            .unwrap();
+
+        assert_eq!(
+            session
+                .query(
+                    "INSERT INTO returning_trigger_rows VALUES (1, 0), (2, 0) RETURNING id, value, nextval('returning_trigger_values')",
+                    &[],
+                )
+                .unwrap()
+                .rows,
+            vec![
+                vec![Value::Int8(1), Value::Int8(1), Value::Int8(2)],
+                vec![Value::Int8(2), Value::Int8(3), Value::Int8(4)],
+            ]
+        );
+        assert_eq!(
+            session
+                .query(
+                    "SELECT id, value FROM returning_trigger_rows ORDER BY id",
+                    &[],
+                )
+                .unwrap()
+                .rows,
+            vec![
+                vec![Value::Int8(1), Value::Int8(1)],
+                vec![Value::Int8(2), Value::Int8(3)],
+            ]
+        );
+
+        session
+            .execute(
+                r#"
+                CREATE SEQUENCE failing_returning_trigger_values;
+                CREATE TABLE failing_returning_trigger_rows (id BIGINT, value BIGINT);
+                CREATE FUNCTION allocate_failing_returning_trigger_value() RETURNS TRIGGER AS $$
+                BEGIN
+                    NEW.value := nextval('failing_returning_trigger_values');
+                    RETURN NEW;
+                END;
+                $$ LANGUAGE plpgsql;
+                CREATE TRIGGER allocate_failing_returning_trigger_value
+                    BEFORE INSERT ON failing_returning_trigger_rows
+                    FOR EACH ROW EXECUTE FUNCTION allocate_failing_returning_trigger_value();
+                "#,
+            )
+            .unwrap();
+        assert_eq!(
+            session
+                .execute(
+                    "INSERT INTO failing_returning_trigger_rows VALUES (1, 0), (2, 0) RETURNING 1 / (id - 1)",
+                )
+                .unwrap_err()
+                .sqlstate,
+            SqlState::DivisionByZero
+        );
+        assert_eq!(
+            session
+                .query("SELECT nextval('failing_returning_trigger_values')", &[])
+                .unwrap()
+                .rows,
+            vec![vec![Value::Int8(2)]]
+        );
+        assert!(
+            session
+                .query("SELECT * FROM failing_returning_trigger_rows", &[])
+                .unwrap()
+                .rows
+                .is_empty()
+        );
+    }
+
+    #[test]
+    #[cfg_attr(feature = "execution-log", tracing::instrument(skip_all))]
+    fn interleaves_before_insert_triggers_with_conflict_handling() {
+        let db = Db::create();
+        let mut session = db.create_session();
+        session
+            .execute(
+                r#"
+                CREATE SEQUENCE conflict_nothing_values;
+                CREATE TABLE conflict_nothing_rows (id BIGINT PRIMARY KEY, value BIGINT);
+                INSERT INTO conflict_nothing_rows VALUES (2, 0);
+                CREATE FUNCTION allocate_conflict_nothing_value() RETURNS TRIGGER AS $$
+                BEGIN NEW.value := nextval('conflict_nothing_values'); RETURN NEW; END;
+                $$ LANGUAGE plpgsql;
+                CREATE TRIGGER allocate_conflict_nothing_value
+                    BEFORE INSERT ON conflict_nothing_rows
+                    FOR EACH ROW EXECUTE FUNCTION allocate_conflict_nothing_value();
+                "#,
+            )
+            .unwrap();
+        assert_eq!(
+            session
+                .query(
+                    "INSERT INTO conflict_nothing_rows VALUES (1, 0), (2, 0), (3, 0) ON CONFLICT DO NOTHING RETURNING id, value, nextval('conflict_nothing_values')",
+                    &[],
+                )
+                .unwrap()
+                .rows,
+            vec![
+                vec![Value::Int8(1), Value::Int8(1), Value::Int8(2)],
+                vec![Value::Int8(3), Value::Int8(4), Value::Int8(5)],
+            ]
+        );
+
+        session
+            .execute(
+                r#"
+                CREATE SEQUENCE conflict_update_values;
+                CREATE TABLE conflict_update_rows (id BIGINT PRIMARY KEY, value BIGINT);
+                INSERT INTO conflict_update_rows VALUES (1, 0);
+                CREATE FUNCTION allocate_conflict_update_value() RETURNS TRIGGER AS $$
+                BEGIN NEW.value := nextval('conflict_update_values'); RETURN NEW; END;
+                $$ LANGUAGE plpgsql;
+                CREATE TRIGGER allocate_conflict_update_value
+                    BEFORE INSERT OR UPDATE ON conflict_update_rows
+                    FOR EACH ROW EXECUTE FUNCTION allocate_conflict_update_value();
+                "#,
+            )
+            .unwrap();
+        assert_eq!(
+            session
+                .query(
+                    "WITH inserted AS (INSERT INTO conflict_update_rows VALUES (1, 0), (2, 0) ON CONFLICT (id) DO UPDATE SET value = excluded.value RETURNING id, value, nextval('conflict_update_values')) SELECT * FROM inserted",
+                    &[],
+                )
+                .unwrap()
+                .rows,
+            vec![
+                vec![Value::Int8(1), Value::Int8(2), Value::Int8(3)],
+                vec![Value::Int8(2), Value::Int8(4), Value::Int8(5)],
+            ]
+        );
+        assert_eq!(
+            session
+                .query(
+                    "SELECT id, value FROM conflict_update_rows ORDER BY id",
+                    &[],
+                )
+                .unwrap()
+                .rows,
+            vec![
+                vec![Value::Int8(1), Value::Int8(2)],
+                vec![Value::Int8(2), Value::Int8(4)],
+            ]
+        );
+
+        session
+            .execute(
+                r#"
+                CREATE SEQUENCE failing_conflict_values;
+                CREATE TABLE failing_conflict_rows (
+                    id BIGINT PRIMARY KEY,
+                    value BIGINT CHECK (value > 0)
+                );
+                INSERT INTO failing_conflict_rows VALUES (1, 1);
+                CREATE FUNCTION allocate_failing_conflict_value() RETURNS TRIGGER AS $$
+                BEGIN NEW.value := nextval('failing_conflict_values'); RETURN NEW; END;
+                $$ LANGUAGE plpgsql;
+                CREATE TRIGGER allocate_failing_conflict_value
+                    BEFORE INSERT ON failing_conflict_rows
+                    FOR EACH ROW EXECUTE FUNCTION allocate_failing_conflict_value();
+                "#,
+            )
+            .unwrap();
+        assert_eq!(
+            session
+                .execute(
+                    "INSERT INTO failing_conflict_rows VALUES (1, 0), (2, 0) ON CONFLICT (id) DO UPDATE SET value = 0 RETURNING id, value",
+                )
+                .unwrap_err()
+                .sqlstate,
+            SqlState::CheckViolation
+        );
+        assert_eq!(
+            session
+                .query("SELECT nextval('failing_conflict_values')", &[])
+                .unwrap()
+                .rows,
+            vec![vec![Value::Int8(2)]]
+        );
+
+        session
+            .execute(
+                r#"
+                CREATE TABLE cte_conflict_rows (id BIGINT PRIMARY KEY);
+                CREATE FUNCTION preserve_cte_conflict_row() RETURNS TRIGGER AS $$
+                BEGIN RETURN NEW; END;
+                $$ LANGUAGE plpgsql;
+                CREATE TRIGGER preserve_cte_conflict_row
+                    BEFORE INSERT ON cte_conflict_rows
+                    FOR EACH ROW EXECUTE FUNCTION preserve_cte_conflict_row();
+                "#,
+            )
+            .unwrap();
+        assert_eq!(
+            session
+                .query(
+                    "WITH first_insert AS (INSERT INTO cte_conflict_rows VALUES (1) RETURNING id), second_insert AS (INSERT INTO cte_conflict_rows VALUES (1) ON CONFLICT DO NOTHING RETURNING id) SELECT first_insert.id, (SELECT count(*) FROM second_insert) FROM first_insert",
+                    &[],
+                )
+                .unwrap()
+                .rows,
+            vec![vec![Value::Int8(1), Value::Int8(0)]]
+        );
+
+        session
+            .execute(
+                r#"
+                CREATE SEQUENCE cte_conflict_returning_values;
+                CREATE TABLE volatile_cte_conflict_rows (id BIGINT PRIMARY KEY);
+                CREATE TRIGGER preserve_volatile_cte_conflict_row
+                    BEFORE INSERT ON volatile_cte_conflict_rows
+                    FOR EACH ROW EXECUTE FUNCTION preserve_cte_conflict_row();
+                "#,
+            )
+            .unwrap();
+        assert_eq!(
+            session
+                .query(
+                    "WITH first_insert AS (INSERT INTO volatile_cte_conflict_rows VALUES (1) RETURNING id), second_insert AS (INSERT INTO volatile_cte_conflict_rows VALUES (1) ON CONFLICT DO NOTHING RETURNING nextval('cte_conflict_returning_values')) SELECT first_insert.id, (SELECT count(*) FROM second_insert) FROM first_insert",
+                    &[],
+                )
+                .unwrap()
+                .rows,
+            vec![vec![Value::Int8(1), Value::Int8(0)]]
+        );
+        assert_eq!(
+            session
+                .query("SELECT nextval('cte_conflict_returning_values')", &[])
+                .unwrap()
+                .rows,
+            vec![vec![Value::Int8(1)]]
+        );
+
+        session
+            .execute(
+                r#"
+                CREATE SEQUENCE mixed_cte_conflict_returning_values;
+                CREATE TABLE mixed_cte_conflict_source (id BIGINT PRIMARY KEY);
+                CREATE TABLE mixed_cte_conflict_rows (id BIGINT PRIMARY KEY);
+                INSERT INTO mixed_cte_conflict_source VALUES (1);
+                CREATE TRIGGER preserve_mixed_cte_conflict_row
+                    BEFORE INSERT ON mixed_cte_conflict_rows
+                    FOR EACH ROW EXECUTE FUNCTION preserve_cte_conflict_row();
+                "#,
+            )
+            .unwrap();
+        assert_eq!(
+            session
+                .query(
+                    "WITH first_insert AS (INSERT INTO mixed_cte_conflict_rows SELECT id FROM mixed_cte_conflict_source RETURNING id), second_insert AS (INSERT INTO mixed_cte_conflict_rows VALUES (1) ON CONFLICT DO NOTHING RETURNING nextval('mixed_cte_conflict_returning_values')) SELECT first_insert.id, (SELECT count(*) FROM second_insert) FROM first_insert",
+                    &[],
+                )
+                .unwrap()
+                .rows,
+            vec![vec![Value::Int8(1), Value::Int8(0)]]
+        );
+        assert_eq!(
+            session
+                .query("SELECT nextval('mixed_cte_conflict_returning_values')", &[])
+                .unwrap()
+                .rows,
+            vec![vec![Value::Int8(1)]]
+        );
+
+        session
+            .execute(
+                r#"
+                CREATE SEQUENCE failing_cte_returning_values;
+                CREATE TABLE failing_cte_returning_rows (id BIGINT PRIMARY KEY);
+                CREATE TRIGGER preserve_failing_cte_returning_row
+                    BEFORE INSERT ON failing_cte_returning_rows
+                    FOR EACH ROW EXECUTE FUNCTION preserve_cte_conflict_row();
+                "#,
+            )
+            .unwrap();
+        assert_eq!(
+            session
+                .query(
+                    "WITH first_insert AS (INSERT INTO failing_cte_returning_rows VALUES (1) RETURNING 1 / (id - 1) AS id), second_insert AS (INSERT INTO failing_cte_returning_rows VALUES (2) RETURNING nextval('failing_cte_returning_values') AS id) SELECT first_insert.id, second_insert.id FROM first_insert CROSS JOIN second_insert",
+                    &[],
+                )
+                .unwrap_err()
+                .sqlstate,
+            SqlState::DivisionByZero
+        );
+        assert_eq!(
+            session
+                .query("SELECT nextval('failing_cte_returning_values')", &[])
+                .unwrap()
+                .rows,
+            vec![vec![Value::Int8(1)]]
+        );
+    }
+
+    #[test]
+    #[cfg_attr(feature = "execution-log", tracing::instrument(skip_all))]
+    fn rejects_stale_repeatable_read_cte_mutation_targets() {
+        for mutation in [
+            "WITH changed AS (UPDATE stale_cte_rows SET value = value + 1 WHERE id = 1 RETURNING value) SELECT * FROM changed",
+            "WITH changed AS (DELETE FROM stale_cte_rows WHERE id = 1 RETURNING value) SELECT * FROM changed",
+        ] {
+            let db = Db::create();
+            let mut writer = db.create_session();
+            let mut reader = db.create_session();
+            writer
+                .execute(
+                    "CREATE TABLE stale_cte_rows (id INTEGER PRIMARY KEY, value INTEGER); INSERT INTO stale_cte_rows VALUES (1, 1)",
+                )
+                .unwrap();
+            reader
+                .execute("BEGIN ISOLATION LEVEL REPEATABLE READ")
+                .unwrap();
+            reader.query("SELECT * FROM stale_cte_rows", &[]).unwrap();
+            writer
+                .execute("UPDATE stale_cte_rows SET value = 2 WHERE id = 1")
+                .unwrap();
+
+            assert_eq!(
+                reader.execute(mutation).unwrap_err().sqlstate,
+                SqlState::SerializationFailure,
+                "{mutation}"
+            );
+            reader.execute("ROLLBACK").unwrap();
+        }
+    }
+
+    #[test]
+    #[cfg_attr(feature = "execution-log", tracing::instrument(skip_all))]
+    fn validates_prepared_cte_updates_before_evaluating_later_rows() {
+        let db = Db::create();
+        let mut session = db.create_session();
+        session
+            .execute(
+                r#"
+                CREATE SEQUENCE prepared_update_values;
+                CREATE TABLE prepared_update_parents (id BIGINT PRIMARY KEY);
+                CREATE TABLE prepared_update_rows (
+                    id BIGINT PRIMARY KEY,
+                    parent_id BIGINT REFERENCES prepared_update_parents,
+                    value BIGINT
+                );
+                INSERT INTO prepared_update_parents VALUES (1);
+                INSERT INTO prepared_update_rows VALUES (1, 1, 0), (2, 1, 0), (3, 1, 0);
+                "#,
+            )
+            .unwrap();
+
+        assert_eq!(
+            session
+                .execute(
+                    "WITH updated AS (UPDATE prepared_update_rows SET id = 3, value = 1 / (2 - id) WHERE id < 3 RETURNING id) SELECT * FROM updated",
+                )
+                .unwrap_err()
+                .sqlstate,
+            SqlState::UniqueViolation
+        );
+        assert_eq!(
+            session
+                .execute(
+                    "WITH updated AS (UPDATE prepared_update_rows SET id = 3, value = nextval('prepared_update_values') WHERE id < 3 RETURNING id) SELECT * FROM updated",
+                )
+                .unwrap_err()
+                .sqlstate,
+            SqlState::UniqueViolation
+        );
+        assert_eq!(
+            session
+                .query("SELECT nextval('prepared_update_values')", &[])
+                .unwrap()
+                .rows,
+            vec![vec![Value::Int8(2)]]
+        );
+        assert_eq!(
+            session
+                .query(
+                    "WITH updated AS (UPDATE prepared_update_rows SET id = CASE WHEN id = 1 THEN 4 ELSE 1 END WHERE id < 3 RETURNING id) SELECT * FROM updated",
+                    &[],
+                )
+                .unwrap()
+                .rows,
+            vec![vec![Value::Int8(4)], vec![Value::Int8(1)]]
+        );
     }
 
     #[test]

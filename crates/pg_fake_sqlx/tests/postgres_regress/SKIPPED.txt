@@ -19,7 +19,7 @@ collate:1
 comments:7
 constraints:3
 conversion:2
-copy2:2
+copy2:3
 copy:2
 copydml:7
 copyencoding:4

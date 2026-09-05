@@ -431,6 +431,20 @@ impl Table {
             })
     }
 
+    pub(crate) fn rows_have_unique_conflict(
+        &self,
+        left: &Row,
+        right: &Row,
+        context: &StatementExecutionContext,
+    ) -> bool {
+        self.indexes.iter().any(|index| {
+            matches_index_predicate(&self.schema, index, left, context)
+                && matches_index_predicate(&self.schema, index, right, context)
+                && build_row_index_key(&self.schema, index, left)
+                    .is_some_and(|key| build_row_index_key(&self.schema, index, right) == Some(key))
+        })
+    }
+
     #[cfg_attr(feature = "execution-log", tracing::instrument(skip_all))]
     pub(crate) fn find_visible_unique_conflict(
         &self,
@@ -578,6 +592,44 @@ impl Table {
                 find_visible_version(chain, snapshot, current_xid, transactions)
             })?;
             (build_row_index_key(&self.schema, index, &version.row).as_ref() == Some(&key))
+                .then_some(*row_id)
+        })
+    }
+
+    pub(crate) fn find_unique_candidate_row(
+        &self,
+        columns: &[usize],
+        values: &[Value],
+        current_xid: Xid,
+        transactions: &TransactionRegistry,
+    ) -> Option<RowId> {
+        let index = self
+            .indexes
+            .iter()
+            .find(|index| index.columns == columns && index.predicate.is_none())?;
+        let key = build_index_key(&self.schema, columns, values)?;
+        index.entries.get(&key)?.iter().find_map(|row_id| {
+            self.version_chains
+                .chains
+                .get(row_id)?
+                .versions
+                .iter()
+                .rev()
+                .any(|version| {
+                    version.xmin != current_xid
+                        && !matches!(
+                            transactions.get_status(version.xmin),
+                            Some(TransactionStatus::Aborted)
+                        )
+                        && version.xmax.is_none_or(|xmax| {
+                            !matches!(
+                                transactions.get_status(xmax),
+                                Some(TransactionStatus::Committed(_))
+                            )
+                        })
+                        && build_row_index_key(&self.schema, index, &version.row).as_ref()
+                            == Some(&key)
+                })
                 .then_some(*row_id)
         })
     }

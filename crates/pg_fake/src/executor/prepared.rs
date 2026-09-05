@@ -76,6 +76,15 @@ impl PreparedExpression {
             Self::NullTest { expression, .. } => expression.has_column(),
         }
     }
+
+    pub(super) fn is_constant(&self) -> bool {
+        match self {
+            Self::Literal { .. } => true,
+            Self::Column { .. } | Self::Parameter { .. } => false,
+            Self::Binary { left, right, .. } => left.is_constant() && right.is_constant(),
+            Self::NullTest { expression, .. } => expression.is_constant(),
+        }
+    }
 }
 
 pub(crate) fn build_prepared_query_plan(
@@ -550,6 +559,13 @@ pub(super) fn evaluate_prepared_expression(
             ..
         } => {
             let left_value = evaluate_prepared_expression(left, row, parameters, deadline)?;
+            if matches!(
+                (operator, &left_value),
+                (ast::BinaryOperator::And, Value::Bool(false))
+                    | (ast::BinaryOperator::Or, Value::Bool(true))
+            ) {
+                return Ok(left_value);
+            }
             let right_value = evaluate_prepared_expression(right, row, parameters, deadline)?;
             match operator {
                 ast::BinaryOperator::Eq

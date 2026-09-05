@@ -546,6 +546,29 @@ pub const FEATURES: &[Feature] = &[
         ],
     },
     Feature {
+        name: "procedural migrations and triggers",
+        cases: &[
+            Case {
+                id: "before_insert_trigger",
+                source: "triggers.sql:29 plus focused migration fixture",
+                setup: &[
+                    "CREATE TABLE phase3_trigger_items (id INTEGER, value BIGINT NOT NULL)",
+                    "CREATE FUNCTION phase3_trigger_increment() RETURNS TRIGGER AS $$ BEGIN NEW.value := NEW.value + 1; RETURN NEW; END; $$ LANGUAGE plpgsql",
+                    "CREATE TRIGGER phase3_trigger_increment BEFORE INSERT ON phase3_trigger_items FOR EACH ROW EXECUTE FUNCTION phase3_trigger_increment()",
+                ],
+                sql: "INSERT INTO phase3_trigger_items VALUES (1, 4) RETURNING value",
+                blocker: BlockerKind::Implementation,
+            },
+            Case {
+                id: "anonymous_do_control_flow",
+                source: "focused procedural migration fixture",
+                setup: &["CREATE TABLE phase3_do_results (value BIGINT, message TEXT)"],
+                sql: "DO $$ DECLARE affected BIGINT := 1; message TEXT := 'ready'; BEGIN SELECT affected, message INTO affected, message; IF affected = 1 AND message IS NOT NULL THEN INSERT INTO phase3_do_results VALUES (affected, message); ELSIF affected IS NULL THEN UPDATE phase3_do_results SET value = 2; ELSE DELETE FROM phase3_do_results; END IF; GET DIAGNOSTICS affected = ROW_COUNT; END; $$",
+                blocker: BlockerKind::Implementation,
+            },
+        ],
+    },
+    Feature {
         name: "SELECT row locks",
         cases: &[Case {
             id: "no_key_update_nowait",

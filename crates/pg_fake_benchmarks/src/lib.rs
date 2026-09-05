@@ -38,6 +38,11 @@ pub fn list_benchmarks() -> Vec<Benchmark> {
             postgres_comparisons(),
         ),
         build_benchmark(
+            "procedural_trigger_insert_update",
+            postgres_values(),
+            postgres_comparisons(),
+        ),
+        build_benchmark(
             "alter_table_rewrite_100_rows",
             postgres_values(),
             postgres_comparisons(),

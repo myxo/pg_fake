@@ -25,20 +25,188 @@ pub(crate) fn collect_required_cte_row_locks(
         return Ok(Vec::new());
     }
     let reachable = query::collect_reachable_cte_names(query);
+    let cte_names = query
+        .with
+        .as_ref()
+        .map(|with| {
+            with.cte_tables
+                .iter()
+                .map(|cte| normalize_identifier(&cte.alias.name))
+                .collect::<Vec<_>>()
+        })
+        .unwrap_or_default();
     let mut locks = Vec::new();
     if let Some(with) = &query.with {
-        for cte in &with.cte_tables {
-            if !reachable.contains(&normalize_identifier(&cte.alias.name)) {
+        for (cte_index, cte) in with.cte_tables.iter().enumerate() {
+            let name = normalize_identifier(&cte.alias.name);
+            if !reachable.contains(&name)
+                || context
+                    .get_executed_cte_result(cte.alias.name.span, &name)
+                    .is_some()
+            {
                 continue;
             }
-            let statement = query::convert_query_to_statement(cte.query.as_ref().clone());
+            let prepared = query::prepare_cte_mutation_for_locking(
+                state, query, cte_index, xid, snapshot, context,
+            )?;
+            if context.requires_trigger_lock_recheck() {
+                locks.extend(context.take_trigger_lock_recheck_locks());
+                return Ok(locks);
+            }
+            if let Some(pending) = context.get_pending_cte_mutation() {
+                locks.extend(collect_required_cte_row_locks(
+                    state,
+                    &pending.statement,
+                    xid,
+                    snapshot,
+                    context,
+                )?);
+                match &pending.statement {
+                    ast::Statement::Update(update) => locks.extend(
+                        writes::collect_update_cte_locks(state, update, xid, snapshot, context)?,
+                    ),
+                    ast::Statement::Delete(delete) => locks.extend(
+                        writes::collect_delete_cte_locks(state, delete, xid, snapshot, context)?,
+                    ),
+                    _ => locks.extend(collect_required_row_locks(
+                        state,
+                        &pending.statement,
+                        xid,
+                        snapshot,
+                        context,
+                    )?),
+                }
+                if context.requires_trigger_lock_recheck() {
+                    locks.extend(context.take_trigger_lock_recheck_locks());
+                }
+                return Ok(locks);
+            }
+            let statement = prepared
+                .unwrap_or_else(|| query::convert_query_to_statement(cte.query.as_ref().clone()));
             locks.extend(collect_required_cte_row_locks(
                 state, &statement, xid, snapshot, context,
             )?);
+            if context.requires_trigger_lock_recheck() {
+                locks.extend(context.take_trigger_lock_recheck_locks());
+                return Ok(locks);
+            }
+            match &statement {
+                ast::Statement::Update(update) => {
+                    locks.extend(writes::collect_update_cte_locks(
+                        state, update, xid, snapshot, context,
+                    )?);
+                    if context.requires_trigger_lock_recheck() {
+                        context.take_trigger_lock_recheck_locks();
+                        return Ok(locks);
+                    }
+                    continue;
+                }
+                ast::Statement::Delete(delete) => {
+                    locks.extend(writes::collect_delete_cte_locks(
+                        state, delete, xid, snapshot, context,
+                    )?);
+                    if context.requires_trigger_lock_recheck() {
+                        context.take_trigger_lock_recheck_locks();
+                        return Ok(locks);
+                    }
+                    continue;
+                }
+                _ => {}
+            }
+            if let ast::Statement::Insert(insert) = &statement {
+                let schema = state
+                    .catalog
+                    .require_named_table(&resolve_insert_table_name(&insert.table)?)?;
+                let mut has_subquery = false;
+                if let Some(source) = &insert.source {
+                    let _ = ast::visit_expressions(source, |expression| {
+                        if matches!(
+                            expression,
+                            ast::Expr::Subquery(_)
+                                | ast::Expr::Exists { .. }
+                                | ast::Expr::InSubquery { .. }
+                        ) {
+                            has_subquery = true;
+                            return std::ops::ControlFlow::Break(());
+                        }
+                        std::ops::ControlFlow::Continue(())
+                    });
+                }
+                let can_prepare = insert.source.as_ref().is_none_or(|source| {
+                    !has_subquery
+                        && (matches!(source.body.as_ref(), ast::SetExpr::Values(_))
+                            || query::collect_cte_references(source, &cte_names).is_empty())
+                });
+                if !schema.triggers.is_empty() && !can_prepare {
+                    locks.extend(collect_triggered_insert_fallback_locks(
+                        state, insert, schema, xid, context,
+                    )?);
+                    continue;
+                }
+            }
             locks.extend(collect_required_row_locks(
                 state, &statement, xid, snapshot, context,
             )?);
+            if context.requires_trigger_lock_recheck() {
+                locks.extend(context.take_trigger_lock_recheck_locks());
+                return Ok(locks);
+            }
         }
+    }
+    Ok(locks)
+}
+
+fn collect_triggered_insert_fallback_locks(
+    state: &DatabaseState,
+    insert: &ast::Insert,
+    schema: &TableSchema,
+    xid: Xid,
+    context: &StatementExecutionContext,
+) -> Result<Vec<RequiredRowLock>> {
+    let mut locks = Vec::new();
+    if writes::resolve_conflict_arbiter(schema, insert.on.as_ref())?.is_some() {
+        let table = state
+            .tables
+            .get(&schema.id)
+            .expect("catalog table must have storage");
+        locks.extend(
+            table
+                .find_unique_candidate_rows(xid, &state.transactions, None, None, context)
+                .into_iter()
+                .map(|row_id| RequiredRowLock {
+                    key: RowLockKey {
+                        table_id: schema.id,
+                        row_id,
+                    },
+                    mode: RowLockMode::Update,
+                    mutation_candidate: None,
+                }),
+        );
+    }
+    for constraint in &schema.constraints {
+        let crate::catalog::Constraint::ForeignKey(foreign_key) = constraint else {
+            continue;
+        };
+        let foreign_schema = state
+            .catalog
+            .require_table_by_id(foreign_key.foreign_table_id)?;
+        let table = state
+            .tables
+            .get(&foreign_schema.id)
+            .expect("catalog table must have storage");
+        locks.extend(
+            table
+                .find_unique_candidate_rows(xid, &state.transactions, None, None, context)
+                .into_iter()
+                .map(|row_id| RequiredRowLock {
+                    key: RowLockKey {
+                        table_id: foreign_schema.id,
+                        row_id,
+                    },
+                    mode: RowLockMode::Share,
+                    mutation_candidate: None,
+                }),
+        );
     }
     Ok(locks)
 }
@@ -55,6 +223,10 @@ pub(crate) fn collect_required_row_locks(
         let name = resolve_insert_table_name(&insert.table)?;
         if state.catalog.require_named_view(&name).is_ok() {
             return Ok(Vec::new());
+        }
+        let schema = state.catalog.require_named_table(&name)?;
+        if !schema.triggers.is_empty() {
+            return collect_triggered_insert_locks(state, insert, schema, xid, snapshot, context);
         }
         let mut locks = collect_insert_foreign_key_locks(state, insert, xid, snapshot, context)?;
         locks.extend(collect_insert_conflict_locks(state, insert, xid, context)?);
@@ -169,75 +341,311 @@ pub(crate) fn collect_required_row_locks(
         .tables
         .get(&schema.id)
         .expect("catalog table must have storage");
-    if let Some((column, value)) =
+    let prepared_targets = match statement {
+        ast::Statement::Update(update) => {
+            context.get_prepared_mutation_targets(update.span(), snapshot.commit_seq)
+        }
+        ast::Statement::Delete(delete) => {
+            context.get_prepared_mutation_targets(delete.span(), snapshot.commit_seq)
+        }
+        _ => None,
+    };
+    let mut locks = if let Some(targets) = &prepared_targets {
+        targets
+            .iter()
+            .map(|target| RequiredRowLock {
+                key: RowLockKey {
+                    table_id: schema.id,
+                    row_id: target.row_id,
+                },
+                mode,
+                mutation_candidate: Some(MutationCandidate {
+                    version_xmin: target.version_xmin,
+                    row: Some(target.current.clone()),
+                }),
+            })
+            .collect()
+    } else if let Some((column, value)) =
         resolve_unique_point_lookup(table, schema, selection, RowScope::Table(schema), context)?
     {
-        let Some((row_id, version)) = table.find_unique_visible_version(
+        match table.find_unique_visible_version(
             &[column],
             &[value],
             snapshot,
             xid,
             &state.transactions,
-        ) else {
-            return Ok(Vec::new());
-        };
-        check_concurrent_update(state, version, xid, snapshot)?;
-        return Ok(vec![RequiredRowLock {
-            key: RowLockKey {
-                table_id: schema.id,
-                row_id,
-            },
-            mode,
-            mutation_candidate: retain_mutation_candidates.then(|| MutationCandidate {
-                version_xmin: version.xmin,
-                row: retain_mutation_row.then(|| version.row.clone()),
-            }),
-        }]);
-    }
-    let bound_scope = bind_target_scope(schema, alias);
-    let prepared_selection = match selection {
-        Some(selection) => prepared::bind_prepared_expression(selection, &bound_scope, &[])?
-            .filter(|expression| expression.get_data_type() == BaseType::Bool),
-        None => None,
-    };
-    table
-        .iterate_version_chains()
-        .try_fold(Vec::new(), |mut locks, (row_id, chain)| {
-            let Some(version) = find_visible_version(chain, snapshot, xid, &state.transactions)
-            else {
-                return Ok(locks);
-            };
-            if let Some(selection) = selection {
-                let value = if let Some(prepared_selection) = &prepared_selection {
-                    prepared::evaluate_prepared_expression(
-                        prepared_selection,
-                        &version.row,
-                        &[],
-                        context.deadline,
-                    )?
-                } else {
-                    evaluate(selection, RowScope::Table(schema), &version.row, context)?
-                };
-                match value {
-                    Value::Bool(true) => {}
-                    Value::Bool(false) | Value::Null => return Ok(locks),
-                    _ => return Ok(locks),
-                }
+        ) {
+            Some((row_id, version)) => {
+                check_concurrent_update(state, version, xid, snapshot)?;
+                vec![RequiredRowLock {
+                    key: RowLockKey {
+                        table_id: schema.id,
+                        row_id,
+                    },
+                    mode,
+                    mutation_candidate: retain_mutation_candidates.then(|| MutationCandidate {
+                        version_xmin: version.xmin,
+                        row: retain_mutation_row.then(|| version.row.clone()),
+                    }),
+                }]
             }
-            check_concurrent_update(state, version, xid, snapshot)?;
-            locks.push(RequiredRowLock {
-                key: RowLockKey {
-                    table_id: schema.id,
-                    row_id,
-                },
-                mode,
-                mutation_candidate: retain_mutation_candidates.then(|| MutationCandidate {
-                    version_xmin: version.xmin,
-                    row: retain_mutation_row.then(|| version.row.clone()),
-                }),
-            });
-            Ok(locks)
+            None => Vec::new(),
+        }
+    } else {
+        let bound_scope = bind_target_scope(schema, alias);
+        let prepared_selection = match selection {
+            Some(selection) => prepared::bind_prepared_expression(selection, &bound_scope, &[])?
+                .filter(|expression| expression.get_data_type() == BaseType::Bool),
+            None => None,
+        };
+        table
+            .iterate_version_chains()
+            .try_fold(Vec::new(), |mut locks, (row_id, chain)| {
+                let Some(version) = find_visible_version(chain, snapshot, xid, &state.transactions)
+                else {
+                    return Ok(locks);
+                };
+                if let Some(selection) = selection {
+                    let value = if let Some(prepared_selection) = &prepared_selection {
+                        prepared::evaluate_prepared_expression(
+                            prepared_selection,
+                            &version.row,
+                            &[],
+                            context.deadline,
+                        )?
+                    } else {
+                        evaluate(selection, RowScope::Table(schema), &version.row, context)?
+                    };
+                    match value {
+                        Value::Bool(true) => {}
+                        Value::Bool(false) | Value::Null => return Ok(locks),
+                        _ => return Ok(locks),
+                    }
+                }
+                check_concurrent_update(state, version, xid, snapshot)?;
+                locks.push(RequiredRowLock {
+                    key: RowLockKey {
+                        table_id: schema.id,
+                        row_id,
+                    },
+                    mode,
+                    mutation_candidate: retain_mutation_candidates.then(|| MutationCandidate {
+                        version_xmin: version.xmin,
+                        row: retain_mutation_row.then(|| version.row.clone()),
+                    }),
+                });
+                Ok(locks)
+            })?
+    };
+    if prepared_targets.is_none() && retain_mutation_candidates {
+        let targets = locks
+            .iter()
+            .map(|required| {
+                let candidate = required.mutation_candidate.as_ref()?;
+                Some(PreparedMutationTarget {
+                    row_id: required.key.row_id,
+                    version_xmin: candidate.version_xmin,
+                    current: candidate.row.clone()?,
+                    bound_row: None,
+                })
+            })
+            .collect::<Option<Vec<_>>>();
+        if let Some(targets) = targets {
+            match statement {
+                ast::Statement::Update(update) => context.set_prepared_mutation_targets(
+                    update.span(),
+                    update.to_string(),
+                    snapshot.commit_seq,
+                    targets,
+                ),
+                ast::Statement::Delete(delete) => context.set_prepared_mutation_targets(
+                    delete.span(),
+                    delete.to_string(),
+                    snapshot.commit_seq,
+                    targets,
+                ),
+                _ => {}
+            }
+        }
+    }
+    if let ast::Statement::Update(update) = statement
+        && schema
+            .constraints
+            .iter()
+            .any(|constraint| matches!(constraint, crate::catalog::Constraint::ForeignKey(_)))
+        && schema.triggers.iter().any(|trigger| {
+            trigger
+                .definition
+                .events
+                .iter()
+                .any(|event| matches!(event, ast::TriggerEvent::Update(_)))
         })
+    {
+        if locks.iter().any(|required| {
+            required.key.table_id == schema.id
+                && !state
+                    .row_locks
+                    .is_held(required.key, xid, RowLockMode::Update)
+        }) {
+            context.request_trigger_lock_recheck();
+            return Ok(locks);
+        }
+        let rows =
+            writes::prepare_triggered_update_rows(state, update, schema, xid, snapshot, context)?;
+        locks.extend(collect_foreign_key_locks_for_rows(
+            state,
+            schema,
+            rows.iter().filter_map(|row| row.updated.as_ref()),
+            xid,
+        )?);
+    }
+    Ok(locks)
+}
+
+fn collect_triggered_insert_locks(
+    state: &DatabaseState,
+    insert: &ast::Insert,
+    schema: &TableSchema,
+    xid: Xid,
+    snapshot: &Snapshot,
+    context: &StatementExecutionContext,
+) -> Result<Vec<RequiredRowLock>> {
+    let column_indexes = writes::resolve_insert_column_indexes(schema, &insert.columns)?;
+    let (rows, preview_conflicts) = writes::preview_triggered_insert_rows(
+        state,
+        insert,
+        schema,
+        &column_indexes,
+        xid,
+        snapshot,
+        context,
+    )?;
+    let mut locks = Vec::new();
+    let mut conflicting_rows = vec![false; rows.len()];
+    if writes::resolve_conflict_arbiter(schema, insert.on.as_ref())?.is_some() {
+        let table = state
+            .tables
+            .get(&schema.id)
+            .expect("catalog table must have storage");
+        for (index, row) in rows.iter().enumerate() {
+            if let Some(row_id) =
+                table.find_conflicting_row(row, xid, &state.transactions, None, None, context)
+            {
+                conflicting_rows[index] = true;
+                locks.push(RequiredRowLock {
+                    key: RowLockKey {
+                        table_id: schema.id,
+                        row_id,
+                    },
+                    mode: RowLockMode::Update,
+                    mutation_candidate: None,
+                });
+            }
+        }
+    }
+    if matches!(
+        insert.on,
+        Some(ast::OnInsert::OnConflict(ast::OnConflict {
+            action: ast::OnConflictAction::DoUpdate(_),
+            ..
+        }))
+    ) && schema
+        .constraints
+        .iter()
+        .any(|constraint| matches!(constraint, crate::catalog::Constraint::ForeignKey(_)))
+        && schema.triggers.iter().any(|trigger| {
+            trigger
+                .definition
+                .events
+                .iter()
+                .any(|event| matches!(event, ast::TriggerEvent::Update(_)))
+        })
+    {
+        if locks.iter().any(|required| {
+            required.key.table_id == schema.id
+                && !state
+                    .row_locks
+                    .is_held(required.key, xid, RowLockMode::Update)
+        }) {
+            context.request_trigger_lock_recheck();
+        } else {
+            locks.extend(collect_foreign_key_locks_for_rows(
+                state,
+                schema,
+                preview_conflicts
+                    .iter()
+                    .filter_map(|update| update.as_ref()?.updated.as_ref()),
+                xid,
+            )?);
+        }
+    }
+    locks.extend(collect_foreign_key_locks_for_rows(
+        state,
+        schema,
+        rows.iter()
+            .enumerate()
+            .filter_map(|(index, row)| (!conflicting_rows[index]).then_some(row)),
+        xid,
+    )?);
+    Ok(locks)
+}
+
+pub(super) fn collect_foreign_key_locks_for_rows<'a>(
+    state: &DatabaseState,
+    schema: &TableSchema,
+    rows: impl Iterator<Item = &'a Vec<Value>>,
+    xid: Xid,
+) -> Result<Vec<RequiredRowLock>> {
+    let rows = rows.collect::<Vec<_>>();
+    let mut locks = Vec::new();
+    for constraint in &schema.constraints {
+        let crate::catalog::Constraint::ForeignKey(foreign_key) = constraint else {
+            continue;
+        };
+        let local = resolve_foreign_key_column_indexes(schema, &foreign_key.columns)?;
+        let foreign_schema = state
+            .catalog
+            .require_table_by_id(foreign_key.foreign_table_id)?;
+        let referred = if foreign_key.referred_columns.is_empty() {
+            foreign_schema
+                .constraints
+                .iter()
+                .find_map(|constraint| match constraint {
+                    crate::catalog::Constraint::PrimaryKey { columns, .. } => Some(columns.clone()),
+                    _ => None,
+                })
+                .expect("foreign key definition was validated")
+        } else {
+            foreign_key.referred_columns.clone()
+        };
+        let referred = resolve_foreign_key_column_indexes(foreign_schema, &referred)?;
+        let table = state
+            .tables
+            .get(&foreign_schema.id)
+            .expect("catalog table must have storage");
+        for row in &rows {
+            let key = local
+                .iter()
+                .map(|index| row[*index].clone())
+                .collect::<Vec<_>>();
+            if key.iter().any(Value::is_null) {
+                continue;
+            }
+            if let Some(row_id) =
+                table.find_unique_candidate_row(&referred, &key, xid, &state.transactions)
+            {
+                locks.push(RequiredRowLock {
+                    key: RowLockKey {
+                        table_id: foreign_schema.id,
+                        row_id,
+                    },
+                    mode: RowLockMode::Share,
+                    mutation_candidate: None,
+                });
+            }
+        }
+    }
+    Ok(locks)
 }
 
 #[cfg_attr(feature = "execution-log", tracing::instrument(skip_all))]
@@ -293,7 +701,7 @@ fn collect_insert_conflict_locks(
         .get(&schema.id)
         .expect("catalog table must have storage");
     let mut locks = Vec::new();
-    let mut needs_fallback = values.is_none() || updates_conflict;
+    let mut needs_fallback = values.is_none() || updates_conflict || !schema.triggers.is_empty();
     for expressions in values.into_iter().flat_map(|values| &values.rows) {
         if expressions.len() != column_indexes.len() {
             continue;
@@ -401,7 +809,7 @@ pub(crate) fn mutation_locks_cover_targets(statement: &ast::Statement) -> bool {
 }
 
 #[cfg_attr(feature = "execution-log", tracing::instrument(skip_all))]
-fn check_concurrent_update(
+pub(super) fn check_concurrent_update(
     state: &DatabaseState,
     version: &crate::storage::RowVersion,
     xid: Xid,
@@ -504,6 +912,34 @@ fn collect_insert_foreign_key_locks(
         .any(|constraint| matches!(constraint, crate::catalog::Constraint::ForeignKey(_)))
     {
         return Ok(Vec::new());
+    }
+    if !schema.triggers.is_empty() {
+        let mut locks = Vec::new();
+        for constraint in &schema.constraints {
+            let crate::catalog::Constraint::ForeignKey(foreign_key) = constraint else {
+                continue;
+            };
+            let foreign_schema = state
+                .catalog
+                .require_table_by_id(foreign_key.foreign_table_id)?;
+            let table = state
+                .tables
+                .get(&foreign_schema.id)
+                .expect("catalog table must have storage");
+            for (row_id, chain) in table.iterate_version_chains() {
+                if find_visible_version(chain, snapshot, xid, &state.transactions).is_some() {
+                    locks.push(RequiredRowLock {
+                        key: RowLockKey {
+                            table_id: foreign_schema.id,
+                            row_id,
+                        },
+                        mode: RowLockMode::Share,
+                        mutation_candidate: None,
+                    });
+                }
+            }
+        }
+        return Ok(locks);
     }
     let Some(source) = &insert.source else {
         return Ok(Vec::new());

@@ -7,7 +7,6 @@ license.workspace = true
 [features]
 default = []
 execution-log = ["dep:tracing"]
-test-support = []
 
 [dependencies]
 bigdecimal = "0.4"

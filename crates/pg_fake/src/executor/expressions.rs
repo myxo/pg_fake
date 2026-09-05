@@ -861,6 +861,13 @@ pub(super) fn evaluate(
             };
             let left =
                 evaluate_and_coerce(left, target, CastContext::Implicit, schema, row, context)?;
+            if matches!(
+                (op, &left),
+                (ast::BinaryOperator::And, Value::Bool(false))
+                    | (ast::BinaryOperator::Or, Value::Bool(true))
+            ) {
+                return Ok(left);
+            }
             let right =
                 evaluate_and_coerce(right, target, CastContext::Implicit, schema, row, context)?;
             match op {

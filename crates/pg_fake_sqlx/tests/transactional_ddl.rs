@@ -598,14 +598,15 @@ fn view_catalog_edge_cases_match_postgres() {
 async fn migration_view_and_trigger_renames_execute_through_sqlx() {
     let db = Db::create();
     let mut connection = PgFakeConnection::new(db.clone());
-    sqlx::raw_sql(AssertSqlSafe("CREATE TABLE migration_source (id INTEGER)"))
-        .execute(&mut connection)
-        .await
-        .unwrap();
-    db.seed_trigger_catalog_for_test(
-        "CREATE TRIGGER migration_audit BEFORE INSERT ON migration_source \
-           FOR EACH ROW EXECUTE FUNCTION migration_audit()",
-    )
+    sqlx::raw_sql(AssertSqlSafe(
+        "CREATE TABLE migration_source (id INTEGER); \
+         CREATE FUNCTION migration_audit() RETURNS TRIGGER AS $$ \
+         BEGIN RETURN NEW; END; $$ LANGUAGE plpgsql; \
+         CREATE TRIGGER migration_audit BEFORE INSERT ON migration_source \
+         FOR EACH ROW EXECUTE FUNCTION migration_audit()",
+    ))
+    .execute(&mut connection)
+    .await
     .unwrap();
     sqlx::raw_sql(AssertSqlSafe(
         "BEGIN; \

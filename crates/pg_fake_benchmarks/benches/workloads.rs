@@ -369,6 +369,54 @@ fn temporary_table_benchmark(
     group.finish();
 }
 
+fn procedural_trigger_benchmark(
+    criterion: &mut Criterion,
+    runtime: &Runtime,
+    connections: &mut [NamedBenchmarkConnection<'_>],
+) {
+    for (_, connection) in connections.iter_mut() {
+        connection.execute(
+            runtime,
+            "CREATE TABLE procedural_trigger_insert_update (id INTEGER PRIMARY KEY, value INTEGER, inserted_value INTEGER, updated_value INTEGER)",
+        );
+        connection.execute(
+            runtime,
+            "CREATE FUNCTION procedural_trigger_insert_update_function() RETURNS TRIGGER LANGUAGE plpgsql AS $$BEGIN IF NEW.inserted_value IS NULL THEN NEW.inserted_value := NEW.value; ELSE NEW.updated_value := NEW.value; END IF; RETURN NEW; END$$",
+        );
+        connection.execute(
+            runtime,
+            "CREATE TRIGGER procedural_trigger_insert_update_trigger BEFORE INSERT OR UPDATE ON procedural_trigger_insert_update FOR EACH ROW EXECUTE FUNCTION procedural_trigger_insert_update_function()",
+        );
+    }
+    let mut group = criterion
+        .benchmark_group(benchmarks::find_benchmark("procedural_trigger_insert_update").name);
+    group.throughput(Throughput::Elements(2));
+    for (name, connection) in connections.iter_mut() {
+        group.bench_function(*name, |benchmark| {
+            benchmark.iter(|| {
+                connection.execute(runtime, "BEGIN");
+                connection.execute(
+                    runtime,
+                    "INSERT INTO procedural_trigger_insert_update VALUES (1, 10, NULL, NULL)",
+                );
+                connection.execute(
+                    runtime,
+                    "UPDATE procedural_trigger_insert_update SET value = 20 WHERE id = 1",
+                );
+                connection.execute(runtime, "ROLLBACK");
+            });
+        });
+    }
+    group.finish();
+    for (_, connection) in connections.iter_mut() {
+        connection.execute(runtime, "DROP TABLE procedural_trigger_insert_update");
+        connection.execute(
+            runtime,
+            "DROP FUNCTION procedural_trigger_insert_update_function()",
+        );
+    }
+}
+
 fn sequence_benchmark(
     criterion: &mut Criterion,
     runtime: &Runtime,
@@ -1273,6 +1321,7 @@ fn benchmarks(criterion: &mut Criterion) {
         create_table_benchmark(criterion, &runtime, &mut connections);
         transactional_ddl_benchmark(criterion, &runtime, &mut connections);
         migration_table_lock_benchmark(criterion, &runtime, &mut connections);
+        procedural_trigger_benchmark(criterion, &runtime, &mut connections);
         alter_table_benchmark(criterion, &runtime, &mut connections);
         partial_unique_index_benchmark(criterion, &runtime, &mut connections);
         temporary_table_benchmark(criterion, &runtime, &mut connections);

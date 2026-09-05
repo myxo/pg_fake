@@ -21,7 +21,7 @@ pub(crate) struct SequenceValueState {
 pub(crate) type SequenceStorage = Arc<Mutex<BTreeMap<SequenceId, SequenceValueState>>>;
 pub(crate) type SequenceSessionStorage = Arc<Mutex<SequenceSessionState>>;
 
-#[derive(Debug, Default)]
+#[derive(Debug, Clone, Default)]
 pub(crate) struct SequenceSessionState {
     current_values: BTreeMap<SequenceId, i64>,
     last_used: Option<SequenceId>,

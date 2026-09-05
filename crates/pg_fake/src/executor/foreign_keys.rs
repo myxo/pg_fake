@@ -178,6 +178,7 @@ pub(super) fn validate_row_foreign_keys(
     snapshot: &Snapshot,
     deferred_constraints: &BTreeSet<ConstraintId>,
     defer_all: bool,
+    pending_rows: &[Vec<Value>],
 ) -> Result<()> {
     let snapshot = snapshot.include_current_command();
     for constraint in &schema.constraints {
@@ -223,12 +224,23 @@ pub(super) fn validate_row_foreign_keys(
         };
         let referred_indexes =
             resolve_foreign_key_column_indexes(foreign_schema, &referred_columns)?;
-        let found = state
+        let table = state
             .tables
             .get(&foreign_schema.id)
-            .expect("catalog table must have storage")
+            .expect("catalog table must have storage");
+        let found = table
             .find_unique_row(&referred_indexes, &key, &snapshot, xid, &state.transactions)
-            .is_some();
+            .is_some()
+            || table
+                .find_unique_candidate_row(&referred_indexes, &key, xid, &state.transactions)
+                .is_some()
+            || foreign_schema.id == schema.id
+                && pending_rows.iter().any(|pending| {
+                    referred_indexes
+                        .iter()
+                        .map(|index| &pending[*index])
+                        .eq(key.iter())
+                });
         if !found {
             return Err(PgError::create(
                 SqlState::ForeignKeyViolation,
@@ -267,6 +279,7 @@ pub(crate) fn validate_deferred_foreign_keys(state: &DatabaseState, xid: Xid) ->
                     &snapshot,
                     &BTreeSet::new(),
                     false,
+                    &[],
                 )?;
             }
         }
@@ -474,6 +487,16 @@ fn apply_cascaded_row_update(
     visited: &mut BTreeSet<(TableId, RowId)>,
     context: &StatementExecutionContext,
 ) -> Result<()> {
+    let Some(updated) = procedural::execute_before_row_triggers(
+        state,
+        schema,
+        procedural::TriggerEventKind::Update,
+        updated,
+        context,
+    )?
+    else {
+        return Ok(());
+    };
     validate_not_null(schema, &updated)?;
     validate_check_constraints(schema, &updated, context)?;
     if state
@@ -521,6 +544,7 @@ fn apply_cascaded_row_update(
         snapshot,
         deferred_constraints,
         defer_all,
+        &[],
     )?;
     apply_referencing_foreign_key_actions(
         state,

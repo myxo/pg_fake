@@ -1254,9 +1254,13 @@ pub(crate) fn create_typed_literal(value: Value, data_type: PgType) -> ast::Expr
             ast::Value::SingleQuotedString(Value::Interval(value).format_postgres_text())
         }
     };
+    create_typed_cast(ast::Expr::Value(literal.into()), data_type)
+}
+
+pub(crate) fn create_typed_cast(expression: ast::Expr, data_type: PgType) -> ast::Expr {
     ast::Expr::Cast {
         kind: ast::CastKind::Cast,
-        expr: Box::new(ast::Expr::Value(literal.into())),
+        expr: Box::new(expression),
         data_type: convert_to_ast_data_type(data_type),
         format: None,
     }

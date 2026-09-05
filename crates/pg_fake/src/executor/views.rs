@@ -1,6 +1,4 @@
 use super::*;
-#[cfg(any(test, feature = "test-support"))]
-use crate::catalog::TriggerSchema;
 use crate::catalog::{ViewColumn, ViewDependency, ViewId, ViewSchema};
 use ast::VisitMut as _;
 
@@ -1339,39 +1337,6 @@ pub(crate) fn execute_comment_on_view(
     Ok(StatementResult::Affected(0))
 }
 
-pub(crate) fn execute_create_trigger(
-    _state: &mut DatabaseState,
-    _create: &ast::CreateTrigger,
-) -> Result<StatementResult> {
-    reject_unsupported("CREATE TRIGGER is not implemented")
-}
-
-#[cfg(any(test, feature = "test-support"))]
-pub(crate) fn seed_trigger_catalog_for_test(
-    state: &mut DatabaseState,
-    create: &ast::CreateTrigger,
-) -> Result<()> {
-    let name = normalize_unqualified_object_name(&create.name)?;
-    let table_name = normalize_relation_name(&create.table_name)?;
-    let mut table = state.catalog.require_named_table(&table_name)?.clone();
-    if table.triggers.iter().any(|trigger| trigger.name == name) {
-        return Err(PgError::create(
-            SqlState::DuplicateObject,
-            format!(
-                "trigger {name:?} for relation {:?} already exists",
-                table.name
-            ),
-        ));
-    }
-    table.triggers.push(TriggerSchema {
-        id: state.catalog.allocate_trigger_id(),
-        name,
-        definition: create.clone(),
-    });
-    state.catalog.replace_table(table)?;
-    Ok(())
-}
-
 pub(crate) fn execute_alter_trigger(
     state: &mut DatabaseState,
     name: &ast::Ident,
@@ -1408,6 +1373,9 @@ pub(crate) fn execute_alter_trigger(
     trigger.name = new_name;
     trigger.definition.name =
         relation_name_to_object_name(RelationName::create_unqualified(trigger.name.clone()));
+    table
+        .triggers
+        .sort_by(|left, right| left.name.cmp(&right.name));
     state.catalog.replace_table(table)?;
     Ok(StatementResult::Affected(0))
 }

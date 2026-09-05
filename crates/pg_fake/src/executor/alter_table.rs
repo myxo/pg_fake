@@ -179,6 +179,7 @@ fn execute_alter_table_inner(
             snapshot,
             deferred_constraints,
             defer_all,
+            &[],
         )?;
         if state
             .tables

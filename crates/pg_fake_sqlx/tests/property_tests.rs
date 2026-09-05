@@ -80,6 +80,10 @@ impl Drop for PostgresCase<'_, '_> {
         let _ = self
             .runtime
             .block_on(sqlx::raw_sql(AssertSqlSafe(sql.as_str())).execute(&mut *self.connection));
+        let sql = format!("DROP FUNCTION IF EXISTS {}_trigger_fn()", self.table);
+        let _ = self
+            .runtime
+            .block_on(sqlx::raw_sql(AssertSqlSafe(sql.as_str())).execute(&mut *self.connection));
     }
 }
 
@@ -1529,6 +1533,88 @@ fn generate_set_operation(src: &mut Source) -> (String, RowOrder) {
     )
 }
 
+#[cfg(test)]
+fn generate_trigger_tree(src: &mut Source, depth: usize) -> String {
+    if depth != 0 && src.any("nested_if") {
+        let pivot = src.any_of("pivot", int_in(-5..=15));
+        let left = generate_trigger_tree(src, depth - 1);
+        let right = generate_trigger_tree(src, depth - 1);
+        format!("IF NEW.value < {pivot} THEN {left} ELSE {right} END IF;")
+    } else {
+        let delta = src.any_of("delta", int_in(-3..=5));
+        format!("NEW.value := NEW.value + {delta};")
+    }
+}
+
+#[cfg(test)]
+fn generate_trigger_function(src: &mut Source, table: &str) -> String {
+    let fallback = src.any_of("fallback", int_in(1..=9));
+    let tree = generate_trigger_tree(src, 2);
+    format!(
+        "CREATE FUNCTION {table}_trigger_fn() RETURNS TRIGGER AS $$ \
+         BEGIN \
+           IF NEW.label IS NULL THEN \
+             RETURN NULL; \
+           ELSIF NEW.value IS NULL THEN \
+             NEW.value := {fallback}; \
+           ELSE \
+             {tree} \
+           END IF; \
+           RETURN NEW; \
+         END; \
+         $$ LANGUAGE plpgsql"
+    )
+}
+
+#[cfg(test)]
+fn generate_do_tree(src: &mut Source, table: &str) -> String {
+    let inserted = src.any_of("inserted", int_in(-5..=15));
+    let delta = src.any_of("update_delta", int_in(-3..=5));
+    let label = if src.any("null_insert_label") {
+        "NULL"
+    } else {
+        "'generated'"
+    };
+    let assignment = if src.any("equals_assignment") {
+        "="
+    } else {
+        ":="
+    };
+    let branch_shift = src.any_of("branch_shift", int_in(0..=2));
+    let nested = if src.any("nested_do_if") {
+        format!(
+            "IF label IS NOT NULL THEN \
+               UPDATE {table} SET value = value + {delta} WHERE id = 3; \
+             ELSE \
+               DELETE FROM {table} WHERE id = 3; \
+             END IF;"
+        )
+    } else {
+        format!("UPDATE {table} SET value = value + {delta} WHERE id = 3;")
+    };
+    format!(
+        "DO $$ \
+         DECLARE \
+           affected BIGINT; \
+           observed BIGINT; \
+           label TEXT := {label}; \
+         BEGIN \
+           INSERT INTO {table} VALUES (3, {inserted}, label); \
+           GET DIAGNOSTICS affected = ROW_COUNT; \
+           observed {assignment} affected + {branch_shift}; \
+           SELECT label, affected INTO label, affected; \
+           IF observed = 1 THEN \
+             {nested} \
+           ELSIF observed = 0 THEN \
+             INSERT INTO {table} VALUES (4, 4, 'fallback'); \
+           ELSE \
+             INSERT INTO {table} VALUES (5, observed, 'else'); \
+           END IF; \
+         END; \
+         $$"
+    )
+}
+
 fn generate_insert(
     src: &mut Source,
     table: &TableSchema,
@@ -1941,6 +2027,65 @@ fn generated_set_operations_match_postgres() {
             &sql,
             order,
         );
+    });
+}
+
+#[test]
+fn generated_procedural_trees_match_postgres() {
+    let _test_lock = TEST_LOCK.lock().expect("test mutex must not be poisoned");
+    let server = start_postgres_server();
+    let runtime = tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()
+        .unwrap();
+    let postgres = RefCell::new(
+        runtime
+            .block_on(PgConnection::connect(&server.url))
+            .expect("must connect SQLx to PostgreSQL 18 once"),
+    );
+    check(|src| {
+        let table = format!(
+            "pg_fake_procedural_property_{}_{}",
+            std::process::id(),
+            TABLE_NUMBER.fetch_add(1, Ordering::Relaxed)
+        );
+        let mut postgres_connection = postgres.borrow_mut();
+        let mut postgres = PostgresCase {
+            connection: &mut postgres_connection,
+            runtime: &runtime,
+            table: table.clone(),
+        };
+        let mut fake = PgFakeConnection::new(Db::create());
+        let function = generate_trigger_function(src, &table);
+        let block = generate_do_tree(src, &table);
+        for (sql, order) in [
+            (
+                format!(
+                    "CREATE TABLE {table} (id BIGINT PRIMARY KEY, value BIGINT NOT NULL, label TEXT)"
+                ),
+                RowOrder::Unordered,
+            ),
+            (function, RowOrder::Unordered),
+            (
+                format!(
+                    "CREATE TRIGGER generated_before BEFORE INSERT OR UPDATE ON {table} \
+                     FOR EACH ROW EXECUTE FUNCTION {table}_trigger_fn()"
+                ),
+                RowOrder::Unordered,
+            ),
+            (
+                format!("INSERT INTO {table} VALUES (1, NULL, 'kept'), (2, 2, NULL)"),
+                RowOrder::Unordered,
+            ),
+            (block, RowOrder::Unordered),
+            (
+                format!("SELECT id, value, label FROM {table} ORDER BY id"),
+                RowOrder::Ordered,
+            ),
+        ] {
+            src.log_value("sql", &sql);
+            assert_statement(&runtime, postgres.get_connection(), &mut fake, &sql, order);
+        }
     });
 }
 

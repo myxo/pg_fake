@@ -31,7 +31,10 @@ pub(crate) fn classify(statement: &ast::Statement) -> StatementKind {
         | ast::Statement::CreateIndex(_)
         | ast::Statement::CreateSchema { .. }
         | ast::Statement::CreateView { .. }
+        | ast::Statement::CreateFunction(_)
         | ast::Statement::CreateTrigger(_)
+        | ast::Statement::DropFunction(_)
+        | ast::Statement::DropTrigger(_)
         | ast::Statement::AlterTable { .. }
         | ast::Statement::AlterIndex { .. }
         | ast::Statement::AlterTrigger { .. }
@@ -167,6 +170,22 @@ mod tests {
         assert_eq!(lock.tables[1].name.to_string(), "public.second_table");
         assert_eq!(lock.lock_mode, Some(ast::LockTableMode::Exclusive));
         assert!(!lock.nowait);
+    }
+
+    #[test]
+    fn parses_insert_source_with_nested_parentheses() {
+        parse(
+            "INSERT INTO destination SELECT 1, 10 \
+             ON CONFLICT (id) DO UPDATE SET value = excluded.value RETURNING id, value",
+        )
+        .unwrap();
+        parse(
+            "INSERT INTO destination (id, value) \
+             ((SELECT 1, 10 LIMIT 1) UNION ALL SELECT 2, 20) \
+             UNION ALL SELECT 3, 30 \
+             ON CONFLICT (id) DO UPDATE SET value = excluded.value RETURNING id, value",
+        )
+        .unwrap();
     }
 
     #[test]

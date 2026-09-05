@@ -17,6 +17,7 @@ pub enum SqlState {
 
     // 22 — Data Exception
     NumericValueOutOfRange,              // 22003
+    NullValueNotAllowed,                 // 22004
     DivisionByZero,                      // 22012
     InvalidRowCountInLimitClause,        // 2201W
     InvalidRowCountInResultOffsetClause, // 2201X
@@ -53,27 +54,35 @@ pub enum SqlState {
     QueryCanceled, // 57014
 
     // 42 — Syntax Error / Access Rule
-    UndefinedTable,          // 42P01
-    DuplicateTable,          // 42P07
-    DuplicateSchema,         // 42P06
-    DuplicateColumn,         // 42701
-    DuplicateObject,         // 42710
-    AmbiguousColumn,         // 42702
-    SyntaxError,             // 42601
-    UndefinedColumn,         // 42703
-    UndefinedFunction,       // 42883
-    UndefinedObject,         // 42704
-    UndefinedParameter,      // 42P02
-    AmbiguousParameter,      // 42P08
-    CannotCoerce,            // 42846
-    DatatypeMismatch,        // 42804
-    InvalidColumnReference,  // 42P10
-    InvalidRecursion,        // 42P19
-    GroupingError,           // 42803
-    WrongObjectType,         // 42809
-    GeneratedAlways,         // 428C9
-    InvalidTableDefinition,  // 42P16
-    InvalidObjectDefinition, // 42P17
+    UndefinedTable,            // 42P01
+    DuplicateTable,            // 42P07
+    DuplicateSchema,           // 42P06
+    DuplicateColumn,           // 42701
+    DuplicateFunction,         // 42723
+    DuplicateObject,           // 42710
+    AmbiguousColumn,           // 42702
+    SyntaxError,               // 42601
+    UndefinedColumn,           // 42703
+    UndefinedFunction,         // 42883
+    UndefinedObject,           // 42704
+    UndefinedParameter,        // 42P02
+    AmbiguousParameter,        // 42P08
+    CannotCoerce,              // 42846
+    DatatypeMismatch,          // 42804
+    InvalidColumnReference,    // 42P10
+    InvalidRecursion,          // 42P19
+    GroupingError,             // 42803
+    WrongObjectType,           // 42809
+    GeneratedAlways,           // 428C9
+    InvalidTableDefinition,    // 42P16
+    InvalidObjectDefinition,   // 42P17
+    InvalidFunctionDefinition, // 42P13
+
+    // 2F — SQL Routine Exception
+    FunctionExecutedNoReturnStatement, // 2F005
+
+    // P0 — PL/pgSQL Error
+    RaiseException, // P0001
 
     // 55 — Object Not In Prerequisite State
     ObjectNotInPrerequisiteState, // 55000
@@ -92,6 +101,7 @@ impl SqlState {
             SqlState::ProtocolViolation => "08P01",
             SqlState::FeatureNotSupported => "0A000",
             SqlState::NumericValueOutOfRange => "22003",
+            SqlState::NullValueNotAllowed => "22004",
             SqlState::DivisionByZero => "22012",
             SqlState::InvalidRowCountInLimitClause => "2201W",
             SqlState::InvalidRowCountInResultOffsetClause => "2201X",
@@ -116,6 +126,7 @@ impl SqlState {
             SqlState::DuplicateTable => "42P07",
             SqlState::DuplicateSchema => "42P06",
             SqlState::DuplicateColumn => "42701",
+            SqlState::DuplicateFunction => "42723",
             SqlState::DuplicateObject => "42710",
             SqlState::AmbiguousColumn => "42702",
             SqlState::SyntaxError => "42601",
@@ -133,6 +144,9 @@ impl SqlState {
             SqlState::GeneratedAlways => "428C9",
             SqlState::InvalidTableDefinition => "42P16",
             SqlState::InvalidObjectDefinition => "42P17",
+            SqlState::InvalidFunctionDefinition => "42P13",
+            SqlState::FunctionExecutedNoReturnStatement => "2F005",
+            SqlState::RaiseException => "P0001",
             SqlState::ObjectNotInPrerequisiteState => "55000",
             SqlState::LockNotAvailable => "55P03",
             SqlState::InternalError => "XX000",
@@ -151,7 +165,7 @@ impl std::fmt::Display for SqlState {
 ///
 /// `sqlstate` is Tier A (guaranteed to match Postgres).
 /// `message`, `detail`, `hint`, `position` are Tier B (best effort).
-#[derive(Debug, Error, PartialEq)]
+#[derive(Debug, Clone, Error, PartialEq)]
 #[error("{sqlstate}: {message}")]
 pub struct PgError {
     pub sqlstate: SqlState,

@@ -273,6 +273,26 @@ pub(crate) fn bind_target_scope(schema: &TableSchema, alias: Option<&ast::Ident>
     }
 }
 
+pub(crate) fn create_value_scope(columns: impl Iterator<Item = (String, PgType)>) -> BoundScope {
+    BoundScope {
+        columns: columns
+            .enumerate()
+            .map(|(slot, (name, data_type))| BoundColumn {
+                source_name: name.clone(),
+                name,
+                data_type,
+                qualifier: String::new(),
+                slot,
+                merged: None,
+                unqualified: true,
+                wildcard: false,
+                depth: 0,
+                table_id: None,
+            })
+            .collect(),
+    }
+}
+
 #[cfg_attr(feature = "execution-log", tracing::instrument(skip_all))]
 pub(crate) fn bind_query_scope(catalog: &Catalog, select: &ast::Select) -> Result<BoundScope> {
     bind_from_scope(catalog, &select.from)
