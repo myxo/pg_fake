@@ -1,0 +1,1 @@
+{"group_id":"alter_table_rewrite_100_rows","function_id":"pg_fake","value_str":null,"throughput":{"Elements":100},"full_id":"alter_table_rewrite_100_rows/pg_fake","directory_name":"alter_table_rewrite_100_rows/pg_fake","title":"alter_table_rewrite_100_rows/pg_fake"}

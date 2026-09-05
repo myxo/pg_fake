@@ -275,37 +275,37 @@ fn alter_table_benchmark(
         .map(|id| format!("({id}, {id})"))
         .collect::<Vec<_>>()
         .join(",");
-    for (_, connection) in connections.iter_mut() {
-        connection.execute(
-            runtime,
-            "CREATE TABLE alter_table_rewrite_100_rows (id INTEGER PRIMARY KEY, value INTEGER)",
-        );
-        connection.execute(
-            runtime,
-            &format!("INSERT INTO alter_table_rewrite_100_rows VALUES {values}"),
-        );
-    }
+    let insert = format!("INSERT INTO alter_table_rewrite_100_rows VALUES {values}");
     let mut group =
         criterion.benchmark_group(benchmarks::find_benchmark("alter_table_rewrite_100_rows").name);
     group.throughput(Throughput::Elements(100));
     for (name, connection) in connections.iter_mut() {
         group.bench_function(*name, |benchmark| {
-            benchmark.iter(|| {
-                connection.execute(
-                    runtime,
-                    "ALTER TABLE alter_table_rewrite_100_rows ADD COLUMN marker BIGINT DEFAULT 1 NOT NULL",
-                );
-                connection.execute(
-                    runtime,
-                    "ALTER TABLE alter_table_rewrite_100_rows DROP COLUMN marker",
-                );
+            benchmark.iter_custom(|iterations| {
+                let mut elapsed = Duration::ZERO;
+                for _ in 0..iterations {
+                    connection.execute(
+                        runtime,
+                        "CREATE TABLE alter_table_rewrite_100_rows (id INTEGER PRIMARY KEY, value INTEGER)",
+                    );
+                    connection.execute(runtime, &insert);
+                    let started = Instant::now();
+                    connection.execute(
+                        runtime,
+                        "ALTER TABLE alter_table_rewrite_100_rows ADD COLUMN marker BIGINT DEFAULT 1 NOT NULL",
+                    );
+                    connection.execute(
+                        runtime,
+                        "ALTER TABLE alter_table_rewrite_100_rows DROP COLUMN marker",
+                    );
+                    elapsed += started.elapsed();
+                    connection.execute(runtime, "DROP TABLE alter_table_rewrite_100_rows");
+                }
+                elapsed
             });
         });
     }
     group.finish();
-    for (_, connection) in connections.iter_mut() {
-        connection.execute(runtime, "DROP TABLE alter_table_rewrite_100_rows");
-    }
 }
 
 fn partial_unique_index_benchmark(
