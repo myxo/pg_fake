@@ -1,4 +1,4 @@
-use std::{env, path::PathBuf};
+use std::env;
 
 use testcontainers::{Container, ImageExt, runners::SyncRunner};
 use testcontainers_modules::postgres::Postgres;
@@ -9,14 +9,12 @@ pub(crate) struct PostgresServer {
 }
 
 pub(crate) fn start_postgres_server() -> PostgresServer {
-    let configured_url = dotenvy::var("PG_FAKE_DATABASE_URL").ok();
-    if configured_url.is_none() && env::var_os("DOCKER_HOST").is_none() {
-        let socket = PathBuf::from(env::var_os("HOME").expect("HOME must be set"))
-            .join(".colima/default/docker.sock");
-        if socket.exists() {
-            unsafe { env::set_var("DOCKER_HOST", format!("unix://{}", socket.display())) };
-        }
-    }
+    let configured_url = env::var("PG_FAKE_DATABASE_URL").ok().or_else(|| {
+        dotenvy::dotenv_iter().ok()?.find_map(|entry| {
+            let (key, value) = entry.expect("must parse test environment configuration");
+            (key == "PG_FAKE_DATABASE_URL").then_some(value)
+        })
+    });
     let container = configured_url.is_none().then(|| {
         Postgres::default()
             .with_tag("18")

@@ -3,10 +3,7 @@ use std::str::FromStr;
 #[cfg(test)]
 use std::{
     cell::RefCell,
-    sync::{
-        Mutex,
-        atomic::{AtomicU64, Ordering},
-    },
+    sync::atomic::{AtomicU64, Ordering},
 };
 
 use bigdecimal::BigDecimal;
@@ -24,9 +21,6 @@ use tokio::runtime::Runtime;
 
 #[cfg(test)]
 mod common;
-
-#[cfg(test)]
-use common::start_postgres_server;
 
 #[derive(Debug, PartialEq, Eq)]
 enum Outcome {
@@ -52,9 +46,58 @@ fn returns_rows(statement: &Statement) -> bool {
 }
 
 #[cfg(test)]
-static TEST_LOCK: Mutex<()> = Mutex::new(());
-#[cfg(test)]
 static TABLE_NUMBER: AtomicU64 = AtomicU64::new(1);
+
+#[cfg(test)]
+struct PropertyPostgresServer {
+    url: String,
+    database: String,
+    connection: PgConnection,
+    runtime: Runtime,
+    _server: common::PostgresServer,
+}
+
+#[cfg(test)]
+impl Drop for PropertyPostgresServer {
+    fn drop(&mut self) {
+        let sql = format!("DROP DATABASE {} WITH (FORCE)", self.database);
+        let _ = self
+            .runtime
+            .block_on(sqlx::raw_sql(AssertSqlSafe(sql.as_str())).execute(&mut self.connection));
+    }
+}
+
+#[cfg(test)]
+fn start_property_postgres_server() -> PropertyPostgresServer {
+    let server = common::start_postgres_server();
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .expect("must create PostgreSQL setup runtime");
+    let mut connection = runtime
+        .block_on(PgConnection::connect(&server.url))
+        .expect("must connect to PostgreSQL for property-test setup");
+    let backend = runtime
+        .block_on(
+            sqlx::query_scalar::<_, i32>(AssertSqlSafe("SELECT pg_backend_pid()"))
+                .fetch_one(&mut connection),
+        )
+        .expect("must identify property-test setup connection");
+    let database = format!("pg_fake_property_{}_{backend}", std::process::id());
+    let mut url = url::Url::parse(&server.url).expect("must parse PostgreSQL test URL");
+    url.set_path(&database);
+    let sql = format!("CREATE DATABASE {database} TEMPLATE template0");
+    runtime
+        .block_on(sqlx::raw_sql(AssertSqlSafe(sql.as_str())).execute(&mut connection))
+        .expect("must create isolated property-test database");
+    PropertyPostgresServer {
+        url: url.into(),
+        database,
+        connection,
+        runtime,
+        _server: server,
+    }
+}
 
 struct PostgresCase<'connection, 'runtime> {
     connection: &'connection mut PgConnection,
@@ -1921,6 +1964,9 @@ fn run_generated_sql_case(
         runtime,
         table: table_name.clone(),
     };
+    runtime
+        .block_on(sqlx::raw_sql(AssertSqlSafe("RESET ALL")).execute(postgres.get_connection()))
+        .expect("must reset PostgreSQL settings for a fresh generated case");
     let mut fake = PgFakeConnection::new(Db::create());
     let table = generate_table(src, table_name);
     let foreign_tables = generate_foreign_tables(src, &table);
@@ -2024,9 +2070,8 @@ pub fn fuzz_generated_sql_matches_postgres(src: &mut Source) {
 
 #[test]
 fn generated_sql_matches_postgres() {
-    let _test_lock = TEST_LOCK.lock().expect("test mutex must not be poisoned");
-    let server = start_postgres_server();
-    let runtime = tokio::runtime::Builder::new_multi_thread()
+    let server = start_property_postgres_server();
+    let runtime = tokio::runtime::Builder::new_current_thread()
         .enable_all()
         .build()
         .unwrap();
@@ -2047,9 +2092,8 @@ fn generated_sql_matches_postgres() {
 
 #[test]
 fn generated_set_operations_match_postgres() {
-    let _test_lock = TEST_LOCK.lock().expect("test mutex must not be poisoned");
-    let server = start_postgres_server();
-    let runtime = tokio::runtime::Builder::new_multi_thread()
+    let server = start_property_postgres_server();
+    let runtime = tokio::runtime::Builder::new_current_thread()
         .enable_all()
         .build()
         .unwrap();
@@ -2074,9 +2118,11 @@ fn generated_set_operations_match_postgres() {
 
 #[test]
 fn matches_json_storage_parameters_metadata_and_unsupported_operations() {
-    let _test_lock = TEST_LOCK.lock().expect("test mutex must not be poisoned");
-    let server = start_postgres_server();
-    let runtime = Runtime::new().expect("must create tokio runtime");
+    let server = start_property_postgres_server();
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .expect("must create tokio runtime");
     let mut postgres = runtime
         .block_on(PgConnection::connect(&server.url))
         .expect("must connect SQLx to PostgreSQL 18");
@@ -2203,9 +2249,8 @@ fn matches_json_storage_parameters_metadata_and_unsupported_operations() {
 
 #[test]
 fn matches_generated_json_text_and_errors() {
-    let _test_lock = TEST_LOCK.lock().expect("test mutex must not be poisoned");
-    let server = start_postgres_server();
-    let runtime = tokio::runtime::Builder::new_multi_thread()
+    let server = start_property_postgres_server();
+    let runtime = tokio::runtime::Builder::new_current_thread()
         .enable_all()
         .build()
         .unwrap();
@@ -2258,9 +2303,8 @@ fn matches_generated_json_text_and_errors() {
 
 #[test]
 fn generated_procedural_trees_match_postgres() {
-    let _test_lock = TEST_LOCK.lock().expect("test mutex must not be poisoned");
-    let server = start_postgres_server();
-    let runtime = tokio::runtime::Builder::new_multi_thread()
+    let server = start_property_postgres_server();
+    let runtime = tokio::runtime::Builder::new_current_thread()
         .enable_all()
         .build()
         .unwrap();
@@ -2317,9 +2361,8 @@ fn generated_procedural_trees_match_postgres() {
 
 #[test]
 fn generated_alter_table_rewrites_match_postgres() {
-    let _test_lock = TEST_LOCK.lock().expect("test mutex must not be poisoned");
-    let server = start_postgres_server();
-    let runtime = tokio::runtime::Builder::new_multi_thread()
+    let server = start_property_postgres_server();
+    let runtime = tokio::runtime::Builder::new_current_thread()
         .enable_all()
         .build()
         .unwrap();
@@ -2380,9 +2423,8 @@ fn generated_alter_table_rewrites_match_postgres() {
 
 #[test]
 fn generated_nested_views_match_postgres() {
-    let _test_lock = TEST_LOCK.lock().expect("test mutex must not be poisoned");
-    let server = start_postgres_server();
-    let runtime = tokio::runtime::Builder::new_multi_thread()
+    let server = start_property_postgres_server();
+    let runtime = tokio::runtime::Builder::new_current_thread()
         .enable_all()
         .build()
         .unwrap();
@@ -2445,9 +2487,8 @@ fn generated_nested_views_match_postgres() {
 
 #[test]
 fn generated_partial_unique_indexes_match_postgres() {
-    let _test_lock = TEST_LOCK.lock().expect("test mutex must not be poisoned");
-    let server = start_postgres_server();
-    let runtime = tokio::runtime::Builder::new_multi_thread()
+    let server = start_property_postgres_server();
+    let runtime = tokio::runtime::Builder::new_current_thread()
         .enable_all()
         .build()
         .unwrap();
@@ -2565,9 +2606,8 @@ fn generated_partial_unique_indexes_match_postgres() {
 
 #[test]
 fn generated_interleaved_transaction_snapshots_match_postgres() {
-    let _test_lock = TEST_LOCK.lock().expect("test mutex must not be poisoned");
-    let server = start_postgres_server();
-    let runtime = tokio::runtime::Builder::new_multi_thread()
+    let server = start_property_postgres_server();
+    let runtime = tokio::runtime::Builder::new_current_thread()
         .enable_all()
         .build()
         .unwrap();
