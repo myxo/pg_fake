@@ -547,8 +547,10 @@ pub(crate) fn infer_parameter_types_with_data_modifying_ctes(
     data_modifying_ctes: &[ast::Statement],
     catalog: &Catalog,
     parameter_count: usize,
+    supplied_types: &[Option<BaseType>],
 ) -> Result<Vec<BaseType>> {
     let mut types = vec![None; parameter_count];
+    types[..supplied_types.len()].copy_from_slice(supplied_types);
     for statement in data_modifying_ctes {
         constrain_statement_parameters(statement, catalog, &mut types)?;
     }
@@ -1269,10 +1271,10 @@ fn validate_implicit_type(
 
 #[cfg_attr(feature = "execution-log", tracing::instrument(skip_all))]
 fn coerce_parameter(value: Value, target: BaseType) -> Result<Value> {
-    if target == BaseType::Json
+    if matches!(target, BaseType::Json | BaseType::Jsonb)
         && let Value::Text(text) = value
     {
-        return Value::parse(BaseType::Json, &text);
+        return Value::parse(target, &text);
     }
     let Some(source) = value.get_base_type() else {
         return Ok(Value::Null);
@@ -1316,6 +1318,7 @@ pub(crate) fn create_typed_literal(value: Value, data_type: PgType) -> ast::Expr
             ast::Value::SingleQuotedString(Value::Interval(value).format_postgres_text())
         }
         Value::Json(value) => ast::Value::SingleQuotedString(value),
+        Value::Jsonb(value) => ast::Value::SingleQuotedString(value.get_postgres_text().to_owned()),
     };
     create_typed_cast(ast::Expr::Value(literal.into()), data_type)
 }
@@ -1384,5 +1387,6 @@ fn convert_to_ast_data_type(data_type: PgType) -> ast::DataType {
             precision: None,
         },
         BaseType::Json => ast::DataType::JSON,
+        BaseType::Jsonb => ast::DataType::JSONB,
     }
 }

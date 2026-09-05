@@ -3241,6 +3241,7 @@ struct BoundExpressionNormalizer<'a> {
 }
 #[derive(Eq, Hash, PartialEq)]
 enum JoinKey {
+    Jsonb(crate::jsonb::Jsonb),
     Bool(bool),
     Int2(i16),
     Int4(i32),
@@ -7623,6 +7624,7 @@ fn resolve_hash_join_slots(
                 | BaseType::Bpchar
                 | BaseType::Bytea
                 | BaseType::Uuid
+                | BaseType::Jsonb
         )
     {
         return None;
@@ -7733,6 +7735,7 @@ fn visit_hash_join_chain_rows(
 #[cfg_attr(feature = "execution-log", tracing::instrument(skip_all))]
 fn create_hash_join_key(value: &Value) -> Option<JoinKey> {
     match value {
+        Value::Jsonb(value) => Some(JoinKey::Jsonb(value.clone())),
         Value::Null => None,
         Value::Bool(value) => Some(JoinKey::Bool(*value)),
         Value::Int2(value) => Some(JoinKey::Int2(*value)),

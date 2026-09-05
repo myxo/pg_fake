@@ -63,6 +63,7 @@ pub(crate) fn convert_ast_data_type(data_type: &ast::DataType) -> Result<PgType>
         ) => (BaseType::TimestampTz, encode_time_typmod(*precision)?),
         ast::DataType::Interval { .. } => (BaseType::Interval, PgType::NO_TYPEMOD),
         ast::DataType::JSON => (BaseType::Json, PgType::NO_TYPEMOD),
+        ast::DataType::JSONB => (BaseType::Jsonb, PgType::NO_TYPEMOD),
         ast::DataType::Custom(name, _) => {
             let identifiers = name
                 .0
@@ -171,6 +172,12 @@ pub(crate) fn can_cast(source: BaseType, target: BaseType, context: CastContext)
 
 #[cfg_attr(feature = "execution-log", tracing::instrument(skip_all))]
 fn resolve_required_cast_context(source: BaseType, target: BaseType) -> Option<CastContext> {
+    if matches!(
+        (source, target),
+        (BaseType::Json, BaseType::Jsonb) | (BaseType::Jsonb, BaseType::Json)
+    ) {
+        return Some(CastContext::Assignment);
+    }
     if source == target || is_string_type(source) && is_string_type(target) {
         return Some(CastContext::Implicit);
     }
@@ -268,6 +275,11 @@ pub(crate) fn coerce(
             unreachable!("json values use Value::Json")
         };
         Value::parse(BaseType::Json, &value)?
+    } else if matches!(
+        (source, target.base),
+        (BaseType::Json, BaseType::Jsonb) | (BaseType::Jsonb, BaseType::Json)
+    ) {
+        Value::parse(target.base, &value.format_postgres_text())?
     } else if source == target.base || is_string_type(source) && is_string_type(target.base) {
         value
     } else if source == BaseType::Json && is_string_type(target.base) {

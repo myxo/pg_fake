@@ -1790,6 +1790,8 @@ dependencies = [
  "hashlink",
  "log",
  "pg_fake",
+ "serde",
+ "serde_json",
  "sqlx",
  "sqlx-core",
  "sqlx-postgres",

@@ -13,7 +13,7 @@ bigdecimal = "0.4"
 chrono = { version = "0.4", default-features = false, features = ["std", "now"] }
 rand_chacha = { version = "0.9", features = ["os_rng"] }
 serde = "1"
-serde_json = { version = "1", features = ["arbitrary_precision", "unbounded_depth"] }
+serde_json = { version = "1", features = ["arbitrary_precision", "unbounded_depth", "raw_value"] }
 sqlparser = { version = "0.62", features = ["visitor"] }
 thiserror = "2"
 tracing = { version = "0.1", optional = true, features = ["attributes"] }

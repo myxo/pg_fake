@@ -300,13 +300,29 @@ pub const FEATURES: &[Feature] = &[
     },
     Feature {
         name: "jsonb",
-        cases: &[Case {
-            id: "jsonb_normalization",
-            source: "jsonb.sql:10",
-            setup: &[],
-            sql: "SELECT '{ \"value\" : 1 }'::jsonb",
-            blocker: BlockerKind::Implementation,
-        }],
+        cases: &[
+            Case {
+                id: "jsonb_normalization",
+                source: "jsonb.sql:10",
+                setup: &[],
+                sql: "SELECT '{ \"value\" : 1 }'::jsonb",
+                blocker: BlockerKind::Implementation,
+            },
+            Case {
+                id: "jsonb_migration_storage",
+                source: "local:jsonb_migration_storage",
+                setup: &["CREATE TABLE phase3_jsonb_storage (payload JSONB NOT NULL UNIQUE)"],
+                sql: "INSERT INTO phase3_jsonb_storage VALUES ('{\"amount\":{\"currency\":\"USD\",\"value\":\"12.50\"}}') RETURNING payload",
+                blocker: BlockerKind::Implementation,
+            },
+            Case {
+                id: "jsonb_numeric_equality",
+                source: "local:jsonb_numeric_equality",
+                setup: &[],
+                sql: "SELECT '{\"a\":1.00,\"b\":2}'::jsonb = '{\"b\":2,\"a\":1e0}'::jsonb",
+                blocker: BlockerKind::Implementation,
+            },
+        ],
     },
     Feature {
         name: "json and jsonb operators",

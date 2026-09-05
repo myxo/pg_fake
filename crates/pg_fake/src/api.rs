@@ -3056,6 +3056,14 @@ impl Session {
 
     #[cfg_attr(feature = "execution-log", tracing::instrument(skip_all))]
     pub fn prepare(&mut self, sql: &str) -> Result<PreparedStatement> {
+        self.prepare_with_parameter_types(sql, &[])
+    }
+
+    pub fn prepare_with_parameter_types(
+        &mut self,
+        sql: &str,
+        parameter_types: &[Option<crate::value::BaseType>],
+    ) -> Result<PreparedStatement> {
         let mut statements = match parser::parse(sql) {
             Ok(statements) => statements,
             Err(error) => {
@@ -3068,11 +3076,26 @@ impl Session {
                 "prepared statements require exactly one statement",
             ));
         }
-        let statement = statements.pop().expect("statement count was checked");
+        let mut statement = statements.pop().expect("statement count was checked");
         let parameter_count = match analyzer::count_parameters(&statement) {
             Ok(count) => count,
             Err(error) => return self.abort_with_error(error),
         };
+        let _ = ast::visit_expressions_mut(&mut statement, |expression| {
+            if let ast::Expr::Value(value) = expression
+                && let ast::Value::Placeholder(placeholder) = &value.value
+            {
+                let index = analyzer::parse_placeholder_index(placeholder)
+                    .expect("parameter indices were validated");
+                if let Some(Some(base)) = parameter_types.get(index) {
+                    *expression = analyzer::create_typed_cast(
+                        expression.clone(),
+                        crate::value::PgType::create(*base),
+                    );
+                }
+            }
+            std::ops::ControlFlow::<()>::Continue(())
+        });
         if matches!(statement, ast::Statement::CreateView(_)) && parameter_count != 0 {
             return self.abort_with_error(PgError::create(
                 SqlState::UndefinedParameter,
@@ -3107,6 +3130,7 @@ impl Session {
             state.load_catalog(xid, snapshot, Some(self.temporary_schema_id));
             analyzer::count_parameters(&statement)
                 .and_then(|parameter_count| {
+                    let parameter_count = parameter_count.max(parameter_types.len());
                     executor::expand_ctes_for_analysis(&statement, &state)
                         .map(|(statement, mutations)| (statement, mutations, parameter_count))
                 })
@@ -3139,6 +3163,7 @@ impl Session {
                             &mutations,
                             &state.catalog,
                             parameter_count,
+                            parameter_types,
                         )
                         .and_then(|parameter_types| {
                             let described = analyzer::bind_parameters(

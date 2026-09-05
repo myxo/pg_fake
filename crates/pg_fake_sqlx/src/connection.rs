@@ -151,7 +151,7 @@ impl ConnectOptions for PgFakeConnectOptions {
 
 struct ConnectionState {
     session: Session,
-    statements: LinkedHashMap<String, CoreStatement>,
+    statements: LinkedHashMap<(String, Vec<Option<BaseType>>), CoreStatement>,
     statement_cache_bytes: usize,
     statement_cache_limit_bytes: usize,
 }
@@ -159,7 +159,7 @@ struct ConnectionState {
 impl ConnectionState {
     fn prune_cached_statements(&mut self) {
         while self.statement_cache_bytes > self.statement_cache_limit_bytes {
-            let (sql, _) = self
+            let ((sql, _), _) = self
                 .statements
                 .pop_front()
                 .expect("cache must contain an entry while over its byte limit");
@@ -237,23 +237,37 @@ impl PgFakeConnection {
                     state.session.execute("ROLLBACK").map_err(database_error)?;
                 }
                 let results = if let Some(arguments) = arguments {
+                    let parameter_types = arguments
+                        .types
+                        .iter()
+                        .map(|info| info.base)
+                        .collect::<Vec<_>>();
+                    let cache_key = (sql.clone(), parameter_types.clone());
                     let is_explicit_statement = statement.is_some();
                     let prepared = if let Some(statement) = statement {
                         statement.statement
                     } else if persistent {
-                        if let Some(statement) = state.statements.to_back(sql.as_str()) {
+                        if let Some(statement) = state.statements.to_back(&cache_key) {
                             statement.clone()
                         } else {
-                            let statement = state.session.prepare(&sql).map_err(database_error)?;
+                            let statement = state
+                                .session
+                                .prepare_with_parameter_types(&sql, &parameter_types)
+                                .map_err(database_error)?;
                             if sql.len() <= state.statement_cache_limit_bytes {
                                 state.statement_cache_bytes += sql.len();
-                                state.statements.insert(sql.clone(), statement.clone());
+                                state
+                                    .statements
+                                    .insert(cache_key.clone(), statement.clone());
                                 state.prune_cached_statements();
                             }
                             statement
                         }
                     } else {
-                        state.session.prepare(&sql).map_err(database_error)?
+                        state
+                            .session
+                            .prepare_with_parameter_types(&sql, &parameter_types)
+                            .map_err(database_error)?
                     };
                     let result = state
                         .session
@@ -266,9 +280,12 @@ impl PgFakeConnection {
                                 if error.sqlstate == SqlState::FeatureNotSupported
                                     && error.message == "cached plan must be replanned"
                         ) {
-                        let prepared = state.session.prepare(&sql).map_err(database_error)?;
+                        let prepared = state
+                            .session
+                            .prepare_with_parameter_types(&sql, &parameter_types)
+                            .map_err(database_error)?;
                         if sql.len() <= state.statement_cache_limit_bytes {
-                            state.statements.insert(sql.clone(), prepared.clone());
+                            state.statements.insert(cache_key, prepared.clone());
                         }
                         state
                             .session
@@ -479,6 +496,10 @@ impl<'c> Executor<'c> for &'c mut PgFakeConnection {
         let rollback_first = self.take_pending_rollback();
         let query = sql.as_str().to_owned();
         let supplied_parameters = parameters.to_vec();
+        let parameter_types = supplied_parameters
+            .iter()
+            .map(|info| info.base)
+            .collect::<Vec<_>>();
         Box::pin(async move {
             let (statement, inferred_parameters, columns) =
                 tokio::task::spawn_blocking(move || {
@@ -486,7 +507,10 @@ impl<'c> Executor<'c> for &'c mut PgFakeConnection {
                     if rollback_first {
                         state.session.execute("ROLLBACK").map_err(database_error)?;
                     }
-                    let statement = state.session.prepare(&query).map_err(database_error)?;
+                    let statement = state
+                        .session
+                        .prepare_with_parameter_types(&query, &parameter_types)
+                        .map_err(database_error)?;
                     let parameters = statement
                         .get_parameter_types()
                         .iter()
@@ -658,7 +682,7 @@ mod tests {
             state
                 .statements
                 .keys()
-                .map(String::as_str)
+                .map(|(sql, _)| sql.as_str())
                 .collect::<Vec<_>>(),
             ["SELECT 1", "SELECT 3"]
         );

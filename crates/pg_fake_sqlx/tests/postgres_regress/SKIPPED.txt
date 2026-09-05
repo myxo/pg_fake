@@ -63,7 +63,7 @@ join:30
 join_hash:5
 json:8
 json_encoding:7
-jsonb:1
+jsonb:36
 jsonb_jsonpath:1
 jsonpath:1
 jsonpath_encoding:2
@@ -114,7 +114,7 @@ select_views:4
 sequence:7
 strings:1
 subselect:6
-temp:8
+temp:21
 text:1
 time:4
 timestamp:3

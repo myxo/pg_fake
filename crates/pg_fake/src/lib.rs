@@ -4,6 +4,7 @@ mod catalog;
 mod coercion;
 pub mod error;
 mod executor;
+pub mod jsonb;
 pub mod parser;
 mod storage;
 mod txn;

@@ -2248,6 +2248,145 @@ fn matches_json_storage_parameters_metadata_and_unsupported_operations() {
 }
 
 #[test]
+fn matches_jsonb_normalization_comparison_and_storage() {
+    let server = start_property_postgres_server();
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap();
+    let mut postgres = runtime
+        .block_on(PgConnection::connect(&server.url))
+        .unwrap();
+    let mut fake = PgFakeConnection::new(Db::create());
+    for sql in [
+        "SELECT JSONB '{\"b\":2,\"aa\":1,\"b\":1.00}'",
+        "SELECT '{}'::pg_catalog.jsonb, 'null'::jsonb, NULL::jsonb",
+        r#"SELECT '{"$serde_json::private::Number":null}'::jsonb"#,
+        r#"SELECT '{"$serde_json::private::Number":"not a number"}'::jsonb"#,
+        r#"SELECT '{"a":1.230e-5,"b":-0.00,"c":1e+30}'::jsonb"#,
+        r#"SELECT '{"\u0061":"\ud83c\udf0d", "a":"last", "z":"\b\f\n\r\t"}'::jsonb"#,
+        "SELECT '{\"a\":1}'::json::jsonb::json::text, '[true]'::text::jsonb::varchar(4)",
+        "SELECT '{}'::jsonb UNION ALL SELECT '[]'",
+        "SELECT NULL UNION ALL SELECT '{}'::jsonb",
+        "SELECT '1.00'::jsonb = '1e0'::jsonb, '1.00'::jsonb <= '1e0'::jsonb",
+        "SELECT '[]'::jsonb < 'null'::jsonb, '[[]]'::jsonb > '[null]'::jsonb",
+        "SELECT DISTINCT payload FROM (VALUES ('1'::jsonb), ('1.0'::jsonb), ('null'::jsonb), (NULL::jsonb)) AS d(payload) ORDER BY payload",
+        "SELECT count(DISTINCT payload) FROM (VALUES ('1'::jsonb), ('1.0'::jsonb), ('null'::jsonb), (NULL::jsonb)) AS d(payload)",
+        "SELECT payload::text, count(*) FROM (VALUES ('1'::jsonb), ('1.0'::jsonb), ('{}'::jsonb)) AS d(payload) GROUP BY payload ORDER BY payload",
+        "SELECT '1'::jsonb UNION SELECT '1.0'::jsonb",
+        "SELECT '1'::jsonb INTERSECT ALL SELECT '1.0'::jsonb",
+        "SELECT '1'::jsonb EXCEPT SELECT '1.0'::jsonb",
+        "CREATE TABLE jsonb_documents (id INT PRIMARY KEY, payload JSONB NOT NULL UNIQUE, fallback JSONB DEFAULT '{}')",
+        "INSERT INTO jsonb_documents (id, payload) VALUES (1, '{\"amount\":{\"currency\":\"USD\",\"value\":\"12.50\"}}'::json), (2, '1.00') RETURNING *",
+        "INSERT INTO jsonb_documents (id, payload) VALUES (3, '1') ON CONFLICT (payload) DO UPDATE SET id = excluded.id RETURNING *",
+        "CREATE TABLE jsonb_other (payload JSONB)",
+        "INSERT INTO jsonb_other VALUES ('1e0'), (NULL), ('{\"amount\":{\"value\":\"12.50\",\"currency\":\"USD\"}}')",
+        "SELECT d.id FROM jsonb_documents d JOIN jsonb_other o ON d.payload = o.payload ORDER BY d.id",
+        "CREATE TABLE jsonb_child (payload JSONB REFERENCES jsonb_documents(payload))",
+        "INSERT INTO jsonb_child VALUES ('1.0')",
+        "BEGIN",
+        "UPDATE jsonb_documents SET payload = 'false' WHERE id = 1 RETURNING payload",
+        "ROLLBACK",
+        "SELECT * FROM jsonb_documents ORDER BY id",
+    ] {
+        assert_statement(&runtime, &mut postgres, &mut fake, sql, RowOrder::Ordered);
+    }
+    let documents = [
+        "[]",
+        "null",
+        "\"a\"",
+        "\"z\"",
+        "0",
+        "1",
+        "1.00",
+        "false",
+        "true",
+        "[null]",
+        "[[]]",
+        "[1,2]",
+        "[2]",
+        "{}",
+        "{\"aa\":0}",
+        "{\"b\":0}",
+        "{\"a\":1,\"b\":2}",
+    ];
+    let values = documents
+        .iter()
+        .enumerate()
+        .map(|(index, doc)| format!("({index}, '{doc}'::jsonb)"))
+        .collect::<Vec<_>>()
+        .join(",");
+    let sql = format!(
+        "SELECT a.id, b.id, a.payload = b.payload, a.payload < b.payload, a.payload > b.payload FROM (VALUES {values}) a(id,payload) CROSS JOIN (VALUES {values}) b(id,payload) ORDER BY a.id,b.id"
+    );
+    assert_statement(&runtime, &mut postgres, &mut fake, &sql, RowOrder::Ordered);
+    for sql in [
+        r#"SELECT '"\u0000"'::jsonb"#,
+        r#"SELECT '"\ud800"'::jsonb"#,
+        r#"SELECT '"\udc00"'::jsonb"#,
+        r#"SELECT '{"a":"\u0000","a":1}'::jsonb"#,
+        r#"SELECT '{"a":1e131072,"a":1}'::jsonb"#,
+        "SELECT '1e131072'::jsonb",
+        "SELECT '1e-16384'::jsonb",
+        "SELECT '0e131072'::jsonb",
+        "SELECT '0e-16384'::jsonb",
+        "SELECT '0e1073741823'::jsonb",
+        "SELECT '0e1073741824'::jsonb",
+        "SELECT '[1,]'::jsonb",
+        "SELECT true OR ('['::jsonb IS NULL)",
+        "SELECT '[' WHERE false UNION ALL SELECT '{}'::jsonb",
+        "SELECT 1::jsonb",
+        "SELECT '{}'::jsonb = '{}'::json",
+        "INSERT INTO jsonb_documents (id, payload) VALUES (5, '1.0')",
+        "INSERT INTO jsonb_documents (id, payload) VALUES (5, NULL)",
+        "INSERT INTO jsonb_documents (id, payload) VALUES (5, '{}'::text)",
+        "INSERT INTO jsonb_documents (id, payload) VALUES (5, '2'), (6, '[1,]')",
+        "INSERT INTO jsonb_child VALUES ('2')",
+        "DELETE FROM jsonb_documents WHERE id = 3",
+    ] {
+        assert_statement_allow_error(&runtime, &mut postgres, &mut fake, sql, RowOrder::Ordered);
+    }
+    let nested = format!("{}0{}", "[".repeat(512), "]".repeat(512));
+    assert_statement(
+        &runtime,
+        &mut postgres,
+        &mut fake,
+        &format!("SELECT '{nested}'::jsonb"),
+        RowOrder::Ordered,
+    );
+}
+
+#[test]
+fn matches_generated_jsonb_normalization_and_comparison() {
+    let server = start_property_postgres_server();
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap();
+    let postgres = RefCell::new(
+        runtime
+            .block_on(PgConnection::connect(&server.url))
+            .unwrap(),
+    );
+    let fake = RefCell::new(PgFakeConnection::new(Db::create()));
+    check(|src| {
+        let left = generate_json_document(src, 3);
+        let right = generate_json_document(src, 3);
+        let sql = format!(
+            "SELECT '{left}'::jsonb::text, '{right}'::jsonb::json::text, '{left}'::jsonb = '{right}'::jsonb, '{left}'::jsonb < '{right}'::jsonb"
+        );
+        src.log_value("sql", &sql);
+        assert_statement_allow_error(
+            &runtime,
+            &mut postgres.borrow_mut(),
+            &mut fake.borrow_mut(),
+            &sql,
+            RowOrder::Ordered,
+        );
+    });
+}
+
+#[test]
 fn matches_generated_json_text_and_errors() {
     let server = start_property_postgres_server();
     let runtime = tokio::runtime::Builder::new_current_thread()

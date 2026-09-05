@@ -535,6 +535,62 @@ fn benchmark_json(
     }
 }
 
+fn benchmark_jsonb(
+    criterion: &mut Criterion,
+    runtime: &Runtime,
+    connections: &mut [NamedBenchmarkConnection<'_>],
+) {
+    for (_, connection) in connections.iter_mut() {
+        connection.execute(
+            runtime,
+            "CREATE TABLE jsonb_insert_returning (payload JSONB NOT NULL)",
+        );
+        connection.execute(
+            runtime,
+            "CREATE TABLE jsonb_join_group (id INT, payload JSONB)",
+        );
+        let values = (0..100)
+            .map(|id| format!("({id}, '{{\"value\":{}}}')", id % 20))
+            .collect::<Vec<_>>()
+            .join(",");
+        connection.execute(
+            runtime,
+            &format!("INSERT INTO jsonb_join_group VALUES {values}"),
+        );
+    }
+    for (name, query, cleanup) in [
+        (
+            "jsonb_insert_returning",
+            r#"INSERT INTO jsonb_insert_returning VALUES ('{"amount":{"value":"12.50","currency":"USD"},"tags":[1,2,3]}') RETURNING payload"#,
+            Some("DELETE FROM jsonb_insert_returning"),
+        ),
+        (
+            "jsonb_join_group",
+            "SELECT a.payload, count(*) FROM jsonb_join_group a JOIN jsonb_join_group b ON a.payload = b.payload GROUP BY a.payload ORDER BY a.payload",
+            None,
+        ),
+    ] {
+        let mut group = criterion.benchmark_group(benchmarks::find_benchmark(name).name);
+        for (backend, connection) in connections.iter_mut() {
+            group.bench_function(*backend, |benchmark| {
+                benchmark.iter(|| {
+                    connection.fetch(runtime, query);
+                    if let Some(cleanup) = cleanup {
+                        connection.execute(runtime, cleanup);
+                    }
+                });
+            });
+        }
+        group.finish();
+    }
+    for (_, connection) in connections.iter_mut() {
+        connection.execute(
+            runtime,
+            "DROP TABLE jsonb_insert_returning, jsonb_join_group",
+        );
+    }
+}
+
 fn insert_benchmark(
     criterion: &mut Criterion,
     runtime: &Runtime,
@@ -1358,6 +1414,7 @@ fn benchmarks(criterion: &mut Criterion) {
         serial_identity_benchmark(criterion, &runtime, &mut connections);
         uuid_temporal_benchmark(criterion, &runtime, &mut connections);
         benchmark_json(criterion, &runtime, &mut connections);
+        benchmark_jsonb(criterion, &runtime, &mut connections);
         insert_benchmark(criterion, &runtime, &mut connections);
         on_conflict_benchmark(criterion, &runtime, &mut connections);
         update_benchmark(criterion, &runtime, &mut connections);

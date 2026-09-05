@@ -11,6 +11,145 @@ mod common;
 use common::start_postgres_server;
 
 #[tokio::test]
+async fn round_trips_jsonb_wrappers_and_metadata() {
+    let server = start_postgres_server();
+    let mut postgres = PgConnection::connect(&server.url).await.unwrap();
+    let mut fake = PgFakeConnection::new(Db::create());
+    let document =
+        serde_json::json!({"amount": {"currency": "USD", "value": "12.50"}, "enabled": true});
+    let postgres_row =
+        sqlx::query("SELECT $1 AS payload, $2::jsonb AS absent, $1::json AS textual")
+            .bind(sqlx::types::Json(&document))
+            .bind(None::<sqlx::types::Json<serde_json::Value>>)
+            .fetch_one(&mut postgres)
+            .await
+            .unwrap();
+    let fake_row = sqlx::query("SELECT $1 AS payload, $2::jsonb AS absent, $1::json AS textual")
+        .bind(sqlx::types::Json(&document))
+        .bind(None::<sqlx::types::Json<serde_json::Value>>)
+        .fetch_one(&mut fake)
+        .await
+        .unwrap();
+    for index in [0, 2] {
+        assert_eq!(
+            fake_row.get::<serde_json::Value, _>(index),
+            postgres_row.get::<serde_json::Value, _>(index)
+        );
+        assert_eq!(
+            fake_row.columns()[index].type_info().name(),
+            postgres_row.columns()[index].type_info().name()
+        );
+        assert_eq!(
+            fake_row.get::<&serde_json::value::RawValue, _>(index).get(),
+            postgres_row
+                .get::<&serde_json::value::RawValue, _>(index)
+                .get()
+        );
+    }
+    assert_eq!(fake_row.get::<Option<serde_json::Value>, _>(1), None);
+    let described = fake
+        .prepare(SqlStr::from_static("SELECT $1::jsonb AS payload"))
+        .await
+        .unwrap();
+    assert_eq!(
+        described.columns()[0].type_info().base,
+        Some(pg_fake::value::BaseType::Jsonb)
+    );
+    assert_eq!(described.columns()[0].type_info().typmod, -1);
+
+    let raw = serde_json::value::RawValue::from_string(r#"{"a":1,"a":1.00}"#.into()).unwrap();
+    let postgres_row = sqlx::query("SELECT $1::jsonb AS payload")
+        .bind(&raw)
+        .fetch_one(&mut postgres)
+        .await
+        .unwrap();
+    let fake_row = sqlx::query("SELECT $1::jsonb AS payload")
+        .bind(&raw)
+        .fetch_one(&mut fake)
+        .await
+        .unwrap();
+    assert_eq!(
+        fake_row.get::<&serde_json::value::RawValue, _>(0).get(),
+        postgres_row.get::<&serde_json::value::RawValue, _>(0).get()
+    );
+
+    let sql = "SELECT $1 AS payload";
+    let postgres_extra = sqlx::query("SELECT 1")
+        .bind(&document)
+        .fetch_one(&mut postgres)
+        .await
+        .unwrap();
+    let fake_extra = sqlx::query("SELECT 1")
+        .bind(&document)
+        .fetch_one(&mut fake)
+        .await
+        .unwrap();
+    assert_eq!(fake_extra.get::<i32, _>(0), postgres_extra.get::<i32, _>(0));
+    let text = sqlx::query(sql)
+        .bind("plain text")
+        .fetch_one(&mut fake)
+        .await
+        .unwrap();
+    assert_eq!(text.columns()[0].type_info().name(), "TEXT");
+    let json = sqlx::query(sql)
+        .bind(&document)
+        .fetch_one(&mut fake)
+        .await
+        .unwrap();
+    assert_eq!(json.columns()[0].type_info().name(), "JSONB");
+    assert_eq!(json.get::<serde_json::Value, _>(0), document);
+    let text = sqlx::query(sql)
+        .bind("second text")
+        .fetch_one(&mut fake)
+        .await
+        .unwrap();
+    assert_eq!(text.get::<String, _>(0), "second text");
+
+    let typed = fake
+        .prepare_with(
+            SqlStr::from_static("SELECT $1 AS payload"),
+            &[pg_fake_sqlx::PgFakeTypeInfo::new(
+                pg_fake::value::BaseType::Jsonb,
+            )],
+        )
+        .await
+        .unwrap();
+    assert_eq!(typed.columns()[0].type_info().name(), "JSONB");
+    let row = typed
+        .query()
+        .bind(&document)
+        .fetch_one(&mut fake)
+        .await
+        .unwrap();
+    assert_eq!(row.get::<serde_json::Value, _>(0), document);
+
+    let pool = PgFakePoolOptions::new()
+        .max_connections(2)
+        .connect_with(PgFakeConnectOptions::new(Db::create()))
+        .await
+        .unwrap();
+    sqlx::query("CREATE TABLE jsonb_payloads (payload JSONB NOT NULL)")
+        .execute(&pool)
+        .await
+        .unwrap();
+    let mut tx = pool.begin().await.unwrap();
+    let row = sqlx::query("INSERT INTO jsonb_payloads VALUES ($1) RETURNING payload")
+        .bind(&document)
+        .fetch_one(&mut *tx)
+        .await
+        .unwrap();
+    assert_eq!(row.get::<serde_json::Value, _>(0), document);
+    tx.rollback().await.unwrap();
+    assert_eq!(
+        sqlx::query_scalar::<_, i64>("SELECT count(*) FROM jsonb_payloads")
+            .fetch_one(&pool)
+            .await
+            .unwrap(),
+        0
+    );
+}
+
+#[tokio::test]
 async fn sqlx_queries_map_all_phase_one_types() {
     let mut connection = PgFakeConnection::new(Db::create());
     connection

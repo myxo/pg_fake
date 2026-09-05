@@ -286,10 +286,10 @@ pub(super) fn evaluate_literal(expr: &ast::Expr) -> Result<Value> {
             let ast::Value::SingleQuotedString(text) = &typed.value.value else {
                 return reject_unsupported("typed literal is not implemented");
             };
-            if target.base != BaseType::Json {
+            if !matches!(target.base, BaseType::Json | BaseType::Jsonb) {
                 return reject_unsupported("typed literal is not implemented");
             }
-            Value::parse(BaseType::Json, text)
+            Value::parse(target.base, text)
         }
         ast::Expr::UnaryOp {
             op: ast::UnaryOperator::Plus,
@@ -555,7 +555,7 @@ pub(crate) fn infer_expression_type(expr: &ast::Expr, schema: RowScope<'_>) -> R
                 return reject_unsupported("cast variant is not implemented");
             }
             let target = coercion::convert_ast_data_type(data_type)?;
-            if target.base == BaseType::Json
+            if matches!(target.base, BaseType::Json | BaseType::Jsonb)
                 && let Some(text) = extract_unknown_string_literal(expr)
             {
                 coercion::coerce_unknown(text, target, CastContext::Explicit)?;
@@ -678,6 +678,16 @@ pub(super) fn resolve_operator_type(
     }
     let left_type = infer_expression_type(left, schema)?;
     let right_type = infer_expression_type(right, schema)?;
+    if left_type != right_type
+        && (matches!(left_type, BaseType::Json | BaseType::Jsonb)
+            || matches!(right_type, BaseType::Json | BaseType::Jsonb))
+        && !is_null_literal(left)
+        && !is_null_literal(right)
+        && extract_unknown_string_literal(left).is_none()
+        && extract_unknown_string_literal(right).is_none()
+    {
+        return Err(create_missing_operator_error(left_type));
+    }
     if left_type != right_type
         && (left_type == BaseType::Float4 || right_type == BaseType::Float4)
         && is_numeric_type(left_type)
@@ -1708,6 +1718,7 @@ pub(super) fn compare_values(left: &Value, right: &Value) -> Result<Ordering> {
         (Value::Json(_), Value::Json(_)) => {
             return Err(create_missing_operator_error(BaseType::Json));
         }
+        (Value::Jsonb(left), Value::Jsonb(right)) => left.compare(right),
         _ => {
             return Err(PgError::create(
                 SqlState::DatatypeMismatch,

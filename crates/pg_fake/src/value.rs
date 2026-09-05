@@ -52,7 +52,7 @@ pub struct PgInterval {
 /// Each variant maps to a distinct `pg_type` OID. The character types
 /// (`Text`, `Varchar`, `Bpchar`) all share the `Value::Text` backing; the
 /// declared type (and its typmod) lives in the catalog.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum BaseType {
     Bool,
     Int2,
@@ -72,6 +72,7 @@ pub enum BaseType {
     TimestampTz,
     Interval,
     Json,
+    Jsonb,
 }
 
 impl BaseType {
@@ -97,6 +98,7 @@ impl BaseType {
             BaseType::TimestampTz => 1184,
             BaseType::Interval => 1186,
             BaseType::Json => 114,
+            BaseType::Jsonb => 3802,
         }
     }
 
@@ -122,6 +124,7 @@ impl BaseType {
             BaseType::TimestampTz => "timestamptz",
             BaseType::Interval => "interval",
             BaseType::Json => "json",
+            BaseType::Jsonb => "jsonb",
         }
     }
 
@@ -147,6 +150,7 @@ impl BaseType {
             1184 => Some(BaseType::TimestampTz),
             1186 => Some(BaseType::Interval),
             114 => Some(BaseType::Json),
+            3802 => Some(BaseType::Jsonb),
             _ => None,
         }
     }
@@ -174,6 +178,7 @@ impl BaseType {
             "timestamptz" | "timestamp with time zone" => Some(BaseType::TimestampTz),
             "interval" => Some(BaseType::Interval),
             "json" => Some(BaseType::Json),
+            "jsonb" => Some(BaseType::Jsonb),
             _ => None,
         }
     }
@@ -236,6 +241,7 @@ pub enum Value {
     TimestampTz(PgTimestampTz),
     Interval(PgInterval),
     Json(String),
+    Jsonb(crate::jsonb::Jsonb),
 }
 
 impl Value {
@@ -268,6 +274,7 @@ impl Value {
             Value::TimestampTz(_) => Some(BaseType::TimestampTz),
             Value::Interval(_) => Some(BaseType::Interval),
             Value::Json(_) => Some(BaseType::Json),
+            Value::Jsonb(_) => Some(BaseType::Jsonb),
         }
     }
 
@@ -337,6 +344,7 @@ impl Value {
             }
             Value::Interval(value) => format_interval(*value),
             Value::Json(value) => value.clone(),
+            Value::Jsonb(value) => value.get_postgres_text().to_owned(),
         }
     }
 
@@ -370,6 +378,7 @@ impl Value {
             BaseType::Json => validate_json(input)
                 .map(|()| Value::Json(input.to_owned()))
                 .map_err(|()| create_invalid_text_error(input, "json")),
+            BaseType::Jsonb => crate::jsonb::Jsonb::parse(input).map(Value::Jsonb),
         }
     }
 }

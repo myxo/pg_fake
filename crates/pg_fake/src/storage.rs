@@ -43,6 +43,7 @@ struct VersionReclamation {
 
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
 enum NormalizedIndexValue {
+    Jsonb(crate::jsonb::Jsonb),
     Bool(bool),
     Int2(i16),
     Int4(i32),
@@ -796,6 +797,7 @@ fn build_index_key(
 #[cfg_attr(feature = "execution-log", tracing::instrument(skip_all))]
 fn normalize_index_value(value: &Value, base: BaseType) -> Option<NormalizedIndexValue> {
     match (value, base) {
+        (Value::Jsonb(value), BaseType::Jsonb) => Some(NormalizedIndexValue::Jsonb(value.clone())),
         (Value::Null, _) => None,
         (Value::Bool(value), BaseType::Bool) => Some(NormalizedIndexValue::Bool(*value)),
         (Value::Int2(value), BaseType::Int2) => Some(NormalizedIndexValue::Int2(*value)),

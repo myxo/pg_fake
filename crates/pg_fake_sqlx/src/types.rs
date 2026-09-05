@@ -63,6 +63,7 @@ impl TypeInfo for PgFakeTypeInfo {
             Some(BaseType::TimestampTz) => "TIMESTAMPTZ",
             Some(BaseType::Interval) => "INTERVAL",
             Some(BaseType::Json) => "JSON",
+            Some(BaseType::Jsonb) => "JSONB",
             None => "NULL",
         }
     }
@@ -127,6 +128,35 @@ impl Arguments for PgFakeArguments {
 sqlx_core::impl_into_arguments_for_arguments!(PgFakeArguments);
 sqlx_core::impl_encode_for_option!(PgFake);
 
+impl<T: ?Sized> Type<PgFake> for sqlx::types::Json<T> {
+    fn type_info() -> PgFakeTypeInfo {
+        PgFakeTypeInfo::new(BaseType::Jsonb)
+    }
+
+    fn compatible(type_info: &PgFakeTypeInfo) -> bool {
+        matches!(type_info.base, Some(BaseType::Json | BaseType::Jsonb))
+    }
+}
+
+impl<'q, T: serde::Serialize> Encode<'q, PgFake> for sqlx::types::Json<T> {
+    fn encode_by_ref(&self, buffer: &mut Vec<Value>) -> Result<IsNull, BoxDynError> {
+        buffer.push(Value::Text(serde_json::to_string(&self.0)?));
+        Ok(IsNull::No)
+    }
+}
+
+impl<'r, T: serde::Deserialize<'r>> Decode<'r, PgFake> for sqlx::types::Json<T> {
+    fn decode(value: PgFakeValueRef<'r>) -> Result<Self, BoxDynError> {
+        let text = match value.value {
+            Value::Json(text) => text.as_str(),
+            Value::Jsonb(value) => value.get_postgres_text(),
+            Value::Null => return Err(Box::new(UnexpectedNullError)),
+            value => return Err(format!("cannot decode {value:?} as JSON").into()),
+        };
+        Ok(Self(serde_json::from_str(text)?))
+    }
+}
+
 macro_rules! scalar_type {
     ($rust:ty, $base:expr, $variant:path) => {
         impl Type<PgFake> for $rust {
@@ -163,6 +193,7 @@ scalar_type!(i64, BaseType::Int8, Value::Int8);
 scalar_type!(f32, BaseType::Float4, Value::Float4);
 scalar_type!(f64, BaseType::Float8, Value::Float8);
 scalar_type!(BigDecimal, BaseType::Numeric, Value::Numeric);
+scalar_type!(pg_fake::jsonb::Jsonb, BaseType::Jsonb, Value::Jsonb);
 scalar_type!(uuid::Uuid, BaseType::Uuid, Value::Uuid);
 scalar_type!(
     pg_fake::value::PgInterval,
