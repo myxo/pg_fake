@@ -506,6 +506,35 @@ fn uuid_temporal_benchmark(
     }
 }
 
+fn benchmark_json(
+    criterion: &mut Criterion,
+    runtime: &Runtime,
+    connections: &mut [NamedBenchmarkConnection<'_>],
+) {
+    for (_, connection) in connections.iter_mut() {
+        connection.execute(
+            runtime,
+            "CREATE TABLE json_insert_returning (payload JSON NOT NULL)",
+        );
+    }
+    let query = r#"INSERT INTO json_insert_returning VALUES ('{ "z" : 1e+02, "z" : -0.00, "nested" : [true, null, "Привет"] }') RETURNING payload"#;
+    let mut group =
+        criterion.benchmark_group(benchmarks::find_benchmark("json_insert_returning").name);
+    group.throughput(Throughput::Elements(1));
+    for (name, connection) in connections.iter_mut() {
+        group.bench_function(*name, |benchmark| {
+            benchmark.iter(|| {
+                connection.fetch(runtime, query);
+                connection.execute(runtime, "DELETE FROM json_insert_returning");
+            });
+        });
+    }
+    group.finish();
+    for (_, connection) in connections.iter_mut() {
+        connection.execute(runtime, "DROP TABLE json_insert_returning");
+    }
+}
+
 fn insert_benchmark(
     criterion: &mut Criterion,
     runtime: &Runtime,
@@ -1328,6 +1357,7 @@ fn benchmarks(criterion: &mut Criterion) {
         sequence_benchmark(criterion, &runtime, &mut connections);
         serial_identity_benchmark(criterion, &runtime, &mut connections);
         uuid_temporal_benchmark(criterion, &runtime, &mut connections);
+        benchmark_json(criterion, &runtime, &mut connections);
         insert_benchmark(criterion, &runtime, &mut connections);
         on_conflict_benchmark(criterion, &runtime, &mut connections);
         update_benchmark(criterion, &runtime, &mut connections);

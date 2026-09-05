@@ -102,6 +102,11 @@ pub fn list_benchmarks() -> Vec<Benchmark> {
             postgres_comparisons(),
         ),
         build_benchmark(
+            "json_insert_returning",
+            postgres_values(),
+            postgres_comparisons(),
+        ),
+        build_benchmark(
             "transaction_insert",
             postgres_values(),
             postgres_comparisons(),

@@ -1904,6 +1904,19 @@ fn execute_recursive_cte(
     if query.fetch.is_some() || !query.locks.is_empty() || query.for_clause.is_some() {
         return reject_unsupported("recursive query clause is not implemented");
     }
+    let columns = describe_recursive_cte_columns(state, query, alias, name)?;
+    let distinct = matches!(
+        set_quantifier,
+        ast::SetQuantifier::None | ast::SetQuantifier::Distinct
+    );
+    if distinct {
+        for column in &columns {
+            validate_equality_type(
+                BaseType::resolve_oid(column.type_oid)
+                    .expect("recursive columns use supported PostgreSQL types"),
+            )?;
+        }
+    }
     let (limit, offset) = resolve_select_limit(query, context)?;
     let generation_demand = query
         .order_by
@@ -1933,25 +1946,6 @@ fn execute_recursive_cte(
     for (column, alias) in seed.columns.iter_mut().zip(&alias.columns) {
         column.name = normalize_identifier(&alias.name);
     }
-    let mut recursive_query = create_set_expression_query((**right).clone());
-    let _ = recursive_query.visit(&mut CteReferenceReplacer {
-        ctes: &[MaterializedCte {
-            name: name.to_owned(),
-            alias: alias.clone(),
-            result: QueryResult {
-                columns: seed.columns.clone(),
-                rows: Vec::new(),
-            },
-        }],
-        masked: Vec::new(),
-    });
-    let recursive_columns =
-        describe_query_result_columns(state, &ast::Statement::Query(Box::new(recursive_query)))?;
-    let columns = resolve_recursive_columns(&seed.columns, &recursive_columns)?;
-    let distinct = matches!(
-        set_quantifier,
-        ast::SetQuantifier::None | ast::SetQuantifier::Distinct
-    );
     let mut rows = coerce_set_rows(seed.rows, &seed.columns, &columns)?;
     if distinct {
         rows = remove_set_duplicates(rows)?;
@@ -3065,10 +3059,16 @@ fn describe_set_expression_columns(
         ast::SetExpr::Query(query) => {
             describe_query_result_columns(state, &ast::Statement::Query(query.clone()))
         }
-        ast::SetExpr::SetOperation { left, right, .. } => resolve_set_columns(
-            &describe_set_expression_columns(state, query, left)?,
-            &describe_set_expression_columns(state, query, right)?,
-        ),
+        ast::SetExpr::SetOperation { left, right, .. } => {
+            let left_columns = describe_set_expression_columns(state, query, left)?;
+            let right_columns = describe_set_expression_columns(state, query, right)?;
+            resolve_set_columns_with_unknown(
+                &left_columns,
+                &right_columns,
+                &identify_unknown_set_operand_columns(left, left_columns.len()),
+                &identify_unknown_set_operand_columns(right, right_columns.len()),
+            )
+        }
         ast::SetExpr::Select(_) | ast::SetExpr::Values(_) => {
             let mut operand = query.clone();
             operand.with = None;
@@ -4049,6 +4049,7 @@ fn resolve_grouping_expressions(
                 ));
             }
             let data_type = infer_query_expression_type(state, &resolved, scope)?;
+            validate_equality_type(data_type.base)?;
             Ok((resolved, data_type))
         })
         .collect()
@@ -4151,6 +4152,54 @@ fn execute_values_query(
             typmod: column.data_type.typmod,
         })
         .collect::<Vec<_>>();
+    let orders = if let Some(order_by) = &query.order_by {
+        let ast::OrderByKind::Expressions(orders) = &order_by.kind else {
+            return reject_unsupported("ORDER BY ALL is not implemented");
+        };
+        Some(
+            orders
+                .iter()
+                .map(|order| {
+                    let index = if let Some(position) = extract_number_literal(&order.expr)
+                        && !position.contains(['.', 'e', 'E'])
+                    {
+                        position
+                            .parse::<usize>()
+                            .ok()
+                            .and_then(|position| position.checked_sub(1))
+                    } else if let ast::Expr::Identifier(identifier) = &order.expr {
+                        scope
+                            .resolve_column(std::slice::from_ref(identifier))
+                            .ok()
+                            .map(|(slot, _)| slot)
+                    } else {
+                        None
+                    }
+                    .ok_or_else(|| {
+                        PgError::create(
+                            SqlState::InvalidColumnReference,
+                            "ORDER BY position is not in select list",
+                        )
+                    })?;
+                    if index >= columns.len() {
+                        return Err(PgError::create(
+                            SqlState::InvalidColumnReference,
+                            "ORDER BY position is not in select list",
+                        ));
+                    }
+                    validate_ordering_type(scope.columns[index].data_type.base)?;
+                    let ascending = resolve_order_ascending(&order.options)?;
+                    Ok((
+                        index,
+                        ascending,
+                        order.options.nulls_first.unwrap_or(!ascending),
+                    ))
+                })
+                .collect::<Result<Vec<_>>>()?,
+        )
+    } else {
+        None
+    };
     let constants = create_constant_expression_schema();
     let mut rows = values
         .rows
@@ -4171,48 +4220,7 @@ fn execute_values_query(
                 .collect::<Result<Vec<_>>>()
         })
         .collect::<Result<Vec<_>>>()?;
-    if let Some(order_by) = &query.order_by {
-        let ast::OrderByKind::Expressions(orders) = &order_by.kind else {
-            return reject_unsupported("ORDER BY ALL is not implemented");
-        };
-        let orders = orders
-            .iter()
-            .map(|order| {
-                let index = if let Some(position) = extract_number_literal(&order.expr)
-                    && !position.contains(['.', 'e', 'E'])
-                {
-                    position
-                        .parse::<usize>()
-                        .ok()
-                        .and_then(|position| position.checked_sub(1))
-                } else if let ast::Expr::Identifier(identifier) = &order.expr {
-                    scope
-                        .resolve_column(std::slice::from_ref(identifier))
-                        .ok()
-                        .map(|(slot, _)| slot)
-                } else {
-                    None
-                }
-                .ok_or_else(|| {
-                    PgError::create(
-                        SqlState::InvalidColumnReference,
-                        "ORDER BY position is not in select list",
-                    )
-                })?;
-                if index >= columns.len() {
-                    return Err(PgError::create(
-                        SqlState::InvalidColumnReference,
-                        "ORDER BY position is not in select list",
-                    ));
-                }
-                let ascending = resolve_order_ascending(&order.options)?;
-                Ok((
-                    index,
-                    ascending,
-                    order.options.nulls_first.unwrap_or(!ascending),
-                ))
-            })
-            .collect::<Result<Vec<_>>>()?;
+    if let Some(orders) = &orders {
         rows.sort_by(|left, right| {
             orders
                 .iter()
@@ -4294,6 +4302,46 @@ fn create_set_operand_query(query: &ast::Query, expression: &ast::SetExpr) -> as
 }
 
 #[cfg_attr(feature = "execution-log", tracing::instrument(skip_all))]
+fn validate_unknown_set_operand_columns(
+    expression: &ast::SetExpr,
+    unknown: &[bool],
+    columns: &[ColumnMeta],
+) -> Result<()> {
+    let select = match expression {
+        ast::SetExpr::Select(select) => select.as_ref(),
+        ast::SetExpr::Query(query) => match query.body.as_ref() {
+            ast::SetExpr::Select(select) => select.as_ref(),
+            _ => return Ok(()),
+        },
+        _ => return Ok(()),
+    };
+    assert_eq!(unknown.len(), columns.len());
+    for ((item, unknown), column) in select.projection.iter().zip(unknown).zip(columns) {
+        if !unknown {
+            continue;
+        }
+        let expression = match item {
+            ast::SelectItem::UnnamedExpr(expression)
+            | ast::SelectItem::ExprWithAlias {
+                expr: expression, ..
+            } => expression,
+            _ => continue,
+        };
+        if let Some(text) = extract_unknown_string_literal(expression) {
+            coercion::coerce_unknown(
+                text,
+                PgType::create(
+                    BaseType::resolve_oid(column.type_oid)
+                        .expect("set-operation column has a supported type OID"),
+                ),
+                CastContext::Implicit,
+            )?;
+        }
+    }
+    Ok(())
+}
+
+#[cfg_attr(feature = "execution-log", tracing::instrument(skip_all))]
 fn execute_set_expression(
     state: &DatabaseState,
     query: &ast::Query,
@@ -4317,9 +4365,29 @@ fn execute_set_expression(
             left,
             right,
         } => {
+            let left_columns = describe_set_expression_columns(state, query, left)?;
+            let right_columns = describe_set_expression_columns(state, query, right)?;
+            let left_unknown = identify_unknown_set_operand_columns(left, left_columns.len());
+            let right_unknown = identify_unknown_set_operand_columns(right, right_columns.len());
+            let columns = resolve_set_columns_with_unknown(
+                &left_columns,
+                &right_columns,
+                &left_unknown,
+                &right_unknown,
+            )?;
+            validate_unknown_set_operand_columns(left, &left_unknown, &columns)?;
+            validate_unknown_set_operand_columns(right, &right_unknown, &columns)?;
+            validate_set_operation_types(*op, *set_quantifier, &columns)?;
             let left = execute_set_expression(state, query, left, xid, snapshot, context)?;
             let right = execute_set_expression(state, query, right, xid, snapshot, context)?;
-            execute_set_operation(*op, *set_quantifier, left, right)
+            execute_set_operation(
+                *op,
+                *set_quantifier,
+                left,
+                right,
+                &left_unknown,
+                &right_unknown,
+            )
         }
         ast::SetExpr::Select(_) | ast::SetExpr::Values(_) => {
             let operand = create_set_operand_query(query, expression);
@@ -4340,6 +4408,8 @@ fn execute_set_operation(
     quantifier: ast::SetQuantifier,
     left: QueryResult,
     right: QueryResult,
+    left_unknown: &[bool],
+    right_unknown: &[bool],
 ) -> Result<QueryResult> {
     if left.columns.len() != right.columns.len() {
         return Err(PgError::create(
@@ -4347,9 +4417,17 @@ fn execute_set_operation(
             "each set-operation query must have the same number of columns",
         ));
     }
-    let columns = resolve_set_columns(&left.columns, &right.columns)?;
-    let left = coerce_set_rows(left.rows, &left.columns, &columns)?;
-    let right = coerce_set_rows(right.rows, &right.columns, &columns)?;
+    let columns = resolve_set_columns_with_unknown(
+        &left.columns,
+        &right.columns,
+        left_unknown,
+        right_unknown,
+    )?;
+    validate_set_operation_types(operator, quantifier, &columns)?;
+    let left =
+        coerce_set_rows_with_unknown(left.rows, &left.columns, &columns, Some(left_unknown))?;
+    let right =
+        coerce_set_rows_with_unknown(right.rows, &right.columns, &columns, Some(right_unknown))?;
     let rows = match (operator, quantifier) {
         (ast::SetOperator::Union, ast::SetQuantifier::All) => {
             left.into_iter().chain(right).collect()
@@ -4373,27 +4451,68 @@ fn execute_set_operation(
 }
 
 #[cfg_attr(feature = "execution-log", tracing::instrument(skip_all))]
+fn validate_set_operation_types(
+    operator: ast::SetOperator,
+    quantifier: ast::SetQuantifier,
+    columns: &[ColumnMeta],
+) -> Result<()> {
+    if !matches!(
+        (operator, quantifier),
+        (ast::SetOperator::Union, ast::SetQuantifier::All)
+    ) {
+        for column in columns {
+            validate_equality_type(
+                BaseType::resolve_oid(column.type_oid)
+                    .expect("set-operation columns use supported PostgreSQL types"),
+            )?;
+        }
+    }
+    Ok(())
+}
+
+#[cfg_attr(feature = "execution-log", tracing::instrument(skip_all))]
 fn resolve_set_columns(left: &[ColumnMeta], right: &[ColumnMeta]) -> Result<Vec<ColumnMeta>> {
+    resolve_set_columns_with_unknown(
+        left,
+        right,
+        &vec![false; left.len()],
+        &vec![false; right.len()],
+    )
+}
+
+#[cfg_attr(feature = "execution-log", tracing::instrument(skip_all))]
+fn resolve_set_columns_with_unknown(
+    left: &[ColumnMeta],
+    right: &[ColumnMeta],
+    left_unknown: &[bool],
+    right_unknown: &[bool],
+) -> Result<Vec<ColumnMeta>> {
     if left.len() != right.len() {
         return Err(PgError::create(
             SqlState::SyntaxError,
             "each set-operation query must have the same number of columns",
         ));
     }
+    assert_eq!(left.len(), left_unknown.len());
+    assert_eq!(right.len(), right_unknown.len());
     left.iter()
         .zip(right)
-        .map(|(left, right)| {
+        .zip(left_unknown.iter().zip(right_unknown))
+        .map(|((left, right), (left_unknown, right_unknown))| {
             let left_type = BaseType::resolve_oid(left.type_oid)
                 .expect("set-operation column has a supported type OID");
             let right_type = BaseType::resolve_oid(right.type_oid)
                 .expect("set-operation column has a supported type OID");
-            let data_type =
-                coercion::resolve_common_type(left_type, right_type).ok_or_else(|| {
+            let data_type = match (*left_unknown, *right_unknown) {
+                (true, false) => right_type,
+                (false, true) => left_type,
+                _ => coercion::resolve_common_type(left_type, right_type).ok_or_else(|| {
                     PgError::create(
                         SqlState::DatatypeMismatch,
                         "set-operation types cannot be matched",
                     )
-                })?;
+                })?,
+            };
             Ok(ColumnMeta {
                 name: left.name.clone(),
                 type_oid: data_type.map_to_oid(),
@@ -4428,20 +4547,44 @@ fn coerce_set_rows(
     source: &[ColumnMeta],
     target: &[ColumnMeta],
 ) -> Result<Vec<Vec<Value>>> {
+    coerce_set_rows_with_unknown(rows, source, target, None)
+}
+
+#[cfg_attr(feature = "execution-log", tracing::instrument(skip_all))]
+fn coerce_set_rows_with_unknown(
+    rows: Vec<Vec<Value>>,
+    source: &[ColumnMeta],
+    target: &[ColumnMeta],
+    unknown: Option<&[bool]>,
+) -> Result<Vec<Vec<Value>>> {
+    if let Some(unknown) = unknown {
+        assert_eq!(source.len(), unknown.len());
+    }
     rows.into_iter()
         .map(|row| {
             row.into_iter()
                 .zip(source)
                 .zip(target)
-                .map(|((value, source), target)| {
+                .enumerate()
+                .map(|(index, ((value, source), target))| {
+                    let target = PgType::create(
+                        BaseType::resolve_oid(target.type_oid)
+                            .expect("set-operation column has a supported type OID"),
+                    );
+                    if unknown.is_some_and(|unknown| unknown[index]) {
+                        return match value {
+                            Value::Null => Ok(Value::Null),
+                            Value::Text(text) => {
+                                coercion::coerce_unknown(&text, target, CastContext::Implicit)
+                            }
+                            _ => unreachable!("unknown set columns contain text or NULL"),
+                        };
+                    }
                     coercion::coerce(
                         value,
                         BaseType::resolve_oid(source.type_oid)
                             .expect("set-operation column has a supported type OID"),
-                        PgType::create(
-                            BaseType::resolve_oid(target.type_oid)
-                                .expect("set-operation column has a supported type OID"),
-                        ),
+                        target,
                         CastContext::Implicit,
                     )
                 })
@@ -4548,6 +4691,10 @@ fn sort_set_rows(
                     "ORDER BY position is not in select list",
                 )
             })?;
+            validate_ordering_type(
+                BaseType::resolve_oid(columns[index].type_oid)
+                    .expect("set-operation columns use supported PostgreSQL types"),
+            )?;
             let ascending = resolve_order_ascending(&order.options)?;
             Ok((
                 index,
@@ -4730,6 +4877,23 @@ fn resolve_order_specs<'a>(
                             },
                         }
                     };
+                    let data_type = match &key {
+                        OrderKey::Output(index) => BaseType::resolve_oid(columns[*index].type_oid)
+                            .expect("projection columns use supported PostgreSQL types"),
+                        OrderKey::Input(slot, _) => {
+                            scope
+                                .columns
+                                .iter()
+                                .find(|column| column.slot == *slot)
+                                .expect("resolved ORDER BY column is in scope")
+                                .data_type
+                                .base
+                        }
+                        OrderKey::Expression(expression) => {
+                            infer_query_expression_type(state, expression, scope)?.base
+                        }
+                    };
+                    validate_ordering_type(data_type)?;
                     let ascending = resolve_order_ascending(&order.options)?;
                     Ok(RowOrderSpec {
                         key,
@@ -4761,6 +4925,7 @@ fn resolve_distinct_plan<'a>(
     state: &DatabaseState,
     select: &'a ast::Select,
     projections: &[ProjectionSource<'_>],
+    columns: &[ColumnMeta],
     order_specs: &[RowOrderSpec<'_>],
     scope: &BoundScope,
 ) -> Result<DistinctPlan<'a>> {
@@ -4770,6 +4935,16 @@ fn resolve_distinct_plan<'a>(
     match distinct {
         ast::Distinct::All => Ok(DistinctPlan::None),
         ast::Distinct::Distinct => {
+            for projection in projections {
+                validate_equality_type(
+                    infer_query_expression_type(
+                        state,
+                        &create_projection_expression(projection, scope),
+                        scope,
+                    )?
+                    .base,
+                )?;
+            }
             for order in order_specs {
                 if matches!(order.key, OrderKey::Output(_)) {
                     continue;
@@ -4802,17 +4977,39 @@ fn resolve_distinct_plan<'a>(
                     "DISTINCT ON requires at least one expression",
                 ));
             }
-            for expression in expressions {
-                infer_query_expression_type(state, expression, scope)?;
+            let output_indexes = expressions
+                .iter()
+                .map(|expression| {
+                    let ast::Expr::Identifier(identifier) = expression else {
+                        return None;
+                    };
+                    columns
+                        .iter()
+                        .position(|column| column.name == normalize_identifier(identifier))
+                })
+                .collect::<Vec<_>>();
+            for (expression, output_index) in expressions.iter().zip(&output_indexes) {
+                let data_type = output_index.map_or_else(
+                    || infer_query_expression_type(state, expression, scope).map(|data| data.base),
+                    |index| {
+                        Ok(BaseType::resolve_oid(columns[index].type_oid)
+                            .expect("projection columns use supported PostgreSQL types"))
+                    },
+                )?;
+                validate_equality_type(data_type)?;
             }
             let mut matched = vec![false; expressions.len()];
             for order in order_specs {
                 let order_expression = create_order_expression(order, projections, scope);
                 let mut found = None;
-                for (index, expression) in expressions.iter().enumerate() {
-                    if !matched[index]
-                        && compare_bound_expressions(&order_expression, expression, scope)?
-                    {
+                for (index, (expression, output_index)) in
+                    expressions.iter().zip(&output_indexes).enumerate()
+                {
+                    let matches = output_index.is_some_and(
+                        |output_index| matches!(order.key, OrderKey::Output(index) if index == output_index),
+                    ) || output_index.is_none()
+                        && compare_bound_expressions(&order_expression, expression, scope)?;
+                    if !matched[index] && matches {
                         found = Some(index);
                         break;
                     }
@@ -4829,9 +5026,12 @@ fn resolve_distinct_plan<'a>(
                 }
             }
             let mut keys = Vec::with_capacity(expressions.len());
-            for expression in expressions {
-                let mut key = None;
+            for (expression, output_index) in expressions.iter().zip(output_indexes) {
+                let mut key = output_index.map(DistinctKey::Output);
                 for (index, projection) in projections.iter().enumerate() {
+                    if key.is_some() {
+                        break;
+                    }
                     if compare_bound_expressions(
                         expression,
                         &create_projection_expression(projection, scope),
@@ -5103,9 +5303,14 @@ impl PrimaryKeyDependencyCollector<'_> {
             }
             None => Vec::new(),
         };
-        let Ok(distinct) =
-            resolve_distinct_plan(self.state, select, &projections, &order_specs, &scope)
-        else {
+        let Ok(distinct) = resolve_distinct_plan(
+            self.state,
+            select,
+            &projections,
+            &columns,
+            &order_specs,
+            &scope,
+        ) else {
             return;
         };
         if let Ok(plan) = resolve_grouping_plan(
@@ -6334,7 +6539,8 @@ pub(super) fn execute_query(
 
     let (projections, columns) = build_projection_plan(state, &select.projection, &scope)?;
     let order_specs = resolve_order_specs(state, query, &projections, &columns, &scope)?;
-    let distinct = resolve_distinct_plan(state, select, &projections, &order_specs, &scope)?;
+    let distinct =
+        resolve_distinct_plan(state, select, &projections, &columns, &order_specs, &scope)?;
     let grouping = resolve_grouping_plan(
         state,
         select,

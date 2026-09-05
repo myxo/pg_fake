@@ -269,6 +269,7 @@ pub(super) fn evaluate_literal(expr: &ast::Expr) -> Result<Value> {
             ast::Value::Null => Ok(Value::Null),
             ast::Value::Boolean(value) => Ok(Value::Bool(*value)),
             ast::Value::SingleQuotedString(value) => Ok(Value::Text(value.clone())),
+            ast::Value::DollarQuotedString(value) => Ok(Value::Text(value.value.clone())),
             ast::Value::Number(value, _) if value.contains(['.', 'e', 'E']) => {
                 Value::parse(BaseType::Numeric, value)
             }
@@ -280,6 +281,16 @@ pub(super) fn evaluate_literal(expr: &ast::Expr) -> Result<Value> {
         };
     }
     match expr {
+        ast::Expr::TypedString(typed) if !typed.uses_odbc_syntax => {
+            let target = coercion::convert_ast_data_type(&typed.data_type)?;
+            let ast::Value::SingleQuotedString(text) = &typed.value.value else {
+                return reject_unsupported("typed literal is not implemented");
+            };
+            if target.base != BaseType::Json {
+                return reject_unsupported("typed literal is not implemented");
+            }
+            Value::parse(BaseType::Json, text)
+        }
         ast::Expr::UnaryOp {
             op: ast::UnaryOperator::Plus,
             expr,
@@ -318,6 +329,7 @@ pub(crate) fn extract_unknown_string_literal(expr: &ast::Expr) -> Option<&str> {
     match expr {
         ast::Expr::Value(value) => match &value.value {
             ast::Value::SingleQuotedString(value) => Some(value),
+            ast::Value::DollarQuotedString(value) => Some(&value.value),
             _ => None,
         },
         ast::Expr::Nested(expr) => extract_unknown_string_literal(expr),
@@ -331,7 +343,9 @@ pub(crate) fn infer_expression_type(expr: &ast::Expr, schema: RowScope<'_>) -> R
         return match value {
             ast::Value::Null => Ok(BaseType::Text),
             ast::Value::Boolean(_) => Ok(BaseType::Bool),
-            ast::Value::SingleQuotedString(_) => Ok(BaseType::Text),
+            ast::Value::SingleQuotedString(_) | ast::Value::DollarQuotedString(_) => {
+                Ok(BaseType::Text)
+            }
             ast::Value::Number(value, _) if value.contains(['.', 'e', 'E']) => {
                 Ok(BaseType::Numeric)
             }
@@ -342,6 +356,12 @@ pub(crate) fn infer_expression_type(expr: &ast::Expr, schema: RowScope<'_>) -> R
         };
     }
     match expr {
+        ast::Expr::TypedString(typed) if !typed.uses_odbc_syntax => {
+            let value = evaluate_literal(expr)?;
+            Ok(value
+                .get_base_type()
+                .expect("typed string literal is not NULL"))
+        }
         ast::Expr::Identifier(column) => {
             Ok(schema.resolve_column(std::slice::from_ref(column))?.1.base)
         }
@@ -402,7 +422,8 @@ pub(crate) fn infer_expression_type(expr: &ast::Expr, schema: RowScope<'_>) -> R
             | ast::BinaryOperator::Lt
             | ast::BinaryOperator::GtEq
             | ast::BinaryOperator::LtEq => {
-                resolve_operator_type(left, right, schema)?;
+                let data_type = resolve_operator_type(left, right, schema)?;
+                validate_comparison_type(op, data_type)?;
                 Ok(BaseType::Bool)
             }
             ast::BinaryOperator::And | ast::BinaryOperator::Or => {
@@ -428,15 +449,42 @@ pub(crate) fn infer_expression_type(expr: &ast::Expr, schema: RowScope<'_>) -> R
                 "operator has incompatible types",
             )),
         },
-        ast::Expr::IsNull(_) | ast::Expr::IsNotNull(_) => Ok(BaseType::Bool),
+        ast::Expr::IsNull(expression) | ast::Expr::IsNotNull(expression) => {
+            infer_expression_type(expression, schema)?;
+            Ok(BaseType::Bool)
+        }
         ast::Expr::InList { expr, list, .. } => {
             validate_membership_types(expr, list, schema)?;
             Ok(BaseType::Bool)
         }
-        ast::Expr::InSubquery { .. }
-        | ast::Expr::Exists { .. }
-        | ast::Expr::AnyOp { .. }
-        | ast::Expr::AllOp { .. } => Ok(BaseType::Bool),
+        ast::Expr::InSubquery { .. } | ast::Expr::Exists { .. } => Ok(BaseType::Bool),
+        ast::Expr::AnyOp {
+            left,
+            compare_op,
+            right,
+            ..
+        }
+        | ast::Expr::AllOp {
+            left,
+            compare_op,
+            right,
+        } => {
+            if let ast::Expr::Tuple(candidates) = right.as_ref() {
+                if candidates.is_empty() {
+                    for field in extract_row_fields(left) {
+                        validate_comparison_type(
+                            compare_op,
+                            infer_expression_type(field, schema)?,
+                        )?;
+                    }
+                } else {
+                    for candidate in candidates {
+                        validate_row_comparison_types(left, candidate, compare_op, schema)?;
+                    }
+                }
+            }
+            Ok(BaseType::Bool)
+        }
         ast::Expr::IsTrue(expr) | ast::Expr::IsFalse(expr) | ast::Expr::IsUnknown(expr) => {
             let base = infer_expression_type(expr, schema)?;
             if base == BaseType::Bool
@@ -452,7 +500,7 @@ pub(crate) fn infer_expression_type(expr: &ast::Expr, schema: RowScope<'_>) -> R
             }
         }
         ast::Expr::IsDistinctFrom(left, right) | ast::Expr::IsNotDistinctFrom(left, right) => {
-            resolve_operator_type(left, right, schema)?;
+            validate_equality_type(resolve_operator_type(left, right, schema)?)?;
             Ok(BaseType::Bool)
         }
         ast::Expr::Case {
@@ -463,14 +511,15 @@ pub(crate) fn infer_expression_type(expr: &ast::Expr, schema: RowScope<'_>) -> R
         } => {
             if let Some(operand) = operand {
                 for condition in conditions {
-                    resolve_expression_pair_type(operand, &condition.condition, schema).map_err(
-                        |_| {
-                            PgError::create(
-                                SqlState::DatatypeMismatch,
-                                "CASE types are incompatible",
-                            )
-                        },
-                    )?;
+                    let data_type =
+                        resolve_expression_pair_type(operand, &condition.condition, schema)
+                            .map_err(|_| {
+                                PgError::create(
+                                    SqlState::DatatypeMismatch,
+                                    "CASE types are incompatible",
+                                )
+                            })?;
+                    validate_equality_type(data_type)?;
                 }
             } else {
                 for condition in conditions {
@@ -506,6 +555,11 @@ pub(crate) fn infer_expression_type(expr: &ast::Expr, schema: RowScope<'_>) -> R
                 return reject_unsupported("cast variant is not implemented");
             }
             let target = coercion::convert_ast_data_type(data_type)?;
+            if target.base == BaseType::Json
+                && let Some(text) = extract_unknown_string_literal(expr)
+            {
+                coercion::coerce_unknown(text, target, CastContext::Explicit)?;
+            }
             if extract_unknown_string_literal(expr).is_none()
                 && !is_null_literal(expr)
                 && !is_parameter_placeholder(expr)
@@ -719,10 +773,17 @@ fn infer_function_return_type(function: &ast::Function, schema: RowScope<'_>) ->
         )
     };
     match function_name.as_str() {
-        "coalesce" | "greatest" | "least" if !arguments.is_empty() => {
-            resolve_expression_list_type(&arguments, schema)
+        "coalesce" if !arguments.is_empty() => resolve_expression_list_type(&arguments, schema),
+        "greatest" | "least" if !arguments.is_empty() => {
+            let data_type = resolve_expression_list_type(&arguments, schema)?;
+            validate_ordering_type(data_type)?;
+            Ok(data_type)
         }
-        "nullif" if arguments.len() == 2 => resolve_expression_list_type(&arguments, schema),
+        "nullif" if arguments.len() == 2 => {
+            let data_type = resolve_expression_list_type(&arguments, schema)?;
+            validate_equality_type(data_type)?;
+            Ok(data_type)
+        }
         "length" | "lower" | "upper" if arguments.len() == 1 => {
             let base = infer_expression_type(arguments[0], schema)?;
             if !is_null_literal(arguments[0])
@@ -821,7 +882,7 @@ pub(super) fn evaluate(
             schema.resolve_column_value(std::slice::from_ref(column), row)
         }
         ast::Expr::CompoundIdentifier(columns) => schema.resolve_column_value(columns, row),
-        ast::Expr::Value(_) => evaluate_literal(expr),
+        ast::Expr::Value(_) | ast::Expr::TypedString(_) => evaluate_literal(expr),
         ast::Expr::Nested(expr) => evaluate(expr, schema, row, context),
         ast::Expr::UnaryOp { op, expr } => {
             if matches!(op, ast::UnaryOperator::Minus)
@@ -1071,17 +1132,31 @@ fn validate_membership_types(
     schema: RowScope<'_>,
 ) -> Result<()> {
     let left = extract_row_fields(expr);
+    for field in left {
+        validate_equality_type(infer_expression_type(field, schema)?)?;
+    }
     for candidate in list {
-        let right = extract_row_fields(candidate);
-        if left.len() != right.len() {
-            return Err(PgError::create(
-                SqlState::SyntaxError,
-                "subquery has too many columns",
-            ));
-        }
-        for (left, right) in left.iter().zip(right) {
-            resolve_expression_pair_type(left, right, schema)?;
-        }
+        validate_row_comparison_types(expr, candidate, &ast::BinaryOperator::Eq, schema)?;
+    }
+    Ok(())
+}
+
+fn validate_row_comparison_types(
+    left: &ast::Expr,
+    right: &ast::Expr,
+    operator: &ast::BinaryOperator,
+    schema: RowScope<'_>,
+) -> Result<()> {
+    let left = extract_row_fields(left);
+    let right = extract_row_fields(right);
+    if left.len() != right.len() {
+        return Err(PgError::create(
+            SqlState::SyntaxError,
+            "subquery has too many columns",
+        ));
+    }
+    for (left, right) in left.iter().zip(right) {
+        validate_comparison_type(operator, resolve_operator_type(left, right, schema)?)?;
     }
     Ok(())
 }
@@ -1630,6 +1705,9 @@ pub(super) fn compare_values(left: &Value, right: &Value) -> Result<Ordering> {
                 + i128::from(right.micros);
             left.cmp(&right)
         }
+        (Value::Json(_), Value::Json(_)) => {
+            return Err(create_missing_operator_error(BaseType::Json));
+        }
         _ => {
             return Err(PgError::create(
                 SqlState::DatatypeMismatch,
@@ -1637,6 +1715,39 @@ pub(super) fn compare_values(left: &Value, right: &Value) -> Result<Ordering> {
             ));
         }
     })
+}
+
+pub(super) fn validate_equality_type(data_type: BaseType) -> Result<()> {
+    if data_type == BaseType::Json {
+        Err(create_missing_operator_error(data_type))
+    } else {
+        Ok(())
+    }
+}
+
+pub(super) fn validate_ordering_type(data_type: BaseType) -> Result<()> {
+    validate_equality_type(data_type)
+}
+
+fn validate_comparison_type(operator: &ast::BinaryOperator, data_type: BaseType) -> Result<()> {
+    if matches!(
+        operator,
+        ast::BinaryOperator::Eq | ast::BinaryOperator::NotEq
+    ) {
+        validate_equality_type(data_type)
+    } else {
+        validate_ordering_type(data_type)
+    }
+}
+
+fn create_missing_operator_error(data_type: BaseType) -> PgError {
+    PgError::create(
+        SqlState::UndefinedFunction,
+        format!(
+            "operator does not exist for type {}",
+            data_type.get_postgres_name()
+        ),
+    )
 }
 
 #[cfg_attr(feature = "execution-log", tracing::instrument(skip_all))]

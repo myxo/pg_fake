@@ -62,6 +62,7 @@ impl TypeInfo for PgFakeTypeInfo {
             Some(BaseType::Timestamp) => "TIMESTAMP",
             Some(BaseType::TimestampTz) => "TIMESTAMPTZ",
             Some(BaseType::Interval) => "INTERVAL",
+            Some(BaseType::Json) => "JSON",
             None => "NULL",
         }
     }
@@ -324,7 +325,7 @@ impl<'q> Encode<'q, PgFake> for String {
 impl<'r> Decode<'r, PgFake> for &'r str {
     fn decode(value: PgFakeValueRef<'r>) -> Result<Self, BoxDynError> {
         match value.value {
-            Value::Text(value) => Ok(value),
+            Value::Text(value) | Value::Json(value) => Ok(value),
             Value::Null => Err(Box::new(UnexpectedNullError)),
             value => Err(format!("cannot decode {value:?} as str").into()),
         }

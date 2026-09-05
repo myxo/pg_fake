@@ -71,12 +71,17 @@ pub(super) fn execute_create_index(
             return reject_unsupported("index expressions are not implemented");
         };
         let name = normalize_identifier(identifier);
-        if !table.columns.iter().any(|column| column.name == name) {
-            return Err(PgError::create(
-                SqlState::UndefinedColumn,
-                format!("column {name:?} does not exist"),
-            ));
-        }
+        let definition = table
+            .columns
+            .iter()
+            .find(|column| column.name == name)
+            .ok_or_else(|| {
+                PgError::create(
+                    SqlState::UndefinedColumn,
+                    format!("column {name:?} does not exist"),
+                )
+            })?;
+        validate_btree_key_type(definition.data_type.base)?;
         if !key_names.insert(name.clone()) {
             return Err(PgError::create(
                 SqlState::DuplicateColumn,

@@ -127,6 +127,9 @@ fn parse_aggregate_call<'a>(
         return Err(signature_error());
     };
     let argument_type = infer_expression_type(argument, schema)?;
+    if distinct {
+        validate_equality_type(argument_type)?;
+    }
     let (kind, result_type) = match name.as_str() {
         "count" => (AggregateKind::Count, BaseType::Int8),
         "sum" => match argument_type {

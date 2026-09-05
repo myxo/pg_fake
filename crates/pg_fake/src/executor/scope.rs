@@ -334,7 +334,10 @@ pub(crate) fn identify_unknown_query_columns(query: &ast::Query, columns: usize)
             ast::SelectItem::UnnamedExpr(expression)
             | ast::SelectItem::ExprWithAlias {
                 expr: expression, ..
-            } => super::extract_unknown_string_literal(expression).is_some(),
+            } => {
+                super::extract_unknown_string_literal(expression).is_some()
+                    || super::is_null_literal(expression)
+            }
             _ => false,
         })
         .collect::<Vec<_>>();
@@ -343,6 +346,77 @@ pub(crate) fn identify_unknown_query_columns(query: &ast::Query, columns: usize)
     } else {
         vec![false; columns]
     }
+}
+
+#[cfg_attr(feature = "execution-log", tracing::instrument(skip_all))]
+pub(crate) fn identify_unknown_set_operand_columns(
+    expression: &ast::SetExpr,
+    columns: usize,
+) -> Vec<bool> {
+    let query = match expression {
+        ast::SetExpr::Select(select) => ast::Query {
+            with: None,
+            body: Box::new(ast::SetExpr::Select(select.clone())),
+            order_by: None,
+            limit_clause: None,
+            fetch: None,
+            locks: Vec::new(),
+            for_clause: None,
+            settings: None,
+            format_clause: None,
+            pipe_operators: Vec::new(),
+        },
+        ast::SetExpr::Query(query) => (**query).clone(),
+        _ => return vec![false; columns],
+    };
+    let ast::SetExpr::Select(select) = query.body.as_ref() else {
+        return vec![false; columns];
+    };
+    let mut unknown = identify_unknown_query_columns(&query, columns);
+    if matches!(select.distinct, Some(ast::Distinct::Distinct)) {
+        unknown.fill(false);
+        return unknown;
+    }
+    let mut mark_resolved = |expression: &ast::Expr| {
+        let index = if let Some(position) = super::extract_number_literal(expression)
+            && !position.contains(['.', 'e', 'E'])
+        {
+            position
+                .parse::<usize>()
+                .ok()
+                .and_then(|position| position.checked_sub(1))
+        } else if let ast::Expr::Identifier(identifier) = expression {
+            select.projection.iter().position(|item| {
+                matches!(item, ast::SelectItem::ExprWithAlias { alias, .. }
+                    if normalize_identifier(alias) == normalize_identifier(identifier))
+            })
+        } else {
+            None
+        };
+        if let Some(index) = index
+            && let Some(unknown) = unknown.get_mut(index)
+        {
+            *unknown = false;
+        }
+    };
+    if let Some(ast::Distinct::On(expressions)) = &select.distinct {
+        for expression in expressions {
+            mark_resolved(expression);
+        }
+    }
+    if let ast::GroupByExpr::Expressions(expressions, _) = &select.group_by {
+        for expression in expressions {
+            mark_resolved(expression);
+        }
+    }
+    if let Some(order_by) = &query.order_by
+        && let ast::OrderByKind::Expressions(orders) = &order_by.kind
+    {
+        for order in orders {
+            mark_resolved(&order.expr);
+        }
+    }
+    unknown
 }
 
 #[cfg_attr(feature = "execution-log", tracing::instrument(skip_all))]
@@ -694,20 +768,29 @@ fn describe_bound_query_columns(
                 .collect()
         }
         ast::SetExpr::Query(query) => describe_bound_query_columns(catalog, query, outer),
-        ast::SetExpr::SetOperation { left, right, .. } => {
-            let left = describe_bound_set_expression_columns(catalog, left, outer)?;
-            let right = describe_bound_set_expression_columns(catalog, right, outer)?;
+        ast::SetExpr::SetOperation {
+            left: left_expression,
+            right: right_expression,
+            ..
+        } => {
+            let left = describe_bound_set_expression_columns(catalog, left_expression, outer)?;
+            let right = describe_bound_set_expression_columns(catalog, right_expression, outer)?;
             if left.len() != right.len() {
                 return Err(PgError::create(
                     SqlState::SyntaxError,
                     "each set-operation query must have the same number of columns",
                 ));
             }
+            let left_unknown = identify_unknown_set_operand_columns(left_expression, left.len());
+            let right_unknown = identify_unknown_set_operand_columns(right_expression, right.len());
             left.into_iter()
                 .zip(right)
-                .map(|(mut left, right)| {
-                    left.data_type = PgType::create(
-                        crate::coercion::resolve_common_type(
+                .zip(left_unknown.into_iter().zip(right_unknown))
+                .map(|((mut left, right), (left_unknown, right_unknown))| {
+                    let base = match (left_unknown, right_unknown) {
+                        (true, false) => right.data_type.base,
+                        (false, true) => left.data_type.base,
+                        _ => crate::coercion::resolve_common_type(
                             left.data_type.base,
                             right.data_type.base,
                         )
@@ -717,7 +800,8 @@ fn describe_bound_query_columns(
                                 "set-operation types cannot be matched",
                             )
                         })?,
-                    );
+                    };
+                    left.data_type = PgType::create(base);
                     Ok(left)
                 })
                 .collect()
@@ -1032,6 +1116,7 @@ fn bind_join_columns(
                         "JOIN/USING types cannot be matched",
                     )
                 })?;
+        super::validate_equality_type(data_type)?;
         left.data_type = PgType::create(data_type);
         left.merged = Some((left.slot, right.slot));
         right.unqualified = false;

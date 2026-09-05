@@ -146,6 +146,39 @@ async fn sqlx_intervals_round_trip() {
 }
 
 #[tokio::test]
+async fn preserves_json_text_and_metadata_through_sqlx() {
+    let mut connection = PgFakeConnection::new(Db::create());
+    connection
+        .execute("CREATE TABLE json_values (id INTEGER, payload JSON)")
+        .await
+        .unwrap();
+    let text = r#"{ "first" : 1e+02, "first" : -0.00, "unicode" : "Привет 🌍" }"#;
+    let row = sqlx::query("INSERT INTO json_values VALUES ($1, $2::json) RETURNING payload")
+        .bind(1_i32)
+        .bind(text)
+        .fetch_one(&mut connection)
+        .await
+        .unwrap();
+    let returned = row.get_unchecked::<String, _>(0);
+    assert_eq!(returned, text);
+    assert_eq!(row.get_unchecked::<&str, _>(0), text);
+    assert_eq!(row.get_unchecked::<Option<&str>, _>(0), Some(text));
+    assert_eq!(row.columns()[0].type_info().name(), "JSON");
+
+    let statement = connection
+        .prepare(SqlStr::from_static(
+            "SELECT payload FROM json_values WHERE id = $1",
+        ))
+        .await
+        .unwrap();
+    assert_eq!(statement.columns()[0].type_info().name(), "JSON");
+    assert_eq!(
+        statement.columns()[0].type_info().base,
+        Some(pg_fake::value::BaseType::Json)
+    );
+}
+
+#[tokio::test]
 async fn sqlx_prepared_sequence_calls_return_bigints() {
     let mut connection = PgFakeConnection::new(Db::create());
     connection

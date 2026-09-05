@@ -62,8 +62,24 @@ pub(crate) fn convert_ast_data_type(data_type: &ast::DataType) -> Result<PgType>
             ast::TimezoneInfo::WithTimeZone | ast::TimezoneInfo::Tz,
         ) => (BaseType::TimestampTz, encode_time_typmod(*precision)?),
         ast::DataType::Interval { .. } => (BaseType::Interval, PgType::NO_TYPEMOD),
-        ast::DataType::Custom(_, _) => {
-            let Some(base) = BaseType::parse_sql_name(&data_type.to_string()) else {
+        ast::DataType::JSON => (BaseType::Json, PgType::NO_TYPEMOD),
+        ast::DataType::Custom(name, _) => {
+            let identifiers = name
+                .0
+                .iter()
+                .map(ast::ObjectNamePart::as_ident)
+                .collect::<Option<Vec<_>>>();
+            let name = match identifiers.as_deref() {
+                Some([name]) => Some(name.value.as_str()),
+                Some([schema, name])
+                    if schema.quote_style.is_none()
+                        && schema.value.eq_ignore_ascii_case("pg_catalog") =>
+                {
+                    Some(name.value.as_str())
+                }
+                _ => None,
+            };
+            let Some(base) = name.and_then(BaseType::parse_sql_name) else {
                 return Err(PgError::create(
                     SqlState::UndefinedObject,
                     format!("type {data_type} does not exist"),
@@ -231,6 +247,12 @@ pub(crate) fn coerce(
         return Ok(Value::Null);
     }
     if !can_cast(source, target.base, context) {
+        if context == CastContext::Assignment {
+            return Err(PgError::create(
+                SqlState::DatatypeMismatch,
+                "column has incompatible type",
+            ));
+        }
         return Err(create_cannot_cast_error(source, target.base));
     }
     let value = if source == BaseType::Bpchar
@@ -241,8 +263,18 @@ pub(crate) fn coerce(
             unreachable!("string values use Value::Text")
         };
         Value::Text(value.trim_end_matches(' ').into())
+    } else if source == BaseType::Json && target.base == BaseType::Json {
+        let Value::Json(value) = value else {
+            unreachable!("json values use Value::Json")
+        };
+        Value::parse(BaseType::Json, &value)?
     } else if source == target.base || is_string_type(source) && is_string_type(target.base) {
         value
+    } else if source == BaseType::Json && is_string_type(target.base) {
+        let Value::Json(value) = value else {
+            unreachable!("json values use Value::Json")
+        };
+        Value::Text(value)
     } else if is_string_type(target.base) {
         Value::Text(match value {
             Value::Bool(true) => "true".into(),

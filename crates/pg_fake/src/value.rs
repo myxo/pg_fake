@@ -71,6 +71,7 @@ pub enum BaseType {
     Timestamp,
     TimestampTz,
     Interval,
+    Json,
 }
 
 impl BaseType {
@@ -95,6 +96,7 @@ impl BaseType {
             BaseType::Timestamp => 1114,
             BaseType::TimestampTz => 1184,
             BaseType::Interval => 1186,
+            BaseType::Json => 114,
         }
     }
 
@@ -119,6 +121,7 @@ impl BaseType {
             BaseType::Timestamp => "timestamp",
             BaseType::TimestampTz => "timestamptz",
             BaseType::Interval => "interval",
+            BaseType::Json => "json",
         }
     }
 
@@ -143,6 +146,7 @@ impl BaseType {
             1114 => Some(BaseType::Timestamp),
             1184 => Some(BaseType::TimestampTz),
             1186 => Some(BaseType::Interval),
+            114 => Some(BaseType::Json),
             _ => None,
         }
     }
@@ -169,6 +173,7 @@ impl BaseType {
             "timestamp" | "timestamp without time zone" => Some(BaseType::Timestamp),
             "timestamptz" | "timestamp with time zone" => Some(BaseType::TimestampTz),
             "interval" => Some(BaseType::Interval),
+            "json" => Some(BaseType::Json),
             _ => None,
         }
     }
@@ -230,6 +235,7 @@ pub enum Value {
     Timestamp(PgTimestamp),
     TimestampTz(PgTimestampTz),
     Interval(PgInterval),
+    Json(String),
 }
 
 impl Value {
@@ -261,6 +267,7 @@ impl Value {
             Value::Timestamp(_) => Some(BaseType::Timestamp),
             Value::TimestampTz(_) => Some(BaseType::TimestampTz),
             Value::Interval(_) => Some(BaseType::Interval),
+            Value::Json(_) => Some(BaseType::Json),
         }
     }
 
@@ -329,6 +336,7 @@ impl Value {
                 format!("{}+00", format_timestamp(value.naive_utc()))
             }
             Value::Interval(value) => format_interval(*value),
+            Value::Json(value) => value.clone(),
         }
     }
 
@@ -359,8 +367,43 @@ impl Value {
             BaseType::Timestamp => parse_timestamp(input).map(Value::Timestamp),
             BaseType::TimestampTz => parse_timestamptz(input).map(Value::TimestampTz),
             BaseType::Interval => parse_interval(input).map(Value::Interval),
+            BaseType::Json => validate_json(input)
+                .map(|()| Value::Json(input.to_owned()))
+                .map_err(|()| create_invalid_text_error(input, "json")),
         }
     }
+}
+
+fn validate_json(input: &str) -> std::result::Result<(), ()> {
+    let bytes = input.as_bytes();
+    let mut validated = Vec::with_capacity(bytes.len());
+    let mut index = 0;
+    while index < bytes.len() {
+        if bytes[index] == b'\\'
+            && bytes.get(index + 1) == Some(&b'u')
+            && let Some(hex) = bytes.get(index + 2..index + 6)
+            && hex.iter().all(u8::is_ascii_hexdigit)
+        {
+            let code = u16::from_str_radix(
+                std::str::from_utf8(hex).expect("JSON escape digits are ASCII"),
+                16,
+            )
+            .expect("JSON escape digits form a u16");
+            if (0xd800..=0xdfff).contains(&code) {
+                validated.extend_from_slice(b"\\u0041");
+                index += 6;
+                continue;
+            }
+        }
+        validated.push(bytes[index]);
+        index += 1;
+    }
+    let validated = std::str::from_utf8(&validated).expect("JSON validation preserves UTF-8");
+    let mut deserializer = serde_json::Deserializer::from_str(validated);
+    deserializer.disable_recursion_limit();
+    serde::Deserialize::deserialize(&mut deserializer)
+        .and_then(|_: serde::de::IgnoredAny| deserializer.end())
+        .map_err(|_| ())
 }
 
 #[cfg_attr(feature = "execution-log", tracing::instrument(skip_all))]

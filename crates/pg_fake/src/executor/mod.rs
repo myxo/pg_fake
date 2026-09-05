@@ -58,7 +58,7 @@ use expressions::{
     compare_values, evaluate, evaluate_and_coerce, evaluate_assignment_expression,
     evaluate_column_default, evaluate_comparison, extract_number_literal, is_default_expression,
     resolve_operator_type, validate_check_constraint_types, validate_check_constraints,
-    validate_column_default, validate_not_null,
+    validate_column_default, validate_equality_type, validate_not_null, validate_ordering_type,
 };
 pub(crate) use expressions::{
     create_constant_expression_schema, evaluate_index_predicate, extract_unknown_string_literal,
@@ -74,6 +74,17 @@ use indexes::{execute_alter_index, execute_create_index, execute_drop_indexes};
 pub(crate) use locks::{
     collect_required_cte_row_locks, collect_required_row_locks, mutation_locks_cover_targets,
 };
+
+fn validate_btree_key_type(data_type: BaseType) -> Result<()> {
+    if data_type == BaseType::Json {
+        Err(PgError::create(
+            SqlState::UndefinedObject,
+            "data type json has no default operator class for access method btree",
+        ))
+    } else {
+        Ok(())
+    }
+}
 pub(crate) use prepared::{PreparedQueryPlan, build_prepared_query_plan, execute_prepared_query};
 pub(crate) use procedural::coerce_procedural_value;
 pub(crate) use scope::infer_query_output_columns;
@@ -81,7 +92,7 @@ use scope::{BoundColumn, bind_select_scope};
 pub(crate) use scope::{
     BoundScope, RowScope, bind_from_scope, bind_query_scope, bind_target_scope,
     combine_bound_scopes, create_value_scope, identify_unknown_query_columns,
-    substitute_typed_subqueries,
+    identify_unknown_set_operand_columns, substitute_typed_subqueries,
 };
 pub(crate) use sequences::{
     SequenceExecutionContext, SequenceSessionState, SequenceSessionStorage, SequenceStorage,
@@ -1075,6 +1086,7 @@ pub(crate) fn execute_statement(
                                 format!("column {name:?} does not exist"),
                             )
                         })?;
+                    validate_btree_key_type(column.data_type.base)?;
                     if primary_key {
                         column.nullable = false;
                     }

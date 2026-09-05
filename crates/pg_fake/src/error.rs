@@ -69,6 +69,7 @@ pub enum SqlState {
     AmbiguousParameter,        // 42P08
     CannotCoerce,              // 42846
     DatatypeMismatch,          // 42804
+    InvalidForeignKey,         // 42830
     InvalidColumnReference,    // 42P10
     InvalidRecursion,          // 42P19
     GroupingError,             // 42803
@@ -137,6 +138,7 @@ impl SqlState {
             SqlState::AmbiguousParameter => "42P08",
             SqlState::CannotCoerce => "42846",
             SqlState::DatatypeMismatch => "42804",
+            SqlState::InvalidForeignKey => "42830",
             SqlState::InvalidColumnReference => "42P10",
             SqlState::InvalidRecursion => "42P19",
             SqlState::GroupingError => "42803",

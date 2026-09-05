@@ -248,6 +248,7 @@ fn execute_alter_operation(
             for option in &column_def.options {
                 match &option.option {
                     ast::ColumnOption::PrimaryKey(_) => {
+                        validate_btree_key_type(column.data_type.base)?;
                         column.nullable = false;
                         schema
                             .constraints
@@ -262,6 +263,7 @@ fn execute_alter_operation(
                             });
                     }
                     ast::ColumnOption::Unique(_) => {
+                        validate_btree_key_type(column.data_type.base)?;
                         schema.constraints.push(crate::catalog::Constraint::Unique {
                             id: state.catalog.allocate_constraint_id(),
                             name: option
@@ -752,6 +754,20 @@ fn alter_column(
                 ));
             }
             let target = coercion::convert_ast_data_type(data_type)?;
+            if schema.constraints.iter().any(|constraint| {
+                matches!(
+                    constraint,
+                    crate::catalog::Constraint::PrimaryKey { columns, .. }
+                        | crate::catalog::Constraint::Unique { columns, .. }
+                        if columns.contains(&name)
+                )
+            }) || schema
+                .indexes
+                .iter()
+                .any(|index| index.columns.iter().any(|column| column.name == name))
+            {
+                validate_btree_key_type(target.base)?;
+            }
             let old_schema = schema.clone();
             let source = old_schema.columns[index].data_type.base;
             let values = rows
@@ -802,6 +818,17 @@ fn create_table_constraint(
                 .map(resolve_index_column_name)
                 .collect::<Result<Vec<_>>>()?;
             validate_constraint_columns(schema, &columns)?;
+            for name in &columns {
+                validate_btree_key_type(
+                    schema
+                        .columns
+                        .iter()
+                        .find(|column| column.name == *name)
+                        .expect("validated constraint column must exist")
+                        .data_type
+                        .base,
+                )?;
+            }
             Ok(crate::catalog::Constraint::PrimaryKey {
                 id: state.catalog.allocate_constraint_id(),
                 name: primary_key
@@ -822,6 +849,17 @@ fn create_table_constraint(
                 .map(resolve_index_column_name)
                 .collect::<Result<Vec<_>>>()?;
             validate_constraint_columns(schema, &columns)?;
+            for name in &columns {
+                validate_btree_key_type(
+                    schema
+                        .columns
+                        .iter()
+                        .find(|column| column.name == *name)
+                        .expect("validated constraint column must exist")
+                        .data_type
+                        .base,
+                )?;
+            }
             Ok(crate::catalog::Constraint::Unique {
                 id: state.catalog.allocate_constraint_id(),
                 name: unique

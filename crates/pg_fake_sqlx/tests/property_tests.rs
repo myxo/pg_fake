@@ -1533,6 +1533,48 @@ fn generate_set_operation(src: &mut Source) -> (String, RowOrder) {
     )
 }
 
+fn generate_json_document(src: &mut Source, depth: usize) -> String {
+    if depth == 0 {
+        return src
+            .choose(
+                "json_scalar",
+                &[
+                    "null",
+                    "true",
+                    "false",
+                    "0",
+                    "-0.00",
+                    "1e+100",
+                    "1e100000",
+                    "999999999999999999999999999999999999999999",
+                    r#""Привет 🌍""#,
+                    r#""escaped\\ntext""#,
+                    r#""\ud800""#,
+                ],
+            )
+            .expect("JSON scalar choices are non-empty")
+            .0
+            .to_string();
+    }
+    let whitespace = *src
+        .choose("json_whitespace", &["", " ", "  ", "\n\t"])
+        .expect("JSON whitespace choices are non-empty")
+        .0;
+    match src.any_of("json_kind", int_in(0..=2)) {
+        0 => generate_json_document(src, 0),
+        1 => format!(
+            "[{whitespace}{}{whitespace},{whitespace}{}{whitespace}]",
+            generate_json_document(src, depth - 1),
+            generate_json_document(src, depth - 1),
+        ),
+        _ => format!(
+            "{{{whitespace}\"key\"{whitespace}:{whitespace}{}{whitespace},{whitespace}\"key\"{whitespace}:{whitespace}{}{whitespace}}}",
+            generate_json_document(src, depth - 1),
+            generate_json_document(src, depth - 1),
+        ),
+    }
+}
+
 #[cfg(test)]
 fn generate_trigger_tree(src: &mut Source, depth: usize) -> String {
     if depth != 0 && src.any("nested_if") {
@@ -2026,6 +2068,190 @@ fn generated_set_operations_match_postgres() {
             &mut fake.borrow_mut(),
             &sql,
             order,
+        );
+    });
+}
+
+#[test]
+fn matches_json_storage_parameters_metadata_and_unsupported_operations() {
+    let _test_lock = TEST_LOCK.lock().expect("test mutex must not be poisoned");
+    let server = start_postgres_server();
+    let runtime = Runtime::new().expect("must create tokio runtime");
+    let mut postgres = runtime
+        .block_on(PgConnection::connect(&server.url))
+        .expect("must connect SQLx to PostgreSQL 18");
+    let mut fake = PgFakeConnection::new(Db::create());
+    let table = format!(
+        "pg_fake_json_differential_{}_{}",
+        std::process::id(),
+        TABLE_NUMBER.fetch_add(1, Ordering::Relaxed)
+    );
+    let cleanup = format!("DROP TABLE IF EXISTS {table}");
+    assert_statement(
+        &runtime,
+        &mut postgres,
+        &mut fake,
+        &cleanup,
+        RowOrder::Unordered,
+    );
+    let create = format!(
+        "CREATE TABLE {table} (id INTEGER, payload JSON NOT NULL CHECK (payload IS NOT NULL), fallback JSON DEFAULT '{{ \"default\" : [1, 2] }}')"
+    );
+    assert_statement(
+        &runtime,
+        &mut postgres,
+        &mut fake,
+        &create,
+        RowOrder::Unordered,
+    );
+
+    let document = r#"{ "z" : 1e+02, "z" : -0.00, "unicode" : "Привет 🌍" }"#;
+    let insert = format!(
+        "INSERT INTO {table} (id, payload) VALUES (1, $1::json) RETURNING payload, fallback"
+    );
+    let postgres_row = runtime
+        .block_on(
+            sqlx::query(AssertSqlSafe(insert.as_str()))
+                .bind(document)
+                .fetch_one(&mut postgres),
+        )
+        .unwrap();
+    let fake_row = runtime
+        .block_on(
+            sqlx::query(AssertSqlSafe(insert.as_str()))
+                .bind(document)
+                .fetch_one(&mut fake),
+        )
+        .unwrap();
+    let postgres_payload = postgres_row.get_unchecked::<String, _>(0);
+    let fake_payload = fake_row.get_unchecked::<String, _>(0);
+    assert_eq!(fake_payload, postgres_payload);
+    assert_eq!(fake_payload, document);
+    assert_eq!(
+        fake_row.try_get_unchecked::<&str, _>(0).unwrap(),
+        postgres_row.try_get_unchecked::<&str, _>(0).unwrap(),
+    );
+    assert_eq!(
+        fake_row.try_get_unchecked::<Option<&str>, _>(0).unwrap(),
+        postgres_row
+            .try_get_unchecked::<Option<&str>, _>(0)
+            .unwrap(),
+    );
+    assert_eq!(
+        fake_row.columns()[0].type_info().name(),
+        postgres_row.columns()[0].type_info().name(),
+    );
+    assert_eq!(fake_row.columns()[0].type_info().name(), "JSON");
+
+    let nested = format!("{}0{}", "[".repeat(512), "]".repeat(512));
+    let nested_sql = format!("SELECT '{nested}'::json");
+    assert_statement(
+        &runtime,
+        &mut postgres,
+        &mut fake,
+        &nested_sql,
+        RowOrder::Ordered,
+    );
+
+    for sql in [
+        "SELECT JSON '{\"typed\": true}'",
+        "SELECT '{}'::pg_catalog.json",
+        "SELECT '{\"$serde_json::private::Number\":null}'::json",
+        "SELECT ' {\"a\":1} '::json UNION ALL SELECT '[2]'",
+        "SELECT NULL UNION ALL SELECT '{}'::json",
+        "(SELECT '{}' AS payload, 1 AS position ORDER BY position) UNION ALL SELECT '{}'::json, 1",
+    ] {
+        assert_statement(&runtime, &mut postgres, &mut fake, sql, RowOrder::Ordered);
+    }
+
+    for sql in [
+        format!("INSERT INTO {table} (id, payload) VALUES (2, '[1,]')"),
+        format!("INSERT INTO {table} (id, payload) VALUES (2, '{{}}'::text)"),
+        format!("SELECT payload = payload FROM {table}"),
+        format!("SELECT payload FROM {table} ORDER BY payload"),
+        format!("SELECT payload FROM {table} GROUP BY payload"),
+        format!("SELECT DISTINCT payload FROM {table}"),
+        format!("SELECT count(DISTINCT payload) FROM {table}"),
+        "SELECT nullif('{}'::json, NULL::json)".into(),
+        "SELECT greatest('{}'::json, '{}'::json)".into(),
+        "SELECT CASE NULL::json WHEN '{}'::json THEN 1 ELSE 2 END".into(),
+        format!("SELECT '{{}}'::json = ANY (SELECT payload FROM {table} WHERE false)"),
+        format!("CREATE INDEX {table}_payload_idx ON {table} (payload)"),
+        format!("ALTER TABLE {table} ADD UNIQUE (payload)"),
+        "SELECT '{}'::json UNION SELECT '{}'::json".into(),
+        "VALUES ('{}'::json) ORDER BY 1".into(),
+        "VALUES ('{}'::json), ('[]'::json) ORDER BY 1".into(),
+        "SELECT least('{}'::json)".into(),
+        "SELECT * FROM (VALUES ('{}'::json)) AS left_side(payload) JOIN (VALUES ('{}'::json)) AS right_side(payload) USING (payload)".into(),
+        "WITH RECURSIVE documents(payload) AS (SELECT '{}'::json UNION SELECT payload FROM documents WHERE false) SELECT * FROM documents".into(),
+        "SELECT true OR ('['::json IS NULL)".into(),
+        "SELECT '[' WHERE false UNION ALL SELECT '{}'::json".into(),
+        "SELECT '{}'::json UNION ALL SELECT '[' WHERE false".into(),
+        "(SELECT '[' LIMIT 0) UNION ALL SELECT '{}'::json".into(),
+    ] {
+        assert_statement_allow_error(&runtime, &mut postgres, &mut fake, &sql, RowOrder::Ordered);
+    }
+    let drop = format!("DROP TABLE {table}");
+    assert_statement(
+        &runtime,
+        &mut postgres,
+        &mut fake,
+        &drop,
+        RowOrder::Unordered,
+    );
+}
+
+#[test]
+fn matches_generated_json_text_and_errors() {
+    let _test_lock = TEST_LOCK.lock().expect("test mutex must not be poisoned");
+    let server = start_postgres_server();
+    let runtime = tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()
+        .unwrap();
+    let postgres = RefCell::new(
+        runtime
+            .block_on(PgConnection::connect(&server.url))
+            .expect("must connect SQLx to PostgreSQL 18 once"),
+    );
+    let fake = RefCell::new(PgFakeConnection::new(Db::create()));
+    check(|src| {
+        let leading = if src.any("json_leading_space") {
+            "  "
+        } else {
+            ""
+        };
+        let trailing = if src.any("json_trailing_space") {
+            "\n"
+        } else {
+            ""
+        };
+        let document = format!("{leading}{}{trailing}", generate_json_document(src, 3));
+        let sql = format!("SELECT ('{document}'::json)::text");
+        src.log_value("sql", &sql);
+        assert_statement(
+            &runtime,
+            &mut postgres.borrow_mut(),
+            &mut fake.borrow_mut(),
+            &sql,
+            RowOrder::Ordered,
+        );
+
+        let invalid = *src
+            .choose(
+                "invalid_json",
+                &["{", "[1,]", "01", r#""unterminated"#, r#""\u""#],
+            )
+            .expect("invalid JSON choices are non-empty")
+            .0;
+        let sql = format!("SELECT '{invalid}'::json");
+        src.log_value("invalid_sql", &sql);
+        assert_statement_allow_error(
+            &runtime,
+            &mut postgres.borrow_mut(),
+            &mut fake.borrow_mut(),
+            &sql,
+            RowOrder::Ordered,
         );
     });
 }

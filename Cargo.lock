@@ -1744,6 +1744,8 @@ dependencies = [
  "dotenvy",
  "postgres",
  "rand_chacha",
+ "serde",
+ "serde_json",
  "sqlparser",
  "testcontainers",
  "testcontainers-modules",

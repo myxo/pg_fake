@@ -267,13 +267,36 @@ pub const FEATURES: &[Feature] = &[
     },
     Feature {
         name: "json",
-        cases: &[Case {
-            id: "json_text",
-            source: "json.sql:2",
-            setup: &[],
-            sql: "SELECT '{ \"value\" : 1 }'::json",
-            blocker: BlockerKind::Implementation,
-        }],
+        cases: &[
+            Case {
+                id: "json_text",
+                source: "json.sql:2",
+                setup: &[],
+                sql: "SELECT '{ \"value\" : 1 }'::json",
+                blocker: BlockerKind::Implementation,
+            },
+            Case {
+                id: "json_storage_fidelity",
+                source: "focused JSON storage fixture",
+                setup: &["CREATE TABLE phase3_json_storage (payload JSON NOT NULL)"],
+                sql: "INSERT INTO phase3_json_storage VALUES ('{ \"z\" : 1e+02, \"z\" : -0.00, \"nested\" : [true, null, \"Привет\"] }') RETURNING payload",
+                blocker: BlockerKind::Implementation,
+            },
+            Case {
+                id: "json_malformed_input",
+                source: "json.sql:18",
+                setup: &[],
+                sql: "SELECT '[1,]'::json",
+                blocker: BlockerKind::Implementation,
+            },
+            Case {
+                id: "json_equality_rejected",
+                source: "json.sql:181",
+                setup: &[],
+                sql: "SELECT '{}'::json = '{}'::json",
+                blocker: BlockerKind::Implementation,
+            },
+        ],
     },
     Feature {
         name: "jsonb",

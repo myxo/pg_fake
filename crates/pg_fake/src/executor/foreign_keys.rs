@@ -128,7 +128,7 @@ pub(super) fn validate_foreign_key_definitions(
                 })
                 .ok_or_else(|| {
                     PgError::create(
-                        SqlState::InvalidColumnReference,
+                        SqlState::InvalidForeignKey,
                         "there is no primary key for referenced table",
                     )
                 })?
@@ -151,7 +151,7 @@ pub(super) fn validate_foreign_key_definitions(
             )
         }) {
             return Err(PgError::create(
-                SqlState::InvalidColumnReference,
+                SqlState::InvalidForeignKey,
                 "there is no unique constraint matching given keys for referenced table",
             ));
         }

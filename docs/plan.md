@@ -657,7 +657,7 @@ expressions and validate complete migration blocks.
 
 ## Milestone E — JSON and JSONB
 
-### Task 16 — JSON type and text fidelity
+### Task 16 — JSON type and text fidelity [COMPLETE]
 
 **Goal:** Add PostgreSQL `json` storage while preserving its textual nature.
 
@@ -676,6 +676,20 @@ expressions and validate complete migration blocks.
 **Migration dependency:** The required migration workload does not declare
 `json`; this task remains a Phase 3 type commitment and is not a prerequisite
 hidden behind the Task 20 gate.
+
+**Progress:**
+
+- [x] Add native and SQLx `json` type support with PostgreSQL OID 114.
+- [x] Validate JSON input while preserving its exact textual representation,
+  including duplicate keys, numeric spelling, Unicode, and deep nesting.
+- [x] Support literals, casts, assignments, defaults, parameters, constraints,
+  `RETURNING`, metadata, and unknown-literal propagation.
+- [x] Reject unsupported JSON equality, ordering, grouping, distinct, indexes,
+  unique constraints, and related comparison-dependent operations.
+- [x] Add native, SQLx, PostgreSQL differential, property, manifest, and
+  benchmark coverage.
+- [x] Pass formatting, workspace checks/tests, Astra review, PostgreSQL 18
+  differential matrices, and the exact 10,000-iteration property gate.
 
 ### Task 17 — JSONB representation and comparison
 

@@ -295,7 +295,7 @@ fn infer_set_expression_types(
     match expression {
         ast::SetExpr::Select(select) => {
             let scope = executor::bind_query_scope(catalog, select)?;
-            Ok(select
+            let types = select
                 .projection
                 .iter()
                 .flat_map(|item| match item {
@@ -304,13 +304,30 @@ fn infer_set_expression_types(
                     | ast::SelectItem::ExprWithAlias {
                         expr: expression, ..
                     } => vec![
-                        executor::infer_expression_type(
-                            expression,
-                            executor::RowScope::Bound(&scope),
-                        )
-                        .ok(),
+                        if executor::extract_unknown_string_literal(expression).is_some()
+                            || executor::is_null_literal(expression)
+                            || matches!(expression, ast::Expr::Value(value)
+                                if matches!(value.value, ast::Value::Placeholder(_)))
+                        {
+                            None
+                        } else {
+                            executor::infer_expression_type(
+                                expression,
+                                executor::RowScope::Bound(&scope),
+                            )
+                            .ok()
+                        },
                     ],
                     _ => Vec::new(),
+                })
+                .collect::<Vec<_>>();
+            let unknown = executor::identify_unknown_set_operand_columns(expression, types.len());
+            let parameters = identify_parameter_set_operand_columns(expression, types.len());
+            Ok(types
+                .into_iter()
+                .zip(unknown.into_iter().zip(parameters))
+                .map(|(data_type, (unknown, parameter))| {
+                    data_type.or((!unknown && !parameter).then_some(BaseType::Text))
                 })
                 .collect())
         }
@@ -340,7 +357,18 @@ fn infer_set_expression_types(
                 })
                 .collect())
         }
-        ast::SetExpr::Query(query) => infer_set_expression_types(&query.body, catalog),
+        ast::SetExpr::Query(query) => {
+            let types = infer_set_expression_types(&query.body, catalog)?;
+            let unknown = executor::identify_unknown_set_operand_columns(expression, types.len());
+            let parameters = identify_parameter_set_operand_columns(expression, types.len());
+            Ok(types
+                .into_iter()
+                .zip(unknown.into_iter().zip(parameters))
+                .map(|(data_type, (unknown, parameter))| {
+                    data_type.or((!unknown && !parameter).then_some(BaseType::Text))
+                })
+                .collect())
+        }
         ast::SetExpr::SetOperation { left, right, .. } => {
             let left = infer_set_expression_types(left, catalog)?;
             let right = infer_set_expression_types(right, catalog)?;
@@ -361,6 +389,35 @@ fn infer_set_expression_types(
                 .collect())
         }
         _ => reject_unsupported("set-operation input is not implemented"),
+    }
+}
+
+#[cfg_attr(feature = "execution-log", tracing::instrument(skip_all))]
+fn identify_parameter_set_operand_columns(expression: &ast::SetExpr, columns: usize) -> Vec<bool> {
+    let select = match expression {
+        ast::SetExpr::Select(select) => select.as_ref(),
+        ast::SetExpr::Query(query) => match query.body.as_ref() {
+            ast::SetExpr::Select(select) => select.as_ref(),
+            _ => return vec![false; columns],
+        },
+        _ => return vec![false; columns],
+    };
+    let parameters = select
+        .projection
+        .iter()
+        .map(|item| match item {
+            ast::SelectItem::UnnamedExpr(ast::Expr::Value(value))
+            | ast::SelectItem::ExprWithAlias {
+                expr: ast::Expr::Value(value),
+                ..
+            } => matches!(value.value, ast::Value::Placeholder(_)),
+            _ => false,
+        })
+        .collect::<Vec<_>>();
+    if parameters.len() == columns {
+        parameters
+    } else {
+        vec![false; columns]
     }
 }
 
@@ -1212,6 +1269,11 @@ fn validate_implicit_type(
 
 #[cfg_attr(feature = "execution-log", tracing::instrument(skip_all))]
 fn coerce_parameter(value: Value, target: BaseType) -> Result<Value> {
+    if target == BaseType::Json
+        && let Value::Text(text) = value
+    {
+        return Value::parse(BaseType::Json, &text);
+    }
     let Some(source) = value.get_base_type() else {
         return Ok(Value::Null);
     };
@@ -1253,6 +1315,7 @@ pub(crate) fn create_typed_literal(value: Value, data_type: PgType) -> ast::Expr
         Value::Interval(value) => {
             ast::Value::SingleQuotedString(Value::Interval(value).format_postgres_text())
         }
+        Value::Json(value) => ast::Value::SingleQuotedString(value),
     };
     create_typed_cast(ast::Expr::Value(literal.into()), data_type)
 }
@@ -1320,5 +1383,6 @@ fn convert_to_ast_data_type(data_type: PgType) -> ast::DataType {
             fields: None,
             precision: None,
         },
+        BaseType::Json => ast::DataType::JSON,
     }
 }

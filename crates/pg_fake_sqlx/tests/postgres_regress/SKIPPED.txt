@@ -61,8 +61,8 @@ int8:9
 interval:1
 join:30
 join_hash:5
-json:1
-json_encoding:2
+json:8
+json_encoding:7
 jsonb:1
 jsonb_jsonpath:1
 jsonpath:1

@@ -1117,14 +1117,15 @@ fn evaluate_triggered_insert_rows(
                         .zip(column_indexes)
                     {
                         row[*index] = if *unknown {
-                            let Value::Text(text) = value else {
-                                unreachable!("unknown string literals evaluate to text")
-                            };
-                            coercion::coerce_unknown(
-                                &text,
-                                schema.columns[*index].data_type,
-                                CastContext::Assignment,
-                            )?
+                            match value {
+                                Value::Text(text) => coercion::coerce_unknown(
+                                    &text,
+                                    schema.columns[*index].data_type,
+                                    CastContext::Assignment,
+                                )?,
+                                Value::Null => Value::Null,
+                                _ => unreachable!("unknown literals evaluate to text or null"),
+                            }
                         } else {
                             let source_type = BaseType::resolve_oid(source_column.type_oid)
                                 .expect("query columns use supported PostgreSQL types");
@@ -1247,14 +1248,15 @@ fn evaluate_triggered_insert_rows(
                 .zip(column_indexes)
             {
                 let value = if *unknown {
-                    let Value::Text(text) = value else {
-                        unreachable!("unknown string literals evaluate to text")
-                    };
-                    coercion::coerce_unknown(
-                        &text,
-                        schema.columns[*index].data_type,
-                        CastContext::Assignment,
-                    )?
+                    match value {
+                        Value::Text(text) => coercion::coerce_unknown(
+                            &text,
+                            schema.columns[*index].data_type,
+                            CastContext::Assignment,
+                        )?,
+                        Value::Null => Value::Null,
+                        _ => unreachable!("unknown literals evaluate to text or null"),
+                    }
                 } else {
                     let source_type = BaseType::resolve_oid(source_column.type_oid)
                         .expect("query columns use supported PostgreSQL types");
