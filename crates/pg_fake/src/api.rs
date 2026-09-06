@@ -49,6 +49,7 @@ pub struct PreparedStatement {
     columns: Vec<ColumnMeta>,
     query_plan: Option<executor::PreparedQueryPlan>,
     catalog_dependencies: Vec<PreparedCatalogDependency>,
+    relation_locks: Option<Vec<(String, RelationLockMode)>>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1809,6 +1810,7 @@ fn acquire_relation_locks<'a>(
     mut state: MutexGuard<'a, DatabaseState>,
     statement: &ast::Statement,
     prepared_dependencies: Option<&[PreparedCatalogDependency]>,
+    prepared_locks: Option<&[(String, RelationLockMode)]>,
     xid: Xid,
     temporary_schema_id: SchemaId,
     isolation: IsolationLevel,
@@ -1821,16 +1823,23 @@ fn acquire_relation_locks<'a>(
             snapshot = Snapshot::create(&state.transactions).use_command(snapshot.command_id);
         }
         state.load_catalog(Some(xid), snapshot, Some(temporary_schema_id));
-        let locks = match collect_relation_locks(&state, statement, prepared_dependencies) {
-            Ok(locks) => locks,
-            Err(error) => {
-                state.relation_locks.cancel_transaction_waits(xid);
-                state.wait_for.clear_wait(xid);
-                condvar.notify_all();
-                return Err(error);
-            }
+        let discovered_locks;
+        let locks = if let Some(locks) = prepared_locks {
+            locks
+        } else {
+            discovered_locks =
+                match collect_relation_locks(&state, statement, prepared_dependencies) {
+                    Ok(locks) => locks,
+                    Err(error) => {
+                        state.relation_locks.cancel_transaction_waits(xid);
+                        state.wait_for.clear_wait(xid);
+                        condvar.notify_all();
+                        return Err(error);
+                    }
+                };
+            discovered_locks.as_slice()
         };
-        let conflicts = match state.relation_locks.acquire_many(&locks, xid) {
+        let conflicts = match state.relation_locks.acquire_many(locks, xid) {
             RelationLockAttempt::Acquired => {
                 state.wait_for.clear_wait(xid);
                 condvar.notify_all();
@@ -2542,7 +2551,7 @@ impl Session {
         );
         self.substitute_scoped_procedural_locals(&mut statement, locals)?;
         let StatementResult::Query(query) =
-            self.execute_statement(&statement, None, None, Some(procedural))?
+            self.execute_statement(&statement, None, None, None, Some(procedural))?
         else {
             unreachable!("generated expression query returns rows")
         };
@@ -2665,7 +2674,7 @@ impl Session {
                 Some(ast::LimitClause::OffsetCommaLimit { .. }) => unreachable!(),
             }
         }
-        let result = self.execute_statement(&statement, None, None, Some(procedural))?;
+        let result = self.execute_statement(&statement, None, None, None, Some(procedural))?;
         let Some(into) = into else {
             *row_count = match &result {
                 StatementResult::Affected(affected) => *affected,
@@ -2905,7 +2914,7 @@ impl Session {
             if self.transaction.is_none() {
                 self.start_transaction(self.default_isolation, true);
             }
-            match self.execute_statement(&statement, None, None, None) {
+            match self.execute_statement(&statement, None, None, None, None) {
                 Ok(result) => results.push(result),
                 Err(error) => {
                     if self.is_transaction_implicit_batch() {
@@ -3192,19 +3201,46 @@ impl Session {
                                 &statement,
                                 &parameter_types,
                             )?;
-                            Ok((parameter_types, columns, query_plan, catalog_dependencies))
+                            let relation_locks = if can_cache_read_locks(&statement)
+                                && catalog_dependencies
+                                    .iter()
+                                    .all(|dependency| match dependency {
+                                        PreparedCatalogDependency::View { schema, .. } => {
+                                            can_cache_read_locks(&ast::Statement::Query(
+                                                schema.query.clone(),
+                                            ))
+                                        }
+                                        _ => true,
+                                    }) {
+                                collect_relation_locks(
+                                    &state,
+                                    &statement,
+                                    Some(&catalog_dependencies),
+                                )
+                                .ok()
+                            } else {
+                                None
+                            };
+                            Ok((
+                                parameter_types,
+                                columns,
+                                query_plan,
+                                catalog_dependencies,
+                                relation_locks,
+                            ))
                         })
                     },
                 )
         };
         match prepared {
-            Ok((parameter_types, columns, query_plan, catalog_dependencies)) => {
+            Ok((parameter_types, columns, query_plan, catalog_dependencies, relation_locks)) => {
                 Ok(PreparedStatement {
                     statement,
                     parameter_types,
                     columns,
                     query_plan,
                     catalog_dependencies,
+                    relation_locks,
                 })
             }
             Err(error) => self.abort_with_error(error),
@@ -3251,16 +3287,20 @@ impl Session {
                 Err(error) => return self.abort_with_error(error),
             };
             (
-                Some(
-                    match analyzer::bind_parameters(
-                        &statement.statement,
-                        &statement.parameter_types,
-                        params,
-                    ) {
-                        Ok(statement) => statement,
-                        Err(error) => return self.abort_with_error(error),
-                    },
-                ),
+                if statement.relation_locks.is_some() {
+                    None
+                } else {
+                    Some(
+                        match analyzer::bind_parameters(
+                            &statement.statement,
+                            &statement.parameter_types,
+                            params,
+                        ) {
+                            Ok(statement) => statement,
+                            Err(error) => return self.abort_with_error(error),
+                        },
+                    )
+                },
                 Some((
                     query_plan,
                     parameters.as_slice(),
@@ -3293,6 +3333,7 @@ impl Session {
             execution_statement,
             prepared_query,
             Some(&statement.catalog_dependencies),
+            statement.relation_locks.as_deref(),
             None,
         ) {
             Ok(result) => {
@@ -3542,6 +3583,7 @@ impl Session {
         statement: &ast::Statement,
         prepared_query: Option<(&executor::PreparedQueryPlan, &[Value], &[ColumnMeta])>,
         prepared_dependencies: Option<&[PreparedCatalogDependency]>,
+        prepared_locks: Option<&[(String, RelationLockMode)]>,
         procedural: Option<ProceduralStatementContext>,
     ) -> Result<StatementResult> {
         match statement {
@@ -3849,6 +3891,7 @@ impl Session {
             state,
             statement,
             prepared_dependencies,
+            prepared_locks,
             transaction.xid,
             self.temporary_schema_id,
             transaction.isolation,
@@ -4194,6 +4237,18 @@ impl Session {
 }
 
 #[cfg_attr(feature = "execution-log", tracing::instrument(skip_all))]
+fn can_cache_read_locks(statement: &ast::Statement) -> bool {
+    let only_queries = ast::visit_statements(statement, |statement| {
+        if matches!(statement, ast::Statement::Query(_)) {
+            std::ops::ControlFlow::Continue(())
+        } else {
+            std::ops::ControlFlow::Break(())
+        }
+    })
+    .is_continue();
+    only_queries && !contains_sequence_function(statement)
+}
+
 fn contains_dml(statement: &ast::Statement) -> bool {
     match statement {
         ast::Statement::Insert(_) | ast::Statement::Update(_) | ast::Statement::Delete(_) => true,
@@ -4442,6 +4497,43 @@ mod tests {
     #[cfg_attr(feature = "execution-log", tracing::instrument(skip_all))]
     fn create_affected_results(rows: u64) -> Vec<StatementResult> {
         vec![StatementResult::Affected(rows)]
+    }
+
+    #[test]
+    fn excludes_nested_writes_and_sequence_calls_from_cached_read_locks() {
+        for sql in [
+            "WITH changed AS (INSERT INTO items VALUES (1) RETURNING id) SELECT * FROM changed",
+            "SELECT * FROM (WITH changed AS (DELETE FROM items RETURNING id) SELECT * FROM changed) nested",
+            "SELECT 1 UNION ALL (WITH changed AS (UPDATE items SET id = 2 RETURNING id) SELECT * FROM changed)",
+            "SELECT (SELECT nextval($1))",
+        ] {
+            let statement = parser::parse(sql).unwrap().pop().unwrap();
+            assert!(!can_cache_read_locks(&statement), "{sql}");
+        }
+        let db = Db::create();
+        let mut session = db.create_session();
+        session.execute("CREATE SEQUENCE ids; CREATE VIEW generated_ids AS SELECT nextval('ids') AS id; CREATE VIEW indirect_ids AS SELECT * FROM generated_ids").unwrap();
+        let prepared = session.prepare("SELECT * FROM indirect_ids").unwrap();
+        assert!(prepared.relation_locks.is_none());
+        let dynamic = session.prepare("SELECT nextval($1::text)").unwrap();
+        assert!(dynamic.relation_locks.is_none());
+        assert_eq!(
+            session
+                .query_prepared(&dynamic, &[Value::Text("ids".into())])
+                .unwrap()
+                .rows,
+            vec![vec![Value::Int8(1)]]
+        );
+        session
+            .execute("CREATE SEQUENCE other_ids START 20")
+            .unwrap();
+        assert_eq!(
+            session
+                .query_prepared(&dynamic, &[Value::Text("other_ids".into())])
+                .unwrap()
+                .rows,
+            vec![vec![Value::Int8(20)]]
+        );
     }
 
     #[test]

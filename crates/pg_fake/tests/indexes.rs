@@ -417,3 +417,91 @@ fn reports_index_definition_and_namespace_errors() {
         SqlState::UndefinedObject
     );
 }
+
+#[test]
+fn preserves_prepared_read_locks_and_schema_validation() {
+    let db = Db::create();
+    let mut reader = db.create_session();
+    reader.execute("CREATE TABLE prepared_locks (id INTEGER PRIMARY KEY, value INTEGER); INSERT INTO prepared_locks VALUES (1, 10)").unwrap();
+    let lookup = reader
+        .prepare("SELECT value FROM prepared_locks WHERE id = $1")
+        .unwrap();
+    let mut writer = db.create_session();
+    writer.execute("SET lock_timeout = '10ms'").unwrap();
+    reader.execute("BEGIN").unwrap();
+    assert_eq!(
+        reader
+            .query_prepared(&lookup, &[Value::Int4(1)])
+            .unwrap()
+            .rows,
+        vec![vec![Value::Int4(10)]]
+    );
+    assert_eq!(
+        writer
+            .execute("ALTER TABLE prepared_locks ADD COLUMN extra INTEGER")
+            .unwrap_err()
+            .sqlstate,
+        SqlState::LockNotAvailable
+    );
+    reader.execute("COMMIT").unwrap();
+    writer
+        .execute("ALTER TABLE prepared_locks ADD COLUMN extra INTEGER")
+        .unwrap();
+    assert_eq!(
+        reader
+            .query_prepared(&lookup, &[Value::Int4(1)])
+            .unwrap_err()
+            .sqlstate,
+        SqlState::FeatureNotSupported
+    );
+}
+
+#[test]
+fn preserves_generic_prepared_read_and_default_sequence_locks() {
+    let db = Db::create();
+    let mut reader = db.create_session();
+    reader.execute("CREATE TABLE cached_left (id SERIAL PRIMARY KEY); CREATE TABLE cached_right (id INTEGER); INSERT INTO cached_left DEFAULT VALUES; INSERT INTO cached_right VALUES (2)").unwrap();
+    let simple = reader.prepare("SELECT id FROM cached_left").unwrap();
+    let compound = reader
+        .prepare("SELECT id FROM cached_left UNION ALL SELECT id FROM cached_right WHERE id = $1")
+        .unwrap();
+    let mut writer = db.create_session();
+    writer.execute("SET lock_timeout = '10ms'").unwrap();
+    reader.execute("BEGIN").unwrap();
+    assert_eq!(
+        reader.query_prepared(&simple, &[]).unwrap().rows,
+        vec![vec![Value::Int4(1)]]
+    );
+    assert_eq!(
+        writer
+            .execute("DROP SEQUENCE cached_left_id_seq")
+            .unwrap_err()
+            .sqlstate,
+        SqlState::LockNotAvailable
+    );
+    assert_eq!(
+        reader
+            .query_prepared(&compound, &[Value::Int4(2)])
+            .unwrap()
+            .rows,
+        vec![vec![Value::Int4(1)], vec![Value::Int4(2)]]
+    );
+    assert_eq!(
+        writer
+            .execute("ALTER TABLE cached_right ADD COLUMN extra INTEGER")
+            .unwrap_err()
+            .sqlstate,
+        SqlState::LockNotAvailable
+    );
+    reader.execute("COMMIT").unwrap();
+    writer
+        .execute("ALTER TABLE cached_right ADD COLUMN extra INTEGER")
+        .unwrap();
+    assert_eq!(
+        reader
+            .query_prepared(&compound, &[Value::Int4(2)])
+            .unwrap_err()
+            .sqlstate,
+        SqlState::FeatureNotSupported
+    );
+}

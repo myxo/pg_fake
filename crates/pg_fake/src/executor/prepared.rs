@@ -137,7 +137,10 @@ pub(crate) fn build_prepared_query_plan(
         return Ok(None);
     }
     let ast::TableFactor::Table {
-        name, args: None, ..
+        name,
+        alias: _,
+        args: None,
+        ..
     } = &select.from[0].relation
     else {
         return Ok(None);
@@ -288,6 +291,12 @@ fn is_prepared_expression_candidate(expression: &ast::Expr) -> bool {
     match expression {
         ast::Expr::Identifier(_) | ast::Expr::CompoundIdentifier(_) | ast::Expr::Value(_) => true,
         ast::Expr::Nested(expression) => is_prepared_expression_candidate(expression),
+        ast::Expr::Cast {
+            kind: ast::CastKind::Cast | ast::CastKind::DoubleColon,
+            expr,
+            format: None,
+            ..
+        } => is_prepared_expression_candidate(expr),
         ast::Expr::IsNull(expression) | ast::Expr::IsNotNull(expression) => {
             is_prepared_expression_candidate(expression)
         }
@@ -349,6 +358,20 @@ pub(super) fn bind_prepared_expression(
         },
         ast::Expr::Nested(expression) => {
             bind_prepared_expression(expression, scope, parameter_types)
+        }
+        ast::Expr::Cast {
+            kind: ast::CastKind::Cast | ast::CastKind::DoubleColon,
+            expr,
+            data_type,
+            format: None,
+        } => {
+            let Some(parameter @ PreparedExpression::Parameter { .. }) =
+                bind_prepared_expression(expr, scope, parameter_types)?
+            else {
+                return Ok(None);
+            };
+            let target = coercion::convert_ast_data_type(data_type)?;
+            Ok((target == PgType::create(parameter.get_data_type())).then_some(parameter))
         }
         ast::Expr::IsNull(operand) | ast::Expr::IsNotNull(operand) => {
             let Some(operand) = bind_prepared_expression(operand, scope, parameter_types)? else {
