@@ -4870,7 +4870,7 @@ fn resolve_select_limit(
 }
 
 #[cfg_attr(feature = "execution-log", tracing::instrument(skip_all))]
-fn validate_select_predicates(
+pub(super) fn validate_select_predicates(
     state: &DatabaseState,
     select: &ast::Select,
     scope: &BoundScope,
@@ -6229,8 +6229,8 @@ fn collect_grouped_select_rows(
                     context,
                 )?;
                 prepared
-                    .get_or_insert_with(|| AggregateState::create(call))
-                    .add_input(call, input);
+                    .get_or_insert_with(|| AggregateState::create(&call.descriptor))
+                    .add_input(&call.descriptor, input);
             }
             if group.source.is_none() {
                 group.source = Some(row.to_vec());
@@ -6257,8 +6257,8 @@ fn collect_grouped_select_rows(
                     }
                     let call = call.as_ref().expect("aggregate call was initialized");
                     let (value, data_type) = aggregate
-                        .unwrap_or_else(|| AggregateState::create(call))
-                        .finish(call)?;
+                        .unwrap_or_else(|| AggregateState::create(&call.descriptor))
+                        .finish(&call.descriptor)?;
                     Ok(GroupedAggregateValue {
                         function: collected.function.clone(),
                         owner: collected.owner,

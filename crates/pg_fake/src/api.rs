@@ -3211,6 +3211,7 @@ impl Session {
                                 &state,
                                 &statement,
                                 &parameter_types,
+                                Some(&columns),
                             )?;
                             let relation_locks = if can_cache_read_locks(&statement)
                                 && catalog_dependencies
@@ -4060,7 +4061,8 @@ impl Session {
                 }
             };
         }
-        let one_shot_plan = match executor::build_prepared_query_plan(&state, statement, &[]) {
+        let one_shot_plan = match executor::build_prepared_query_plan(&state, statement, &[], None)
+        {
             Ok(plan) => plan,
             Err(error) => {
                 drop(state);

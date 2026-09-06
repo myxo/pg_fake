@@ -2,7 +2,7 @@ use super::*;
 use bigdecimal::BigDecimal;
 use sqlparser::ast;
 
-#[derive(Clone, Copy)]
+#[derive(Debug, Clone, Copy)]
 enum AggregateKind {
     CountAll,
     Count,
@@ -14,19 +14,24 @@ enum AggregateKind {
     BooleanOr,
 }
 
-pub(super) struct AggregateCall<'a> {
+#[derive(Debug, Clone)]
+pub(super) struct AggregateDescriptor {
     kind: AggregateKind,
-    argument: Option<&'a ast::Expr>,
-    filter: Option<&'a ast::Expr>,
-    distinct: bool,
+    pub(super) distinct: bool,
     argument_type: Option<BaseType>,
     result_type: BaseType,
 }
 
+pub(super) struct AggregateCall<'a> {
+    pub(super) descriptor: AggregateDescriptor,
+    argument: Option<&'a ast::Expr>,
+    filter: Option<&'a ast::Expr>,
+}
+
 #[derive(Clone)]
 pub(super) struct AggregateInput {
-    included: bool,
-    argument: Option<Value>,
+    pub(super) included: bool,
+    pub(super) argument: Option<Value>,
 }
 
 #[cfg_attr(feature = "execution-log", tracing::instrument(skip_all))]
@@ -53,7 +58,7 @@ pub(super) fn infer_aggregate_return_type(
     if !is_aggregate_function(function) {
         return Ok(None);
     }
-    parse_aggregate_call(function, schema).map(|call| Some(call.result_type))
+    parse_aggregate_call(function, schema).map(|call| Some(call.descriptor.result_type))
 }
 
 #[cfg_attr(feature = "execution-log", tracing::instrument(skip_all))]
@@ -113,12 +118,14 @@ pub(super) fn parse_aggregate_call<'a>(
             ));
         }
         return Ok(AggregateCall {
-            kind: AggregateKind::CountAll,
+            descriptor: AggregateDescriptor {
+                kind: AggregateKind::CountAll,
+                distinct,
+                argument_type: None,
+                result_type: BaseType::Int8,
+            },
             argument: None,
             filter: function.filter.as_deref(),
-            distinct,
-            argument_type: None,
-            result_type: BaseType::Int8,
         });
     }
     let [ast::FunctionArg::Unnamed(ast::FunctionArgExpr::Expr(argument))] =
@@ -196,12 +203,14 @@ pub(super) fn parse_aggregate_call<'a>(
         _ => unreachable!("aggregate name was checked"),
     };
     Ok(AggregateCall {
-        kind,
+        descriptor: AggregateDescriptor {
+            kind,
+            distinct,
+            argument_type: Some(argument_type),
+            result_type,
+        },
         argument: Some(argument),
         filter: function.filter.as_deref(),
-        distinct,
-        argument_type: Some(argument_type),
-        result_type,
     })
 }
 
@@ -238,7 +247,7 @@ pub(super) struct AggregateState {
 }
 
 impl AggregateState {
-    pub(super) fn create(call: &AggregateCall<'_>) -> Self {
+    pub(super) fn create(call: &AggregateDescriptor) -> Self {
         Self {
             inputs: call.distinct.then(Vec::new),
             count: 0,
@@ -247,7 +256,7 @@ impl AggregateState {
         }
     }
 
-    pub(super) fn add_input(&mut self, call: &AggregateCall<'_>, input: AggregateInput) {
+    pub(super) fn add_input(&mut self, call: &AggregateDescriptor, input: AggregateInput) {
         if let Some(inputs) = &mut self.inputs {
             inputs.push(input);
         } else if self.error.is_none() {
@@ -255,7 +264,11 @@ impl AggregateState {
         }
     }
 
-    fn accumulate_input(&mut self, call: &AggregateCall<'_>, input: AggregateInput) -> Result<()> {
+    fn accumulate_input(
+        &mut self,
+        call: &AggregateDescriptor,
+        input: AggregateInput,
+    ) -> Result<()> {
         if !input.included {
             return Ok(());
         }
@@ -322,7 +335,7 @@ impl AggregateState {
         Ok(())
     }
 
-    pub(super) fn finish(mut self, call: &AggregateCall<'_>) -> Result<(Value, BaseType)> {
+    pub(super) fn finish(mut self, call: &AggregateDescriptor) -> Result<(Value, BaseType)> {
         if let Some(error) = self.error.take() {
             return Err(error);
         }

@@ -4,7 +4,7 @@ use super::*;
 #[derive(Debug, Clone)]
 pub(crate) struct PreparedQueryPlan {
     table_id: TableId,
-    projection: Vec<PreparedProjection>,
+    output: PreparedOutput,
     selection: Option<PreparedExpression>,
     access: PreparedAccess,
     columns: Vec<ColumnMeta>,
@@ -23,6 +23,18 @@ enum PreparedAccess {
         column: usize,
         value: PreparedExpression,
     },
+}
+
+#[derive(Debug, Clone)]
+enum PreparedOutput {
+    Rows(Vec<PreparedProjection>),
+    Aggregates(Vec<PreparedAggregate>),
+}
+
+#[derive(Debug, Clone)]
+struct PreparedAggregate {
+    descriptor: AggregateDescriptor,
+    argument: Option<PreparedExpression>,
 }
 
 #[derive(Debug, Clone)]
@@ -91,6 +103,7 @@ pub(crate) fn build_prepared_query_plan(
     state: &DatabaseState,
     statement: &ast::Statement,
     parameter_types: &[BaseType],
+    described_columns: Option<&[ColumnMeta]>,
 ) -> Result<Option<PreparedQueryPlan>> {
     let ast::Statement::Query(query) = statement else {
         return Ok(None);
@@ -145,17 +158,28 @@ pub(crate) fn build_prepared_query_plan(
     else {
         return Ok(None);
     };
-    if !select.projection.iter().all(|item| match item {
-        ast::SelectItem::Wildcard(options) => options == &ast::WildcardAdditionalOptions::default(),
-        ast::SelectItem::UnnamedExpr(expression)
-        | ast::SelectItem::ExprWithAlias {
-            expr: expression, ..
-        } => is_prepared_expression_candidate(expression),
-        _ => false,
-    }) || select
-        .selection
-        .as_ref()
-        .is_some_and(|expression| !is_prepared_expression_candidate(expression))
+    let aggregate_query = !select.projection.is_empty()
+        && select.projection.iter().all(|item| {
+            matches!(item,
+            ast::SelectItem::UnnamedExpr(ast::Expr::Function(function))
+            | ast::SelectItem::ExprWithAlias { expr: ast::Expr::Function(function), .. }
+            if is_aggregate_function(function))
+        });
+    if !(aggregate_query
+        || select.projection.iter().all(|item| match item {
+            ast::SelectItem::Wildcard(options) => {
+                options == &ast::WildcardAdditionalOptions::default()
+            }
+            ast::SelectItem::UnnamedExpr(expression)
+            | ast::SelectItem::ExprWithAlias {
+                expr: expression, ..
+            } => is_prepared_expression_candidate(expression),
+            _ => false,
+        }))
+        || select
+            .selection
+            .as_ref()
+            .is_some_and(|expression| !is_prepared_expression_candidate(expression))
     {
         return Ok(None);
     }
@@ -165,102 +189,170 @@ pub(crate) fn build_prepared_query_plan(
     }
     let schema = state.catalog.require_named_table(&relation_name)?;
     let scope = bind_query_scope(&state.catalog, select)?;
-    let mut projection = Vec::new();
+    if aggregate_query && described_columns.is_none() {
+        super::query::validate_select_predicates(state, select, &scope)?;
+    }
     let mut columns = Vec::new();
-    for item in &select.projection {
-        match item {
-            ast::SelectItem::Wildcard(options)
-                if options == &ast::WildcardAdditionalOptions::default() =>
+    let output = if aggregate_query {
+        let mut aggregates = Vec::new();
+        for item in &select.projection {
+            let function = match item {
+                ast::SelectItem::UnnamedExpr(ast::Expr::Function(function))
+                | ast::SelectItem::ExprWithAlias {
+                    expr: ast::Expr::Function(function),
+                    ..
+                } => function,
+                _ => unreachable!("aggregate projection was checked"),
+            };
+            if function.filter.is_some()
+                || function.over.is_some()
+                || function.null_treatment.is_some()
+                || !function.within_group.is_empty()
+                || function.uses_odbc_syntax
+                || !matches!(function.parameters, ast::FunctionArguments::None)
             {
-                for column in scope.columns.iter().filter(|column| column.wildcard) {
-                    projection.push(PreparedProjection::Column(column.slot));
+                return Ok(None);
+            }
+            let mut typed = function.clone();
+            let ast::FunctionArguments::List(arguments) = &mut typed.args else {
+                return Ok(None);
+            };
+            if !arguments.clauses.is_empty()
+                || matches!(
+                    arguments.duplicate_treatment,
+                    Some(ast::DuplicateTreatment::Distinct)
+                )
+            {
+                return Ok(None);
+            }
+            let argument = match arguments.args.as_mut_slice() {
+                [] | [ast::FunctionArg::Unnamed(ast::FunctionArgExpr::Wildcard)] => None,
+                [ast::FunctionArg::Unnamed(ast::FunctionArgExpr::Expr(expression))] => {
+                    if is_null_literal(expression) {
+                        return Ok(None);
+                    }
+                    let Some(argument) =
+                        bind_prepared_expression(expression, &scope, parameter_types)?
+                    else {
+                        return Ok(None);
+                    };
+                    *expression = crate::analyzer::create_typed_literal(
+                        Value::Null,
+                        PgType::create(argument.get_data_type()),
+                    );
+                    Some(argument)
+                }
+                _ => return Ok(None),
+            };
+            let call = parse_aggregate_call(&typed, RowScope::Bound(&scope))?;
+            aggregates.push(PreparedAggregate {
+                descriptor: call.descriptor,
+                argument,
+            });
+        }
+        columns = match described_columns {
+            Some(columns) => columns.to_vec(),
+            None => describe_query_result_columns(state, statement)?,
+        };
+        PreparedOutput::Aggregates(aggregates)
+    } else {
+        let mut projection = Vec::new();
+        for item in &select.projection {
+            match item {
+                ast::SelectItem::Wildcard(options)
+                    if options == &ast::WildcardAdditionalOptions::default() =>
+                {
+                    for column in scope.columns.iter().filter(|column| column.wildcard) {
+                        projection.push(PreparedProjection::Column(column.slot));
+                        columns.push(ColumnMeta {
+                            name: column.name.clone(),
+                            type_oid: column.data_type.map_to_oid(),
+                            typmod: column.data_type.typmod,
+                        });
+                    }
+                }
+                ast::SelectItem::UnnamedExpr(ast::Expr::Identifier(column)) => {
+                    let (slot, data_type) = scope.resolve_column(std::slice::from_ref(column))?;
+                    projection.push(PreparedProjection::Column(slot));
                     columns.push(ColumnMeta {
-                        name: column.name.clone(),
-                        type_oid: column.data_type.map_to_oid(),
-                        typmod: column.data_type.typmod,
+                        name: column.value.clone(),
+                        type_oid: data_type.map_to_oid(),
+                        typmod: data_type.typmod,
                     });
                 }
+                ast::SelectItem::UnnamedExpr(ast::Expr::CompoundIdentifier(identifiers)) => {
+                    let (slot, data_type) = scope.resolve_column(identifiers)?;
+                    projection.push(PreparedProjection::Column(slot));
+                    columns.push(ColumnMeta {
+                        name: identifiers
+                            .last()
+                            .expect("compound identifier is non-empty")
+                            .value
+                            .clone(),
+                        type_oid: data_type.map_to_oid(),
+                        typmod: data_type.typmod,
+                    });
+                }
+                ast::SelectItem::ExprWithAlias {
+                    expr: ast::Expr::Identifier(column),
+                    alias,
+                } => {
+                    let (slot, data_type) = scope.resolve_column(std::slice::from_ref(column))?;
+                    projection.push(PreparedProjection::Column(slot));
+                    columns.push(ColumnMeta {
+                        name: alias.value.clone(),
+                        type_oid: data_type.map_to_oid(),
+                        typmod: data_type.typmod,
+                    });
+                }
+                ast::SelectItem::ExprWithAlias {
+                    expr: ast::Expr::CompoundIdentifier(identifiers),
+                    alias,
+                } => {
+                    let (slot, data_type) = scope.resolve_column(identifiers)?;
+                    projection.push(PreparedProjection::Column(slot));
+                    columns.push(ColumnMeta {
+                        name: alias.value.clone(),
+                        type_oid: data_type.map_to_oid(),
+                        typmod: data_type.typmod,
+                    });
+                }
+                ast::SelectItem::UnnamedExpr(expression) => {
+                    let Some(expression) =
+                        bind_prepared_expression(expression, &scope, parameter_types)?
+                    else {
+                        return Ok(None);
+                    };
+                    let data_type = expression.get_data_type();
+                    projection.push(PreparedProjection::Expression(expression));
+                    columns.push(ColumnMeta {
+                        name: "?column?".into(),
+                        type_oid: data_type.map_to_oid(),
+                        typmod: PgType::NO_TYPEMOD,
+                    });
+                }
+                ast::SelectItem::ExprWithAlias {
+                    expr: expression,
+                    alias,
+                } => {
+                    let Some(expression) =
+                        bind_prepared_expression(expression, &scope, parameter_types)?
+                    else {
+                        return Ok(None);
+                    };
+                    let data_type = expression.get_data_type();
+                    projection.push(PreparedProjection::Expression(expression));
+                    columns.push(ColumnMeta {
+                        name: normalize_identifier(alias),
+                        type_oid: data_type.map_to_oid(),
+                        typmod: PgType::NO_TYPEMOD,
+                    });
+                }
+                _ => return Ok(None),
             }
-            ast::SelectItem::UnnamedExpr(ast::Expr::Identifier(column)) => {
-                let (slot, data_type) = scope.resolve_column(std::slice::from_ref(column))?;
-                projection.push(PreparedProjection::Column(slot));
-                columns.push(ColumnMeta {
-                    name: column.value.clone(),
-                    type_oid: data_type.map_to_oid(),
-                    typmod: data_type.typmod,
-                });
-            }
-            ast::SelectItem::UnnamedExpr(ast::Expr::CompoundIdentifier(identifiers)) => {
-                let (slot, data_type) = scope.resolve_column(identifiers)?;
-                projection.push(PreparedProjection::Column(slot));
-                columns.push(ColumnMeta {
-                    name: identifiers
-                        .last()
-                        .expect("compound identifier is non-empty")
-                        .value
-                        .clone(),
-                    type_oid: data_type.map_to_oid(),
-                    typmod: data_type.typmod,
-                });
-            }
-            ast::SelectItem::ExprWithAlias {
-                expr: ast::Expr::Identifier(column),
-                alias,
-            } => {
-                let (slot, data_type) = scope.resolve_column(std::slice::from_ref(column))?;
-                projection.push(PreparedProjection::Column(slot));
-                columns.push(ColumnMeta {
-                    name: alias.value.clone(),
-                    type_oid: data_type.map_to_oid(),
-                    typmod: data_type.typmod,
-                });
-            }
-            ast::SelectItem::ExprWithAlias {
-                expr: ast::Expr::CompoundIdentifier(identifiers),
-                alias,
-            } => {
-                let (slot, data_type) = scope.resolve_column(identifiers)?;
-                projection.push(PreparedProjection::Column(slot));
-                columns.push(ColumnMeta {
-                    name: alias.value.clone(),
-                    type_oid: data_type.map_to_oid(),
-                    typmod: data_type.typmod,
-                });
-            }
-            ast::SelectItem::UnnamedExpr(expression) => {
-                let Some(expression) =
-                    bind_prepared_expression(expression, &scope, parameter_types)?
-                else {
-                    return Ok(None);
-                };
-                let data_type = expression.get_data_type();
-                projection.push(PreparedProjection::Expression(expression));
-                columns.push(ColumnMeta {
-                    name: "?column?".into(),
-                    type_oid: data_type.map_to_oid(),
-                    typmod: PgType::NO_TYPEMOD,
-                });
-            }
-            ast::SelectItem::ExprWithAlias {
-                expr: expression,
-                alias,
-            } => {
-                let Some(expression) =
-                    bind_prepared_expression(expression, &scope, parameter_types)?
-                else {
-                    return Ok(None);
-                };
-                let data_type = expression.get_data_type();
-                projection.push(PreparedProjection::Expression(expression));
-                columns.push(ColumnMeta {
-                    name: normalize_identifier(alias),
-                    type_oid: data_type.map_to_oid(),
-                    typmod: PgType::NO_TYPEMOD,
-                });
-            }
-            _ => return Ok(None),
         }
-    }
+        PreparedOutput::Rows(projection)
+    };
     let selection = match &select.selection {
         Some(selection) => {
             let Some(selection) = bind_prepared_expression(selection, &scope, parameter_types)?
@@ -280,7 +372,7 @@ pub(crate) fn build_prepared_query_plan(
         .unwrap_or(PreparedAccess::Scan);
     Ok(Some(PreparedQueryPlan {
         table_id: schema.id,
-        projection,
+        output,
         selection,
         access,
         columns,
@@ -505,6 +597,13 @@ pub(crate) fn execute_prepared_query(
         .get(&plan.table_id)
         .expect("prepared table must have storage");
     let mut rows = Vec::new();
+    let mut aggregate_states = match &plan.output {
+        PreparedOutput::Rows(_) => Vec::new(),
+        PreparedOutput::Aggregates(aggregates) => aggregates
+            .iter()
+            .map(|aggregate| AggregateState::create(&aggregate.descriptor))
+            .collect::<Vec<_>>(),
+    };
     let mut visit = |row: &[Value]| -> Result<()> {
         if deadline.is_some_and(|deadline| Instant::now() >= deadline) {
             return Err(PgError::create(
@@ -520,17 +619,37 @@ pub(crate) fn execute_prepared_query(
         {
             return Ok(());
         }
-        rows.push(
-            plan.projection
-                .iter()
-                .map(|projection| match projection {
-                    PreparedProjection::Column(slot) => Ok(row[*slot].clone()),
-                    PreparedProjection::Expression(expression) => {
-                        evaluate_prepared_expression(expression, row, parameters, deadline)
-                    }
-                })
-                .collect::<Result<_>>()?,
-        );
+        match &plan.output {
+            PreparedOutput::Rows(projection) => rows.push(
+                projection
+                    .iter()
+                    .map(|projection| match projection {
+                        PreparedProjection::Column(slot) => Ok(row[*slot].clone()),
+                        PreparedProjection::Expression(expression) => {
+                            evaluate_prepared_expression(expression, row, parameters, deadline)
+                        }
+                    })
+                    .collect::<Result<_>>()?,
+            ),
+            PreparedOutput::Aggregates(aggregates) => {
+                for (aggregate, aggregate_state) in aggregates.iter().zip(&mut aggregate_states) {
+                    let argument = aggregate
+                        .argument
+                        .as_ref()
+                        .map(|expression| {
+                            evaluate_prepared_expression(expression, row, parameters, deadline)
+                        })
+                        .transpose()?;
+                    aggregate_state.add_input(
+                        &aggregate.descriptor,
+                        AggregateInput {
+                            included: true,
+                            argument,
+                        },
+                    );
+                }
+            }
+        }
         Ok(())
     };
     match &plan.access {
@@ -555,6 +674,17 @@ pub(crate) fn execute_prepared_query(
                 visit(row)?;
             }
         }
+    }
+    if let PreparedOutput::Aggregates(aggregates) = &plan.output {
+        rows.push(
+            aggregate_states
+                .into_iter()
+                .zip(aggregates)
+                .map(|(state, aggregate)| {
+                    state.finish(&aggregate.descriptor).map(|(value, _)| value)
+                })
+                .collect::<Result<_>>()?,
+        );
     }
     Ok(rows)
 }
