@@ -433,7 +433,7 @@ pub(super) fn execute_before_row_triggers(
     mut row: Vec<Value>,
     context: &StatementExecutionContext,
 ) -> Result<Option<Vec<Value>>> {
-    let scope = create_new_scope(schema);
+    let mut scope = None;
     for trigger in &schema.triggers {
         let fires = trigger.definition.events.iter().any(|configured| {
             matches!(
@@ -445,8 +445,9 @@ pub(super) fn execute_before_row_triggers(
         if !fires {
             continue;
         }
+        let scope = scope.get_or_insert_with(|| create_new_scope(schema));
         let function = require_function(state, trigger)?;
-        match execute_trigger_statements(&function.body.statements, &scope, &mut row, context)? {
+        match execute_trigger_statements(&function.body.statements, scope, &mut row, context)? {
             Some(TriggerReturn::Continue) => {}
             Some(TriggerReturn::Skip) => return Ok(None),
             None => {
