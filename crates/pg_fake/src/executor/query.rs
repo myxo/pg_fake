@@ -3227,7 +3227,7 @@ pub(super) struct GroupedAggregateValue {
 pub(super) type GroupedAggregateValues = Vec<GroupedAggregateValue>;
 struct CollectedGroup {
     key: Vec<Value>,
-    rows: Vec<Vec<Value>>,
+    source: Option<Vec<Value>>,
     aggregate_inputs: Vec<Vec<AggregateInput>>,
 }
 struct GroupedExpressionSubstituter<'a> {
@@ -6126,7 +6126,7 @@ fn collect_grouped_select_rows(
     xid: Xid,
     snapshot: &Snapshot,
     context: &StatementExecutionContext,
-) -> Result<Vec<(Vec<Value>, Vec<Vec<Value>>, GroupedAggregateValues)>> {
+) -> Result<Vec<(Vec<Value>, GroupedAggregateValues)>> {
     let typed_aggregate_functions = aggregate_functions
         .iter()
         .map(|collected| {
@@ -6146,7 +6146,7 @@ fn collect_grouped_select_rows(
     let mut groups = if grouped_expressions.is_empty() {
         vec![CollectedGroup {
             key: Vec::new(),
-            rows: Vec::new(),
+            source: None,
             aggregate_inputs: vec![Vec::new(); aggregate_functions.len()],
         }]
     } else {
@@ -6190,7 +6190,7 @@ fn collect_grouped_select_rows(
                 None => {
                     groups.push(CollectedGroup {
                         key,
-                        rows: Vec::new(),
+                        source: None,
                         aggregate_inputs: vec![Vec::new(); aggregate_functions.len()],
                     });
                     groups.len() - 1
@@ -6218,7 +6218,9 @@ fn collect_grouped_select_rows(
                 })
                 .collect::<Result<Vec<_>>>()?;
             let group = &mut groups[index];
-            group.rows.push(row.to_vec());
+            if group.source.is_none() {
+                group.source = Some(row.to_vec());
+            }
             for (prepared, inputs) in group.aggregate_inputs.iter_mut().zip(inputs) {
                 prepared.push(inputs);
             }
@@ -6231,9 +6233,7 @@ fn collect_grouped_select_rows(
         .into_iter()
         .map(|group| {
             let source = group
-                .rows
-                .first()
-                .cloned()
+                .source
                 .unwrap_or_else(|| vec![Value::Null; scope.columns.len()]);
             let aggregate_values = aggregate_functions
                 .iter()
@@ -6258,7 +6258,7 @@ fn collect_grouped_select_rows(
                     })
                 })
                 .collect::<Result<Vec<_>>>()?;
-            Ok((source, group.rows, aggregate_values))
+            Ok((source, aggregate_values))
         })
         .collect::<Result<Vec<_>>>()?)
 }
@@ -6322,7 +6322,7 @@ fn execute_grouped_select_rows(
         context,
     )?;
     let mut rows = Vec::new();
-    for (row, _group_rows, aggregate_values) in groups {
+    for (row, aggregate_values) in groups {
         if !evaluate_group_having(
             state,
             select,
@@ -6999,7 +6999,7 @@ pub(super) fn stream_plain_query_rows(
                 context,
             )?;
             let mut rows = Vec::new();
-            for (source, _group_rows, aggregate_values) in groups {
+            for (source, aggregate_values) in groups {
                 if !evaluate_group_having(
                     state,
                     select,
