@@ -588,3 +588,27 @@ fn rejects_permanent_views_over_temporary_sequences() {
         .execute("CREATE TEMP VIEW valid_view AS SELECT nextval('temp_sequence') AS n")
         .unwrap();
 }
+
+#[test]
+fn expands_nested_views_while_preserving_cte_name_shadowing() {
+    let db = Db::create();
+    let mut session = db.create_session();
+    session.execute("CREATE TABLE source_rows (id INTEGER); INSERT INTO source_rows VALUES (3); CREATE VIEW visible_rows AS SELECT id FROM source_rows; CREATE VIEW nested_rows AS SELECT id FROM visible_rows").unwrap();
+    for (sql, expected) in [
+        (
+            "WITH visible_rows AS (SELECT 7 AS id) SELECT id FROM visible_rows UNION ALL SELECT id FROM public.visible_rows ORDER BY id",
+            vec![vec![Value::Int4(3)], vec![Value::Int4(7)]],
+        ),
+        (
+            "SELECT (SELECT id FROM nested_rows) AS id UNION ALL SELECT id FROM (SELECT id FROM nested_rows) nested ORDER BY id",
+            vec![vec![Value::Int4(3)], vec![Value::Int4(3)]],
+        ),
+    ] {
+        assert_eq!(session.query(sql, &[]).unwrap().rows, expected);
+        let prepared = session.prepare(sql).unwrap();
+        assert_eq!(
+            session.query_prepared(&prepared, &[]).unwrap().rows,
+            expected
+        );
+    }
+}

@@ -1006,16 +1006,55 @@ impl ast::VisitorMut for ViewExpander<'_> {
     }
 }
 
-pub(crate) fn expand_query_views(catalog: &Catalog, query: &ast::Query) -> Result<ast::Query> {
-    let mut query = query.clone();
+pub(crate) fn expand_query_views(
+    catalog: &Catalog,
+    query: &ast::Query,
+) -> Result<Option<ast::Query>> {
+    struct ViewProbe<'a> {
+        catalog: &'a Catalog,
+    }
+
+    impl ast::Visitor for ViewProbe<'_> {
+        type Break = ();
+
+        fn pre_visit_table_factor(
+            &mut self,
+            factor: &ast::TableFactor,
+        ) -> std::ops::ControlFlow<Self::Break> {
+            let ast::TableFactor::Table {
+                name, args: None, ..
+            } = factor
+            else {
+                return std::ops::ControlFlow::Continue(());
+            };
+            if let Ok(name) = normalize_relation_name(name)
+                && let Err(error) = self.catalog.require_named_view(&name)
+                && matches!(
+                    error.sqlstate,
+                    SqlState::UndefinedTable | SqlState::WrongObjectType
+                )
+            {
+                return std::ops::ControlFlow::Continue(());
+            }
+            std::ops::ControlFlow::Break(())
+        }
+    }
+
+    if ast::Visit::visit(query, &mut ViewProbe { catalog }).is_continue() {
+        return Ok(None);
+    }
+    let mut expanded = query.clone();
     let mut expander = ViewExpander {
         catalog,
         stack: Vec::new(),
         masked: Vec::new(),
         error: None,
     };
-    let _ = query.visit(&mut expander);
-    expander.error.map_or(Ok(query), Err)
+    let _ = expanded.visit(&mut expander);
+    match expander.error {
+        Some(error) => Err(error),
+        None => Ok((expanded != *query).then_some(expanded)),
+    }
 }
 
 pub(crate) fn rename_table_references(catalog: &mut Catalog, table_id: TableId, new_name: &str) {

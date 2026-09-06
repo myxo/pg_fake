@@ -6592,8 +6592,7 @@ pub(super) fn execute_query(
     snapshot: &Snapshot,
     context: &StatementExecutionContext,
 ) -> Result<StatementResult> {
-    let expanded = super::views::expand_query_views(&state.catalog, query)?;
-    if &expanded != query {
+    if let Some(expanded) = super::views::expand_query_views(&state.catalog, query)? {
         return execute_query(state, &expanded, xid, snapshot, context);
     }
     if contains_query_ctes(query) {
@@ -6725,8 +6724,7 @@ pub(super) fn stream_plain_query_rows(
         None => None,
     };
     let query = cached_query.as_ref().unwrap_or(query);
-    let expanded = super::views::expand_query_views(&state.catalog, query)?;
-    if &expanded != query {
+    if let Some(expanded) = super::views::expand_query_views(&state.catalog, query)? {
         return stream_plain_query_rows(
             state,
             &expanded,
