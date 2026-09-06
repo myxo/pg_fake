@@ -597,13 +597,13 @@ fn constrain_statement_parameters(
 }
 
 #[cfg_attr(feature = "execution-log", tracing::instrument(skip_all))]
-pub(crate) fn infer_parameter_types_with_data_modifying_ctes(
-    described: &ast::Statement,
+pub(crate) fn analyze_prepared_statement_parameters<'a>(
+    described: &'a ast::Statement,
     data_modifying_ctes: &[ast::Statement],
     catalog: &Catalog,
     parameter_count: usize,
     supplied_types: &[Option<BaseType>],
-) -> Result<Vec<BaseType>> {
+) -> Result<(Vec<BaseType>, Cow<'a, ast::Statement>)> {
     let mut types = vec![None; parameter_count];
     types[..supplied_types.len()].copy_from_slice(supplied_types);
     for statement in data_modifying_ctes {
@@ -617,7 +617,7 @@ pub(crate) fn infer_parameter_types_with_data_modifying_ctes(
         let bound = bind_parameters(statement, &types, &vec![Value::Null; types.len()])?;
         validate_statement(&bound, catalog)?;
     }
-    Ok(types)
+    Ok((types, bound))
 }
 
 #[cfg_attr(feature = "execution-log", tracing::instrument(skip_all))]

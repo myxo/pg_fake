@@ -3197,19 +3197,14 @@ impl Session {
                 )
                 .and_then(
                     |(described, mutations, parameter_count, catalog_dependencies)| {
-                        analyzer::infer_parameter_types_with_data_modifying_ctes(
+                        analyzer::analyze_prepared_statement_parameters(
                             &described,
                             &mutations,
                             &state.catalog,
                             parameter_count,
                             parameter_types,
                         )
-                        .and_then(|parameter_types| {
-                            let described = analyzer::bind_parameters(
-                                &described,
-                                &parameter_types,
-                                &vec![Value::Null; parameter_types.len()],
-                            )?;
+                        .and_then(|(parameter_types, described)| {
                             let columns =
                                 executor::describe_query_result_columns(&state, &described)?;
                             let query_plan = executor::build_prepared_query_plan(
