@@ -589,6 +589,7 @@ impl StatementExecutionContext {
 
 #[derive(Clone)]
 pub(crate) struct DatabaseState {
+    loaded_catalog: Option<(u64, Option<crate::catalog::SchemaId>)>,
     pub(crate) catalog: Catalog,
     pub(crate) catalog_history: CatalogHistory,
     pub(crate) tables: BTreeMap<TableId, Table>,
@@ -628,6 +629,7 @@ impl DatabaseState {
         let catalog =
             catalog_history.materialize(None, Snapshot::create(&transactions), &transactions);
         DatabaseState {
+            loaded_catalog: None,
             catalog,
             catalog_history,
             tables: BTreeMap::new(),
@@ -648,6 +650,14 @@ impl DatabaseState {
         snapshot: Snapshot,
         temporary_schema_id: Option<crate::catalog::SchemaId>,
     ) {
+        let current_catalog = self
+            .catalog_history
+            .resolve_current_generation(xid, snapshot, &self.transactions)
+            .map(|generation| (generation, temporary_schema_id));
+        if current_catalog.is_some() && current_catalog == self.loaded_catalog {
+            return;
+        }
+        self.loaded_catalog = None;
         self.catalog = self.catalog_history.materialize_for_session(
             xid,
             snapshot,
@@ -660,6 +670,7 @@ impl DatabaseState {
                 table.replace_schema(schema);
             }
         }
+        self.loaded_catalog = current_catalog;
     }
 
     #[cfg_attr(feature = "execution-log", tracing::instrument(skip_all))]

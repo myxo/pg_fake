@@ -285,6 +285,9 @@ struct CatalogVersion<T> {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct CatalogHistory {
+    generation: u64,
+    pending_transactions: BTreeSet<Xid>,
+    latest_commit: CommitSeq,
     schemas: BTreeMap<SchemaId, Vec<CatalogVersion<SchemaIdentity>>>,
     tables: BTreeMap<TableId, Vec<CatalogVersion<TableSchema>>>,
     sequences: BTreeMap<SequenceId, Vec<CatalogVersion<SequenceSchema>>>,
@@ -1456,6 +1459,9 @@ impl CatalogHistory {
             name: DEFAULT_SCHEMA.into(),
         };
         CatalogHistory {
+            generation: 0,
+            pending_transactions: BTreeSet::new(),
+            latest_commit: CommitSeq(0),
             schemas: BTreeMap::from([(
                 schema.id,
                 vec![CatalogVersion {
@@ -1482,9 +1488,37 @@ impl CatalogHistory {
     }
 
     pub(crate) fn create_temporary_schema_id(&mut self) -> SchemaId {
+        self.generation += 1;
         let id = SchemaId(self.next_schema_id);
         self.next_schema_id += 1;
         id
+    }
+
+    pub(crate) fn resolve_current_generation(
+        &mut self,
+        xid: Option<Xid>,
+        snapshot: Snapshot,
+        transactions: &TransactionRegistry,
+    ) -> Option<u64> {
+        self.pending_transactions
+            .retain(|pending| match transactions.get_status(*pending) {
+                Some(TransactionStatus::InFlight) => true,
+                Some(TransactionStatus::Committed(commit)) => {
+                    self.latest_commit = self.latest_commit.max(commit);
+                    self.generation += 1;
+                    false
+                }
+                Some(TransactionStatus::Aborted) | None => {
+                    self.generation += 1;
+                    false
+                }
+            });
+        (self.pending_transactions.is_empty()
+            && snapshot.commit_seq >= self.latest_commit
+            && xid.is_none_or(|xid| {
+                transactions.get_status(xid) == Some(TransactionStatus::InFlight)
+            }))
+        .then_some(self.generation)
     }
 
     #[cfg_attr(feature = "execution-log", tracing::instrument(skip_all))]
@@ -1668,6 +1702,8 @@ impl CatalogHistory {
         xid: Xid,
         command_id: CommandId,
     ) {
+        self.generation += 1;
+        self.pending_transactions.insert(xid);
         record_catalog_changes(
             &mut self.schemas,
             previous
@@ -1771,6 +1807,8 @@ impl CatalogHistory {
 
     #[cfg_attr(feature = "execution-log", tracing::instrument(skip_all))]
     pub(crate) fn discard_transaction(&mut self, xid: Xid) -> ReclaimedCatalogObjects {
+        self.generation += 1;
+        self.pending_transactions.remove(&xid);
         discard_catalog_transaction(&mut self.schemas, xid);
         discard_catalog_transaction(&mut self.views, xid);
         discard_catalog_transaction(&mut self.functions, xid);
@@ -1784,6 +1822,7 @@ impl CatalogHistory {
         &mut self,
         temporary_schema_id: SchemaId,
     ) -> ReclaimedCatalogObjects {
+        self.generation += 1;
         let tables = self
             .tables
             .iter()
