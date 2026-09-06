@@ -251,10 +251,10 @@ pub(crate) enum TablePersistence {
 pub(crate) struct Schema {
     pub(crate) id: SchemaId,
     pub(crate) name: String,
-    tables: BTreeMap<String, TableSchema>,
-    views: BTreeMap<String, ViewSchema>,
-    sequences: BTreeMap<String, SequenceSchema>,
-    functions: BTreeMap<String, FunctionSchema>,
+    tables: BTreeMap<String, Arc<TableSchema>>,
+    views: BTreeMap<String, Arc<ViewSchema>>,
+    sequences: BTreeMap<String, Arc<SequenceSchema>>,
+    functions: BTreeMap<String, Arc<FunctionSchema>>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -301,10 +301,10 @@ pub(crate) struct CatalogHistory {
     pending_transactions: BTreeSet<Xid>,
     latest_commit: CommitSeq,
     schemas: BTreeMap<SchemaId, Vec<CatalogVersion<SchemaIdentity>>>,
-    tables: BTreeMap<TableId, Vec<CatalogVersion<TableSchema>>>,
-    sequences: BTreeMap<SequenceId, Vec<CatalogVersion<SequenceSchema>>>,
-    views: BTreeMap<ViewId, Vec<CatalogVersion<ViewSchema>>>,
-    functions: BTreeMap<FunctionId, Vec<CatalogVersion<FunctionSchema>>>,
+    tables: BTreeMap<TableId, Vec<CatalogVersion<Arc<TableSchema>>>>,
+    sequences: BTreeMap<SequenceId, Vec<CatalogVersion<Arc<SequenceSchema>>>>,
+    views: BTreeMap<ViewId, Vec<CatalogVersion<Arc<ViewSchema>>>>,
+    functions: BTreeMap<FunctionId, Vec<CatalogVersion<Arc<FunctionSchema>>>>,
     next_schema_id: u64,
     next_table_id: u64,
     next_sequence_id: u64,
@@ -480,12 +480,16 @@ impl Catalog {
                 format!("{:?} is not a table", name.name),
             ));
         }
-        schema.tables.get(&name.name).ok_or_else(|| {
-            PgError::create(
-                SqlState::UndefinedTable,
-                format!("relation {:?} does not exist", name.name),
-            )
-        })
+        schema
+            .tables
+            .get(&name.name)
+            .map(Arc::as_ref)
+            .ok_or_else(|| {
+                PgError::create(
+                    SqlState::UndefinedTable,
+                    format!("relation {:?} does not exist", name.name),
+                )
+            })
     }
 
     pub(crate) fn require_named_view(&self, name: &RelationName) -> Result<&ViewSchema> {
@@ -503,12 +507,16 @@ impl Catalog {
                 format!("{:?} is not a view", name.name),
             ));
         }
-        schema.views.get(&name.name).ok_or_else(|| {
-            PgError::create(
-                SqlState::UndefinedTable,
-                format!("relation {:?} does not exist", name.name),
-            )
-        })
+        schema
+            .views
+            .get(&name.name)
+            .map(Arc::as_ref)
+            .ok_or_else(|| {
+                PgError::create(
+                    SqlState::UndefinedTable,
+                    format!("relation {:?} does not exist", name.name),
+                )
+            })
     }
 
     pub(crate) fn require_named_sequence(&self, name: &RelationName) -> Result<&SequenceSchema> {
@@ -530,12 +538,16 @@ impl Catalog {
                 format!("{:?} is not a sequence", name.name),
             ));
         }
-        schema.sequences.get(&name.name).ok_or_else(|| {
-            PgError::create(
-                SqlState::UndefinedTable,
-                format!("relation {:?} does not exist", name.name),
-            )
-        })
+        schema
+            .sequences
+            .get(&name.name)
+            .map(Arc::as_ref)
+            .ok_or_else(|| {
+                PgError::create(
+                    SqlState::UndefinedTable,
+                    format!("relation {:?} does not exist", name.name),
+                )
+            })
     }
 
     #[cfg_attr(not(test), allow(dead_code))]
@@ -638,7 +650,7 @@ impl Catalog {
         }
         self.get_default_schema_mut().tables.insert(
             name.clone(),
-            TableSchema {
+            Arc::new(TableSchema {
                 id,
                 schema_id,
                 name,
@@ -647,7 +659,7 @@ impl Catalog {
                 indexes: Vec::new(),
                 triggers: Vec::new(),
                 persistence: TablePersistence::Permanent,
-            },
+            }),
         );
         self.rebuild_foreign_key_metadata();
         Ok(id)
@@ -697,7 +709,7 @@ impl Catalog {
         }
         let previous = self.get_schema_by_id_mut(name.schema_id).tables.insert(
             name.name.clone(),
-            TableSchema {
+            Arc::new(TableSchema {
                 id,
                 schema_id: name.schema_id,
                 name: name.name,
@@ -706,7 +718,7 @@ impl Catalog {
                 indexes: Vec::new(),
                 triggers: Vec::new(),
                 persistence,
-            },
+            }),
         );
         assert!(previous.is_none(), "new table must not replace a relation");
         self.rebuild_foreign_key_metadata();
@@ -723,7 +735,7 @@ impl Catalog {
                 format!("{name:?} is not a table"),
             ));
         }
-        schema.tables.get(name).ok_or_else(|| {
+        schema.tables.get(name).map(Arc::as_ref).ok_or_else(|| {
             PgError::create(
                 SqlState::UndefinedTable,
                 format!("relation {name:?} does not exist"),
@@ -740,12 +752,16 @@ impl Catalog {
                 format!("{name:?} is not a table"),
             ));
         }
-        schema.tables.get_mut(name).ok_or_else(|| {
-            PgError::create(
-                SqlState::UndefinedTable,
-                format!("relation {name:?} does not exist"),
-            )
-        })
+        schema
+            .tables
+            .get_mut(name)
+            .map(Arc::make_mut)
+            .ok_or_else(|| {
+                PgError::create(
+                    SqlState::UndefinedTable,
+                    format!("relation {name:?} does not exist"),
+                )
+            })
     }
 
     #[cfg_attr(feature = "execution-log", tracing::instrument(skip_all))]
@@ -754,6 +770,7 @@ impl Catalog {
             .schemas
             .values()
             .flat_map(|schema| schema.tables.values())
+            .map(Arc::as_ref)
             .find(|table| table.id == id)
             .ok_or_else(|| {
                 PgError::create(
@@ -784,7 +801,7 @@ impl Catalog {
         let previous = self
             .get_schema_by_id_mut(table.schema_id)
             .tables
-            .insert(table.name.clone(), table);
+            .insert(table.name.clone(), Arc::new(table));
         assert!(previous.is_none(), "replacement table name must be free");
         self.rebuild_foreign_key_metadata();
         Ok(())
@@ -827,6 +844,7 @@ impl Catalog {
         self.get_schema_by_id(name.schema_id)
             .functions
             .get(&name.name)
+            .map(Arc::as_ref)
             .ok_or_else(|| {
                 PgError::create(
                     SqlState::UndefinedFunction,
@@ -840,6 +858,7 @@ impl Catalog {
             .schemas
             .values()
             .flat_map(|schema| schema.functions.values())
+            .map(Arc::as_ref)
             .find(|function| function.id == id)
             .ok_or_else(|| {
                 PgError::create(
@@ -877,13 +896,13 @@ impl Catalog {
         );
         self.get_schema_by_id_mut(name.schema_id).functions.insert(
             name.name.clone(),
-            FunctionSchema {
+            Arc::new(FunctionSchema {
                 id,
                 schema_id: name.schema_id,
                 name: name.name,
                 definition,
                 body,
-            },
+            }),
         );
         Ok(id)
     }
@@ -915,7 +934,7 @@ impl Catalog {
                     .indexes
                     .iter()
                     .find(|index| index.name == name.name)
-                    .map(|index| (table, index))
+                    .map(|index| (table.as_ref(), index))
             })
             .ok_or_else(|| {
                 PgError::create(
@@ -936,6 +955,12 @@ impl Catalog {
             .values_mut()
             .flat_map(|schema| schema.tables.values_mut())
         {
+            if table.id != table_id && !table.constraints.iter().any(|constraint| {
+                matches!(constraint, Constraint::ForeignKey(foreign_key) if foreign_key.foreign_table_id == table_id)
+            }) {
+                continue;
+            }
+            let table = Arc::make_mut(table);
             for constraint in &mut table.constraints {
                 match constraint {
                     Constraint::PrimaryKey { columns, .. } | Constraint::Unique { columns, .. }
@@ -974,11 +999,16 @@ impl Catalog {
             .values_mut()
             .flat_map(|schema| schema.sequences.values_mut())
         {
-            if let Some((owner, column)) = &mut sequence.owned_by
-                && *owner == table_id
-                && column == old_name
+            if sequence
+                .owned_by
+                .as_ref()
+                .is_some_and(|(owner, column)| *owner == table_id && column == old_name)
             {
-                *column = new_name.to_owned();
+                Arc::make_mut(sequence)
+                    .owned_by
+                    .as_mut()
+                    .expect("sequence owner was checked")
+                    .1 = new_name.to_owned();
             }
         }
         self.rebuild_foreign_key_metadata();
@@ -990,6 +1020,12 @@ impl Catalog {
             .values_mut()
             .flat_map(|schema| schema.tables.values_mut())
         {
+            if !table.constraints.iter().any(|constraint| {
+                matches!(constraint, Constraint::ForeignKey(foreign_key) if foreign_key.foreign_table_id == table_id)
+            }) {
+                continue;
+            }
+            let table = Arc::make_mut(table);
             for constraint in &mut table.constraints {
                 if let Constraint::ForeignKey(foreign_key) = constraint
                     && foreign_key.foreign_table_id == table_id
@@ -1015,6 +1051,7 @@ impl Catalog {
             .schemas
             .values()
             .flat_map(|schema| schema.tables.values())
+            .map(Arc::as_ref)
     }
 
     pub(crate) fn iterate_views(&self) -> impl Iterator<Item = &ViewSchema> {
@@ -1022,6 +1059,7 @@ impl Catalog {
             .schemas
             .values()
             .flat_map(|schema| schema.views.values())
+            .map(Arc::as_ref)
     }
 
     pub(crate) fn iterate_views_mut(&mut self) -> impl Iterator<Item = &mut ViewSchema> {
@@ -1029,6 +1067,7 @@ impl Catalog {
             .schemas
             .values_mut()
             .flat_map(|schema| schema.views.values_mut())
+            .map(Arc::make_mut)
     }
 
     pub(crate) fn create_named_view(
@@ -1049,7 +1088,7 @@ impl Catalog {
         self.next_view_id += 1;
         let previous = self.get_schema_by_id_mut(name.schema_id).views.insert(
             name.name.clone(),
-            ViewSchema {
+            Arc::new(ViewSchema {
                 id,
                 schema_id: name.schema_id,
                 name: name.name,
@@ -1058,7 +1097,7 @@ impl Catalog {
                 comment: None,
                 dependencies,
                 column_dependencies,
-            },
+            }),
         );
         assert!(previous.is_none(), "new view must not replace a relation");
         Ok(id)
@@ -1082,7 +1121,7 @@ impl Catalog {
         let previous = self
             .get_schema_by_id_mut(view.schema_id)
             .views
-            .insert(view.name.clone(), view);
+            .insert(view.name.clone(), Arc::new(view));
         assert!(previous.is_none(), "replacement view name must be free");
         Ok(())
     }
@@ -1112,6 +1151,7 @@ impl Catalog {
                     .remove(&view.name)
                     .expect("required view must exist")
             })
+            .map(Arc::unwrap_or_clone)
             .collect())
     }
 
@@ -1172,6 +1212,7 @@ impl Catalog {
                     .remove(name)
                     .expect("required table must exist")
             })
+            .map(Arc::unwrap_or_clone)
             .collect();
         self.rebuild_foreign_key_metadata();
         Ok(dropped)
@@ -1229,6 +1270,7 @@ impl Catalog {
                     .remove(&table.name)
                     .expect("required table must exist")
             })
+            .map(Arc::unwrap_or_clone)
             .collect();
         self.rebuild_foreign_key_metadata();
         Ok(dropped)
@@ -1242,7 +1284,7 @@ impl Catalog {
             .remove(&table.name)
             .expect("required table must exist");
         self.rebuild_foreign_key_metadata();
-        Ok(dropped)
+        Ok(Arc::unwrap_or_clone(dropped))
     }
 
     #[cfg(test)]
@@ -1340,7 +1382,7 @@ impl Catalog {
         sequence.schema_id = self.get_default_schema().id;
         self.get_default_schema_mut()
             .sequences
-            .insert(sequence.name.clone(), sequence);
+            .insert(sequence.name.clone(), Arc::new(sequence));
         Ok(id)
     }
 
@@ -1364,7 +1406,7 @@ impl Catalog {
         let previous = self
             .get_schema_by_id_mut(sequence.schema_id)
             .sequences
-            .insert(sequence.name.clone(), sequence);
+            .insert(sequence.name.clone(), Arc::new(sequence));
         assert!(
             previous.is_none(),
             "new sequence must not replace a relation"
@@ -1382,7 +1424,7 @@ impl Catalog {
                 format!("{name:?} is not a sequence"),
             ));
         }
-        schema.sequences.get(name).ok_or_else(|| {
+        schema.sequences.get(name).map(Arc::as_ref).ok_or_else(|| {
             PgError::create(
                 SqlState::UndefinedTable,
                 format!("relation {name:?} does not exist"),
@@ -1396,6 +1438,7 @@ impl Catalog {
             .schemas
             .values()
             .flat_map(|schema| schema.sequences.values())
+            .map(Arc::as_ref)
     }
 
     #[cfg_attr(feature = "execution-log", tracing::instrument(skip_all))]
@@ -1431,11 +1474,12 @@ impl Catalog {
                 ),
             ));
         }
-        Ok(self
-            .get_schema_by_id_mut(sequence.schema_id)
-            .sequences
-            .remove(&sequence.name)
-            .expect("required sequence must exist"))
+        Ok(Arc::unwrap_or_clone(
+            self.get_schema_by_id_mut(sequence.schema_id)
+                .sequences
+                .remove(&sequence.name)
+                .expect("required sequence must exist"),
+        ))
     }
 
     #[cfg_attr(feature = "execution-log", tracing::instrument(skip_all))]
@@ -1459,6 +1503,7 @@ impl Catalog {
                     .remove(&name)
                     .expect("owned sequence must exist")
             })
+            .map(Arc::unwrap_or_clone)
             .collect()
     }
 
@@ -1486,6 +1531,7 @@ impl Catalog {
                     .remove(&name)
                     .expect("owned sequence must exist")
             })
+            .map(Arc::unwrap_or_clone)
             .collect()
     }
 }
@@ -2579,6 +2625,37 @@ mod tests {
         );
 
         let mut changed_snapshot = snapshot.clone();
+        changed_snapshot
+            .require_table_mut("parents")
+            .unwrap()
+            .columns[0]
+            .name = "renamed_id".into();
+        changed_snapshot.rename_column_dependencies(parent, "id", "renamed_id");
+        let mut renamed = changed_snapshot.require_table("parents").unwrap().clone();
+        renamed.name = "renamed_parents".into();
+        changed_snapshot.replace_table(renamed).unwrap();
+        changed_snapshot.rename_table_dependencies(parent, "renamed_parents");
+        let changed_foreign_key = &changed_snapshot.referencing_foreign_keys(parent)[0].1;
+        assert_eq!(changed_foreign_key.foreign_table.name, "renamed_parents");
+        assert_eq!(changed_foreign_key.referred_columns, ["renamed_id"]);
+        assert_eq!(
+            changed_snapshot
+                .require_sequence("parents_id_seq")
+                .unwrap()
+                .owned_by,
+            Some((parent, "renamed_id".into()))
+        );
+        assert_eq!(
+            snapshot.require_table("parents").unwrap().columns[0].name,
+            "id"
+        );
+        let original_foreign_key = &snapshot.referencing_foreign_keys(parent)[0].1;
+        assert_eq!(original_foreign_key.foreign_table.name, "parents");
+        assert_eq!(original_foreign_key.referred_columns, ["id"]);
+        assert_eq!(
+            snapshot.require_sequence("parents_id_seq").unwrap(),
+            &sequence
+        );
         changed_snapshot.create_schema("later".into()).unwrap();
         assert!(snapshot.require_schema("later").is_err());
         assert!(catalog.require_schema("later").is_err());
