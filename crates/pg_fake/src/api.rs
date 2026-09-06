@@ -9250,6 +9250,41 @@ mod tests {
     }
 
     #[test]
+    fn preserves_aggregate_filter_evaluation_across_rows_and_executions() {
+        let db = Db::create();
+        let mut session = db.create_session();
+        session
+            .execute(
+                "CREATE SEQUENCE aggregate_filter_arguments;
+             CREATE SEQUENCE aggregate_filter_checks;
+             CREATE TABLE aggregate_filter_rows (id INTEGER, bucket INTEGER);
+             INSERT INTO aggregate_filter_rows VALUES (1, 1), (2, 1), (3, 2), (4, 2)",
+            )
+            .unwrap();
+        let query = session
+            .prepare(
+                "SELECT bucket,
+                    (sum(nextval('aggregate_filter_arguments')) FILTER (WHERE id % 2 = 1))::BIGINT,
+                    count(*) FILTER (WHERE nextval('aggregate_filter_checks') > 0)
+             FROM aggregate_filter_rows GROUP BY bucket ORDER BY bucket",
+            )
+            .unwrap();
+        for first in [1, 3] {
+            assert_eq!(
+                session.query_prepared(&query, &[]).unwrap().rows,
+                vec![
+                    vec![Value::Int4(1), Value::Int8(first), Value::Int8(2)],
+                    vec![Value::Int4(2), Value::Int8(first + 1), Value::Int8(2)],
+                ]
+            );
+        }
+        assert_eq!(
+            session.query("SELECT nextval('aggregate_filter_arguments'), nextval('aggregate_filter_checks')", &[]).unwrap().rows,
+            vec![vec![Value::Int8(5), Value::Int8(9)]]
+        );
+    }
+
+    #[test]
     fn preserves_volatile_aggregate_occurrences_and_prunes_dead_ones() {
         for (projection, expected_rows, next_value) in [
             (

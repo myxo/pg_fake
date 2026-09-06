@@ -3769,6 +3769,7 @@ fn prepare_group_aggregate_input(
     state: &DatabaseState,
     original: &ast::Function,
     typed: &ast::Function,
+    call: &AggregateCall<'_>,
     scope: &BoundScope,
     row: &[Value],
     xid: Xid,
@@ -3783,7 +3784,7 @@ fn prepare_group_aggregate_input(
         _ => None,
     };
     let original_filter = original.filter.as_deref();
-    prepare_aggregate_function_input(typed, RowScope::Bound(scope), |typed_expression| {
+    prepare_aggregate_function_input(call, |typed_expression| {
         let expression = if typed
             .filter
             .as_deref()
@@ -6140,6 +6141,8 @@ fn collect_grouped_select_rows(
             Ok(function)
         })
         .collect::<Result<Vec<_>>>()?;
+    let mut aggregate_calls: Vec<Option<AggregateCall<'_>>> =
+        (0..aggregate_functions.len()).map(|_| None).collect();
     let mut groups = if grouped_expressions.is_empty() {
         vec![CollectedGroup {
             key: Vec::new(),
@@ -6196,11 +6199,16 @@ fn collect_grouped_select_rows(
             let inputs = aggregate_functions
                 .iter()
                 .zip(&typed_aggregate_functions)
-                .map(|(collected, typed)| {
+                .zip(&mut aggregate_calls)
+                .map(|((collected, typed), call)| {
+                    if call.is_none() {
+                        *call = Some(parse_aggregate_call(typed, RowScope::Bound(scope))?);
+                    }
                     prepare_group_aggregate_input(
                         state,
                         &collected.function,
                         typed,
+                        call.as_ref().expect("aggregate call was initialized"),
                         scope,
                         row,
                         xid,
@@ -6231,10 +6239,13 @@ fn collect_grouped_select_rows(
                 .iter()
                 .zip(&typed_aggregate_functions)
                 .zip(group.aggregate_inputs)
-                .map(|((collected, typed), inputs)| {
+                .zip(&mut aggregate_calls)
+                .map(|(((collected, typed), inputs), call)| {
+                    if call.is_none() {
+                        *call = Some(parse_aggregate_call(typed, RowScope::Bound(scope))?);
+                    }
                     let (value, data_type) = evaluate_prepared_aggregate_function(
-                        typed,
-                        RowScope::Bound(scope),
+                        call.as_ref().expect("aggregate call was initialized"),
                         &inputs,
                     )?;
                     Ok(GroupedAggregateValue {

@@ -1043,6 +1043,20 @@ fn matches_aggregates_with_scalar_subqueries() {
 }
 
 #[test]
+fn matches_aggregate_filters_with_correlated_inputs() {
+    assert_differential(
+        "CREATE TABLE __TABLE__ (id INTEGER, bucket INTEGER, keep BOOLEAN);
+         INSERT INTO __TABLE__ VALUES (1, 1, TRUE), (0, 1, FALSE), (2, 2, TRUE), (0, 2, FALSE);
+         SELECT bucket, sum(10 / id) FILTER (WHERE keep),
+                sum((SELECT source.id)) FILTER (WHERE (SELECT source.keep)), count(*)
+         FROM __TABLE__ AS source GROUP BY bucket ORDER BY bucket;
+         SELECT sum(10 / id) FILTER (WHERE keep) FROM __TABLE__ WHERE id = 0;
+         SELECT bucket, count(*) FROM __TABLE__ WHERE FALSE GROUP BY bucket",
+        RowOrder::Ordered,
+    );
+}
+
+#[test]
 fn matches_grouping_having_and_output_references() {
     assert_differential(
         "CREATE TABLE __TABLE__ (category INTEGER, value INTEGER); \

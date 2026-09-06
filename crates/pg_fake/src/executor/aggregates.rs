@@ -14,7 +14,7 @@ enum AggregateKind {
     BooleanOr,
 }
 
-struct AggregateCall<'a> {
+pub(super) struct AggregateCall<'a> {
     kind: AggregateKind,
     argument: Option<&'a ast::Expr>,
     filter: Option<&'a ast::Expr>,
@@ -57,7 +57,7 @@ pub(super) fn infer_aggregate_return_type(
 }
 
 #[cfg_attr(feature = "execution-log", tracing::instrument(skip_all))]
-fn parse_aggregate_call<'a>(
+pub(super) fn parse_aggregate_call<'a>(
     function: &'a ast::Function,
     schema: RowScope<'_>,
 ) -> Result<AggregateCall<'a>> {
@@ -206,27 +206,6 @@ fn parse_aggregate_call<'a>(
 }
 
 pub(super) fn prepare_aggregate_function_input<F>(
-    function: &ast::Function,
-    schema: RowScope<'_>,
-    evaluate_expression: F,
-) -> Result<AggregateInput>
-where
-    F: FnMut(&ast::Expr) -> Result<Value>,
-{
-    let call = parse_aggregate_call(function, schema)?;
-    prepare_aggregate_input(&call, evaluate_expression)
-}
-
-pub(super) fn evaluate_prepared_aggregate_function(
-    function: &ast::Function,
-    schema: RowScope<'_>,
-    inputs: &[AggregateInput],
-) -> Result<(Value, BaseType)> {
-    let call = parse_aggregate_call(function, schema)?;
-    evaluate_aggregate_inputs(call, inputs)
-}
-
-fn prepare_aggregate_input<F>(
     call: &AggregateCall<'_>,
     mut evaluate_expression: F,
 ) -> Result<AggregateInput>
@@ -251,8 +230,8 @@ where
     })
 }
 
-fn evaluate_aggregate_inputs(
-    call: AggregateCall<'_>,
+pub(super) fn evaluate_prepared_aggregate_function(
+    call: &AggregateCall<'_>,
     inputs: &[AggregateInput],
 ) -> Result<(Value, BaseType)> {
     let Some(_argument) = call.argument else {
