@@ -145,7 +145,7 @@ pub(super) fn execute_create_index(
         .tables
         .get_mut(&table.id)
         .expect("catalog table must have storage")
-        .replace_schema(table);
+        .replace_schema(Cow::Owned(table));
     Ok(StatementResult::Affected(0))
 }
 
@@ -227,7 +227,7 @@ pub(super) fn execute_alter_index(
         .tables
         .get_mut(&table.id)
         .expect("catalog table must have storage")
-        .replace_schema(table);
+        .replace_schema(Cow::Owned(table));
     Ok(StatementResult::Affected(0))
 }
 
@@ -296,7 +296,7 @@ fn replace_index_tables(
             .tables
             .get_mut(&table.id)
             .expect("catalog table must have storage")
-            .replace_schema(table);
+            .replace_schema(Cow::Owned(table));
     }
     Ok(())
 }

@@ -157,7 +157,7 @@ fn execute_alter_table_inner(
         .tables
         .get_mut(&schema.id)
         .expect("catalog table must have storage")
-        .replace_schema(schema.clone());
+        .replace_schema(Cow::Borrowed(&schema));
 
     let mut validation_schema = schema.clone();
     validation_schema

@@ -1,4 +1,7 @@
-use std::collections::{BTreeMap, BTreeSet};
+use std::{
+    borrow::Cow,
+    collections::{BTreeMap, BTreeSet},
+};
 
 use crate::{
     catalog::{Constraint, IndexSchema, TableSchema},
@@ -126,12 +129,12 @@ impl Table {
         }
     }
 
-    pub(crate) fn replace_schema(&mut self, schema: TableSchema) {
+    pub(crate) fn replace_schema(&mut self, schema: Cow<'_, TableSchema>) {
         assert_eq!(self.schema.id, schema.id);
-        if self.schema == schema {
+        if &self.schema == schema.as_ref() {
             return;
         }
-        self.schema = schema;
+        self.schema = schema.into_owned();
         self.indexes = self
             .schema
             .constraints
