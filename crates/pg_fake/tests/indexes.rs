@@ -5,6 +5,139 @@ fn query_rows(session: &mut pg_fake::api::Session, sql: &str) -> Vec<Vec<Value>>
 }
 
 #[test]
+fn preserves_index_versions_across_reads_updates_and_rollback() {
+    let db = Db::create();
+    let mut writer = db.create_session();
+    writer
+        .execute("CREATE TABLE indexed_versions (id INTEGER PRIMARY KEY, value INTEGER); INSERT INTO indexed_versions VALUES (1, 10)")
+        .unwrap();
+    let mut reader = db.create_session();
+    let lookup = reader
+        .prepare("SELECT value FROM indexed_versions WHERE id = $1")
+        .unwrap();
+    reader
+        .execute("BEGIN ISOLATION LEVEL REPEATABLE READ")
+        .unwrap();
+    assert_eq!(
+        reader
+            .query_prepared(&lookup, &[Value::Int4(1)])
+            .unwrap()
+            .rows,
+        vec![vec![Value::Int4(10)]]
+    );
+    writer
+        .execute("UPDATE indexed_versions SET id = 2, value = 20 WHERE id = 1")
+        .unwrap();
+    for _ in 0..3 {
+        assert_eq!(
+            reader
+                .query_prepared(&lookup, &[Value::Int4(1)])
+                .unwrap()
+                .rows,
+            vec![vec![Value::Int4(10)]]
+        );
+        assert!(
+            reader
+                .query_prepared(&lookup, &[Value::Int4(2)])
+                .unwrap()
+                .rows
+                .is_empty()
+        );
+        assert_eq!(
+            query_rows(
+                &mut writer,
+                "SELECT value FROM indexed_versions WHERE id = 2"
+            ),
+            vec![vec![Value::Int4(20)]]
+        );
+    }
+    writer
+        .execute("BEGIN; UPDATE indexed_versions SET id = 3 WHERE id = 2")
+        .unwrap();
+    assert_eq!(
+        query_rows(
+            &mut writer,
+            "SELECT value FROM indexed_versions WHERE id = 3"
+        ),
+        vec![vec![Value::Int4(20)]]
+    );
+    writer.execute("ROLLBACK").unwrap();
+    assert_eq!(
+        query_rows(
+            &mut writer,
+            "SELECT value FROM indexed_versions WHERE id = 2"
+        ),
+        vec![vec![Value::Int4(20)]]
+    );
+    assert!(
+        query_rows(
+            &mut writer,
+            "SELECT value FROM indexed_versions WHERE id = 3"
+        )
+        .is_empty()
+    );
+    reader.execute("COMMIT").unwrap();
+    writer
+        .execute("DELETE FROM indexed_versions WHERE id = 2; INSERT INTO indexed_versions VALUES (2, 30)")
+        .unwrap();
+    assert_eq!(
+        reader
+            .query_prepared(&lookup, &[Value::Int4(2)])
+            .unwrap()
+            .rows,
+        vec![vec![Value::Int4(30)]]
+    );
+    assert_eq!(
+        writer
+            .execute("INSERT INTO indexed_versions VALUES (2, 40)")
+            .unwrap_err()
+            .sqlstate,
+        SqlState::UniqueViolation
+    );
+}
+
+#[test]
+fn validates_insert_batches_against_stored_and_pending_keys() {
+    let db = Db::create();
+    let mut session = db.create_session();
+    session
+        .execute(
+            "CREATE TABLE insert_keys (id INTEGER PRIMARY KEY); INSERT INTO insert_keys VALUES (1)",
+        )
+        .unwrap();
+    for insert in [
+        "INSERT INTO insert_keys VALUES (2), (1)",
+        "INSERT INTO insert_keys VALUES (2), (2)",
+    ] {
+        assert_eq!(
+            session.execute(insert).unwrap_err().sqlstate,
+            SqlState::UniqueViolation
+        );
+        assert_eq!(
+            query_rows(&mut session, "SELECT id FROM insert_keys ORDER BY id"),
+            vec![vec![Value::Int4(1)]]
+        );
+    }
+    assert_eq!(
+        query_rows(
+            &mut session,
+            "INSERT INTO insert_keys VALUES (2), (3) RETURNING id"
+        ),
+        vec![vec![Value::Int4(2)], vec![Value::Int4(3)]]
+    );
+    session
+        .execute("INSERT INTO insert_keys SELECT id + 10 FROM insert_keys")
+        .unwrap();
+    assert_eq!(
+        query_rows(&mut session, "SELECT id FROM insert_keys ORDER BY id"),
+        [1, 2, 3, 11, 12, 13]
+            .into_iter()
+            .map(|id| vec![Value::Int4(id)])
+            .collect::<Vec<_>>()
+    );
+}
+
+#[test]
 fn creates_renames_and_drops_btree_indexes() {
     let db = Db::create();
     let mut session = db.create_session();

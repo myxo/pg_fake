@@ -128,6 +128,9 @@ impl Table {
 
     pub(crate) fn replace_schema(&mut self, schema: TableSchema) {
         assert_eq!(self.schema.id, schema.id);
+        if self.schema == schema {
+            return;
+        }
         self.schema = schema;
         self.indexes = self
             .schema

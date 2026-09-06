@@ -641,11 +641,15 @@ fn evaluate_triggered_insert_rows(
         }
     }
     let prepares_returning = returning.is_some();
-    let mut validation_table = state
-        .tables
-        .get(&schema.id)
-        .expect("catalog table must have storage")
-        .clone();
+    let mut validation_table = if insert.on.is_some() || stop_at_blocking_conflict {
+        state
+            .tables
+            .get(&schema.id)
+            .expect("catalog table must have storage")
+            .clone()
+    } else {
+        Table::create(schema.clone())
+    };
     let mut affected_rows = BTreeSet::new();
     for (prior_insert, prepared) in stop_at_blocking_conflict
         .then(|| context.get_prior_prepared_trigger_inserts(insert))
