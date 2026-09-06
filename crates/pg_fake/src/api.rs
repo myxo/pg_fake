@@ -3267,6 +3267,8 @@ impl Session {
                     statement.columns.as_slice(),
                 )),
             )
+        } else if statement.parameter_types.is_empty() && params.is_empty() {
+            (None, None)
         } else {
             (
                 Some(

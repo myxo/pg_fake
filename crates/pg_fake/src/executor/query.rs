@@ -3082,13 +3082,7 @@ fn describe_set_expression_columns(
             )
         }
         ast::SetExpr::Select(_) | ast::SetExpr::Values(_) => {
-            let mut operand = query.clone();
-            operand.with = None;
-            operand.body = Box::new(expression.clone());
-            operand.order_by = None;
-            operand.limit_clause = None;
-            operand.fetch = None;
-            operand.locks.clear();
+            let operand = create_set_operand_query(query, expression);
             describe_query_result_columns(state, &ast::Statement::Query(Box::new(operand)))
         }
         _ => reject_unsupported("set-operation input is not implemented"),
@@ -4319,14 +4313,18 @@ fn execute_values_query(
 
 #[cfg_attr(feature = "execution-log", tracing::instrument(skip_all))]
 fn create_set_operand_query(query: &ast::Query, expression: &ast::SetExpr) -> ast::Query {
-    let mut operand = query.clone();
-    operand.with = None;
-    operand.body = Box::new(expression.clone());
-    operand.order_by = None;
-    operand.limit_clause = None;
-    operand.fetch = None;
-    operand.locks.clear();
-    operand
+    ast::Query {
+        with: None,
+        body: Box::new(expression.clone()),
+        order_by: None,
+        limit_clause: None,
+        fetch: None,
+        locks: Vec::new(),
+        for_clause: query.for_clause.clone(),
+        settings: query.settings.clone(),
+        format_clause: query.format_clause.clone(),
+        pipe_operators: query.pipe_operators.clone(),
+    }
 }
 
 #[cfg_attr(feature = "execution-log", tracing::instrument(skip_all))]
@@ -4369,11 +4367,47 @@ fn validate_unknown_set_operand_columns(
     Ok(())
 }
 
+struct SetExpressionMetadata {
+    columns: Vec<ColumnMeta>,
+    unknown: Vec<bool>,
+    operands: Option<(Box<SetExpressionMetadata>, Box<SetExpressionMetadata>)>,
+}
+
+fn build_set_expression_metadata(
+    state: &DatabaseState,
+    query: &ast::Query,
+    expression: &ast::SetExpr,
+) -> Result<SetExpressionMetadata> {
+    let (columns, operands) = if let ast::SetExpr::SetOperation { left, right, .. } = expression {
+        let left = build_set_expression_metadata(state, query, left)?;
+        let right = build_set_expression_metadata(state, query, right)?;
+        let columns = resolve_set_columns_with_unknown(
+            &left.columns,
+            &right.columns,
+            &left.unknown,
+            &right.unknown,
+        )?;
+        (columns, Some((Box::new(left), Box::new(right))))
+    } else {
+        (
+            describe_set_expression_columns(state, query, expression)?,
+            None,
+        )
+    };
+    let unknown = identify_unknown_set_operand_columns(expression, columns.len());
+    Ok(SetExpressionMetadata {
+        columns,
+        unknown,
+        operands,
+    })
+}
+
 #[cfg_attr(feature = "execution-log", tracing::instrument(skip_all))]
 fn execute_set_expression(
     state: &DatabaseState,
     query: &ast::Query,
     expression: &ast::SetExpr,
+    metadata: Option<&SetExpressionMetadata>,
     xid: Xid,
     snapshot: &Snapshot,
     context: &StatementExecutionContext,
@@ -4393,28 +4427,50 @@ fn execute_set_expression(
             left,
             right,
         } => {
-            let left_columns = describe_set_expression_columns(state, query, left)?;
-            let right_columns = describe_set_expression_columns(state, query, right)?;
-            let left_unknown = identify_unknown_set_operand_columns(left, left_columns.len());
-            let right_unknown = identify_unknown_set_operand_columns(right, right_columns.len());
-            let columns = resolve_set_columns_with_unknown(
-                &left_columns,
-                &right_columns,
-                &left_unknown,
-                &right_unknown,
+            let planned;
+            let metadata = match metadata {
+                Some(metadata) => metadata,
+                None => {
+                    planned = build_set_expression_metadata(state, query, expression)?;
+                    &planned
+                }
+            };
+            let (left_metadata, right_metadata) = metadata
+                .operands
+                .as_ref()
+                .expect("set operation metadata contains both operands");
+            validate_unknown_set_operand_columns(left, &left_metadata.unknown, &metadata.columns)?;
+            validate_unknown_set_operand_columns(
+                right,
+                &right_metadata.unknown,
+                &metadata.columns,
             )?;
-            validate_unknown_set_operand_columns(left, &left_unknown, &columns)?;
-            validate_unknown_set_operand_columns(right, &right_unknown, &columns)?;
-            validate_set_operation_types(*op, *set_quantifier, &columns)?;
-            let left = execute_set_expression(state, query, left, xid, snapshot, context)?;
-            let right = execute_set_expression(state, query, right, xid, snapshot, context)?;
+            validate_set_operation_types(*op, *set_quantifier, &metadata.columns)?;
+            let left = execute_set_expression(
+                state,
+                query,
+                left,
+                Some(left_metadata),
+                xid,
+                snapshot,
+                context,
+            )?;
+            let right = execute_set_expression(
+                state,
+                query,
+                right,
+                Some(right_metadata),
+                xid,
+                snapshot,
+                context,
+            )?;
             execute_set_operation(
                 *op,
                 *set_quantifier,
                 left,
                 right,
-                &left_unknown,
-                &right_unknown,
+                &left_metadata.unknown,
+                &right_metadata.unknown,
             )
         }
         ast::SetExpr::Select(_) | ast::SetExpr::Values(_) => {
@@ -6510,6 +6566,25 @@ fn finalize_select_rows(
 }
 
 #[cfg_attr(feature = "execution-log", tracing::instrument(skip_all))]
+fn contains_query_ctes(query: &ast::Query) -> bool {
+    struct CteDetector;
+
+    impl ast::Visitor for CteDetector {
+        type Break = ();
+
+        fn pre_visit_query(&mut self, query: &ast::Query) -> std::ops::ControlFlow<()> {
+            if query.with.is_some() {
+                std::ops::ControlFlow::Break(())
+            } else {
+                std::ops::ControlFlow::Continue(())
+            }
+        }
+    }
+
+    ast::Visit::visit(query, &mut CteDetector).is_break()
+}
+
+#[cfg_attr(feature = "execution-log", tracing::instrument(skip_all))]
 pub(super) fn execute_query(
     state: &DatabaseState,
     query: &ast::Query,
@@ -6521,9 +6596,11 @@ pub(super) fn execute_query(
     if &expanded != query {
         return execute_query(state, &expanded, xid, snapshot, context);
     }
-    let materialized = materialize_query_ctes(state, query, xid, snapshot, context)?;
-    if &materialized != query {
-        return execute_query(state, &materialized, xid, snapshot, context);
+    if contains_query_ctes(query) {
+        let materialized = materialize_query_ctes(state, query, xid, snapshot, context)?;
+        if &materialized != query {
+            return execute_query(state, &materialized, xid, snapshot, context);
+        }
     }
     if query.fetch.is_some() {
         return reject_unsupported("query clause is not implemented");
@@ -6536,7 +6613,8 @@ pub(super) fn execute_query(
         if lock_mode.is_some() {
             return reject_unsupported("FOR UPDATE is not allowed with set operations");
         }
-        let mut result = execute_set_expression(state, query, &query.body, xid, snapshot, context)?;
+        let mut result =
+            execute_set_expression(state, query, &query.body, None, xid, snapshot, context)?;
         sort_set_rows(&mut result.rows, &result.columns, query)?;
         let (limit, offset) = resolve_select_limit(query, context)?;
         result.rows = result
@@ -6660,18 +6738,20 @@ pub(super) fn stream_plain_query_rows(
             consume,
         );
     }
-    let materialized = materialize_query_ctes(state, query, xid, snapshot, context)?;
-    if &materialized != query {
-        return stream_plain_query_rows(
-            state,
-            &materialized,
-            xid,
-            snapshot,
-            context,
-            maximum_rows,
-            prepared,
-            consume,
-        );
+    if contains_query_ctes(query) {
+        let materialized = materialize_query_ctes(state, query, xid, snapshot, context)?;
+        if &materialized != query {
+            return stream_plain_query_rows(
+                state,
+                &materialized,
+                xid,
+                snapshot,
+                context,
+                maximum_rows,
+                prepared,
+                consume,
+            );
+        }
     }
     if let ast::SetExpr::Query(nested) = query.body.as_ref()
         && query.with.is_none()
