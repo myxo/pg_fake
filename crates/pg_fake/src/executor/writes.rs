@@ -1609,9 +1609,8 @@ fn validate_mutation_target_versions(
         .get(&schema.id)
         .expect("catalog table must have storage");
     for (row_id, version_xmin, _, _) in targets {
-        let (_, chain) = table
-            .iterate_version_chains()
-            .find(|(candidate, _)| candidate == row_id)
+        let chain = table
+            .get_version_chain(*row_id)
             .expect("selected mutation row must exist");
         let version = chain
             .versions
@@ -2825,9 +2824,8 @@ fn has_mutated_target_in_command(
         .tables
         .get(&table_id)
         .expect("catalog table must have storage");
-    let (_, chain) = table
-        .iterate_version_chains()
-        .find(|(candidate, _)| *candidate == row_id)
+    let chain = table
+        .get_version_chain(row_id)
         .expect("prepared mutation row must exist");
     assert!(
         chain

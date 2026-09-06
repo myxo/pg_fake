@@ -378,6 +378,10 @@ impl Table {
         }
     }
 
+    pub(crate) fn get_version_chain(&self, row_id: RowId) -> Option<&RowVersionChain> {
+        self.version_chains.chains.get(&row_id)
+    }
+
     #[cfg_attr(feature = "execution-log", tracing::instrument(skip_all))]
     pub(crate) fn iterate_version_chains(&self) -> impl Iterator<Item = (RowId, &RowVersionChain)> {
         self.version_chains

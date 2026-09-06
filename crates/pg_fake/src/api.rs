@@ -1947,6 +1947,7 @@ fn acquire_row_locks<'a>(
 )> {
     let lock_deadline = (timeout != Duration::ZERO).then(|| Instant::now() + timeout);
     let mut acquired = Vec::<executor::RequiredRowLock>::new();
+    let mut acquired_indexes = BTreeMap::<_, usize>::new();
     loop {
         state.load_catalog(Some(xid), snapshot, Some(temporary_schema_id));
         let required = match target {
@@ -1964,14 +1965,17 @@ fn acquire_row_locks<'a>(
                 .acquire(required_lock.key, xid, required_lock.mode)
             {
                 RowLockAttempt::Acquired => {
-                    match acquired.iter_mut().find(|acquired| {
-                        acquired.key == required_lock.key && acquired.mode == required_lock.mode
-                    }) {
-                        Some(acquired) if acquired.mutation_candidate.is_none() => {
-                            acquired.mutation_candidate = required_lock.mutation_candidate.clone();
+                    match acquired_indexes.entry((required_lock.key, required_lock.mode)) {
+                        std::collections::btree_map::Entry::Occupied(entry) => {
+                            let acquired = &mut acquired[*entry.get()];
+                            if acquired.mutation_candidate.is_none() {
+                                acquired.mutation_candidate = required_lock.mutation_candidate.clone();
+                            }
                         }
-                        Some(_) => {}
-                        None => acquired.push(required_lock.clone()),
+                        std::collections::btree_map::Entry::Vacant(entry) => {
+                            entry.insert(acquired.len());
+                            acquired.push(required_lock.clone());
+                        }
                     }
                     condvar.notify_all();
                 }

@@ -33,7 +33,7 @@ pub(crate) struct RowLockKey {
     pub(crate) row_id: RowId,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 pub(crate) enum RowLockMode {
     Share,
     Update,
