@@ -323,3 +323,45 @@ fn preserves_catalog_commit_visibility_with_pending_ddl_and_commit_failures() {
         );
     }
 }
+
+#[test]
+fn preserves_own_catalog_changes_after_repeated_prepared_reads() {
+    let db = Db::create();
+    let mut session = db.create_session();
+    session
+        .execute("BEGIN; CREATE TABLE own_rows (id INTEGER); INSERT INTO own_rows VALUES (1)")
+        .unwrap();
+    let prepared = session.prepare("SELECT * FROM own_rows").unwrap();
+    for _ in 0..3 {
+        assert_eq!(
+            session.query_prepared(&prepared, &[]).unwrap().rows,
+            vec![vec![Value::Int4(1)]]
+        );
+    }
+    session
+        .execute("ALTER TABLE own_rows ADD COLUMN extra INTEGER DEFAULT 2")
+        .unwrap();
+    let prepared = session.prepare("SELECT * FROM own_rows").unwrap();
+    for _ in 0..3 {
+        assert_eq!(
+            session.query_prepared(&prepared, &[]).unwrap().rows,
+            vec![vec![Value::Int4(1), Value::Int4(2)]]
+        );
+    }
+    session.execute("DROP TABLE own_rows; CREATE TABLE own_rows (id INTEGER, extra INTEGER); INSERT INTO own_rows VALUES (3, 4)").unwrap();
+    let prepared = session.prepare("SELECT * FROM own_rows").unwrap();
+    for _ in 0..3 {
+        assert_eq!(
+            session.query_prepared(&prepared, &[]).unwrap().rows,
+            vec![vec![Value::Int4(3), Value::Int4(4)]]
+        );
+    }
+    session.execute("ROLLBACK").unwrap();
+    assert_eq!(
+        session
+            .query("SELECT * FROM own_rows", &[])
+            .unwrap_err()
+            .sqlstate,
+        SqlState::UndefinedTable
+    );
+}

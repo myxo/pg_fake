@@ -310,7 +310,7 @@ pub(crate) enum CatalogVisibility {
 pub(crate) struct CatalogHistory {
     generation: u64,
     pruning_generation: u64,
-    pending_transactions: BTreeSet<Xid>,
+    pending_transactions: BTreeMap<Xid, CommandId>,
     latest_commit: CommitSeq,
     schemas: BTreeMap<SchemaId, Vec<CatalogVersion<SchemaIdentity>>>,
     tables: BTreeMap<TableId, Vec<CatalogVersion<Arc<TableSchema>>>>,
@@ -1558,7 +1558,7 @@ impl CatalogHistory {
         CatalogHistory {
             generation: 0,
             pruning_generation: 0,
-            pending_transactions: BTreeSet::new(),
+            pending_transactions: BTreeMap::new(),
             latest_commit: CommitSeq(0),
             schemas: BTreeMap::from([(
                 schema.id,
@@ -1599,7 +1599,7 @@ impl CatalogHistory {
         transactions: &TransactionRegistry,
     ) -> CatalogVisibility {
         self.pending_transactions
-            .retain(|pending| match transactions.get_status(*pending) {
+            .retain(|pending, _| match transactions.get_status(*pending) {
                 Some(TransactionStatus::InFlight) => true,
                 Some(TransactionStatus::Committed(commit)) => {
                     self.latest_commit = self.latest_commit.max(commit);
@@ -1619,11 +1619,19 @@ impl CatalogHistory {
             return CatalogVisibility::Current(self.generation);
         }
         let mut snapshot = snapshot;
-        if xid.is_none_or(|xid| {
-            transactions.get_status(xid) == Some(TransactionStatus::InFlight)
-                && !self.pending_transactions.contains(&xid)
-        }) {
-            snapshot.command_id = CommandId(0);
+        match xid {
+            None => snapshot.command_id = CommandId(0),
+            Some(xid) if transactions.get_status(xid) == Some(TransactionStatus::InFlight) => {
+                snapshot.command_id =
+                    self.pending_transactions
+                        .get(&xid)
+                        .map_or(CommandId(0), |command| {
+                            snapshot
+                                .command_id
+                                .min(CommandId(command.0.saturating_add(1)))
+                        });
+            }
+            Some(_) => {}
         }
         CatalogVisibility::Snapshot {
             generation: self.generation,
@@ -1635,7 +1643,7 @@ impl CatalogHistory {
 
     pub(crate) fn can_reuse_after_commit(&self, xid: Xid, snapshot: Snapshot) -> bool {
         self.pending_transactions.len() == 1
-            && self.pending_transactions.contains(&xid)
+            && self.pending_transactions.contains_key(&xid)
             && snapshot.commit_seq >= self.latest_commit
     }
 
@@ -1823,7 +1831,10 @@ impl CatalogHistory {
         command_id: CommandId,
     ) {
         self.generation += 1;
-        self.pending_transactions.insert(xid);
+        self.pending_transactions
+            .entry(xid)
+            .and_modify(|last_command| *last_command = (*last_command).max(command_id))
+            .or_insert(command_id);
         record_catalog_changes(
             &mut self.schemas,
             previous
