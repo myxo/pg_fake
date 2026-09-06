@@ -1254,18 +1254,18 @@ pub(crate) fn execute_create_view(
             format!("{:?} is not a view", resolved.name),
         ));
     }
-    let (expanded, mutations) =
-        super::expand_ctes_for_analysis(&ast::Statement::Query(create.query.clone()), state)?;
+    let statement = ast::Statement::Query(create.query.clone());
+    let (expanded, mutations) = super::expand_ctes_for_analysis(&statement, state)?;
     if !mutations.is_empty() {
         return Err(PgError::create(
             SqlState::FeatureNotSupported,
             "views cannot contain data-modifying statements",
         ));
     }
-    let ast::Statement::Query(expanded) = expanded else {
+    let ast::Statement::Query(expanded) = expanded.as_ref() else {
         unreachable!("view definition is a query")
     };
-    let inferred = infer_query_output_columns(&state.catalog, &expanded)?;
+    let inferred = infer_query_output_columns(&state.catalog, expanded)?;
     if create.columns.len() > inferred.len() {
         return Err(PgError::create(
             SqlState::InvalidTableDefinition,

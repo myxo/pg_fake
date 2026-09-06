@@ -1649,7 +1649,7 @@ fn collect_relation_locks(
     }
     let (expanded_statement, mutations) = executor::expand_ctes_for_analysis(statement, state)?;
     let locking_read = matches!(
-        &expanded_statement,
+        expanded_statement.as_ref(),
         ast::Statement::Query(query) if !query.locks.is_empty()
     );
     let discovered_dependencies;
@@ -1658,7 +1658,7 @@ fn collect_relation_locks(
         None => {
             discovered_dependencies = collect_prepared_catalog_dependencies(
                 &state.catalog,
-                std::iter::once(&expanded_statement).chain(mutations.iter()),
+                std::iter::once(expanded_statement.as_ref()).chain(mutations.iter()),
             )?;
             &discovered_dependencies
         }
@@ -1707,21 +1707,21 @@ fn collect_relation_locks(
     }
     collect_foreign_key_relation_locks(
         state,
-        std::iter::once(&expanded_statement).chain(mutations.iter()),
+        std::iter::once(expanded_statement.as_ref()).chain(mutations.iter()),
         &mut locks,
     )?;
-    for mutation in std::iter::once(expanded_statement).chain(mutations) {
+    for mutation in std::iter::once(expanded_statement.as_ref()).chain(mutations.iter()) {
         let name = match mutation {
             ast::Statement::Insert(insert) => {
                 Some(executor::resolve_insert_table_name(&insert.table)?)
             }
-            ast::Statement::Update(update) => match update.table.relation {
+            ast::Statement::Update(update) => match &update.table.relation {
                 ast::TableFactor::Table { name, .. } => {
-                    Some(executor::normalize_relation_name(&name)?)
+                    Some(executor::normalize_relation_name(name)?)
                 }
                 _ => None,
             },
-            ast::Statement::Delete(delete) => match delete.from {
+            ast::Statement::Delete(delete) => match &delete.from {
                 ast::FromTable::WithFromKeyword(from) => from
                     .first()
                     .and_then(|table| {
@@ -2622,7 +2622,7 @@ impl Session {
                 let state = self.db.state.lock().expect("database mutex is poisoned");
                 executor::expand_ctes_for_analysis(&statement, &state)?
             };
-            self.substitute_scoped_procedural_locals(&mut expanded, locals)?;
+            self.substitute_scoped_procedural_locals(expanded.to_mut(), locals)?;
             for mutation in &mut mutations {
                 self.substitute_scoped_procedural_locals(mutation, locals)?;
             }
@@ -3176,7 +3176,7 @@ impl Session {
                 .and_then(|(statement, mutations, parameter_count)| {
                     let catalog_dependencies = collect_prepared_catalog_dependencies(
                         &state.catalog,
-                        std::iter::once(&statement).chain(mutations.iter()),
+                        std::iter::once(statement.as_ref()).chain(mutations.iter()),
                     )?;
                     analyzer::substitute_typed_subqueries(&statement, &state.catalog).map(
                         |statement| (statement, mutations, parameter_count, catalog_dependencies),

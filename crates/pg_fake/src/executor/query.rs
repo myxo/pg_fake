@@ -1,6 +1,7 @@
 use super::*;
 use ast::VisitMut as _;
 use sqlparser::ast;
+use std::borrow::Cow;
 use std::cell::Cell;
 
 struct MaterializedCte {
@@ -656,13 +657,22 @@ fn validate_recursive_cte_types(catalog: &Catalog, query: &ast::Query) -> Result
 }
 
 #[cfg_attr(feature = "execution-log", tracing::instrument(skip_all))]
-pub(crate) fn expand_ctes_for_analysis(
-    statement: &ast::Statement,
+pub(crate) fn expand_ctes_for_analysis<'a>(
+    statement: &'a ast::Statement,
     state: &DatabaseState,
-) -> Result<(ast::Statement, Vec<ast::Statement>)> {
+) -> Result<(Cow<'a, ast::Statement>, Vec<ast::Statement>)> {
     let ast::Statement::Query(query) = statement else {
-        return Ok((statement.clone(), Vec::new()));
+        return Ok((Cow::Borrowed(statement), Vec::new()));
     };
+    if query.with.is_none()
+        && !matches!(
+            query.body.as_ref(),
+            ast::SetExpr::Insert(_) | ast::SetExpr::Update(_) | ast::SetExpr::Delete(_)
+        )
+        && !detect_statement_features(statement).0
+    {
+        return Ok((Cow::Borrowed(statement), Vec::new()));
+    }
     let mut mutations = Vec::new();
     if let Some(with) = &query.with
         && with.recursive
@@ -794,7 +804,7 @@ pub(crate) fn expand_ctes_for_analysis(
         if let Some(error) = replacer.error {
             return Err(error);
         }
-        return Ok((convert_query_to_statement(query), mutations));
+        return Ok((Cow::Owned(convert_query_to_statement(query)), mutations));
     }
     if let Some(with) = &query.with
         && !with.recursive
@@ -852,7 +862,7 @@ pub(crate) fn expand_ctes_for_analysis(
         }
     }
     Ok((
-        convert_query_to_statement(inline_query_ctes(query, state)?),
+        Cow::Owned(convert_query_to_statement(inline_query_ctes(query, state)?)),
         mutations,
     ))
 }
