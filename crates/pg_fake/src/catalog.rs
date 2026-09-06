@@ -1,4 +1,8 @@
-use std::collections::{BTreeMap, BTreeSet};
+use std::{
+    borrow::Cow,
+    collections::{BTreeMap, BTreeSet},
+    sync::{Arc, Weak},
+};
 
 use sqlparser::ast;
 
@@ -255,7 +259,7 @@ pub(crate) struct Schema {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct Catalog {
-    schemas: BTreeMap<String, Schema>,
+    relations: Arc<CatalogRelations>,
     next_schema_id: u64,
     next_table_id: u64,
     next_sequence_id: u64,
@@ -264,6 +268,14 @@ pub(crate) struct Catalog {
     next_view_id: u64,
     next_trigger_id: u64,
     next_function_id: u64,
+}
+
+#[derive(Debug, Clone)]
+pub(crate) struct CatalogIdentity(Weak<CatalogRelations>);
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct CatalogRelations {
+    schemas: BTreeMap<String, Schema>,
     deferrable_foreign_keys: Vec<(ConstraintId, bool)>,
     referencing_foreign_keys: BTreeMap<TableId, Vec<(TableId, usize)>>,
 }
@@ -317,6 +329,14 @@ impl Default for Catalog {
 }
 
 impl Catalog {
+    pub(crate) fn create_identity(&self) -> CatalogIdentity {
+        CatalogIdentity(Arc::downgrade(&self.relations))
+    }
+
+    pub(crate) fn matches_identity(&self, identity: &CatalogIdentity) -> bool {
+        std::ptr::eq(Arc::as_ptr(&self.relations), identity.0.as_ptr())
+    }
+
     #[cfg_attr(feature = "execution-log", tracing::instrument(skip_all))]
     pub(crate) fn create() -> Self {
         let public = Schema {
@@ -328,7 +348,11 @@ impl Catalog {
             functions: BTreeMap::new(),
         };
         Catalog {
-            schemas: BTreeMap::from([(public.name.clone(), public)]),
+            relations: Arc::new(CatalogRelations {
+                schemas: BTreeMap::from([(public.name.clone(), public)]),
+                deferrable_foreign_keys: Vec::new(),
+                referencing_foreign_keys: BTreeMap::new(),
+            }),
             next_schema_id: 2,
             next_table_id: 1,
             next_sequence_id: 1,
@@ -337,8 +361,6 @@ impl Catalog {
             next_view_id: 1,
             next_trigger_id: 1,
             next_function_id: 1,
-            deferrable_foreign_keys: Vec::new(),
-            referencing_foreign_keys: BTreeMap::new(),
         }
     }
 
@@ -348,20 +370,23 @@ impl Catalog {
     }
 
     fn get_default_schema_mut(&mut self) -> &mut Schema {
-        self.schemas
+        Arc::make_mut(&mut self.relations)
+            .schemas
             .get_mut(DEFAULT_SCHEMA)
             .expect("the public schema must exist")
     }
 
     fn get_schema_by_id_mut(&mut self, id: SchemaId) -> &mut Schema {
-        self.schemas
+        Arc::make_mut(&mut self.relations)
+            .schemas
             .values_mut()
             .find(|schema| schema.id == id)
             .expect("catalog object schema must exist")
     }
 
     fn get_schema_by_id(&self, id: SchemaId) -> &Schema {
-        self.schemas
+        self.relations
+            .schemas
             .values()
             .find(|schema| schema.id == id)
             .expect("catalog object schema must exist")
@@ -378,7 +403,8 @@ impl Catalog {
         let schema = match &name.schema {
             Some(schema) => self.require_schema(schema)?,
             None => {
-                self.schemas
+                self.relations
+                    .schemas
                     .get(TEMP_SCHEMA)
                     .filter(|schema| {
                         schema.tables.contains_key(&name.name)
@@ -514,7 +540,7 @@ impl Catalog {
 
     #[cfg_attr(not(test), allow(dead_code))]
     pub(crate) fn create_schema(&mut self, name: String) -> Result<SchemaId> {
-        if self.schemas.contains_key(&name) {
+        if self.relations.schemas.contains_key(&name) {
             return Err(PgError::create(
                 SqlState::DuplicateSchema,
                 format!("schema {name:?} already exists"),
@@ -522,7 +548,7 @@ impl Catalog {
         }
         let id = SchemaId(self.next_schema_id);
         self.next_schema_id += 1;
-        let previous = self.schemas.insert(
+        let previous = Arc::make_mut(&mut self.relations).schemas.insert(
             name.clone(),
             Schema {
                 id,
@@ -542,7 +568,7 @@ impl Catalog {
         if name == DEFAULT_SCHEMA {
             return reject_unsupported("dropping the public schema is not implemented");
         }
-        let schema = self.schemas.get(name).ok_or_else(|| {
+        let schema = self.relations.schemas.get(name).ok_or_else(|| {
             PgError::create(
                 SqlState::InvalidSchemaName,
                 format!("schema {name:?} does not exist"),
@@ -558,14 +584,14 @@ impl Catalog {
                 format!("cannot drop schema {name:?} because other objects depend on it"),
             ));
         }
-        Ok(self
+        Ok(Arc::make_mut(&mut self.relations)
             .schemas
             .remove(name)
             .expect("required schema must exist"))
     }
 
     pub(crate) fn require_schema(&self, name: &str) -> Result<&Schema> {
-        self.schemas.get(name).ok_or_else(|| {
+        self.relations.schemas.get(name).ok_or_else(|| {
             PgError::create(
                 SqlState::InvalidSchemaName,
                 format!("schema {name:?} does not exist"),
@@ -724,7 +750,8 @@ impl Catalog {
 
     #[cfg_attr(feature = "execution-log", tracing::instrument(skip_all))]
     pub(crate) fn require_table_by_id(&self, id: TableId) -> Result<&TableSchema> {
-        self.schemas
+        self.relations
+            .schemas
             .values()
             .flat_map(|schema| schema.tables.values())
             .find(|table| table.id == id)
@@ -809,7 +836,8 @@ impl Catalog {
     }
 
     pub(crate) fn require_function_by_id(&self, id: FunctionId) -> Result<&FunctionSchema> {
-        self.schemas
+        self.relations
+            .schemas
             .values()
             .flat_map(|schema| schema.functions.values())
             .find(|function| function.id == id)
@@ -903,7 +931,7 @@ impl Catalog {
         old_name: &str,
         new_name: &str,
     ) {
-        for table in self
+        for table in Arc::make_mut(&mut self.relations)
             .schemas
             .values_mut()
             .flat_map(|schema| schema.tables.values_mut())
@@ -941,7 +969,7 @@ impl Catalog {
                 }
             }
         }
-        for sequence in self
+        for sequence in Arc::make_mut(&mut self.relations)
             .schemas
             .values_mut()
             .flat_map(|schema| schema.sequences.values_mut())
@@ -957,7 +985,7 @@ impl Catalog {
     }
 
     pub(crate) fn rename_table_dependencies(&mut self, table_id: TableId, new_name: &str) {
-        for table in self
+        for table in Arc::make_mut(&mut self.relations)
             .schemas
             .values_mut()
             .flat_map(|schema| schema.tables.values_mut())
@@ -983,19 +1011,22 @@ impl Catalog {
 
     #[cfg_attr(feature = "execution-log", tracing::instrument(skip_all))]
     pub(crate) fn iterate_tables(&self) -> impl Iterator<Item = &TableSchema> {
-        self.schemas
+        self.relations
+            .schemas
             .values()
             .flat_map(|schema| schema.tables.values())
     }
 
     pub(crate) fn iterate_views(&self) -> impl Iterator<Item = &ViewSchema> {
-        self.schemas
+        self.relations
+            .schemas
             .values()
             .flat_map(|schema| schema.views.values())
     }
 
     pub(crate) fn iterate_views_mut(&mut self) -> impl Iterator<Item = &mut ViewSchema> {
-        self.schemas
+        Arc::make_mut(&mut self.relations)
+            .schemas
             .values_mut()
             .flat_map(|schema| schema.views.values_mut())
     }
@@ -1225,7 +1256,8 @@ impl Catalog {
         deferred_constraints: &std::collections::BTreeSet<ConstraintId>,
         defer_all: bool,
     ) -> bool {
-        self.deferrable_foreign_keys
+        self.relations
+            .deferrable_foreign_keys
             .iter()
             .any(|(id, initially_deferred)| {
                 defer_all || *initially_deferred || deferred_constraints.contains(id)
@@ -1237,7 +1269,8 @@ impl Catalog {
         &self,
         parent: TableId,
     ) -> Vec<(TableSchema, ForeignKey)> {
-        self.referencing_foreign_keys
+        self.relations
+            .referencing_foreign_keys
             .get(&parent)
             .into_iter()
             .flatten()
@@ -1254,7 +1287,9 @@ impl Catalog {
     }
 
     pub(crate) fn has_referencing_foreign_keys(&self, parent: TableId) -> bool {
-        self.referencing_foreign_keys.contains_key(&parent)
+        self.relations
+            .referencing_foreign_keys
+            .contains_key(&parent)
     }
 
     #[cfg_attr(feature = "execution-log", tracing::instrument(skip_all))]
@@ -1276,8 +1311,9 @@ impl Catalog {
                     .push((table.id, index));
             }
         }
-        self.deferrable_foreign_keys = deferrable_foreign_keys;
-        self.referencing_foreign_keys = referencing_foreign_keys;
+        let relations = Arc::make_mut(&mut self.relations);
+        relations.deferrable_foreign_keys = deferrable_foreign_keys;
+        relations.referencing_foreign_keys = referencing_foreign_keys;
     }
 
     #[cfg(test)]
@@ -1356,7 +1392,8 @@ impl Catalog {
 
     #[cfg_attr(feature = "execution-log", tracing::instrument(skip_all))]
     pub(crate) fn iterate_sequences(&self) -> impl Iterator<Item = &SequenceSchema> {
-        self.schemas
+        self.relations
+            .schemas
             .values()
             .flat_map(|schema| schema.sequences.values())
     }
@@ -1404,6 +1441,7 @@ impl Catalog {
     #[cfg_attr(feature = "execution-log", tracing::instrument(skip_all))]
     pub(crate) fn drop_owned_sequences(&mut self, table_id: TableId) -> Vec<SequenceSchema> {
         let names = self
+            .relations
             .schemas
             .values()
             .flat_map(|schema| {
@@ -1430,6 +1468,7 @@ impl Catalog {
         column_name: &str,
     ) -> Vec<SequenceSchema> {
         let names = self
+            .relations
             .schemas
             .values()
             .flat_map(|schema| {
@@ -1584,7 +1623,11 @@ impl CatalogHistory {
             "the public schema must remain visible"
         );
         let mut catalog = Catalog {
-            schemas,
+            relations: Arc::new(CatalogRelations {
+                schemas,
+                deferrable_foreign_keys: Vec::new(),
+                referencing_foreign_keys: BTreeMap::new(),
+            }),
             next_schema_id: self.next_schema_id,
             next_table_id: self.next_table_id,
             next_sequence_id: self.next_sequence_id,
@@ -1593,15 +1636,13 @@ impl CatalogHistory {
             next_view_id: self.next_view_id,
             next_trigger_id: self.next_trigger_id,
             next_function_id: self.next_function_id,
-            deferrable_foreign_keys: Vec::new(),
-            referencing_foreign_keys: BTreeMap::new(),
         };
         for versions in self.tables.values() {
             let Some(table) = find_visible_catalog_version(versions, xid, snapshot, transactions)
             else {
                 continue;
             };
-            let Some(schema) = catalog
+            let Some(schema) = Arc::make_mut(&mut catalog.relations)
                 .schemas
                 .values_mut()
                 .find(|schema| schema.id == table.schema_id)
@@ -1620,7 +1661,7 @@ impl CatalogHistory {
             else {
                 continue;
             };
-            let Some(schema) = catalog
+            let Some(schema) = Arc::make_mut(&mut catalog.relations)
                 .schemas
                 .values_mut()
                 .find(|schema| schema.id == sequence.schema_id)
@@ -1640,7 +1681,7 @@ impl CatalogHistory {
             else {
                 continue;
             };
-            let Some(schema) = catalog
+            let Some(schema) = Arc::make_mut(&mut catalog.relations)
                 .schemas
                 .values_mut()
                 .find(|schema| schema.id == view.schema_id)
@@ -1659,7 +1700,7 @@ impl CatalogHistory {
             else {
                 continue;
             };
-            let Some(schema) = catalog
+            let Some(schema) = Arc::make_mut(&mut catalog.relations)
                 .schemas
                 .values_mut()
                 .find(|schema| schema.id == function.schema_id)
@@ -1713,28 +1754,30 @@ impl CatalogHistory {
         record_catalog_changes(
             &mut self.schemas,
             previous
+                .relations
                 .schemas
                 .values()
                 .map(|schema| {
                     (
                         schema.id,
-                        SchemaIdentity {
+                        Cow::<SchemaIdentity>::Owned(SchemaIdentity {
                             id: schema.id,
                             name: schema.name.clone(),
-                        },
+                        }),
                     )
                 })
                 .filter(|(_, schema)| schema.name != TEMP_SCHEMA),
             current
+                .relations
                 .schemas
                 .values()
                 .map(|schema| {
                     (
                         schema.id,
-                        SchemaIdentity {
+                        Cow::<SchemaIdentity>::Owned(SchemaIdentity {
                             id: schema.id,
                             name: schema.name.clone(),
-                        },
+                        }),
                     )
                 })
                 .filter(|(_, schema)| schema.name != TEMP_SCHEMA),
@@ -1744,60 +1787,68 @@ impl CatalogHistory {
         record_catalog_changes(
             &mut self.tables,
             previous
+                .relations
                 .schemas
                 .values()
                 .flat_map(|schema| schema.tables.values())
-                .map(|table| (table.id, table.clone())),
+                .map(|table| (table.id, Cow::Borrowed(table))),
             current
+                .relations
                 .schemas
                 .values()
                 .flat_map(|schema| schema.tables.values())
-                .map(|table| (table.id, table.clone())),
+                .map(|table| (table.id, Cow::Borrowed(table))),
             xid,
             command_id,
         );
         record_catalog_changes(
             &mut self.views,
             previous
+                .relations
                 .schemas
                 .values()
                 .flat_map(|schema| schema.views.values())
-                .map(|view| (view.id, view.clone())),
+                .map(|view| (view.id, Cow::Borrowed(view))),
             current
+                .relations
                 .schemas
                 .values()
                 .flat_map(|schema| schema.views.values())
-                .map(|view| (view.id, view.clone())),
+                .map(|view| (view.id, Cow::Borrowed(view))),
             xid,
             command_id,
         );
         record_catalog_changes(
             &mut self.sequences,
             previous
+                .relations
                 .schemas
                 .values()
                 .flat_map(|schema| schema.sequences.values())
-                .map(|sequence| (sequence.id, sequence.clone())),
+                .map(|sequence| (sequence.id, Cow::Borrowed(sequence))),
             current
+                .relations
                 .schemas
                 .values()
                 .flat_map(|schema| schema.sequences.values())
-                .map(|sequence| (sequence.id, sequence.clone())),
+                .map(|sequence| (sequence.id, Cow::Borrowed(sequence))),
             xid,
             command_id,
         );
         record_catalog_changes(
             &mut self.functions,
             previous
+                .relations
                 .schemas
                 .values()
                 .flat_map(|schema| schema.functions.values())
-                .map(|function| (function.id, function.clone())),
+                .map(|function| (function.id, Cow::Borrowed(function))),
             current
+                .relations
                 .schemas
                 .values()
                 .flat_map(|schema| schema.functions.values())
-                .map(|function| (function.id, function.clone())),
+                .map(|function| (function.id, Cow::Borrowed(function))),
             xid,
             command_id,
         );
@@ -1927,15 +1978,15 @@ impl CatalogHistory {
 }
 
 #[cfg_attr(feature = "execution-log", tracing::instrument(skip_all))]
-fn record_catalog_changes<Id, T>(
+fn record_catalog_changes<'a, Id, T>(
     histories: &mut BTreeMap<Id, Vec<CatalogVersion<T>>>,
-    previous: impl Iterator<Item = (Id, T)>,
-    current: impl Iterator<Item = (Id, T)>,
+    previous: impl Iterator<Item = (Id, Cow<'a, T>)>,
+    current: impl Iterator<Item = (Id, Cow<'a, T>)>,
     xid: Xid,
     command_id: CommandId,
 ) where
     Id: Copy + Ord,
-    T: Clone + PartialEq,
+    T: Clone + PartialEq + 'a,
 {
     let previous = previous.collect::<BTreeMap<_, _>>();
     let current = current.collect::<BTreeMap<_, _>>();
@@ -1949,7 +2000,7 @@ fn record_catalog_changes<Id, T>(
                 versions
                     .iter_mut()
                     .rev()
-                    .find(|version| version.xmax.is_none() && &version.value == old)
+                    .find(|version| version.xmax.is_none() && &version.value == old.as_ref())
             })
             .expect("materialized catalog object must have a live version");
         version.xmax = Some(xid);
@@ -1964,7 +2015,7 @@ fn record_catalog_changes<Id, T>(
             xmin_command_id: command_id,
             xmax: None,
             xmax_command_id: None,
-            value: new,
+            value: new.into_owned(),
         });
     }
 }
@@ -2515,6 +2566,22 @@ mod tests {
             catalog.require_sequence("parents_id_seq").unwrap(),
             &sequence
         );
+        let snapshot = catalog.clone();
+        catalog.drop_table("children").unwrap();
+        catalog.drop_owned_sequences(parent);
+        assert!(!catalog.has_referencing_foreign_keys(parent));
+        assert!(catalog.require_sequence("parents_id_seq").is_err());
+        assert_eq!(snapshot.require_table("children").unwrap().id, child);
+        assert_eq!(snapshot.referencing_foreign_keys(parent)[0].0.id, child);
+        assert_eq!(
+            snapshot.require_sequence("parents_id_seq").unwrap(),
+            &sequence
+        );
+
+        let mut changed_snapshot = snapshot.clone();
+        changed_snapshot.create_schema("later".into()).unwrap();
+        assert!(snapshot.require_schema("later").is_err());
+        assert!(catalog.require_schema("later").is_err());
     }
 
     #[test]

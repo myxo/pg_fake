@@ -49,6 +49,7 @@ pub struct PreparedStatement {
     columns: Vec<ColumnMeta>,
     query_plan: Option<executor::PreparedQueryPlan>,
     catalog_dependencies: Vec<PreparedCatalogDependency>,
+    catalog_identity: crate::catalog::CatalogIdentity,
     relation_locks: Option<Vec<(String, RelationLockMode)>>,
 }
 
@@ -326,9 +327,9 @@ impl ast::Visitor for PreparedDependencyCollector<'_> {
     }
 }
 
-fn collect_prepared_catalog_dependencies(
+fn collect_prepared_catalog_dependencies<'a>(
     catalog: &crate::catalog::Catalog,
-    statements: impl IntoIterator<Item = ast::Statement>,
+    statements: impl IntoIterator<Item = &'a ast::Statement>,
 ) -> Result<Vec<PreparedCatalogDependency>> {
     let mut collector = PreparedDependencyCollector {
         skip_function_name: false,
@@ -338,7 +339,7 @@ fn collect_prepared_catalog_dependencies(
         error: None,
     };
     for statement in statements {
-        match &statement {
+        match statement {
             ast::Statement::Query(_)
             | ast::Statement::Insert(_)
             | ast::Statement::Update(_)
@@ -384,7 +385,7 @@ fn collect_prepared_catalog_dependencies(
         if let Some(error) = collector.error.take() {
             return Err(error);
         }
-        if let ast::Statement::Insert(insert) = &statement
+        if let ast::Statement::Insert(insert) = statement
             && let Some(ast::OnInsert::OnConflict(ast::OnConflict {
                 conflict_target: Some(ast::ConflictTarget::OnConstraint(name)),
                 ..
@@ -1189,7 +1190,7 @@ fn collect_ddl_relation_locks(
             );
             for dependency in collect_prepared_catalog_dependencies(
                 catalog,
-                [ast::Statement::Query(create.query.clone())],
+                &[ast::Statement::Query(create.query.clone())],
             )? {
                 match dependency {
                     PreparedCatalogDependency::Table { schema, .. } => {
@@ -1388,9 +1389,9 @@ fn collect_assignment_columns(assignments: &[ast::Assignment]) -> Result<Vec<Str
     Ok(columns.into_iter().collect())
 }
 
-fn collect_foreign_key_relation_locks(
+fn collect_foreign_key_relation_locks<'a>(
     state: &DatabaseState,
-    statements: impl IntoIterator<Item = ast::Statement>,
+    statements: impl IntoIterator<Item = &'a ast::Statement>,
     locks: &mut std::collections::BTreeMap<String, RelationLockMode>,
 ) -> Result<()> {
     let mut pending = Vec::new();
@@ -1422,7 +1423,7 @@ fn collect_foreign_key_relation_locks(
                 if let Some(ast::OnInsert::OnConflict(ast::OnConflict {
                     action: ast::OnConflictAction::DoUpdate(update),
                     ..
-                })) = insert.on
+                })) = &insert.on
                 {
                     pending.push(ForeignKeyMutation::Update {
                         table: table.id,
@@ -1439,10 +1440,10 @@ fn collect_foreign_key_relation_locks(
                 }
             }
             ast::Statement::Update(update) => {
-                let ast::TableFactor::Table { name, .. } = update.table.relation else {
+                let ast::TableFactor::Table { name, .. } = &update.table.relation else {
                     continue;
                 };
-                let name = executor::normalize_relation_name(&name)?;
+                let name = executor::normalize_relation_name(name)?;
                 if state.catalog.require_named_view(&name).is_ok() {
                     continue;
                 }
@@ -1461,7 +1462,7 @@ fn collect_foreign_key_relation_locks(
                 });
             }
             ast::Statement::Delete(delete) => {
-                let ast::FromTable::WithFromKeyword(from) = delete.from else {
+                let ast::FromTable::WithFromKeyword(from) = &delete.from else {
                     continue;
                 };
                 let Some(ast::TableWithJoins {
@@ -1651,12 +1652,16 @@ fn collect_relation_locks(
         &expanded_statement,
         ast::Statement::Query(query) if !query.locks.is_empty()
     );
+    let discovered_dependencies;
     let dependencies = match prepared_dependencies {
-        Some(dependencies) => dependencies.to_vec(),
-        None => collect_prepared_catalog_dependencies(
-            &state.catalog,
-            std::iter::once(expanded_statement.clone()).chain(mutations.iter().cloned()),
-        )?,
+        Some(dependencies) => dependencies,
+        None => {
+            discovered_dependencies = collect_prepared_catalog_dependencies(
+                &state.catalog,
+                std::iter::once(&expanded_statement).chain(mutations.iter()),
+            )?;
+            &discovered_dependencies
+        }
     };
     let mut locks = std::collections::BTreeMap::new();
     for dependency in dependencies {
@@ -1665,7 +1670,7 @@ fn collect_relation_locks(
                 locks.insert(
                     ResolvedRelationName {
                         schema_id: table.schema_id,
-                        name: table.name,
+                        name: table.name.clone(),
                     }
                     .get_lock_name(),
                     if locking_read {
@@ -1681,7 +1686,7 @@ fn collect_relation_locks(
                 locks.insert(
                     ResolvedRelationName {
                         schema_id: sequence.schema_id,
-                        name: sequence.name,
+                        name: sequence.name.clone(),
                     }
                     .get_lock_name(),
                     RelationLockMode::Shared,
@@ -1691,7 +1696,7 @@ fn collect_relation_locks(
                 locks.insert(
                     ResolvedRelationName {
                         schema_id: view.schema_id,
-                        name: view.name,
+                        name: view.name.clone(),
                     }
                     .get_lock_name(),
                     RelationLockMode::Shared,
@@ -1702,7 +1707,7 @@ fn collect_relation_locks(
     }
     collect_foreign_key_relation_locks(
         state,
-        std::iter::once(expanded_statement.clone()).chain(mutations.iter().cloned()),
+        std::iter::once(&expanded_statement).chain(mutations.iter()),
         &mut locks,
     )?;
     for mutation in std::iter::once(expanded_statement).chain(mutations) {
@@ -2551,7 +2556,7 @@ impl Session {
         );
         self.substitute_scoped_procedural_locals(&mut statement, locals)?;
         let StatementResult::Query(query) =
-            self.execute_statement(&statement, None, None, None, Some(procedural))?
+            self.execute_statement(&statement, None, None, Some(procedural))?
         else {
             unreachable!("generated expression query returns rows")
         };
@@ -2674,7 +2679,7 @@ impl Session {
                 Some(ast::LimitClause::OffsetCommaLimit { .. }) => unreachable!(),
             }
         }
-        let result = self.execute_statement(&statement, None, None, None, Some(procedural))?;
+        let result = self.execute_statement(&statement, None, None, Some(procedural))?;
         let Some(into) = into else {
             *row_count = match &result {
                 StatementResult::Affected(affected) => *affected,
@@ -2914,7 +2919,7 @@ impl Session {
             if self.transaction.is_none() {
                 self.start_transaction(self.default_isolation, true);
             }
-            match self.execute_statement(&statement, None, None, None, None) {
+            match self.execute_statement(&statement, None, None, None) {
                 Ok(result) => results.push(result),
                 Err(error) => {
                     if self.is_transaction_implicit_batch() {
@@ -3160,7 +3165,7 @@ impl Session {
                 .and_then(|(statement, mutations, parameter_count)| {
                     let catalog_dependencies = collect_prepared_catalog_dependencies(
                         &state.catalog,
-                        std::iter::once(statement.clone()).chain(mutations.iter().cloned()),
+                        std::iter::once(&statement).chain(mutations.iter()),
                     )?;
                     analyzer::substitute_typed_subqueries(&statement, &state.catalog).map(
                         |statement| (statement, mutations, parameter_count, catalog_dependencies),
@@ -3227,22 +3232,29 @@ impl Session {
                                 query_plan,
                                 catalog_dependencies,
                                 relation_locks,
+                                state.catalog.create_identity(),
                             ))
                         })
                     },
                 )
         };
         match prepared {
-            Ok((parameter_types, columns, query_plan, catalog_dependencies, relation_locks)) => {
-                Ok(PreparedStatement {
-                    statement,
-                    parameter_types,
-                    columns,
-                    query_plan,
-                    catalog_dependencies,
-                    relation_locks,
-                })
-            }
+            Ok((
+                parameter_types,
+                columns,
+                query_plan,
+                catalog_dependencies,
+                relation_locks,
+                catalog_identity,
+            )) => Ok(PreparedStatement {
+                statement,
+                parameter_types,
+                columns,
+                query_plan,
+                catalog_dependencies,
+                relation_locks,
+                catalog_identity,
+            }),
             Err(error) => self.abort_with_error(error),
         }
     }
@@ -3329,13 +3341,7 @@ impl Session {
         if started_implicit_transaction {
             self.start_transaction(self.default_isolation, true);
         }
-        match self.execute_statement(
-            execution_statement,
-            prepared_query,
-            Some(&statement.catalog_dependencies),
-            statement.relation_locks.as_deref(),
-            None,
-        ) {
+        match self.execute_statement(execution_statement, prepared_query, Some(statement), None) {
             Ok(result) => {
                 if started_implicit_transaction && self.is_transaction_implicit_batch() {
                     self.commit_transaction()?;
@@ -3586,10 +3592,11 @@ impl Session {
         &mut self,
         statement: &ast::Statement,
         prepared_query: Option<(&executor::PreparedQueryPlan, &[Value], &[ColumnMeta])>,
-        prepared_dependencies: Option<&[PreparedCatalogDependency]>,
-        prepared_locks: Option<&[(String, RelationLockMode)]>,
+        prepared_statement: Option<&PreparedStatement>,
         procedural: Option<ProceduralStatementContext>,
     ) -> Result<StatementResult> {
+        let prepared_dependencies =
+            prepared_statement.map(|statement| statement.catalog_dependencies.as_slice());
         match statement {
             ast::Statement::Analyze(_) if !self.db.strict => {
                 return Ok(StatementResult::Affected(0));
@@ -3895,7 +3902,7 @@ impl Session {
             state,
             statement,
             prepared_dependencies,
-            prepared_locks,
+            prepared_statement.and_then(|statement| statement.relation_locks.as_deref()),
             transaction.xid,
             self.temporary_schema_id,
             transaction.isolation,
@@ -3906,6 +3913,9 @@ impl Session {
         };
         state = acquired.0;
         snapshot = acquired.1;
+        let prepared_dependencies = prepared_statement
+            .filter(|statement| !state.catalog.matches_identity(&statement.catalog_identity))
+            .map(|statement| statement.catalog_dependencies.as_slice());
         let prepared_dependency_error = prepared_dependencies.and_then(|dependencies| {
             dependencies.iter().find_map(|dependency| match dependency {
                 PreparedCatalogDependency::Table { name, schema } => {
@@ -4501,6 +4511,58 @@ mod tests {
     #[cfg_attr(feature = "execution-log", tracing::instrument(skip_all))]
     fn create_affected_results(rows: u64) -> Vec<StatementResult> {
         vec![StatementResult::Affected(rows)]
+    }
+
+    #[test]
+    fn revalidates_prepared_dependencies_after_waiting_for_ddl() {
+        let db = Db::create();
+        let mut reader = db.create_session();
+        let mut writer = db.create_session();
+        writer
+            .execute(
+                "CREATE TABLE waited_schema (id INTEGER); INSERT INTO waited_schema VALUES (1)",
+            )
+            .unwrap();
+        let prepared = reader.prepare("SELECT id FROM waited_schema").unwrap();
+        reader.query_prepared(&prepared, &[]).unwrap();
+        writer
+            .execute("BEGIN; ALTER TABLE waited_schema ADD COLUMN extra INTEGER")
+            .unwrap();
+        let waiting = thread::spawn(move || reader.query_prepared(&prepared, &[]));
+        wait_until_relation_blocked(&db);
+        writer.execute("COMMIT").unwrap();
+        assert_eq!(
+            waiting.join().unwrap().unwrap_err().sqlstate,
+            SqlState::FeatureNotSupported
+        );
+    }
+
+    #[test]
+    fn reuses_prepared_queries_after_failed_catalog_changes_are_restored() {
+        let db = Db::create();
+        let mut session = db.create_session();
+        session
+            .execute(
+                "CREATE TABLE restored_schema (id INTEGER); INSERT INTO restored_schema VALUES (1)",
+            )
+            .unwrap();
+        let prepared = session.prepare("SELECT id FROM restored_schema").unwrap();
+        assert_eq!(
+            session.query_prepared(&prepared, &[]).unwrap().rows,
+            vec![vec![Value::Int4(1)]]
+        );
+        assert!(session.execute("ALTER TABLE restored_schema ADD COLUMN failed INTEGER DEFAULT 7, ADD COLUMN id INTEGER").is_err());
+        assert_eq!(
+            session.query_prepared(&prepared, &[]).unwrap().rows,
+            vec![vec![Value::Int4(1)]]
+        );
+        session
+            .execute("ALTER TABLE restored_schema ADD COLUMN valid INTEGER")
+            .unwrap();
+        assert_eq!(
+            session.query_prepared(&prepared, &[]).unwrap_err().sqlstate,
+            SqlState::FeatureNotSupported
+        );
     }
 
     #[test]
