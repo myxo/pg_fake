@@ -597,18 +597,8 @@ impl Table {
         current_xid: Xid,
         transactions: &TransactionRegistry,
     ) -> Option<RowId> {
-        let index = self
-            .indexes
-            .iter()
-            .find(|index| index.columns == columns && index.predicate.is_none())?;
-        let key = build_index_key(&self.schema, columns, values)?;
-        index.entries.get(&key)?.iter().find_map(|row_id| {
-            let version = self.version_chains.chains.get(row_id).and_then(|chain| {
-                find_visible_version(chain, snapshot, current_xid, transactions)
-            })?;
-            (build_row_index_key(&self.schema, index, &version.row).as_ref() == Some(&key))
-                .then_some(*row_id)
-        })
+        self.find_unique_visible_version(columns, values, snapshot, current_xid, transactions)
+            .map(|(row_id, _)| row_id)
     }
 
     pub(crate) fn find_unique_candidate_row(
@@ -678,12 +668,18 @@ impl Table {
         current_xid: Xid,
         transactions: &TransactionRegistry,
     ) -> Option<(RowId, &RowVersion)> {
-        let row_id = self.find_unique_row(columns, values, snapshot, current_xid, transactions)?;
-        self.version_chains
-            .chains
-            .get(&row_id)
-            .and_then(|chain| find_visible_version(chain, snapshot, current_xid, transactions))
-            .map(|version| (row_id, version))
+        let index = self
+            .indexes
+            .iter()
+            .find(|index| index.columns == columns && index.predicate.is_none())?;
+        let key = build_index_key(&self.schema, columns, values)?;
+        index.entries.get(&key)?.iter().find_map(|row_id| {
+            let version = self.version_chains.chains.get(row_id).and_then(|chain| {
+                find_visible_version(chain, snapshot, current_xid, transactions)
+            })?;
+            (build_row_index_key(&self.schema, index, &version.row).as_ref() == Some(&key))
+                .then_some((*row_id, version))
+        })
     }
 
     #[cfg_attr(feature = "execution-log", tracing::instrument(skip_all))]
