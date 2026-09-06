@@ -22,7 +22,6 @@ use sqlparser::{
     tokenizer::Span,
 };
 use std::{
-    borrow::Cow,
     cmp::Ordering,
     collections::{BTreeMap, BTreeSet},
     sync::{
@@ -682,9 +681,9 @@ impl DatabaseState {
             self.inactive_catalogs.insert(previous_schema_id, previous);
         }
         if !cache_hit {
-            for schema in self.catalog.iterate_tables() {
+            for schema in self.catalog.iterate_shared_tables() {
                 if let Some(table) = self.tables.get_mut(&schema.id) {
-                    table.replace_schema(Cow::Borrowed(schema));
+                    table.replace_schema(Arc::clone(schema));
                 }
             }
         }

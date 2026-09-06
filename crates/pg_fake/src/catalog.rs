@@ -1059,11 +1059,14 @@ impl Catalog {
 
     #[cfg_attr(feature = "execution-log", tracing::instrument(skip_all))]
     pub(crate) fn iterate_tables(&self) -> impl Iterator<Item = &TableSchema> {
+        self.iterate_shared_tables().map(Arc::as_ref)
+    }
+
+    pub(crate) fn iterate_shared_tables(&self) -> impl Iterator<Item = &Arc<TableSchema>> {
         self.relations
             .schemas
             .values()
             .flat_map(|schema| schema.tables.values())
-            .map(Arc::as_ref)
     }
 
     pub(crate) fn iterate_views(&self) -> impl Iterator<Item = &ViewSchema> {

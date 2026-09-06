@@ -1,6 +1,6 @@
 use std::{
-    borrow::Cow,
     collections::{BTreeMap, BTreeSet},
+    sync::Arc,
 };
 
 use crate::{
@@ -76,7 +76,7 @@ struct UniqueIndex {
 
 #[derive(Debug, Clone, PartialEq)]
 pub(crate) struct Table {
-    pub(crate) schema: TableSchema,
+    pub(crate) schema: Arc<TableSchema>,
     version_chains: VersionChainStore,
     indexes: Vec<UniqueIndex>,
     reclamation: Box<VersionReclamation>,
@@ -116,7 +116,7 @@ impl Table {
             )
             .collect();
         Table {
-            schema,
+            schema: Arc::new(schema),
             version_chains: VersionChainStore {
                 chains: BTreeMap::new(),
             },
@@ -129,12 +129,16 @@ impl Table {
         }
     }
 
-    pub(crate) fn replace_schema(&mut self, schema: Cow<'_, TableSchema>) {
+    pub(crate) fn replace_schema(&mut self, schema: Arc<TableSchema>) {
         assert_eq!(self.schema.id, schema.id);
-        if &self.schema == schema.as_ref() {
+        if Arc::ptr_eq(&self.schema, &schema) {
             return;
         }
-        self.schema = schema.into_owned();
+        let unchanged = self.schema == schema;
+        self.schema = schema;
+        if unchanged {
+            return;
+        }
         self.indexes = self
             .schema
             .constraints
