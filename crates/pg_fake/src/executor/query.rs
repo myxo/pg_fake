@@ -3238,7 +3238,7 @@ pub(super) type GroupedAggregateValues = Vec<GroupedAggregateValue>;
 struct CollectedGroup {
     key: Vec<Value>,
     source: Option<Vec<Value>>,
-    aggregate_inputs: Vec<Vec<AggregateInput>>,
+    aggregate_states: Vec<Option<AggregateState>>,
 }
 struct GroupedExpressionSubstituter<'a> {
     catalog: &'a crate::catalog::Catalog,
@@ -6157,7 +6157,7 @@ fn collect_grouped_select_rows(
         vec![CollectedGroup {
             key: Vec::new(),
             source: None,
-            aggregate_inputs: vec![Vec::new(); aggregate_functions.len()],
+            aggregate_states: (0..aggregate_functions.len()).map(|_| None).collect(),
         }]
     } else {
         Vec::new()
@@ -6201,38 +6201,39 @@ fn collect_grouped_select_rows(
                     groups.push(CollectedGroup {
                         key,
                         source: None,
-                        aggregate_inputs: vec![Vec::new(); aggregate_functions.len()],
+                        aggregate_states: (0..aggregate_functions.len()).map(|_| None).collect(),
                     });
                     groups.len() - 1
                 }
             };
-            let inputs = aggregate_functions
+            let group = &mut groups[index];
+            for (((collected, typed), call), prepared) in aggregate_functions
                 .iter()
                 .zip(&typed_aggregate_functions)
                 .zip(&mut aggregate_calls)
-                .map(|((collected, typed), call)| {
-                    if call.is_none() {
-                        *call = Some(parse_aggregate_call(typed, RowScope::Bound(scope))?);
-                    }
-                    prepare_group_aggregate_input(
-                        state,
-                        &collected.function,
-                        typed,
-                        call.as_ref().expect("aggregate call was initialized"),
-                        scope,
-                        row,
-                        xid,
-                        snapshot,
-                        context,
-                    )
-                })
-                .collect::<Result<Vec<_>>>()?;
-            let group = &mut groups[index];
+                .zip(&mut group.aggregate_states)
+            {
+                if call.is_none() {
+                    *call = Some(parse_aggregate_call(typed, RowScope::Bound(scope))?);
+                }
+                let call = call.as_ref().expect("aggregate call was initialized");
+                let input = prepare_group_aggregate_input(
+                    state,
+                    &collected.function,
+                    typed,
+                    call,
+                    scope,
+                    row,
+                    xid,
+                    snapshot,
+                    context,
+                )?;
+                prepared
+                    .get_or_insert_with(|| AggregateState::create(call))
+                    .add_input(call, input);
+            }
             if group.source.is_none() {
                 group.source = Some(row.to_vec());
-            }
-            for (prepared, inputs) in group.aggregate_inputs.iter_mut().zip(inputs) {
-                prepared.push(inputs);
             }
             Ok(())
         },
@@ -6248,16 +6249,16 @@ fn collect_grouped_select_rows(
             let aggregate_values = aggregate_functions
                 .iter()
                 .zip(&typed_aggregate_functions)
-                .zip(group.aggregate_inputs)
+                .zip(group.aggregate_states)
                 .zip(&mut aggregate_calls)
-                .map(|(((collected, typed), inputs), call)| {
+                .map(|(((collected, typed), aggregate), call)| {
                     if call.is_none() {
                         *call = Some(parse_aggregate_call(typed, RowScope::Bound(scope))?);
                     }
-                    let (value, data_type) = evaluate_prepared_aggregate_function(
-                        call.as_ref().expect("aggregate call was initialized"),
-                        &inputs,
-                    )?;
+                    let call = call.as_ref().expect("aggregate call was initialized");
+                    let (value, data_type) = aggregate
+                        .unwrap_or_else(|| AggregateState::create(call))
+                        .finish(call)?;
                     Ok(GroupedAggregateValue {
                         function: collected.function.clone(),
                         owner: collected.owner,

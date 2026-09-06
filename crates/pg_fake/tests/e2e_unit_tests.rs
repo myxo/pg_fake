@@ -9,6 +9,7 @@ use std::{
 
 use pg_fake::{
     api::{Db, StatementResult},
+    error::SqlState,
     parser::{self, Statement},
     value::{BaseType, Value},
 };
@@ -1921,4 +1922,29 @@ fn matches_correlated_subqueries() {
          SELECT (SELECT c.value FROM __TABLE___children AS c WHERE c.parent_id = p.id) FROM __TABLE__ AS p WHERE p.id = 1",
         RowOrder::Ordered,
     );
+}
+
+#[test]
+fn preserves_aggregate_input_effects_after_accumulator_errors() {
+    for (sql, expected) in [
+        (
+            "SELECT sum(value), count(nextval('aggregate_effects')) FROM aggregate_inputs",
+            SqlState::NumericValueOutOfRange,
+        ),
+        (
+            "SELECT sum(value), count(nextval('aggregate_effects')), sum(1 / (3 - id)) FROM aggregate_inputs",
+            SqlState::DivisionByZero,
+        ),
+    ] {
+        let mut session = Db::create().create_session();
+        session.execute("CREATE TABLE aggregate_inputs (id INTEGER, value REAL);             INSERT INTO aggregate_inputs VALUES (1, 3e38), (2, 3e38), (3, 3e38);             CREATE SEQUENCE aggregate_effects").unwrap();
+        assert_eq!(session.query(sql, &[]).unwrap_err().sqlstate, expected);
+        assert_eq!(
+            session
+                .query("SELECT nextval('aggregate_effects')", &[])
+                .unwrap()
+                .rows,
+            vec![vec![Value::Int8(4)]],
+        );
+    }
 }

@@ -230,51 +230,57 @@ where
     })
 }
 
-pub(super) fn evaluate_prepared_aggregate_function(
-    call: &AggregateCall<'_>,
-    inputs: &[AggregateInput],
-) -> Result<(Value, BaseType)> {
-    let Some(_argument) = call.argument else {
-        let count = inputs.iter().filter(|input| input.included).count();
-        return Ok((
-            Value::Int8(i64::try_from(count).expect("row count must fit in int8")),
-            call.result_type,
-        ));
-    };
-    let argument_type = call
-        .argument_type
-        .expect("aggregate expression has an argument type");
-    let mut values = Vec::with_capacity(inputs.len());
-    for input in inputs.iter().filter(|input| input.included) {
-        let value = input
-            .argument
-            .clone()
-            .expect("included aggregate input has an argument");
-        if !value.is_null() {
-            let duplicate = call.distinct
-                && values.iter().try_fold(false, |duplicate, existing| {
-                    Ok(duplicate || compare_values(existing, &value)? == Ordering::Equal)
-                })?;
-            if duplicate {
-                continue;
-            }
-            values.push(value);
+pub(super) struct AggregateState {
+    inputs: Option<Vec<AggregateInput>>,
+    count: usize,
+    value: Option<Value>,
+    error: Option<PgError>,
+}
+
+impl AggregateState {
+    pub(super) fn create(call: &AggregateCall<'_>) -> Self {
+        Self {
+            inputs: call.distinct.then(Vec::new),
+            count: 0,
+            value: None,
+            error: None,
         }
     }
-    let value = match call.kind {
-        AggregateKind::Count => {
-            Value::Int8(i64::try_from(values.len()).expect("non-null row count must fit in int8"))
+
+    pub(super) fn add_input(&mut self, call: &AggregateCall<'_>, input: AggregateInput) {
+        if let Some(inputs) = &mut self.inputs {
+            inputs.push(input);
+        } else if self.error.is_none() {
+            self.error = self.accumulate_input(call, input).err();
         }
-        AggregateKind::Sum(accumulator) | AggregateKind::Average(accumulator) => {
-            let mut sum = None;
-            for value in values.iter().cloned() {
+    }
+
+    fn accumulate_input(&mut self, call: &AggregateCall<'_>, input: AggregateInput) -> Result<()> {
+        if !input.included {
+            return Ok(());
+        }
+        if matches!(call.kind, AggregateKind::CountAll) {
+            self.count += 1;
+            return Ok(());
+        }
+        let value = input
+            .argument
+            .expect("included aggregate input has an argument");
+        if value.is_null() {
+            return Ok(());
+        }
+        self.count += 1;
+        self.value = match call.kind {
+            AggregateKind::Count => None,
+            AggregateKind::Sum(accumulator) | AggregateKind::Average(accumulator) => {
                 let value = coercion::coerce(
                     value,
-                    argument_type,
+                    call.argument_type
+                        .expect("aggregate expression has an argument type"),
                     PgType::create(accumulator),
                     CastContext::Implicit,
                 )?;
-                sum = Some(match sum {
+                Some(match self.value.take() {
                     None => value,
                     Some(current) if accumulator == BaseType::Interval => {
                         evaluate_temporal_arithmetic(&ast::BinaryOperator::Plus, current, value)?
@@ -282,77 +288,102 @@ pub(super) fn evaluate_prepared_aggregate_function(
                     Some(current) => {
                         evaluate_numeric_operator(&ast::BinaryOperator::Plus, current, value)?
                     }
-                });
+                })
             }
-            match (call.kind, sum) {
-                (_, None) => Value::Null,
-                (AggregateKind::Sum(_), Some(sum)) => sum,
-                (AggregateKind::Average(BaseType::Interval), Some(sum)) => {
-                    evaluate_temporal_arithmetic(
-                        &ast::BinaryOperator::Divide,
-                        sum,
-                        Value::Float8(values.len() as f64),
-                    )?
-                }
-                (AggregateKind::Average(BaseType::Numeric), Some(sum)) => {
-                    evaluate_numeric_operator(
-                        &ast::BinaryOperator::Divide,
-                        sum,
-                        Value::Numeric(BigDecimal::from(
-                            i64::try_from(values.len()).expect("row count must fit in int8"),
-                        )),
-                    )?
-                }
-                (AggregateKind::Average(BaseType::Float8), Some(sum)) => {
-                    let average = evaluate_numeric_operator(
-                        &ast::BinaryOperator::Divide,
-                        sum,
-                        Value::Float8(values.len() as f64),
-                    )?;
-                    match average {
-                        Value::Float8(value) if value == 0.0 => Value::Float8(0.0),
-                        average => average,
+            AggregateKind::Minimum | AggregateKind::Maximum => Some(match self.value.take() {
+                None => value,
+                Some(current) => {
+                    let ordering = compare_values(&value, &current)?;
+                    if matches!(call.kind, AggregateKind::Minimum) && ordering == Ordering::Less
+                        || matches!(call.kind, AggregateKind::Maximum)
+                            && ordering == Ordering::Greater
+                    {
+                        value
+                    } else {
+                        current
                     }
                 }
-                _ => unreachable!("average accumulator type was checked"),
-            }
-        }
-        AggregateKind::Minimum | AggregateKind::Maximum => {
-            let mut selected = None;
-            for value in values {
-                selected = Some(match selected {
-                    None => value,
-                    Some(current) => {
-                        let ordering = compare_values(&value, &current)?;
-                        if matches!(call.kind, AggregateKind::Minimum) && ordering == Ordering::Less
-                            || matches!(call.kind, AggregateKind::Maximum)
-                                && ordering == Ordering::Greater
-                        {
-                            value
-                        } else {
-                            current
-                        }
-                    }
-                });
-            }
-            selected.unwrap_or(Value::Null)
-        }
-        AggregateKind::BooleanAnd | AggregateKind::BooleanOr => {
-            let mut selected = None;
-            for value in values {
+            }),
+            AggregateKind::BooleanAnd | AggregateKind::BooleanOr => {
                 let Value::Bool(value) = value else {
                     unreachable!("boolean aggregate argument was type-checked")
                 };
-                selected = Some(match (call.kind, selected) {
-                    (AggregateKind::BooleanAnd, Some(current)) => current && value,
-                    (AggregateKind::BooleanOr, Some(current)) => current || value,
+                Some(Value::Bool(match (call.kind, self.value.take()) {
+                    (AggregateKind::BooleanAnd, Some(Value::Bool(current))) => current && value,
+                    (AggregateKind::BooleanOr, Some(Value::Bool(current))) => current || value,
                     (_, None) => value,
-                    _ => unreachable!("boolean aggregate kind was checked"),
-                });
+                    _ => unreachable!("boolean aggregate accumulator contains a boolean"),
+                }))
             }
-            selected.map(Value::Bool).unwrap_or(Value::Null)
+            AggregateKind::CountAll => {
+                unreachable!("count all returned before argument evaluation")
+            }
+        };
+        Ok(())
+    }
+
+    pub(super) fn finish(mut self, call: &AggregateCall<'_>) -> Result<(Value, BaseType)> {
+        if let Some(error) = self.error.take() {
+            return Err(error);
         }
-        AggregateKind::CountAll => unreachable!("count all returned before argument evaluation"),
-    };
-    Ok((value, call.result_type))
+        if let Some(inputs) = self.inputs.take() {
+            let mut values = Vec::with_capacity(inputs.len());
+            for input in inputs.into_iter().filter(|input| input.included) {
+                let value = input
+                    .argument
+                    .expect("included aggregate input has an argument");
+                if !value.is_null() {
+                    let duplicate = values.iter().try_fold(false, |duplicate, existing| {
+                        Ok(duplicate || compare_values(existing, &value)? == Ordering::Equal)
+                    })?;
+                    if !duplicate {
+                        values.push(value);
+                    }
+                }
+            }
+            for value in values {
+                self.accumulate_input(
+                    call,
+                    AggregateInput {
+                        included: true,
+                        argument: Some(value),
+                    },
+                )?;
+            }
+        }
+        let value = match (call.kind, self.value) {
+            (AggregateKind::Count | AggregateKind::CountAll, _) => {
+                Value::Int8(i64::try_from(self.count).expect("row count must fit in int8"))
+            }
+            (_, None) => Value::Null,
+            (AggregateKind::Average(BaseType::Interval), Some(sum)) => {
+                evaluate_temporal_arithmetic(
+                    &ast::BinaryOperator::Divide,
+                    sum,
+                    Value::Float8(self.count as f64),
+                )?
+            }
+            (AggregateKind::Average(BaseType::Numeric), Some(sum)) => evaluate_numeric_operator(
+                &ast::BinaryOperator::Divide,
+                sum,
+                Value::Numeric(BigDecimal::from(
+                    i64::try_from(self.count).expect("row count must fit in int8"),
+                )),
+            )?,
+            (AggregateKind::Average(BaseType::Float8), Some(sum)) => {
+                let average = evaluate_numeric_operator(
+                    &ast::BinaryOperator::Divide,
+                    sum,
+                    Value::Float8(self.count as f64),
+                )?;
+                match average {
+                    Value::Float8(value) if value == 0.0 => Value::Float8(0.0),
+                    average => average,
+                }
+            }
+            (AggregateKind::Average(_), _) => unreachable!("average accumulator type was checked"),
+            (_, Some(value)) => value,
+        };
+        Ok((value, call.result_type))
+    }
 }
