@@ -3347,7 +3347,7 @@ impl Session {
                 None,
             )
         };
-        let execution_statement = bound_statement.as_ref().unwrap_or(&statement.statement);
+        let execution_statement = bound_statement.as_deref().unwrap_or(&statement.statement);
         let started_implicit_transaction = self.transaction.is_none();
         if started_implicit_transaction {
             self.start_transaction(self.default_isolation, true);

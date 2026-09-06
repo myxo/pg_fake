@@ -1,6 +1,6 @@
 //! Parameter analysis and binding for prepared statements.
 
-use std::ops::ControlFlow;
+use std::{borrow::Cow, ops::ControlFlow};
 
 use sqlparser::ast;
 
@@ -802,12 +802,15 @@ pub(crate) fn coerce_parameters(
 }
 
 #[cfg_attr(feature = "execution-log", tracing::instrument(skip_all))]
-pub(crate) fn bind_parameters(
-    statement: &ast::Statement,
+pub(crate) fn bind_parameters<'a>(
+    statement: &'a ast::Statement,
     infer_parameter_types: &[BaseType],
     values: &[Value],
-) -> Result<ast::Statement> {
+) -> Result<Cow<'a, ast::Statement>> {
     let values = coerce_parameters(infer_parameter_types, values)?;
+    if values.is_empty() {
+        return Ok(Cow::Borrowed(statement));
+    }
     let mut statement = statement.clone();
     let mut error = None;
     let _ = ast::visit_expressions_mut(&mut statement, |expression| {
@@ -828,7 +831,7 @@ pub(crate) fn bind_parameters(
         *expression = create_typed_literal(values[index].clone(), PgType::create(target));
         ControlFlow::Continue(())
     });
-    error.map_or(Ok(statement), Err)
+    error.map_or(Ok(Cow::Owned(statement)), Err)
 }
 
 #[cfg_attr(feature = "execution-log", tracing::instrument(skip_all))]
