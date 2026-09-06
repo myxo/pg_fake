@@ -1821,8 +1821,14 @@ fn acquire_relation_locks<'a>(
     isolation: IsolationLevel,
     mut snapshot: Snapshot,
 ) -> Result<(MutexGuard<'a, DatabaseState>, Snapshot)> {
-    let lock_deadline = (timeout != Duration::ZERO).then(|| Instant::now() + timeout);
     let ddl = matches!(parser::classify(statement), parser::StatementKind::Ddl);
+    if !ddl && prepared_locks.is_some_and(|locks| state.relation_locks.can_reuse_locks(locks, xid))
+    {
+        state.wait_for.clear_wait(xid);
+        condvar.notify_all();
+        return Ok((state, snapshot));
+    }
+    let lock_deadline = (timeout != Duration::ZERO).then(|| Instant::now() + timeout);
     loop {
         if ddl {
             snapshot = Snapshot::create(&state.transactions).use_command(snapshot.command_id);
@@ -1969,7 +1975,8 @@ fn acquire_row_locks<'a>(
                         std::collections::btree_map::Entry::Occupied(entry) => {
                             let acquired = &mut acquired[*entry.get()];
                             if acquired.mutation_candidate.is_none() {
-                                acquired.mutation_candidate = required_lock.mutation_candidate.clone();
+                                acquired.mutation_candidate =
+                                    required_lock.mutation_candidate.clone();
                             }
                         }
                         std::collections::btree_map::Entry::Vacant(entry) => {
@@ -3870,10 +3877,12 @@ impl Session {
             },
             |procedural| procedural.deadline,
         );
-        let statement_timestamp = procedural.map_or_else(
-            || self.db.read_clock(),
-            |procedural| procedural.statement_timestamp,
-        );
+        let statement_timestamp = prepared_query.is_none().then(|| {
+            procedural.map_or_else(
+                || self.db.read_clock(),
+                |procedural| procedural.statement_timestamp,
+            )
+        });
         let was_read_only = transaction.read_only;
         transaction.read_only &=
             prepared_query.is_some() || is_plain_read_only_statement(statement);
@@ -4104,7 +4113,7 @@ impl Session {
         let context = executor::StatementExecutionContext {
             command_id,
             transaction_timestamp: transaction.transaction_timestamp,
-            statement_timestamp,
+            statement_timestamp: statement_timestamp.expect("fallback captures statement time"),
             clock_timestamp: self.db.read_clock(),
             deadline: statement_deadline,
             rng: self.db.rng.clone(),
@@ -5506,19 +5515,17 @@ mod tests {
             .execute("INSERT INTO clock_source VALUES (1)")
             .unwrap();
         session.execute("BEGIN").unwrap();
-        let first = session
-            .query(
-                "SELECT now(), statement_timestamp(), clock_timestamp() FROM clock_source",
-                &[],
-            )
+        let clock = session
+            .prepare("SELECT now(), statement_timestamp(), clock_timestamp() FROM clock_source")
             .unwrap();
+        let scan = session.prepare("SELECT id FROM clock_source").unwrap();
+        let first = session.query_prepared(&clock, &[]).unwrap();
         db.advance_time(chrono::Duration::seconds(1)).unwrap();
-        let second = session
-            .query(
-                "SELECT now(), statement_timestamp(), clock_timestamp() FROM clock_source",
-                &[],
-            )
-            .unwrap();
+        assert_eq!(
+            session.query_prepared(&scan, &[]).unwrap().rows,
+            vec![vec![Value::Int4(1)]]
+        );
+        let second = session.query_prepared(&clock, &[]).unwrap();
         assert_eq!(first.rows[0][0], second.rows[0][0]);
         assert_ne!(first.rows[0][1], second.rows[0][1]);
         assert_ne!(first.rows[0][2], second.rows[0][2]);
@@ -11275,6 +11282,48 @@ mod tests {
         assert_eq!(
             session.query("SELECT * FROM first", &[]).unwrap().rows,
             vec![vec![Value::Int4(1)]]
+        );
+    }
+
+    #[test]
+    fn reuses_prepared_read_locks_while_ddl_waits() {
+        let db = Db::create_builder()
+            .set_lock_timeout(Duration::from_secs(2))
+            .build();
+        let mut reader = db.create_session();
+        reader
+            .execute("CREATE TABLE held_read (id INTEGER); INSERT INTO held_read VALUES (1)")
+            .unwrap();
+        let statement = reader.prepare("SELECT id FROM held_read").unwrap();
+        reader.execute("BEGIN").unwrap();
+        reader.query_prepared(&statement, &[]).unwrap();
+        let mut writer = db.create_session();
+        let (sender, receiver) = mpsc::channel();
+        let handle = thread::spawn(move || {
+            sender
+                .send(writer.execute("ALTER TABLE held_read ADD COLUMN extra INTEGER"))
+                .unwrap();
+        });
+        wait_until_relation_blocked(&db);
+        for _ in 0..3 {
+            assert_eq!(
+                reader.query_prepared(&statement, &[]).unwrap().rows,
+                vec![vec![Value::Int4(1)]]
+            );
+        }
+        assert!(matches!(
+            receiver.try_recv(),
+            Err(mpsc::TryRecvError::Empty)
+        ));
+        reader.execute("COMMIT").unwrap();
+        receiver
+            .recv_timeout(Duration::from_secs(1))
+            .unwrap()
+            .unwrap();
+        handle.join().unwrap();
+        assert_eq!(
+            reader.query_prepared(&statement, &[]).unwrap_err().sqlstate,
+            SqlState::FeatureNotSupported
         );
     }
 

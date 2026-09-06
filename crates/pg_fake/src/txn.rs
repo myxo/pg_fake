@@ -223,6 +223,19 @@ impl RelationLockManager {
         }
     }
 
+    pub(crate) fn can_reuse_locks(
+        &self,
+        requested: &[(String, RelationLockMode)],
+        xid: Xid,
+    ) -> bool {
+        requested.iter().all(|(name, mode)| {
+            self.locks.get(name).is_some_and(|lock| {
+                lock.holders.get(&xid).is_some_and(|held| held >= mode)
+                    && !lock.waiters.iter().any(|(waiter, _)| *waiter == xid)
+            })
+        })
+    }
+
     #[cfg_attr(feature = "execution-log", tracing::instrument(skip_all))]
     pub(crate) fn acquire_many(
         &mut self,
