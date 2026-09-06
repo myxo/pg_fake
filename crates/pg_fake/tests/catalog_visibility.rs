@@ -198,6 +198,20 @@ fn clears_reused_session_catalogs_when_loading_an_old_snapshot() {
         first.query("SELECT * FROM later_rows", &[]).unwrap();
         second.query("SELECT * FROM later_rows", &[]).unwrap();
     }
+    let prepared = old.prepare("SELECT * FROM anchor_rows").unwrap();
+    for _ in 0..3 {
+        assert_eq!(
+            old.query_prepared(&prepared, &[]).unwrap().rows,
+            vec![vec![Value::Int4(1)]]
+        );
+    }
+    first
+        .execute("CREATE TABLE reclaimed_rows (id INTEGER); DROP TABLE reclaimed_rows")
+        .unwrap();
+    assert_eq!(
+        old.query_prepared(&prepared, &[]).unwrap().rows,
+        vec![vec![Value::Int4(1)]]
+    );
     assert_eq!(
         old.query("SELECT * FROM later_rows", &[])
             .unwrap_err()

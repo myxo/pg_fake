@@ -4,9 +4,9 @@ use rand_chacha::{ChaCha12Rng, rand_core::RngCore};
 use crate::{
     api::{ColumnMeta, QueryResult, StatementResult},
     catalog::{
-        Catalog, CatalogHistory, ColumnDef, ConstraintId, ForeignKey, ForeignKeyAction,
-        IdentityKind, IndexColumnDefinition, IndexSchema, RelationName, ResolvedRelationName,
-        SequenceSchema, TEMP_SCHEMA, TableId, TablePersistence, TableSchema,
+        Catalog, CatalogHistory, CatalogVisibility, ColumnDef, ConstraintId, ForeignKey,
+        ForeignKeyAction, IdentityKind, IndexColumnDefinition, IndexSchema, RelationName,
+        ResolvedRelationName, SequenceSchema, TEMP_SCHEMA, TableId, TablePersistence, TableSchema,
     },
     coercion::{self, CastContext},
     error::{PgError, Result, SqlState, reject_unsupported},
@@ -53,8 +53,9 @@ mod views;
 mod writes;
 
 use aggregates::{
-    AggregateCall, AggregateInput, evaluate_prepared_aggregate_function, infer_aggregate_return_type,
-    is_aggregate_function, parse_aggregate_call, prepare_aggregate_function_input,
+    AggregateCall, AggregateInput, evaluate_prepared_aggregate_function,
+    infer_aggregate_return_type, is_aggregate_function, parse_aggregate_call,
+    prepare_aggregate_function_input,
 };
 use arithmetic::{
     evaluate_boolean_operator, evaluate_distinctness, evaluate_numeric_operator,
@@ -589,7 +590,7 @@ impl StatementExecutionContext {
 
 #[derive(Clone)]
 pub(crate) struct DatabaseState {
-    loaded_catalog: Option<(u64, Option<crate::catalog::SchemaId>)>,
+    loaded_catalog: Option<(CatalogVisibility, Option<crate::catalog::SchemaId>)>,
     inactive_catalogs: BTreeMap<Option<crate::catalog::SchemaId>, Catalog>,
     pub(crate) catalog: Catalog,
     pub(crate) catalog_history: CatalogHistory,
@@ -652,19 +653,16 @@ impl DatabaseState {
         snapshot: Snapshot,
         temporary_schema_id: Option<crate::catalog::SchemaId>,
     ) {
-        let current_catalog = self
+        let visibility = self
             .catalog_history
-            .resolve_current_generation(xid, snapshot, &self.transactions)
-            .map(|generation| (generation, temporary_schema_id));
-        if current_catalog.is_some() && current_catalog == self.loaded_catalog {
+            .resolve_visibility(xid, snapshot, &self.transactions);
+        let catalog_key = (visibility, temporary_schema_id);
+        if self.loaded_catalog == Some(catalog_key) {
             return;
         }
         let previous_key = self.loaded_catalog.take();
-        let same_generation = matches!(
-            (previous_key, current_catalog),
-            (Some((previous, _)), Some((current, _))) if previous == current
-        );
-        if !same_generation {
+        let same_visibility = previous_key.is_some_and(|(previous, _)| previous == visibility);
+        if !same_visibility {
             self.inactive_catalogs.clear();
         }
         let cached = self.inactive_catalogs.remove(&temporary_schema_id);
@@ -678,9 +676,9 @@ impl DatabaseState {
             )
         });
         let previous = std::mem::replace(&mut self.catalog, catalog);
-        if same_generation {
+        if same_visibility {
             let (_, previous_schema_id) =
-                previous_key.expect("same generation has a loaded catalog");
+                previous_key.expect("same visibility has a loaded catalog");
             self.inactive_catalogs.insert(previous_schema_id, previous);
         }
         if !cache_hit {
@@ -691,7 +689,7 @@ impl DatabaseState {
                 }
             }
         }
-        self.loaded_catalog = current_catalog;
+        self.loaded_catalog = Some(catalog_key);
     }
 
     pub(crate) fn commit_loaded_catalog_transaction(
@@ -704,16 +702,14 @@ impl DatabaseState {
         let reusable = self.catalog_history.can_reuse_after_commit(xid, snapshot);
         let commit_seq = self.transactions.commit(xid);
         if reusable {
-            let generation = self
-                .catalog_history
-                .resolve_current_generation(
-                    None,
-                    Snapshot::create(&self.transactions),
-                    &self.transactions,
-                )
-                .expect("committed current catalog has no pending DDL");
+            let visibility = self.catalog_history.resolve_visibility(
+                None,
+                Snapshot::create(&self.transactions),
+                &self.transactions,
+            );
+            assert!(matches!(visibility, CatalogVisibility::Current(_)));
             self.inactive_catalogs.clear();
-            self.loaded_catalog = Some((generation, temporary_schema_id));
+            self.loaded_catalog = Some((visibility, temporary_schema_id));
         }
         commit_seq
     }

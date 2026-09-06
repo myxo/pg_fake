@@ -295,9 +295,21 @@ struct CatalogVersion<T> {
     value: T,
 }
 
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(crate) enum CatalogVisibility {
+    Current(u64),
+    Snapshot {
+        generation: u64,
+        pruning_generation: u64,
+        xid: Option<Xid>,
+        snapshot: Snapshot,
+    },
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct CatalogHistory {
     generation: u64,
+    pruning_generation: u64,
     pending_transactions: BTreeSet<Xid>,
     latest_commit: CommitSeq,
     schemas: BTreeMap<SchemaId, Vec<CatalogVersion<SchemaIdentity>>>,
@@ -1545,6 +1557,7 @@ impl CatalogHistory {
         };
         CatalogHistory {
             generation: 0,
+            pruning_generation: 0,
             pending_transactions: BTreeSet::new(),
             latest_commit: CommitSeq(0),
             schemas: BTreeMap::from([(
@@ -1579,12 +1592,12 @@ impl CatalogHistory {
         id
     }
 
-    pub(crate) fn resolve_current_generation(
+    pub(crate) fn resolve_visibility(
         &mut self,
         xid: Option<Xid>,
         snapshot: Snapshot,
         transactions: &TransactionRegistry,
-    ) -> Option<u64> {
+    ) -> CatalogVisibility {
         self.pending_transactions
             .retain(|pending| match transactions.get_status(*pending) {
                 Some(TransactionStatus::InFlight) => true,
@@ -1598,12 +1611,26 @@ impl CatalogHistory {
                     false
                 }
             });
-        (self.pending_transactions.is_empty()
+        if self.pending_transactions.is_empty()
             && snapshot.commit_seq >= self.latest_commit
-            && xid.is_none_or(|xid| {
-                transactions.get_status(xid) == Some(TransactionStatus::InFlight)
-            }))
-        .then_some(self.generation)
+            && xid
+                .is_none_or(|xid| transactions.get_status(xid) == Some(TransactionStatus::InFlight))
+        {
+            return CatalogVisibility::Current(self.generation);
+        }
+        let mut snapshot = snapshot;
+        if xid.is_none_or(|xid| {
+            transactions.get_status(xid) == Some(TransactionStatus::InFlight)
+                && !self.pending_transactions.contains(&xid)
+        }) {
+            snapshot.command_id = CommandId(0);
+        }
+        CatalogVisibility::Snapshot {
+            generation: self.generation,
+            pruning_generation: self.pruning_generation,
+            xid,
+            snapshot,
+        }
     }
 
     pub(crate) fn can_reuse_after_commit(&self, xid: Xid, snapshot: Snapshot) -> bool {
@@ -1988,6 +2015,7 @@ impl CatalogHistory {
         transactions: &TransactionRegistry,
         protected_tables: &std::collections::BTreeSet<TableId>,
     ) -> ReclaimedCatalogObjects {
+        self.pruning_generation += 1;
         prune_catalog_versions(
             &mut self.schemas,
             horizon,
