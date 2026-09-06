@@ -590,6 +590,7 @@ impl StatementExecutionContext {
 #[derive(Clone)]
 pub(crate) struct DatabaseState {
     loaded_catalog: Option<(u64, Option<crate::catalog::SchemaId>)>,
+    inactive_catalogs: BTreeMap<Option<crate::catalog::SchemaId>, Catalog>,
     pub(crate) catalog: Catalog,
     pub(crate) catalog_history: CatalogHistory,
     pub(crate) tables: BTreeMap<TableId, Table>,
@@ -630,6 +631,7 @@ impl DatabaseState {
             catalog_history.materialize(None, Snapshot::create(&transactions), &transactions);
         DatabaseState {
             loaded_catalog: None,
+            inactive_catalogs: BTreeMap::new(),
             catalog,
             catalog_history,
             tables: BTreeMap::new(),
@@ -657,20 +659,63 @@ impl DatabaseState {
         if current_catalog.is_some() && current_catalog == self.loaded_catalog {
             return;
         }
-        self.loaded_catalog = None;
-        self.catalog = self.catalog_history.materialize_for_session(
-            xid,
-            snapshot,
-            &self.transactions,
-            temporary_schema_id,
+        let previous_key = self.loaded_catalog.take();
+        let same_generation = matches!(
+            (previous_key, current_catalog),
+            (Some((previous, _)), Some((current, _))) if previous == current
         );
-        let schemas = self.catalog.iterate_tables().cloned().collect::<Vec<_>>();
-        for schema in schemas {
-            if let Some(table) = self.tables.get_mut(&schema.id) {
-                table.replace_schema(schema);
+        if !same_generation {
+            self.inactive_catalogs.clear();
+        }
+        let cached = self.inactive_catalogs.remove(&temporary_schema_id);
+        let cache_hit = cached.is_some();
+        let catalog = cached.unwrap_or_else(|| {
+            self.catalog_history.materialize_for_session(
+                xid,
+                snapshot,
+                &self.transactions,
+                temporary_schema_id,
+            )
+        });
+        let previous = std::mem::replace(&mut self.catalog, catalog);
+        if same_generation {
+            let (_, previous_schema_id) =
+                previous_key.expect("same generation has a loaded catalog");
+            self.inactive_catalogs.insert(previous_schema_id, previous);
+        }
+        if !cache_hit {
+            let schemas = self.catalog.iterate_tables().cloned().collect::<Vec<_>>();
+            for schema in schemas {
+                if let Some(table) = self.tables.get_mut(&schema.id) {
+                    table.replace_schema(schema);
+                }
             }
         }
         self.loaded_catalog = current_catalog;
+    }
+
+    pub(crate) fn commit_loaded_catalog_transaction(
+        &mut self,
+        xid: Xid,
+        snapshot: Snapshot,
+        temporary_schema_id: Option<crate::catalog::SchemaId>,
+    ) -> CommitSeq {
+        // The commit path has loaded and synchronized the final catalog under this lock.
+        let reusable = self.catalog_history.can_reuse_after_commit(xid, snapshot);
+        let commit_seq = self.transactions.commit(xid);
+        if reusable {
+            let generation = self
+                .catalog_history
+                .resolve_current_generation(
+                    None,
+                    Snapshot::create(&self.transactions),
+                    &self.transactions,
+                )
+                .expect("committed current catalog has no pending DDL");
+            self.inactive_catalogs.clear();
+            self.loaded_catalog = Some((generation, temporary_schema_id));
+        }
+        commit_seq
     }
 
     #[cfg_attr(feature = "execution-log", tracing::instrument(skip_all))]

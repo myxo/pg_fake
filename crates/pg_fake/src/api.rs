@@ -3485,7 +3485,11 @@ impl Session {
             self.db.condvar.notify_all();
             return Err(error);
         }
-        let commit_seq = state.transactions.commit(transaction.xid);
+        let commit_seq = state.commit_loaded_catalog_transaction(
+            transaction.xid,
+            snapshot,
+            Some(self.temporary_schema_id),
+        );
         for table_id in state.take_touched_tables(transaction.xid) {
             let has_reclamation = state
                 .tables

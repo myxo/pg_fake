@@ -1521,6 +1521,12 @@ impl CatalogHistory {
         .then_some(self.generation)
     }
 
+    pub(crate) fn can_reuse_after_commit(&self, xid: Xid, snapshot: Snapshot) -> bool {
+        self.pending_transactions.len() == 1
+            && self.pending_transactions.contains(&xid)
+            && snapshot.commit_seq >= self.latest_commit
+    }
+
     #[cfg_attr(feature = "execution-log", tracing::instrument(skip_all))]
     pub(crate) fn materialize(
         &self,
