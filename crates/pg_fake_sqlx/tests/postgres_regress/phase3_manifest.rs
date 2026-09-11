@@ -240,6 +240,50 @@ pub const FEATURES: &[Feature] = &[
         }],
     },
     Feature {
+        name: "migration data transforms",
+        cases: &[
+            Case {
+                id: "window_partition_and_order",
+                source: "window.sql:47 plus focused JSONB partition fixture",
+                setup: &[
+                    "CREATE TABLE phase3_transform_window (id INTEGER, payload JSONB)",
+                    "INSERT INTO phase3_transform_window VALUES (2, '{\"a\":1}'), (1, '{\"a\":1.0}'), (3, NULL), (4, NULL)",
+                ],
+                sql: "SELECT id, row_number() OVER (ORDER BY id), count(*) OVER (PARTITION BY payload) FROM phase3_transform_window ORDER BY id",
+                blocker: BlockerKind::Implementation,
+            },
+            Case {
+                id: "ordered_string_aggregate",
+                source: "aggregates.sql plus focused migration fixture",
+                setup: &[
+                    "CREATE TABLE phase3_transform_aggregate (id INTEGER, label TEXT)",
+                    "INSERT INTO phase3_transform_aggregate VALUES (2, ' b '), (1, 'a'), (3, NULL)",
+                ],
+                sql: "SELECT count(*), max(id), string_agg(btrim(label), ',' ORDER BY id) FROM phase3_transform_aggregate",
+                blocker: BlockerKind::Implementation,
+            },
+            Case {
+                id: "migration_predicates_and_temporal_expressions",
+                source: "focused migration expression fixture",
+                setup: &[],
+                sql: "SELECT NULL IS DISTINCT FROM NULL, 2 IN (1, 2, NULL), NOT EXISTS (SELECT 1 WHERE false), 'ABC-12' ~ '^[A-Z]{3}-([0-9]{2})$', extract(epoch FROM '1970-01-01 00:00:05+00'::timestamptz)::bigint, (CURRENT_TIMESTAMP + INTERVAL '7 days') > CURRENT_TIMESTAMP",
+                blocker: BlockerKind::Implementation,
+            },
+            Case {
+                id: "insert_select_and_update_from",
+                source: "focused migration DML fixture",
+                setup: &[
+                    "CREATE TABLE phase3_transform_source (id INTEGER, amount BIGINT)",
+                    "CREATE TABLE phase3_transform_destination (id INTEGER PRIMARY KEY, amount BIGINT)",
+                    "INSERT INTO phase3_transform_source VALUES (1, 7), (2, 12)",
+                    "WITH selected AS MATERIALIZED (SELECT * FROM phase3_transform_source) INSERT INTO phase3_transform_destination SELECT * FROM selected ON CONFLICT (id) DO NOTHING",
+                ],
+                sql: "UPDATE phase3_transform_destination AS destination SET amount = source.amount * 2 FROM (SELECT * FROM phase3_transform_source) AS source WHERE destination.id = source.id RETURNING destination.id, destination.amount",
+                blocker: BlockerKind::Implementation,
+            },
+        ],
+    },
+    Feature {
         name: "window offset and value functions",
         cases: &[Case {
             id: "lag",

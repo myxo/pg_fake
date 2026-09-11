@@ -349,7 +349,7 @@ pub(super) fn evaluate_temporal_arithmetic(
     ) -> Result<crate::value::PgInterval> {
         if !factor.is_finite() {
             return Err(PgError::create(
-                SqlState::NumericValueOutOfRange,
+                SqlState::IntervalFieldOverflow,
                 "interval out of range",
             ));
         }
@@ -368,7 +368,7 @@ pub(super) fn evaluate_temporal_arithmetic(
             || scaled_micros > i64::MAX as f64
         {
             return Err(PgError::create(
-                SqlState::NumericValueOutOfRange,
+                SqlState::IntervalFieldOverflow,
                 "interval out of range",
             ));
         }
@@ -382,44 +382,53 @@ pub(super) fn evaluate_temporal_arithmetic(
     fn negate_interval_if(
         mut interval: crate::value::PgInterval,
         negative: bool,
-    ) -> crate::value::PgInterval {
+    ) -> Result<crate::value::PgInterval> {
         if negative {
-            interval.months = -interval.months;
-            interval.days = -interval.days;
-            interval.micros = -interval.micros;
+            interval.months = interval.months.checked_neg().ok_or_else(|| {
+                PgError::create(SqlState::IntervalFieldOverflow, "interval out of range")
+            })?;
+            interval.days = interval.days.checked_neg().ok_or_else(|| {
+                PgError::create(SqlState::IntervalFieldOverflow, "interval out of range")
+            })?;
+            interval.micros = interval.micros.checked_neg().ok_or_else(|| {
+                PgError::create(SqlState::IntervalFieldOverflow, "interval out of range")
+            })?;
         }
-        interval
+        Ok(interval)
     }
     #[cfg_attr(feature = "execution-log", tracing::instrument(skip_all))]
     fn add_interval_to_timestamp(
         mut value: chrono::NaiveDateTime,
         interval: crate::value::PgInterval,
+        subtract: bool,
     ) -> Result<chrono::NaiveDateTime> {
         if interval.months != 0 {
-            value = if interval.months > 0 {
-                value.checked_add_months(Months::new(interval.months as u32))
+            value = if (interval.months > 0) != subtract {
+                value.checked_add_months(Months::new(interval.months.unsigned_abs()))
             } else {
                 value.checked_sub_months(Months::new(interval.months.unsigned_abs()))
             }
             .ok_or_else(|| {
-                PgError::create(SqlState::NumericValueOutOfRange, "timestamp out of range")
+                PgError::create(SqlState::DatetimeFieldOverflow, "timestamp out of range")
             })?;
         }
         if interval.days != 0 {
-            value = if interval.days > 0 {
-                value.checked_add_days(Days::new(interval.days as u64))
+            value = if (interval.days > 0) != subtract {
+                value.checked_add_days(Days::new(interval.days.unsigned_abs() as u64))
             } else {
                 value.checked_sub_days(Days::new(interval.days.unsigned_abs() as u64))
             }
             .ok_or_else(|| {
-                PgError::create(SqlState::NumericValueOutOfRange, "timestamp out of range")
+                PgError::create(SqlState::DatetimeFieldOverflow, "timestamp out of range")
             })?;
         }
-        value
-            .checked_add_signed(TimeDelta::microseconds(interval.micros))
-            .ok_or_else(|| {
-                PgError::create(SqlState::NumericValueOutOfRange, "timestamp out of range")
-            })
+        let micros = TimeDelta::microseconds(interval.micros);
+        if subtract {
+            value.checked_sub_signed(micros)
+        } else {
+            value.checked_add_signed(micros)
+        }
+        .ok_or_else(|| PgError::create(SqlState::DatetimeFieldOverflow, "timestamp out of range"))
     }
     match (operator, left, right) {
         (
@@ -427,16 +436,16 @@ pub(super) fn evaluate_temporal_arithmetic(
             Value::Interval(left),
             Value::Interval(right),
         ) => {
-            let right = negate_interval_if(right, matches!(operator, ast::BinaryOperator::Minus));
+            let right = negate_interval_if(right, matches!(operator, ast::BinaryOperator::Minus))?;
             Ok(Value::Interval(crate::value::PgInterval {
                 months: left.months.checked_add(right.months).ok_or_else(|| {
-                    PgError::create(SqlState::NumericValueOutOfRange, "interval out of range")
+                    PgError::create(SqlState::IntervalFieldOverflow, "interval out of range")
                 })?,
                 days: left.days.checked_add(right.days).ok_or_else(|| {
-                    PgError::create(SqlState::NumericValueOutOfRange, "interval out of range")
+                    PgError::create(SqlState::IntervalFieldOverflow, "interval out of range")
                 })?,
                 micros: left.micros.checked_add(right.micros).ok_or_else(|| {
-                    PgError::create(SqlState::NumericValueOutOfRange, "interval out of range")
+                    PgError::create(SqlState::IntervalFieldOverflow, "interval out of range")
                 })?,
             }))
         }
@@ -452,7 +461,7 @@ pub(super) fn evaluate_temporal_arithmetic(
                 Value::Float4(v) => f64::from(v),
                 Value::Float8(v) => v,
                 Value::Numeric(v) => v.to_f64().ok_or_else(|| {
-                    PgError::create(SqlState::NumericValueOutOfRange, "interval out of range")
+                    PgError::create(SqlState::IntervalFieldOverflow, "interval out of range")
                 })?,
                 _ => {
                     return Err(PgError::create(
@@ -487,7 +496,8 @@ pub(super) fn evaluate_temporal_arithmetic(
         ) => {
             let value = add_interval_to_timestamp(
                 date.and_hms_opt(0, 0, 0).expect("midnight is valid"),
-                negate_interval_if(interval, matches!(operator, ast::BinaryOperator::Minus)),
+                interval,
+                matches!(operator, ast::BinaryOperator::Minus),
             )?;
             Ok(Value::Timestamp(crate::value::PgTimestamp::Finite(value)))
         }
@@ -501,7 +511,8 @@ pub(super) fn evaluate_temporal_arithmetic(
         ) => Ok(Value::Timestamp(crate::value::PgTimestamp::Finite(
             add_interval_to_timestamp(
                 value,
-                negate_interval_if(interval, matches!(operator, ast::BinaryOperator::Minus)),
+                interval,
+                matches!(operator, ast::BinaryOperator::Minus),
             )?,
         ))),
         (
@@ -511,7 +522,8 @@ pub(super) fn evaluate_temporal_arithmetic(
         ) => Ok(Value::TimestampTz(crate::value::PgTimestampTz::Finite(
             add_interval_to_timestamp(
                 value.naive_utc(),
-                negate_interval_if(interval, matches!(operator, ast::BinaryOperator::Minus)),
+                interval,
+                matches!(operator, ast::BinaryOperator::Minus),
             )?
             .and_utc(),
         ))),

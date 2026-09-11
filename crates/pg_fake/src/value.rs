@@ -503,16 +503,31 @@ fn parse_interval(input: &str) -> Result<PgInterval> {
             let second = fields[2]
                 .parse::<f64>()
                 .map_err(|_| create_invalid_text_error(input, "interval"))?;
-            value.micros = value
-                .micros
-                .checked_add(
-                    sign * (hour * 3_600_000_000
-                        + minute * 60_000_000
-                        + (second * 1_000_000.0).round() as i64),
-                )
+            let second_micros = second * 1_000_000.0;
+            if !second_micros.is_finite()
+                || second_micros < i64::MIN as f64
+                || second_micros > i64::MAX as f64
+            {
+                return Err(PgError::create(
+                    SqlState::IntervalFieldOverflow,
+                    "interval out of range",
+                ));
+            }
+            let micros = hour
+                .checked_mul(3_600_000_000)
+                .and_then(|value| {
+                    minute
+                        .checked_mul(60_000_000)
+                        .and_then(|minutes| value.checked_add(minutes))
+                })
+                .and_then(|value| value.checked_add(second_micros.round() as i64))
+                .and_then(|value| value.checked_mul(sign))
                 .ok_or_else(|| {
-                    PgError::create(SqlState::NumericValueOutOfRange, "interval out of range")
+                    PgError::create(SqlState::IntervalFieldOverflow, "interval out of range")
                 })?;
+            value.micros = value.micros.checked_add(micros).ok_or_else(|| {
+                PgError::create(SqlState::IntervalFieldOverflow, "interval out of range")
+            })?;
             index += 1;
             continue;
         }
@@ -529,69 +544,69 @@ fn parse_interval(input: &str) -> Result<PgInterval> {
                     .checked_add(
                         i32::try_from(number.checked_mul(12).ok_or_else(|| {
                             PgError::create(
-                                SqlState::NumericValueOutOfRange,
+                                SqlState::IntervalFieldOverflow,
                                 "interval out of range",
                             )
                         })?)
                         .map_err(|_| {
                             PgError::create(
-                                SqlState::NumericValueOutOfRange,
+                                SqlState::IntervalFieldOverflow,
                                 "interval out of range",
                             )
                         })?,
                     )
                     .ok_or_else(|| {
-                        PgError::create(SqlState::NumericValueOutOfRange, "interval out of range")
+                        PgError::create(SqlState::IntervalFieldOverflow, "interval out of range")
                     })?
             }
             "mon" | "mons" | "month" | "months" => {
                 value.months = value
                     .months
                     .checked_add(i32::try_from(number).map_err(|_| {
-                        PgError::create(SqlState::NumericValueOutOfRange, "interval out of range")
+                        PgError::create(SqlState::IntervalFieldOverflow, "interval out of range")
                     })?)
                     .ok_or_else(|| {
-                        PgError::create(SqlState::NumericValueOutOfRange, "interval out of range")
+                        PgError::create(SqlState::IntervalFieldOverflow, "interval out of range")
                     })?
             }
             "day" | "days" => {
                 value.days = value
                     .days
                     .checked_add(i32::try_from(number).map_err(|_| {
-                        PgError::create(SqlState::NumericValueOutOfRange, "interval out of range")
+                        PgError::create(SqlState::IntervalFieldOverflow, "interval out of range")
                     })?)
                     .ok_or_else(|| {
-                        PgError::create(SqlState::NumericValueOutOfRange, "interval out of range")
+                        PgError::create(SqlState::IntervalFieldOverflow, "interval out of range")
                     })?
             }
             "hour" | "hours" => {
                 value.micros = value
                     .micros
                     .checked_add(number.checked_mul(3_600_000_000).ok_or_else(|| {
-                        PgError::create(SqlState::NumericValueOutOfRange, "interval out of range")
+                        PgError::create(SqlState::IntervalFieldOverflow, "interval out of range")
                     })?)
                     .ok_or_else(|| {
-                        PgError::create(SqlState::NumericValueOutOfRange, "interval out of range")
+                        PgError::create(SqlState::IntervalFieldOverflow, "interval out of range")
                     })?
             }
             "minute" | "minutes" | "min" | "mins" => {
                 value.micros = value
                     .micros
                     .checked_add(number.checked_mul(60_000_000).ok_or_else(|| {
-                        PgError::create(SqlState::NumericValueOutOfRange, "interval out of range")
+                        PgError::create(SqlState::IntervalFieldOverflow, "interval out of range")
                     })?)
                     .ok_or_else(|| {
-                        PgError::create(SqlState::NumericValueOutOfRange, "interval out of range")
+                        PgError::create(SqlState::IntervalFieldOverflow, "interval out of range")
                     })?
             }
             "second" | "seconds" | "sec" | "secs" => {
                 value.micros = value
                     .micros
                     .checked_add(number.checked_mul(1_000_000).ok_or_else(|| {
-                        PgError::create(SqlState::NumericValueOutOfRange, "interval out of range")
+                        PgError::create(SqlState::IntervalFieldOverflow, "interval out of range")
                     })?)
                     .ok_or_else(|| {
-                        PgError::create(SqlState::NumericValueOutOfRange, "interval out of range")
+                        PgError::create(SqlState::IntervalFieldOverflow, "interval out of range")
                     })?
             }
             _ => return Err(create_invalid_text_error(input, "interval")),

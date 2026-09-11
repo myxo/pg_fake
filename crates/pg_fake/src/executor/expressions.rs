@@ -1,4 +1,5 @@
 use super::*;
+use bigdecimal::{BigDecimal, num_bigint::BigInt};
 use sqlparser::ast;
 
 #[cfg_attr(feature = "execution-log", tracing::instrument(skip_all))]
@@ -411,6 +412,17 @@ pub(crate) fn infer_expression_type(expr: &ast::Expr, schema: RowScope<'_>) -> R
             }
             Ok(BaseType::TextArray)
         }
+        ast::Expr::Interval(interval)
+            if interval.leading_field.is_none()
+                && interval.leading_precision.is_none()
+                && interval.last_field.is_none()
+                && interval.fractional_seconds_precision.is_none() =>
+        {
+            if extract_unknown_string_literal(&interval.value).is_none() {
+                return reject_unsupported("interval expression is not implemented");
+            }
+            Ok(BaseType::Interval)
+        }
         ast::Expr::BinaryOp { left, op, right } => match op {
             ast::BinaryOperator::Plus
             | ast::BinaryOperator::Minus
@@ -442,6 +454,21 @@ pub(crate) fn infer_expression_type(expr: &ast::Expr, schema: RowScope<'_>) -> R
             | ast::BinaryOperator::LtEq => {
                 let data_type = resolve_operator_type(left, right, schema)?;
                 validate_comparison_type(op, data_type)?;
+                Ok(BaseType::Bool)
+            }
+            ast::BinaryOperator::PGRegexMatch => {
+                for expression in [left.as_ref(), right.as_ref()] {
+                    let base = infer_expression_type(expression, schema)?;
+                    if !matches!(base, BaseType::Text | BaseType::Varchar | BaseType::Bpchar)
+                        && !is_null_literal(expression)
+                        && extract_unknown_string_literal(expression).is_none()
+                    {
+                        return Err(PgError::create(
+                            SqlState::UndefinedFunction,
+                            "operator does not exist for these argument types",
+                        ));
+                    }
+                }
                 Ok(BaseType::Bool)
             }
             ast::BinaryOperator::And | ast::BinaryOperator::Or => {
@@ -768,11 +795,15 @@ pub(super) fn extract_function_arguments(function: &ast::Function) -> Result<Vec
     {
         return reject_unsupported("function feature is not implemented");
     }
-    let ast::FunctionArguments::List(arguments) = &function.args else {
-        return Err(PgError::create(
-            SqlState::UndefinedFunction,
-            "function signature does not exist",
-        ));
+    let arguments = match &function.args {
+        ast::FunctionArguments::None => return Ok(Vec::new()),
+        ast::FunctionArguments::List(arguments) => arguments,
+        ast::FunctionArguments::Subquery(_) => {
+            return Err(PgError::create(
+                SqlState::UndefinedFunction,
+                "function signature does not exist",
+            ));
+        }
     };
     if arguments.duplicate_treatment.is_some() || !arguments.clauses.is_empty() {
         return reject_unsupported("function argument feature is not implemented");
@@ -788,7 +819,91 @@ pub(super) fn extract_function_arguments(function: &ast::Function) -> Result<Vec
 }
 
 #[cfg_attr(feature = "execution-log", tracing::instrument(skip_all))]
+pub(super) fn infer_window_return_type(
+    function: &ast::Function,
+    schema: RowScope<'_>,
+) -> Result<Option<BaseType>> {
+    let Some(ast::WindowType::WindowSpec(window)) = &function.over else {
+        if function.over.is_some() {
+            return reject_unsupported("named windows are not implemented");
+        }
+        return Ok(None);
+    };
+    let name = normalize_unqualified_object_name(&function.name)?;
+    if function.uses_odbc_syntax
+        || !matches!(function.parameters, ast::FunctionArguments::None)
+        || function.filter.is_some()
+        || function.null_treatment.is_some()
+        || !function.within_group.is_empty()
+        || window.window_name.is_some()
+        || window.window_frame.is_some()
+    {
+        return reject_unsupported("window function feature is not implemented");
+    }
+    match name.as_str() {
+        "row_number" => {
+            let ast::FunctionArguments::List(arguments) = &function.args else {
+                return Err(PgError::create(
+                    SqlState::UndefinedFunction,
+                    "function row_number does not exist",
+                ));
+            };
+            if !arguments.args.is_empty()
+                || !arguments.clauses.is_empty()
+                || arguments.duplicate_treatment.is_some()
+                || !window.partition_by.is_empty()
+                || window.order_by.is_empty()
+            {
+                return reject_unsupported("row_number window shape is not implemented");
+            }
+            for order in &window.order_by {
+                if order.with_fill.is_some()
+                    || matches!(order.options.sort, Some(ast::OrderBySort::Using(_)))
+                {
+                    return reject_unsupported("window order feature is not implemented");
+                }
+                validate_ordering_type(infer_expression_type(&order.expr, schema)?)?;
+            }
+            Ok(Some(BaseType::Int8))
+        }
+        "count" => {
+            let ast::FunctionArguments::List(arguments) = &function.args else {
+                return Err(PgError::create(
+                    SqlState::UndefinedFunction,
+                    "function count does not exist",
+                ));
+            };
+            if arguments.args.is_empty() {
+                return Err(PgError::create(
+                    SqlState::WrongObjectType,
+                    "count requires an argument or wildcard",
+                ));
+            }
+            if !matches!(
+                arguments.args.as_slice(),
+                [ast::FunctionArg::Unnamed(ast::FunctionArgExpr::Wildcard)]
+            ) || !arguments.clauses.is_empty()
+                || arguments.duplicate_treatment.is_some()
+                || window.partition_by.len() != 1
+                || !window.order_by.is_empty()
+            {
+                return reject_unsupported("count window shape is not implemented");
+            }
+            validate_equality_type(infer_expression_type(&window.partition_by[0], schema)?)?;
+            Ok(Some(BaseType::Int8))
+        }
+        _ => Err(PgError::create(
+            SqlState::UndefinedFunction,
+            format!("function {name} does not exist"),
+        )),
+    }
+}
+
+#[cfg_attr(feature = "execution-log", tracing::instrument(skip_all))]
 fn infer_function_return_type(function: &ast::Function, schema: RowScope<'_>) -> Result<BaseType> {
+    if let Some(result) = infer_window_return_type(function, schema)? {
+        return Ok(result);
+    }
     if let Some(result) = infer_aggregate_return_type(function, schema)? {
         return Ok(result);
     }
@@ -815,7 +930,7 @@ fn infer_function_return_type(function: &ast::Function, schema: RowScope<'_>) ->
             validate_equality_type(data_type)?;
             Ok(data_type)
         }
-        "length" | "lower" | "upper" if arguments.len() == 1 => {
+        "length" | "lower" | "upper" | "btrim" if arguments.len() == 1 => {
             let base = infer_expression_type(arguments[0], schema)?;
             if !is_null_literal(arguments[0])
                 && !matches!(base, BaseType::Text | BaseType::Varchar | BaseType::Bpchar)
@@ -839,7 +954,11 @@ fn infer_function_return_type(function: &ast::Function, schema: RowScope<'_>) ->
             Ok(base)
         }
         "gen_random_uuid" | "uuidv4" | "uuidv7" if arguments.is_empty() => Ok(BaseType::Uuid),
-        "now" | "transaction_timestamp" | "statement_timestamp" | "clock_timestamp"
+        "now"
+        | "current_timestamp"
+        | "transaction_timestamp"
+        | "statement_timestamp"
+        | "clock_timestamp"
             if arguments.is_empty() =>
         {
             Ok(BaseType::TimestampTz)
@@ -869,6 +988,7 @@ fn infer_function_return_type(function: &ast::Function, schema: RowScope<'_>) ->
         | "length"
         | "lower"
         | "upper"
+        | "btrim"
         | "abs"
         | "nextval"
         | "currval"
@@ -946,6 +1066,16 @@ pub(super) fn evaluate(
                 .collect::<Result<Vec<_>>>()?;
             Ok(Value::TextArray(values))
         }
+        ast::Expr::Interval(interval)
+            if interval.leading_field.is_none()
+                && interval.leading_precision.is_none()
+                && interval.last_field.is_none()
+                && interval.fractional_seconds_precision.is_none() =>
+        {
+            let text = extract_unknown_string_literal(&interval.value)
+                .expect("interval expression type was checked");
+            Value::parse(BaseType::Interval, text)
+        }
         ast::Expr::BinaryOp { left, op, right } => {
             if let Some((l, r, result)) = super::json::infer_json_operator(op, left, right, schema)?
             {
@@ -1019,6 +1149,16 @@ pub(super) fn evaluate(
                 }
                 ast::BinaryOperator::And | ast::BinaryOperator::Or => {
                     evaluate_boolean_operator(op, left, right)
+                }
+                ast::BinaryOperator::PGRegexMatch => {
+                    let (Value::Text(value), Value::Text(pattern)) = (left, right) else {
+                        return Ok(Value::Null);
+                    };
+                    validate_regex_repetition_bounds(&pattern)?;
+                    let regex = regex::Regex::new(&pattern).map_err(|error| {
+                        PgError::create(SqlState::InvalidRegularExpression, error.to_string())
+                    })?;
+                    Ok(Value::Bool(regex.is_match(&value)))
                 }
                 _ => reject_unsupported("operator is not implemented"),
             }
@@ -1360,6 +1500,12 @@ fn evaluate_function(
     row: &[Value],
     context: &StatementExecutionContext,
 ) -> Result<Value> {
+    if infer_window_return_type(function, schema)?.is_some() {
+        return Err(PgError::create(
+            SqlState::GroupingError,
+            "window function is not allowed in this context",
+        ));
+    }
     if is_aggregate_function(function) {
         infer_aggregate_return_type(function, schema)?;
         return Err(PgError::create(
@@ -1411,9 +1557,15 @@ fn evaluate_function(
                 uuid::Builder::from_unix_timestamp_millis(milliseconds, &bytes).into_uuid(),
             ))
         }
-        "now" | "transaction_timestamp" | "statement_timestamp" | "clock_timestamp" => {
+        "now"
+        | "current_timestamp"
+        | "transaction_timestamp"
+        | "statement_timestamp"
+        | "clock_timestamp" => {
             let value = match function_name.as_str() {
-                "now" | "transaction_timestamp" => context.transaction_timestamp,
+                "now" | "current_timestamp" | "transaction_timestamp" => {
+                    context.transaction_timestamp
+                }
                 "statement_timestamp" => context.statement_timestamp,
                 "clock_timestamp" => context.clock_timestamp,
                 _ => unreachable!(),
@@ -1626,6 +1778,11 @@ fn evaluate_function(
             }
             _ => unreachable!("upper argument was type-checked"),
         },
+        "btrim" => match evaluate(arguments[0], schema, row, context)? {
+            Value::Null => Ok(Value::Null),
+            Value::Text(value) => Ok(Value::Text(value.trim_matches(' ').into())),
+            _ => unreachable!("btrim argument was type-checked"),
+        },
         "abs" => match evaluate(arguments[0], schema, row, context)? {
             Value::Null => Ok(Value::Null),
             Value::Int2(value) => value.checked_abs().map(Value::Int2).ok_or_else(|| {
@@ -1675,7 +1832,11 @@ fn extract_datetime_field(field: ast::DateTimeField, value: Value) -> Result<Val
             ast::DateTimeField::Day => i64::from(value.day()),
             ast::DateTimeField::Dow => i64::from(value.weekday().num_days_from_sunday()),
             ast::DateTimeField::Doy => i64::from(value.ordinal()),
-            ast::DateTimeField::Epoch => i64::from(value.num_days_from_ce()) * 86_400,
+            ast::DateTimeField::Epoch => value
+                .and_hms_opt(0, 0, 0)
+                .expect("midnight is valid")
+                .and_utc()
+                .timestamp(),
             _ => {
                 return reject_unsupported("date part is not implemented");
             }
@@ -1706,7 +1867,12 @@ fn extract_datetime_field(field: ast::DateTimeField, value: Value) -> Result<Val
             ast::DateTimeField::Microsecond | ast::DateTimeField::Microseconds => {
                 i64::from(value.nanosecond() / 1_000)
             }
-            ast::DateTimeField::Epoch => value.and_utc().timestamp(),
+            ast::DateTimeField::Epoch => {
+                return Ok(convert_epoch_to_numeric(
+                    value.and_utc().timestamp(),
+                    value.and_utc().timestamp_subsec_micros(),
+                ));
+            }
             _ => {
                 return reject_unsupported("date part is not implemented");
             }
@@ -1721,7 +1887,12 @@ fn extract_datetime_field(field: ast::DateTimeField, value: Value) -> Result<Val
             ast::DateTimeField::Microsecond | ast::DateTimeField::Microseconds => {
                 i64::from(value.nanosecond() / 1_000)
             }
-            ast::DateTimeField::Epoch => value.timestamp(),
+            ast::DateTimeField::Epoch => {
+                return Ok(convert_epoch_to_numeric(
+                    value.timestamp(),
+                    value.timestamp_subsec_micros(),
+                ));
+            }
             _ => {
                 return reject_unsupported("date part is not implemented");
             }
@@ -1745,6 +1916,67 @@ fn extract_datetime_field(field: ast::DateTimeField, value: Value) -> Result<Val
         }
     };
     Ok(Value::Numeric(value.into()))
+}
+
+#[cfg_attr(feature = "execution-log", tracing::instrument(skip_all))]
+fn convert_epoch_to_numeric(seconds: i64, subsecond_micros: u32) -> Value {
+    Value::Numeric(BigDecimal::from(seconds) + BigDecimal::new(BigInt::from(subsecond_micros), 6))
+}
+
+#[cfg_attr(feature = "execution-log", tracing::instrument(skip_all))]
+fn validate_regex_repetition_bounds(pattern: &str) -> Result<()> {
+    let bytes = pattern.as_bytes();
+    let mut index = 0;
+    let mut in_character_class = false;
+    while index < bytes.len() {
+        match bytes[index] {
+            b'\\' => index += 2,
+            b'[' if !in_character_class => {
+                in_character_class = true;
+                index += 1;
+            }
+            b']' if in_character_class => {
+                in_character_class = false;
+                index += 1;
+            }
+            b'{' if !in_character_class => {
+                index += 1;
+                let mut bound = 0_u16;
+                let mut has_digits = false;
+                while index < bytes.len() && bytes[index].is_ascii_digit() {
+                    has_digits = true;
+                    bound = bound
+                        .saturating_mul(10)
+                        .saturating_add(u16::from(bytes[index] - b'0'));
+                    if bound > 255 {
+                        return Err(PgError::create(
+                            SqlState::InvalidRegularExpression,
+                            "invalid repetition count",
+                        ));
+                    }
+                    index += 1;
+                }
+                if has_digits && index < bytes.len() && bytes[index] == b',' {
+                    index += 1;
+                    bound = 0;
+                    while index < bytes.len() && bytes[index].is_ascii_digit() {
+                        bound = bound
+                            .saturating_mul(10)
+                            .saturating_add(u16::from(bytes[index] - b'0'));
+                        if bound > 255 {
+                            return Err(PgError::create(
+                                SqlState::InvalidRegularExpression,
+                                "invalid repetition count",
+                            ));
+                        }
+                        index += 1;
+                    }
+                }
+            }
+            _ => index += 1,
+        }
+    }
+    Ok(())
 }
 
 #[cfg_attr(feature = "execution-log", tracing::instrument(skip_all))]

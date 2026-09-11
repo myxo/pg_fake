@@ -601,6 +601,49 @@ fn benchmark_jsonb(
     }
 }
 
+fn migration_data_transform_benchmark(
+    criterion: &mut Criterion,
+    runtime: &Runtime,
+    connections: &mut [NamedBenchmarkConnection<'_>],
+) {
+    let values = (1..=100)
+        .map(|id| format!("({id}, ' value {id} ', {})", id % 10))
+        .collect::<Vec<_>>()
+        .join(",");
+    for (_, connection) in connections.iter_mut() {
+        connection.execute(
+            runtime,
+            "CREATE TABLE migration_data_transform_100_rows (id INTEGER, label TEXT, bucket INTEGER)",
+        );
+        connection.execute(
+            runtime,
+            &format!("INSERT INTO migration_data_transform_100_rows VALUES {values}"),
+        );
+    }
+    for (name, query) in [
+        (
+            "window_row_number_100_rows",
+            "SELECT id, row_number() OVER (ORDER BY id DESC) FROM migration_data_transform_100_rows ORDER BY id",
+        ),
+        (
+            "ordered_string_agg_100_rows",
+            "SELECT bucket, string_agg(btrim(label), ',' ORDER BY id) FROM migration_data_transform_100_rows GROUP BY bucket ORDER BY bucket",
+        ),
+    ] {
+        let mut group = criterion.benchmark_group(benchmarks::find_benchmark(name).name);
+        group.throughput(Throughput::Elements(100));
+        for (backend, connection) in connections.iter_mut() {
+            group.bench_function(*backend, |benchmark| {
+                benchmark.iter(|| connection.fetch(runtime, query));
+            });
+        }
+        group.finish();
+    }
+    for (_, connection) in connections.iter_mut() {
+        connection.execute(runtime, "DROP TABLE migration_data_transform_100_rows");
+    }
+}
+
 fn insert_benchmark(
     criterion: &mut Criterion,
     runtime: &Runtime,
@@ -1425,6 +1468,7 @@ fn benchmarks(criterion: &mut Criterion) {
         uuid_temporal_benchmark(criterion, &runtime, &mut connections);
         benchmark_json(criterion, &runtime, &mut connections);
         benchmark_jsonb(criterion, &runtime, &mut connections);
+        migration_data_transform_benchmark(criterion, &runtime, &mut connections);
         insert_benchmark(criterion, &runtime, &mut connections);
         on_conflict_benchmark(criterion, &runtime, &mut connections);
         update_benchmark(criterion, &runtime, &mut connections);

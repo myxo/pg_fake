@@ -822,7 +822,7 @@ they are not prerequisites invented by the migration gate.
 
 ## Milestone F — Migration query completion
 
-### Task 19 — Migration data-transform query subset
+### Task 19 — Migration data-transform query subset [COMPLETE]
 
 **Goal:** Execute relational expressions commonly embedded in migration
 backfills and reconciliation blocks.
@@ -864,6 +864,22 @@ backfills and reconciliation blocks.
 are not used by the required migration workload. Task 19 owns the temporal and
 numeric forms named above because Task 20 depends on them and runs before
 Task 21.
+
+**Progress:**
+
+- [x] Execute `row_number()` ordering and partitioned window `count(*)`, with
+  JSONB and SQL NULL partition equality and `bigint` metadata.
+- [x] Execute ordered `string_agg`, `btrim`, bounded regular-expression
+  matching, interval literals, and `CURRENT_TIMESTAMP` arithmetic with
+  PostgreSQL-compatible result and error types.
+- [x] Validate the required insert-select, conflict, update-from, derived-table,
+  correlated scalar-subquery, CTE, join, aggregate, predicate, cast, numeric,
+  temporal, procedural `SELECT INTO`, and rollback compositions.
+- [x] Add focused native and PostgreSQL SQLx differential fixtures, Phase 3
+  manifest cases, and generated differential coverage.
+- [x] Add representative row-number and ordered-string-aggregate benchmarks.
+- [x] Run formatting, workspace tests, benchmarks, the exact 10,000-iteration
+  property gate, and repeated subagent review until clean.
 
 ### Task 20 — Transactional migration-chain gate
 

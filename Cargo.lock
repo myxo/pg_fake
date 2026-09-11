@@ -1744,6 +1744,7 @@ dependencies = [
  "dotenvy",
  "postgres",
  "rand_chacha",
+ "regex",
  "serde",
  "serde_json",
  "sqlparser",

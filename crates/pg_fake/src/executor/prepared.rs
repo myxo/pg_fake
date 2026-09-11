@@ -645,6 +645,8 @@ pub(crate) fn execute_prepared_query(
                         AggregateInput {
                             included: true,
                             argument,
+                            delimiter: None,
+                            order_keys: Vec::new(),
                         },
                     );
                 }

@@ -826,10 +826,20 @@ fn describe_bound_query_columns(
                         infer_expression_data_type(catalog, expr, &scope)
                             .map(|data_type| (normalize_identifier(alias), data_type)),
                     ],
-                    ast::SelectItem::UnnamedExpr(expr) => vec![
-                        infer_expression_data_type(catalog, expr, &scope)
-                            .map(|data_type| ("?column?".into(), data_type)),
-                    ],
+                    ast::SelectItem::UnnamedExpr(expr) => {
+                        vec![infer_expression_data_type(catalog, expr, &scope).and_then(
+                            |data_type| {
+                                let name = match expr {
+                                    ast::Expr::Function(function) => {
+                                        super::normalize_unqualified_object_name(&function.name)?
+                                    }
+                                    ast::Expr::Extract { .. } => "extract".into(),
+                                    _ => "?column?".into(),
+                                };
+                                Ok((name, data_type))
+                            },
+                        )]
+                    }
                     _ => vec![reject_unsupported("SELECT projection is not implemented")],
                 })
                 .collect::<Result<Vec<_>>>()

@@ -63,9 +63,10 @@ use arithmetic::{
 };
 use expressions::{
     compare_values, evaluate, evaluate_and_coerce, evaluate_assignment_expression,
-    evaluate_column_default, evaluate_comparison, extract_number_literal, is_default_expression,
-    resolve_operator_type, validate_check_constraint_types, validate_check_constraints,
-    validate_column_default, validate_equality_type, validate_not_null, validate_ordering_type,
+    evaluate_column_default, evaluate_comparison, extract_number_literal, infer_window_return_type,
+    is_default_expression, resolve_operator_type, validate_check_constraint_types,
+    validate_check_constraints, validate_column_default, validate_equality_type, validate_not_null,
+    validate_ordering_type,
 };
 pub(crate) use expressions::{
     create_constant_expression_schema, evaluate_index_predicate, extract_unknown_string_literal,

@@ -2540,3 +2540,90 @@ fn matches_generated_json_operations() {
         );
     });
 }
+
+#[test]
+fn matches_generated_migration_data_transform_queries() {
+    let server = start_isolated_postgres_server();
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap();
+    let postgres = RefCell::new(
+        runtime
+            .block_on(PgConnection::connect(&server.url))
+            .unwrap(),
+    );
+    let fake = RefCell::new(PgFakeConnection::new(Db::create()));
+    check(|src| {
+        let first = src.any_of("first", int_in(-20_i32..=20));
+        let second = src.any_of("second", int_in(-20_i32..=20));
+        let third = src.any_of("third", int_in(-20_i32..=20));
+        let transform = src.any_of("transform", int_in(0..=8));
+        let sql = match transform {
+            0 => format!(
+                "SELECT ({first}::integer * {second}::numeric)::bigint, \
+                        {first}::integer IS DISTINCT FROM {second}::integer, \
+                        {third} IN ({first}, {second}, NULL), \
+                        coalesce(NULL::integer, {third}) > {second}"
+            ),
+            1 => format!(
+                "SELECT value, row_number() OVER (ORDER BY value DESC NULLS FIRST) \
+                 FROM (VALUES ({first}), (NULL), ({second}), ({third})) AS generated(value) \
+                 ORDER BY 2"
+            ),
+            2 => format!(
+                "SELECT value, count(*) OVER (PARTITION BY value) \
+                 FROM (VALUES ({first}), (NULL), ({second}), ({third}), (NULL)) AS generated(value) \
+                 ORDER BY value NULLS FIRST"
+            ),
+            3 => format!(
+                "SELECT count(*), max(value), \
+                        string_agg(label, ':' ORDER BY value DESC NULLS LAST) \
+                 FROM (VALUES ({first}, 'a'), ({second}, NULL), ({third}, 'c')) AS generated(value, label)"
+            ),
+            4 => format!(
+                "WITH left_side AS MATERIALIZED (SELECT {first} AS value), \
+                      right_side AS (SELECT {second} AS value) \
+                 SELECT EXISTS (SELECT 1 FROM right_side WHERE value = {second}), \
+                        (SELECT max(value) FROM left_side LIMIT 1), \
+                        'ABC-{third}' ~ '^ABC--?[0-9]{{1,2}}$'"
+            ),
+            5 => format!(
+                "SELECT extract(epoch FROM '1970-01-01 00:00:00.{:06}+00'::timestamptz), \
+                        extract(epoch FROM '1969-12-31 23:59:59.{:06}+00'::timestamptz)",
+                first.unsigned_abs() * 10_000,
+                second.unsigned_abs() * 10_000,
+            ),
+            6 => format!(
+                "SELECT 'ABC' ~ '^ABC(-[0-9]{{1,{}}})?$', \
+                        'ABC-{}' ~ '^ABC(-[0-9]{{1,{}}})?$'",
+                first.unsigned_abs() % 9 + 1,
+                second.unsigned_abs(),
+                third.unsigned_abs() % 9 + 1,
+            ),
+            7 => format!("SELECT 'x' ~ 'x{{{}}}'", 256 + first.unsigned_abs()),
+            _ => format!(
+                "SELECT count() OVER (PARTITION BY value) \
+                 FROM (VALUES ({first}), ({second}), ({third})) AS generated(value)"
+            ),
+        };
+        src.log_value("sql", &sql);
+        if transform >= 7 {
+            assert_statement_allow_error(
+                &runtime,
+                &mut postgres.borrow_mut(),
+                &mut fake.borrow_mut(),
+                &sql,
+                RowOrder::Ordered,
+            );
+        } else {
+            assert_statement(
+                &runtime,
+                &mut postgres.borrow_mut(),
+                &mut fake.borrow_mut(),
+                &sql,
+                RowOrder::Ordered,
+            );
+        }
+    });
+}

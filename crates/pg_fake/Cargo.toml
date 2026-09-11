@@ -12,6 +12,7 @@ execution-log = ["dep:tracing"]
 bigdecimal = "0.4"
 chrono = { version = "0.4", default-features = false, features = ["std", "now"] }
 rand_chacha = { version = "0.9", features = ["os_rng"] }
+regex = "1"
 serde = "1"
 serde_json = { version = "1", features = ["arbitrary_precision", "unbounded_depth", "raw_value"] }
 sqlparser = { version = "0.62", features = ["visitor"] }
