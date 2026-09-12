@@ -19,9 +19,10 @@ use crate::{
     value::{BaseType, PgType, Value},
 };
 
+use super::expressions::prune_constant_cases;
 use super::{
-    ConstantCasePruner, DistinctKey, DistinctPlan, OrderKey, OrderedRow, ProjectionSource,
-    RowOrderSpec, contains_volatile_expression, evaluate_distinct_keys, evaluate_order_keys,
+    DistinctKey, DistinctPlan, OrderKey, ProjectionSource, RowOrderSpec, SelectRow,
+    contains_volatile_expression, evaluate_distinct_keys, evaluate_order_keys,
     evaluate_projection_values, evaluate_where_clause,
 };
 
@@ -181,14 +182,7 @@ pub(super) fn materialize_aggregate_expression(
     owner: AggregateOwner,
 ) -> Result<ast::Expr> {
     let mut expression = expression.clone();
-    let mut pruner = ConstantCasePruner {
-        type_context: Some((state, scope)),
-        error: None,
-    };
-    let _ = expression.visit(&mut pruner);
-    if let Some(error) = pruner.error {
-        return Err(error);
-    }
+    prune_constant_cases(&mut expression, Some((state, scope)))?;
     let mut materializer = AggregateMaterializer {
         values,
         owner,
@@ -215,14 +209,7 @@ pub(super) fn collect_group_aggregate_functions(
     let mut visit = |owner, expression: &ast::Expr| {
         collector.owner = owner;
         let mut expression = expression.clone();
-        let mut pruner = ConstantCasePruner {
-            type_context: Some((state, scope)),
-            error: None,
-        };
-        let _ = expression.visit(&mut pruner);
-        if let Some(error) = pruner.error {
-            return Err(error);
-        }
+        prune_constant_cases(&mut expression, Some((state, scope)))?;
         let _ = expression.visit(&mut collector);
         Ok(())
     };
@@ -494,7 +481,7 @@ pub(super) fn execute_grouped_select_rows(
     xid: Xid,
     snapshot: &Snapshot,
     context: &StatementExecutionContext,
-) -> Result<Vec<OrderedRow>> {
+) -> Result<Vec<SelectRow>> {
     let aggregate_functions = collect_group_aggregate_functions(
         state,
         select,
@@ -560,7 +547,7 @@ pub(super) fn execute_grouped_select_rows(
             snapshot,
             context,
         )?;
-        rows.push(OrderedRow {
+        rows.push(SelectRow {
             values,
             keys,
             distinct_keys,

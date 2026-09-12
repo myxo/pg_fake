@@ -1,8 +1,12 @@
 use super::*;
-use ast::VisitMut as _;
 use sqlparser::ast;
 
+mod distinct;
+mod expressions;
 mod grouping;
+mod limits;
+mod ordering;
+mod projection;
 pub(super) mod set_operations;
 mod values;
 mod windows;
@@ -10,31 +14,39 @@ mod windows;
 use super::ctes::{contains_query_ctes, materialize_query_ctes};
 use super::subqueries::evaluate_query_expression;
 use super::{
-    equality::{are_rows_not_distinct, create_equality_key},
+    equality::create_equality_key,
     from::{is_selection_fully_pushed, visit_query_source_rows},
     scope::try_resolve_column_reference,
 };
+use distinct::{
+    DistinctKey, DistinctPlan, compare_distinct_keys, evaluate_distinct_keys,
+    remove_duplicate_rows, resolve_distinct_plan,
+};
+pub(super) use expressions::infer_query_expression_type;
+use expressions::{contains_volatile_expression, evaluate_select_expression};
 pub(crate) use grouping::collect_query_primary_key_dependencies;
+pub(super) use grouping::contains_query_aggregate;
 use grouping::{
     AggregateOwner, collect_group_aggregate_functions, collect_grouped_select_rows,
     evaluate_group_having, execute_grouped_select_rows, inspect_aggregate_usage,
     materialize_aggregate_expression, resolve_grouping_plan,
 };
-pub(super) use grouping::{GroupedAggregateValues, contains_query_aggregate};
-use set_operations::{coerce_set_rows, create_set_operand_query, describe_set_expression_columns};
-use values::{bind_values_scope, execute_values_query};
+pub(super) use limits::{has_zero_limit, resolve_select_limit};
+use ordering::{
+    OrderKey, RowOrderSpec, compare_order_keys, compare_ordered_rows, evaluate_order_keys,
+    resolve_order_specs, retain_top_ordered_row, sort_ordered_rows,
+};
+pub(crate) use projection::describe_query_result_columns;
+pub(super) use projection::{
+    ProjectionSource, build_mutation_projection_plan, build_projection_plan,
+    evaluate_projection_values,
+};
+use projection::{
+    contains_volatile_projection, create_projection_expression, evaluate_projection_value,
+};
+use set_operations::{coerce_set_rows, create_set_operand_query};
+use values::execute_values_query;
 use windows::{collect_window_functions, execute_windowed_select_rows};
-
-#[cfg_attr(feature = "execution-log", tracing::instrument(skip_all))]
-pub(super) fn has_zero_limit(query: &ast::Query) -> bool {
-    matches!(
-        &query.limit_clause,
-        Some(ast::LimitClause::LimitOffset {
-            limit: Some(ast::Expr::Value(value)),
-            ..
-        }) if matches!(&value.value, ast::Value::Number(number, _) if number == "0")
-    )
-}
 
 struct StatementFeatureDetector {
     cte: bool,
@@ -74,139 +86,8 @@ pub(crate) fn detect_statement_features(statement: &ast::Statement) -> (bool, bo
     (detector.cte, detector.subquery)
 }
 
-#[cfg_attr(feature = "execution-log", tracing::instrument(skip_all))]
-pub(crate) fn describe_query_result_columns(
-    state: &DatabaseState,
-    statement: &ast::Statement,
-) -> Result<Vec<ColumnMeta>> {
-    match statement {
-        ast::Statement::Query(query) => match query.body.as_ref() {
-            ast::SetExpr::Select(select) => bind_select_scope(state, select).and_then(|scope| {
-                build_projection_plan(state, &select.projection, &scope).map(|(_, columns)| columns)
-            }),
-            ast::SetExpr::Values(values) => bind_values_scope(values).map(|scope| {
-                scope
-                    .columns
-                    .iter()
-                    .map(|column| ColumnMeta {
-                        name: column.name.clone(),
-                        type_oid: column.data_type.map_to_oid(),
-                        typmod: column.data_type.typmod,
-                    })
-                    .collect()
-            }),
-            _ => describe_set_expression_columns(state, query, &query.body),
-        },
-        ast::Statement::Insert(insert) => {
-            let Some(returning) = &insert.returning else {
-                return Ok(Vec::new());
-            };
-            let schema = state
-                .catalog
-                .require_named_table(&resolve_insert_table_name(&insert.table)?)?;
-            let scope = bind_target_scope(
-                schema,
-                insert.table_alias.as_ref().map(|alias| &alias.alias),
-            );
-            build_mutation_projection_plan(state, returning, &scope, schema.columns.len())
-                .map(|(_, columns)| columns)
-        }
-        ast::Statement::Update(update) => {
-            let Some(returning) = &update.returning else {
-                return Ok(Vec::new());
-            };
-            let ast::TableFactor::Table {
-                name, alias, args, ..
-            } = &update.table.relation
-            else {
-                return Ok(Vec::new());
-            };
-            if args.is_some() {
-                return Ok(Vec::new());
-            }
-            let schema = state
-                .catalog
-                .require_named_table(&normalize_relation_name(name)?)?;
-            let from = match &update.from {
-                None => &[][..],
-                Some(ast::UpdateTableFromKind::AfterSet(from)) => from.as_slice(),
-                Some(ast::UpdateTableFromKind::BeforeSet(_)) => return Ok(Vec::new()),
-            };
-            let scope = combine_bound_scopes(
-                bind_target_scope(schema, alias.as_ref().map(|alias| &alias.name)),
-                bind_from_scope(&state.catalog, from)?,
-            );
-            build_mutation_projection_plan(state, returning, &scope, schema.columns.len())
-                .map(|(_, columns)| columns)
-        }
-        ast::Statement::Delete(delete) => {
-            let Some(returning) = &delete.returning else {
-                return Ok(Vec::new());
-            };
-            let ast::FromTable::WithFromKeyword(from) = &delete.from else {
-                return Ok(Vec::new());
-            };
-            let Some(ast::TableWithJoins {
-                relation:
-                    ast::TableFactor::Table {
-                        name, alias, args, ..
-                    },
-                ..
-            }) = from.first()
-            else {
-                return Ok(Vec::new());
-            };
-            if args.is_some() {
-                return Ok(Vec::new());
-            }
-            let schema = state
-                .catalog
-                .require_named_table(&normalize_relation_name(name)?)?;
-            let scope = combine_bound_scopes(
-                bind_target_scope(schema, alias.as_ref().map(|alias| &alias.name)),
-                bind_from_scope(&state.catalog, delete.using.as_deref().unwrap_or_default())?,
-            );
-            build_mutation_projection_plan(state, returning, &scope, schema.columns.len())
-                .map(|(_, columns)| columns)
-        }
-        _ => Ok(Vec::new()),
-    }
-}
-
-pub(super) enum ProjectionSource<'a> {
-    Column(usize),
-    Merged(Vec<usize>, PgType, Option<String>),
-    Expression(&'a ast::Expr),
-}
-enum OrderKey<'a> {
-    Output(usize),
-    Input(usize, &'a ast::Expr),
-    Expression(&'a ast::Expr),
-}
-enum DistinctPlan<'a> {
-    None,
-    Rows,
-    On {
-        expressions: &'a [ast::Expr],
-        keys: Vec<DistinctKey<'a>>,
-    },
-}
-enum DistinctKey<'a> {
-    Output(usize),
-    Order(usize),
-    Expression(&'a ast::Expr),
-}
-enum RowCountClause {
-    Limit,
-    Offset,
-}
-struct RowOrderSpec<'a> {
-    key: OrderKey<'a>,
-    ascending: bool,
-    nulls_first: bool,
-}
 #[derive(Clone)]
-pub(super) struct OrderedRow {
+pub(super) struct SelectRow {
     values: Vec<Value>,
     keys: Vec<Value>,
     distinct_keys: Vec<Value>,
@@ -232,7 +113,7 @@ pub(super) enum PreparedQueryStream {
     },
     Ordered {
         query: ast::Query,
-        rows: Vec<OrderedRow>,
+        rows: Vec<SelectRow>,
         next: usize,
     },
     Grouped {
@@ -257,183 +138,6 @@ pub(super) enum PreparedQueryStream {
         next: usize,
     },
 }
-struct ConstantCasePruner<'a> {
-    type_context: Option<(&'a DatabaseState, &'a BoundScope)>,
-    error: Option<PgError>,
-}
-struct BoundExpressionNormalizer<'a> {
-    scope: &'a BoundScope,
-    query_depth: usize,
-    error: Option<PgError>,
-}
-
-impl ast::VisitorMut for ConstantCasePruner<'_> {
-    type Break = ();
-
-    fn pre_visit_expr(&mut self, expression: &mut ast::Expr) -> std::ops::ControlFlow<Self::Break> {
-        loop {
-            if !matches!(expression, ast::Expr::Case { operand: None, .. }) {
-                break;
-            }
-            let data_type = if let Some((state, scope)) = self.type_context {
-                match infer_query_expression_type(state, expression, scope) {
-                    Ok(data_type) => Some(data_type),
-                    Err(error) => {
-                        self.error = Some(error);
-                        return std::ops::ControlFlow::Break(());
-                    }
-                }
-            } else {
-                None
-            };
-            let ast::Expr::Case {
-                operand: None,
-                conditions,
-                else_result,
-                ..
-            } = expression
-            else {
-                break;
-            };
-            if conditions.is_empty() {
-                break;
-            }
-            let mut retained = Vec::new();
-            let mut terminal = None;
-            for condition in std::mem::take(conditions) {
-                match &condition.condition {
-                    ast::Expr::Value(value)
-                        if matches!(value.value, ast::Value::Boolean(false) | ast::Value::Null) => {
-                    }
-                    ast::Expr::Value(value) if value.value == ast::Value::Boolean(true) => {
-                        terminal = Some(condition.result);
-                        break;
-                    }
-                    _ => retained.push(condition),
-                }
-            }
-            if retained.is_empty() {
-                let replacement = terminal
-                    .or_else(|| else_result.take().map(|result| *result))
-                    .unwrap_or_else(|| ast::Expr::Value(ast::Value::Null.into()));
-                *expression = data_type.map_or(replacement.clone(), |data_type| {
-                    crate::analyzer::create_typed_cast(replacement, data_type)
-                });
-                continue;
-            }
-            *conditions = retained;
-            if let Some(terminal) = terminal {
-                *else_result = Some(Box::new(terminal));
-            }
-            break;
-        }
-        std::ops::ControlFlow::Continue(())
-    }
-}
-
-impl ast::VisitorMut for BoundExpressionNormalizer<'_> {
-    type Break = ();
-
-    #[cfg_attr(feature = "execution-log", tracing::instrument(skip_all))]
-    fn pre_visit_query(&mut self, _query: &mut ast::Query) -> std::ops::ControlFlow<Self::Break> {
-        self.query_depth += 1;
-        std::ops::ControlFlow::Continue(())
-    }
-
-    #[cfg_attr(feature = "execution-log", tracing::instrument(skip_all))]
-    fn post_visit_query(&mut self, _query: &mut ast::Query) -> std::ops::ControlFlow<Self::Break> {
-        self.query_depth -= 1;
-        std::ops::ControlFlow::Continue(())
-    }
-
-    #[cfg_attr(feature = "execution-log", tracing::instrument(skip_all))]
-    fn pre_visit_expr(&mut self, expression: &mut ast::Expr) -> std::ops::ControlFlow<Self::Break> {
-        if self.query_depth != 0 {
-            return std::ops::ControlFlow::Continue(());
-        }
-        let identifiers = match expression {
-            ast::Expr::Identifier(identifier) => Some(std::slice::from_ref(identifier)),
-            ast::Expr::CompoundIdentifier(identifiers) => Some(identifiers.as_slice()),
-            _ => None,
-        };
-        let Some(identifiers) = identifiers else {
-            return std::ops::ControlFlow::Continue(());
-        };
-        match self.scope.resolve_column(identifiers) {
-            Ok((slot, _)) => {
-                *expression =
-                    ast::Expr::Identifier(ast::Ident::new(format!("__pg_fake_bound_{slot}")));
-            }
-            Err(error) => {
-                self.error = Some(error);
-                return std::ops::ControlFlow::Break(());
-            }
-        }
-        std::ops::ControlFlow::Continue(())
-    }
-}
-
-#[cfg_attr(feature = "execution-log", tracing::instrument(skip_all))]
-fn normalize_bound_expression(expression: &ast::Expr, scope: &BoundScope) -> Result<ast::Expr> {
-    let mut expression = expression.clone();
-    let mut normalizer = BoundExpressionNormalizer {
-        scope,
-        query_depth: 0,
-        error: None,
-    };
-    let _ = expression.visit(&mut normalizer);
-    normalizer.error.map_or(Ok(expression), Err)
-}
-
-#[cfg_attr(feature = "execution-log", tracing::instrument(skip_all))]
-fn compare_bound_expressions(
-    left: &ast::Expr,
-    right: &ast::Expr,
-    scope: &BoundScope,
-) -> Result<bool> {
-    Ok(normalize_bound_expression(left, scope)? == normalize_bound_expression(right, scope)?)
-}
-
-#[cfg_attr(feature = "execution-log", tracing::instrument(skip_all))]
-fn create_projection_expression(
-    projection: &ProjectionSource<'_>,
-    scope: &BoundScope,
-) -> ast::Expr {
-    match projection {
-        ProjectionSource::Expression(expression) => (*expression).clone(),
-        ProjectionSource::Column(slot) => {
-            let column = scope
-                .columns
-                .iter()
-                .find(|column| column.slot == *slot)
-                .expect("projected column is present in the bound scope");
-            ast::Expr::CompoundIdentifier(vec![
-                ast::Ident::new(column.qualifier.clone()),
-                ast::Ident::new(column.name.clone()),
-            ])
-        }
-        ProjectionSource::Merged(slots, _, qualifier) => {
-            let column = scope
-                .columns
-                .iter()
-                .find(|column| match qualifier {
-                    Some(qualifier) => {
-                        column.qualifier == *qualifier
-                            && column.qualified_merged.as_ref() == Some(slots)
-                    }
-                    None => column.merged.as_ref() == Some(slots) && column.wildcard,
-                })
-                .expect("projected merged column is present in the bound scope");
-            match qualifier {
-                Some(qualifier) => ast::Expr::CompoundIdentifier(vec![
-                    ast::Ident::new(qualifier.clone()),
-                    ast::Ident::new(column.name.clone()),
-                ]),
-                None => ast::Expr::Identifier(ast::Ident::new(column.name.clone())),
-            }
-        }
-    }
-}
 
 #[cfg_attr(feature = "execution-log", tracing::instrument(skip_all))]
 pub(super) fn resolve_select_lock_mode(query: &ast::Query) -> Result<Option<RowLockMode>> {
@@ -450,40 +154,6 @@ pub(super) fn resolve_select_lock_mode(query: &ast::Query) -> Result<Option<RowL
         ast::LockType::Share => RowLockMode::Share,
         ast::LockType::Update => RowLockMode::Update,
     }))
-}
-
-#[cfg_attr(feature = "execution-log", tracing::instrument(skip_all))]
-pub(super) fn resolve_select_limit(
-    query: &ast::Query,
-    context: &StatementExecutionContext,
-) -> Result<(Option<usize>, usize)> {
-    match &query.limit_clause {
-        None => Ok((None, 0)),
-        Some(ast::LimitClause::LimitOffset {
-            limit,
-            offset,
-            limit_by,
-        }) => {
-            if !limit_by.is_empty() {
-                return reject_unsupported("LIMIT BY is not implemented");
-            }
-            let limit = limit
-                .as_ref()
-                .map(|limit| evaluate_row_count(limit, RowCountClause::Limit, context))
-                .transpose()?
-                .flatten();
-            let offset = offset
-                .as_ref()
-                .map(|offset| evaluate_row_count(&offset.value, RowCountClause::Offset, context))
-                .transpose()?
-                .flatten()
-                .unwrap_or(0);
-            Ok((limit, offset))
-        }
-        Some(ast::LimitClause::OffsetCommaLimit { .. }) => {
-            reject_unsupported("LIMIT clause is not implemented")
-        }
-    }
 }
 
 #[cfg_attr(feature = "execution-log", tracing::instrument(skip_all))]
@@ -514,265 +184,6 @@ pub(super) fn validate_select_predicates(
 }
 
 #[cfg_attr(feature = "execution-log", tracing::instrument(skip_all))]
-fn resolve_order_specs<'a>(
-    state: &DatabaseState,
-    query: &'a ast::Query,
-    projections: &[ProjectionSource<'_>],
-    columns: &[ColumnMeta],
-    scope: &BoundScope,
-) -> Result<Vec<RowOrderSpec<'a>>> {
-    query
-        .order_by
-        .as_ref()
-        .map(|order_by| {
-            if order_by.interpolate.is_some() {
-                return reject_unsupported("ORDER BY INTERPOLATE is not implemented");
-            }
-            let ast::OrderByKind::Expressions(orders) = &order_by.kind else {
-                return reject_unsupported("ORDER BY ALL is not implemented");
-            };
-            orders
-                .iter()
-                .map(|order| {
-                    if order.with_fill.is_some() {
-                        return reject_unsupported("ORDER BY WITH FILL is not implemented");
-                    }
-                    let key = if let Some(position) = extract_number_literal(&order.expr)
-                        && !position.contains(['.', 'e', 'E'])
-                    {
-                        let position = position.parse::<usize>().map_err(|_| {
-                            PgError::create(
-                                SqlState::InvalidColumnReference,
-                                "ORDER BY position is not in select list",
-                            )
-                        })?;
-                        if position == 0 || position > projections.len() {
-                            return Err(PgError::create(
-                                SqlState::InvalidColumnReference,
-                                "ORDER BY position is not in select list",
-                            ));
-                        }
-                        OrderKey::Output(position - 1)
-                    } else if let ast::Expr::Identifier(identifier) = &order.expr
-                        && let Some(index) = columns
-                            .iter()
-                            .position(|column| column.name == normalize_identifier(identifier))
-                    {
-                        OrderKey::Output(index)
-                    } else {
-                        let mut output = None;
-                        for (index, projection) in projections.iter().enumerate() {
-                            if compare_bound_expressions(
-                                &order.expr,
-                                &create_projection_expression(projection, scope),
-                                scope,
-                            )? {
-                                output = Some(index);
-                                break;
-                            }
-                        }
-                        match output {
-                            Some(index) => OrderKey::Output(index),
-                            None => match &order.expr {
-                                ast::Expr::Identifier(identifier) => OrderKey::Input(
-                                    scope.resolve_column(std::slice::from_ref(identifier))?.0,
-                                    &order.expr,
-                                ),
-                                ast::Expr::CompoundIdentifier(identifiers) => OrderKey::Input(
-                                    scope.resolve_column(identifiers)?.0,
-                                    &order.expr,
-                                ),
-                                _ => {
-                                    infer_query_expression_type(state, &order.expr, scope)?;
-                                    OrderKey::Expression(&order.expr)
-                                }
-                            },
-                        }
-                    };
-                    let data_type = match &key {
-                        OrderKey::Output(index) => BaseType::resolve_oid(columns[*index].type_oid)
-                            .expect("projection columns use supported PostgreSQL types"),
-                        OrderKey::Input(slot, _) => {
-                            scope
-                                .columns
-                                .iter()
-                                .find(|column| column.slot == *slot)
-                                .expect("resolved ORDER BY column is in scope")
-                                .data_type
-                                .base
-                        }
-                        OrderKey::Expression(expression) => {
-                            infer_query_expression_type(state, expression, scope)?.base
-                        }
-                    };
-                    validate_ordering_type(data_type)?;
-                    let ascending = resolve_order_ascending(&order.options)?;
-                    Ok(RowOrderSpec {
-                        key,
-                        ascending,
-                        nulls_first: order.options.nulls_first.unwrap_or(!ascending),
-                    })
-                })
-                .collect::<Result<Vec<_>>>()
-        })
-        .transpose()
-        .map(|orders| orders.unwrap_or_default())
-}
-
-#[cfg_attr(feature = "execution-log", tracing::instrument(skip_all))]
-fn create_order_expression(
-    order: &RowOrderSpec<'_>,
-    projections: &[ProjectionSource<'_>],
-    scope: &BoundScope,
-) -> ast::Expr {
-    match order.key {
-        OrderKey::Output(index) => create_projection_expression(&projections[index], scope),
-        OrderKey::Input(_, expression) => expression.clone(),
-        OrderKey::Expression(expression) => expression.clone(),
-    }
-}
-
-#[cfg_attr(feature = "execution-log", tracing::instrument(skip_all))]
-fn resolve_distinct_plan<'a>(
-    state: &DatabaseState,
-    select: &'a ast::Select,
-    projections: &[ProjectionSource<'_>],
-    columns: &[ColumnMeta],
-    order_specs: &[RowOrderSpec<'_>],
-    scope: &BoundScope,
-) -> Result<DistinctPlan<'a>> {
-    let Some(distinct) = &select.distinct else {
-        return Ok(DistinctPlan::None);
-    };
-    match distinct {
-        ast::Distinct::All => Ok(DistinctPlan::None),
-        ast::Distinct::Distinct => {
-            for projection in projections {
-                validate_equality_type(
-                    infer_query_expression_type(
-                        state,
-                        &create_projection_expression(projection, scope),
-                        scope,
-                    )?
-                    .base,
-                )?;
-            }
-            for order in order_specs {
-                if matches!(order.key, OrderKey::Output(_)) {
-                    continue;
-                }
-                let order_expression = create_order_expression(order, projections, scope);
-                let mut selected = false;
-                for projection in projections {
-                    if compare_bound_expressions(
-                        &order_expression,
-                        &create_projection_expression(projection, scope),
-                        scope,
-                    )? {
-                        selected = true;
-                        break;
-                    }
-                }
-                if !selected {
-                    return Err(PgError::create(
-                        SqlState::InvalidColumnReference,
-                        "for SELECT DISTINCT, ORDER BY expressions must appear in select list",
-                    ));
-                }
-            }
-            Ok(DistinctPlan::Rows)
-        }
-        ast::Distinct::On(expressions) => {
-            if expressions.is_empty() {
-                return Err(PgError::create(
-                    SqlState::SyntaxError,
-                    "DISTINCT ON requires at least one expression",
-                ));
-            }
-            let output_indexes = expressions
-                .iter()
-                .map(|expression| {
-                    let ast::Expr::Identifier(identifier) = expression else {
-                        return None;
-                    };
-                    columns
-                        .iter()
-                        .position(|column| column.name == normalize_identifier(identifier))
-                })
-                .collect::<Vec<_>>();
-            for (expression, output_index) in expressions.iter().zip(&output_indexes) {
-                let data_type = output_index.map_or_else(
-                    || infer_query_expression_type(state, expression, scope).map(|data| data.base),
-                    |index| {
-                        Ok(BaseType::resolve_oid(columns[index].type_oid)
-                            .expect("projection columns use supported PostgreSQL types"))
-                    },
-                )?;
-                validate_equality_type(data_type)?;
-            }
-            let mut matched = vec![false; expressions.len()];
-            for order in order_specs {
-                let order_expression = create_order_expression(order, projections, scope);
-                let mut found = None;
-                for (index, (expression, output_index)) in
-                    expressions.iter().zip(&output_indexes).enumerate()
-                {
-                    let matches = output_index.is_some_and(
-                        |output_index| matches!(order.key, OrderKey::Output(index) if index == output_index),
-                    ) || output_index.is_none()
-                        && compare_bound_expressions(&order_expression, expression, scope)?;
-                    if !matched[index] && matches {
-                        found = Some(index);
-                        break;
-                    }
-                }
-                match found {
-                    Some(index) => matched[index] = true,
-                    None if matched.iter().all(|matched| *matched) => break,
-                    None => {
-                        return Err(PgError::create(
-                            SqlState::InvalidColumnReference,
-                            "SELECT DISTINCT ON expressions must match initial ORDER BY expressions",
-                        ));
-                    }
-                }
-            }
-            let mut keys = Vec::with_capacity(expressions.len());
-            for (expression, output_index) in expressions.iter().zip(output_indexes) {
-                let mut key = output_index.map(DistinctKey::Output);
-                for (index, projection) in projections.iter().enumerate() {
-                    if key.is_some() {
-                        break;
-                    }
-                    if compare_bound_expressions(
-                        expression,
-                        &create_projection_expression(projection, scope),
-                        scope,
-                    )? {
-                        key = Some(DistinctKey::Output(index));
-                        break;
-                    }
-                }
-                if key.is_none() {
-                    for (index, order) in order_specs.iter().enumerate() {
-                        if compare_bound_expressions(
-                            expression,
-                            &create_order_expression(order, projections, scope),
-                            scope,
-                        )? {
-                            key = Some(DistinctKey::Order(index));
-                            break;
-                        }
-                    }
-                }
-                keys.push(key.unwrap_or(DistinctKey::Expression(expression)));
-            }
-            Ok(DistinctPlan::On { expressions, keys })
-        }
-    }
-}
-
-#[cfg_attr(feature = "execution-log", tracing::instrument(skip_all))]
 fn evaluate_where_clause(
     state: &DatabaseState,
     selection: Option<&ast::Expr>,
@@ -795,205 +206,6 @@ fn evaluate_where_clause(
 }
 
 #[cfg_attr(feature = "execution-log", tracing::instrument(skip_all))]
-fn evaluate_select_expression(
-    state: &DatabaseState,
-    expression: &ast::Expr,
-    scope: &BoundScope,
-    row: &[Value],
-    aggregate_values: Option<(&GroupedAggregateValues, AggregateOwner)>,
-    xid: Xid,
-    snapshot: &Snapshot,
-    context: &StatementExecutionContext,
-) -> Result<Value> {
-    let materialized;
-    let expression = if let Some((values, owner)) = aggregate_values {
-        materialized = materialize_aggregate_expression(state, expression, scope, values, owner)?;
-        &materialized
-    } else {
-        expression
-    };
-    evaluate_query_expression(state, expression, scope, row, xid, snapshot, context)
-}
-
-#[cfg_attr(feature = "execution-log", tracing::instrument(skip_all))]
-fn evaluate_projection_value(
-    state: &DatabaseState,
-    projection: &ProjectionSource<'_>,
-    scope: &BoundScope,
-    row: &[Value],
-    aggregate_values: Option<(&GroupedAggregateValues, AggregateOwner)>,
-    xid: Xid,
-    snapshot: &Snapshot,
-    context: &StatementExecutionContext,
-) -> Result<Value> {
-    match projection {
-        ProjectionSource::Column(index) => Ok(row[*index].clone()),
-        ProjectionSource::Merged(slots, data_type, _) => {
-            let value = slots
-                .iter()
-                .map(|slot| &row[*slot])
-                .find(|value| !value.is_null())
-                .cloned()
-                .unwrap_or(Value::Null);
-            if value.is_null() {
-                Ok(value)
-            } else {
-                coercion::coerce(
-                    value.clone(),
-                    value
-                        .get_base_type()
-                        .expect("non-null value has a base type"),
-                    *data_type,
-                    CastContext::Implicit,
-                )
-            }
-        }
-        ProjectionSource::Expression(expression) => evaluate_select_expression(
-            state,
-            expression,
-            scope,
-            row,
-            aggregate_values,
-            xid,
-            snapshot,
-            context,
-        ),
-    }
-}
-
-fn contains_volatile_expression(expression: &ast::Expr) -> bool {
-    let mut expression = expression.clone();
-    let _ = expression.visit(&mut ConstantCasePruner {
-        type_context: None,
-        error: None,
-    });
-    let mut found = false;
-    let _ = ast::visit_expressions(&expression, |nested| {
-        let ast::Expr::Function(function) = nested else {
-            return std::ops::ControlFlow::Continue(());
-        };
-        if normalize_unqualified_object_name(&function.name).is_ok_and(|name| {
-            matches!(
-                name.as_str(),
-                "gen_random_uuid"
-                    | "uuidv4"
-                    | "uuidv7"
-                    | "clock_timestamp"
-                    | "nextval"
-                    | "currval"
-                    | "lastval"
-                    | "setval"
-            )
-        }) {
-            found = true;
-            return std::ops::ControlFlow::Break(());
-        }
-        std::ops::ControlFlow::Continue(())
-    });
-    found
-}
-
-fn contains_volatile_projection(projection: &ProjectionSource<'_>) -> bool {
-    matches!(projection, ProjectionSource::Expression(expression) if contains_volatile_expression(expression))
-}
-
-#[cfg_attr(feature = "execution-log", tracing::instrument(skip_all))]
-pub(super) fn evaluate_projection_values(
-    state: &DatabaseState,
-    projections: &[ProjectionSource<'_>],
-    scope: &BoundScope,
-    row: &[Value],
-    aggregate_values: Option<&GroupedAggregateValues>,
-    xid: Xid,
-    snapshot: &Snapshot,
-    context: &StatementExecutionContext,
-) -> Result<Vec<Value>> {
-    projections
-        .iter()
-        .enumerate()
-        .map(|(index, projection)| {
-            evaluate_projection_value(
-                state,
-                projection,
-                scope,
-                row,
-                aggregate_values.map(|values| (values, AggregateOwner::Projection(index))),
-                xid,
-                snapshot,
-                context,
-            )
-        })
-        .collect()
-}
-
-#[cfg_attr(feature = "execution-log", tracing::instrument(skip_all))]
-fn evaluate_order_keys(
-    state: &DatabaseState,
-    order_specs: &[RowOrderSpec<'_>],
-    values: &[Value],
-    scope: &BoundScope,
-    row: &[Value],
-    aggregate_values: Option<&GroupedAggregateValues>,
-    xid: Xid,
-    snapshot: &Snapshot,
-    context: &StatementExecutionContext,
-) -> Result<Vec<Value>> {
-    order_specs
-        .iter()
-        .enumerate()
-        .map(|(index, order)| match order.key {
-            OrderKey::Output(index) => Ok(values[index].clone()),
-            OrderKey::Input(slot, _) => Ok(row[slot].clone()),
-            OrderKey::Expression(expression) => evaluate_select_expression(
-                state,
-                expression,
-                scope,
-                row,
-                aggregate_values.map(|values| (values, AggregateOwner::Order(index))),
-                xid,
-                snapshot,
-                context,
-            ),
-        })
-        .collect()
-}
-
-#[cfg_attr(feature = "execution-log", tracing::instrument(skip_all))]
-fn evaluate_distinct_keys(
-    state: &DatabaseState,
-    distinct: &DistinctPlan<'_>,
-    values: &[Value],
-    order_keys: &[Value],
-    scope: &BoundScope,
-    row: &[Value],
-    aggregate_values: Option<&GroupedAggregateValues>,
-    xid: Xid,
-    snapshot: &Snapshot,
-    context: &StatementExecutionContext,
-) -> Result<Vec<Value>> {
-    let DistinctPlan::On { keys, .. } = distinct else {
-        return Ok(Vec::new());
-    };
-    keys.iter()
-        .enumerate()
-        .map(|(index, key)| match key {
-            DistinctKey::Output(index) => Ok(values[*index].clone()),
-            DistinctKey::Order(index) => Ok(order_keys[*index].clone()),
-            DistinctKey::Expression(expression) => evaluate_select_expression(
-                state,
-                expression,
-                scope,
-                row,
-                aggregate_values.map(|values| (values, AggregateOwner::Distinct(index))),
-                xid,
-                snapshot,
-                context,
-            ),
-        })
-        .collect()
-}
-
-#[cfg_attr(feature = "execution-log", tracing::instrument(skip_all))]
 fn execute_plain_select_rows(
     state: &DatabaseState,
     select: &ast::Select,
@@ -1005,7 +217,7 @@ fn execute_plain_select_rows(
     snapshot: &Snapshot,
     context: &StatementExecutionContext,
     top_k: Option<usize>,
-) -> Result<Vec<OrderedRow>> {
+) -> Result<Vec<SelectRow>> {
     if let Some(rows) = execute_correlated_exists_rows(
         state,
         select,
@@ -1096,7 +308,7 @@ fn execute_plain_select_rows(
                 )?;
                 retain_top_ordered_row(
                     &mut rows,
-                    OrderedRow {
+                    SelectRow {
                         values,
                         keys,
                         distinct_keys: Vec::new(),
@@ -1134,7 +346,7 @@ fn execute_plain_select_rows(
             )?;
             retain_top_ordered_row(
                 &mut rows,
-                OrderedRow {
+                SelectRow {
                     values,
                     keys,
                     distinct_keys,
@@ -1181,7 +393,7 @@ fn execute_correlated_exists_rows(
     xid: Xid,
     snapshot: &Snapshot,
     context: &StatementExecutionContext,
-) -> Option<Result<Vec<OrderedRow>>> {
+) -> Option<Result<Vec<SelectRow>>> {
     let ast::Expr::Exists {
         subquery,
         negated: false,
@@ -1307,7 +519,7 @@ fn execute_correlated_exists_rows(
             let distinct_keys = evaluate_distinct_keys(
                 state, distinct, &values, &keys, scope, row, None, xid, snapshot, context,
             )?;
-            rows.push(OrderedRow {
+            rows.push(SelectRow {
                 values,
                 keys,
                 distinct_keys,
@@ -1331,7 +543,7 @@ fn execute_any_membership_rows(
     xid: Xid,
     snapshot: &Snapshot,
     context: &StatementExecutionContext,
-) -> Option<Result<Vec<OrderedRow>>> {
+) -> Option<Result<Vec<SelectRow>>> {
     let ast::Expr::AnyOp {
         left,
         compare_op: ast::BinaryOperator::Eq,
@@ -1433,7 +645,7 @@ fn execute_any_membership_rows(
             let distinct_keys = evaluate_distinct_keys(
                 state, distinct, &values, &keys, scope, row, None, xid, snapshot, context,
             )?;
-            rows.push(OrderedRow {
+            rows.push(SelectRow {
                 values,
                 keys,
                 distinct_keys,
@@ -1447,166 +659,8 @@ fn execute_any_membership_rows(
 }
 
 #[cfg_attr(feature = "execution-log", tracing::instrument(skip_all))]
-fn sort_ordered_rows(rows: &mut [OrderedRow], order_specs: &[RowOrderSpec<'_>]) {
-    if !order_specs.is_empty() {
-        rows.sort_by(|left, right| compare_ordered_rows(left, right, order_specs));
-    }
-}
-
-#[cfg_attr(feature = "execution-log", tracing::instrument(skip_all))]
-fn compare_ordered_rows(
-    left: &OrderedRow,
-    right: &OrderedRow,
-    order_specs: &[RowOrderSpec<'_>],
-) -> Ordering {
-    compare_order_keys(&left.keys, &right.keys, order_specs)
-}
-
-fn compare_order_keys(
-    left: &[Value],
-    right: &[Value],
-    order_specs: &[RowOrderSpec<'_>],
-) -> Ordering {
-    order_specs
-        .iter()
-        .zip(left.iter().zip(right))
-        .find_map(|(spec, (left, right))| {
-            let ordering = match (left, right) {
-                (Value::Null, Value::Null) => Ordering::Equal,
-                (Value::Null, _) => {
-                    if spec.nulls_first {
-                        Ordering::Less
-                    } else {
-                        Ordering::Greater
-                    }
-                }
-                (_, Value::Null) => {
-                    if spec.nulls_first {
-                        Ordering::Greater
-                    } else {
-                        Ordering::Less
-                    }
-                }
-                _ => {
-                    let ordering =
-                        compare_values(left, right).expect("ORDER BY expression type was checked");
-                    if spec.ascending {
-                        ordering
-                    } else {
-                        ordering.reverse()
-                    }
-                }
-            };
-            (ordering != Ordering::Equal).then_some(ordering)
-        })
-        .unwrap_or(Ordering::Equal)
-}
-
-fn retain_top_ordered_row(
-    rows: &mut Vec<OrderedRow>,
-    row: OrderedRow,
-    top_k: Option<usize>,
-    order_specs: &[RowOrderSpec<'_>],
-) {
-    let Some(top_k) = top_k else {
-        rows.push(row);
-        return;
-    };
-    if top_k == 0 {
-        return;
-    }
-    if rows.len() < top_k {
-        rows.push(row);
-        let mut child = rows.len() - 1;
-        while child > 0 {
-            let parent = (child - 1) / 2;
-            if compare_ordered_rows(&rows[parent], &rows[child], order_specs) != Ordering::Less {
-                break;
-            }
-            rows.swap(parent, child);
-            child = parent;
-        }
-        return;
-    }
-    if compare_ordered_rows(&row, &rows[0], order_specs) != Ordering::Less {
-        return;
-    }
-    rows[0] = row;
-    let mut parent = 0;
-    loop {
-        let left = parent * 2 + 1;
-        if left >= rows.len() {
-            break;
-        }
-        let right = left + 1;
-        let worse_child = if right < rows.len()
-            && compare_ordered_rows(&rows[left], &rows[right], order_specs) == Ordering::Less
-        {
-            right
-        } else {
-            left
-        };
-        if compare_ordered_rows(&rows[parent], &rows[worse_child], order_specs) != Ordering::Less {
-            break;
-        }
-        rows.swap(parent, worse_child);
-        parent = worse_child;
-    }
-}
-
-#[cfg_attr(feature = "execution-log", tracing::instrument(skip_all))]
-fn remove_duplicate_rows(
-    rows: Vec<OrderedRow>,
-    distinct: &DistinctPlan<'_>,
-) -> Result<Vec<OrderedRow>> {
-    let mut selected: Vec<OrderedRow> = Vec::new();
-    for row in rows {
-        let key = match distinct {
-            DistinctPlan::None => {
-                selected.push(row);
-                continue;
-            }
-            DistinctPlan::Rows => &row.values,
-            DistinctPlan::On { .. } => &row.distinct_keys,
-        };
-        let mut duplicate = false;
-        for existing in &selected {
-            let existing_key = match distinct {
-                DistinctPlan::Rows => &existing.values,
-                DistinctPlan::On { .. } => &existing.distinct_keys,
-                DistinctPlan::None => unreachable!("non-distinct rows returned before comparison"),
-            };
-            if are_rows_not_distinct(existing_key, key)? {
-                duplicate = true;
-                break;
-            }
-        }
-        if !duplicate {
-            selected.push(row);
-        }
-    }
-    Ok(selected)
-}
-
-fn compare_distinct_keys(left: &OrderedRow, right: &OrderedRow) -> Ordering {
-    left.distinct_keys
-        .iter()
-        .zip(&right.distinct_keys)
-        .find_map(|(left, right)| {
-            let ordering = match (left, right) {
-                (Value::Null, Value::Null) => Ordering::Equal,
-                (Value::Null, _) => Ordering::Greater,
-                (_, Value::Null) => Ordering::Less,
-                _ => compare_values(left, right).expect("DISTINCT expressions were type-checked"),
-            };
-            (ordering != Ordering::Equal).then_some(ordering)
-        })
-        .unwrap_or(Ordering::Equal)
-}
-
-#[cfg_attr(feature = "execution-log", tracing::instrument(skip_all))]
 fn finalize_select_rows(
-    mut rows: Vec<OrderedRow>,
+    mut rows: Vec<SelectRow>,
     order_specs: &[RowOrderSpec<'_>],
     distinct: &DistinctPlan<'_>,
     limit: Option<usize>,
@@ -2242,7 +1296,7 @@ pub(super) fn stream_plain_query_rows(
                         snapshot,
                         context,
                     )?;
-                    rows.push(OrderedRow {
+                    rows.push(SelectRow {
                         values,
                         keys,
                         distinct_keys: Vec::new(),
@@ -2373,236 +1427,4 @@ pub(super) fn stream_plain_query_rows(
         }
     }
     Ok(Some(columns))
-}
-
-#[cfg_attr(feature = "execution-log", tracing::instrument(skip_all))]
-pub(super) fn build_projection_plan<'a>(
-    state: &DatabaseState,
-    projection: &'a [ast::SelectItem],
-    scope: &BoundScope,
-) -> Result<(Vec<ProjectionSource<'a>>, Vec<ColumnMeta>)> {
-    let mut projections = Vec::new();
-    let mut columns = Vec::new();
-    for item in projection {
-        match item {
-            ast::SelectItem::Wildcard(_) => {
-                for column in scope.select_wildcard_columns(None) {
-                    if column.wildcard {
-                        projections.push(match &column.merged {
-                            Some(slots) => {
-                                ProjectionSource::Merged(slots.clone(), column.data_type, None)
-                            }
-                            None => ProjectionSource::Column(column.slot),
-                        });
-                        columns.push(ColumnMeta {
-                            name: column.name.clone(),
-                            type_oid: column.data_type.map_to_oid(),
-                            typmod: column.data_type.typmod,
-                        });
-                    }
-                }
-            }
-            ast::SelectItem::QualifiedWildcard(
-                ast::SelectItemQualifiedWildcardKind::ObjectName(object_name),
-                _,
-            ) => {
-                let qualifier = normalize_unqualified_object_name(object_name)?;
-                let matching = scope.select_wildcard_columns(Some(&qualifier));
-                if matching.is_empty()
-                    && !scope
-                        .columns
-                        .iter()
-                        .any(|column| column.qualifier == qualifier)
-                {
-                    return Err(PgError::create(
-                        SqlState::UndefinedTable,
-                        format!("missing FROM-clause entry for table {qualifier:?}"),
-                    ));
-                }
-                for column in matching {
-                    projections.push(if let Some(slots) = &column.qualified_merged {
-                        ProjectionSource::Merged(
-                            slots.clone(),
-                            column.data_type,
-                            Some(column.qualifier.clone()),
-                        )
-                    } else {
-                        ProjectionSource::Column(column.slot)
-                    });
-                    columns.push(ColumnMeta {
-                        name: column.name.clone(),
-                        type_oid: column.data_type.map_to_oid(),
-                        typmod: column.data_type.typmod,
-                    });
-                }
-            }
-            ast::SelectItem::UnnamedExpr(expression @ ast::Expr::Identifier(column)) => {
-                let (_, data_type) = scope.resolve_column(std::slice::from_ref(column))?;
-                projections.push(ProjectionSource::Expression(expression));
-                columns.push(ColumnMeta {
-                    name: column.value.clone(),
-                    type_oid: data_type.map_to_oid(),
-                    typmod: data_type.typmod,
-                });
-            }
-            ast::SelectItem::UnnamedExpr(
-                expression @ ast::Expr::CompoundIdentifier(identifiers),
-            ) => {
-                let (slot, data_type) = scope.resolve_column(identifiers)?;
-                if scope.columns.iter().any(|column| {
-                    column.slot == slot && column.wildcard && column.qualified_merged.is_none()
-                }) {
-                    projections.push(ProjectionSource::Column(slot));
-                } else {
-                    projections.push(ProjectionSource::Expression(expression));
-                }
-                columns.push(ColumnMeta {
-                    name: identifiers
-                        .last()
-                        .expect("compound identifier is non-empty")
-                        .value
-                        .clone(),
-                    type_oid: data_type.map_to_oid(),
-                    typmod: data_type.typmod,
-                });
-            }
-            ast::SelectItem::UnnamedExpr(expr) => {
-                let data_type = infer_query_expression_type(state, expr, scope)?;
-                projections.push(ProjectionSource::Expression(expr));
-                columns.push(ColumnMeta {
-                    name: match expr {
-                        ast::Expr::Function(function) => {
-                            normalize_unqualified_object_name(&function.name)?
-                        }
-                        ast::Expr::Extract { .. } => "extract".into(),
-                        _ => "?column?".into(),
-                    },
-                    type_oid: data_type.map_to_oid(),
-                    typmod: data_type.typmod,
-                });
-            }
-            ast::SelectItem::ExprWithAlias { expr, alias } => {
-                let resolved = match expr {
-                    ast::Expr::Identifier(column) => {
-                        Some(scope.resolve_column(std::slice::from_ref(column))?)
-                    }
-                    ast::Expr::CompoundIdentifier(identifiers) => {
-                        Some(scope.resolve_column(identifiers)?)
-                    }
-                    _ => None,
-                };
-                let (projection, data_type, typmod) = match resolved {
-                    Some((_, data_type)) => (
-                        ProjectionSource::Expression(expr),
-                        data_type,
-                        data_type.typmod,
-                    ),
-                    None => {
-                        let data_type = infer_query_expression_type(state, expr, scope)?;
-                        (
-                            ProjectionSource::Expression(expr),
-                            data_type,
-                            data_type.typmod,
-                        )
-                    }
-                };
-                projections.push(projection);
-                columns.push(ColumnMeta {
-                    name: normalize_identifier(alias),
-                    type_oid: data_type.map_to_oid(),
-                    typmod,
-                });
-            }
-            _ => {
-                return reject_unsupported("SELECT projection is not implemented");
-            }
-        }
-    }
-    Ok((projections, columns))
-}
-
-#[cfg_attr(feature = "execution-log", tracing::instrument(skip_all))]
-pub(super) fn build_mutation_projection_plan<'a>(
-    state: &DatabaseState,
-    projection: &'a [ast::SelectItem],
-    scope: &BoundScope,
-    target_columns: usize,
-) -> Result<(Vec<ProjectionSource<'a>>, Vec<ColumnMeta>)> {
-    let mut target_wildcard_scope = scope.clone();
-    for column in &mut target_wildcard_scope.columns[target_columns..] {
-        column.wildcard = false;
-    }
-    let mut projections = Vec::new();
-    let mut columns = Vec::new();
-    for item in projection {
-        let item_scope = if matches!(item, ast::SelectItem::Wildcard(_)) {
-            &target_wildcard_scope
-        } else {
-            scope
-        };
-        let (mut item_projections, mut item_columns) =
-            build_projection_plan(state, std::slice::from_ref(item), item_scope)?;
-        projections.append(&mut item_projections);
-        columns.append(&mut item_columns);
-    }
-    Ok((projections, columns))
-}
-
-#[cfg_attr(feature = "execution-log", tracing::instrument(skip_all))]
-pub(super) fn infer_query_expression_type(
-    state: &DatabaseState,
-    expr: &ast::Expr,
-    scope: &BoundScope,
-) -> Result<PgType> {
-    super::scope::infer_expression_data_type(&state.catalog, expr, scope)
-}
-
-#[cfg_attr(feature = "execution-log", tracing::instrument(skip_all))]
-fn evaluate_row_count(
-    expr: &ast::Expr,
-    clause: RowCountClause,
-    context: &StatementExecutionContext,
-) -> Result<Option<usize>> {
-    if matches!(clause, RowCountClause::Limit)
-        && matches!(expr, ast::Expr::Identifier(identifier) if identifier.quote_style.is_none() && identifier.value.eq_ignore_ascii_case("all"))
-    {
-        return Ok(None);
-    }
-    let schema = create_constant_expression_schema();
-    let value = evaluate_and_coerce(
-        expr,
-        BaseType::Int8,
-        CastContext::Implicit,
-        RowScope::Table(&schema),
-        &[],
-        context,
-    )
-    .map_err(|error| {
-        if error.sqlstate == SqlState::CannotCoerce {
-            PgError::create(
-                SqlState::DatatypeMismatch,
-                match clause {
-                    RowCountClause::Limit => "argument of LIMIT must be type bigint",
-                    RowCountClause::Offset => "argument of OFFSET must be type bigint",
-                },
-            )
-        } else {
-            error
-        }
-    })?;
-    match value {
-        Value::Null => Ok(None),
-        Value::Int8(value) if value >= 0 => Ok(Some(usize::try_from(value).unwrap_or(usize::MAX))),
-        Value::Int8(_) => Err(PgError::create(
-            match clause {
-                RowCountClause::Limit => SqlState::InvalidRowCountInLimitClause,
-                RowCountClause::Offset => SqlState::InvalidRowCountInResultOffsetClause,
-            },
-            match clause {
-                RowCountClause::Limit => "LIMIT must not be negative",
-                RowCountClause::Offset => "OFFSET must not be negative",
-            },
-        )),
-        _ => unreachable!("row count was coerced to bigint"),
-    }
 }

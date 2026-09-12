@@ -17,7 +17,7 @@ use crate::{
 };
 
 use super::{
-    DistinctKey, DistinctPlan, OrderKey, OrderedRow, ProjectionSource, RowOrderSpec,
+    DistinctKey, DistinctPlan, OrderKey, ProjectionSource, RowOrderSpec, SelectRow,
     evaluate_query_expression, evaluate_select_expression, evaluate_where_clause,
 };
 
@@ -221,7 +221,7 @@ pub(super) fn execute_windowed_select_rows(
     xid: Xid,
     snapshot: &Snapshot,
     context: &StatementExecutionContext,
-) -> Result<Vec<OrderedRow>> {
+) -> Result<Vec<SelectRow>> {
     let mut source_rows = Vec::new();
     visit_query_source_rows(
         state,
@@ -332,7 +332,7 @@ pub(super) fn execute_windowed_select_rows(
                     .collect::<Result<Vec<_>>>()?,
                 DistinctPlan::None | DistinctPlan::Rows => Vec::new(),
             };
-            Ok(OrderedRow {
+            Ok(SelectRow {
                 values,
                 keys,
                 distinct_keys,

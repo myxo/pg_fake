@@ -19,7 +19,7 @@ use crate::{
     value::{BaseType, PgType, Value},
 };
 
-use super::{RowCountClause, evaluate_row_count};
+use super::limits::{RowCountClause, evaluate_row_count};
 
 #[cfg_attr(feature = "execution-log", tracing::instrument(skip_all))]
 pub(super) fn bind_values_scope(values: &ast::Values) -> Result<BoundScope> {

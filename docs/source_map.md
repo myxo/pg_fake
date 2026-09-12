@@ -32,6 +32,17 @@ creation use the same catalog traversal and CTE scoping rules.
 [`executor/query/mod.rs`](../crates/pg_fake/src/executor/query/mod.rs) coordinates
 query execution, including SELECT, grouping, windows, CTEs, and streaming.
 
+- [`projection.rs`](../crates/pg_fake/src/executor/query/projection.rs) binds
+  `SELECT` and `RETURNING` outputs, describes their columns, and evaluates values.
+- [`ordering.rs`](../crates/pg_fake/src/executor/query/ordering.rs) resolves
+  `ORDER BY` keys and performs sorting and bounded top-row selection.
+- [`distinct.rs`](../crates/pg_fake/src/executor/query/distinct.rs) validates
+  `DISTINCT` and `DISTINCT ON`, reuses output/order keys, and removes duplicates.
+- [`limits.rs`](../crates/pg_fake/src/executor/query/limits.rs) resolves
+  `LIMIT` and `OFFSET`, including NULL, `ALL`, and invalid row counts.
+- [`expressions.rs`](../crates/pg_fake/src/executor/query/expressions.rs) compares
+  bound expressions, prunes constant CASE branches, detects volatility, and
+  substitutes aggregate values before expression evaluation.
 - [`values.rs`](../crates/pg_fake/src/executor/query/values.rs) binds and executes
   `VALUES` row constructors, including column types, ordering, and row limits.
 - [`windows.rs`](../crates/pg_fake/src/executor/query/windows.rs) collects window
