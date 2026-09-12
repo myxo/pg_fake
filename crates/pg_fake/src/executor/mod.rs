@@ -44,12 +44,14 @@ pub(crate) use json::{
     resolve_json_operator_types,
 };
 mod locks;
+mod outer_references;
 mod prepared;
 mod procedural;
 mod query;
 mod scope;
 pub(crate) use scope::{bind_join, bind_table_factor};
 mod sequences;
+mod subqueries;
 mod views;
 mod writes;
 
@@ -618,11 +620,11 @@ pub(crate) struct MutationCandidate {
 }
 
 pub(crate) use ctes::{expand_ctes_for_analysis, materialize_statement_ctes};
+pub(crate) use procedural::substitute_procedural_references;
 pub(crate) use query::describe_query_result_columns;
 pub(crate) use query::detect_statement_features;
-pub(crate) use query::materialize_uncorrelated_subqueries;
-pub(crate) use query::substitute_procedural_references;
 pub(crate) use sequences::normalize_sequence_name;
+pub(crate) use subqueries::materialize_uncorrelated_subqueries;
 
 impl DatabaseState {
     #[cfg_attr(feature = "execution-log", tracing::instrument(skip_all))]

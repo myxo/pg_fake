@@ -8,10 +8,8 @@ use crate::{
     error::{PgError, Result, SqlState, reject_unsupported},
     executor::{
         DatabaseState, StatementExecutionContext, execute_statement, normalize_identifier,
-        query::{
-            describe_query_result_columns, execute_query, has_zero_limit,
-            materialize_uncorrelated_subqueries,
-        },
+        query::{describe_query_result_columns, execute_query, has_zero_limit},
+        subqueries::materialize_uncorrelated_subqueries,
     },
     txn::{Snapshot, Xid},
 };

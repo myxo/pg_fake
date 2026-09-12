@@ -1323,9 +1323,10 @@ fn validate_json_join_references(
     if let Some(super::json::JsonTableFunction { argument, .. }) =
         super::json::extract_json_table_function(factor)?
     {
-        let referenced = super::query::collect_outer_reference_slots(catalog, argument, scope)?
-            .iter()
-            .any(|slot| forbidden.contains(slot));
+        let referenced =
+            super::outer_references::collect_outer_reference_slots(catalog, argument, scope)?
+                .iter()
+                .any(|slot| forbidden.contains(slot));
         if referenced {
             return Err(PgError::create(
                 SqlState::InvalidColumnReference,

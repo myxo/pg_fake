@@ -46,6 +46,17 @@ The query coordinator delegates CTE handling to `executor/ctes`. The shared
 `are_rows_not_distinct` predicate makes the NULL equality used by grouping and
 duplicate handling explicit.
 
+[`executor/subqueries.rs`](../crates/pg_fake/src/executor/subqueries.rs) evaluates
+scalar, `EXISTS`, `IN`, `ANY`, and `ALL` subqueries, preserving result types and
+reusing results prepared during lock discovery. Correlated expressions first
+substitute values from the outer row.
+
+[`executor/outer_references.rs`](../crates/pg_fake/src/executor/outer_references.rs)
+resolves those outer references while respecting inner scopes and output aliases.
+Procedural SQL uses the same traversal with an explicit ambiguity policy;
+[`procedural.rs`](../crates/pg_fake/src/executor/procedural.rs) supplies its variable
+scope and statement-specific binding rules.
+
 ## Common table expressions
 
 [`executor/ctes/mod.rs`](../crates/pg_fake/src/executor/ctes/mod.rs) materializes

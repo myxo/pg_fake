@@ -1,5 +1,6 @@
 use sqlparser::{dialect::PostgreSqlDialect, parser::Parser};
 
+use super::outer_references::{NameConflictPolicy, substitute_outer_references};
 use super::*;
 use crate::catalog::{FunctionSchema, TriggerSchema};
 
@@ -462,4 +463,77 @@ pub(super) fn execute_before_row_triggers(
         }
     }
     Ok(Some(row))
+}
+
+pub(crate) fn substitute_procedural_references(
+    state: &DatabaseState,
+    statement: &mut ast::Statement,
+    scope: &BoundScope,
+    row: &[Value],
+) -> Result<()> {
+    let scopes = match statement {
+        ast::Statement::Update(update) => {
+            let ast::TableFactor::Table {
+                name, alias, args, ..
+            } = &update.table.relation
+            else {
+                return reject_unsupported("UPDATE target is not implemented");
+            };
+            if args.is_some() {
+                return reject_unsupported("UPDATE table functions are not implemented");
+            }
+            let schema = state
+                .catalog
+                .require_named_table(&normalize_relation_name(name)?)?;
+            let from = match &update.from {
+                None => &[][..],
+                Some(ast::UpdateTableFromKind::AfterSet(from)) => from.as_slice(),
+                Some(ast::UpdateTableFromKind::BeforeSet(_)) => {
+                    return reject_unsupported("UPDATE FROM before SET is not implemented");
+                }
+            };
+            vec![writes::create_mutation_scope(
+                state,
+                schema,
+                alias.as_ref().map(|alias| &alias.name),
+                from,
+            )?]
+        }
+        ast::Statement::Delete(delete) => {
+            let ast::FromTable::WithFromKeyword(from) = &delete.from else {
+                return reject_unsupported("DELETE without FROM is not implemented");
+            };
+            let Some(target) = from.first() else {
+                return reject_unsupported("DELETE target is not implemented");
+            };
+            let ast::TableFactor::Table {
+                name, alias, args, ..
+            } = &target.relation
+            else {
+                return reject_unsupported("DELETE target is not implemented");
+            };
+            if args.is_some() {
+                return reject_unsupported("DELETE table functions are not implemented");
+            }
+            let schema = state
+                .catalog
+                .require_named_table(&normalize_relation_name(name)?)?;
+            vec![writes::create_mutation_scope(
+                state,
+                schema,
+                alias.as_ref().map(|alias| &alias.name),
+                delete.using.as_deref().unwrap_or_default(),
+            )?]
+        }
+        _ => Vec::new(),
+    };
+    substitute_outer_references(
+        &state.catalog,
+        statement,
+        scope,
+        row,
+        scopes,
+        NameConflictPolicy::RejectAmbiguous,
+    )
+    .map(|_| ())
 }

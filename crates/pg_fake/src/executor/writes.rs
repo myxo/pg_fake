@@ -292,7 +292,7 @@ fn evaluate_mutation_assignment(
         coercion::coerce_unknown(text, target, CastContext::Assignment)
     } else {
         coercion::coerce(
-            query::evaluate_query_expression(
+            subqueries::evaluate_query_expression(
                 state, expression, scope, row, xid, snapshot, context,
             )?,
             query::infer_query_expression_type(state, expression, scope)?.base,
@@ -316,7 +316,7 @@ fn matches_mutation_row(
         return Ok(true);
     };
     Ok(
-        match query::evaluate_query_expression(
+        match subqueries::evaluate_query_expression(
             state, selection, scope, row, xid, snapshot, context,
         )? {
             Value::Bool(value) => value,
