@@ -28,6 +28,26 @@ Catalog dependencies serve both prepared statements and lock discovery.
 Keeping them independent of prepared handles lets ordinary queries and view
 creation use the same catalog traversal and CTE scoping rules.
 
+## Prepared-statement analysis
+
+[`analyzer/mod.rs`](../crates/pg_fake/src/analyzer/mod.rs) coordinates parameter
+analysis, validates typed statements, and binds supplied values to placeholders.
+
+- [`parameter_types/mod.rs`](../crates/pg_fake/src/analyzer/parameter_types/mod.rs)
+  applies statement-level type expectations and finalizes unconstrained parameters.
+  [`queries.rs`](../crates/pg_fake/src/analyzer/parameter_types/queries.rs) propagates
+  expectations through SELECT, VALUES, set operations, joins, and FROM sources;
+  [`expressions.rs`](../crates/pg_fake/src/analyzer/parameter_types/expressions.rs)
+  constrains individual placeholders from operators and function arguments.
+- [`validation.rs`](../crates/pg_fake/src/analyzer/validation.rs) validates
+  assignments, predicates, RETURNING, and query clauses after parameter binding.
+- [`subqueries.rs`](../crates/pg_fake/src/analyzer/subqueries.rs) substitutes typed
+  subquery placeholders while respecting the surrounding statement scope.
+- [`literals.rs`](../crates/pg_fake/src/analyzer/literals.rs) constructs typed SQL
+  literals and casts, preserving PostgreSQL type modifiers.
+- [`scopes.rs`](../crates/pg_fake/src/analyzer/scopes.rs) shares mutation scopes
+  and projection-alias recognition among the analysis passes.
+
 ## Statement state
 
 [`executor/context.rs`](../crates/pg_fake/src/executor/context.rs) owns
@@ -248,7 +268,7 @@ module.
 
 1. A session parses SQL through [`parser.rs`](../crates/pg_fake/src/parser.rs).
    Parameterized calls use the prepared-statement path and
-   [`analyzer.rs`](../crates/pg_fake/src/analyzer.rs).
+   [`analyzer/mod.rs`](../crates/pg_fake/src/analyzer/mod.rs).
 2. The session handles settings and transaction commands, or chooses a snapshot
    for ordinary execution. SQL inside a `DO` block re-enters session execution.
 3. It acquires relation locks and then validates prepared dependencies against
