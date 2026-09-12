@@ -205,10 +205,28 @@ operator typing, scalar functions, and table-function expansion.
 feature executors after checking the statement deadline.
 [`table_ddl.rs`](../crates/pg_fake/src/executor/table_ddl.rs) creates and drops
 tables, binds defaults and generated sequences, and supplies definition helpers
-shared with [`alter_table.rs`](../crates/pg_fake/src/executor/alter_table.rs).
+shared with [`alter_table/mod.rs`](../crates/pg_fake/src/executor/alter_table/mod.rs).
 [`sequence_ddl.rs`](../crates/pg_fake/src/executor/sequence_ddl.rs) creates and drops
 sequences, including ownership and dependency checks; runtime sequence allocation
 remains in [`sequences.rs`](../crates/pg_fake/src/executor/sequences.rs).
+
+## Table alterations
+
+[`executor/alter_table/mod.rs`](../crates/pg_fake/src/executor/alter_table/mod.rs)
+coordinates table rewrites: captures visible rows, applies operations in order,
+updates catalog and row versions, validates the resulting rows, and cleans up
+new sequences if the alteration fails.
+
+- [`operations.rs`](../crates/pg_fake/src/executor/alter_table/operations.rs)
+  dispatches individual ALTER TABLE operations and validates the schema after each.
+- [`columns.rs`](../crates/pg_fake/src/executor/alter_table/columns.rs) builds
+  column definitions, allocates serial/identity sequences, and changes defaults,
+  nullability, or types with optional USING expressions.
+- [`constraints.rs`](../crates/pg_fake/src/executor/alter_table/constraints.rs)
+  builds named table and foreign-key constraints, including NOT VALID metadata.
+- [`dependencies.rs`](../crates/pg_fake/src/executor/alter_table/dependencies.rs)
+  checks dependent views and foreign keys, removes dependent objects, and updates
+  stored column references during renames.
 
 ## Stored views
 

@@ -3,9 +3,8 @@ use bigdecimal::ToPrimitive;
 use crate::{
     ColumnMeta, StatementResult,
     catalog::{
-        Catalog, ColumnDef, ConstraintId, ForeignKey, ForeignKeyAction, IdentityKind,
-        IndexColumnDefinition, IndexSchema, RelationName, ResolvedRelationName, TableId,
-        TablePersistence, TableSchema,
+        Catalog, ConstraintId, ForeignKey, ForeignKeyAction, IndexColumnDefinition, IndexSchema,
+        RelationName, ResolvedRelationName, TableId, TablePersistence, TableSchema,
     },
     coercion::{self, CastContext},
     error::{PgError, Result, SqlState, reject_unsupported},
@@ -64,29 +63,23 @@ use aggregates::{
 use arithmetic::{
     evaluate_boolean_operator, evaluate_numeric_operator, evaluate_temporal_arithmetic,
 };
-use column_defaults::{evaluate_column_default, validate_column_default};
+use column_defaults::evaluate_column_default;
 use expressions::{
-    compare_values, evaluate, evaluate_and_coerce, evaluate_assignment_expression,
-    evaluate_comparison, validate_equality_type, validate_ordering_type,
+    compare_values, evaluate, evaluate_and_coerce, evaluate_comparison, validate_equality_type,
+    validate_ordering_type,
 };
 pub(crate) use expressions::{
     create_constant_expression_schema, extract_unknown_string_literal, infer_expression_type,
     is_null_literal,
 };
 pub(crate) use foreign_keys::{contains_deferred_foreign_keys, validate_deferred_foreign_keys};
-use foreign_keys::{
-    convert_referential_action, resolve_foreign_key_name, validate_foreign_key_definitions,
-    validate_row_foreign_keys,
-};
 pub(crate) use indexes::evaluate_index_predicate;
 use indexes::{execute_alter_index, execute_create_index, execute_drop_indexes};
 pub(crate) use locks::{
     MutationCandidate, RequiredRowLock, collect_required_cte_row_locks, collect_required_row_locks,
     mutation_locks_cover_targets,
 };
-use row_constraints::{
-    validate_check_constraint_types, validate_check_constraints, validate_not_null,
-};
+use row_constraints::{validate_check_constraints, validate_not_null};
 
 fn validate_btree_key_type(data_type: BaseType) -> Result<()> {
     if data_type == BaseType::Json {
@@ -109,10 +102,6 @@ pub(crate) use scope::{
 pub(crate) use sequences::{
     SequenceExecutionContext, SequenceSessionState, SequenceSessionStorage, SequenceStorage,
     SequenceValueState,
-};
-use table_ddl::{
-    create_generated_sequence_name, find_first_referenced_column, generate_constraint_name,
-    resolve_default_sequence,
 };
 use views::{execute_comment_on_view, execute_create_view, execute_drop_views};
 use writes::{execute_delete, execute_insert, execute_update};
