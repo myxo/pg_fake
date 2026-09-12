@@ -19,11 +19,13 @@ use crate::{
     value::{BaseType, PgType, Value},
 };
 
-use super::expressions::prune_constant_cases;
 use super::{
-    DistinctKey, DistinctPlan, OrderKey, ProjectionSource, RowOrderSpec, SelectRow,
-    contains_volatile_expression, evaluate_distinct_keys, evaluate_order_keys,
-    evaluate_projection_values, evaluate_where_clause,
+    SelectRow,
+    distinct::{DistinctKey, DistinctPlan, evaluate_distinct_keys},
+    expressions::{contains_volatile_expression, prune_constant_cases},
+    ordering::{OrderKey, RowOrderSpec, evaluate_order_keys},
+    projection::{ProjectionSource, evaluate_projection_values},
+    select::evaluate_where_clause,
 };
 
 mod validation;

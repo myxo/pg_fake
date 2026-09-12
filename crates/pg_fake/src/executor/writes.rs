@@ -1089,7 +1089,7 @@ fn evaluate_triggered_insert_rows(
             }
         }
     }
-    let streamed = query::stream_plain_query_rows(
+    let streamed = query::stream_query_rows(
         &source_state,
         source,
         xid,
@@ -1225,8 +1225,7 @@ fn evaluate_triggered_insert_rows(
         }
         Ok(None) => {}
     }
-    let Some(query::PreparedQueryStream::Materialized { result: source, .. }) =
-        source_query.as_ref()
+    let Some(query::QueryStreamState::Materialized { result: source, .. }) = source_query.as_ref()
     else {
         unreachable!("non-streamable INSERT source is materialized")
     };

@@ -19,9 +19,10 @@ use crate::{
 };
 
 use super::super::{
-    DistinctPlan, OrderKey, ProjectionSource, RowOrderSpec, build_projection_plan,
-    create_projection_expression, infer_query_expression_type, resolve_distinct_plan,
-    resolve_order_specs,
+    distinct::{DistinctPlan, resolve_distinct_plan},
+    expressions::infer_query_expression_type,
+    ordering::{OrderKey, RowOrderSpec, resolve_order_specs},
+    projection::{ProjectionSource, build_projection_plan, create_projection_expression},
 };
 use super::GroupingPlan;
 

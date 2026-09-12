@@ -30,8 +30,14 @@ creation use the same catalog traversal and CTE scoping rules.
 ## Query execution
 
 [`executor/query/mod.rs`](../crates/pg_fake/src/executor/query/mod.rs) coordinates
-query execution, including SELECT, grouping, windows, CTEs, and streaming.
+query validation, chooses the row-evaluation path, and applies final result
+ordering, distinctness, and limits.
 
+- [`select.rs`](../crates/pg_fake/src/executor/query/select.rs) evaluates ordinary
+  SELECT rows and membership filters, including deferred projection evaluation.
+- [`streaming.rs`](../crates/pg_fake/src/executor/query/streaming.rs) resumes
+  query execution across consumer requests. `QueryStreamState` retains progress
+  through unordered, ordered, grouped, `UNION ALL`, and materialized results.
 - [`projection.rs`](../crates/pg_fake/src/executor/query/projection.rs) binds
   `SELECT` and `RETURNING` outputs, describes their columns, and evaluates values.
 - [`ordering.rs`](../crates/pg_fake/src/executor/query/ordering.rs) resolves

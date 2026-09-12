@@ -11,14 +11,19 @@ use crate::{
         from::visit_query_source_rows,
         normalize_unqualified_object_name, resolve_order_ascending,
         scope::{BoundScope, RowScope},
+        subqueries::evaluate_query_expression,
     },
     txn::{Snapshot, Xid},
     value::{BaseType, PgType, Value},
 };
 
 use super::{
-    DistinctKey, DistinctPlan, OrderKey, ProjectionSource, RowOrderSpec, SelectRow,
-    evaluate_query_expression, evaluate_select_expression, evaluate_where_clause,
+    SelectRow,
+    distinct::{DistinctKey, DistinctPlan},
+    expressions::evaluate_select_expression,
+    ordering::{OrderKey, RowOrderSpec},
+    projection::ProjectionSource,
+    select::evaluate_where_clause,
 };
 
 struct WindowCollector {
