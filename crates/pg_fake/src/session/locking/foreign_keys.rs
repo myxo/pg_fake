@@ -158,7 +158,7 @@ pub(super) fn collect_foreign_key_relation_locks<'a>(
                 }
             }
         }
-        for (child, foreign_key) in state.catalog.referencing_foreign_keys(table_id) {
+        for (child, foreign_key) in state.catalog.collect_referencing_foreign_keys(table_id) {
             if let Some(updated_columns) = updated_columns {
                 let referred_columns = if foreign_key.referred_columns.is_empty() {
                     table

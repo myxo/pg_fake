@@ -301,7 +301,9 @@ pub(super) fn apply_referencing_foreign_key_actions(
     context: &StatementExecutionContext,
 ) -> Result<()> {
     let snapshot = snapshot.include_current_command();
-    let foreign_keys = state.catalog.referencing_foreign_keys(parent_schema.id);
+    let foreign_keys = state
+        .catalog
+        .collect_referencing_foreign_keys(parent_schema.id);
     for (child_schema, foreign_key) in foreign_keys {
         let referred_columns = if foreign_key.referred_columns.is_empty() {
             parent_schema

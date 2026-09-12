@@ -161,7 +161,7 @@ pub(super) fn collect_ddl_relation_locks(
                     RelationLockMode::Exclusive,
                 );
                 if let Ok(table) = catalog.require_named_table(&name) {
-                    for (referencing, _) in catalog.referencing_foreign_keys(table.id) {
+                    for (referencing, _) in catalog.collect_referencing_foreign_keys(table.id) {
                         locks
                             .entry(
                                 ResolvedRelationName {
@@ -315,7 +315,7 @@ pub(super) fn collect_ddl_relation_locks(
                         ..
                     }
                 ) {
-                    for (referencing, _) in catalog.referencing_foreign_keys(table.id) {
+                    for (referencing, _) in catalog.collect_referencing_foreign_keys(table.id) {
                         locks.insert(
                             ResolvedRelationName {
                                 schema_id: referencing.schema_id,

@@ -1,7 +1,7 @@
 
 use super::*;
 use crate::txn::{CommandId, Snapshot, TransactionRegistry};
-use crate::value::BaseType;
+use crate::value::{BaseType, PgType};
 use chaos_theory::check;
 
 #[cfg_attr(feature = "execution-log", tracing::instrument(skip_all))]
@@ -418,7 +418,7 @@ fn binds_foreign_keys_and_sequence_owners_to_table_identities() {
         unreachable!()
     };
     assert_eq!(foreign_key.foreign_table_id, parent);
-    assert_eq!(catalog.referencing_foreign_keys(parent)[0].0.id, child);
+    assert_eq!(catalog.collect_referencing_foreign_keys(parent)[0].0.id, child);
 
     let mut sequence = SequenceSchema {
         id: SequenceId(0),
@@ -446,7 +446,7 @@ fn binds_foreign_keys_and_sequence_owners_to_table_identities() {
     assert!(!catalog.has_referencing_foreign_keys(parent));
     assert!(catalog.require_sequence("parents_id_seq").is_err());
     assert_eq!(snapshot.require_table("children").unwrap().id, child);
-    assert_eq!(snapshot.referencing_foreign_keys(parent)[0].0.id, child);
+    assert_eq!(snapshot.collect_referencing_foreign_keys(parent)[0].0.id, child);
     assert_eq!(
         snapshot.require_sequence("parents_id_seq").unwrap(),
         &sequence
@@ -463,7 +463,7 @@ fn binds_foreign_keys_and_sequence_owners_to_table_identities() {
     renamed.name = "renamed_parents".into();
     changed_snapshot.replace_table(renamed).unwrap();
     changed_snapshot.rename_table_dependencies(parent, "renamed_parents");
-    let changed_foreign_key = &changed_snapshot.referencing_foreign_keys(parent)[0].1;
+    let changed_foreign_key = &changed_snapshot.collect_referencing_foreign_keys(parent)[0].1;
     assert_eq!(changed_foreign_key.foreign_table.name, "renamed_parents");
     assert_eq!(changed_foreign_key.referred_columns, ["renamed_id"]);
     assert_eq!(
@@ -477,7 +477,7 @@ fn binds_foreign_keys_and_sequence_owners_to_table_identities() {
         snapshot.require_table("parents").unwrap().columns[0].name,
         "id"
     );
-    let original_foreign_key = &snapshot.referencing_foreign_keys(parent)[0].1;
+    let original_foreign_key = &snapshot.collect_referencing_foreign_keys(parent)[0].1;
     assert_eq!(original_foreign_key.foreign_table.name, "parents");
     assert_eq!(original_foreign_key.referred_columns, ["id"]);
     assert_eq!(

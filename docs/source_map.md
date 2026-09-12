@@ -155,10 +155,26 @@ rows an operation must lock. [`txn.rs`](../crates/pg_fake/src/txn.rs) owns lock
 compatibility, queues, the wait-for graph, transaction status, and visibility.
 These separate the SQL requirements, blocking execution, and lock bookkeeping.
 
-## Catalog visibility
+## Catalog objects and visibility
 
-[`catalog/mod.rs`](../crates/pg_fake/src/catalog/mod.rs) holds the visible catalog:
-named objects, schemas, dependency metadata, and catalog identity used by caches.
+[`catalog/mod.rs`](../crates/pg_fake/src/catalog/mod.rs) owns schemas, the visible
+object maps, catalog identity used by caches, and dependency updates spanning
+multiple object kinds. Each object module keeps its definitions with its catalog
+operations:
+
+- [`names.rs`](../crates/pg_fake/src/catalog/names.rs) resolves relation names,
+  creation namespaces, and temporary-schema precedence.
+- [`tables.rs`](../crates/pg_fake/src/catalog/tables.rs) defines tables, columns,
+  indexes, and triggers, and looks up, creates, replaces, or removes tables.
+- [`constraints.rs`](../crates/pg_fake/src/catalog/constraints.rs) defines
+  constraints and maintains foreign-key dependency and deferral metadata.
+- [`sequences.rs`](../crates/pg_fake/src/catalog/sequences.rs) manages sequence
+  definitions, ownership, and removal dependencies. Sequence values live in
+  `executor/sequences.rs` because allocation survives transaction rollback.
+- [`views.rs`](../crates/pg_fake/src/catalog/views.rs) manages view definitions,
+  output columns, and view dependencies.
+- [`functions.rs`](../crates/pg_fake/src/catalog/functions.rs) manages function
+  definitions and preserves their identities when replacing them.
 
 [`catalog/history.rs`](../crates/pg_fake/src/catalog/history.rs) owns transactional
 catalog versions. Its interface materializes the catalog for a snapshot, records
