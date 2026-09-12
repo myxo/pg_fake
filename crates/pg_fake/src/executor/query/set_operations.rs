@@ -8,6 +8,7 @@ use crate::{
     error::{PgError, Result, SqlState, reject_unsupported},
     executor::{
         DatabaseState, StatementExecutionContext,
+        equality::are_rows_not_distinct,
         expressions::{
             compare_values, extract_number_literal, extract_unknown_string_literal,
             validate_equality_type, validate_ordering_type,
@@ -19,9 +20,7 @@ use crate::{
     value::{BaseType, PgType, Value},
 };
 
-use super::{
-    are_rows_not_distinct, describe_query_result_columns, execute_query, resolve_select_limit,
-};
+use super::{describe_query_result_columns, execute_query, resolve_select_limit};
 
 #[cfg_attr(feature = "execution-log", tracing::instrument(skip_all))]
 pub(super) fn execute_set_query(

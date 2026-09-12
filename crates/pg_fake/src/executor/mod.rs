@@ -35,8 +35,10 @@ mod aggregates;
 mod alter_table;
 mod arithmetic;
 mod ctes;
+mod equality;
 mod expressions;
 mod foreign_keys;
+mod from;
 mod indexes;
 mod json;
 pub(crate) use json::{

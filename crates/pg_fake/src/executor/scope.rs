@@ -1348,3 +1348,17 @@ fn validate_json_join_references(
     }
     Ok(())
 }
+
+#[cfg_attr(feature = "execution-log", tracing::instrument(skip_all))]
+pub(super) fn try_resolve_column_reference(
+    expression: &ast::Expr,
+    scope: &BoundScope,
+) -> Option<(usize, PgType)> {
+    match expression {
+        ast::Expr::Identifier(identifier) => {
+            scope.resolve_column(std::slice::from_ref(identifier)).ok()
+        }
+        ast::Expr::CompoundIdentifier(identifiers) => scope.resolve_column(identifiers).ok(),
+        _ => None,
+    }
+}

@@ -42,9 +42,20 @@ query execution, including SELECT, grouping, windows, CTEs, and streaming.
   operand type resolution, duplicate handling, and ordering/limiting the combined
   result. Recursive CTEs and streamed `UNION ALL` reuse its row and type operations.
 
-The query coordinator delegates CTE handling to `executor/ctes`. The shared
-`are_rows_not_distinct` predicate makes the NULL equality used by grouping and
-duplicate handling explicit.
+The query coordinator delegates CTE handling to `executor/ctes` and source-row
+production to `executor/from`.
+
+[`executor/from/mod.rs`](../crates/pg_fake/src/executor/from/mod.rs) combines `FROM`
+sources, including derived tables and JSON expansion. Queries and mutations share
+this source-row interface. Its [`scans.rs`](../crates/pg_fake/src/executor/from/scans.rs)
+owns visible table scans, index lookups, and predicate pushdown;
+[`joins.rs`](../crates/pg_fake/src/executor/from/joins.rs) owns join conditions,
+hash and nested-loop evaluation, and unmatched rows in outer joins.
+
+[`executor/equality.rs`](../crates/pg_fake/src/executor/equality.rs) holds the
+hashable equality keys shared by joins and membership predicates. NULL has no
+such key. Its `are_rows_not_distinct` predicate separately expresses the NULL
+equality used by grouping and duplicate handling.
 
 [`executor/subqueries.rs`](../crates/pg_fake/src/executor/subqueries.rs) evaluates
 scalar, `EXISTS`, `IN`, `ANY`, and `ALL` subqueries, preserving result types and

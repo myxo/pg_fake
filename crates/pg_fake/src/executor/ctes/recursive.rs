@@ -9,11 +9,12 @@ use crate::{
     error::{PgError, Result, SqlState, reject_unsupported},
     executor::{
         DatabaseState, StatementExecutionContext,
+        equality::are_rows_not_distinct,
         expressions::validate_equality_type,
         normalize_identifier, normalize_unqualified_object_name,
         query::{
-            are_rows_not_distinct, contains_query_aggregate, describe_query_result_columns,
-            execute_query, has_zero_limit, resolve_select_limit,
+            contains_query_aggregate, describe_query_result_columns, execute_query, has_zero_limit,
+            resolve_select_limit,
             set_operations::{
                 coerce_set_rows, remove_set_duplicates, resolve_set_columns, sort_set_rows,
             },

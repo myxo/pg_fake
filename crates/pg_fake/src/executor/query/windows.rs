@@ -6,7 +6,9 @@ use crate::{
     error::Result,
     executor::{
         DatabaseState, StatementExecutionContext,
+        equality::are_rows_not_distinct,
         expressions::{compare_values, infer_window_return_type},
+        from::visit_query_source_rows,
         normalize_unqualified_object_name, resolve_order_ascending,
         scope::{BoundScope, RowScope},
     },
@@ -16,8 +18,7 @@ use crate::{
 
 use super::{
     DistinctKey, DistinctPlan, OrderKey, OrderedRow, ProjectionSource, RowOrderSpec,
-    are_rows_not_distinct, evaluate_query_expression, evaluate_select_expression,
-    evaluate_where_clause, visit_query_source_rows,
+    evaluate_query_expression, evaluate_select_expression, evaluate_where_clause,
 };
 
 struct WindowCollector {

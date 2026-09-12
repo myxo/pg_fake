@@ -265,7 +265,7 @@ fn materialize_mutation_source_rows(
     if from.is_empty() {
         return Ok(vec![vec![Value::Null; scope.columns.len()]]);
     }
-    query::materialize_from_rows(
+    from::materialize_from_rows(
         state,
         from,
         scope,
