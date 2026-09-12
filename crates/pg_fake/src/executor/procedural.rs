@@ -427,6 +427,49 @@ fn execute_trigger_statements(
     Ok(None)
 }
 
+pub(crate) fn execute_alter_trigger(
+    state: &mut DatabaseState,
+    name: &ast::Ident,
+    table_name: &ast::ObjectName,
+    new_name: &ast::Ident,
+) -> Result<StatementResult> {
+    let name = normalize_identifier(name);
+    let new_name = normalize_identifier(new_name);
+    let table_name = normalize_relation_name(table_name)?;
+    let mut table = state.catalog.require_named_table(&table_name)?.clone();
+    if table
+        .triggers
+        .iter()
+        .any(|trigger| trigger.name == new_name)
+    {
+        return Err(PgError::create(
+            SqlState::DuplicateObject,
+            format!(
+                "trigger {new_name:?} for relation {:?} already exists",
+                table.name
+            ),
+        ));
+    }
+    let trigger = table
+        .triggers
+        .iter_mut()
+        .find(|trigger| trigger.name == name)
+        .ok_or_else(|| {
+            PgError::create(
+                SqlState::UndefinedObject,
+                format!("trigger {name:?} for table {:?} does not exist", table.name),
+            )
+        })?;
+    trigger.name = new_name;
+    trigger.definition.name =
+        create_relation_object_name(RelationName::create_unqualified(trigger.name.clone()));
+    table
+        .triggers
+        .sort_by(|left, right| left.name.cmp(&right.name));
+    state.catalog.replace_table(table)?;
+    Ok(StatementResult::Affected(0))
+}
+
 pub(super) fn execute_before_row_triggers(
     state: &DatabaseState,
     schema: &TableSchema,

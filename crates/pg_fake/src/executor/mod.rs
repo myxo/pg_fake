@@ -5,8 +5,8 @@ use crate::{
     ColumnMeta, StatementResult,
     catalog::{
         Catalog, ColumnDef, ConstraintId, ForeignKey, ForeignKeyAction, IdentityKind,
-        IndexColumnDefinition, IndexSchema, RelationName, ResolvedRelationName, TEMP_SCHEMA,
-        TableId, TablePersistence, TableSchema,
+        IndexColumnDefinition, IndexSchema, RelationName, ResolvedRelationName, TableId,
+        TablePersistence, TableSchema,
     },
     coercion::{self, CastContext},
     error::{PgError, Result, SqlState, reject_unsupported},
@@ -110,9 +110,7 @@ use table_ddl::{
     create_generated_sequence_name, find_first_referenced_column, generate_constraint_name,
     resolve_default_sequence,
 };
-use views::{
-    execute_alter_trigger, execute_comment_on_view, execute_create_view, execute_drop_views,
-};
+use views::{execute_comment_on_view, execute_create_view, execute_drop_views};
 use writes::{execute_delete, execute_insert, execute_update};
 
 #[derive(Clone)]
@@ -177,7 +175,7 @@ pub(crate) fn execute_statement(
             name,
             table_name,
             new_name,
-        } => execute_alter_trigger(state, name, table_name, new_name),
+        } => procedural::execute_alter_trigger(state, name, table_name, new_name),
         ast::Statement::Comment {
             object_type: ast::CommentObject::View,
             object_name,
@@ -270,6 +268,19 @@ pub(crate) fn execute_statement(
         ast::Statement::Lock(_) => Ok(StatementResult::Affected(0)),
         _ => reject_unsupported("statement is not implemented"),
     }
+}
+
+fn create_relation_object_name(name: RelationName) -> ast::ObjectName {
+    let mut parts = Vec::with_capacity(2);
+    if let Some(schema) = name.schema {
+        parts.push(ast::ObjectNamePart::Identifier(ast::Ident::with_quote(
+            '"', schema,
+        )));
+    }
+    parts.push(ast::ObjectNamePart::Identifier(ast::Ident::with_quote(
+        '"', name.name,
+    )));
+    ast::ObjectName(parts)
 }
 
 #[cfg_attr(feature = "execution-log", tracing::instrument(skip_all))]

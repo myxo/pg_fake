@@ -134,6 +134,27 @@ shared with [`alter_table.rs`](../crates/pg_fake/src/executor/alter_table.rs).
 sequences, including ownership and dependency checks; runtime sequence allocation
 remains in [`sequences.rs`](../crates/pg_fake/src/executor/sequences.rs).
 
+## Stored views
+
+[`executor/views/mod.rs`](../crates/pg_fake/src/executor/views/mod.rs) handles
+CREATE, DROP, and COMMENT ON VIEW.
+
+- [`binding.rs`](../crates/pg_fake/src/executor/views/binding.rs) binds stored
+  references to catalog objects, records table/sequence/constraint dependencies,
+  and checks view dependency cycles.
+- [`column_dependencies.rs`](../crates/pg_fake/src/executor/views/column_dependencies.rs)
+  tracks referenced columns through aliases, wildcards, and natural/USING joins.
+- [`expansion.rs`](../crates/pg_fake/src/executor/views/expansion.rs) expands
+  nested views into queries while preserving their declared output columns.
+- [`references.rs`](../crates/pg_fake/src/executor/views/references.rs) preserves
+  stored view references and column positions across table/column renames and
+  drops of unreferenced columns.
+- [`cte_scope.rs`](../crates/pg_fake/src/executor/views/cte_scope.rs) tracks CTE
+  names that hide catalog relations during binding and reference traversal.
+
+Trigger creation, renaming, and removal live together in
+[`executor/procedural.rs`](../crates/pg_fake/src/executor/procedural.rs).
+
 ## Row mutations
 
 [`executor/writes/mod.rs`](../crates/pg_fake/src/executor/writes/mod.rs) exposes
