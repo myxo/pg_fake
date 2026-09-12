@@ -4,12 +4,12 @@ use super::{
 };
 use crate::executor::{
     DatabaseState, PreparedConflictUpdate, StatementContext,
-    expressions::{
-        evaluate_column_default, is_default_expression, is_null_literal,
-        validate_check_constraints, validate_index_predicate, validate_not_null,
-    },
+    column_defaults::{evaluate_column_default, is_default_expression},
+    expressions::is_null_literal,
     foreign_keys::{apply_referencing_foreign_key_actions, validate_row_foreign_keys},
+    indexes::validate_index_predicate,
     normalize_identifier, prepared, procedural, query,
+    row_constraints::{validate_check_constraints, validate_not_null},
     scope::{BoundScope, bind_target_scope, combine_bound_scopes},
 };
 use crate::{

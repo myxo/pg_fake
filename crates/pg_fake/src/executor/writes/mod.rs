@@ -1,6 +1,7 @@
 use crate::executor::{
     DatabaseState, StatementContext,
-    expressions::{extract_unknown_string_literal, is_default_expression, is_null_literal},
+    column_defaults::is_default_expression,
+    expressions::{extract_unknown_string_literal, is_null_literal},
     normalize_unqualified_object_name, prepared, query,
     scope::BoundScope,
     subqueries,

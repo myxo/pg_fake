@@ -4,11 +4,10 @@ use super::{
 };
 use crate::executor::{
     DatabaseState, PreparedConflictUpdate, PreparedInsert, StatementContext,
-    expressions::{
-        create_constant_expression_schema, evaluate_assignment_expression, evaluate_column_default,
-        is_default_expression, validate_check_constraints, validate_not_null,
-    },
+    column_defaults::{evaluate_column_default, is_default_expression},
+    expressions::{create_constant_expression_schema, evaluate_assignment_expression},
     prepared, procedural, query, resolve_insert_table_name,
+    row_constraints::{validate_check_constraints, validate_not_null},
     scope::{bind_target_scope, identify_unknown_query_columns},
 };
 use crate::{

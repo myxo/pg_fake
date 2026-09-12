@@ -123,6 +123,25 @@ clause can also contain or feed mutations.
   execution share evaluations, and runs required mutations even when the outer
   query needs no rows.
 
+## Scalar expressions and row rules
+
+[`executor/expressions/mod.rs`](../crates/pg_fake/src/executor/expressions/mod.rs)
+recursively evaluates scalar expressions and applies expression-level coercion.
+Its [`types.rs`](../crates/pg_fake/src/executor/expressions/types.rs) resolves
+expression and operator types;
+[`literals.rs`](../crates/pg_fake/src/executor/expressions/literals.rs) parses
+literals and identifies unknown strings, NULL, and placeholders;
+[`functions.rs`](../crates/pg_fake/src/executor/expressions/functions.rs) handles
+function signatures and values, including window-call validation;
+[`comparisons.rs`](../crates/pg_fake/src/executor/expressions/comparisons.rs)
+handles ordering, comparison eligibility, and row/list membership.
+
+[`column_defaults.rs`](../crates/pg_fake/src/executor/column_defaults.rs) validates
+and evaluates column defaults, including sequence allocation.
+[`row_constraints.rs`](../crates/pg_fake/src/executor/row_constraints.rs) checks
+NOT NULL and CHECK constraints. Partial-index predicates live with index
+operations in [`indexes.rs`](../crates/pg_fake/src/executor/indexes.rs).
+
 ## Schema changes
 
 [`executor/mod.rs`](../crates/pg_fake/src/executor/mod.rs) dispatches statements to

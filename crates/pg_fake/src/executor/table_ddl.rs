@@ -1,11 +1,13 @@
 use super::{
     DatabaseState, SequenceValueState,
-    expressions::{validate_check_constraint_types, validate_column_default},
+    column_defaults::validate_column_default,
     foreign_keys::{
         convert_referential_action, resolve_foreign_key_name, validate_foreign_key_definitions,
     },
     normalize_identifier, normalize_relation_name, normalize_unqualified_object_name,
-    resolve_index_column_name, sequences, validate_btree_key_type,
+    resolve_index_column_name,
+    row_constraints::validate_check_constraint_types,
+    sequences, validate_btree_key_type,
 };
 use crate::{
     StatementResult,
