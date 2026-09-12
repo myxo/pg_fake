@@ -34,6 +34,9 @@ query execution, including SELECT, grouping, windows, CTEs, and streaming.
 
 - [`values.rs`](../crates/pg_fake/src/executor/query/values.rs) binds and executes
   `VALUES` row constructors, including column types, ordering, and row limits.
+- [`windows.rs`](../crates/pg_fake/src/executor/query/windows.rs) collects window
+  expressions belonging to the current query, computes their values over filtered
+  rows, and substitutes them into projection, ordering, and distinct expressions.
 - [`set_operations.rs`](../crates/pg_fake/src/executor/query/set_operations.rs)
   describes and combines operands of `UNION`, `INTERSECT`, and `EXCEPT`. It owns
   operand type resolution, duplicate handling, and ordering/limiting the combined
