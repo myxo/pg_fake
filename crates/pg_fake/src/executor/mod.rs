@@ -75,12 +75,11 @@ pub(crate) use expressions::{
     create_constant_expression_schema, evaluate_index_predicate, extract_unknown_string_literal,
     infer_expression_data_type, infer_expression_type, is_null_literal, validate_index_predicate,
 };
-use foreign_keys::{
-    apply_referencing_foreign_key_actions, convert_referential_action,
-    resolve_foreign_key_column_indexes, resolve_foreign_key_name, validate_foreign_key_definitions,
-    validate_row_foreign_keys,
-};
 pub(crate) use foreign_keys::{contains_deferred_foreign_keys, validate_deferred_foreign_keys};
+use foreign_keys::{
+    convert_referential_action, resolve_foreign_key_column_indexes, resolve_foreign_key_name,
+    validate_foreign_key_definitions, validate_row_foreign_keys,
+};
 use indexes::{execute_alter_index, execute_create_index, execute_drop_indexes};
 pub(crate) use locks::{
     collect_required_cte_row_locks, collect_required_row_locks, mutation_locks_cover_targets,

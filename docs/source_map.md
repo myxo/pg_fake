@@ -113,6 +113,29 @@ clause can also contain or feed mutations.
   execution share evaluations, and runs required mutations even when the outer
   query needs no rows.
 
+## Row mutations
+
+[`executor/writes/mod.rs`](../crates/pg_fake/src/executor/writes/mod.rs) exposes
+INSERT, UPDATE, and DELETE execution and shares assignment binding and coercion.
+
+- [`insert.rs`](../crates/pg_fake/src/executor/writes/insert.rs) applies prepared
+  inserts, records affected rows, and checks foreign keys.
+- [`insert_preparation.rs`](../crates/pg_fake/src/executor/writes/insert_preparation.rs)
+  evaluates source rows, defaults, BEFORE triggers, and RETURNING before applying
+  inserts. It retains source snapshots and cached evaluations across lock waits.
+- [`conflicts.rs`](../crates/pg_fake/src/executor/writes/conflicts.rs) resolves
+  `ON CONFLICT` arbiters, binds the target and `excluded` scopes, and prepares or
+  applies conflict updates while enforcing the once-per-row rule.
+- [`update.rs`](../crates/pg_fake/src/executor/writes/update.rs) prepares and applies
+  UPDATE assignments and triggers, then checks constraints and referencing rows.
+- [`delete.rs`](../crates/pg_fake/src/executor/writes/delete.rs) deletes selected
+  versions and applies referencing foreign-key actions.
+- [`targets.rs`](../crates/pg_fake/src/executor/writes/targets.rs) binds mutation
+  scopes, selects target versions using FROM or USING, and prepares CTE row locks.
+  It tracks rows already changed by the same command.
+- [`returning.rs`](../crates/pg_fake/src/executor/writes/returning.rs) binds and
+  evaluates RETURNING and constructs query or affected-row results.
+
 ## Locking
 
 [`session/locking`](../crates/pg_fake/src/session/locking/mod.rs) coordinates
