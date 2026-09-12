@@ -987,7 +987,72 @@ focused PostgreSQL 18 differential tests.
 
 ## Milestone G — Priority runtime SQL
 
-### Task 21 — Temporal, formatting, numeric, and pattern expressions
+### Task 21 — Temporal, formatting, numeric, and pattern expressions [COMPLETE]
+
+**Scope:** The runtime manifest previously had no cases defining this task.
+The implementation supplies the following bounded surface and fixtures:
+
+- `to_timestamp(double precision)` converts Unix seconds, including fractional
+  and negative epochs, to timestamptz. Existing implicit numeric casts apply.
+  Finite results use the existing chrono calendar range; valid PostgreSQL
+  instants beyond that range fail explicitly as unsupported.
+- `to_char(timestamp/timestamptz, text)` accepts `YYYY`, `MM`, `DD`, `HH24`,
+  `MI`, `SS`, `MS`, `US`, `TZH`, `TZM`, and `OF`, punctuation, and quoted
+  literal text (including escaped quotes). Date and timestamp typed literals
+  and implicit date/timestamp arguments use central session-aware coercion.
+  Numeric/interval formatting and formatted timestamp input remain unsupported.
+- `date_trunc(text, timestamp/timestamptz [, text zone])` covers microseconds,
+  milliseconds, second, minute, hour, day, ISO week, month, quarter, and year.
+  The three-argument form uses timestamptz. Other units and interval truncation
+  remain unsupported.
+- `AT TIME ZONE` converts timestamp and timestamptz using text UTC/GMT,
+  numeric/POSIX UTC offsets, common fixed abbreviations, and IANA zones,
+  including DST gaps and overlaps. Interval zones and timetz remain unsupported.
+  Session-dependent functions
+  use the existing session UTC/fixed-offset setting at execution time.
+- `floor(numeric/double precision)` uses PostgreSQL overload selection and
+  rounding, including negative numbers; existing arithmetic and casts compose.
+- `LIKE`, `ILIKE`, and their negations accept `%`, `_`, default backslash,
+  custom single-character `ESCAPE`, and disabled escaping. Case-insensitive
+  matching uses ASCII/C collation; explicit collations remain unsupported.
+- Regex predicates `~`, `~*`, `!~`, `!~*`, and `regexp_like(text, text [, flags])`
+  support ASCII literals/ranges and negated classes, anchors, groups,
+  alternation, and greedy quantifiers (bounded counts at most 255).
+  Flags `i`, `c`, and `s` are supported.
+  POSIX named classes and other ARE constructs, regex extraction/replacement,
+  and non-ASCII regex or case-insensitive inputs remain explicitly unsupported.
+- Existing text `string_agg(value, delimiter [ORDER BY ...])`, including
+  `FILTER`, NULL/empty inputs and varying delimiters, composes with these
+  expressions. DISTINCT and bytea overloads remain unsupported.
+
+**Progress:**
+
+- [x] Define the missing runtime scope and assign focused fixtures.
+- [x] Implement temporal, numeric, and pattern expressions with prepared types.
+- [x] Extend differential/property, manifest, and benchmark coverage.
+- [x] Pass formatting, all 449 non-generated workspace tests, strict Clippy,
+  and repeated subagent review with no remaining findings.
+- [x] Pass the exact required property gate (all 14 tests, 612.36 seconds)
+  and execute both runtime benchmarks against PostgreSQL 18.
+- [x] Obtain user approval and mark Task 21 complete.
+
+**Validation:** The final workspace run passes all 449 non-generated tests;
+formatting and `cargo clippy --workspace --all-targets -- -D warnings` pass.
+The focused runtime suite passes all three tests, covering the checked-in SQL
+fixture, prepared metadata/decoding and shared-parameter errors, unsupported
+forms, DST boundaries, format escaping, regex syntax, and transaction rollback.
+The required `CHAOS_THEORY_CHECK_ITERS=10000 CHAOS_THEORY_CHECK_TIME=600s
+cargo test -p pg_fake_sqlx --test property_tests` gate passes all 14 tests.
+Repeated subagent review is clean.
+
+Both new 100-row benchmarks execute successfully in an isolated PostgreSQL 18
+database after the test suites finish. A short 10-sample run measures the temporal
+workload at approximately 777 microseconds for `pg_fake` versus 118 microseconds
+for PostgreSQL, and the pattern workload at 4.02 milliseconds versus 117
+microseconds. Both currently miss the project's speed target. These are
+indicative timings, not a recorded baseline; no benchmark baseline was changed.
+
+Implementation and validation are finished; the user approved completion.
 
 **Goal:** Implement common scalar and aggregate expression families used by
 application queries.

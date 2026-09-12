@@ -393,6 +393,7 @@ impl AggregateState {
                         .expect("aggregate expression has an argument type"),
                     PgType::create(accumulator),
                     CastContext::Implicit,
+                    "UTC",
                 )?;
                 Some(match self.value.take() {
                     None => value,

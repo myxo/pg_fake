@@ -156,6 +156,11 @@ pub(super) fn infer_function_return_type(
     if let Some(base) = json::infer_json_function(&function_name, &arguments, schema)? {
         return Ok(base);
     }
+    if let Some((_, result)) =
+        super::runtime::infer_runtime_function(&function_name, &arguments, schema)?
+    {
+        return Ok(result);
+    }
     match function_name.as_str() {
         "coalesce" if !arguments.is_empty() => resolve_expression_list_type(&arguments, schema),
         "greatest" | "least" if !arguments.is_empty() => {
@@ -287,6 +292,18 @@ pub(super) fn evaluate_function(
             &function_name,
             &arguments,
             result_type,
+            schema,
+            row,
+            context,
+        );
+    }
+    if let Some((targets, _)) =
+        super::runtime::infer_runtime_function(&function_name, &arguments, schema)?
+    {
+        return super::runtime::evaluate_runtime_function(
+            &function_name,
+            &arguments,
+            &targets,
             schema,
             row,
             context,

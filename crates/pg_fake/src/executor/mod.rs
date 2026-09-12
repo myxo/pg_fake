@@ -45,7 +45,7 @@ pub(crate) use context::{
 pub(crate) use ctes::{expand_ctes_for_analysis, materialize_statement_ctes};
 pub(crate) use expressions::{
     create_constant_expression_schema, extract_unknown_string_literal, infer_expression_type,
-    is_null_literal,
+    is_null_literal, resolve_runtime_function,
 };
 pub(crate) use foreign_keys::{contains_deferred_foreign_keys, validate_deferred_foreign_keys};
 pub(crate) use indexes::evaluate_index_predicate;

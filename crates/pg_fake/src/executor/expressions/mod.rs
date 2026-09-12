@@ -10,7 +10,7 @@ use super::{
 use crate::{
     catalog::{TableId, TableSchema},
     coercion::{self, CastContext},
-    error::{PgError, Result, SqlState, reject_unsupported},
+    error::{Result, reject_unsupported},
     value::{BaseType, PgType, Value},
 };
 use sqlparser::ast;
@@ -18,6 +18,9 @@ use sqlparser::ast;
 mod comparisons;
 mod functions;
 mod literals;
+mod patterns;
+mod runtime;
+mod temporal;
 mod types;
 
 pub(super) use comparisons::{
@@ -26,6 +29,7 @@ pub(super) use comparisons::{
 pub(super) use functions::{infer_window_return_type, validate_function_argument};
 pub(super) use literals::{evaluate_literal, extract_number_literal};
 pub(crate) use literals::{extract_unknown_string_literal, is_null_literal};
+pub(crate) use runtime::resolve_runtime_function;
 pub(super) use types::resolve_operator_type;
 pub(crate) use types::{infer_expression_data_type, infer_expression_type};
 
@@ -43,13 +47,14 @@ pub(super) fn evaluate_assignment_expression(
     context: &StatementContext,
 ) -> Result<Value> {
     if let Some(text) = extract_unknown_string_literal(expr) {
-        coercion::coerce_unknown(text, target, CastContext::Assignment)
+        coercion::coerce_unknown(text, target, CastContext::Assignment, &context.timezone)
     } else {
         coercion::coerce(
             evaluate(expr, RowScope::Table(schema), row, context)?,
             infer_expression_type(expr, RowScope::Table(schema))?,
             target,
             CastContext::Assignment,
+            &context.timezone,
         )
     }
 }
@@ -81,6 +86,18 @@ pub(super) fn evaluate(
             schema.resolve_column_value(std::slice::from_ref(column), row)
         }
         ast::Expr::CompoundIdentifier(columns) => schema.resolve_column_value(columns, row),
+        ast::Expr::TypedString(typed) if !typed.uses_odbc_syntax => {
+            let base = infer_expression_type(expr, schema)?;
+            let ast::Value::SingleQuotedString(text) = &typed.value.value else {
+                unreachable!("typed literal was validated");
+            };
+            coercion::coerce_unknown(
+                text,
+                PgType::create(base),
+                CastContext::Explicit,
+                &context.timezone,
+            )
+        }
         ast::Expr::Value(_) | ast::Expr::TypedString(_) => evaluate_literal(expr),
         ast::Expr::Nested(expr) => evaluate(expr, schema, row, context),
         ast::Expr::UnaryOp { op, expr } => {
@@ -123,6 +140,128 @@ pub(super) fn evaluate(
             let text = extract_unknown_string_literal(&interval.value)
                 .expect("interval expression type was checked");
             Value::parse(BaseType::Interval, text)
+        }
+        ast::Expr::Floor { expr: value, .. } => {
+            let target = infer_expression_type(expr, schema)?;
+            runtime::evaluate_runtime_function("floor", &[value], &[target], schema, row, context)
+        }
+        ast::Expr::AtTimeZone {
+            timestamp,
+            time_zone,
+        } => {
+            let result = infer_expression_type(expr, schema)?;
+            let target = if result == BaseType::Timestamp {
+                BaseType::TimestampTz
+            } else {
+                BaseType::Timestamp
+            };
+            let timestamp = evaluate_and_coerce(
+                timestamp,
+                target,
+                CastContext::Implicit,
+                schema,
+                row,
+                context,
+            )?;
+            let zone = evaluate_and_coerce(
+                time_zone,
+                BaseType::Text,
+                CastContext::Implicit,
+                schema,
+                row,
+                context,
+            )?;
+            let Value::Text(zone) = zone else {
+                return Ok(Value::Null);
+            };
+            coercion::time_zones::convert_time_zone(timestamp, &zone)
+        }
+        ast::Expr::Like {
+            expr: value,
+            pattern,
+            escape_char,
+            negated,
+            ..
+        }
+        | ast::Expr::ILike {
+            expr: value,
+            pattern,
+            escape_char,
+            negated,
+            ..
+        } => {
+            infer_expression_type(expr, schema)?;
+            let value = evaluate(value, schema, row, context)?;
+            let pattern = evaluate_and_coerce(
+                pattern,
+                BaseType::Text,
+                CastContext::Implicit,
+                schema,
+                row,
+                context,
+            )?;
+            let escape = match escape_char.as_ref().map(|escape| &escape.value) {
+                None => "\\",
+                Some(ast::Value::SingleQuotedString(escape)) => escape,
+                Some(ast::Value::Null) => return Ok(Value::Null),
+                _ => return reject_unsupported("LIKE escape is not implemented"),
+            };
+            let (Value::Text(value), Value::Text(pattern)) = (value, pattern) else {
+                return Ok(Value::Null);
+            };
+            let Value::Bool(matched) = patterns::evaluate_like(
+                &value,
+                &pattern,
+                escape,
+                matches!(expr, ast::Expr::ILike { .. }),
+                context,
+            )?
+            else {
+                unreachable!()
+            };
+            Ok(Value::Bool(matched != *negated))
+        }
+        ast::Expr::BinaryOp { left, op, right }
+            if matches!(
+                op,
+                ast::BinaryOperator::PGRegexMatch
+                    | ast::BinaryOperator::PGRegexIMatch
+                    | ast::BinaryOperator::PGRegexNotMatch
+                    | ast::BinaryOperator::PGRegexNotIMatch
+            ) =>
+        {
+            infer_expression_type(expr, schema)?;
+            let left = evaluate(left, schema, row, context)?;
+            let right = evaluate_and_coerce(
+                right,
+                BaseType::Text,
+                CastContext::Implicit,
+                schema,
+                row,
+                context,
+            )?;
+            let (Value::Text(value), Value::Text(pattern)) = (left, right) else {
+                return Ok(Value::Null);
+            };
+            let flags = if matches!(
+                op,
+                ast::BinaryOperator::PGRegexIMatch | ast::BinaryOperator::PGRegexNotIMatch
+            ) {
+                "i"
+            } else {
+                ""
+            };
+            let Value::Bool(matched) = patterns::evaluate_regex(&value, &pattern, flags)? else {
+                unreachable!()
+            };
+            Ok(Value::Bool(
+                matched
+                    != matches!(
+                        op,
+                        ast::BinaryOperator::PGRegexNotMatch
+                            | ast::BinaryOperator::PGRegexNotIMatch
+                    ),
+            ))
         }
         ast::Expr::BinaryOp { left, op, right } => {
             if let Some((l, r, result)) = json::infer_json_operator(op, left, right, schema)? {
@@ -196,16 +335,6 @@ pub(super) fn evaluate(
                 }
                 ast::BinaryOperator::And | ast::BinaryOperator::Or => {
                     evaluate_boolean_operator(op, left, right)
-                }
-                ast::BinaryOperator::PGRegexMatch => {
-                    let (Value::Text(value), Value::Text(pattern)) = (left, right) else {
-                        return Ok(Value::Null);
-                    };
-                    validate_regex_repetition_bounds(&pattern)?;
-                    let regex = regex::Regex::new(&pattern).map_err(|error| {
-                        PgError::create(SqlState::InvalidRegularExpression, error.to_string())
-                    })?;
-                    Ok(Value::Bool(regex.is_match(&value)))
                 }
                 _ => reject_unsupported("operator is not implemented"),
             }
@@ -357,13 +486,14 @@ pub(super) fn evaluate(
             }
             let target = coercion::convert_ast_data_type(data_type)?;
             if let Some(text) = extract_unknown_string_literal(expr) {
-                coercion::coerce_unknown(text, target, CastContext::Explicit)
+                coercion::coerce_unknown(text, target, CastContext::Explicit, &context.timezone)
             } else {
                 coercion::coerce(
                     evaluate(expr, schema, row, context)?,
                     infer_expression_type(expr, schema)?,
                     target,
                     CastContext::Explicit,
+                    &context.timezone,
                 )
             }
         }
@@ -384,7 +514,7 @@ pub(super) fn evaluate_and_coerce(
     execution: &StatementContext,
 ) -> Result<Value> {
     if let Some(text) = extract_unknown_string_literal(expression) {
-        coercion::coerce_unknown(text, PgType::create(target), context)
+        coercion::coerce_unknown(text, PgType::create(target), context, &execution.timezone)
     } else {
         let source = infer_expression_type(expression, schema)?;
         coercion::coerce(
@@ -392,62 +522,7 @@ pub(super) fn evaluate_and_coerce(
             source,
             PgType::create(target),
             context,
+            &execution.timezone,
         )
     }
-}
-
-#[cfg_attr(feature = "execution-log", tracing::instrument(skip_all))]
-fn validate_regex_repetition_bounds(pattern: &str) -> Result<()> {
-    let bytes = pattern.as_bytes();
-    let mut index = 0;
-    let mut in_character_class = false;
-    while index < bytes.len() {
-        match bytes[index] {
-            b'\\' => index += 2,
-            b'[' if !in_character_class => {
-                in_character_class = true;
-                index += 1;
-            }
-            b']' if in_character_class => {
-                in_character_class = false;
-                index += 1;
-            }
-            b'{' if !in_character_class => {
-                index += 1;
-                let mut bound = 0_u16;
-                let mut has_digits = false;
-                while index < bytes.len() && bytes[index].is_ascii_digit() {
-                    has_digits = true;
-                    bound = bound
-                        .saturating_mul(10)
-                        .saturating_add(u16::from(bytes[index] - b'0'));
-                    if bound > 255 {
-                        return Err(PgError::create(
-                            SqlState::InvalidRegularExpression,
-                            "invalid repetition count",
-                        ));
-                    }
-                    index += 1;
-                }
-                if has_digits && index < bytes.len() && bytes[index] == b',' {
-                    index += 1;
-                    bound = 0;
-                    while index < bytes.len() && bytes[index].is_ascii_digit() {
-                        bound = bound
-                            .saturating_mul(10)
-                            .saturating_add(u16::from(bytes[index] - b'0'));
-                        if bound > 255 {
-                            return Err(PgError::create(
-                                SqlState::InvalidRegularExpression,
-                                "invalid repetition count",
-                            ));
-                        }
-                        index += 1;
-                    }
-                }
-            }
-            _ => index += 1,
-        }
-    }
-    Ok(())
 }

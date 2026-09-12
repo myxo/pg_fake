@@ -81,6 +81,66 @@ pub(crate) fn infer_expression_type(expr: &ast::Expr, schema: RowScope<'_>) -> R
                 .expect("resolved JSON operator")
                 .2)
         }
+        ast::Expr::Floor { expr, field } => {
+            if !matches!(
+                field,
+                ast::CeilFloorKind::DateTimeField(ast::DateTimeField::NoDateTime)
+            ) {
+                return reject_unsupported("FLOOR modifier is not implemented");
+            }
+            Ok(
+                super::runtime::infer_runtime_function("floor", &[expr], schema)?
+                    .expect("floor is a runtime function")
+                    .1,
+            )
+        }
+        ast::Expr::AtTimeZone {
+            timestamp,
+            time_zone,
+        } => {
+            if infer_expression_type(time_zone, schema)? == BaseType::Interval {
+                return reject_unsupported("interval time zones are not implemented");
+            }
+            validate_function_argument(time_zone, BaseType::Text, schema, &|| {
+                PgError::create(
+                    SqlState::UndefinedFunction,
+                    "time zone signature does not exist",
+                )
+            })?;
+            if is_null_literal(timestamp) || extract_unknown_string_literal(timestamp).is_some() {
+                return Ok(BaseType::Timestamp);
+            }
+            match infer_expression_type(timestamp, schema)? {
+                BaseType::Timestamp => Ok(BaseType::TimestampTz),
+                BaseType::TimestampTz | BaseType::Date => Ok(BaseType::Timestamp),
+                BaseType::Time => {
+                    reject_unsupported("time zone conversion for time is not implemented")
+                }
+                _ => Err(PgError::create(
+                    SqlState::UndefinedFunction,
+                    "time zone signature does not exist",
+                )),
+            }
+        }
+        ast::Expr::Like {
+            expr, pattern, any, ..
+        }
+        | ast::Expr::ILike {
+            expr, pattern, any, ..
+        } => {
+            if *any {
+                return reject_unsupported("LIKE ANY is not implemented");
+            }
+            for argument in [expr, pattern] {
+                validate_function_argument(argument, BaseType::Text, schema, &|| {
+                    PgError::create(
+                        SqlState::UndefinedFunction,
+                        "pattern operator does not exist for argument types",
+                    )
+                })?;
+            }
+            Ok(BaseType::Bool)
+        }
         ast::Expr::Array(array) => {
             for element in &array.elem {
                 validate_function_argument(element, BaseType::Text, schema, &|| {
@@ -136,7 +196,10 @@ pub(crate) fn infer_expression_type(expr: &ast::Expr, schema: RowScope<'_>) -> R
                 validate_comparison_type(op, data_type)?;
                 Ok(BaseType::Bool)
             }
-            ast::BinaryOperator::PGRegexMatch => {
+            ast::BinaryOperator::PGRegexMatch
+            | ast::BinaryOperator::PGRegexIMatch
+            | ast::BinaryOperator::PGRegexNotMatch
+            | ast::BinaryOperator::PGRegexNotIMatch => {
                 for expression in [left.as_ref(), right.as_ref()] {
                     let base = infer_expression_type(expression, schema)?;
                     if !matches!(base, BaseType::Text | BaseType::Varchar | BaseType::Bpchar)
@@ -283,7 +346,7 @@ pub(crate) fn infer_expression_type(expr: &ast::Expr, schema: RowScope<'_>) -> R
             if matches!(target.base, BaseType::Json | BaseType::Jsonb)
                 && let Some(text) = extract_unknown_string_literal(expr)
             {
-                coercion::coerce_unknown(text, target, CastContext::Explicit)?;
+                coercion::coerce_unknown(text, target, CastContext::Explicit, "UTC")?;
             }
             if extract_unknown_string_literal(expr).is_none()
                 && !is_null_literal(expr)

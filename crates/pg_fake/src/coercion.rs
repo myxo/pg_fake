@@ -1,3 +1,5 @@
+pub(crate) mod time_zones;
+
 use bigdecimal::{BigDecimal, FromPrimitive, RoundingMode, ToPrimitive};
 use chrono::Timelike;
 use sqlparser::ast;
@@ -229,6 +231,13 @@ fn resolve_required_cast_context(source: BaseType, target: BaseType) -> Option<C
     if matches!(
         (source, target),
         (BaseType::Date, BaseType::Timestamp | BaseType::TimestampTz)
+            | (BaseType::Timestamp, BaseType::TimestampTz)
+    ) {
+        return Some(CastContext::Implicit);
+    }
+    if matches!(
+        (source, target),
+        (BaseType::Date, BaseType::Timestamp | BaseType::TimestampTz)
             | (BaseType::Timestamp, BaseType::Date | BaseType::TimestampTz)
             | (BaseType::TimestampTz, BaseType::Date | BaseType::Timestamp)
     ) {
@@ -258,6 +267,7 @@ pub(crate) fn coerce(
     source: BaseType,
     target: PgType,
     context: CastContext,
+    timezone: &str,
 ) -> Result<Value> {
     if value.is_null() {
         return Ok(Value::Null);
@@ -271,7 +281,25 @@ pub(crate) fn coerce(
         }
         return Err(create_cannot_cast_error(source, target.base));
     }
-    let value = if source == BaseType::Jsonb
+    let value = if target.base == BaseType::TimestampTz
+        && matches!(source, BaseType::Timestamp | BaseType::Date)
+    {
+        let timestamp = if source == BaseType::Date {
+            convert_non_string_value(value, BaseType::Timestamp)?
+        } else {
+            value
+        };
+        time_zones::convert_time_zone(timestamp, timezone)?
+    } else if source == BaseType::TimestampTz
+        && matches!(target.base, BaseType::Timestamp | BaseType::Date)
+    {
+        let timestamp = time_zones::convert_time_zone(value, timezone)?;
+        if target.base == BaseType::Date {
+            convert_non_string_value(timestamp, BaseType::Date)?
+        } else {
+            timestamp
+        }
+    } else if source == BaseType::Jsonb
         && (target.base == BaseType::Bool || get_numeric_rank(target.base).is_some())
     {
         let text = value.format_postgres_text();
@@ -290,6 +318,7 @@ pub(crate) fn coerce(
                 BaseType::Numeric,
                 target,
                 CastContext::Explicit,
+                timezone,
             )?
         } else {
             return Err(PgError::create(
@@ -332,7 +361,7 @@ pub(crate) fn coerce(
         let Value::Text(text) = value else {
             unreachable!("string values use Value::Text")
         };
-        Value::parse(target.base, &text)?
+        coerce_unknown(&text, target, context, timezone)?
     } else {
         convert_non_string_value(value, target.base)?
     };
@@ -340,11 +369,28 @@ pub(crate) fn coerce(
 }
 
 #[cfg_attr(feature = "execution-log", tracing::instrument(skip_all))]
-pub(crate) fn coerce_unknown(text: &str, target: PgType, context: CastContext) -> Result<Value> {
+pub(crate) fn coerce_unknown(
+    text: &str,
+    target: PgType,
+    context: CastContext,
+    timezone: &str,
+) -> Result<Value> {
     let value = if is_string_type(target.base) {
         Value::Text(text.into())
     } else {
         Value::parse(target.base, text)?
+    };
+    let value = if target.base == BaseType::TimestampTz {
+        if let Some(local) = crate::value::parse_local_timestamp(text) {
+            time_zones::convert_time_zone(
+                Value::Timestamp(crate::value::PgTimestamp::Finite(local)),
+                timezone,
+            )?
+        } else {
+            value
+        }
+    } else {
+        value
     };
     apply_typmod(value, target, context)
 }

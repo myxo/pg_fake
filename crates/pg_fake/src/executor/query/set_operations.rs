@@ -130,6 +130,7 @@ fn validate_unknown_set_operand_columns(
                         .expect("set-operation column has a supported type OID"),
                 ),
                 CastContext::Implicit,
+                "UTC",
             )?;
         }
     }
@@ -405,9 +406,12 @@ fn coerce_set_rows_with_unknown(
                     if unknown.is_some_and(|unknown| unknown[index]) {
                         return match value {
                             Value::Null => Ok(Value::Null),
-                            Value::Text(text) => {
-                                coercion::coerce_unknown(&text, target, CastContext::Implicit)
-                            }
+                            Value::Text(text) => coercion::coerce_unknown(
+                                &text,
+                                target,
+                                CastContext::Implicit,
+                                "UTC",
+                            ),
                             _ => unreachable!("unknown set columns contain text or NULL"),
                         };
                     }
@@ -417,6 +421,7 @@ fn coerce_set_rows_with_unknown(
                             .expect("set-operation column has a supported type OID"),
                         target,
                         CastContext::Implicit,
+                        "UTC",
                     )
                 })
                 .collect()

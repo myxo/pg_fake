@@ -365,7 +365,7 @@ impl Session {
         procedural: DoBlockContext,
     ) -> Result<Value> {
         if let Some(text) = executor::extract_unknown_string_literal(expression) {
-            return coercion::coerce_unknown(text, target, CastContext::Assignment);
+            return coercion::coerce_unknown(text, target, CastContext::Assignment, &self.timezone);
         }
         let value = self.evaluate_procedural_expression(expression, locals, procedural)?;
         let Some(source) = value.get_base_type() else {

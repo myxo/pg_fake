@@ -356,12 +356,13 @@ pub(crate) fn coerce_procedural_value(
     target: PgType,
 ) -> Result<Value> {
     if coercion::can_cast(source, target.base, CastContext::Assignment) {
-        coercion::coerce(value, source, target, CastContext::Assignment)
+        coercion::coerce(value, source, target, CastContext::Assignment, "UTC")
     } else {
         coercion::coerce_unknown(
             &value.format_postgres_text(),
             target,
             CastContext::Assignment,
+            "UTC",
         )
     }
 }
@@ -389,7 +390,7 @@ fn execute_trigger_statements(
                     .collect::<Result<Vec<_>>>()?;
                 let (index, target_type) = RowScope::Bound(scope).resolve_column(&identifiers)?;
                 row[index] = if let Some(text) = extract_unknown_string_literal(value) {
-                    coercion::coerce_unknown(text, target_type, CastContext::Assignment)?
+                    coercion::coerce_unknown(text, target_type, CastContext::Assignment, "UTC")?
                 } else {
                     coerce_procedural_value(
                         evaluate_trigger_expression(value, scope, row, context)?,

@@ -22,6 +22,7 @@ pub enum SqlState {
     DatetimeFieldOverflow,               // 22008
     IntervalFieldOverflow,               // 22015
     InvalidRegularExpression,            // 2201B
+    InvalidEscapeSequence,               // 22025
     InvalidRowCountInLimitClause,        // 2201W
     InvalidRowCountInResultOffsetClause, // 2201X
     InvalidTextRepresentation,           // 22P02
@@ -112,6 +113,7 @@ impl SqlState {
             SqlState::DatetimeFieldOverflow => "22008",
             SqlState::IntervalFieldOverflow => "22015",
             SqlState::InvalidRegularExpression => "2201B",
+            SqlState::InvalidEscapeSequence => "22025",
             SqlState::InvalidRowCountInLimitClause => "2201W",
             SqlState::InvalidRowCountInResultOffsetClause => "2201X",
             SqlState::InvalidTextRepresentation => "22P02",

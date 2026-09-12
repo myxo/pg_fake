@@ -292,6 +292,7 @@ impl Session {
             transaction_timestamp: transaction.transaction_timestamp,
             statement_timestamp: statement_timestamp.expect("fallback captures statement time"),
             clock_timestamp: self.db.read_clock(),
+            timezone: self.timezone.clone(),
             deadline: statement_deadline,
             rng: self.db.rng.clone(),
             sequences,

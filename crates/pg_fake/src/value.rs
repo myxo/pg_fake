@@ -679,15 +679,9 @@ fn parse_timestamp(input: &str) -> Result<PgTimestamp> {
     if let Ok(value) = DateTime::parse_from_rfc3339(&normalize_rfc3339_input(input)) {
         return Ok(PgTimestamp::Finite(value.naive_local()));
     }
-    [
-        "%Y-%m-%d %H:%M:%S%.f",
-        "%Y-%m-%d %H:%M",
-        "%Y-%m-%dT%H:%M:%S%.f",
-    ]
-    .iter()
-    .find_map(|format| NaiveDateTime::parse_from_str(input, format).ok())
-    .map(PgTimestamp::Finite)
-    .ok_or_else(|| create_invalid_text_error(input, "timestamp"))
+    parse_local_timestamp(input)
+        .map(PgTimestamp::Finite)
+        .ok_or_else(|| create_invalid_text_error(input, "timestamp"))
 }
 
 #[cfg_attr(feature = "execution-log", tracing::instrument(skip_all))]
@@ -701,6 +695,13 @@ fn parse_timestamptz(input: &str) -> Result<PgTimestampTz> {
     if let Ok(value) = DateTime::parse_from_rfc3339(&normalize_rfc3339_input(input)) {
         return Ok(PgTimestampTz::Finite(value.with_timezone(&Utc)));
     }
+    parse_local_timestamp(input)
+        .map(|value| PgTimestampTz::Finite(value.and_utc()))
+        .ok_or_else(|| create_invalid_text_error(input, "timestamp with time zone"))
+}
+
+pub(crate) fn parse_local_timestamp(input: &str) -> Option<NaiveDateTime> {
+    let input = input.trim();
     [
         "%Y-%m-%d %H:%M:%S%.f",
         "%Y-%m-%d %H:%M",
@@ -708,13 +709,25 @@ fn parse_timestamptz(input: &str) -> Result<PgTimestampTz> {
     ]
     .iter()
     .find_map(|format| NaiveDateTime::parse_from_str(input, format).ok())
-    .map(|value| PgTimestampTz::Finite(value.and_utc()))
-    .ok_or_else(|| create_invalid_text_error(input, "timestamp with time zone"))
+    .or_else(|| {
+        chrono::NaiveDate::parse_from_str(input, "%Y-%m-%d")
+            .ok()?
+            .and_hms_opt(0, 0, 0)
+    })
 }
 
 #[cfg_attr(feature = "execution-log", tracing::instrument(skip_all))]
 fn normalize_rfc3339_input(input: &str) -> String {
     let mut input = input.replacen(' ', "T", 1);
+    if input.len() > 10
+        && input.is_char_boundary(10)
+        && input
+            .as_bytes()
+            .get(10)
+            .is_some_and(|byte| matches!(byte, b'+' | b'-' | b'Z'))
+    {
+        input.insert_str(10, "T00:00:00");
+    }
     if input.len() >= 3 {
         let suffix = &input[input.len() - 3..];
         if suffix.starts_with('+') || suffix.starts_with('-') {

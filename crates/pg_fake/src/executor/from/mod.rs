@@ -148,7 +148,12 @@ fn materialize_table_factor_rows(
             columns: scope.columns[..start].to_vec(),
         };
         let value = if let Some(text) = extract_unknown_string_literal(argument) {
-            coercion::coerce_unknown(text, PgType::create(base), CastContext::Implicit)?
+            coercion::coerce_unknown(
+                text,
+                PgType::create(base),
+                CastContext::Implicit,
+                &context.timezone,
+            )?
         } else {
             let source =
                 scope::infer_expression_data_type(&state.catalog, argument, &argument_scope)?.base;
@@ -161,7 +166,13 @@ fn materialize_table_factor_rows(
                 snapshot,
                 context,
             )?;
-            coercion::coerce(value, source, PgType::create(base), CastContext::Implicit)?
+            coercion::coerce(
+                value,
+                source,
+                PgType::create(base),
+                CastContext::Implicit,
+                &context.timezone,
+            )?
         };
         return Ok(json::evaluate_json_expansion(&name, value, ordinality)?
             .into_iter()

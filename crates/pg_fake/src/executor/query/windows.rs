@@ -285,6 +285,7 @@ pub(super) fn execute_windowed_select_rows(
                                     .expect("non-null value has a base type"),
                                 *data_type,
                                 CastContext::Implicit,
+                                &context.timezone,
                             )
                         }
                     }

@@ -198,6 +198,7 @@ pub(super) fn evaluate_projection_value(
                         .expect("non-null value has a base type"),
                     *data_type,
                     CastContext::Implicit,
+                    &context.timezone,
                 )
             }
         }
@@ -347,6 +348,8 @@ pub(in crate::executor) fn build_projection_plan<'a>(
                             normalize_unqualified_object_name(&function.name)?
                         }
                         ast::Expr::Extract { .. } => "extract".into(),
+                        ast::Expr::Floor { .. } => "floor".into(),
+                        ast::Expr::AtTimeZone { .. } => "timezone".into(),
                         _ => "?column?".into(),
                     },
                     type_oid: data_type.map_to_oid(),

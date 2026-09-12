@@ -26,6 +26,7 @@ pub(super) fn evaluate_column_default(
             BaseType::Int8,
             column.data_type,
             CastContext::Assignment,
+            &context.timezone,
         );
     }
     let Some(expr) = &column.default else {
@@ -56,7 +57,7 @@ pub(super) fn validate_column_default(column: &ColumnDef) -> Result<()> {
         return Ok(());
     };
     if let Some(text) = extract_unknown_string_literal(expression) {
-        coercion::coerce_unknown(text, column.data_type, CastContext::Assignment)?;
+        coercion::coerce_unknown(text, column.data_type, CastContext::Assignment, "UTC")?;
         return Ok(());
     }
     let source = infer_expression_type(

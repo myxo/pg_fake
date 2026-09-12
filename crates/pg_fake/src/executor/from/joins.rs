@@ -593,6 +593,7 @@ fn evaluate_using_join_condition(
             left.data_type.base,
             PgType::create(data_type),
             CastContext::Implicit,
+            "UTC",
         )?;
         let right = coercion::coerce(
             right
@@ -608,6 +609,7 @@ fn evaluate_using_join_condition(
             right.data_type.base,
             PgType::create(data_type),
             CastContext::Implicit,
+            "UTC",
         )?;
         if left.is_null() || right.is_null() || left != right {
             return Ok(false);

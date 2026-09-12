@@ -2627,3 +2627,107 @@ fn matches_generated_migration_data_transform_queries() {
         }
     });
 }
+
+#[test]
+fn matches_generated_runtime_expressions() {
+    let server = start_isolated_postgres_server();
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap();
+    let postgres = RefCell::new(
+        runtime
+            .block_on(PgConnection::connect(&server.url))
+            .unwrap(),
+    );
+    let fake = RefCell::new(PgFakeConnection::new(Db::create()));
+    assert_statement(
+        &runtime,
+        &mut postgres.borrow_mut(),
+        &mut fake.borrow_mut(),
+        "SET TIME ZONE 'UTC'",
+        RowOrder::Ordered,
+    );
+    check(|src| {
+        let case = src.any_of("case", int_in(0..=5));
+        let epoch = src.any_of("epoch", int_in(-2_208_988_800_i64..=4_102_444_800));
+        let fraction = src.any_of("fraction", int_in(0..=999_999));
+        let unit = [
+            "microseconds",
+            "milliseconds",
+            "second",
+            "minute",
+            "hour",
+            "day",
+            "week",
+            "month",
+            "quarter",
+            "year",
+        ][src.any_of("unit", int_in(0..=9))];
+        let zone = [
+            "UTC",
+            "+03:00",
+            "-05:30",
+            "America/New_York",
+            "Europe/Berlin",
+            "Asia/Kolkata",
+        ][src.any_of("zone", int_in(0..=5))];
+        let sql = match case {
+            0 => format!(
+                "SELECT to_timestamp({epoch}.{fraction:06}), floor({epoch}.{fraction:06}), floor({epoch}.{fraction:06}::double precision), date_trunc('{unit}', to_timestamp({epoch}.{fraction:06}))"
+            ),
+            1 => format!(
+                "SELECT date_trunc('{unit}', to_timestamp({epoch}.{fraction:06}), '{zone}'), to_timestamp({epoch}) AT TIME ZONE '{zone}', to_char(to_timestamp({epoch}.{fraction:06}), 'YYYY-MM-DD HH24:MI:SS.US OF')"
+            ),
+            2 => {
+                let text_length = src.any_of("text_length", int_in(0..=12));
+                let pattern_length = src.any_of("pattern_length", int_in(0..=12));
+                let alphabet = ['a', 'b', 'A', 'B', '%', '_', '\\'];
+                let text = (0..text_length)
+                    .map(|_| alphabet[src.any_of("text_char", int_in(0..=6))])
+                    .collect::<String>();
+                let pattern = (0..pattern_length)
+                    .map(|_| alphabet[src.any_of("pattern_char", int_in(0..=6))])
+                    .collect::<String>();
+                let escape = ["\\", "", "a", "%", "_"][src.any_of("escape", int_in(0..=4))];
+                format!(
+                    "SELECT '{text}' LIKE '{pattern}' ESCAPE '{escape}', '{text}' ILIKE '{pattern}' ESCAPE '{escape}', '{text}' NOT LIKE '{pattern}' ESCAPE '{escape}'"
+                )
+            }
+            3 => {
+                let count = src.any_of("count", int_in(0..=10));
+                let lower = src.any_of("lower", int_in(0..=5));
+                let upper = lower + src.any_of("extra", int_in(0..=5));
+                let text = "aB".repeat(count);
+                let pattern = format!("^([a-z]{{{lower},{upper}}})?$");
+                format!(
+                    "SELECT '{text}' ~ '{pattern}', '{text}' ~* '{pattern}', '{text}' !~ '{pattern}', '{text}' !~* '{pattern}', regexp_like('{text}', '{pattern}', 'i')"
+                )
+            }
+            4 => format!(
+                "SELECT floor(value), string_agg(to_char(to_timestamp(value), 'SS.US'), ':' ORDER BY value) FILTER (WHERE value::text LIKE '%1%') FROM (VALUES ({epoch}.{fraction:06}), (NULL::numeric), ({epoch}.1)) AS input(value) GROUP BY floor(value) ORDER BY 1"
+            ),
+            _ => format!(
+                "SELECT to_char(date_trunc('{unit}', to_timestamp({epoch})), 'YYYY-MM-DD HH24:MI:SS'), NULL::text ILIKE '%', regexp_like(NULL::text, '['), floor(NULL::numeric)"
+            ),
+        };
+        src.log_value("sql", &sql);
+        if case == 2 {
+            assert_statement_allow_error(
+                &runtime,
+                &mut postgres.borrow_mut(),
+                &mut fake.borrow_mut(),
+                &sql,
+                RowOrder::Ordered,
+            );
+        } else {
+            assert_statement(
+                &runtime,
+                &mut postgres.borrow_mut(),
+                &mut fake.borrow_mut(),
+                &sql,
+                RowOrder::Ordered,
+            );
+        }
+    });
+}

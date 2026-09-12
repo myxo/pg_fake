@@ -716,6 +716,14 @@ fn migration_data_transform_benchmark(
     }
     for (name, query) in [
         (
+            "runtime_temporal_100_rows",
+            "SELECT id, to_char(date_trunc('minute', to_timestamp(id)), 'YYYY-MM-DD HH24:MI:SS'), floor(id::numeric / 7) FROM migration_data_transform_100_rows ORDER BY id",
+        ),
+        (
+            "runtime_patterns_100_rows",
+            "SELECT id, label ILIKE '%VALUE%', regexp_like(label, '[a-z]+ [0-9]+', 'i') FROM migration_data_transform_100_rows ORDER BY id",
+        ),
+        (
             "window_row_number_100_rows",
             "SELECT id, row_number() OVER (ORDER BY id DESC) FROM migration_data_transform_100_rows ORDER BY id",
         ),

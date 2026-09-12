@@ -38,6 +38,24 @@ pub(super) fn infer_expression_parameters(
                 matches!(op, ast::UnaryOperator::Not).then_some(BaseType::Bool),
                 types,
             ),
+            ast::Expr::Like { expr, pattern, .. }
+            | ast::Expr::ILike { expr, pattern, .. }
+            | ast::Expr::BinaryOp {
+                left: expr,
+                right: pattern,
+                op:
+                    ast::BinaryOperator::PGRegexMatch
+                    | ast::BinaryOperator::PGRegexIMatch
+                    | ast::BinaryOperator::PGRegexNotMatch
+                    | ast::BinaryOperator::PGRegexNotIMatch,
+            } => (|| {
+                for argument in [expr, pattern] {
+                    if infer_parameter_expression_type(argument, schema, types).is_none() {
+                        constrain_parameter_type(argument, Some(BaseType::Text), types)?;
+                    }
+                }
+                Ok(())
+            })(),
             ast::Expr::BinaryOp { left, op, right } => {
                 if executor::resolve_json_operator_types(
                     op,
@@ -91,6 +109,25 @@ pub(super) fn infer_expression_parameters(
                 constrain_parameter_type(left, left_expected, types)
                     .and_then(|()| constrain_parameter_type(right, right_expected, types))
             }
+            ast::Expr::Floor { expr, .. } => {
+                let target = infer_parameter_expression_type(expr, schema, types)
+                    .unwrap_or(BaseType::Float8);
+                constrain_parameter_type(expr, Some(target), types)
+            }
+            ast::Expr::AtTimeZone {
+                timestamp,
+                time_zone,
+            } => (|| {
+                for (argument, default) in [
+                    (timestamp, BaseType::TimestampTz),
+                    (time_zone, BaseType::Text),
+                ] {
+                    if infer_parameter_expression_type(argument, schema, types).is_none() {
+                        constrain_parameter_type(argument, Some(default), types)?;
+                    }
+                }
+                Ok(())
+            })(),
             ast::Expr::InList { expr, list, .. } => (|| {
                 let left = match expr.as_ref() {
                     ast::Expr::Tuple(fields) => fields.as_slice(),
@@ -192,6 +229,27 @@ fn infer_function_parameters(
         })
         .collect::<Vec<_>>();
     let name = executor::normalize_unqualified_object_name(&function.name)?;
+    let argument_types = arguments
+        .iter()
+        .map(|argument| {
+            if executor::is_null_literal(argument)
+                || executor::extract_unknown_string_literal(argument).is_some()
+            {
+                None
+            } else {
+                infer_parameter_expression_type(argument, schema, types)
+            }
+        })
+        .collect::<Vec<_>>();
+    if let Some(signature) = executor::resolve_runtime_function(&name, &argument_types) {
+        let (targets, _) = signature?;
+        for (argument, target) in arguments.iter().zip(targets) {
+            if infer_parameter_expression_type(argument, schema, types).is_none() {
+                constrain_parameter_type(argument, Some(target), types)?;
+            }
+        }
+        return Ok(());
+    }
     if let Some(targets) = executor::resolve_json_function_arguments(&name) {
         for (argument, target) in arguments.iter().zip(targets) {
             constrain_parameter_type(argument, Some(target), types)?;
@@ -226,7 +284,7 @@ fn infer_function_parameters(
         return Ok(());
     }
     let expected = match name.as_str() {
-        "length" | "lower" | "upper" => Some(BaseType::Text),
+        "length" | "lower" | "upper" | "btrim" | "string_agg" => Some(BaseType::Text),
         _ => arguments
             .iter()
             .find_map(|argument| executor::infer_expression_type(argument, schema).ok()),

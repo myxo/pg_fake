@@ -51,7 +51,14 @@ pub(in crate::executor) fn evaluate_literal(expr: &ast::Expr) -> Result<Value> {
             let ast::Value::SingleQuotedString(text) = &typed.value.value else {
                 return reject_unsupported("typed literal is not implemented");
             };
-            if !matches!(target.base, BaseType::Json | BaseType::Jsonb) {
+            if !matches!(
+                target.base,
+                BaseType::Json
+                    | BaseType::Jsonb
+                    | BaseType::Date
+                    | BaseType::Timestamp
+                    | BaseType::TimestampTz
+            ) {
                 return reject_unsupported("typed literal is not implemented");
             }
             Value::parse(target.base, text)

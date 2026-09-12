@@ -25,6 +25,7 @@ pub(crate) struct StatementContext {
     pub(crate) transaction_timestamp: chrono::DateTime<chrono::Utc>,
     pub(crate) statement_timestamp: chrono::DateTime<chrono::Utc>,
     pub(crate) clock_timestamp: chrono::DateTime<chrono::Utc>,
+    pub(crate) timezone: String,
     pub(crate) deadline: Option<Instant>,
     pub(crate) rng: Arc<Mutex<ChaCha12Rng>>,
     pub(crate) sequences: SequenceExecutionContext,

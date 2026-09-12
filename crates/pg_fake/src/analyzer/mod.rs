@@ -151,5 +151,11 @@ fn coerce_parameter(value: Value, target: BaseType) -> Result<Value> {
     let Some(source) = value.get_base_type() else {
         return Ok(Value::Null);
     };
-    coercion::coerce(value, source, PgType::create(target), CastContext::Implicit)
+    coercion::coerce(
+        value,
+        source,
+        PgType::create(target),
+        CastContext::Implicit,
+        "UTC",
+    )
 }

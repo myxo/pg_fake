@@ -198,6 +198,7 @@ impl RowScope<'_> {
                             .expect("non-null value has a base type"),
                         column.data_type,
                         crate::coercion::CastContext::Implicit,
+                        "UTC",
                     );
                 }
                 Ok(row[column.slot].clone())

@@ -26,6 +26,16 @@ pub fn find_benchmark(name: &str) -> Benchmark {
 
 pub fn list_benchmarks() -> Vec<Benchmark> {
     vec![
+        build_benchmark(
+            "runtime_temporal_100_rows",
+            postgres_values(),
+            postgres_comparisons(),
+        ),
+        build_benchmark(
+            "runtime_patterns_100_rows",
+            postgres_values(),
+            postgres_comparisons(),
+        ),
         build_benchmark("create_table", postgres_values(), postgres_comparisons()),
         build_benchmark(
             "transactional_ddl_create_rollback",

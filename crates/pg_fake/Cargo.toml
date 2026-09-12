@@ -14,6 +14,7 @@ execution-log = ["dep:tracing"]
 [dependencies]
 bigdecimal = "0.4"
 chrono = { version = "0.4", default-features = false, features = ["std", "now"] }
+chrono-tz = "0.10"
 rand_chacha = { version = "0.9", features = ["os_rng"] }
 regex = "1"
 serde = "1"

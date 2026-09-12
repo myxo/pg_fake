@@ -39,6 +39,39 @@ pub struct Scenario {
 
 pub const FEATURES: &[Feature] = &[
     Feature {
+        name: "runtime temporal, numeric, and pattern expressions",
+        cases: &[
+            Case {
+                id: "runtime_epoch_and_floor",
+                source: "tests/fixtures/runtime_expressions.sql",
+                setup: &[],
+                sql: "SELECT extract(epoch FROM to_timestamp(-1.25)), floor(-1.25), floor(2)",
+                blocker: BlockerKind::Implementation,
+            },
+            Case {
+                id: "runtime_timestamp_format_and_truncate",
+                source: "tests/fixtures/runtime_expressions.sql",
+                setup: &[],
+                sql: "SELECT to_char(date_trunc('hour', '2024-02-29 23:59:59'::timestamp), 'YYYY-MM-DD HH24:MI:SS')",
+                blocker: BlockerKind::Implementation,
+            },
+            Case {
+                id: "runtime_dst_timezone",
+                source: "tests/fixtures/runtime_expressions.sql",
+                setup: &[],
+                sql: "SELECT extract(epoch FROM ('2024-03-10 02:30:00'::timestamp AT TIME ZONE 'America/New_York'))",
+                blocker: BlockerKind::Implementation,
+            },
+            Case {
+                id: "runtime_like_regex",
+                source: "tests/fixtures/runtime_expressions.sql",
+                setup: &[],
+                sql: "SELECT 'Alpha_1' ILIKE 'alpha!_%' ESCAPE '!', 'Alpha' !~ '^a', regexp_like('Alpha', '^a', 'i')",
+                blocker: BlockerKind::Implementation,
+            },
+        ],
+    },
+    Feature {
         name: "qualified and temporary relations",
         cases: &[
             Case {

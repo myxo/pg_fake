@@ -29,6 +29,7 @@ fn rounds_numeric_assignments_and_checks_ranges() {
             BaseType::Numeric,
             PgType::create(BaseType::Int4),
             CastContext::Assignment,
+            "UTC",
         )
         .unwrap(),
         Value::Int4(3)
@@ -39,6 +40,7 @@ fn rounds_numeric_assignments_and_checks_ranges() {
             BaseType::Int4,
             PgType::create(BaseType::Int2),
             CastContext::Assignment,
+            "UTC",
         )
         .unwrap_err()
         .sqlstate,
@@ -73,6 +75,7 @@ fn provides_assignment_conversion_for_every_numeric_pair() {
                 source,
                 PgType::create(target),
                 CastContext::Assignment,
+                "UTC",
             )
             .unwrap();
             assert_eq!(

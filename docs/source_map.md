@@ -174,6 +174,17 @@ function signatures and values, including window-call validation;
 [`comparisons.rs`](../crates/pg_fake/src/executor/expressions/comparisons.rs)
 handles ordering, comparison eligibility, and row/list membership.
 
+[`runtime.rs`](../crates/pg_fake/src/executor/expressions/runtime.rs) shares scalar
+runtime signatures with parameter inference and dispatches temporal, floor, and
+regex functions. [`temporal.rs`](../crates/pg_fake/src/executor/expressions/temporal.rs)
+implements epoch conversion and bounded timestamp formatting/truncation.
+[`coercion/time_zones.rs`](../crates/pg_fake/src/coercion/time_zones.rs) resolves
+zones and supplies conversions shared by casts and `AT TIME ZONE`. Execution
+passes the session time zone into central coercion. [`patterns.rs`](../crates/pg_fake/src/executor/expressions/patterns.rs)
+implements LIKE escaping and the supported ASCII regular-expression predicates.
+The exact runtime scope is recorded under Task 21 in `plan.md` and exercised by
+`tests/fixtures/runtime_expressions.sql` in the SQLx crate.
+
 [`column_defaults.rs`](../crates/pg_fake/src/executor/column_defaults.rs) validates
 and evaluates column defaults, including sequence allocation.
 [`row_constraints.rs`](../crates/pg_fake/src/executor/row_constraints.rs) checks
