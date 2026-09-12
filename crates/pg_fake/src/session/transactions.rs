@@ -537,7 +537,7 @@ fn abort_database_transaction(state: &mut DatabaseState, xid: Xid) {
 #[cfg_attr(feature = "execution-log", tracing::instrument(skip_all))]
 fn prune_database_versions(state: &mut DatabaseState) {
     let horizon = state.transactions.find_reclamation_horizon();
-    for table_id in state.reclaimable_table_ids() {
+    for table_id in state.collect_reclaimable_table_ids() {
         let Some(table) = state.tables.get_mut(&table_id) else {
             state.clear_table_reclaimable(table_id);
             continue;

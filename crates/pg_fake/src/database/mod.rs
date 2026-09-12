@@ -5,12 +5,12 @@ use std::{
 
 use rand_chacha::{ChaCha12Rng, rand_core::SeedableRng};
 
-use crate::{
-    error::{PgError, Result, SqlState},
-    executor::DatabaseState,
-};
+use crate::error::{PgError, Result, SqlState};
 
 use super::Session;
+
+mod state;
+pub(crate) use state::DatabaseState;
 
 #[derive(Clone)]
 pub struct Db {

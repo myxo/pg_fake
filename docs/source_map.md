@@ -12,7 +12,8 @@ and named after their responsibilities.
 
 | Module | Responsibility |
 | --- | --- |
-| [`database.rs`](../crates/pg_fake/src/database.rs) | Database construction, shared engine state, mock time, and random seed configuration. |
+| [`database/mod.rs`](../crates/pg_fake/src/database/mod.rs) | Database construction, mock time, and random seed configuration. |
+| [`database/state.rs`](../crates/pg_fake/src/database/state.rs) | Shared catalog, table storage, transactions, locks, and sequence values; visible-catalog caching and touched-table tracking. |
 | [`results.rs`](../crates/pg_fake/src/results.rs) | Result rows, column metadata, and affected-row counts. |
 | [`catalog_inspection.rs`](../crates/pg_fake/src/catalog_inspection.rs) | Stable catalog descriptions for diagnostics and differential comparisons. |
 | [`session/mod.rs`](../crates/pg_fake/src/session/mod.rs) | Session state, statement batches, snapshots, and execution order. |
