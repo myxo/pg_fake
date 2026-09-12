@@ -2399,7 +2399,7 @@ fn generated_sequence_allocations_follow_the_option_model() {
         let cycles = [false, true];
         let (cycle, _) = src.choose("cycle", &cycles).unwrap();
         let calls = src.any_of("calls", int_in(1..=8));
-        let db = pg_fake::api::Db::create();
+        let db = pg_fake::Db::create();
         let mut session = db.create_session();
         session
             .execute(&format!(
@@ -2443,7 +2443,7 @@ fn generated_temporary_relation_lifetimes_are_session_local() {
     check(|src| {
         let first_value = src.any_of("first_value", int_in(-100_i32..=100));
         let second_value = src.any_of("second_value", int_in(-100_i32..=100));
-        let db = pg_fake::api::Db::create();
+        let db = pg_fake::Db::create();
         let mut first = db.create_session();
         let mut second = db.create_session();
         first

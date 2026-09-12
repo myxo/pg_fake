@@ -1,10 +1,6 @@
-use pg_fake::{
-    api::{Db, StatementResult},
-    error::SqlState,
-    value::Value,
-};
+use pg_fake::{Db, StatementResult, error::SqlState, value::Value};
 
-fn query_rows(session: &mut pg_fake::api::Session, sql: &str) -> Vec<Vec<Value>> {
+fn query_rows(session: &mut pg_fake::Session, sql: &str) -> Vec<Vec<Value>> {
     session.query(sql, &[]).unwrap().rows
 }
 
@@ -46,7 +42,7 @@ fn executes_before_insert_and_update_triggers() {
         .unwrap();
     assert_eq!(
         results,
-        vec![StatementResult::Query(pg_fake::api::QueryResult {
+        vec![StatementResult::Query(pg_fake::QueryResult {
             columns: match &results[0] {
                 StatementResult::Query(query) => query.columns.clone(),
                 _ => unreachable!(),

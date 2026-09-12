@@ -1,12 +1,12 @@
 use std::{collections::BTreeSet, sync::Arc, thread};
 
 use pg_fake::{
-    api::Db,
+    Db,
     error::SqlState,
     value::{BaseType, Value},
 };
 
-fn get_int8(session: &mut pg_fake::api::Session, sql: &str) -> i64 {
+fn get_int8(session: &mut pg_fake::Session, sql: &str) -> i64 {
     let result = session.query(sql, &[]).unwrap();
     assert_eq!(result.columns[0].type_oid, BaseType::Int8.map_to_oid());
     let [Value::Int8(value)] = result.rows[0].as_slice() else {

@@ -1,5 +1,5 @@
 use pg_fake::{
-    api::{Db, StatementResult},
+    Db, StatementResult,
     error::SqlState,
     value::{BaseType, Value},
 };

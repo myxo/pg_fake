@@ -1,6 +1,5 @@
-
 use pg_fake::{
-    api::{ColumnMeta, Db, QueryResult},
+    ColumnMeta, Db, QueryResult,
     value::{BaseType, Value},
 };
 

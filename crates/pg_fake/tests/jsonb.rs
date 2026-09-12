@@ -1,5 +1,5 @@
 use pg_fake::{
-    api::Db,
+    Db,
     error::SqlState,
     jsonb::Jsonb,
     value::{BaseType, Value},

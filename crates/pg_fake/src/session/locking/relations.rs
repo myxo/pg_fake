@@ -16,7 +16,7 @@ use super::super::catalog_dependencies::{
 use super::{ddl::collect_ddl_relation_locks, foreign_keys::collect_foreign_key_relation_locks};
 
 #[cfg_attr(feature = "execution-log", tracing::instrument(skip_all))]
-pub(in crate::api::session) fn collect_relation_locks(
+pub(in crate::session) fn collect_relation_locks(
     state: &DatabaseState,
     statement: &ast::Statement,
     prepared_dependencies: Option<&[CatalogDependency]>,

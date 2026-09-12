@@ -1,4 +1,4 @@
-use pg_fake::{api::Db, error::SqlState, value::Value};
+use pg_fake::{Db, error::SqlState, value::Value};
 
 #[test]
 fn preserves_set_operand_error_and_sequence_order() {

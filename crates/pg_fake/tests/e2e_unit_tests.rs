@@ -8,7 +8,7 @@ use std::{
 };
 
 use pg_fake::{
-    api::{Db, StatementResult},
+    Db, StatementResult,
     error::SqlState,
     parser::{self, Statement},
     value::{BaseType, Value},
@@ -199,11 +199,7 @@ fn execute_on_postgres(client: &mut Client, statement: &Statement, sql: &str) ->
     }
 }
 
-fn execute_on_fake(
-    session: &mut pg_fake::api::Session,
-    statement: &Statement,
-    sql: &str,
-) -> Outcome {
+fn execute_on_fake(session: &mut pg_fake::Session, statement: &Statement, sql: &str) -> Outcome {
     if returns_rows(statement) {
         match session.query(sql, &[]) {
             Ok(result) => Outcome::Rows(

@@ -1,4 +1,4 @@
-use pg_fake::{api::Db, error::SqlState, value::Value};
+use pg_fake::{Db, error::SqlState, value::Value};
 
 #[test]
 fn checks_deferrable_foreign_keys_at_commit() {

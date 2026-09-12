@@ -1,4 +1,4 @@
-use pg_fake::{api::Db, error::SqlState, jsonb::Jsonb, value::Value};
+use pg_fake::{Db, error::SqlState, jsonb::Jsonb, value::Value};
 
 #[test]
 fn executes_prepared_json_paths_and_lateral_expansion() {

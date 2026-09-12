@@ -9,7 +9,7 @@ pub use connection::{
     PgFakeQueryResult, PgFakeStatement,
 };
 pub use error::PgFakeDatabaseError;
-pub use pg_fake::api::Db;
+pub use pg_fake::Db;
 pub use row::{PgFakeColumn, PgFakeRow, PgFakeValue, PgFakeValueRef};
 pub use types::{PgFakeArguments, PgFakeTypeInfo};
 

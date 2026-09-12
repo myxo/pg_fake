@@ -2,7 +2,7 @@ use std::{borrow::Cow, collections::BTreeMap, str::FromStr};
 
 use bigdecimal::BigDecimal;
 use chrono::{DateTime, NaiveDate, Utc};
-use pg_fake::api::{
+use pg_fake::{
     CatalogColumnInspection, CatalogConstraintInspection, CatalogFunctionInspection,
     CatalogIndexInspection, CatalogInspection, CatalogSequenceInspection, CatalogTableInspection,
     CatalogTriggerInspection, CatalogViewInspection,

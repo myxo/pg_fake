@@ -1,7 +1,7 @@
 use std::{str::FromStr, time::Duration};
 
 use bigdecimal::BigDecimal;
-use pg_fake::api::Db;
+use pg_fake::Db;
 use pg_fake_sqlx::{PgFakeConnectOptions, PgFakeConnection, PgFakePoolOptions};
 use sqlx::{AssertSqlSafe, Column, Connection, Executor, Row, SqlStr, Statement, TypeInfo};
 use sqlx_postgres::PgConnection;

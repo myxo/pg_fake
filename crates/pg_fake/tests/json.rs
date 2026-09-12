@@ -1,10 +1,10 @@
 use pg_fake::{
-    api::Db,
+    Db,
     error::SqlState,
     value::{BaseType, Value},
 };
 
-fn query_rows(session: &mut pg_fake::api::Session, sql: &str) -> Vec<Vec<Value>> {
+fn query_rows(session: &mut pg_fake::Session, sql: &str) -> Vec<Vec<Value>> {
     session
         .query(sql, &[])
         .unwrap_or_else(|error| panic!("{sql}: {error:?}"))

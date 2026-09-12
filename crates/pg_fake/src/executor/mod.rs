@@ -2,7 +2,7 @@ use bigdecimal::ToPrimitive;
 use rand_chacha::{ChaCha12Rng, rand_core::RngCore};
 
 use crate::{
-    api::{ColumnMeta, QueryResult, StatementResult},
+    ColumnMeta, QueryResult, StatementResult,
     catalog::{
         Catalog, CatalogHistory, CatalogVisibility, ColumnDef, ConstraintId, ForeignKey,
         ForeignKeyAction, IdentityKind, IndexColumnDefinition, IndexSchema, RelationName,
@@ -95,8 +95,8 @@ fn validate_btree_key_type(data_type: BaseType) -> Result<()> {
 }
 pub(crate) use prepared::{PreparedQueryPlan, build_prepared_query_plan, execute_prepared_query};
 pub(crate) use procedural::coerce_procedural_value;
+use scope::bind_select_scope;
 pub(crate) use scope::infer_query_output_columns;
-use scope::{BoundColumn, bind_select_scope};
 pub(crate) use scope::{
     BoundScope, RowScope, bind_from_scope, bind_query_scope, bind_target_scope,
     combine_bound_scopes, create_value_scope, identify_unknown_query_columns,

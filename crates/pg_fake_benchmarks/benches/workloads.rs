@@ -6,10 +6,7 @@ use std::{
 };
 
 use criterion::{BenchmarkId, Criterion, Throughput, black_box, criterion_group, criterion_main};
-use pg_fake::{
-    api::{IsolationLevel, Session},
-    value::Value,
-};
+use pg_fake::{IsolationLevel, Session, value::Value};
 use pg_fake_benchmarks as benchmarks;
 use pg_fake_sqlx::{Db, PgFakeConnection};
 use sqlx::{AssertSqlSafe, Connection, SqlSafeStr};

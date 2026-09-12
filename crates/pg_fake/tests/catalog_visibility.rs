@@ -1,4 +1,4 @@
-use pg_fake::{api::Db, error::SqlState, value::Value};
+use pg_fake::{Db, error::SqlState, value::Value};
 
 #[test]
 fn preserves_catalog_visibility_across_commit_rollback_and_old_snapshots() {

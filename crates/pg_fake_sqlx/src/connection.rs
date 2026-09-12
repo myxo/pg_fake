@@ -11,9 +11,9 @@ use futures_core::{future::BoxFuture, stream::BoxStream};
 use futures_util::{TryStreamExt, stream};
 use hashlink::LinkedHashMap;
 use log::LevelFilter;
-use pg_fake::api::{Db, PreparedStatement as CoreStatement, Session, StatementResult};
 use pg_fake::error::SqlState;
 use pg_fake::value::BaseType;
+use pg_fake::{Db, PreparedStatement as CoreStatement, Session, StatementResult};
 use sqlx::{
     ColumnIndex, ConnectOptions, Connection, Database, Execute, Executor, SqlStr, Statement,
     database::HasStatementCache,

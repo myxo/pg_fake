@@ -5,11 +5,7 @@ use std::{
     process,
 };
 
-use pg_fake::{
-    api::{Db, QueryResult, Session, StatementResult},
-    error::PgError,
-    value::Value,
-};
+use pg_fake::{Db, QueryResult, Session, StatementResult, error::PgError, value::Value};
 
 enum Command {
     Repl,
