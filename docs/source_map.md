@@ -155,6 +155,18 @@ rows an operation must lock. [`txn.rs`](../crates/pg_fake/src/txn.rs) owns lock
 compatibility, queues, the wait-for graph, transaction status, and visibility.
 These separate the SQL requirements, blocking execution, and lock bookkeeping.
 
+## Catalog visibility
+
+[`catalog/mod.rs`](../crates/pg_fake/src/catalog/mod.rs) holds the visible catalog:
+named objects, schemas, dependency metadata, and catalog identity used by caches.
+
+[`catalog/history.rs`](../crates/pg_fake/src/catalog/history.rs) owns transactional
+catalog versions. Its interface materializes the catalog for a snapshot, records
+DDL changes, discards aborted changes, and reclaims obsolete versions. Visibility
+keys track catalog and pruning generations; temporary objects retain their
+session ownership. Version chains and their visibility rules are private to this
+module.
+
 ## Following a statement
 
 1. A session parses SQL through [`parser.rs`](../crates/pg_fake/src/parser.rs).
@@ -170,8 +182,8 @@ These separate the SQL requirements, blocking execution, and lock bookkeeping.
 5. Commit or rollback finalizes catalog and row versions, restores settings,
    releases locks, and wakes waiting sessions.
 
-The executor implements SQL operations; [`catalog.rs`](../crates/pg_fake/src/catalog.rs)
-holds object definitions and their transactional history;
+The executor implements SQL operations; [`catalog/mod.rs`](../crates/pg_fake/src/catalog/mod.rs)
+holds object definitions and visible object lookups;
 [`storage.rs`](../crates/pg_fake/src/storage.rs) holds row versions and indexes.
 [`coercion.rs`](../crates/pg_fake/src/coercion.rs) centralizes cast rules.
 
