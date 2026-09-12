@@ -1,5 +1,6 @@
 use super::expressions::evaluate_literal;
 use super::*;
+use std::time::Instant;
 
 #[derive(Debug, Clone)]
 pub(crate) struct PreparedQueryPlan {

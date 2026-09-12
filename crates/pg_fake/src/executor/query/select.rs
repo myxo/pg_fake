@@ -11,7 +11,7 @@ use crate::{
     coercion::CastContext,
     error::{PgError, Result, SqlState},
     executor::{
-        DatabaseState, StatementExecutionContext,
+        DatabaseState, StatementContext,
         equality::create_equality_key,
         expressions::{evaluate_and_coerce, is_null_literal},
         from::{is_selection_fully_pushed, visit_query_source_rows},
@@ -59,7 +59,7 @@ pub(super) fn evaluate_where_clause(
     row: &[Value],
     xid: Xid,
     snapshot: &Snapshot,
-    context: &StatementExecutionContext,
+    context: &StatementContext,
 ) -> Result<bool> {
     let Some(selection) = selection else {
         return Ok(true);
@@ -83,7 +83,7 @@ pub(super) fn execute_plain_select_rows(
     distinct: &DistinctPlan<'_>,
     xid: Xid,
     snapshot: &Snapshot,
-    context: &StatementExecutionContext,
+    context: &StatementContext,
     top_k: Option<usize>,
 ) -> Result<Vec<SelectRow>> {
     if let Some(rows) = execute_correlated_exists_rows(
@@ -260,7 +260,7 @@ fn execute_correlated_exists_rows(
     distinct: &DistinctPlan<'_>,
     xid: Xid,
     snapshot: &Snapshot,
-    context: &StatementExecutionContext,
+    context: &StatementContext,
 ) -> Option<Result<Vec<SelectRow>>> {
     let ast::Expr::Exists {
         subquery,
@@ -410,7 +410,7 @@ fn execute_any_membership_rows(
     distinct: &DistinctPlan<'_>,
     xid: Xid,
     snapshot: &Snapshot,
-    context: &StatementExecutionContext,
+    context: &StatementContext,
 ) -> Option<Result<Vec<SelectRow>>> {
     let ast::Expr::AnyOp {
         left,

@@ -2,7 +2,7 @@ use crate::{
     coercion::{self, CastContext},
     error::{Result, reject_unsupported},
     executor::{
-        DatabaseState, StatementExecutionContext,
+        DatabaseState, StatementContext,
         equality::{EqualityKey, create_equality_key},
         json, normalize_relation_name, normalize_unqualified_object_name,
         scope::{self, BoundScope, try_resolve_column_reference},
@@ -38,7 +38,7 @@ pub(super) fn visit_streamed_join_rows(
     scope: &BoundScope,
     xid: Xid,
     snapshot: &Snapshot,
-    context: &StatementExecutionContext,
+    context: &StatementContext,
     selection: Option<&ast::Expr>,
     visit: &mut dyn FnMut(&[Value]) -> Result<()>,
 ) -> Result<()> {
@@ -192,7 +192,7 @@ fn visit_hash_join_chain_rows(
     scope: &BoundScope,
     xid: Xid,
     snapshot: &Snapshot,
-    context: &StatementExecutionContext,
+    context: &StatementContext,
     selection: Option<&ast::Expr>,
     starts: &[usize],
     hash_slots: &[(usize, usize, bool)],
@@ -271,7 +271,7 @@ fn visit_nested_loop_join_rows(
     scope: &BoundScope,
     xid: Xid,
     snapshot: &Snapshot,
-    context: &StatementExecutionContext,
+    context: &StatementContext,
     starts: &[usize],
     right_sources: &[Vec<Vec<Value>>],
     index: usize,
@@ -351,7 +351,7 @@ pub(super) fn materialize_table_with_joins_rows(
     scope: &BoundScope,
     xid: Xid,
     snapshot: &Snapshot,
-    context: &StatementExecutionContext,
+    context: &StatementContext,
     selection: Option<&ast::Expr>,
     next_slot: &mut usize,
     prefix: &[Value],
@@ -514,7 +514,7 @@ fn evaluate_join_condition(
     right_start: usize,
     xid: Xid,
     snapshot: &Snapshot,
-    context: &StatementExecutionContext,
+    context: &StatementContext,
 ) -> Result<bool> {
     let constraint = match operator {
         ast::JoinOperator::Join(constraint)

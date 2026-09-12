@@ -8,7 +8,7 @@ pub(super) fn evaluate_assignment_expression(
     target: PgType,
     schema: &TableSchema,
     row: &[Value],
-    context: &StatementExecutionContext,
+    context: &StatementContext,
 ) -> Result<Value> {
     if let Some(text) = extract_unknown_string_literal(expr) {
         coercion::coerce_unknown(text, target, CastContext::Assignment)
@@ -25,7 +25,7 @@ pub(super) fn evaluate_assignment_expression(
 #[cfg_attr(feature = "execution-log", tracing::instrument(skip_all))]
 pub(super) fn evaluate_column_default(
     column: &ColumnDef,
-    context: &StatementExecutionContext,
+    context: &StatementContext,
 ) -> Result<Value> {
     if let Some(sequence) = &column.default_sequence {
         let value = context.sequences.get_next_resolved_value(sequence)?;
@@ -173,7 +173,7 @@ pub(crate) fn evaluate_index_predicate(
     expression: &ast::Expr,
     schema: &TableSchema,
     row: &[Value],
-    context: &StatementExecutionContext,
+    context: &StatementContext,
 ) -> Result<bool> {
     match evaluate_and_coerce(
         expression,
@@ -193,7 +193,7 @@ pub(crate) fn evaluate_index_predicate(
 pub(super) fn validate_check_constraints(
     schema: &TableSchema,
     row: &[Value],
-    context: &StatementExecutionContext,
+    context: &StatementContext,
 ) -> Result<()> {
     for constraint in &schema.constraints {
         let crate::catalog::Constraint::Check { expression, .. } = constraint else {
@@ -1025,7 +1025,7 @@ pub(super) fn evaluate(
     expr: &ast::Expr,
     schema: RowScope<'_>,
     row: &[Value],
-    context: &StatementExecutionContext,
+    context: &StatementContext,
 ) -> Result<Value> {
     context.check_timeout()?;
     match expr {
@@ -1378,7 +1378,7 @@ fn evaluate_membership(
     negated: bool,
     schema: RowScope<'_>,
     row: &[Value],
-    context: &StatementExecutionContext,
+    context: &StatementContext,
 ) -> Result<Value> {
     validate_membership_types(expr, list, schema)?;
     let mut result = Value::Bool(false);
@@ -1414,7 +1414,7 @@ fn evaluate_quantified(
     all: bool,
     schema: RowScope<'_>,
     row: &[Value],
-    context: &StatementExecutionContext,
+    context: &StatementContext,
 ) -> Result<Value> {
     let candidates = extract_row_fields(right);
     let mut result = Value::Bool(all);
@@ -1442,7 +1442,7 @@ fn evaluate_row_comparison(
     operator: &ast::BinaryOperator,
     schema: RowScope<'_>,
     row: &[Value],
-    context: &StatementExecutionContext,
+    context: &StatementContext,
 ) -> Result<Value> {
     let left = extract_row_fields(left);
     let right = extract_row_fields(right);
@@ -1478,7 +1478,7 @@ pub(super) fn evaluate_and_coerce(
     context: CastContext,
     schema: RowScope<'_>,
     row: &[Value],
-    execution: &StatementExecutionContext,
+    execution: &StatementContext,
 ) -> Result<Value> {
     if let Some(text) = extract_unknown_string_literal(expression) {
         coercion::coerce_unknown(text, PgType::create(target), context)
@@ -1498,7 +1498,7 @@ fn evaluate_function(
     function: &ast::Function,
     schema: RowScope<'_>,
     row: &[Value],
-    context: &StatementExecutionContext,
+    context: &StatementContext,
 ) -> Result<Value> {
     if infer_window_return_type(function, schema)?.is_some() {
         return Err(PgError::create(

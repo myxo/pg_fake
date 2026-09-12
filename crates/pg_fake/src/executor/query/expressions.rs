@@ -2,7 +2,7 @@ use super::grouping::{AggregateOwner, GroupedAggregateValues, materialize_aggreg
 use crate::{
     error::{PgError, Result},
     executor::{
-        DatabaseState, StatementExecutionContext, normalize_unqualified_object_name,
+        DatabaseState, StatementContext, normalize_unqualified_object_name,
         scope::{BoundScope, infer_expression_data_type},
         subqueries::evaluate_query_expression,
     },
@@ -158,7 +158,7 @@ pub(super) fn evaluate_select_expression(
     aggregate_values: Option<(&GroupedAggregateValues, AggregateOwner)>,
     xid: Xid,
     snapshot: &Snapshot,
-    context: &StatementExecutionContext,
+    context: &StatementContext,
 ) -> Result<Value> {
     let materialized;
     let expression = if let Some((values, owner)) = aggregate_values {

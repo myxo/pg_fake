@@ -287,7 +287,7 @@ impl Session {
                 self.sequence_session.clone(),
             )
         };
-        let context = executor::StatementExecutionContext {
+        let context = executor::StatementContext {
             command_id,
             transaction_timestamp: transaction.transaction_timestamp,
             statement_timestamp: statement_timestamp.expect("fallback captures statement time"),
@@ -298,16 +298,16 @@ impl Session {
             source_state: contains_triggered_insert(&state, statement)
                 .then(|| Arc::new(state.clone())),
             source_snapshot: snapshot,
-            prepared_trigger_inserts: Arc::new(Mutex::new(Default::default())),
-            prepared_trigger_updates: Arc::new(Mutex::new(Default::default())),
+            prepared_inserts: Arc::new(Mutex::new(Default::default())),
+            prepared_updates: Arc::new(Mutex::new(Default::default())),
             prepared_mutation_targets: Arc::new(Mutex::new(Default::default())),
             prepared_cte_results: Arc::new(Mutex::new(Vec::new())),
             executed_ctes: Arc::new(Mutex::new(Vec::new())),
             pending_cte_mutations: Arc::new(Mutex::new(Vec::new())),
             prepared_subquery_results: Arc::new(Mutex::new(Default::default())),
             prepares_subquery_results: Arc::new(std::sync::atomic::AtomicBool::new(false)),
-            trigger_lock_recheck: Arc::new(std::sync::atomic::AtomicBool::new(false)),
-            trigger_lock_recheck_locks: Arc::new(Mutex::new(Vec::new())),
+            row_lock_recheck: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            row_lock_recheck_locks: Arc::new(Mutex::new(Vec::new())),
         };
         let (contains_cte, contains_subquery) = executor::detect_statement_features(statement);
         let mut acquired_row_locks = false;

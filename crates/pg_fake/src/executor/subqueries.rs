@@ -4,7 +4,7 @@ use crate::{
     QueryResult, StatementResult,
     error::{PgError, Result, SqlState},
     executor::{
-        DatabaseState, StatementExecutionContext,
+        DatabaseState, StatementContext,
         expressions::evaluate,
         normalize_relation_name,
         outer_references::{
@@ -46,7 +46,7 @@ struct SubqueryMaterializer<'a> {
     state: &'a DatabaseState,
     xid: Xid,
     snapshot: &'a Snapshot,
-    context: &'a StatementExecutionContext,
+    context: &'a StatementContext,
     error: Option<PgError>,
     defer_unresolved: bool,
     scopes: Vec<BoundScope>,
@@ -313,7 +313,7 @@ pub(crate) fn materialize_uncorrelated_subqueries(
     statement: &ast::Statement,
     xid: Xid,
     snapshot: &Snapshot,
-    context: &StatementExecutionContext,
+    context: &StatementContext,
 ) -> Result<ast::Statement> {
     let scope = match statement {
         ast::Statement::Insert(insert) => {
@@ -382,7 +382,7 @@ fn materialize_subqueries<V: ast::VisitMut>(
     value: &mut V,
     xid: Xid,
     snapshot: &Snapshot,
-    context: &StatementExecutionContext,
+    context: &StatementContext,
     defer_unresolved: bool,
     scopes: Vec<BoundScope>,
 ) -> Result<()> {
@@ -410,7 +410,7 @@ pub(super) fn evaluate_query_expression(
     row: &[Value],
     xid: Xid,
     snapshot: &Snapshot,
-    context: &StatementExecutionContext,
+    context: &StatementContext,
 ) -> Result<Value> {
     if !contains_subquery(expression) {
         return evaluate(expression, RowScope::Bound(scope), row, context);

@@ -3,12 +3,12 @@ use super::{
         InsertConflictOutcome, build_conflict_update_plan, execute_insert_conflict,
         resolve_conflict_arbiter,
     },
-    insert_preparation::evaluate_triggered_insert_rows,
+    insert_preparation::evaluate_insert_rows,
     require_mutation_table,
     returning::{ReturningPlan, build_returning_plan, create_write_result, evaluate_returning_row},
 };
 use crate::executor::{
-    DatabaseState, StatementExecutionContext, foreign_keys::validate_row_foreign_keys,
+    DatabaseState, StatementContext, foreign_keys::validate_row_foreign_keys,
     normalize_unqualified_object_name, resolve_insert_table_name, scope::bind_target_scope,
 };
 use crate::{
@@ -56,7 +56,7 @@ pub(in crate::executor) fn execute_insert(
     snapshot: &Snapshot,
     deferred_constraints: &BTreeSet<ConstraintId>,
     defer_all: bool,
-    context: &StatementExecutionContext,
+    context: &StatementContext,
 ) -> Result<StatementResult> {
     let table_name = resolve_insert_table_name(&insert.table)?;
     let schema = require_mutation_table(state, &table_name)?;
@@ -85,7 +85,7 @@ pub(in crate::executor) fn execute_insert(
     )?;
     let column_indexes = resolve_insert_column_indexes(&schema, &insert.columns)?;
     let (rows, prepared_conflicts, prepared_returned_rows, prepared_error) =
-        match context.take_prepared_trigger_insert(insert) {
+        match context.take_prepared_insert(insert) {
             Some(prepared) => (
                 prepared.rows,
                 prepared.conflicts,
@@ -93,7 +93,7 @@ pub(in crate::executor) fn execute_insert(
                 prepared.error,
             ),
             None => {
-                let prepared = evaluate_triggered_insert_rows(
+                let prepared = evaluate_insert_rows(
                     state,
                     insert,
                     &schema,
@@ -246,7 +246,7 @@ fn insert_new_row(
     returned_rows: &mut Vec<Vec<Value>>,
     xid: Xid,
     snapshot: &Snapshot,
-    context: &StatementExecutionContext,
+    context: &StatementContext,
 ) -> Result<RowId> {
     let retained_row = (!can_move_row).then(|| row.clone());
     let row_id = state

@@ -11,7 +11,7 @@ use crate::{
     coercion::{self, CastContext},
     error::{PgError, Result, SqlState, reject_unsupported},
     executor::{
-        DatabaseState, StatementExecutionContext, normalize_identifier, normalize_relation_name,
+        DatabaseState, StatementContext, normalize_identifier, normalize_relation_name,
         normalize_unqualified_object_name, resolve_insert_table_name,
         scope::{
             BoundScope, bind_from_scope, bind_select_scope, bind_target_scope, combine_bound_scopes,
@@ -177,7 +177,7 @@ pub(super) fn evaluate_projection_value(
     aggregate_values: Option<(&GroupedAggregateValues, AggregateOwner)>,
     xid: Xid,
     snapshot: &Snapshot,
-    context: &StatementExecutionContext,
+    context: &StatementContext,
 ) -> Result<Value> {
     match projection {
         ProjectionSource::Column(index) => Ok(row[*index].clone()),
@@ -227,7 +227,7 @@ pub(in crate::executor) fn evaluate_projection_values(
     aggregate_values: Option<&GroupedAggregateValues>,
     xid: Xid,
     snapshot: &Snapshot,
-    context: &StatementExecutionContext,
+    context: &StatementContext,
 ) -> Result<Vec<Value>> {
     projections
         .iter()

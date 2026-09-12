@@ -5,7 +5,7 @@ use crate::{
     coercion::{self, CastContext},
     error::Result,
     executor::{
-        DatabaseState, StatementExecutionContext,
+        DatabaseState, StatementContext,
         equality::are_rows_not_distinct,
         expressions::{compare_values, infer_window_return_type},
         from::visit_query_source_rows,
@@ -133,7 +133,7 @@ fn calculate_window_values(
     rows: &[Vec<Value>],
     xid: Xid,
     snapshot: &Snapshot,
-    context: &StatementExecutionContext,
+    context: &StatementContext,
 ) -> Result<Vec<Vec<Value>>> {
     let mut values = vec![vec![Value::Null; functions.len()]; rows.len()];
     for (function_index, function) in functions.iter().enumerate() {
@@ -225,7 +225,7 @@ pub(super) fn execute_windowed_select_rows(
     functions: &[ast::Function],
     xid: Xid,
     snapshot: &Snapshot,
-    context: &StatementExecutionContext,
+    context: &StatementContext,
 ) -> Result<Vec<SelectRow>> {
     let mut source_rows = Vec::new();
     visit_query_source_rows(

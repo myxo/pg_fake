@@ -722,7 +722,7 @@ pub(super) fn evaluate_json_function(
     base: BaseType,
     scope: RowScope<'_>,
     row: &[Value],
-    context: &StatementExecutionContext,
+    context: &StatementContext,
 ) -> Result<Value> {
     let targets = resolve_json_function_arguments(name);
     let values = arguments

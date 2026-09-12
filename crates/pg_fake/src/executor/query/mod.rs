@@ -2,7 +2,7 @@ use crate::{
     QueryResult, StatementResult,
     error::{PgError, Result, SqlState, reject_unsupported},
     executor::{
-        DatabaseState, StatementExecutionContext,
+        DatabaseState, StatementContext,
         ctes::{contains_query_ctes, materialize_query_ctes},
         expressions::infer_window_return_type,
         scope::{RowScope, bind_select_scope},
@@ -152,7 +152,7 @@ pub(super) fn execute_query(
     query: &ast::Query,
     xid: Xid,
     snapshot: &Snapshot,
-    context: &StatementExecutionContext,
+    context: &StatementContext,
 ) -> Result<StatementResult> {
     if let Some(expanded) = expand_query_views(&state.catalog, query)? {
         return execute_query(state, &expanded, xid, snapshot, context);

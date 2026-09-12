@@ -3,7 +3,7 @@ use crate::{
     coercion::{self, CastContext},
     error::{Result, reject_unsupported},
     executor::{
-        DatabaseState, StatementExecutionContext,
+        DatabaseState, StatementContext,
         expressions::{evaluate, extract_unknown_string_literal},
         json, normalize_relation_name,
         query::execute_query,
@@ -30,7 +30,7 @@ pub(super) fn materialize_from_rows(
     start_slot: usize,
     xid: Xid,
     snapshot: &Snapshot,
-    context: &StatementExecutionContext,
+    context: &StatementContext,
     selection: Option<&ast::Expr>,
 ) -> Result<Vec<Vec<Value>>> {
     if from.is_empty() {
@@ -96,7 +96,7 @@ pub(super) fn visit_query_source_rows(
     scope: &BoundScope,
     xid: Xid,
     snapshot: &Snapshot,
-    context: &StatementExecutionContext,
+    context: &StatementContext,
     selection: Option<&ast::Expr>,
     visit: &mut dyn FnMut(&[Value]) -> Result<()>,
 ) -> Result<()> {
@@ -129,7 +129,7 @@ fn materialize_table_factor_rows(
     scope: &BoundScope,
     xid: Xid,
     snapshot: &Snapshot,
-    context: &StatementExecutionContext,
+    context: &StatementContext,
     selection: Option<&ast::Expr>,
     next_slot: &mut usize,
     prefix: &[Value],

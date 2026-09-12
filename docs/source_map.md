@@ -27,6 +27,15 @@ Catalog dependencies serve both prepared statements and lock discovery.
 Keeping them independent of prepared handles lets ordinary queries and view
 creation use the same catalog traversal and CTE scoping rules.
 
+## Statement state
+
+[`executor/context.rs`](../crates/pg_fake/src/executor/context.rs) owns
+`StatementContext`: statement timestamps, timeout, random and sequence execution,
+source snapshots, and cached evaluations shared by locking and execution. INSERT
+preparations, UPDATE rows, mutation targets, CTE results, and subquery results keep
+their existing occurrence and snapshot keys. Row-lock recheck requests preserve
+progress when execution must wait.
+
 ## Query execution
 
 [`executor/query/mod.rs`](../crates/pg_fake/src/executor/query/mod.rs) coordinates

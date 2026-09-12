@@ -7,7 +7,7 @@ use crate::{
     coercion::{self, CastContext},
     error::{PgError, Result, SqlState, reject_unsupported},
     executor::{
-        StatementExecutionContext,
+        StatementContext,
         expressions::{
             compare_values, create_constant_expression_schema, evaluate_and_coerce,
             extract_number_literal, extract_unknown_string_literal, infer_expression_data_type,
@@ -93,7 +93,7 @@ pub(super) fn bind_values_scope(values: &ast::Values) -> Result<BoundScope> {
 pub(super) fn execute_values_query(
     query: &ast::Query,
     values: &ast::Values,
-    context: &StatementExecutionContext,
+    context: &StatementContext,
 ) -> Result<StatementResult> {
     let scope = bind_values_scope(values)?;
     let columns = scope

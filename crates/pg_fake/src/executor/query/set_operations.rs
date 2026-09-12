@@ -7,7 +7,7 @@ use crate::{
     coercion::{self, CastContext},
     error::{PgError, Result, SqlState, reject_unsupported},
     executor::{
-        DatabaseState, StatementExecutionContext,
+        DatabaseState, StatementContext,
         equality::are_rows_not_distinct,
         expressions::{
             compare_values, extract_number_literal, extract_unknown_string_literal,
@@ -28,7 +28,7 @@ pub(super) fn execute_set_query(
     query: &ast::Query,
     xid: Xid,
     snapshot: &Snapshot,
-    context: &StatementExecutionContext,
+    context: &StatementContext,
 ) -> Result<QueryResult> {
     let mut result =
         execute_set_expression(state, query, &query.body, None, xid, snapshot, context)?;
@@ -173,7 +173,7 @@ fn execute_set_expression(
     metadata: Option<&SetExpressionMetadata>,
     xid: Xid,
     snapshot: &Snapshot,
-    context: &StatementExecutionContext,
+    context: &StatementContext,
 ) -> Result<QueryResult> {
     match expression {
         ast::SetExpr::Query(query) => {

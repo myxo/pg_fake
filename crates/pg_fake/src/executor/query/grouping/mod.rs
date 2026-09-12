@@ -5,7 +5,7 @@ use crate::{
     catalog::ConstraintId,
     error::{PgError, Result, SqlState},
     executor::{
-        DatabaseState, StatementExecutionContext,
+        DatabaseState, StatementContext,
         aggregates::{
             AggregateCall, AggregateInput, AggregateState, is_aggregate_function,
             parse_aggregate_call, prepare_aggregate_function_input,
@@ -272,7 +272,7 @@ fn prepare_group_aggregate_input(
     row: &[Value],
     xid: Xid,
     snapshot: &Snapshot,
-    context: &StatementExecutionContext,
+    context: &StatementContext,
 ) -> Result<AggregateInput> {
     let original_arguments = extract_aggregate_expressions(original);
     let typed_arguments = extract_aggregate_expressions(typed);
@@ -305,7 +305,7 @@ pub(super) fn collect_grouped_select_rows(
     aggregate_functions: &[CollectedAggregateFunction],
     xid: Xid,
     snapshot: &Snapshot,
-    context: &StatementExecutionContext,
+    context: &StatementContext,
 ) -> Result<Vec<(Vec<Value>, GroupedAggregateValues)>> {
     let typed_aggregate_functions = aggregate_functions
         .iter()
@@ -452,7 +452,7 @@ pub(super) fn evaluate_group_having(
     aggregate_values: &GroupedAggregateValues,
     xid: Xid,
     snapshot: &Snapshot,
-    context: &StatementExecutionContext,
+    context: &StatementContext,
 ) -> Result<bool> {
     let Some(having) = &select.having else {
         return Ok(true);
@@ -482,7 +482,7 @@ pub(super) fn execute_grouped_select_rows(
     grouped_expressions: &[(ast::Expr, PgType)],
     xid: Xid,
     snapshot: &Snapshot,
-    context: &StatementExecutionContext,
+    context: &StatementContext,
 ) -> Result<Vec<SelectRow>> {
     let aggregate_functions = collect_group_aggregate_functions(
         state,

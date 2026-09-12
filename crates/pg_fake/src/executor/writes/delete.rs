@@ -7,7 +7,7 @@ use super::{
     },
 };
 use crate::executor::{
-    DatabaseState, RequiredRowLock, StatementExecutionContext, expressions::is_null_literal,
+    DatabaseState, RequiredRowLock, StatementContext, expressions::is_null_literal,
     foreign_keys::apply_referencing_foreign_key_actions, normalize_relation_name, query,
 };
 use crate::{
@@ -28,7 +28,7 @@ pub(in crate::executor) fn execute_delete(
     snapshot: &Snapshot,
     deferred_constraints: &BTreeSet<ConstraintId>,
     defer_all: bool,
-    context: &StatementExecutionContext,
+    context: &StatementContext,
     mut mutation_targets: Option<Vec<RequiredRowLock>>,
 ) -> Result<StatementResult> {
     if !delete.tables.is_empty() || !delete.order_by.is_empty() || delete.limit.is_some() {

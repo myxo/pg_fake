@@ -330,7 +330,7 @@ fn evaluate_trigger_expression(
     expression: &ast::Expr,
     scope: &BoundScope,
     row: &[Value],
-    context: &StatementExecutionContext,
+    context: &StatementContext,
 ) -> Result<Value> {
     evaluate(expression, RowScope::Bound(scope), row, context)
 }
@@ -355,7 +355,7 @@ fn execute_trigger_statements(
     statements: &[ast::PlPgSqlStatement],
     scope: &BoundScope,
     row: &mut Vec<Value>,
-    context: &StatementExecutionContext,
+    context: &StatementContext,
 ) -> Result<Option<TriggerReturn>> {
     for statement in statements {
         match statement {
@@ -432,7 +432,7 @@ pub(super) fn execute_before_row_triggers(
     schema: &TableSchema,
     event: TriggerEventKind,
     mut row: Vec<Value>,
-    context: &StatementExecutionContext,
+    context: &StatementContext,
 ) -> Result<Option<Vec<Value>>> {
     let mut scope = None;
     for trigger in &schema.triggers {

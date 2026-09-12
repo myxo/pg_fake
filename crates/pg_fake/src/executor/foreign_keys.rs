@@ -298,7 +298,7 @@ pub(super) fn apply_referencing_foreign_key_actions(
     deferred_constraints: &BTreeSet<ConstraintId>,
     defer_all: bool,
     visited: &mut BTreeSet<(TableId, RowId)>,
-    context: &StatementExecutionContext,
+    context: &StatementContext,
 ) -> Result<()> {
     let snapshot = snapshot.include_current_command();
     let foreign_keys = state
@@ -487,7 +487,7 @@ fn apply_cascaded_row_update(
     deferred_constraints: &BTreeSet<ConstraintId>,
     defer_all: bool,
     visited: &mut BTreeSet<(TableId, RowId)>,
-    context: &StatementExecutionContext,
+    context: &StatementContext,
 ) -> Result<()> {
     let Some(updated) = procedural::execute_before_row_triggers(
         state,

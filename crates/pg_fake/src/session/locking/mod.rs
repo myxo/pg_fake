@@ -166,7 +166,7 @@ pub(super) fn acquire_row_locks<'a>(
     temporary_schema_id: SchemaId,
     isolation: IsolationLevel,
     mut snapshot: Snapshot,
-    context: &executor::StatementExecutionContext,
+    context: &executor::StatementContext,
     deferred_constraints: &BTreeSet<ConstraintId>,
     defer_all: bool,
 ) -> Result<(
@@ -223,7 +223,7 @@ pub(super) fn acquire_row_locks<'a>(
             }
         }
         let Some((key, conflicts)) = blocked else {
-            if context.take_trigger_lock_recheck() {
+            if context.take_row_lock_recheck() {
                 continue;
             }
             if let Some(pending) = context.take_pending_cte_mutation() {

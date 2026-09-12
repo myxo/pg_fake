@@ -2,7 +2,7 @@ use crate::{
     coercion::CastContext,
     error::{Result, reject_unsupported},
     executor::{
-        DatabaseState, StatementExecutionContext,
+        DatabaseState, StatementContext,
         expressions::{evaluate, evaluate_and_coerce, resolve_operator_type},
         normalize_relation_name,
         scope::{BoundScope, RowScope},
@@ -19,7 +19,7 @@ pub(super) fn visit_table_factor_rows(
     scope: &BoundScope,
     xid: Xid,
     snapshot: &Snapshot,
-    context: &StatementExecutionContext,
+    context: &StatementContext,
     selection: Option<&ast::Expr>,
     start: usize,
     visit: &mut dyn FnMut(&[Value]) -> Result<()>,

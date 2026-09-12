@@ -10,7 +10,7 @@ use crate::{
     ColumnMeta,
     error::{PgError, Result, SqlState, reject_unsupported},
     executor::{
-        DatabaseState, StatementExecutionContext,
+        DatabaseState, StatementContext,
         expressions::{compare_values, extract_number_literal, validate_ordering_type},
         normalize_identifier, resolve_order_ascending,
         scope::BoundScope,
@@ -162,7 +162,7 @@ pub(super) fn evaluate_order_keys(
     aggregate_values: Option<&GroupedAggregateValues>,
     xid: Xid,
     snapshot: &Snapshot,
-    context: &StatementExecutionContext,
+    context: &StatementContext,
 ) -> Result<Vec<Value>> {
     order_specs
         .iter()

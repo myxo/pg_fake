@@ -1,4 +1,4 @@
-use crate::executor::{DatabaseState, StatementExecutionContext, query, scope::BoundScope};
+use crate::executor::{DatabaseState, StatementContext, query, scope::BoundScope};
 use crate::{
     ColumnMeta, QueryResult, StatementResult,
     error::Result,
@@ -40,7 +40,7 @@ pub(super) fn evaluate_returning_row(
     rows: &mut Vec<Vec<Value>>,
     xid: Xid,
     snapshot: &Snapshot,
-    context: &StatementExecutionContext,
+    context: &StatementContext,
 ) -> Result<()> {
     let Some(returning) = returning else {
         return Ok(());

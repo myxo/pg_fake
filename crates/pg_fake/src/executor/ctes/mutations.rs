@@ -7,7 +7,7 @@ use crate::{
     catalog::ConstraintId,
     error::{PgError, Result, SqlState, reject_unsupported},
     executor::{
-        DatabaseState, StatementExecutionContext, execute_statement, normalize_identifier,
+        DatabaseState, StatementContext, execute_statement, normalize_identifier,
         query::{describe_query_result_columns, execute_query, has_zero_limit},
         subqueries::materialize_uncorrelated_subqueries,
     },
@@ -33,7 +33,7 @@ pub(in crate::executor) fn prepare_cte_mutation_for_locking(
     target_index: usize,
     xid: Xid,
     snapshot: &Snapshot,
-    context: &StatementExecutionContext,
+    context: &StatementContext,
 ) -> Result<Option<ast::Statement>> {
     let with = query
         .with
@@ -177,7 +177,7 @@ pub(crate) fn materialize_statement_ctes(
     snapshot: &Snapshot,
     deferred_constraints: &BTreeSet<ConstraintId>,
     defer_all: bool,
-    context: &StatementExecutionContext,
+    context: &StatementContext,
 ) -> Result<ast::Statement> {
     let ast::Statement::Query(query) = statement else {
         return Ok(statement.clone());
@@ -351,7 +351,7 @@ fn materialize_recursive_data_modifying_ctes(
     snapshot: &Snapshot,
     deferred_constraints: &BTreeSet<ConstraintId>,
     defer_all: bool,
-    context: &StatementExecutionContext,
+    context: &StatementContext,
 ) -> Result<ast::Query> {
     let names = with
         .cte_tables

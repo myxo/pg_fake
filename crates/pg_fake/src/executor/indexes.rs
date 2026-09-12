@@ -5,7 +5,7 @@ pub(super) fn execute_create_index(
     create: &ast::CreateIndex,
     xid: Xid,
     snapshot: &Snapshot,
-    context: &StatementExecutionContext,
+    context: &StatementContext,
 ) -> Result<StatementResult> {
     if create.concurrently
         || create.nulls_distinct.is_some()
@@ -238,7 +238,7 @@ fn validate_unique_index_rows(
     predicate: Option<&ast::Expr>,
     xid: Xid,
     snapshot: &Snapshot,
-    context: &StatementExecutionContext,
+    context: &StatementContext,
 ) -> Result<()> {
     let column_indexes = columns
         .iter()

@@ -23,7 +23,7 @@ use crate::{
     ColumnMeta, QueryResult, StatementResult,
     error::{PgError, Result, SqlState},
     executor::{
-        DatabaseState, StatementExecutionContext,
+        DatabaseState, StatementContext,
         ctes::{contains_query_ctes, materialize_query_ctes},
         from::{is_selection_fully_pushed, visit_query_source_rows},
         scope::bind_select_scope,
@@ -86,7 +86,7 @@ pub(in crate::executor) fn stream_query_rows(
     query: &ast::Query,
     xid: Xid,
     snapshot: &Snapshot,
-    context: &StatementExecutionContext,
+    context: &StatementContext,
     maximum_rows: Option<usize>,
     prepared: &mut Option<QueryStreamState>,
     consume: &mut dyn FnMut(Vec<Value>, &[ColumnMeta]) -> Result<()>,

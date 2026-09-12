@@ -2,7 +2,7 @@ use crate::{
     coercion::CastContext,
     error::{PgError, Result, SqlState, reject_unsupported},
     executor::{
-        StatementExecutionContext,
+        StatementContext,
         expressions::{create_constant_expression_schema, evaluate_and_coerce},
         scope::RowScope,
     },
@@ -29,7 +29,7 @@ pub(in crate::executor) fn has_zero_limit(query: &ast::Query) -> bool {
 #[cfg_attr(feature = "execution-log", tracing::instrument(skip_all))]
 pub(in crate::executor) fn resolve_select_limit(
     query: &ast::Query,
-    context: &StatementExecutionContext,
+    context: &StatementContext,
 ) -> Result<(Option<usize>, usize)> {
     match &query.limit_clause {
         None => Ok((None, 0)),
@@ -64,7 +64,7 @@ pub(in crate::executor) fn resolve_select_limit(
 pub(super) fn evaluate_row_count(
     expr: &ast::Expr,
     clause: RowCountClause,
-    context: &StatementExecutionContext,
+    context: &StatementContext,
 ) -> Result<Option<usize>> {
     if matches!(clause, RowCountClause::Limit)
         && matches!(expr, ast::Expr::Identifier(identifier) if identifier.quote_style.is_none() && identifier.value.eq_ignore_ascii_case("all"))

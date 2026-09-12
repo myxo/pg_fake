@@ -1,11 +1,9 @@
 use super::{
-    conflicts::{
-        build_conflict_update_plan, prepare_triggered_conflict_update, resolve_conflict_arbiter,
-    },
+    conflicts::{build_conflict_update_plan, prepare_conflict_update, resolve_conflict_arbiter},
     returning::{ReturningPlan, build_returning_plan, evaluate_returning_row},
 };
 use crate::executor::{
-    DatabaseState, PreparedConflictUpdate, PreparedTriggerInsert, StatementExecutionContext,
+    DatabaseState, PreparedConflictUpdate, PreparedInsert, StatementContext,
     expressions::{
         create_constant_expression_schema, evaluate_assignment_expression, evaluate_column_default,
         is_default_expression, validate_check_constraints, validate_not_null,
@@ -25,18 +23,18 @@ use sqlparser::ast;
 use std::{collections::BTreeSet, sync::Arc};
 
 #[cfg_attr(feature = "execution-log", tracing::instrument(skip_all))]
-pub(super) fn evaluate_triggered_insert_rows(
+pub(super) fn evaluate_insert_rows(
     state: &DatabaseState,
     insert: &ast::Insert,
     schema: &TableSchema,
     column_indexes: &[usize],
     returning: Option<&ReturningPlan<'_>>,
-    resume: Option<&PreparedTriggerInsert>,
+    resume: Option<&PreparedInsert>,
     stop_at_blocking_conflict: bool,
     xid: Xid,
     snapshot: &Snapshot,
-    context: &StatementExecutionContext,
-) -> Result<PreparedTriggerInsert> {
+    context: &StatementContext,
+) -> Result<PreparedInsert> {
     let provided = column_indexes.iter().copied().collect::<BTreeSet<_>>();
     let static_defaults = schema
         .columns
@@ -187,7 +185,7 @@ pub(super) fn evaluate_triggered_insert_rows(
     };
     let mut affected_rows = BTreeSet::new();
     for (prior_insert, prepared) in stop_at_blocking_conflict
-        .then(|| context.get_prior_prepared_trigger_inserts(insert))
+        .then(|| context.get_prior_prepared_inserts(insert))
         .unwrap_or_default()
     {
         let prior_schema = state
@@ -335,7 +333,7 @@ pub(super) fn evaluate_triggered_insert_rows(
             }
             return Ok(());
         }
-        let prepared_conflict = prepare_triggered_conflict_update(
+        let prepared_conflict = prepare_conflict_update(
             state,
             schema,
             &validation_table,
@@ -482,7 +480,7 @@ pub(super) fn evaluate_triggered_insert_rows(
             Ok(None) => None,
             Err(error) => Some(error.clone()),
         };
-        return Ok(PreparedTriggerInsert {
+        return Ok(PreparedInsert {
             source_state: None,
             source_snapshot: None,
             source_query: None,
@@ -515,7 +513,7 @@ pub(super) fn evaluate_triggered_insert_rows(
                         &mut returned_rows,
                     ) {
                         source_rows.push(evaluated.expect("evaluated row is successful"));
-                        return Ok(PreparedTriggerInsert {
+                        return Ok(PreparedInsert {
                             source_state: None,
                             source_snapshot: None,
                             source_query: None,
@@ -534,7 +532,7 @@ pub(super) fn evaluate_triggered_insert_rows(
                 }
                 Ok(None) => source_rows.push(None),
                 Err(error) => {
-                    return Ok(PreparedTriggerInsert {
+                    return Ok(PreparedInsert {
                         source_state: None,
                         source_snapshot: None,
                         source_query: None,
@@ -548,7 +546,7 @@ pub(super) fn evaluate_triggered_insert_rows(
                 }
             }
         }
-        return Ok(PreparedTriggerInsert {
+        return Ok(PreparedInsert {
             source_state: None,
             source_snapshot: None,
             source_query: None,
@@ -595,7 +593,7 @@ pub(super) fn evaluate_triggered_insert_rows(
                     &mut streamed_returned_rows,
                 ) {
                     streamed_source_rows.push(cached.clone());
-                    return Ok(PreparedTriggerInsert {
+                    return Ok(PreparedInsert {
                         source_state: Some(source_state.clone()),
                         source_snapshot: Some(source_snapshot.clone()),
                         source_query,
@@ -610,7 +608,7 @@ pub(super) fn evaluate_triggered_insert_rows(
             }
             streamed_source_rows.push(cached.clone());
             if stopped.get() {
-                return Ok(PreparedTriggerInsert {
+                return Ok(PreparedInsert {
                     source_state: Some(source_state.clone()),
                     source_snapshot: Some(source_snapshot.clone()),
                     source_query,
@@ -711,7 +709,7 @@ pub(super) fn evaluate_triggered_insert_rows(
     );
     match streamed {
         Err(_) if stopped.get() => {
-            return Ok(PreparedTriggerInsert {
+            return Ok(PreparedInsert {
                 source_state: Some(source_state.clone()),
                 source_snapshot: Some(source_snapshot.clone()),
                 source_query,
@@ -725,7 +723,7 @@ pub(super) fn evaluate_triggered_insert_rows(
         }
         Err(error) => {
             return match streamed_error {
-                Some(error) => Ok(PreparedTriggerInsert {
+                Some(error) => Ok(PreparedInsert {
                     source_state: Some(source_state.clone()),
                     source_snapshot: Some(source_snapshot.clone()),
                     source_query,
@@ -746,7 +744,7 @@ pub(super) fn evaluate_triggered_insert_rows(
                     "INSERT has wrong number of values",
                 ));
             }
-            return Ok(PreparedTriggerInsert {
+            return Ok(PreparedInsert {
                 source_state: Some(source_state.clone()),
                 source_snapshot: Some(source_snapshot.clone()),
                 source_query,
@@ -820,7 +818,7 @@ pub(super) fn evaluate_triggered_insert_rows(
                     &mut streamed_returned_rows,
                 ) {
                     streamed_source_rows.push(Some(row));
-                    return Ok(PreparedTriggerInsert {
+                    return Ok(PreparedInsert {
                         source_state: Some(source_state.clone()),
                         source_snapshot: Some(source_snapshot.clone()),
                         source_query,
@@ -839,7 +837,7 @@ pub(super) fn evaluate_triggered_insert_rows(
             }
             Ok(None) => streamed_source_rows.push(None),
             Err(error) => {
-                return Ok(PreparedTriggerInsert {
+                return Ok(PreparedInsert {
                     source_state: Some(source_state.clone()),
                     source_snapshot: Some(source_snapshot.clone()),
                     source_query,
@@ -853,7 +851,7 @@ pub(super) fn evaluate_triggered_insert_rows(
             }
         }
     }
-    Ok(PreparedTriggerInsert {
+    Ok(PreparedInsert {
         source_state: Some(source_state),
         source_snapshot: Some(source_snapshot.clone()),
         source_query,
@@ -866,14 +864,14 @@ pub(super) fn evaluate_triggered_insert_rows(
     })
 }
 
-pub(in crate::executor) fn preview_triggered_insert_rows(
+pub(in crate::executor) fn prepare_insert_rows(
     state: &DatabaseState,
     insert: &ast::Insert,
     schema: &TableSchema,
     column_indexes: &[usize],
     xid: Xid,
     snapshot: &Snapshot,
-    context: &StatementExecutionContext,
+    context: &StatementContext,
 ) -> Result<(Vec<Vec<Value>>, Vec<Option<PreparedConflictUpdate>>)> {
     let returning_scope = bind_target_scope(
         schema,
@@ -885,10 +883,10 @@ pub(in crate::executor) fn preview_triggered_insert_rows(
         schema.columns.len(),
         insert.returning.as_deref(),
     )?;
-    let resume = context.get_prepared_trigger_insert(insert);
+    let resume = context.get_prepared_insert(insert);
     let prepared = match resume {
         Some(prepared) if prepared.complete => prepared,
-        resume => evaluate_triggered_insert_rows(
+        resume => evaluate_insert_rows(
             state,
             insert,
             schema,
@@ -901,9 +899,9 @@ pub(in crate::executor) fn preview_triggered_insert_rows(
             context,
         )?,
     };
-    context.set_prepared_trigger_insert(insert, prepared.clone());
+    context.set_prepared_insert(insert, prepared.clone());
     if !prepared.complete {
-        context.request_trigger_lock_recheck();
+        context.request_row_lock_recheck();
     } else if let Some(error) = prepared.error.clone() {
         return Err(error);
     }

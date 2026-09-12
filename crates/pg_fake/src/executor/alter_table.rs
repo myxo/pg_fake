@@ -53,7 +53,7 @@ pub(super) fn execute_alter_table(
     snapshot: &Snapshot,
     deferred_constraints: &BTreeSet<ConstraintId>,
     defer_all: bool,
-    context: &StatementExecutionContext,
+    context: &StatementContext,
 ) -> Result<StatementResult> {
     let existing_sequences = state
         .sequence_values
@@ -95,7 +95,7 @@ fn execute_alter_table_inner(
     snapshot: &Snapshot,
     deferred_constraints: &BTreeSet<ConstraintId>,
     defer_all: bool,
-    context: &StatementExecutionContext,
+    context: &StatementContext,
 ) -> Result<StatementResult> {
     if alter.only
         || alter.location.is_some()
@@ -212,7 +212,7 @@ fn execute_alter_operation(
     schema: &mut TableSchema,
     rows: &mut [AlteredRow],
     operation: &ast::AlterTableOperation,
-    context: &StatementExecutionContext,
+    context: &StatementContext,
 ) -> Result<()> {
     match operation {
         ast::AlterTableOperation::AddColumn {
@@ -708,7 +708,7 @@ fn alter_column(
     rows: &mut [AlteredRow],
     column_name: &ast::Ident,
     operation: &ast::AlterColumnOperation,
-    context: &StatementExecutionContext,
+    context: &StatementContext,
 ) -> Result<()> {
     let name = normalize_identifier(column_name);
     let index = schema

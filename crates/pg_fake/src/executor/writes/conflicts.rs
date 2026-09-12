@@ -3,7 +3,7 @@ use super::{
     targets::matches_mutation_row,
 };
 use crate::executor::{
-    DatabaseState, PreparedConflictUpdate, StatementExecutionContext,
+    DatabaseState, PreparedConflictUpdate, StatementContext,
     expressions::{
         evaluate_column_default, is_default_expression, is_null_literal,
         validate_check_constraints, validate_index_predicate, validate_not_null,
@@ -254,7 +254,7 @@ pub(super) fn build_conflict_update_plan<'a>(
     })
 }
 
-pub(super) fn prepare_triggered_conflict_update(
+pub(super) fn prepare_conflict_update(
     state: &DatabaseState,
     schema: &TableSchema,
     table: &Table,
@@ -264,7 +264,7 @@ pub(super) fn prepare_triggered_conflict_update(
     affected_rows: Option<&BTreeSet<RowId>>,
     xid: Xid,
     snapshot: &Snapshot,
-    context: &StatementExecutionContext,
+    context: &StatementContext,
 ) -> Result<Option<PreparedConflictUpdate>> {
     let (Some(arbiter), Some(update)) = (arbiter, update) else {
         return Ok(None);
@@ -355,7 +355,7 @@ pub(super) fn execute_insert_conflict(
     snapshot: &Snapshot,
     deferred_constraints: &BTreeSet<ConstraintId>,
     defer_all: bool,
-    context: &StatementExecutionContext,
+    context: &StatementContext,
     prepared: Option<&PreparedConflictUpdate>,
 ) -> Result<InsertConflictOutcome> {
     let Some(arbiter) = arbiter else {

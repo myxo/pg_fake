@@ -1,7 +1,7 @@
-use super::update::prepare_triggered_update_rows;
+use super::update::prepare_update_rows;
 use crate::executor::{
-    DatabaseState, MutationCandidate, PreparedMutationTarget, RequiredRowLock,
-    StatementExecutionContext, from, locks, normalize_relation_name,
+    DatabaseState, MutationCandidate, PreparedMutationTarget, RequiredRowLock, StatementContext,
+    from, locks, normalize_relation_name,
     scope::{BoundScope, RowScope, bind_from_scope, bind_target_scope, combine_bound_scopes},
     subqueries,
 };
@@ -37,7 +37,7 @@ pub(super) fn materialize_mutation_source_rows(
     target_columns: usize,
     xid: Xid,
     snapshot: &Snapshot,
-    context: &StatementExecutionContext,
+    context: &StatementContext,
 ) -> Result<Vec<Vec<Value>>> {
     if from.is_empty() {
         return Ok(vec![vec![Value::Null; scope.columns.len()]]);
@@ -62,7 +62,7 @@ pub(super) fn matches_mutation_row(
     row: &[Value],
     xid: Xid,
     snapshot: &Snapshot,
-    context: &StatementExecutionContext,
+    context: &StatementContext,
 ) -> Result<bool> {
     let Some(selection) = selection else {
         return Ok(true);
@@ -87,7 +87,7 @@ pub(super) fn collect_mutation_targets(
     source_rows: &[Vec<Value>],
     xid: Xid,
     snapshot: &Snapshot,
-    context: &StatementExecutionContext,
+    context: &StatementContext,
     mutation_targets: Option<Vec<RequiredRowLock>>,
 ) -> Result<Vec<MutationTarget>> {
     let table = state
@@ -244,7 +244,7 @@ pub(in crate::executor) fn collect_update_cte_locks(
     update: &ast::Update,
     xid: Xid,
     snapshot: &Snapshot,
-    context: &StatementExecutionContext,
+    context: &StatementContext,
 ) -> Result<Vec<RequiredRowLock>> {
     let ast::TableFactor::Table {
         name: table_name,
@@ -329,7 +329,7 @@ pub(in crate::executor) fn collect_update_cte_locks(
         .iter()
         .any(|lock| !state.row_locks.is_held(lock.key, xid, lock.mode))
     {
-        context.request_trigger_lock_recheck_with_locks(locks.clone());
+        context.request_row_lock_recheck_with_locks(locks.clone());
         return Ok(locks);
     }
     if schema
@@ -337,8 +337,7 @@ pub(in crate::executor) fn collect_update_cte_locks(
         .iter()
         .any(|constraint| matches!(constraint, Constraint::ForeignKey(_)))
     {
-        let prepared =
-            prepare_triggered_update_rows(state, update, schema, xid, snapshot, context)?;
+        let prepared = prepare_update_rows(state, update, schema, xid, snapshot, context)?;
         let foreign_key_locks = locks::collect_foreign_key_locks_for_rows(
             state,
             schema,
@@ -349,7 +348,7 @@ pub(in crate::executor) fn collect_update_cte_locks(
             .iter()
             .any(|lock| !state.row_locks.is_held(lock.key, xid, lock.mode))
         {
-            context.request_trigger_lock_recheck_with_locks(foreign_key_locks.clone());
+            context.request_row_lock_recheck_with_locks(foreign_key_locks.clone());
         }
         locks.extend(foreign_key_locks);
     }
@@ -361,7 +360,7 @@ pub(in crate::executor) fn collect_delete_cte_locks(
     delete: &ast::Delete,
     xid: Xid,
     snapshot: &Snapshot,
-    context: &StatementExecutionContext,
+    context: &StatementContext,
 ) -> Result<Vec<RequiredRowLock>> {
     let ast::FromTable::WithFromKeyword(from) = &delete.from else {
         return Ok(Vec::new());
@@ -455,7 +454,7 @@ pub(in crate::executor) fn collect_delete_cte_locks(
         .iter()
         .any(|lock| !state.row_locks.is_held(lock.key, xid, lock.mode))
     {
-        context.request_trigger_lock_recheck_with_locks(locks.clone());
+        context.request_row_lock_recheck_with_locks(locks.clone());
     }
     Ok(locks)
 }

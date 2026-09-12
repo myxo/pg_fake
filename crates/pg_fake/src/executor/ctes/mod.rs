@@ -9,7 +9,7 @@ use crate::{
     QueryResult, StatementResult,
     error::{PgError, Result, SqlState},
     executor::{
-        DatabaseState, StatementExecutionContext, normalize_identifier,
+        DatabaseState, StatementContext, normalize_identifier,
         query::{describe_query_result_columns, execute_query, has_zero_limit},
     },
     txn::{Snapshot, Xid},
@@ -61,7 +61,7 @@ fn execute_prepared_cte_query(
     query: &ast::Query,
     xid: Xid,
     snapshot: &Snapshot,
-    context: &StatementExecutionContext,
+    context: &StatementContext,
 ) -> Result<QueryResult> {
     if let Some(result) = context.get_prepared_cte_result(occurrence, name) {
         return Ok(result);
@@ -77,7 +77,7 @@ struct DerivedCteMaterializer<'a> {
     state: &'a DatabaseState,
     xid: Xid,
     snapshot: &'a Snapshot,
-    context: &'a StatementExecutionContext,
+    context: &'a StatementContext,
     error: Option<PgError>,
 }
 
@@ -112,7 +112,7 @@ pub(super) fn materialize_query_ctes(
     query: &ast::Query,
     xid: Xid,
     snapshot: &Snapshot,
-    context: &StatementExecutionContext,
+    context: &StatementContext,
 ) -> Result<ast::Query> {
     let mut query = query.clone();
     let Some(with) = query.with.take() else {

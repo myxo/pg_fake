@@ -7,7 +7,7 @@ pub(crate) fn collect_required_cte_row_locks(
     statement: &ast::Statement,
     xid: Xid,
     snapshot: &Snapshot,
-    context: &StatementExecutionContext,
+    context: &StatementContext,
 ) -> Result<Vec<RequiredRowLock>> {
     let ast::Statement::Query(query) = statement else {
         return Ok(Vec::new());
@@ -49,8 +49,8 @@ pub(crate) fn collect_required_cte_row_locks(
             let prepared = ctes::prepare_cte_mutation_for_locking(
                 state, query, cte_index, xid, snapshot, context,
             )?;
-            if context.requires_trigger_lock_recheck() {
-                locks.extend(context.take_trigger_lock_recheck_locks());
+            if context.requires_row_lock_recheck() {
+                locks.extend(context.take_row_lock_recheck_locks());
                 return Ok(locks);
             }
             if let Some(pending) = context.get_pending_cte_mutation() {
@@ -76,8 +76,8 @@ pub(crate) fn collect_required_cte_row_locks(
                         context,
                     )?),
                 }
-                if context.requires_trigger_lock_recheck() {
-                    locks.extend(context.take_trigger_lock_recheck_locks());
+                if context.requires_row_lock_recheck() {
+                    locks.extend(context.take_row_lock_recheck_locks());
                 }
                 return Ok(locks);
             }
@@ -86,8 +86,8 @@ pub(crate) fn collect_required_cte_row_locks(
             locks.extend(collect_required_cte_row_locks(
                 state, &statement, xid, snapshot, context,
             )?);
-            if context.requires_trigger_lock_recheck() {
-                locks.extend(context.take_trigger_lock_recheck_locks());
+            if context.requires_row_lock_recheck() {
+                locks.extend(context.take_row_lock_recheck_locks());
                 return Ok(locks);
             }
             match &statement {
@@ -95,8 +95,8 @@ pub(crate) fn collect_required_cte_row_locks(
                     locks.extend(writes::collect_update_cte_locks(
                         state, update, xid, snapshot, context,
                     )?);
-                    if context.requires_trigger_lock_recheck() {
-                        context.take_trigger_lock_recheck_locks();
+                    if context.requires_row_lock_recheck() {
+                        context.take_row_lock_recheck_locks();
                         return Ok(locks);
                     }
                     continue;
@@ -105,8 +105,8 @@ pub(crate) fn collect_required_cte_row_locks(
                     locks.extend(writes::collect_delete_cte_locks(
                         state, delete, xid, snapshot, context,
                     )?);
-                    if context.requires_trigger_lock_recheck() {
-                        context.take_trigger_lock_recheck_locks();
+                    if context.requires_row_lock_recheck() {
+                        context.take_row_lock_recheck_locks();
                         return Ok(locks);
                     }
                     continue;
@@ -147,8 +147,8 @@ pub(crate) fn collect_required_cte_row_locks(
             locks.extend(collect_required_row_locks(
                 state, &statement, xid, snapshot, context,
             )?);
-            if context.requires_trigger_lock_recheck() {
-                locks.extend(context.take_trigger_lock_recheck_locks());
+            if context.requires_row_lock_recheck() {
+                locks.extend(context.take_row_lock_recheck_locks());
                 return Ok(locks);
             }
         }
@@ -161,7 +161,7 @@ fn collect_triggered_insert_fallback_locks(
     insert: &ast::Insert,
     schema: &TableSchema,
     xid: Xid,
-    context: &StatementExecutionContext,
+    context: &StatementContext,
 ) -> Result<Vec<RequiredRowLock>> {
     let mut locks = Vec::new();
     if writes::resolve_conflict_arbiter(schema, insert.on.as_ref())?.is_some() {
@@ -217,7 +217,7 @@ pub(crate) fn collect_required_row_locks(
     statement: &ast::Statement,
     xid: Xid,
     snapshot: &Snapshot,
-    context: &StatementExecutionContext,
+    context: &StatementContext,
 ) -> Result<Vec<RequiredRowLock>> {
     if let ast::Statement::Insert(insert) = statement {
         let name = resolve_insert_table_name(&insert.table)?;
@@ -487,11 +487,10 @@ pub(crate) fn collect_required_row_locks(
                     .row_locks
                     .is_held(required.key, xid, RowLockMode::Update)
         }) {
-            context.request_trigger_lock_recheck();
+            context.request_row_lock_recheck();
             return Ok(locks);
         }
-        let rows =
-            writes::prepare_triggered_update_rows(state, update, schema, xid, snapshot, context)?;
+        let rows = writes::prepare_update_rows(state, update, schema, xid, snapshot, context)?;
         locks.extend(collect_foreign_key_locks_for_rows(
             state,
             schema,
@@ -508,10 +507,10 @@ fn collect_triggered_insert_locks(
     schema: &TableSchema,
     xid: Xid,
     snapshot: &Snapshot,
-    context: &StatementExecutionContext,
+    context: &StatementContext,
 ) -> Result<Vec<RequiredRowLock>> {
     let column_indexes = writes::resolve_insert_column_indexes(schema, &insert.columns)?;
-    let (rows, preview_conflicts) = writes::preview_triggered_insert_rows(
+    let (rows, preview_conflicts) = writes::prepare_insert_rows(
         state,
         insert,
         schema,
@@ -567,7 +566,7 @@ fn collect_triggered_insert_locks(
                     .row_locks
                     .is_held(required.key, xid, RowLockMode::Update)
         }) {
-            context.request_trigger_lock_recheck();
+            context.request_row_lock_recheck();
         } else {
             locks.extend(collect_foreign_key_locks_for_rows(
                 state,
@@ -653,7 +652,7 @@ fn collect_insert_conflict_locks(
     state: &DatabaseState,
     insert: &ast::Insert,
     xid: Xid,
-    context: &StatementExecutionContext,
+    context: &StatementContext,
 ) -> Result<Vec<RequiredRowLock>> {
     let schema = state
         .catalog
@@ -836,7 +835,7 @@ pub(super) fn resolve_unique_point_lookup(
     schema: &TableSchema,
     selection: Option<&ast::Expr>,
     scope: RowScope<'_>,
-    context: &StatementExecutionContext,
+    context: &StatementContext,
 ) -> Result<Option<(usize, Value)>> {
     let Some(ast::Expr::BinaryOp {
         left,
@@ -901,7 +900,7 @@ fn collect_insert_foreign_key_locks(
     insert: &ast::Insert,
     xid: Xid,
     snapshot: &Snapshot,
-    context: &StatementExecutionContext,
+    context: &StatementContext,
 ) -> Result<Vec<RequiredRowLock>> {
     let schema = state
         .catalog

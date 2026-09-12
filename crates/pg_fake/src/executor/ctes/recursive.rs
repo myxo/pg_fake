@@ -8,7 +8,7 @@ use crate::{
     coercion,
     error::{PgError, Result, SqlState, reject_unsupported},
     executor::{
-        DatabaseState, StatementExecutionContext,
+        DatabaseState, StatementContext,
         equality::are_rows_not_distinct,
         expressions::validate_equality_type,
         normalize_identifier, normalize_unqualified_object_name,
@@ -309,7 +309,7 @@ pub(super) fn materialize_recursive_query_ctes(
     with: ast::With,
     xid: Xid,
     snapshot: &Snapshot,
-    context: &StatementExecutionContext,
+    context: &StatementContext,
 ) -> Result<ast::Query> {
     let names = with
         .cte_tables
@@ -430,7 +430,7 @@ pub(super) fn materialize_recursive_query_ctes(
 pub(super) fn resolve_direct_cte_demand(
     query: &mut ast::Query,
     name: &str,
-    context: &StatementExecutionContext,
+    context: &StatementContext,
 ) -> Result<Option<usize>> {
     let ast::SetExpr::Select(select) = query.body.as_ref() else {
         return Ok(None);
@@ -557,7 +557,7 @@ pub(super) fn execute_recursive_cte(
     output_demand: Option<usize>,
     xid: Xid,
     snapshot: &Snapshot,
-    context: &StatementExecutionContext,
+    context: &StatementContext,
 ) -> Result<QueryResult> {
     let ast::SetExpr::SetOperation {
         left,

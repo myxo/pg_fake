@@ -11,7 +11,7 @@ use crate::{
     ColumnMeta,
     error::{PgError, Result, SqlState},
     executor::{
-        DatabaseState, StatementExecutionContext,
+        DatabaseState, StatementContext,
         equality::are_rows_not_distinct,
         expressions::{compare_values, validate_equality_type},
         normalize_identifier,
@@ -189,7 +189,7 @@ pub(super) fn evaluate_distinct_keys(
     aggregate_values: Option<&GroupedAggregateValues>,
     xid: Xid,
     snapshot: &Snapshot,
-    context: &StatementExecutionContext,
+    context: &StatementContext,
 ) -> Result<Vec<Value>> {
     let DistinctPlan::On { keys, .. } = distinct else {
         return Ok(Vec::new());

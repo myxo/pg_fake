@@ -1,5 +1,5 @@
 use crate::executor::{
-    DatabaseState, StatementExecutionContext,
+    DatabaseState, StatementContext,
     expressions::{extract_unknown_string_literal, is_default_expression, is_null_literal},
     normalize_unqualified_object_name, prepared, query,
     scope::BoundScope,
@@ -26,11 +26,11 @@ mod update;
 pub(super) use conflicts::resolve_conflict_arbiter;
 pub(super) use delete::execute_delete;
 pub(super) use insert::{execute_insert, resolve_insert_column_indexes};
-pub(super) use insert_preparation::preview_triggered_insert_rows;
+pub(super) use insert_preparation::prepare_insert_rows;
 pub(super) use targets::{
     collect_delete_cte_locks, collect_update_cte_locks, create_mutation_scope,
 };
-pub(super) use update::{execute_update, prepare_triggered_update_rows};
+pub(super) use update::{execute_update, prepare_update_rows};
 
 fn require_mutation_table(state: &DatabaseState, name: &RelationName) -> Result<TableSchema> {
     if state.catalog.require_named_view(name).is_ok() {
@@ -54,7 +54,7 @@ fn evaluate_mutation_assignment(
     row: &[Value],
     xid: Xid,
     snapshot: &Snapshot,
-    context: &StatementExecutionContext,
+    context: &StatementContext,
 ) -> Result<Value> {
     if let Some(text) = extract_unknown_string_literal(expression) {
         coercion::coerce_unknown(text, target, CastContext::Assignment)

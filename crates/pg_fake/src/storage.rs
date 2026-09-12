@@ -5,7 +5,7 @@ use std::{
 
 use crate::{
     catalog::{Constraint, IndexSchema, TableSchema},
-    executor::StatementExecutionContext,
+    executor::StatementContext,
     txn::{
         CommandId, CommitSeq, Snapshot, TransactionRegistry, TransactionStatus, Xid,
         find_visible_version,
@@ -408,7 +408,7 @@ impl Table {
         changed_columns: Option<&BTreeSet<usize>>,
         arbiter_columns: Option<&[usize]>,
         arbiter_predicate: Option<&ast::Expr>,
-        context: &StatementExecutionContext,
+        context: &StatementContext,
     ) -> bool {
         let snapshot = snapshot.include_current_command();
         self.indexes
@@ -450,7 +450,7 @@ impl Table {
         &self,
         left: &Row,
         right: &Row,
-        context: &StatementExecutionContext,
+        context: &StatementContext,
     ) -> bool {
         self.indexes.iter().any(|index| {
             matches_index_predicate(&self.schema, index, left, context)
@@ -469,7 +469,7 @@ impl Table {
         transactions: &TransactionRegistry,
         arbiter_columns: &[usize],
         arbiter_predicate: Option<&ast::Expr>,
-        context: &StatementExecutionContext,
+        context: &StatementContext,
     ) -> Option<(RowId, &RowVersion)> {
         let snapshot = snapshot.include_current_command();
         let index = self.indexes.iter().find(|index| {
@@ -496,7 +496,7 @@ impl Table {
         transactions: &TransactionRegistry,
         arbiter_columns: Option<&[usize]>,
         arbiter_predicate: Option<&ast::Expr>,
-        context: &StatementExecutionContext,
+        context: &StatementContext,
     ) -> Option<RowId> {
         self.indexes
             .iter()
@@ -547,7 +547,7 @@ impl Table {
         transactions: &TransactionRegistry,
         arbiter_columns: Option<&[usize]>,
         arbiter_predicate: Option<&ast::Expr>,
-        context: &StatementExecutionContext,
+        context: &StatementContext,
     ) -> Vec<RowId> {
         self.version_chains
             .chains
@@ -764,7 +764,7 @@ fn matches_index_predicate(
     schema: &TableSchema,
     index: &UniqueIndex,
     row: &Row,
-    context: &StatementExecutionContext,
+    context: &StatementContext,
 ) -> bool {
     index.predicate.as_ref().is_none_or(|predicate| {
         crate::executor::evaluate_index_predicate(predicate, schema, row, context)

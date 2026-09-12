@@ -7,7 +7,7 @@ use super::{
     },
 };
 use crate::executor::{
-    DatabaseState, PreparedTriggerUpdate, RequiredRowLock, StatementExecutionContext,
+    DatabaseState, PreparedUpdateRow, RequiredRowLock, StatementContext,
     expressions::{
         evaluate_column_default, is_default_expression, is_null_literal,
         validate_check_constraints, validate_not_null,
@@ -33,7 +33,7 @@ pub(in crate::executor) fn execute_update(
     snapshot: &Snapshot,
     deferred_constraints: &BTreeSet<ConstraintId>,
     defer_all: bool,
-    context: &StatementExecutionContext,
+    context: &StatementContext,
     mutation_targets: Option<Vec<RequiredRowLock>>,
 ) -> Result<StatementResult> {
     let update_table = &update.table;
@@ -82,7 +82,7 @@ pub(in crate::executor) fn execute_update(
         }
     }
     let (assigned, assignments) = build_mutation_assignments(state, &schema, &scope, assignments)?;
-    let prepared_updates = context.take_prepared_trigger_update(update).map(|updates| {
+    let prepared_updates = context.take_prepared_update(update).map(|updates| {
         updates
             .into_iter()
             .filter(|prepared| {
@@ -326,15 +326,15 @@ pub(in crate::executor) fn execute_update(
     Ok(create_write_result(affected, returning, returned_rows))
 }
 
-pub(in crate::executor) fn prepare_triggered_update_rows(
+pub(in crate::executor) fn prepare_update_rows(
     state: &DatabaseState,
     update: &ast::Update,
     schema: &TableSchema,
     xid: Xid,
     snapshot: &Snapshot,
-    context: &StatementExecutionContext,
-) -> Result<Vec<PreparedTriggerUpdate>> {
-    let (index, prepared) = context.get_prepared_trigger_update(update);
+    context: &StatementContext,
+) -> Result<Vec<PreparedUpdateRow>> {
+    let (index, prepared) = context.get_prepared_update(update);
     if let Some(rows) = prepared {
         return Ok(rows);
     }
@@ -466,7 +466,7 @@ pub(in crate::executor) fn prepare_triggered_update_rows(
                 None,
             );
         }
-        rows.push(PreparedTriggerUpdate {
+        rows.push(PreparedUpdateRow {
             row_id,
             version_xmin,
             current,
@@ -474,6 +474,6 @@ pub(in crate::executor) fn prepare_triggered_update_rows(
             updated,
         });
     }
-    context.set_prepared_trigger_update(index, update.clone(), rows.clone());
+    context.set_prepared_update(index, update.clone(), rows.clone());
     Ok(rows)
 }
