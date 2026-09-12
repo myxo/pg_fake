@@ -48,6 +48,24 @@ analysis, validates typed statements, and binds supplied values to placeholders.
 - [`scopes.rs`](../crates/pg_fake/src/analyzer/scopes.rs) shares mutation scopes
   and projection-alias recognition among the analysis passes.
 
+## Column scopes and binding
+
+[`executor/scope/mod.rs`](../crates/pg_fake/src/executor/scope/mod.rs) defines bound
+columns and row scopes. It resolves qualified and unqualified names, detects
+ambiguity, selects wildcard outputs, and reads merged JOIN/USING columns.
+
+- [`sources.rs`](../crates/pg_fake/src/executor/scope/sources.rs) binds tables,
+  views, derived queries, and JSON table functions to column slots. It handles
+  aliases and carries outer scopes into nested queries.
+- [`joins.rs`](../crates/pg_fake/src/executor/scope/joins.rs) binds join inputs,
+  validates ON/USING/NATURAL conditions, merges common columns, and checks lateral
+  references in RIGHT and FULL joins.
+- [`output.rs`](../crates/pg_fake/src/executor/scope/output.rs) describes query
+  output names and types, including unknown literals and set-operation operands.
+- [`subqueries.rs`](../crates/pg_fake/src/executor/scope/subqueries.rs) infers
+  expression types with correlated subqueries and substitutes typed placeholders
+  without evaluating query rows.
+
 ## Statement state
 
 [`executor/context.rs`](../crates/pg_fake/src/executor/context.rs) owns

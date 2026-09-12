@@ -67,12 +67,11 @@ use arithmetic::{
 use column_defaults::{evaluate_column_default, is_default_expression, validate_column_default};
 use expressions::{
     compare_values, evaluate, evaluate_and_coerce, evaluate_assignment_expression,
-    evaluate_comparison, extract_number_literal, resolve_operator_type, validate_equality_type,
-    validate_ordering_type,
+    evaluate_comparison, resolve_operator_type, validate_equality_type, validate_ordering_type,
 };
 pub(crate) use expressions::{
-    create_constant_expression_schema, extract_unknown_string_literal, infer_expression_data_type,
-    infer_expression_type, is_null_literal,
+    create_constant_expression_schema, extract_unknown_string_literal, infer_expression_type,
+    is_null_literal,
 };
 pub(crate) use foreign_keys::{contains_deferred_foreign_keys, validate_deferred_foreign_keys};
 use foreign_keys::{
