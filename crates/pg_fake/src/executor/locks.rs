@@ -24,7 +24,7 @@ pub(crate) fn collect_required_cte_row_locks(
     {
         return Ok(Vec::new());
     }
-    let reachable = query::collect_reachable_cte_names(query);
+    let reachable = ctes::collect_reachable_cte_names(query);
     let cte_names = query
         .with
         .as_ref()
@@ -46,7 +46,7 @@ pub(crate) fn collect_required_cte_row_locks(
             {
                 continue;
             }
-            let prepared = query::prepare_cte_mutation_for_locking(
+            let prepared = ctes::prepare_cte_mutation_for_locking(
                 state, query, cte_index, xid, snapshot, context,
             )?;
             if context.requires_trigger_lock_recheck() {
@@ -82,7 +82,7 @@ pub(crate) fn collect_required_cte_row_locks(
                 return Ok(locks);
             }
             let statement = prepared
-                .unwrap_or_else(|| query::convert_query_to_statement(cte.query.as_ref().clone()));
+                .unwrap_or_else(|| ctes::convert_query_to_statement(cte.query.as_ref().clone()));
             locks.extend(collect_required_cte_row_locks(
                 state, &statement, xid, snapshot, context,
             )?);
@@ -135,7 +135,7 @@ pub(crate) fn collect_required_cte_row_locks(
                 let can_prepare = insert.source.as_ref().is_none_or(|source| {
                     !has_subquery
                         && (matches!(source.body.as_ref(), ast::SetExpr::Values(_))
-                            || query::collect_cte_references(source, &cte_names).is_empty())
+                            || ctes::collect_cte_references(source, &cte_names).is_empty())
                 });
                 if !schema.triggers.is_empty() && !can_prepare {
                     locks.extend(collect_triggered_insert_fallback_locks(

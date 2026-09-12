@@ -39,9 +39,30 @@ query execution, including SELECT, grouping, windows, CTEs, and streaming.
   operand type resolution, duplicate handling, and ordering/limiting the combined
   result. Recursive CTEs and streamed `UNION ALL` reuse its row and type operations.
 
-The recursive CTE iteration and demand-driven streaming paths stay in the query
-coordinator. The shared `are_rows_not_distinct` predicate makes the NULL equality
-used by grouping and duplicate handling explicit.
+The query coordinator delegates CTE handling to `executor/ctes`. The shared
+`are_rows_not_distinct` predicate makes the NULL equality used by grouping and
+duplicate handling explicit.
+
+## Common table expressions
+
+[`executor/ctes/mod.rs`](../crates/pg_fake/src/executor/ctes/mod.rs) materializes
+read CTEs and exposes the entry points used by statement analysis, query execution,
+and lock preparation. CTEs belong beside the query executor because a `WITH`
+clause can also contain or feed mutations.
+
+- [`analysis.rs`](../crates/pg_fake/src/executor/ctes/analysis.rs) expands CTEs for
+  binding, parameter inference, and dependency discovery without executing them.
+- [`references.rs`](../crates/pg_fake/src/executor/ctes/references.rs) discovers
+  dependencies, checks forward references, and replaces materialized CTE references
+  while respecting nested names and preserving column names and types.
+- [`recursive.rs`](../crates/pg_fake/src/executor/ctes/recursive.rs) validates
+  recursion and column types, schedules read dependencies in `WITH RECURSIVE`, and
+  iterates the working table with duplicate handling and row demand.
+- [`mutations.rs`](../crates/pg_fake/src/executor/ctes/mutations.rs) prepares
+  mutation dependencies for locking and materializes statement CTEs. It reuses
+  results saved in the statement execution context so lock preparation and
+  execution share evaluations, and runs required mutations even when the outer
+  query needs no rows.
 
 ## Locking
 

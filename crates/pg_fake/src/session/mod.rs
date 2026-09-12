@@ -333,7 +333,7 @@ impl Session {
             state = acquired_state;
             snapshot = acquired_snapshot;
             Some(
-                match executor::materialize_ctes(
+                match executor::materialize_statement_ctes(
                     &mut state,
                     statement,
                     transaction.xid,

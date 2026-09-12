@@ -34,6 +34,7 @@ use std::{
 mod aggregates;
 mod alter_table;
 mod arithmetic;
+mod ctes;
 mod expressions;
 mod foreign_keys;
 mod indexes;
@@ -616,10 +617,9 @@ pub(crate) struct MutationCandidate {
     pub(crate) row: Option<Vec<Value>>,
 }
 
+pub(crate) use ctes::{expand_ctes_for_analysis, materialize_statement_ctes};
 pub(crate) use query::describe_query_result_columns;
 pub(crate) use query::detect_statement_features;
-pub(crate) use query::expand_ctes_for_analysis;
-pub(crate) use query::materialize_ctes;
 pub(crate) use query::materialize_uncorrelated_subqueries;
 pub(crate) use query::substitute_procedural_references;
 pub(crate) use sequences::normalize_sequence_name;

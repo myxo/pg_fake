@@ -319,7 +319,7 @@ fn validate_set_operation_types(
 }
 
 #[cfg_attr(feature = "execution-log", tracing::instrument(skip_all))]
-pub(super) fn resolve_set_columns(
+pub(in crate::executor) fn resolve_set_columns(
     left: &[ColumnMeta],
     right: &[ColumnMeta],
 ) -> Result<Vec<ColumnMeta>> {
@@ -374,7 +374,7 @@ fn resolve_set_columns_with_unknown(
 }
 
 #[cfg_attr(feature = "execution-log", tracing::instrument(skip_all))]
-pub(super) fn coerce_set_rows(
+pub(in crate::executor) fn coerce_set_rows(
     rows: Vec<Vec<Value>>,
     source: &[ColumnMeta],
     target: &[ColumnMeta],
@@ -426,7 +426,7 @@ fn coerce_set_rows_with_unknown(
 }
 
 #[cfg_attr(feature = "execution-log", tracing::instrument(skip_all))]
-pub(super) fn remove_set_duplicates(rows: Vec<Vec<Value>>) -> Result<Vec<Vec<Value>>> {
+pub(in crate::executor) fn remove_set_duplicates(rows: Vec<Vec<Value>>) -> Result<Vec<Vec<Value>>> {
     let mut selected: Vec<Vec<Value>> = Vec::new();
     for row in rows {
         let mut duplicate = false;
@@ -488,7 +488,7 @@ fn select_set_difference(left: Vec<Vec<Value>>, right: Vec<Vec<Value>>) -> Resul
 }
 
 #[cfg_attr(feature = "execution-log", tracing::instrument(skip_all))]
-pub(super) fn sort_set_rows(
+pub(in crate::executor) fn sort_set_rows(
     rows: &mut [Vec<Value>],
     columns: &[ColumnMeta],
     query: &ast::Query,
