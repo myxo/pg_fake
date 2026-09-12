@@ -9,11 +9,11 @@ use crate::{
     },
     coercion::{self, CastContext},
     error::{PgError, Result, SqlState, reject_unsupported},
-    storage::{RowId, Table},
-    txn::{RowLockKey, RowLockMode, Snapshot, TransactionStatus, Xid, find_visible_version},
+    storage::RowId,
+    txn::{Snapshot, Xid, find_visible_version},
     value::{BaseType, DAYS_PER_MONTH, MICROSECONDS_PER_DAY, PgType, Value},
 };
-use sqlparser::ast::{self, Spanned as _};
+use sqlparser::ast;
 use std::{
     cmp::Ordering,
     collections::{BTreeMap, BTreeSet},
@@ -64,10 +64,10 @@ use aggregates::{
 use arithmetic::{
     evaluate_boolean_operator, evaluate_numeric_operator, evaluate_temporal_arithmetic,
 };
-use column_defaults::{evaluate_column_default, is_default_expression, validate_column_default};
+use column_defaults::{evaluate_column_default, validate_column_default};
 use expressions::{
     compare_values, evaluate, evaluate_and_coerce, evaluate_assignment_expression,
-    evaluate_comparison, resolve_operator_type, validate_equality_type, validate_ordering_type,
+    evaluate_comparison, validate_equality_type, validate_ordering_type,
 };
 pub(crate) use expressions::{
     create_constant_expression_schema, extract_unknown_string_literal, infer_expression_type,
@@ -75,13 +75,14 @@ pub(crate) use expressions::{
 };
 pub(crate) use foreign_keys::{contains_deferred_foreign_keys, validate_deferred_foreign_keys};
 use foreign_keys::{
-    convert_referential_action, resolve_foreign_key_column_indexes, resolve_foreign_key_name,
-    validate_foreign_key_definitions, validate_row_foreign_keys,
+    convert_referential_action, resolve_foreign_key_name, validate_foreign_key_definitions,
+    validate_row_foreign_keys,
 };
 pub(crate) use indexes::evaluate_index_predicate;
 use indexes::{execute_alter_index, execute_create_index, execute_drop_indexes};
 pub(crate) use locks::{
-    collect_required_cte_row_locks, collect_required_row_locks, mutation_locks_cover_targets,
+    MutationCandidate, RequiredRowLock, collect_required_cte_row_locks, collect_required_row_locks,
+    mutation_locks_cover_targets,
 };
 use row_constraints::{
     validate_check_constraint_types, validate_check_constraints, validate_not_null,
@@ -115,18 +116,6 @@ use table_ddl::{
 };
 use views::{execute_comment_on_view, execute_create_view, execute_drop_views};
 use writes::{execute_delete, execute_insert, execute_update};
-
-#[derive(Clone)]
-pub(crate) struct RequiredRowLock {
-    pub(crate) key: RowLockKey,
-    pub(crate) mode: RowLockMode,
-    pub(crate) mutation_candidate: Option<MutationCandidate>,
-}
-#[derive(Clone)]
-pub(crate) struct MutationCandidate {
-    pub(crate) version_xmin: Xid,
-    pub(crate) row: Option<Vec<Value>>,
-}
 
 pub(crate) use ctes::{expand_ctes_for_analysis, materialize_statement_ctes};
 pub(crate) use procedural::substitute_procedural_references;

@@ -268,10 +268,23 @@ required by the isolation level.
 - [`foreign_keys.rs`](../crates/pg_fake/src/session/locking/foreign_keys.rs)
   follows foreign-key checks and cascading mutations to related tables.
 
-[`executor/locks.rs`](../crates/pg_fake/src/executor/locks.rs) discovers the actual
-rows an operation must lock. [`txn.rs`](../crates/pg_fake/src/txn.rs) owns lock
-compatibility, queues, the wait-for graph, transaction status, and visibility.
-These separate the SQL requirements, blocking execution, and lock bookkeeping.
+[`executor/locks/mod.rs`](../crates/pg_fake/src/executor/locks/mod.rs) discovers
+rows to lock, retains mutation candidates, and checks concurrent row changes.
+
+- [`ctes.rs`](../crates/pg_fake/src/executor/locks/ctes.rs) discovers locks for
+  reachable CTEs while preserving pending mutation and row-lock recheck state.
+- [`insert.rs`](../crates/pg_fake/src/executor/locks/insert.rs) discovers conflict
+  rows and locks required by prepared trigger results, with conservative fallbacks
+  when evaluating insert sources early would change behavior.
+- [`foreign_keys.rs`](../crates/pg_fake/src/executor/locks/foreign_keys.rs) finds
+  referenced rows that need share locks for inserted or updated values.
+
+Unique point-lookup recognition lives with scans in
+[`executor/from/scans.rs`](../crates/pg_fake/src/executor/from/scans.rs), shared by
+lock discovery and mutation targeting.
+[`txn.rs`](../crates/pg_fake/src/txn.rs) owns lock compatibility, queues, the
+wait-for graph, transaction status, and visibility. These separate the SQL
+requirements, blocking execution, and lock bookkeeping.
 
 ## Catalog objects and visibility
 

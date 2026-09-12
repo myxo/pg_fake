@@ -1,4 +1,5 @@
 use crate::{
+    catalog::TableSchema,
     coercion::CastContext,
     error::{Result, reject_unsupported},
     executor::{
@@ -7,6 +8,7 @@ use crate::{
         normalize_relation_name,
         scope::{BoundScope, RowScope},
     },
+    storage::Table,
     txn::{Snapshot, Xid, find_visible_version},
     value::Value,
 };
@@ -231,4 +233,55 @@ fn is_point_lookup_value(expr: &ast::Expr) -> bool {
                 ..
             } if matches!(expr.as_ref(), ast::Expr::Value(_))
         )
+}
+
+#[cfg_attr(feature = "execution-log", tracing::instrument(skip_all))]
+pub(in crate::executor) fn resolve_unique_point_lookup(
+    table: &Table,
+    schema: &TableSchema,
+    selection: Option<&ast::Expr>,
+    scope: RowScope<'_>,
+    context: &StatementContext,
+) -> Result<Option<(usize, Value)>> {
+    let Some(ast::Expr::BinaryOp {
+        left,
+        op: ast::BinaryOperator::Eq,
+        right,
+    }) = selection
+    else {
+        return Ok(None);
+    };
+    let (column, value) = match (left.as_ref(), right.as_ref()) {
+        (ast::Expr::Identifier(column), value) if is_point_lookup_value(value) => {
+            (std::slice::from_ref(column), value)
+        }
+        (value, ast::Expr::Identifier(column)) if is_point_lookup_value(value) => {
+            (std::slice::from_ref(column), value)
+        }
+        (ast::Expr::CompoundIdentifier(column), value) if is_point_lookup_value(value) => {
+            (column.as_slice(), value)
+        }
+        (value, ast::Expr::CompoundIdentifier(column)) if is_point_lookup_value(value) => {
+            (column.as_slice(), value)
+        }
+        _ => return Ok(None),
+    };
+    let Ok((column, _)) = scope.resolve_column(column) else {
+        return Ok(None);
+    };
+    if column >= schema.columns.len()
+        || !table.has_unique_index(&[column])
+        || resolve_operator_type(left, right, scope)? != schema.columns[column].data_type.base
+    {
+        return Ok(None);
+    }
+    let value = evaluate_and_coerce(
+        value,
+        schema.columns[column].data_type.base,
+        CastContext::Implicit,
+        scope,
+        &[],
+        context,
+    )?;
+    Ok(Some((column, value)))
 }
