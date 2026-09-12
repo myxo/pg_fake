@@ -1,4 +1,3 @@
-
 use std::{sync::mpsc, thread};
 
 use crate::storage::Table;
@@ -8,7 +7,9 @@ use crate::{
     value::BaseType,
 };
 
-use super::*;
+use crate::executor::DatabaseState;
+
+use super::{catalog_dependencies::CatalogDependency, prepared::can_cache_read_locks, *};
 
 #[cfg_attr(feature = "execution-log", tracing::instrument(skip_all))]
 fn wait_until_blocked(db: &Db) {
@@ -3515,9 +3516,10 @@ fn prepared_subqueries_ddl_sequences_and_constraints_keep_catalog_dependencies()
         .prepare("INSERT INTO items VALUES (1) ON CONFLICT ON CONSTRAINT items_pkey DO NOTHING")
         .unwrap();
     assert!(
-        conflict.catalog_dependencies.iter().any(|dependency| {
-            matches!(dependency, PreparedCatalogDependency::Constraint { .. })
-        })
+        conflict
+            .catalog_dependencies
+            .iter()
+            .any(|dependency| { matches!(dependency, CatalogDependency::Constraint { .. }) })
     );
 
     session.execute("DROP TABLE permissions").unwrap();

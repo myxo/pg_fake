@@ -5244,12 +5244,12 @@ fn resolve_distinct_plan<'a>(
     }
 }
 
-#[cfg_attr(feature = "execution-log", tracing::instrument(skip_all))]
 struct PrimaryKeyGrouping {
     constraint_id: ConstraintId,
     columns: Vec<(usize, PgType)>,
 }
 
+#[cfg_attr(feature = "execution-log", tracing::instrument(skip_all))]
 fn collect_grouped_primary_keys(
     state: &DatabaseState,
     scope: &BoundScope,

@@ -20,6 +20,9 @@ would be a win.
 > [!WARNING]
 > This is Work In Progres library
 
+See the [source map](docs/source_map.md) for module responsibilities and the
+path a statement takes through the engine.
+
 ## Usage
 
 TODO
