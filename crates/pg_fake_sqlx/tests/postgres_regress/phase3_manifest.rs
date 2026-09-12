@@ -704,6 +704,24 @@ pub const FEATURES: &[Feature] = &[
 
 pub const SCENARIOS: &[Scenario] = &[
     Scenario {
+        feature: "transactional migration chain",
+        name: "schema_evolution",
+        source: "tests/migrations/schema_evolution",
+        blocker: BlockerKind::Implementation,
+    },
+    Scenario {
+        feature: "transactional migration chain",
+        name: "procedural_triggers",
+        source: "tests/migrations/procedural_triggers",
+        blocker: BlockerKind::Implementation,
+    },
+    Scenario {
+        feature: "transactional migration chain",
+        name: "data_reconciliation",
+        source: "tests/migrations/data_reconciliation",
+        blocker: BlockerKind::Implementation,
+    },
+    Scenario {
         feature: "ON CONFLICT DO NOTHING",
         name: "concurrent_unique_insert",
         source: "focused two-session scenario",

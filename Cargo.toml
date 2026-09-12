@@ -7,4 +7,4 @@ edition = "2024"
 license = "MIT"
 
 [patch.crates-io]
-sqlparser = { path = "/Users/myxo/projects/datafusion-sqlparser-rs" }
+sqlparser = { git = "https://github.com/myxo/datafusion-sqlparser-rs", rev = "0e1c6c73f68fcb2be15d49d3b4844147abf38af3" }

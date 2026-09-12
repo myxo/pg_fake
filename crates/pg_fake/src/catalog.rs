@@ -1077,6 +1077,14 @@ impl Catalog {
             .map(Arc::as_ref)
     }
 
+    pub(crate) fn iterate_functions(&self) -> impl Iterator<Item = &FunctionSchema> {
+        self.relations
+            .schemas
+            .values()
+            .flat_map(|schema| schema.functions.values())
+            .map(Arc::as_ref)
+    }
+
     pub(crate) fn iterate_views_mut(&mut self) -> impl Iterator<Item = &mut ViewSchema> {
         Arc::make_mut(&mut self.relations)
             .schemas

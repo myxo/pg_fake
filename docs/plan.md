@@ -881,7 +881,7 @@ Task 21.
 - [x] Run formatting, workspace tests, benchmarks, the exact 10,000-iteration
   property gate, and repeated subagent review until clean.
 
-### Task 20 — Transactional migration-chain gate
+### Task 20 — Transactional migration-chain gate [COMPLETE]
 
 **Goal:** Prove that the required migration forms compose into realistic,
 transactional SQLx migration sequences.
@@ -942,6 +942,46 @@ keys/directions, included columns, and predicate; sequence ownership/value;
 view output metadata and definition behavior; function/trigger signature,
 timing/events, dependencies, and side effects. Compare seeded table contents as
 ordered typed rows, plus affected-row counts, SQLSTATE, and transaction outcome.
+
+**Progress:**
+
+- [x] Add the `schema_evolution`, `procedural_triggers`, and
+  `data_reconciliation` checked-in migration scenarios and a coverage table for
+  every required migration form.
+- [x] Implement SQLx's migration connection interface for `PgFakeConnection`,
+  including transactional application, bookkeeping, reapplication checks,
+  revert, and skip behavior. Keep outer migrator locking explicitly disabled in
+  this gate until Task 24 provides advisory locks.
+- [x] Apply every scenario version unchanged to PostgreSQL 18 and `pg_fake`,
+  comparing rows, SQLx result metadata, migration metadata, and OID-free semantic
+  catalog snapshots (columns/defaults/typmods, constraints, indexes, sequences,
+  views/comments/dependencies, functions, and triggers) after each boundary.
+- [x] Cover non-empty backfills, trigger propagation, matched, unmatched, and
+  ambiguous reconciliation rows, JSONB string/numeric/null/missing paths,
+  formatted procedural errors and hints, foreign-key validation failure, table
+  lock timeout, failed-version rollback, repair/retry, typed parameter/result
+  encoding, revert/skip, and state-preserving no-op reapplication.
+- [x] Add a representative transactional migration-chain benchmark. A short
+  10-sample run of reversible SQLx apply/undo cycles measured approximately 730
+  microseconds for `pg_fake` and 5.42 milliseconds for PostgreSQL 18; timing
+  completed despite the existing Gnuplot chart-generation errors.
+- [x] Run formatting, the focused migration suite, all non-generated workspace
+  tests, and the exact 10,000-iteration/600-second property gate. The property
+  gate passed all 13 tests in 607.96 seconds; the expanded focused suite passes
+  all 12 tests. Repeated subagent review is clean, the post-review non-generated
+  workspace suite passes, and Clippy reports only the existing 79 core warnings.
+
+The portable parser pin targets commit
+`0e1c6c73f68fcb2be15d49d3b4844147abf38af3`, which contains the procedural
+parser support used by these scenarios. The published revision and its derive
+crate are resolved from the configured origin and recorded in `Cargo.lock`, so
+the workspace builds without a local path override.
+
+Task 20 adds fixed, ordered integration scenarios rather than a new generated
+SQL family, so it does not add another property generator. The feature
+components composed by the scenarios retain their existing generated
+differential coverage, while the new migration boundaries are covered by
+focused PostgreSQL 18 differential tests.
 
 ---
 

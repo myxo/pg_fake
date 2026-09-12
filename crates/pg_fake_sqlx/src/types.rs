@@ -54,7 +54,7 @@ impl TypeInfo for PgFakeTypeInfo {
             Some(BaseType::Numeric) => "NUMERIC",
             Some(BaseType::Text) => "TEXT",
             Some(BaseType::Varchar) => "VARCHAR",
-            Some(BaseType::Bpchar) => "BPCHAR",
+            Some(BaseType::Bpchar) => "CHAR",
             Some(BaseType::Bytea) => "BYTEA",
             Some(BaseType::Uuid) => "UUID",
             Some(BaseType::Date) => "DATE",

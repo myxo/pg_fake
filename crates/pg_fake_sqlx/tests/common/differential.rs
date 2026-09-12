@@ -14,8 +14,8 @@ use tokio::runtime::Runtime;
 #[cfg(test)]
 use super::common;
 
-#[derive(Debug, PartialEq, Eq)]
-enum Outcome {
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(super) enum Outcome {
     Affected(u64),
     Rows(Vec<Vec<Option<String>>>),
     Error(String),
@@ -110,6 +110,33 @@ impl TestConnection<'_> {
             )),
         }
     }
+}
+
+fn parse_single_statement(sql: &str) -> Statement {
+    let mut statements =
+        parser::parse(sql).unwrap_or_else(|error| panic!("SQL must parse: {sql}\n{error}"));
+    assert_eq!(statements.len(), 1, "operation must be one statement");
+    statements.pop().expect("statement count was checked")
+}
+
+#[allow(dead_code)]
+pub(super) fn postgres_statement_outcome(
+    runtime: &Runtime,
+    connection: &mut PgConnection,
+    sql: &str,
+) -> Outcome {
+    let statement = parse_single_statement(sql);
+    TestConnection::Postgres(connection).execute(runtime, &statement, sql)
+}
+
+#[allow(dead_code)]
+pub(super) fn fake_statement_outcome(
+    runtime: &Runtime,
+    connection: &mut PgFakeConnection,
+    sql: &str,
+) -> Outcome {
+    let statement = parse_single_statement(sql);
+    TestConnection::Fake(connection).execute(runtime, &statement, sql)
 }
 
 async fn execute_sqlx<DB>(
@@ -208,10 +235,7 @@ fn assert_statement_outcome(
     row_order: RowOrder,
     allow_error: bool,
 ) {
-    let mut statements =
-        parser::parse(sql).unwrap_or_else(|error| panic!("SQL must parse: {sql}\n{error}"));
-    assert_eq!(statements.len(), 1, "operation must be one statement");
-    let statement = statements.pop().expect("statement count was checked");
+    let statement = parse_single_statement(sql);
     let [expected, actual] = [
         TestConnection::Postgres(postgres),
         TestConnection::Fake(fake),

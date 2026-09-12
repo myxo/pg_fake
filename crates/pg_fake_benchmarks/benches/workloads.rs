@@ -1,4 +1,5 @@
 use std::{
+    borrow::Cow,
     env,
     path::PathBuf,
     time::{Duration, Instant},
@@ -11,7 +12,8 @@ use pg_fake::{
 };
 use pg_fake_benchmarks as benchmarks;
 use pg_fake_sqlx::{Db, PgFakeConnection};
-use sqlx::{AssertSqlSafe, Connection};
+use sqlx::{AssertSqlSafe, Connection, SqlSafeStr};
+use sqlx_core::migrate::{Migration, MigrationType, Migrator};
 use sqlx_postgres::PgConnection;
 use testcontainers::{Container, ImageExt, runners::SyncRunner};
 use testcontainers_modules::postgres::Postgres;
@@ -38,6 +40,23 @@ impl BenchmarkConnection<'_> {
                     .block_on(sqlx::query(AssertSqlSafe(sql)).execute(&mut **connection))
                     .unwrap();
                 black_box(result);
+            }
+        }
+    }
+
+    fn run_migration_cycle(&mut self, runtime: &Runtime, migrator: &Migrator) {
+        match self {
+            Self::PgFake(connection) => {
+                runtime.block_on(migrator.run(&mut **connection)).unwrap();
+                runtime
+                    .block_on(migrator.undo(&mut **connection, 0))
+                    .unwrap();
+            }
+            Self::Postgres(connection) => {
+                runtime.block_on(migrator.run(&mut **connection)).unwrap();
+                runtime
+                    .block_on(migrator.undo(&mut **connection, 0))
+                    .unwrap();
             }
         }
     }
@@ -264,6 +283,84 @@ fn migration_table_lock_benchmark(
             "DROP TABLE migration_lock_first, migration_lock_second",
         );
     }
+}
+
+fn benchmark_sqlx_migration_chain(
+    criterion: &mut Criterion,
+    runtime: &Runtime,
+    connections: &mut [NamedBenchmarkConnection<'_>],
+) {
+    let first_up = "CREATE SEQUENCE migration_chain_number_seq; \
+        CREATE TABLE migration_chain_accounts (id UUID PRIMARY KEY, name TEXT NOT NULL); \
+        CREATE TABLE migration_chain_entries (id UUID PRIMARY KEY, account_id UUID, position INTEGER); \
+        INSERT INTO migration_chain_accounts VALUES \
+            ('00000000-0000-0000-0000-000000000001', 'account'); \
+        INSERT INTO migration_chain_entries VALUES \
+            ('10000000-0000-0000-0000-000000000001', \
+             '00000000-0000-0000-0000-000000000001', 1), \
+            ('10000000-0000-0000-0000-000000000002', \
+             '00000000-0000-0000-0000-000000000001', 2)";
+    let second_up = "ALTER TABLE migration_chain_entries ADD COLUMN number BIGINT; \
+        WITH numbered AS MATERIALIZED ( \
+            SELECT id, row_number() OVER (ORDER BY id) AS number \
+            FROM migration_chain_entries \
+        ) UPDATE migration_chain_entries AS target SET number = numbered.number \
+          FROM numbered WHERE target.id = numbered.id; \
+        SELECT setval('migration_chain_number_seq', \
+            (SELECT max(number) FROM migration_chain_entries)); \
+        ALTER TABLE migration_chain_entries \
+            ADD CONSTRAINT migration_chain_account_fk \
+            FOREIGN KEY (account_id) REFERENCES migration_chain_accounts(id) NOT VALID; \
+        ALTER TABLE migration_chain_entries \
+            VALIDATE CONSTRAINT migration_chain_account_fk; \
+        CREATE UNIQUE INDEX migration_chain_number_idx \
+            ON migration_chain_entries (number) INCLUDE (position) WHERE number IS NOT NULL; \
+        CREATE VIEW migration_chain_view AS \
+            SELECT id, number FROM migration_chain_entries WHERE number IS NOT NULL; \
+        COMMENT ON VIEW migration_chain_view IS 'migration benchmark'";
+    let mut migrator = Migrator::with_migrations(vec![
+        Migration::new(
+            1,
+            Cow::Borrowed("create migration benchmark schema"),
+            MigrationType::ReversibleUp,
+            first_up.into_sql_str(),
+            false,
+        ),
+        Migration::new(
+            1,
+            Cow::Borrowed("create migration benchmark schema"),
+            MigrationType::ReversibleDown,
+            "DROP TABLE migration_chain_entries, migration_chain_accounts; \
+             DROP SEQUENCE migration_chain_number_seq"
+                .into_sql_str(),
+            false,
+        ),
+        Migration::new(
+            2,
+            Cow::Borrowed("evolve migration benchmark schema"),
+            MigrationType::ReversibleUp,
+            second_up.into_sql_str(),
+            false,
+        ),
+        Migration::new(
+            2,
+            Cow::Borrowed("evolve migration benchmark schema"),
+            MigrationType::ReversibleDown,
+            "DROP VIEW migration_chain_view".into_sql_str(),
+            false,
+        ),
+    ]);
+    migrator.set_locking(false);
+    let mut group =
+        criterion.benchmark_group(benchmarks::find_benchmark("sqlx_migration_chain").name);
+    for (name, connection) in connections.iter_mut() {
+        group.bench_function(*name, |benchmark| {
+            benchmark.iter(|| {
+                connection.run_migration_cycle(runtime, &migrator);
+            });
+        });
+    }
+    group.finish();
 }
 
 fn alter_table_benchmark(
@@ -1459,6 +1556,7 @@ fn benchmarks(criterion: &mut Criterion) {
         create_table_benchmark(criterion, &runtime, &mut connections);
         transactional_ddl_benchmark(criterion, &runtime, &mut connections);
         migration_table_lock_benchmark(criterion, &runtime, &mut connections);
+        benchmark_sqlx_migration_chain(criterion, &runtime, &mut connections);
         procedural_trigger_benchmark(criterion, &runtime, &mut connections);
         alter_table_benchmark(criterion, &runtime, &mut connections);
         partial_unique_index_benchmark(criterion, &runtime, &mut connections);
