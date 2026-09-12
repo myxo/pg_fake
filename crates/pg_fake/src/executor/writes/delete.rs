@@ -78,33 +78,35 @@ pub(in crate::executor) fn execute_delete(
     let has_referencing_foreign_keys = state.catalog.has_referencing_foreign_keys(schema.id);
     let prepared_targets =
         context.take_prepared_mutation_targets(delete.span(), snapshot.commit_seq);
-    if using.is_empty() && returning.is_none() && !has_referencing_foreign_keys {
-        if let Some(mutation_targets) = mutation_targets.take() {
-            let targets = mutation_targets
-                .into_iter()
-                .filter(|required| required.key.table_id == schema.id)
-                .collect::<Vec<_>>();
-            let affected = targets.len() as u64;
-            for required in targets {
-                let candidate = required
-                    .mutation_candidate
-                    .expect("mutation target locks retain their selected version");
-                state
-                    .tables
-                    .get_mut(&schema.id)
-                    .expect("catalog table must have storage")
-                    .mark_version_deleted(
-                        required.key.row_id,
-                        candidate.version_xmin,
-                        xid,
-                        context.command_id,
-                    );
-            }
-            if affected != 0 {
-                state.mark_table_touched(xid, schema.id);
-            }
-            return Ok(StatementResult::Affected(affected));
+    if using.is_empty()
+        && returning.is_none()
+        && !has_referencing_foreign_keys
+        && let Some(mutation_targets) = mutation_targets.take()
+    {
+        let targets = mutation_targets
+            .into_iter()
+            .filter(|required| required.key.table_id == schema.id)
+            .collect::<Vec<_>>();
+        let affected = targets.len() as u64;
+        for required in targets {
+            let candidate = required
+                .mutation_candidate
+                .expect("mutation target locks retain their selected version");
+            state
+                .tables
+                .get_mut(&schema.id)
+                .expect("catalog table must have storage")
+                .mark_version_deleted(
+                    required.key.row_id,
+                    candidate.version_xmin,
+                    xid,
+                    context.command_id,
+                );
         }
+        if affected != 0 {
+            state.mark_table_touched(xid, schema.id);
+        }
+        return Ok(StatementResult::Affected(affected));
     }
     let source_rows = materialize_mutation_source_rows(
         state,

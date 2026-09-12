@@ -112,7 +112,8 @@ impl Table {
                 schema
                     .indexes
                     .iter()
-                    .filter_map(|index| index.unique.then(|| create_unique_index(&schema, index))),
+                    .filter(|&index| index.unique)
+                    .map(|index| create_unique_index(&schema, index)),
             )
             .collect();
         Table {
@@ -162,11 +163,13 @@ impl Table {
                 }
                 Constraint::Check { .. } | Constraint::ForeignKey(_) => None,
             })
-            .chain(self.schema.indexes.iter().filter_map(|index| {
-                index
-                    .unique
-                    .then(|| create_unique_index(&self.schema, index))
-            }))
+            .chain(
+                self.schema
+                    .indexes
+                    .iter()
+                    .filter(|&index| index.unique)
+                    .map(|index| create_unique_index(&self.schema, index)),
+            )
             .collect();
         self.rebuild_indexes();
     }

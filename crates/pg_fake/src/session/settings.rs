@@ -239,7 +239,7 @@ fn parse_timeout(expression: &ast::Expr, parameter: &str) -> Result<Duration> {
     };
     let digit_count = digits
         .bytes()
-        .take_while(|digit| char::from(*digit).to_digit(radix).is_some())
+        .take_while(|digit| char::from(*digit).is_digit(radix))
         .count();
     let retry_as_float = radix != 16
         && digits

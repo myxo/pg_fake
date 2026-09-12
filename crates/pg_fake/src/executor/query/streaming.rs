@@ -37,6 +37,8 @@ use sqlparser::ast;
 
 const STREAM_ROW_LIMIT_REACHED: &str = "pg_fake stream row limit reached";
 
+type RowConsumer<'a> = dyn FnMut(Vec<Value>, &[ColumnMeta]) -> Result<()> + 'a;
+
 #[derive(Clone)]
 pub(in crate::executor) struct GroupedStreamRow {
     values: Vec<Value>,
@@ -65,8 +67,8 @@ pub(in crate::executor) enum QueryStreamState {
     },
     UnionAll {
         query: ast::Query,
-        left: ast::Query,
-        right: ast::Query,
+        left: Box<ast::Query>,
+        right: Box<ast::Query>,
         left_state: Option<Box<QueryStreamState>>,
         right_state: Option<Box<QueryStreamState>>,
         reads_right: bool,
@@ -89,7 +91,7 @@ pub(in crate::executor) fn stream_query_rows(
     context: &StatementContext,
     maximum_rows: Option<usize>,
     prepared: &mut Option<QueryStreamState>,
-    consume: &mut dyn FnMut(Vec<Value>, &[ColumnMeta]) -> Result<()>,
+    consume: &mut RowConsumer<'_>,
 ) -> Result<Option<Vec<ColumnMeta>>> {
     if matches!(prepared, Some(QueryStreamState::Materialized { .. })) {
         return Ok(None);
@@ -167,8 +169,8 @@ pub(in crate::executor) fn stream_query_rows(
             )?;
             *prepared = Some(QueryStreamState::UnionAll {
                 query: query.clone(),
-                left: create_set_operand_query(query, left),
-                right: create_set_operand_query(query, right),
+                left: Box::new(create_set_operand_query(query, left)),
+                right: Box::new(create_set_operand_query(query, right)),
                 left_state: None,
                 right_state: None,
                 reads_right: false,
@@ -280,10 +282,7 @@ pub(in crate::executor) fn stream_query_rows(
                 continue;
             }
             *operand_state = nested.map(Box::new);
-            let result = match result {
-                Err(error) => return Err(error),
-                Ok(result) => result,
-            };
+            let result = result?;
             if limit.is_some_and(|limit| *produced >= offset.saturating_add(limit))
                 || maximum_rows.is_some_and(|maximum| emitted >= maximum)
             {
@@ -468,7 +467,7 @@ pub(in crate::executor) fn stream_query_rows(
             unreachable!("grouped query has grouped stream state")
         };
         let mut emitted = 0;
-        while *next < rows.len() && !maximum_rows.is_some_and(|maximum| emitted >= maximum) {
+        while *next < rows.len() && maximum_rows.is_none_or(|maximum| emitted < maximum) {
             let index = *next;
             let row = &mut rows[index];
             for projection_index in 0..projections.len() {
@@ -574,7 +573,7 @@ pub(in crate::executor) fn stream_query_rows(
             unreachable!("ordered query has ordered stream state")
         };
         let mut emitted = 0;
-        while *next < rows.len() && !maximum_rows.is_some_and(|maximum| emitted >= maximum) {
+        while *next < rows.len() && maximum_rows.is_none_or(|maximum| emitted < maximum) {
             let index = *next;
             let row = &mut rows[index];
             let source = row
@@ -588,7 +587,7 @@ pub(in crate::executor) fn stream_query_rows(
             for (index, projection) in projections.iter().enumerate() {
                 if !evaluated[index] {
                     row.values[index] = evaluate_projection_value(
-                        state, projection, &scope, &source, None, xid, snapshot, context,
+                        state, projection, &scope, source, None, xid, snapshot, context,
                     )?;
                     evaluated[index] = true;
                 }
@@ -673,10 +672,10 @@ pub(in crate::executor) fn stream_query_rows(
         },
     );
     *visited = next_visited;
-    if let Err(error) = result {
-        if error.sqlstate != SqlState::InternalError || error.message != STREAM_ROW_LIMIT_REACHED {
-            return Err(error);
-        }
+    if let Err(error) = result
+        && (error.sqlstate != SqlState::InternalError || error.message != STREAM_ROW_LIMIT_REACHED)
+    {
+        return Err(error);
     }
     Ok(Some(columns))
 }

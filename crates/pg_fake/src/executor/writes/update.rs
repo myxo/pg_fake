@@ -410,7 +410,7 @@ pub(in crate::executor) fn prepare_update_rows(
             } else if let Some(prepared) = &assignment.prepared {
                 prepared::evaluate_prepared_expression(
                     prepared,
-                    &assignment_row,
+                    assignment_row,
                     &[],
                     context.deadline,
                 )?
@@ -420,7 +420,7 @@ pub(in crate::executor) fn prepare_update_rows(
                     assignment.expression,
                     schema.columns[assignment.index].data_type,
                     &scope,
-                    &assignment_row,
+                    assignment_row,
                     xid,
                     snapshot,
                     context,

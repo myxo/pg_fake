@@ -39,7 +39,7 @@ pub(in crate::executor) enum ConflictArbiter {
     Any,
     Index {
         columns: Vec<usize>,
-        predicate: Option<ast::Expr>,
+        predicate: Option<Box<ast::Expr>>,
     },
 }
 
@@ -54,7 +54,7 @@ impl ConflictArbiter {
     pub(super) fn get_predicate(&self) -> Option<&ast::Expr> {
         match self {
             ConflictArbiter::Any => None,
-            ConflictArbiter::Index { predicate, .. } => predicate.as_ref(),
+            ConflictArbiter::Index { predicate, .. } => predicate.as_deref(),
         }
     }
 }
@@ -210,7 +210,10 @@ pub(in crate::executor) fn resolve_conflict_arbiter(
         }
     };
     constraint_columns
-        .map(|(columns, predicate)| ConflictArbiter::Index { columns, predicate })
+        .map(|(columns, predicate)| ConflictArbiter::Index {
+            columns,
+            predicate: predicate.map(Box::new),
+        })
         .map(Some)
         .ok_or_else(|| {
             PgError::create(

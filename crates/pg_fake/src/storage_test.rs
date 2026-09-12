@@ -1,4 +1,3 @@
-
 use crate::{
     catalog::{Catalog, ColumnDef},
     value::{BaseType, PgType},

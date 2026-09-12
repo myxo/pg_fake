@@ -96,7 +96,7 @@ impl ast::VisitorMut for DerivedCteMaterializer<'_> {
             return std::ops::ControlFlow::Continue(());
         }
         match materialize_query_ctes(self.state, subquery, self.xid, self.snapshot, self.context) {
-            Ok(materialized) => *subquery = Box::new(materialized),
+            Ok(materialized) => **subquery = materialized,
             Err(error) => {
                 self.error = Some(error);
                 return std::ops::ControlFlow::Break(());

@@ -68,9 +68,9 @@ pub(super) fn evaluate_insert_rows(
             ));
         }
         let mut row = vec![Value::Null; schema.columns.len()];
-        for index in 0..schema.columns.len() {
+        for (index, value) in row.iter_mut().enumerate() {
             if !provided.contains(&index) {
-                row[index] = evaluate_default(index)?;
+                *value = evaluate_default(index)?;
             }
         }
         let constants = create_constant_expression_schema();
@@ -183,10 +183,11 @@ pub(super) fn evaluate_insert_rows(
         Table::create(schema.clone())
     };
     let mut affected_rows = BTreeSet::new();
-    for (prior_insert, prepared) in stop_at_blocking_conflict
-        .then(|| context.get_prior_prepared_inserts(insert))
-        .unwrap_or_default()
-    {
+    for (prior_insert, prepared) in if stop_at_blocking_conflict {
+        context.get_prior_prepared_inserts(insert)
+    } else {
+        Default::default()
+    } {
         let prior_schema = state
             .catalog
             .require_named_table(&resolve_insert_table_name(&prior_insert.table)?)?;
@@ -594,7 +595,7 @@ pub(super) fn evaluate_insert_rows(
                     streamed_source_rows.push(cached.clone());
                     return Ok(PreparedInsert {
                         source_state: Some(source_state.clone()),
-                        source_snapshot: Some(source_snapshot.clone()),
+                        source_snapshot: Some(*source_snapshot),
                         source_query,
                         source_rows: streamed_source_rows,
                         rows: streamed_rows,
@@ -609,7 +610,7 @@ pub(super) fn evaluate_insert_rows(
             if stopped.get() {
                 return Ok(PreparedInsert {
                     source_state: Some(source_state.clone()),
-                    source_snapshot: Some(source_snapshot.clone()),
+                    source_snapshot: Some(*source_snapshot),
                     source_query,
                     source_rows: streamed_source_rows,
                     rows: streamed_rows,
@@ -641,9 +642,9 @@ pub(super) fn evaluate_insert_rows(
                 Some(row) => Ok(row.clone()),
                 None => (|| {
                     let mut row = vec![Value::Null; schema.columns.len()];
-                    for index in 0..schema.columns.len() {
+                    for (index, value) in row.iter_mut().enumerate() {
                         if !provided.contains(&index) {
-                            row[index] = evaluate_default(index)?;
+                            *value = evaluate_default(index)?;
                         }
                     }
                     for (((value, source_column), unknown), index) in values
@@ -710,7 +711,7 @@ pub(super) fn evaluate_insert_rows(
         Err(_) if stopped.get() => {
             return Ok(PreparedInsert {
                 source_state: Some(source_state.clone()),
-                source_snapshot: Some(source_snapshot.clone()),
+                source_snapshot: Some(*source_snapshot),
                 source_query,
                 source_rows: streamed_source_rows,
                 rows: streamed_rows,
@@ -724,7 +725,7 @@ pub(super) fn evaluate_insert_rows(
             return match streamed_error {
                 Some(error) => Ok(PreparedInsert {
                     source_state: Some(source_state.clone()),
-                    source_snapshot: Some(source_snapshot.clone()),
+                    source_snapshot: Some(*source_snapshot),
                     source_query,
                     source_rows: streamed_source_rows,
                     rows: streamed_rows,
@@ -745,7 +746,7 @@ pub(super) fn evaluate_insert_rows(
             }
             return Ok(PreparedInsert {
                 source_state: Some(source_state.clone()),
-                source_snapshot: Some(source_snapshot.clone()),
+                source_snapshot: Some(*source_snapshot),
                 source_query,
                 source_rows: streamed_source_rows,
                 rows: streamed_rows,
@@ -770,9 +771,9 @@ pub(super) fn evaluate_insert_rows(
     for values in source.rows.iter().skip(streamed_source_rows.len()) {
         let evaluated = (|| -> Result<Option<Vec<Value>>> {
             let mut row = vec![Value::Null; schema.columns.len()];
-            for index in 0..schema.columns.len() {
+            for (index, value) in row.iter_mut().enumerate() {
                 if !provided.contains(&index) {
-                    row[index] = evaluate_default(index)?;
+                    *value = evaluate_default(index)?;
                 }
             }
             for (((value, source_column), unknown), index) in values
@@ -819,7 +820,7 @@ pub(super) fn evaluate_insert_rows(
                     streamed_source_rows.push(Some(row));
                     return Ok(PreparedInsert {
                         source_state: Some(source_state.clone()),
-                        source_snapshot: Some(source_snapshot.clone()),
+                        source_snapshot: Some(*source_snapshot),
                         source_query,
                         source_rows: streamed_source_rows,
                         rows: streamed_rows,
@@ -838,7 +839,7 @@ pub(super) fn evaluate_insert_rows(
             Err(error) => {
                 return Ok(PreparedInsert {
                     source_state: Some(source_state.clone()),
-                    source_snapshot: Some(source_snapshot.clone()),
+                    source_snapshot: Some(*source_snapshot),
                     source_query,
                     source_rows: streamed_source_rows,
                     rows: streamed_rows,
@@ -852,7 +853,7 @@ pub(super) fn evaluate_insert_rows(
     }
     Ok(PreparedInsert {
         source_state: Some(source_state),
-        source_snapshot: Some(source_snapshot.clone()),
+        source_snapshot: Some(*source_snapshot),
         source_query,
         source_rows: streamed_source_rows,
         rows: streamed_rows,
@@ -871,7 +872,7 @@ pub(in crate::executor) fn prepare_insert_rows(
     xid: Xid,
     snapshot: &Snapshot,
     context: &StatementContext,
-) -> Result<(Vec<Vec<Value>>, Vec<Option<PreparedConflictUpdate>>)> {
+) -> Result<PreparedInsert> {
     let returning_scope = bind_target_scope(
         schema,
         insert.table_alias.as_ref().map(|alias| &alias.alias),
@@ -904,5 +905,5 @@ pub(in crate::executor) fn prepare_insert_rows(
     } else if let Some(error) = prepared.error.clone() {
         return Err(error);
     }
-    Ok((prepared.rows, prepared.conflicts))
+    Ok(prepared)
 }

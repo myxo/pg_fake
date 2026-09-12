@@ -544,7 +544,7 @@ impl AggregateState {
                     Value::Float8(self.count as f64),
                 )?;
                 match average {
-                    Value::Float8(value) if value == 0.0 => Value::Float8(0.0),
+                    Value::Float8(0.0) => Value::Float8(0.0),
                     average => average,
                 }
             }

@@ -1,4 +1,3 @@
-
 use super::{
     BASELINE, collect_report, find_results_root, format_change, format_markdown, format_relative,
     has_complete_baseline,

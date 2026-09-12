@@ -221,7 +221,7 @@ pub(crate) fn rename_table_references(catalog: &mut Catalog, table_id: TableId, 
             cte_scopes: Vec::new(),
         };
         let _ = query.visit(&mut renamer);
-        view.query = Box::new(query);
+        *view.query = query;
     }
 }
 
@@ -258,7 +258,7 @@ pub(crate) fn rename_column_references(
         let _ = query.visit(&mut wrapper);
         assert!(columns.remove(old_name));
         columns.insert(new_name.to_owned());
-        view.query = Box::new(query);
+        *view.query = query;
     }
 }
 
@@ -291,6 +291,6 @@ pub(crate) fn preserve_column_drop_references(
             nested_join_depth: 0,
         };
         let _ = query.visit(&mut wrapper);
-        view.query = Box::new(query);
+        *view.query = query;
     }
 }

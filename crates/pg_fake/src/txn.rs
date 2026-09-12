@@ -315,16 +315,16 @@ impl RelationLockManager {
 
 impl RelationLockMode {
     fn conflicts_with(self, requested: Self) -> bool {
-        match (self, requested) {
-            (Self::Shared, Self::Exclusive)
-            | (Self::Exclusive, _)
-            | (_, Self::Exclusive)
-            | (Self::RowShare | Self::RowExclusive, Self::TableExclusive)
-            | (Self::TableExclusive, Self::RowShare | Self::RowExclusive | Self::TableExclusive) => {
-                true
-            }
-            _ => false,
-        }
+        matches!(
+            (self, requested),
+            (Self::Exclusive, _)
+                | (_, Self::Exclusive)
+                | (Self::RowShare | Self::RowExclusive, Self::TableExclusive)
+                | (
+                    Self::TableExclusive,
+                    Self::RowShare | Self::RowExclusive | Self::TableExclusive
+                )
+        )
     }
 }
 

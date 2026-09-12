@@ -1,4 +1,3 @@
-
 use super::*;
 use crate::txn::{CommandId, Snapshot, TransactionRegistry};
 use crate::value::{BaseType, PgType};
@@ -418,7 +417,10 @@ fn binds_foreign_keys_and_sequence_owners_to_table_identities() {
         unreachable!()
     };
     assert_eq!(foreign_key.foreign_table_id, parent);
-    assert_eq!(catalog.collect_referencing_foreign_keys(parent)[0].0.id, child);
+    assert_eq!(
+        catalog.collect_referencing_foreign_keys(parent)[0].0.id,
+        child
+    );
 
     let mut sequence = SequenceSchema {
         id: SequenceId(0),
@@ -446,7 +448,10 @@ fn binds_foreign_keys_and_sequence_owners_to_table_identities() {
     assert!(!catalog.has_referencing_foreign_keys(parent));
     assert!(catalog.require_sequence("parents_id_seq").is_err());
     assert_eq!(snapshot.require_table("children").unwrap().id, child);
-    assert_eq!(snapshot.collect_referencing_foreign_keys(parent)[0].0.id, child);
+    assert_eq!(
+        snapshot.collect_referencing_foreign_keys(parent)[0].0.id,
+        child
+    );
     assert_eq!(
         snapshot.require_sequence("parents_id_seq").unwrap(),
         &sequence

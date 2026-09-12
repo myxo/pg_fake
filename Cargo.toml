@@ -6,5 +6,8 @@ resolver = "2"
 edition = "2024"
 license = "MIT"
 
+[workspace.lints.clippy]
+too_many_arguments = "allow"
+
 [patch.crates-io]
 sqlparser = { git = "https://github.com/myxo/datafusion-sqlparser-rs", rev = "0e1c6c73f68fcb2be15d49d3b4844147abf38af3" }

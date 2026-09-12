@@ -410,7 +410,7 @@ pub(super) fn collect_grouped_select_rows(
     )?;
 
     let groups = sort_groups_by_postgres_visitation(groups);
-    Ok(groups
+    groups
         .into_iter()
         .map(|group| {
             let source = group
@@ -441,7 +441,7 @@ pub(super) fn collect_grouped_select_rows(
                 .collect::<Result<Vec<_>>>()?;
             Ok((source, aggregate_values))
         })
-        .collect::<Result<Vec<_>>>()?)
+        .collect::<Result<Vec<_>>>()
 }
 
 pub(super) fn evaluate_group_having(

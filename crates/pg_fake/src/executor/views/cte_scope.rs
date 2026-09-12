@@ -4,7 +4,7 @@ use sqlparser::ast;
 #[derive(Clone)]
 pub(super) struct CteNameScope {
     pub(super) body_mask: Vec<String>,
-    cte_queries: Vec<Box<ast::Query>>,
+    cte_queries: Vec<ast::Query>,
     cte_masks: Vec<Vec<String>>,
     next_cte: usize,
 }
@@ -14,7 +14,7 @@ pub(super) fn enter_cte_scope(stack: &mut Vec<CteNameScope>, query: &ast::Query)
         if parent
             .cte_queries
             .get(parent.next_cte)
-            .is_some_and(|candidate| candidate.as_ref() == query)
+            .is_some_and(|candidate| candidate == query)
         {
             let mask = parent.cte_masks[parent.next_cte].clone();
             parent.next_cte += 1;
@@ -29,7 +29,7 @@ pub(super) fn enter_cte_scope(stack: &mut Vec<CteNameScope>, query: &ast::Query)
         .map(|with| {
             with.cte_tables
                 .iter()
-                .map(|cte| cte.query.clone())
+                .map(|cte| cte.query.as_ref().clone())
                 .collect::<Vec<_>>()
         })
         .unwrap_or_default();

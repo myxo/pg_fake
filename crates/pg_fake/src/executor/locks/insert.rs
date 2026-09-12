@@ -1,6 +1,6 @@
 use super::{RequiredRowLock, foreign_keys::collect_foreign_key_locks_for_rows};
 use crate::executor::{
-    DatabaseState, StatementContext,
+    DatabaseState, PreparedInsert, StatementContext,
     column_defaults::{evaluate_column_default, is_default_expression},
     expressions::{create_constant_expression_schema, evaluate_assignment_expression},
     normalize_unqualified_object_name, resolve_insert_table_name, writes,
@@ -76,7 +76,11 @@ pub(super) fn collect_triggered_insert_locks(
     context: &StatementContext,
 ) -> Result<Vec<RequiredRowLock>> {
     let column_indexes = writes::resolve_insert_column_indexes(schema, &insert.columns)?;
-    let (rows, preview_conflicts) = writes::prepare_insert_rows(
+    let PreparedInsert {
+        rows,
+        conflicts: preview_conflicts,
+        ..
+    } = writes::prepare_insert_rows(
         state,
         insert,
         schema,
