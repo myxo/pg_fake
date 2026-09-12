@@ -58,9 +58,8 @@ mod views;
 mod writes;
 
 use aggregates::{
-    AggregateCall, AggregateDescriptor, AggregateInput, AggregateState,
-    infer_aggregate_return_type, is_aggregate_function, parse_aggregate_call,
-    prepare_aggregate_function_input,
+    AggregateDescriptor, AggregateInput, AggregateState, infer_aggregate_return_type,
+    is_aggregate_function, parse_aggregate_call,
 };
 use arithmetic::{
     evaluate_boolean_operator, evaluate_distinctness, evaluate_numeric_operator,

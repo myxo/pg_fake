@@ -37,6 +37,13 @@ query execution, including SELECT, grouping, windows, CTEs, and streaming.
 - [`windows.rs`](../crates/pg_fake/src/executor/query/windows.rs) collects window
   expressions belonging to the current query, computes their values over filtered
   rows, and substitutes them into projection, ordering, and distinct expressions.
+- [`grouping/mod.rs`](../crates/pg_fake/src/executor/query/grouping/mod.rs) collects
+  groups, evaluates aggregates and `HAVING`, and keeps volatile aggregate
+  occurrences tied to their owning expressions, including deferred projections.
+  [`validation.rs`](../crates/pg_fake/src/executor/query/grouping/validation.rs)
+  resolves grouped expressions and primary-key dependencies;
+  [`visitation.rs`](../crates/pg_fake/src/executor/query/grouping/visitation.rs)
+  implements the engine's PostgreSQL group visitation ordering.
 - [`set_operations.rs`](../crates/pg_fake/src/executor/query/set_operations.rs)
   describes and combines operands of `UNION`, `INTERSECT`, and `EXCEPT`. It owns
   operand type resolution, duplicate handling, and ordering/limiting the combined
