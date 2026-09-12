@@ -123,6 +123,17 @@ clause can also contain or feed mutations.
   execution share evaluations, and runs required mutations even when the outer
   query needs no rows.
 
+## Schema changes
+
+[`executor/mod.rs`](../crates/pg_fake/src/executor/mod.rs) dispatches statements to
+feature executors after checking the statement deadline.
+[`table_ddl.rs`](../crates/pg_fake/src/executor/table_ddl.rs) creates and drops
+tables, binds defaults and generated sequences, and supplies definition helpers
+shared with [`alter_table.rs`](../crates/pg_fake/src/executor/alter_table.rs).
+[`sequence_ddl.rs`](../crates/pg_fake/src/executor/sequence_ddl.rs) creates and drops
+sequences, including ownership and dependency checks; runtime sequence allocation
+remains in [`sequences.rs`](../crates/pg_fake/src/executor/sequences.rs).
+
 ## Row mutations
 
 [`executor/writes/mod.rs`](../crates/pg_fake/src/executor/writes/mod.rs) exposes
