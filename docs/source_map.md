@@ -180,6 +180,25 @@ and evaluates column defaults, including sequence allocation.
 NOT NULL and CHECK constraints. Partial-index predicates live with index
 operations in [`indexes.rs`](../crates/pg_fake/src/executor/indexes.rs).
 
+## JSON expressions and table functions
+
+[`executor/json/mod.rs`](../crates/pg_fake/src/executor/json/mod.rs) exposes JSON
+operator typing, scalar functions, and table-function expansion.
+
+- [`operators.rs`](../crates/pg_fake/src/executor/json/operators.rs) resolves and
+  evaluates JSON operators, including extraction, existence, and containment.
+- [`functions.rs`](../crates/pg_fake/src/executor/json/functions.rs) validates
+  scalar function arguments and evaluates constructors, conversions, and jsonb_set.
+- [`expansion.rs`](../crates/pg_fake/src/executor/json/expansion.rs) recognizes
+  JSON functions in FROM, describes their columns, and produces rows with optional
+  ordinality.
+- [`paths.rs`](../crates/pg_fake/src/executor/json/paths.rs) resolves array indexes
+  and applies path replacements or deletions shared by operators and jsonb_set.
+- [`text.rs`](../crates/pg_fake/src/executor/json/text.rs) reads JSON text while
+  preserving object entries and raw values, validates strings, and constructs
+  SQL values. JSONB normalization remains in
+  [`jsonb.rs`](../crates/pg_fake/src/jsonb.rs).
+
 ## Schema changes
 
 [`executor/mod.rs`](../crates/pg_fake/src/executor/mod.rs) dispatches statements to
