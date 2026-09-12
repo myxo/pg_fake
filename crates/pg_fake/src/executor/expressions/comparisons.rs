@@ -279,3 +279,7 @@ fn evaluate_row_comparison(
     }
     Ok(result)
 }
+
+#[cfg(test)]
+#[path = "comparisons_test.rs"]
+mod tests;

@@ -1,5 +1,22 @@
-use super::*;
+use crate::{
+    catalog::{
+        Catalog, ConstraintId, ForeignKey, ForeignKeyAction, TableId, TablePersistence, TableSchema,
+    },
+    database::DatabaseState,
+    error::{PgError, Result, SqlState},
+    executor::{
+        column_defaults::evaluate_column_default,
+        context::StatementContext,
+        expressions::evaluate_comparison,
+        normalize_identifier, procedural,
+        row_constraints::{validate_check_constraints, validate_not_null},
+    },
+    storage::RowId,
+    txn::{Snapshot, Xid, find_visible_version},
+    value::Value,
+};
 use sqlparser::ast;
+use std::collections::BTreeSet;
 
 #[cfg_attr(feature = "execution-log", tracing::instrument(skip_all))]
 pub(super) fn convert_referential_action(

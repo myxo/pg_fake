@@ -1,4 +1,25 @@
-use super::*;
+use crate::{
+    StatementResult,
+    catalog::{IndexColumnDefinition, IndexSchema, ResolvedRelationName, TableId, TableSchema},
+    coercion::CastContext,
+    database::DatabaseState,
+    error::{PgError, Result, SqlState, reject_unsupported},
+    executor::{
+        context::StatementContext,
+        expressions::{compare_values, evaluate_and_coerce, infer_expression_type},
+        normalize_identifier, normalize_relation_name, resolve_order_ascending,
+        scope::RowScope,
+        validate_btree_key_type,
+    },
+    txn::{Snapshot, Xid},
+    value::{BaseType, Value},
+};
+use sqlparser::ast;
+use std::{
+    cmp::Ordering,
+    collections::{BTreeMap, BTreeSet},
+    sync::Arc,
+};
 
 pub(super) fn execute_create_index(
     state: &mut DatabaseState,

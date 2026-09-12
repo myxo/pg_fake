@@ -1,8 +1,23 @@
-use sqlparser::{dialect::PostgreSqlDialect, parser::Parser};
-
-use super::outer_references::{NameConflictPolicy, substitute_outer_references};
-use super::*;
-use crate::catalog::{FunctionSchema, TriggerSchema};
+use crate::{
+    StatementResult,
+    catalog::{FunctionSchema, RelationName, TableSchema, TriggerSchema},
+    coercion::{self, CastContext},
+    database::DatabaseState,
+    error::{PgError, Result, SqlState, reject_unsupported},
+    executor::{
+        context::StatementContext,
+        create_relation_object_name,
+        expressions::{evaluate, extract_unknown_string_literal, infer_expression_type},
+        normalize_identifier, normalize_relation_name, normalize_unqualified_object_name,
+        outer_references::{NameConflictPolicy, substitute_outer_references},
+        scope::{BoundScope, RowScope, bind_target_scope},
+        writes,
+    },
+    txn::{Snapshot, Xid},
+    value::{BaseType, PgType, Value},
+};
+use sqlparser::{ast, dialect::PostgreSqlDialect, parser::Parser};
+use std::collections::BTreeSet;
 
 fn extract_function_body(create: &ast::CreateFunction) -> Result<String> {
     let Some(ast::CreateFunctionBody::AsBeforeOptions {

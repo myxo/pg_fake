@@ -1,25 +1,15 @@
-use bigdecimal::ToPrimitive;
-
 use crate::{
-    ColumnMeta, StatementResult,
-    catalog::{
-        Catalog, ConstraintId, ForeignKey, ForeignKeyAction, IndexColumnDefinition, IndexSchema,
-        RelationName, ResolvedRelationName, TableId, TablePersistence, TableSchema,
-    },
-    coercion::{self, CastContext},
+    StatementResult,
+    catalog::{ConstraintId, RelationName},
     error::{PgError, Result, SqlState, reject_unsupported},
-    storage::RowId,
-    txn::{Snapshot, Xid, find_visible_version},
-    value::{BaseType, DAYS_PER_MONTH, MICROSECONDS_PER_DAY, PgType, Value},
+    txn::{Snapshot, Xid},
+    value::BaseType,
 };
+use indexes::{execute_alter_index, execute_create_index, execute_drop_indexes};
 use sqlparser::ast;
-use std::{
-    cmp::Ordering,
-    collections::{BTreeMap, BTreeSet},
-    sync::Arc,
-};
-
-pub(crate) use crate::database::DatabaseState;
+use std::collections::BTreeSet;
+use views::{execute_comment_on_view, execute_create_view, execute_drop_views};
+use writes::{execute_delete, execute_insert, execute_update};
 
 mod aggregates;
 mod alter_table;
@@ -33,14 +23,6 @@ mod foreign_keys;
 mod from;
 mod indexes;
 mod json;
-pub(crate) use context::{
-    PreparedConflictUpdate, PreparedInsert, PreparedMutationTarget, PreparedUpdateRow,
-    StatementContext,
-};
-pub(crate) use json::{
-    JsonTableFunction, extract_json_table_function, resolve_json_function_arguments,
-    resolve_json_operator_types,
-};
 mod locks;
 mod outer_references;
 mod prepared;
@@ -48,7 +30,6 @@ mod procedural;
 mod query;
 mod row_constraints;
 mod scope;
-pub(crate) use scope::{bind_join, bind_table_factor};
 mod sequence_ddl;
 mod sequences;
 mod subqueries;
@@ -56,61 +37,38 @@ mod table_ddl;
 mod views;
 mod writes;
 
-use aggregates::{
-    AggregateDescriptor, AggregateInput, AggregateState, is_aggregate_function,
-    parse_aggregate_call,
+pub(crate) use crate::database::DatabaseState;
+pub(crate) use context::{
+    PreparedConflictUpdate, PreparedInsert, PreparedMutationTarget, PreparedUpdateRow,
+    StatementContext,
 };
-use arithmetic::{
-    evaluate_boolean_operator, evaluate_numeric_operator, evaluate_temporal_arithmetic,
-};
-use column_defaults::evaluate_column_default;
-use expressions::{
-    compare_values, evaluate, evaluate_and_coerce, evaluate_comparison, validate_equality_type,
-    validate_ordering_type,
-};
+pub(crate) use ctes::{expand_ctes_for_analysis, materialize_statement_ctes};
 pub(crate) use expressions::{
     create_constant_expression_schema, extract_unknown_string_literal, infer_expression_type,
     is_null_literal,
 };
 pub(crate) use foreign_keys::{contains_deferred_foreign_keys, validate_deferred_foreign_keys};
 pub(crate) use indexes::evaluate_index_predicate;
-use indexes::{execute_alter_index, execute_create_index, execute_drop_indexes};
+pub(crate) use json::{
+    JsonTableFunction, extract_json_table_function, resolve_json_function_arguments,
+    resolve_json_operator_types,
+};
 pub(crate) use locks::{
     MutationCandidate, RequiredRowLock, collect_required_cte_row_locks, collect_required_row_locks,
     mutation_locks_cover_targets,
 };
-use row_constraints::{validate_check_constraints, validate_not_null};
-
-fn validate_btree_key_type(data_type: BaseType) -> Result<()> {
-    if data_type == BaseType::Json {
-        Err(PgError::create(
-            SqlState::UndefinedObject,
-            "data type json has no default operator class for access method btree",
-        ))
-    } else {
-        Ok(())
-    }
-}
 pub(crate) use prepared::{PreparedQueryPlan, build_prepared_query_plan, execute_prepared_query};
-pub(crate) use procedural::coerce_procedural_value;
-pub(crate) use scope::infer_query_output_columns;
+pub(crate) use procedural::{coerce_procedural_value, substitute_procedural_references};
+pub(crate) use query::{describe_query_result_columns, detect_statement_features};
 pub(crate) use scope::{
-    BoundScope, RowScope, bind_from_scope, bind_query_scope, bind_target_scope,
-    combine_bound_scopes, create_value_scope, identify_unknown_query_columns,
-    identify_unknown_set_operand_columns, substitute_typed_subqueries,
+    BoundScope, RowScope, bind_from_scope, bind_join, bind_query_scope, bind_table_factor,
+    bind_target_scope, combine_bound_scopes, create_value_scope, identify_unknown_query_columns,
+    identify_unknown_set_operand_columns, infer_query_output_columns, substitute_typed_subqueries,
 };
 pub(crate) use sequences::{
     SequenceExecutionContext, SequenceSessionState, SequenceSessionStorage, SequenceStorage,
-    SequenceValueState,
+    SequenceValueState, normalize_sequence_name,
 };
-use views::{execute_comment_on_view, execute_create_view, execute_drop_views};
-use writes::{execute_delete, execute_insert, execute_update};
-
-pub(crate) use ctes::{expand_ctes_for_analysis, materialize_statement_ctes};
-pub(crate) use procedural::substitute_procedural_references;
-pub(crate) use query::describe_query_result_columns;
-pub(crate) use query::detect_statement_features;
-pub(crate) use sequences::normalize_sequence_name;
 pub(crate) use subqueries::materialize_uncorrelated_subqueries;
 
 #[cfg_attr(feature = "execution-log", tracing::instrument(skip_all))]
@@ -334,6 +292,13 @@ fn resolve_index_column_name(column: &ast::IndexColumn) -> Result<String> {
     Ok(normalize_identifier(identifier))
 }
 
-#[cfg(test)]
-#[path = "mod_test.rs"]
-mod tests;
+fn validate_btree_key_type(data_type: BaseType) -> Result<()> {
+    if data_type == BaseType::Json {
+        Err(PgError::create(
+            SqlState::UndefinedObject,
+            "data type json has no default operator class for access method btree",
+        ))
+    } else {
+        Ok(())
+    }
+}

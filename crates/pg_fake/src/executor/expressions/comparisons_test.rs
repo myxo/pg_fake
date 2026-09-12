@@ -1,5 +1,6 @@
-
-use super::*;
+use super::compare_values;
+use crate::value::Value;
+use std::cmp::Ordering;
 
 #[test]
 #[cfg_attr(feature = "execution-log", tracing::instrument(skip_all))]
