@@ -183,20 +183,34 @@ pub(crate) fn bind_table_factor(
         ..
     } = factor
     {
-        if *lateral {
-            return reject_unsupported("LATERAL derived tables are not implemented");
-        }
-        let alias = alias.as_ref().ok_or_else(|| {
-            PgError::create(SqlState::SyntaxError, "subquery in FROM must have an alias")
-        })?;
-        let columns = describe_bound_query_columns(catalog, subquery, None)?;
-        if alias.columns.len() > columns.len() {
+        let bound;
+        let subquery = if *lateral {
+            (bound, _) = crate::executor::bind_lateral_query(
+                catalog,
+                subquery,
+                scope,
+                &vec![crate::value::Value::Null; scope.columns.len()],
+            )?;
+            &bound
+        } else {
+            subquery.as_ref()
+        };
+        let subquery = crate::analyzer::bind_query_parameters_for_analysis(subquery, catalog)?;
+        let subquery = crate::executor::ctes::inline_query_ctes(&subquery, catalog, None, true)?;
+        let columns = describe_bound_query_columns(catalog, &subquery, None)?;
+        if alias
+            .as_ref()
+            .is_some_and(|alias| alias.columns.len() > columns.len())
+        {
             return Err(PgError::create(
                 SqlState::InvalidColumnReference,
                 "derived table has fewer columns than specified in the column alias list",
             ));
         }
-        let qualifier = normalize_identifier(&alias.name);
+        let qualifier = alias
+            .as_ref()
+            .map(|alias| normalize_identifier(&alias.name))
+            .unwrap_or_default();
         let start = scope.columns.len();
         scope
             .columns
@@ -204,8 +218,8 @@ pub(crate) fn bind_table_factor(
                 let source_name = column.name.clone();
                 BoundColumn {
                     name: alias
-                        .columns
-                        .get(index)
+                        .as_ref()
+                        .and_then(|alias| alias.columns.get(index))
                         .map(|alias| normalize_identifier(&alias.name))
                         .unwrap_or(column.name),
                     data_type: column.data_type,

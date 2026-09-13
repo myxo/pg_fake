@@ -20,19 +20,73 @@ use super::{
 };
 
 #[derive(Clone)]
-struct InlineCte {
+pub(in crate::executor) struct InlineCte {
     name: String,
     query: Box<ast::Query>,
     alias: ast::TableAlias,
     masked_names: Vec<String>,
 }
 
+pub(in crate::executor) fn inline_query_with_cte_scope(
+    query: &ast::Query,
+    catalog: &crate::catalog::Catalog,
+    ctes: &[InlineCte],
+) -> Result<ast::Query> {
+    let mut query = query.clone();
+    let mut replacer = InlineCteReferenceReplacer {
+        catalog,
+        state: None,
+        ctes,
+        masked: Vec::new(),
+        pending_mask: None,
+        error: None,
+        validate_recursive_types: true,
+        lateral_depth: 0,
+    };
+    let _ = query.visit(&mut replacer);
+    replacer.error.map_or(Ok(query), Err)
+}
+
+pub(in crate::executor) fn collect_query_cte_scope(query: &ast::Query) -> Result<Vec<InlineCte>> {
+    let Some(with) = &query.with else {
+        return Ok(Vec::new());
+    };
+    let names = with
+        .cte_tables
+        .iter()
+        .map(|cte| normalize_identifier(&cte.alias.name))
+        .collect::<Vec<_>>();
+    with.cte_tables
+        .iter()
+        .enumerate()
+        .map(|(index, cte)| {
+            let name = normalize_identifier(&cte.alias.name);
+            let mut query = cte.query.clone();
+            if with.recursive && validate_recursive_cte(&query, &name)? {
+                let ast::SetExpr::SetOperation { left, .. } = query.body.as_ref() else {
+                    unreachable!("recursive UNION")
+                };
+                query = Box::new(create_set_expression_query((**left).clone()));
+            }
+            Ok(InlineCte {
+                name,
+                query,
+                alias: cte.alias.clone(),
+                masked_names: names[if with.recursive { 0 } else { index }..].to_vec(),
+            })
+        })
+        .collect()
+}
+
 struct InlineCteReferenceReplacer<'a> {
-    state: &'a DatabaseState,
+    state: Option<&'a DatabaseState>,
+    catalog: &'a crate::catalog::Catalog,
     ctes: &'a [InlineCte],
     masked: Vec<Vec<String>>,
     pending_mask: Option<Vec<String>>,
     error: Option<PgError>,
+    validate_recursive_types: bool,
+    lateral_depth: usize,
 }
 
 impl ast::VisitorMut for InlineCteReferenceReplacer<'_> {
@@ -45,7 +99,40 @@ impl ast::VisitorMut for InlineCteReferenceReplacer<'_> {
         if query.with.is_none() {
             return std::ops::ControlFlow::Continue(());
         }
-        match inline_query_ctes(query, self.state) {
+        if !self.ctes.is_empty() {
+            let with = query.with.as_mut().expect("WITH was checked");
+            let names = with
+                .cte_tables
+                .iter()
+                .map(|cte| normalize_identifier(&cte.alias.name))
+                .collect::<Vec<_>>();
+            for (index, cte) in with.cte_tables.iter_mut().enumerate() {
+                let mut replacer = InlineCteReferenceReplacer {
+                    catalog: self.catalog,
+                    state: self.state,
+                    ctes: self.ctes,
+                    masked: self.masked.clone(),
+                    pending_mask: Some(
+                        names[..if with.recursive { names.len() } else { index }].to_vec(),
+                    ),
+                    error: None,
+                    validate_recursive_types: self.validate_recursive_types
+                        && self.lateral_depth == 0,
+                    lateral_depth: 0,
+                };
+                let _ = cte.query.visit(&mut replacer);
+                if let Some(error) = replacer.error {
+                    self.error = Some(error);
+                    return std::ops::ControlFlow::Break(());
+                }
+            }
+        }
+        match inline_query_ctes(
+            query,
+            self.catalog,
+            self.state,
+            self.validate_recursive_types && self.lateral_depth == 0,
+        ) {
             Ok(expanded) => *query = expanded,
             Err(error) => {
                 self.error = Some(error);
@@ -66,6 +153,9 @@ impl ast::VisitorMut for InlineCteReferenceReplacer<'_> {
         &mut self,
         factor: &mut ast::TableFactor,
     ) -> std::ops::ControlFlow<Self::Break> {
+        if matches!(factor, ast::TableFactor::Derived { lateral: true, .. }) {
+            self.lateral_depth += 1;
+        }
         let ast::TableFactor::Table {
             name,
             alias,
@@ -100,18 +190,35 @@ impl ast::VisitorMut for InlineCteReferenceReplacer<'_> {
         self.pending_mask = Some(cte.masked_names.clone());
         std::ops::ControlFlow::Continue(())
     }
+    fn post_visit_table_factor(
+        &mut self,
+        factor: &mut ast::TableFactor,
+    ) -> std::ops::ControlFlow<()> {
+        if matches!(factor, ast::TableFactor::Derived { lateral: true, .. }) {
+            self.lateral_depth -= 1;
+        }
+        std::ops::ControlFlow::Continue(())
+    }
 }
 
 #[cfg_attr(feature = "execution-log", tracing::instrument(skip_all))]
-fn inline_query_ctes(query: &ast::Query, state: &DatabaseState) -> Result<ast::Query> {
+pub(in crate::executor) fn inline_query_ctes(
+    query: &ast::Query,
+    catalog: &crate::catalog::Catalog,
+    state: Option<&DatabaseState>,
+    validate_recursive_types: bool,
+) -> Result<ast::Query> {
     let mut query = query.clone();
     let Some(with) = query.with.take() else {
         let mut replacer = InlineCteReferenceReplacer {
             state,
+            catalog,
             ctes: &[],
             masked: Vec::new(),
             pending_mask: None,
             error: None,
+            validate_recursive_types,
+            lateral_depth: 0,
         };
         let _ = query.visit(&mut replacer);
         if let Some(error) = replacer.error {
@@ -120,7 +227,7 @@ fn inline_query_ctes(query: &ast::Query, state: &DatabaseState) -> Result<ast::Q
         return Ok(query);
     };
     if with.recursive {
-        return inline_recursive_query_ctes(query, with, state);
+        return inline_recursive_query_ctes(query, with, catalog, state, validate_recursive_types);
     }
     let names = with
         .cte_tables
@@ -139,14 +246,18 @@ fn inline_query_ctes(query: &ast::Query, state: &DatabaseState) -> Result<ast::Q
                 format!("WITH query name {name:?} specified more than once"),
             ));
         }
-        let mut cte_query = inline_query_ctes(&cte.query, state)?;
-        reject_cte_forward_references(&cte_query, &names[index..], &state.catalog)?;
+        let mut cte_query =
+            inline_query_ctes(&cte.query, catalog, state, validate_recursive_types)?;
+        reject_cte_forward_references(&cte_query, &names[index..], catalog)?;
         let mut replacer = InlineCteReferenceReplacer {
             state,
+            catalog,
             ctes: &ctes,
             masked: Vec::new(),
             pending_mask: None,
             error: None,
+            validate_recursive_types,
+            lateral_depth: 0,
         };
         let _ = cte_query.visit(&mut replacer);
         if let Some(error) = replacer.error {
@@ -155,7 +266,15 @@ fn inline_query_ctes(query: &ast::Query, state: &DatabaseState) -> Result<ast::Q
         let mut alias = cte.alias;
         if is_data_modifying_query(&cte_query) {
             let statement = convert_query_to_statement(cte_query);
-            let columns = describe_query_result_columns(state, &statement)?;
+            let columns = describe_query_result_columns(
+                state.ok_or_else(|| {
+                    PgError::create(
+                        SqlState::FeatureNotSupported,
+                        "data-modifying WITH must be at the top level",
+                    )
+                })?,
+                &statement,
+            )?;
             if alias.columns.is_empty() {
                 alias.columns = columns
                     .iter()
@@ -179,10 +298,13 @@ fn inline_query_ctes(query: &ast::Query, state: &DatabaseState) -> Result<ast::Q
     }
     let mut replacer = InlineCteReferenceReplacer {
         state,
+        catalog,
         ctes: &ctes,
         masked: Vec::new(),
         pending_mask: None,
         error: None,
+        validate_recursive_types,
+        lateral_depth: 0,
     };
     let _ = query.visit(&mut replacer);
     if let Some(error) = replacer.error {
@@ -195,7 +317,9 @@ fn inline_query_ctes(query: &ast::Query, state: &DatabaseState) -> Result<ast::Q
 fn inline_recursive_query_ctes(
     mut query: ast::Query,
     with: ast::With,
-    state: &DatabaseState,
+    catalog: &crate::catalog::Catalog,
+    state: Option<&DatabaseState>,
+    validate_recursive_types: bool,
 ) -> Result<ast::Query> {
     let names = with
         .cte_tables
@@ -229,13 +353,17 @@ fn inline_recursive_query_ctes(
             let cte = pending[index]
                 .take()
                 .expect("pending CTE was checked as present");
-            let mut cte_query = inline_query_ctes(&cte.query, state)?;
+            let mut cte_query =
+                inline_query_ctes(&cte.query, catalog, state, validate_recursive_types)?;
             let mut replacer = InlineCteReferenceReplacer {
                 state,
+                catalog,
                 ctes: &ctes,
                 masked: Vec::new(),
                 pending_mask: None,
                 error: None,
+                validate_recursive_types,
+                lateral_depth: 0,
             };
             let _ = cte_query.visit(&mut replacer);
             if let Some(error) = replacer.error {
@@ -253,16 +381,21 @@ fn inline_recursive_query_ctes(
                 };
                 let mut replacer = InlineCteReferenceReplacer {
                     state,
+                    catalog,
                     ctes: std::slice::from_ref(&seed),
                     masked: Vec::new(),
                     pending_mask: None,
                     error: None,
+                    validate_recursive_types,
+                    lateral_depth: 0,
                 };
                 let _ = cte_query.visit(&mut replacer);
                 if let Some(error) = replacer.error {
                     return Err(error);
                 }
-                validate_recursive_cte_types(&state.catalog, &cte_query)?;
+                if validate_recursive_types {
+                    validate_recursive_cte_types(catalog, &cte_query)?;
+                }
             }
             ctes.push(InlineCte {
                 name: name.clone(),
@@ -278,10 +411,13 @@ fn inline_recursive_query_ctes(
     }
     let mut replacer = InlineCteReferenceReplacer {
         state,
+        catalog,
         ctes: &ctes,
         masked: Vec::new(),
         pending_mask: None,
         error: None,
+        validate_recursive_types,
+        lateral_depth: 0,
     };
     let _ = query.visit(&mut replacer);
     if let Some(error) = replacer.error {
@@ -360,13 +496,17 @@ pub(crate) fn expand_ctes_for_analysis<'a>(
                         "recursive query must not contain data-modifying statements",
                     ));
                 }
-                let mut cte_query = inline_query_ctes(&cte.query, state)?;
+                let mut cte_query =
+                    inline_query_ctes(&cte.query, &state.catalog, Some(state), true)?;
                 let mut replacer = InlineCteReferenceReplacer {
-                    state,
+                    state: Some(state),
+                    catalog: &state.catalog,
                     ctes: &ctes,
                     masked: Vec::new(),
                     pending_mask: None,
                     error: None,
+                    validate_recursive_types: true,
+                    lateral_depth: 0,
                 };
                 let _ = cte_query.visit(&mut replacer);
                 if let Some(error) = replacer.error {
@@ -401,11 +541,14 @@ pub(crate) fn expand_ctes_for_analysis<'a>(
                         masked_names: names.clone(),
                     };
                     let mut replacer = InlineCteReferenceReplacer {
-                        state,
+                        state: Some(state),
+                        catalog: &state.catalog,
                         ctes: std::slice::from_ref(&seed),
                         masked: Vec::new(),
                         pending_mask: None,
                         error: None,
+                        validate_recursive_types: true,
+                        lateral_depth: 0,
                     };
                     let _ = cte_query.visit(&mut replacer);
                     if let Some(error) = replacer.error {
@@ -428,11 +571,14 @@ pub(crate) fn expand_ctes_for_analysis<'a>(
             }
         }
         let mut replacer = InlineCteReferenceReplacer {
-            state,
+            state: Some(state),
+            catalog: &state.catalog,
             ctes: &ctes,
             masked: Vec::new(),
             pending_mask: None,
             error: None,
+            validate_recursive_types: true,
+            lateral_depth: 0,
         };
         let _ = query.visit(&mut replacer);
         if let Some(error) = replacer.error {
@@ -455,14 +601,17 @@ pub(crate) fn expand_ctes_for_analysis<'a>(
         let mut ctes = Vec::new();
         for (index, cte) in with.cte_tables.iter().enumerate() {
             let name = normalize_identifier(&cte.alias.name);
-            let mut cte_query = inline_query_ctes(&cte.query, state)?;
+            let mut cte_query = inline_query_ctes(&cte.query, &state.catalog, Some(state), true)?;
             reject_cte_forward_references(&cte_query, &names[index..], &state.catalog)?;
             let mut replacer = InlineCteReferenceReplacer {
-                state,
+                state: Some(state),
+                catalog: &state.catalog,
                 ctes: &ctes,
                 masked: Vec::new(),
                 pending_mask: None,
                 error: None,
+                validate_recursive_types: true,
+                lateral_depth: 0,
             };
             let _ = cte_query.visit(&mut replacer);
             if let Some(error) = replacer.error {
@@ -496,7 +645,12 @@ pub(crate) fn expand_ctes_for_analysis<'a>(
         }
     }
     Ok((
-        Cow::Owned(convert_query_to_statement(inline_query_ctes(query, state)?)),
+        Cow::Owned(convert_query_to_statement(inline_query_ctes(
+            query,
+            &state.catalog,
+            Some(state),
+            true,
+        )?)),
         mutations,
     ))
 }

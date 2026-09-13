@@ -5,7 +5,9 @@ use crate::{
     executor::{
         DatabaseState, StatementContext,
         expressions::{evaluate, extract_unknown_string_literal},
-        json, normalize_relation_name,
+        json,
+        lateral::{InitplanKey, bind_lateral_query, contains_lateral_source},
+        normalize_relation_name,
         query::execute_query,
         scope::{self, BoundScope, RowScope},
         subqueries::evaluate_query_expression,
@@ -39,13 +41,18 @@ pub(super) fn materialize_from_rows(
     let mut next_slot = start_slot;
     let mut rows = vec![vec![Value::Null; scope.columns.len()]];
     for table in from {
-        let functions = json::contains_json_expansion(&table.relation)
+        let functions = contains_lateral_source(&table.relation)
             || table
                 .joins
                 .iter()
-                .any(|join| json::contains_json_expansion(&join.relation));
+                .any(|join| contains_lateral_source(&join.relation));
         if functions {
             let start = next_slot;
+            let mut bound = BoundScope {
+                columns: scope.columns[..start].to_vec(),
+            };
+            scope::bind_table_with_joins(&state.catalog, table, &mut bound)?;
+            next_slot = bound.columns.len();
             let mut expanded = Vec::new();
             for prefix in &rows {
                 let mut slot = start;
@@ -100,6 +107,9 @@ pub(super) fn visit_query_source_rows(
     selection: Option<&ast::Expr>,
     visit: &mut dyn FnMut(&[Value]) -> Result<()>,
 ) -> Result<()> {
+    if crate::executor::lateral::skips_lateral_rows(selection, context) {
+        return Ok(());
+    }
     if let [table] = select.from.as_slice()
         && can_stream_join(table)
     {
@@ -208,19 +218,59 @@ fn materialize_table_factor_rows(
         );
     }
     if let ast::TableFactor::Derived {
-        lateral,
-        subquery,
-        alias: Some(_),
-        ..
+        lateral, subquery, ..
     } = factor
     {
-        if *lateral {
-            return reject_unsupported("LATERAL derived tables are not implemented");
-        }
-        let StatementResult::Query(result) =
-            execute_query(state, subquery, xid, snapshot, context)?
-        else {
-            unreachable!("derived query execution returns query rows");
+        let bound;
+        let mut correlated = false;
+        let query = if *lateral {
+            let outer = BoundScope {
+                columns: scope.columns[..*next_slot].to_vec(),
+            };
+            let slots;
+            (bound, slots) = bind_lateral_query(&state.catalog, subquery, &outer, prefix)?;
+            correlated = !slots.is_empty();
+            &bound
+        } else {
+            subquery.as_ref()
+        };
+        let InitplanKey::Scalar(projection) = InitplanKey::create_scalar(query) else {
+            unreachable!("scalar key")
+        };
+        let initplan = InitplanKey::DerivedCte(projection);
+        let cached = context
+            .lateral_initplans
+            .lock()
+            .expect("lateral initplans mutex is poisoned")
+            .get_result(&initplan)
+            .or_else(|| {
+                (!correlated)
+                    .then(|| context.get_prepared_subquery_result(query))
+                    .flatten()
+            });
+        let result = if let Some(result) = cached {
+            result
+        } else {
+            let mut invocation = context.clone();
+            invocation.lateral_invocation |= *lateral;
+            if correlated {
+                invocation.prepared_subquery_results = Default::default();
+                invocation.prepared_cte_results = Default::default();
+            }
+            let StatementResult::Query(result) =
+                execute_query(state, query, xid, snapshot, &invocation)?
+            else {
+                unreachable!("derived query execution returns query rows");
+            };
+            if !correlated {
+                context.set_prepared_subquery_result(query, result.clone());
+            }
+            context
+                .lateral_initplans
+                .lock()
+                .expect("lateral initplans mutex is poisoned")
+                .set_result(&initplan, result.clone());
+            result
         };
         let start = *next_slot;
         *next_slot += result.columns.len();
@@ -228,7 +278,7 @@ fn materialize_table_factor_rows(
             .rows
             .into_iter()
             .map(|values| {
-                let mut row = vec![Value::Null; scope.columns.len()];
+                let mut row = prefix.to_vec();
                 row[start..start + values.len()].clone_from_slice(&values);
                 row
             })

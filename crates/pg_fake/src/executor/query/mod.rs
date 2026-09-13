@@ -26,6 +26,7 @@ mod values;
 mod windows;
 
 use distinct::{DistinctPlan, compare_distinct_keys, remove_duplicate_rows, resolve_distinct_plan};
+pub(super) use expressions::contains_volatile_expression;
 pub(super) use expressions::infer_query_expression_type;
 pub(crate) use grouping::collect_query_primary_key_dependencies;
 pub(super) use grouping::contains_query_aggregate;

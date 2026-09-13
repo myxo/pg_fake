@@ -37,7 +37,7 @@ pub(crate) fn bind_join(
             | ast::JoinOperator::RightOuter(_)
             | ast::JoinOperator::FullOuter(_)
     ) {
-        validate_json_join_references(catalog, &join.relation, scope, left_start..right_start)?;
+        validate_lateral_join_references(catalog, &join.relation, scope, left_start..right_start)?;
     }
     bind_table_factor(catalog, &join.relation, scope)?;
     let constraint = match &join.join_operator {
@@ -68,7 +68,10 @@ fn bind_join_constraint(
 ) -> Result<()> {
     match constraint {
         ast::JoinConstraint::On(expression) => {
-            let data_type = infer_expression_data_type(catalog, expression, scope)?;
+            let join_scope = BoundScope {
+                columns: scope.columns[left_start..].to_vec(),
+            };
+            let data_type = infer_expression_data_type(catalog, expression, &join_scope)?;
             if data_type != PgType::create(crate::value::BaseType::Bool)
                 && !is_null_literal(expression)
             {
@@ -174,12 +177,31 @@ fn bind_join_columns(
     Ok(())
 }
 
-fn validate_json_join_references(
+fn validate_lateral_join_references(
     catalog: &Catalog,
     factor: &ast::TableFactor,
     scope: &BoundScope,
     forbidden: std::ops::Range<usize>,
 ) -> Result<()> {
+    if let ast::TableFactor::Derived {
+        lateral: true,
+        subquery,
+        ..
+    } = factor
+    {
+        let (_, slots) = crate::executor::bind_lateral_query(
+            catalog,
+            subquery,
+            scope,
+            &vec![crate::value::Value::Null; scope.columns.len()],
+        )?;
+        if slots.iter().any(|slot| forbidden.contains(slot)) {
+            return Err(PgError::create(
+                SqlState::InvalidColumnReference,
+                "invalid lateral reference in RIGHT or FULL JOIN",
+            ));
+        }
+    }
     if let Some(json::JsonTableFunction { argument, .. }) =
         json::extract_json_table_function(factor)?
     {
@@ -201,7 +223,7 @@ fn validate_json_join_references(
         for source in std::iter::once(&table_with_joins.relation)
             .chain(table_with_joins.joins.iter().map(|j| &j.relation))
         {
-            validate_json_join_references(catalog, source, &visible, forbidden.clone())?;
+            validate_lateral_join_references(catalog, source, &visible, forbidden.clone())?;
             bind_table_factor(catalog, source, &mut visible)?;
         }
     }

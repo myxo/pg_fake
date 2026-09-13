@@ -170,7 +170,7 @@ pub(super) fn evaluate_select_expression(
     evaluate_query_expression(state, expression, scope, row, xid, snapshot, context)
 }
 
-pub(super) fn contains_volatile_expression(expression: &ast::Expr) -> bool {
+pub(in crate::executor) fn contains_volatile_expression(expression: &ast::Expr) -> bool {
     let mut expression = expression.clone();
     prune_constant_cases(&mut expression, None).expect("untyped CASE pruning cannot fail");
     let mut found = false;

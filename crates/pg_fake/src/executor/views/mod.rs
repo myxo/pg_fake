@@ -12,7 +12,6 @@ use std::collections::BTreeSet;
 
 mod binding;
 mod column_dependencies;
-mod cte_scope;
 mod expansion;
 mod references;
 

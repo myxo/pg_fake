@@ -1,8 +1,6 @@
-use super::{
-    cte_scope::{CteNameScope, enter_cte_scope},
-    quote_identifier,
-};
+use super::quote_identifier;
 use crate::catalog::{Catalog, ColumnDef, TableId, TableSchema, ViewDependency};
+use crate::executor::ctes::scope::{CteNameScope, enter_cte_scope};
 use crate::executor::{create_relation_object_name, normalize_relation_name};
 use sqlparser::ast::{self, VisitMut as _};
 use std::collections::BTreeSet;

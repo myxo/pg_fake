@@ -124,6 +124,14 @@ owns visible table scans, index lookups, and predicate pushdown;
 [`joins.rs`](../crates/pg_fake/src/executor/from/joins.rs) owns join conditions,
 hash and nested-loop evaluation, and unmatched rows in outer joins.
 
+[`lateral.rs`](../crates/pg_fake/src/executor/lateral.rs) binds correlated derived
+sources to each preceding FROM row, preserves projected names, and gives set
+operation branches their own query scopes. Correlated invocations use separate
+derived-result caches so repeated outer values preserve volatile evaluations.
+[`initplans.rs`](../crates/pg_fake/src/executor/lateral/initplans.rs) identifies
+independent scalar and CTE occurrences before binding outer values and shares
+their lazily evaluated results, including resumable recursive CTE rows.
+
 [`executor/equality.rs`](../crates/pg_fake/src/executor/equality.rs) holds the
 hashable equality keys shared by joins and membership predicates. NULL has no
 such key. Its `are_rows_not_distinct` predicate separately expresses the NULL
@@ -133,6 +141,8 @@ equality used by grouping and duplicate handling.
 scalar, `EXISTS`, `IN`, `ANY`, and `ALL` subqueries, preserving result types and
 reusing results prepared during lock discovery. Correlated expressions first
 substitute values from the outer row.
+[`conditionals.rs`](../crates/pg_fake/src/executor/subqueries/conditionals.rs)
+evaluates only the selected conditional branches when they contain subqueries.
 
 [`executor/outer_references.rs`](../crates/pg_fake/src/executor/outer_references.rs)
 resolves those outer references while respecting inner scopes and output aliases.
@@ -254,7 +264,7 @@ CREATE, DROP, and COMMENT ON VIEW.
 - [`references.rs`](../crates/pg_fake/src/executor/views/references.rs) preserves
   stored view references and column positions across table/column renames and
   drops of unreferenced columns.
-- [`cte_scope.rs`](../crates/pg_fake/src/executor/views/cte_scope.rs) tracks CTE
+- [`cte_scope.rs`](../crates/pg_fake/src/executor/ctes/scope.rs) tracks CTE
   names that hide catalog relations during binding and reference traversal.
 
 Trigger creation, renaming, and removal live together in

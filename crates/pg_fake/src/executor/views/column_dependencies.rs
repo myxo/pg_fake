@@ -1,5 +1,5 @@
-use super::cte_scope::{CteNameScope, enter_cte_scope};
 use crate::catalog::{Catalog, TableId, ViewDependency};
+use crate::executor::ctes::scope::{CteNameScope, enter_cte_scope};
 use crate::executor::{
     normalize_identifier, normalize_relation_name, normalize_unqualified_object_name,
     scope::{self, infer_query_output_columns},

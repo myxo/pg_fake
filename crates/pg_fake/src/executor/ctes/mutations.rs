@@ -152,7 +152,7 @@ pub(in crate::executor) fn prepare_cte_mutation_for_locking(
             materialized.push(MaterializedCte {
                 name: names[index].clone(),
                 alias: cte.alias.clone(),
-                result,
+                source: super::CteSource::Rows(result),
             });
             progressed = true;
         }
@@ -333,7 +333,7 @@ pub(crate) fn materialize_statement_ctes(
         ctes.push(MaterializedCte {
             name,
             alias: cte.alias,
-            result,
+            source: super::CteSource::Rows(result),
         });
     }
     replace_cte_references(&mut query, &ctes);
@@ -527,7 +527,7 @@ fn materialize_recursive_data_modifying_ctes(
             ctes.push(MaterializedCte {
                 name: name.clone(),
                 alias: cte.alias,
-                result,
+                source: super::CteSource::Rows(result),
             });
             progressed = true;
         }

@@ -1,14 +1,17 @@
 use sqlparser::ast;
 
+mod conditionals;
+
 use crate::{
     QueryResult, StatementResult,
     error::{PgError, Result, SqlState},
     executor::{
         DatabaseState, StatementContext,
         expressions::evaluate,
+        lateral::InitplanKey,
         normalize_relation_name,
         outer_references::{
-            NameConflictPolicy, collect_outer_reference_slots, substitute_outer_references,
+            OuterReferenceContext, collect_outer_reference_slots, substitute_outer_references,
         },
         query::execute_query,
         resolve_insert_table_name,
@@ -50,22 +53,37 @@ struct SubqueryMaterializer<'a> {
     error: Option<PgError>,
     defer_unresolved: bool,
     scopes: Vec<BoundScope>,
+    lateral_depth: usize,
 }
 
 impl SubqueryMaterializer<'_> {
     #[cfg_attr(feature = "execution-log", tracing::instrument(skip_all))]
     fn execute(&self, query: &ast::Query) -> Result<QueryResult> {
+        let initplan = InitplanKey::create_scalar(query);
+        if let Some(result) = self
+            .context
+            .lateral_initplans
+            .lock()
+            .expect("lateral initplans mutex is poisoned")
+            .get_result(&initplan)
+        {
+            return Ok(result);
+        }
         if let Some(result) = self.context.get_prepared_subquery_result(query) {
             return Ok(result);
         }
         let original = query.clone();
-        let query = materialize_uncorrelated_subqueries(
-            self.state,
-            &ast::Statement::Query(Box::new(query.clone())),
-            self.xid,
-            self.snapshot,
-            self.context,
-        )?;
+        let query = if self.context.lateral_invocation {
+            ast::Statement::Query(Box::new(query.clone()))
+        } else {
+            materialize_uncorrelated_subqueries(
+                self.state,
+                &ast::Statement::Query(Box::new(query.clone())),
+                self.xid,
+                self.snapshot,
+                self.context,
+            )?
+        };
         let ast::Statement::Query(query) = query else {
             unreachable!("subquery statement remains a query");
         };
@@ -78,12 +96,37 @@ impl SubqueryMaterializer<'_> {
             self.context
                 .set_prepared_subquery_result(&original, result.clone());
         }
+        self.context
+            .lateral_initplans
+            .lock()
+            .expect("lateral initplans mutex is poisoned")
+            .set_result(&initplan, result.clone());
         Ok(result)
     }
 }
 
 impl ast::VisitorMut for SubqueryMaterializer<'_> {
     type Break = ();
+
+    fn pre_visit_table_factor(
+        &mut self,
+        factor: &mut ast::TableFactor,
+    ) -> std::ops::ControlFlow<()> {
+        if matches!(factor, ast::TableFactor::Derived { lateral: true, .. }) {
+            self.lateral_depth += 1;
+        }
+        std::ops::ControlFlow::Continue(())
+    }
+
+    fn post_visit_table_factor(
+        &mut self,
+        factor: &mut ast::TableFactor,
+    ) -> std::ops::ControlFlow<()> {
+        if matches!(factor, ast::TableFactor::Derived { lateral: true, .. }) {
+            self.lateral_depth -= 1;
+        }
+        std::ops::ControlFlow::Continue(())
+    }
 
     #[cfg_attr(feature = "execution-log", tracing::instrument(skip_all))]
     fn pre_visit_query(&mut self, query: &mut ast::Query) -> std::ops::ControlFlow<Self::Break> {
@@ -108,6 +151,25 @@ impl ast::VisitorMut for SubqueryMaterializer<'_> {
 
     #[cfg_attr(feature = "execution-log", tracing::instrument(skip_all))]
     fn pre_visit_expr(&mut self, expr: &mut ast::Expr) -> std::ops::ControlFlow<Self::Break> {
+        if self.lateral_depth > 0 {
+            return std::ops::ControlFlow::Continue(());
+        }
+        if self.context.lateral_invocation && !self.defer_unresolved && contains_subquery(expr) {
+            match conditionals::materialize_selected_branch(
+                self.state,
+                expr,
+                self.xid,
+                self.snapshot,
+                self.context,
+            ) {
+                Ok(Some(selected)) => *expr = selected,
+                Ok(None) => {}
+                Err(error) => {
+                    self.error = Some(error);
+                    return std::ops::ControlFlow::Break(());
+                }
+            }
+        }
         if !matches!(
             expr,
             ast::Expr::AnyOp { right, .. } | ast::Expr::AllOp { right, .. }
@@ -387,6 +449,7 @@ fn materialize_subqueries<V: ast::VisitMut>(
     scopes: Vec<BoundScope>,
 ) -> Result<()> {
     let mut materializer = SubqueryMaterializer {
+        lateral_depth: 0,
         state,
         xid,
         snapshot,
@@ -422,7 +485,7 @@ pub(super) fn evaluate_query_expression(
         scope,
         row,
         Vec::new(),
-        NameConflictPolicy::PreferInner,
+        OuterReferenceContext::Subquery,
     )?;
     materialize_subqueries(
         state,

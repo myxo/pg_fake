@@ -182,6 +182,20 @@ fn infer_join_expression_parameters(
         .chain(table.joins.iter().map(|j| &j.relation))
         .enumerate()
     {
+        if let ast::TableFactor::Derived {
+            lateral: true,
+            subquery,
+            ..
+        } = factor
+        {
+            let (query, _) = executor::bind_lateral_query(
+                catalog,
+                subquery,
+                visible,
+                &vec![crate::value::Value::Null; visible.count_columns()],
+            )?;
+            infer_query_parameters(&query, catalog, None, types)?;
+        }
         if let ast::TableFactor::NestedJoin {
             table_with_joins, ..
         } = factor
@@ -243,9 +257,11 @@ fn infer_table_factor_parameters(
         constrain_parameter_type(argument, Some(base), types)?;
     }
     match factor {
-        ast::TableFactor::Derived { subquery, .. } => {
-            infer_query_parameters(subquery, catalog, None, types)
-        }
+        ast::TableFactor::Derived {
+            lateral: false,
+            subquery,
+            ..
+        } => infer_query_parameters(subquery, catalog, None, types),
         ast::TableFactor::NestedJoin {
             table_with_joins, ..
         } => {

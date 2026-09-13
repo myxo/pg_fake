@@ -39,6 +39,25 @@ pub struct Scenario {
 
 pub const FEATURES: &[Feature] = &[
     Feature {
+        name: "bounded LATERAL joins",
+        cases: &[
+            Case {
+                id: "lateral_per_parent_limit",
+                source: "tests/fixtures/lateral.sql",
+                setup: &[],
+                sql: "SELECT p.id, x.id FROM (VALUES (1), (2), (3)) p(id) LEFT JOIN LATERAL (SELECT c.id FROM (VALUES (10, 1), (11, 1), (20, 2)) c(id, parent_id) WHERE c.parent_id = p.id ORDER BY c.id DESC LIMIT 1) x ON TRUE ORDER BY p.id",
+                blocker: BlockerKind::Implementation,
+            },
+            Case {
+                id: "lateral_aggregate",
+                source: "tests/fixtures/lateral.sql",
+                setup: &[],
+                sql: "SELECT p.id, x.n FROM (VALUES (1), (2)) p(id) CROSS JOIN LATERAL (SELECT count(*) AS n FROM (VALUES (1), (1)) c(id) WHERE c.id = p.id) x ORDER BY p.id",
+                blocker: BlockerKind::Implementation,
+            },
+        ],
+    },
+    Feature {
         name: "runtime temporal, numeric, and pattern expressions",
         cases: &[
             Case {

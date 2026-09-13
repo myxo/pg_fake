@@ -38,6 +38,8 @@ pub(crate) struct StatementContext {
     pub(crate) executed_ctes: Arc<Mutex<Vec<(Span, String)>>>,
     pub(crate) pending_cte_mutations: Arc<Mutex<Vec<PendingCteMutation>>>,
     pub(crate) prepared_subquery_results: Arc<Mutex<SubqueryResultCache>>,
+    pub(crate) lateral_initplans: Arc<Mutex<super::lateral::InitplanCache>>,
+    pub(crate) lateral_invocation: bool,
     pub(crate) prepares_subquery_results: Arc<AtomicBool>,
     pub(crate) row_lock_recheck: Arc<AtomicBool>,
     pub(crate) row_lock_recheck_locks: Arc<Mutex<Vec<RequiredRowLock>>>,

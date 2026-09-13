@@ -306,6 +306,11 @@ impl Session {
             executed_ctes: Arc::new(Mutex::new(Vec::new())),
             pending_cte_mutations: Arc::new(Mutex::new(Vec::new())),
             prepared_subquery_results: Arc::new(Mutex::new(Default::default())),
+            lateral_initplans: Arc::new(Mutex::new(executor::collect_lateral_initplans(
+                &state.catalog,
+                statement,
+            ))),
+            lateral_invocation: false,
             prepares_subquery_results: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             row_lock_recheck: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             row_lock_recheck_locks: Arc::new(Mutex::new(Vec::new())),

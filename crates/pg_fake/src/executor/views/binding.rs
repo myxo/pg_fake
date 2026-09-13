@@ -1,7 +1,5 @@
-use super::{
-    cte_scope::{CteNameScope, enter_cte_scope},
-    quote_identifier,
-};
+use super::quote_identifier;
+use crate::executor::ctes::scope::{CteNameScope, enter_cte_scope};
 use crate::executor::{
     DatabaseState, create_relation_object_name, normalize_relation_name, normalize_sequence_name,
     normalize_unqualified_object_name, query,

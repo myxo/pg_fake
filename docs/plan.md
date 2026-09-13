@@ -1070,7 +1070,42 @@ application queries.
   epochs/numbers, formatting, escaping, invalid inputs, NULLs, and collation
   assumptions.
 
-### Task 22 — Bounded `LATERAL` joins
+### Task 22 — Bounded `LATERAL` joins [COMPLETE]
+
+**Progress:** Implementation, review, and validation are complete.
+Implemented correlated derived SELECT/VALUES sources
+with CROSS/INNER/LEFT joins, preceding FROM references, aliases, per-parent
+ordering/limits, aggregate/CTE/JSONB/temporal composition, prepared parameters,
+and focused plus generated PostgreSQL 18 comparisons. Uncorrelated RIGHT/FULL
+sources remain legal; references to their left input are rejected. Existing
+JSON table functions retain their supported surface; other table functions
+remain unsupported. A representative per-parent lookup benchmark is included.
+The user authorized completion and a commit for each of Tasks 22–24 without
+an additional approval step. Review and the property gate still apply.
+
+- [x] Add correlated SELECT/VALUES sources, per-parent ordering/limits, and
+  CROSS/INNER/LEFT join execution, including nested scopes and alias metadata.
+- [x] Add focused SQLx differential fixtures, generated joins, manifest cases,
+  and the per-parent lookup benchmark.
+- [x] Resolve all review findings, including lazy volatile evaluation, independent
+  scalar/CTE reuse, recursive demand, and nested CTE visibility. The final review
+  replayed 65 statements without finding a remaining problem.
+- [x] Pass workspace regressions, strict Clippy, formatting, the exact property
+  gate, and execute the PostgreSQL benchmark.
+- [x] Mark complete and commit under the user's existing authorization.
+
+**Validation:** The focused LATERAL suite passes all three tests. Workspace
+tests (`cargo test --workspace -- --skip generated_`), strict Clippy, formatting,
+and the exact `CHAOS_THEORY_CHECK_ITERS=10000 CHAOS_THEORY_CHECK_TIME=600s
+cargo test -p pg_fake_sqlx --test property_tests` gate pass; the latter completes
+all 15 tests in 627.58 seconds. The final subagent review has no remaining findings.
+
+The isolated PostgreSQL 18 benchmark, run after concurrent tests finish, measures
+the 100-parent lookup at approximately 3.61 milliseconds for `pg_fake` versus
+530 microseconds for PostgreSQL. It misses the project's speed target. This short
+10-sample measurement uses the release build before the final nested-WITH metadata
+fix; the benchmark has no WITH clause and its execution path is unchanged.
+No benchmark baseline was changed.
 
 **Goal:** Execute common correlated lateral subquery shapes.
 

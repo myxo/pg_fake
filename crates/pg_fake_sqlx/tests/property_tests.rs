@@ -2731,3 +2731,66 @@ fn matches_generated_runtime_expressions() {
         }
     });
 }
+
+#[test]
+fn matches_generated_lateral_joins() {
+    let server = start_isolated_postgres_server();
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap();
+    let postgres = RefCell::new(
+        runtime
+            .block_on(PgConnection::connect(&server.url))
+            .unwrap(),
+    );
+    let fake = RefCell::new(PgFakeConnection::new(Db::create()));
+    check(|src| {
+        let parents = (0..src.any_of("parents", int_in(1..=6)))
+            .map(|id| {
+                format!(
+                    "({id}, {})",
+                    if src.any("null") {
+                        "NULL::integer".to_owned()
+                    } else {
+                        integer(src, "value").to_string()
+                    }
+                )
+            })
+            .collect::<Vec<_>>()
+            .join(",");
+        let children = (0..src.any_of("children", int_in(1..=8)))
+            .map(|id| {
+                format!(
+                    "({id}, {}, {})",
+                    src.any_of("parent", int_in(0..=6)),
+                    integer(src, "amount")
+                )
+            })
+            .collect::<Vec<_>>()
+            .join(",");
+        let limit = src.any_of("limit", int_in(0..=4));
+        let offset = src.any_of("offset", int_in(0..=3));
+        let shape = src.any_of("shape", int_in(0..=6));
+        let inner = match shape {
+            0 => format!("SELECT c.id AS value FROM (VALUES {children}) c(id, parent_id, amount) WHERE c.parent_id = p.id ORDER BY c.amount, c.id LIMIT {limit} OFFSET {offset}"),
+            1 => format!("SELECT sum(c.amount) AS value FROM (VALUES {children}) c(id, parent_id, amount) WHERE c.parent_id = p.id"),
+            2 => "SELECT p.amount + y.value AS value FROM (VALUES (1), (2)) y(value) WHERE p.amount IS NOT NULL".to_owned(),
+            3 => "SELECT z.value FROM (VALUES (1)) y(value) CROSS JOIN LATERAL (SELECT p.amount + y.value AS value) z".to_owned(),
+            4 => "WITH y AS (SELECT p.amount AS value) SELECT value FROM y".to_owned(),
+            5 => "SELECT p.amount AS value FROM (VALUES (3)) p(amount) UNION ALL SELECT p.amount".to_owned(),
+            _ => "WITH RECURSIVE y(value) AS (SELECT p.id UNION ALL SELECT value + 1 FROM y WHERE value < 4) SELECT value FROM y".to_owned(),
+        };
+        let join = if src.any("left") { "LEFT" } else { "INNER" };
+        let sql = format!(
+            "SELECT p.id, x.value FROM (VALUES {parents}) p(id, amount) {join} JOIN LATERAL ({inner}) x ON TRUE ORDER BY p.id, x.value"
+        );
+        assert_statement(
+            &runtime,
+            &mut postgres.borrow_mut(),
+            &mut fake.borrow_mut(),
+            &sql,
+            RowOrder::Ordered,
+        );
+    });
+}

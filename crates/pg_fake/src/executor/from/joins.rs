@@ -4,7 +4,8 @@ use crate::{
     executor::{
         DatabaseState, StatementContext,
         equality::{EqualityKey, create_equality_key},
-        json, normalize_relation_name, normalize_unqualified_object_name,
+        lateral::contains_lateral_source,
+        normalize_relation_name, normalize_unqualified_object_name,
         scope::{self, BoundScope, try_resolve_column_reference},
         subqueries::evaluate_query_expression,
     },
@@ -377,7 +378,7 @@ pub(super) fn materialize_table_with_joins_rows(
     }
     for join in &table.joins {
         let right_start = *next_slot;
-        if json::contains_json_expansion(&join.relation)
+        if contains_lateral_source(&join.relation)
             && !matches!(
                 join.join_operator,
                 ast::JoinOperator::Right(_)

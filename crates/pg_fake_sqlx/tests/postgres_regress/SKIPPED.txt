@@ -113,7 +113,7 @@ select_into:5
 select_views:4
 sequence:7
 strings:1
-subselect:6
+subselect:9
 temp:21
 text:1
 time:4

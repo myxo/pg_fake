@@ -23,6 +23,7 @@ mod foreign_keys;
 mod from;
 mod indexes;
 mod json;
+mod lateral;
 mod locks;
 mod outer_references;
 mod prepared;
@@ -53,6 +54,8 @@ pub(crate) use json::{
     JsonTableFunction, extract_json_table_function, resolve_json_function_arguments,
     resolve_json_operator_types,
 };
+pub(crate) use lateral::bind_lateral_query;
+pub(crate) use lateral::collect_lateral_initplans;
 pub(crate) use locks::{
     MutationCandidate, RequiredRowLock, collect_required_cte_row_locks, collect_required_row_locks,
     mutation_locks_cover_targets,

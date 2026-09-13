@@ -23,6 +23,25 @@ pub(crate) use subqueries::substitute_typed_subqueries;
 use parameter_types::{constrain_statement_parameters, finalize_parameter_types};
 use validation::validate_statement;
 
+pub(crate) fn bind_query_parameters_for_analysis(
+    query: &ast::Query,
+    catalog: &Catalog,
+) -> Result<ast::Query> {
+    let statement = ast::Statement::Query(Box::new(query.clone()));
+    let count = count_parameters(&statement)?;
+    if count == 0 {
+        return Ok(query.clone());
+    }
+    let mut types = vec![None; count];
+    constrain_statement_parameters(&statement, catalog, &mut types)?;
+    let types = finalize_parameter_types(types);
+    let bound = bind_parameters(&statement, &types, &vec![Value::Null; count])?;
+    let ast::Statement::Query(query) = bound.into_owned() else {
+        unreachable!("query binding")
+    };
+    Ok(*query)
+}
+
 #[cfg_attr(feature = "execution-log", tracing::instrument(skip_all))]
 pub(crate) fn analyze_prepared_statement_parameters<'a>(
     described: &'a ast::Statement,

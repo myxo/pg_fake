@@ -9,7 +9,7 @@ use crate::{
         create_relation_object_name,
         expressions::{evaluate, extract_unknown_string_literal, infer_expression_type},
         normalize_identifier, normalize_relation_name, normalize_unqualified_object_name,
-        outer_references::{NameConflictPolicy, substitute_outer_references},
+        outer_references::{OuterReferenceContext, substitute_outer_references},
         scope::{BoundScope, RowScope, bind_target_scope},
         writes,
     },
@@ -592,7 +592,7 @@ pub(crate) fn substitute_procedural_references(
         scope,
         row,
         scopes,
-        NameConflictPolicy::RejectAmbiguous,
+        OuterReferenceContext::Procedural,
     )
     .map(|_| ())
 }

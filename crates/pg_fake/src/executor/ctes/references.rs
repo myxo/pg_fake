@@ -69,7 +69,7 @@ pub(super) fn reject_cte_forward_references(
 
 struct CteReferenceCollector<'a> {
     names: &'a [String],
-    masked: Vec<Vec<String>>,
+    masked: Vec<super::scope::CteNameScope>,
     found: BTreeSet<String>,
 }
 
@@ -78,18 +78,7 @@ impl ast::VisitorMut for CteReferenceCollector<'_> {
 
     #[cfg_attr(feature = "execution-log", tracing::instrument(skip_all))]
     fn pre_visit_query(&mut self, query: &mut ast::Query) -> std::ops::ControlFlow<Self::Break> {
-        self.masked.push(
-            query
-                .with
-                .as_ref()
-                .map(|with| {
-                    with.cte_tables
-                        .iter()
-                        .map(|cte| normalize_identifier(&cte.alias.name))
-                        .collect()
-                })
-                .unwrap_or_default(),
-        );
+        super::scope::enter_cte_scope(&mut self.masked, query);
         std::ops::ControlFlow::Continue(())
     }
 
@@ -113,7 +102,12 @@ impl ast::VisitorMut for CteReferenceCollector<'_> {
         let Ok(name) = normalize_unqualified_object_name(name) else {
             return std::ops::ControlFlow::Continue(());
         };
-        if self.names.contains(&name) && !self.masked.iter().any(|masked| masked.contains(&name)) {
+        if self.names.contains(&name)
+            && !self
+                .masked
+                .last()
+                .is_some_and(|scope| scope.body_mask.contains(&name))
+        {
             self.found.insert(name);
         }
         std::ops::ControlFlow::Continue(())
@@ -166,12 +160,14 @@ pub(super) fn replace_cte_references(query: &mut ast::Query, ctes: &[Materialize
     let _ = query.visit(&mut CteReferenceReplacer {
         ctes,
         masked: Vec::new(),
+        replacement_depth: None,
     });
 }
 
 struct CteReferenceReplacer<'a> {
     ctes: &'a [MaterializedCte],
-    masked: Vec<Vec<String>>,
+    masked: Vec<super::scope::CteNameScope>,
+    replacement_depth: Option<usize>,
 }
 
 impl ast::VisitorMut for CteReferenceReplacer<'_> {
@@ -179,24 +175,16 @@ impl ast::VisitorMut for CteReferenceReplacer<'_> {
 
     #[cfg_attr(feature = "execution-log", tracing::instrument(skip_all))]
     fn pre_visit_query(&mut self, query: &mut ast::Query) -> std::ops::ControlFlow<Self::Break> {
-        self.masked.push(
-            query
-                .with
-                .as_ref()
-                .map(|with| {
-                    with.cte_tables
-                        .iter()
-                        .map(|cte| normalize_identifier(&cte.alias.name))
-                        .collect()
-                })
-                .unwrap_or_default(),
-        );
+        super::scope::enter_cte_scope(&mut self.masked, query);
         std::ops::ControlFlow::Continue(())
     }
 
     #[cfg_attr(feature = "execution-log", tracing::instrument(skip_all))]
     fn post_visit_query(&mut self, _query: &mut ast::Query) -> std::ops::ControlFlow<Self::Break> {
         self.masked.pop().expect("visited query pushed CTE mask");
+        if self.replacement_depth == Some(self.masked.len()) {
+            self.replacement_depth = None;
+        }
         std::ops::ControlFlow::Continue(())
     }
 
@@ -205,6 +193,9 @@ impl ast::VisitorMut for CteReferenceReplacer<'_> {
         &mut self,
         factor: &mut ast::TableFactor,
     ) -> std::ops::ControlFlow<Self::Break> {
+        if self.replacement_depth.is_some() {
+            return std::ops::ControlFlow::Continue(());
+        }
         let ast::TableFactor::Table {
             name,
             alias,
@@ -218,13 +209,20 @@ impl ast::VisitorMut for CteReferenceReplacer<'_> {
             return std::ops::ControlFlow::Continue(());
         };
         let Some(cte) = self.ctes.iter().rev().find(|cte| {
-            cte.name == name && !self.masked.iter().any(|masked| masked.contains(&name))
+            cte.name == name
+                && !self
+                    .masked
+                    .last()
+                    .is_some_and(|scope| scope.body_mask.contains(&name))
         }) else {
             return std::ops::ControlFlow::Continue(());
         };
+        let (columns, query) = match &cte.source {
+            super::CteSource::Rows(result) => (&result.columns, create_cte_values_query(result)),
+            super::CteSource::Query { query, columns } => (columns, query.as_ref().clone()),
+        };
         let columns = if cte.alias.columns.is_empty() {
-            cte.result
-                .columns
+            columns
                 .iter()
                 .map(|column| ast::TableAliasColumnDef {
                     name: ast::Ident::with_quote('"', column.name.clone()),
@@ -248,10 +246,11 @@ impl ast::VisitorMut for CteReferenceReplacer<'_> {
         };
         *factor = ast::TableFactor::Derived {
             lateral: false,
-            subquery: Box::new(create_cte_values_query(&cte.result)),
+            subquery: Box::new(query),
             alias: Some(alias),
             sample: None,
         };
+        self.replacement_depth = Some(self.masked.len());
         std::ops::ControlFlow::Continue(())
     }
 }

@@ -2,14 +2,14 @@ use crate::executor::normalize_identifier;
 use sqlparser::ast;
 
 #[derive(Clone)]
-pub(super) struct CteNameScope {
-    pub(super) body_mask: Vec<String>,
+pub(in crate::executor) struct CteNameScope {
+    pub(in crate::executor) body_mask: Vec<String>,
     cte_queries: Vec<ast::Query>,
     cte_masks: Vec<Vec<String>>,
     next_cte: usize,
 }
 
-pub(super) fn enter_cte_scope(stack: &mut Vec<CteNameScope>, query: &ast::Query) {
+pub(in crate::executor) fn enter_cte_scope(stack: &mut Vec<CteNameScope>, query: &ast::Query) {
     let inherited = stack.last_mut().map_or_else(Vec::new, |parent| {
         if parent
             .cte_queries

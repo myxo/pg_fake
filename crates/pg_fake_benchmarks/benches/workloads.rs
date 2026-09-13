@@ -1589,6 +1589,7 @@ fn benchmarks(criterion: &mut Criterion) {
         concurrency_benchmark(criterion, &runtime);
         foreign_key_insert_benchmark(criterion, &runtime, &mut connections);
         inner_join_benchmark(criterion, &runtime, &mut connections);
+        benchmark_lateral(criterion, &runtime, &mut connections);
         derived_and_scalar_subquery_benchmark(criterion, &runtime, &mut connections);
         materialized_cte_benchmark(criterion, &runtime, &mut connections);
         data_modifying_cte_benchmark(criterion, &runtime, &mut connections);
@@ -2021,6 +2022,40 @@ fn inner_join_benchmark(
             runtime,
             "DROP TABLE selective_inner_join_left, selective_inner_join_right, many_match_inner_join_left, many_match_inner_join_right",
         );
+    }
+}
+
+fn benchmark_lateral(
+    criterion: &mut Criterion,
+    runtime: &Runtime,
+    connections: &mut [NamedBenchmarkConnection<'_>],
+) {
+    let values = (1..=100)
+        .map(|id| format!("({id}, {})", id % 10))
+        .collect::<Vec<_>>()
+        .join(",");
+    for (_, connection) in connections.iter_mut() {
+        connection.execute(
+            runtime,
+            "CREATE TABLE lateral_benchmark_items (id INTEGER, parent_id INTEGER)",
+        );
+        connection.execute(
+            runtime,
+            &format!("INSERT INTO lateral_benchmark_items VALUES {values}"),
+        );
+    }
+    let query = "SELECT p.id, x.id FROM lateral_benchmark_items p LEFT JOIN LATERAL (SELECT c.id FROM lateral_benchmark_items c WHERE c.parent_id = p.parent_id ORDER BY c.id DESC LIMIT 1) x ON TRUE";
+    let mut group = criterion
+        .benchmark_group(benchmarks::find_benchmark("lateral_latest_per_parent_100_rows").name);
+    group.throughput(Throughput::Elements(100));
+    for (name, connection) in connections.iter_mut() {
+        group.bench_function(*name, |benchmark| {
+            benchmark.iter(|| connection.fetch(runtime, query))
+        });
+    }
+    group.finish();
+    for (_, connection) in connections.iter_mut() {
+        connection.execute(runtime, "DROP TABLE lateral_benchmark_items");
     }
 }
 

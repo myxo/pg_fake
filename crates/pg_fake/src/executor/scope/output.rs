@@ -132,6 +132,21 @@ pub(super) fn describe_bound_query_columns(
     query: &ast::Query,
     outer: Option<&BoundScope>,
 ) -> Result<Vec<BoundColumn>> {
+    if query.with.is_some() {
+        let mut query = query.clone();
+        if let Some(outer) = outer {
+            crate::executor::outer_references::substitute_outer_references(
+                catalog,
+                &mut query,
+                outer,
+                &vec![crate::value::Value::Null; outer.columns.len()],
+                Vec::new(),
+                crate::executor::outer_references::OuterReferenceContext::Subquery,
+            )?;
+        }
+        let query = crate::executor::ctes::inline_query_ctes(&query, catalog, None, true)?;
+        return describe_bound_query_columns(catalog, &query, None);
+    }
     match query.body.as_ref() {
         ast::SetExpr::Select(select) => {
             let scope = match outer {

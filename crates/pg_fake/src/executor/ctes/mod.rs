@@ -19,8 +19,11 @@ mod analysis;
 mod mutations;
 mod recursive;
 mod references;
+pub(super) mod scope;
 
 pub(crate) use analysis::expand_ctes_for_analysis;
+pub(super) use analysis::inline_query_ctes;
+pub(super) use analysis::{InlineCte, collect_query_cte_scope, inline_query_with_cte_scope};
 pub(crate) use mutations::materialize_statement_ctes;
 pub(super) use mutations::prepare_cte_mutation_for_locking;
 pub(super) use references::{
@@ -33,7 +36,15 @@ use references::{reject_cte_forward_references, replace_cte_references};
 struct MaterializedCte {
     name: String,
     alias: ast::TableAlias,
-    result: QueryResult,
+    source: CteSource,
+}
+
+enum CteSource {
+    Rows(QueryResult),
+    Query {
+        query: Box<ast::Query>,
+        columns: Vec<crate::ColumnMeta>,
+    },
 }
 
 #[cfg_attr(feature = "execution-log", tracing::instrument(skip_all))]
@@ -63,6 +74,15 @@ fn execute_prepared_cte_query(
     snapshot: &Snapshot,
     context: &StatementContext,
 ) -> Result<QueryResult> {
+    let initplan = super::lateral::InitplanKey::Cte(occurrence, name.to_owned());
+    if let Some(result) = context
+        .lateral_initplans
+        .lock()
+        .expect("lateral initplans mutex is poisoned")
+        .get_result(&initplan)
+    {
+        return Ok(result);
+    }
     if let Some(result) = context.get_prepared_cte_result(occurrence, name) {
         return Ok(result);
     }
@@ -70,6 +90,11 @@ fn execute_prepared_cte_query(
     else {
         unreachable!("CTE query produces query rows")
     };
+    context
+        .lateral_initplans
+        .lock()
+        .expect("lateral initplans mutex is poisoned")
+        .set_result(&initplan, result.clone());
     Ok(result)
 }
 
@@ -79,6 +104,7 @@ struct DerivedCteMaterializer<'a> {
     snapshot: &'a Snapshot,
     context: &'a StatementContext,
     error: Option<PgError>,
+    lateral_depth: usize,
 }
 
 impl ast::VisitorMut for DerivedCteMaterializer<'_> {
@@ -89,6 +115,12 @@ impl ast::VisitorMut for DerivedCteMaterializer<'_> {
         &mut self,
         factor: &mut ast::TableFactor,
     ) -> std::ops::ControlFlow<Self::Break> {
+        if matches!(factor, ast::TableFactor::Derived { lateral: true, .. }) {
+            self.lateral_depth += 1;
+        }
+        if self.lateral_depth > 0 {
+            return std::ops::ControlFlow::Continue(());
+        }
         let ast::TableFactor::Derived { subquery, .. } = factor else {
             return std::ops::ControlFlow::Continue(());
         };
@@ -101,6 +133,16 @@ impl ast::VisitorMut for DerivedCteMaterializer<'_> {
                 self.error = Some(error);
                 return std::ops::ControlFlow::Break(());
             }
+        }
+        std::ops::ControlFlow::Continue(())
+    }
+
+    fn post_visit_table_factor(
+        &mut self,
+        factor: &mut ast::TableFactor,
+    ) -> std::ops::ControlFlow<()> {
+        if matches!(factor, ast::TableFactor::Derived { lateral: true, .. }) {
+            self.lateral_depth -= 1;
         }
         std::ops::ControlFlow::Continue(())
     }
@@ -117,6 +159,7 @@ pub(super) fn materialize_query_ctes(
     let mut query = query.clone();
     let Some(with) = query.with.take() else {
         let mut materializer = DerivedCteMaterializer {
+            lateral_depth: 0,
             state,
             xid,
             snapshot,
@@ -172,6 +215,29 @@ pub(super) fn materialize_query_ctes(
             continue;
         }
         replace_cte_references(&mut cte_query, &ctes);
+        if context.lateral_invocation {
+            let analysis = inline_query_ctes(&cte_query, &state.catalog, Some(state), true)?;
+            let mut columns =
+                describe_query_result_columns(state, &ast::Statement::Query(Box::new(analysis)))?;
+            if cte.alias.columns.len() > columns.len() {
+                return Err(PgError::create(
+                    SqlState::InvalidColumnReference,
+                    "WITH query has fewer columns than specified in column list",
+                ));
+            }
+            for (column, alias) in columns.iter_mut().zip(&cte.alias.columns) {
+                column.name = normalize_identifier(&alias.name);
+            }
+            ctes.push(MaterializedCte {
+                name,
+                alias: cte.alias,
+                source: CteSource::Query {
+                    query: Box::new(cte_query),
+                    columns,
+                },
+            });
+            continue;
+        }
         let result = if skips_rows {
             QueryResult {
                 columns: describe_query_result_columns(
@@ -204,7 +270,7 @@ pub(super) fn materialize_query_ctes(
         ctes.push(MaterializedCte {
             name,
             alias: cte.alias,
-            result,
+            source: CteSource::Rows(result),
         });
     }
     replace_cte_references(&mut query, &ctes);

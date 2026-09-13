@@ -99,12 +99,28 @@ pub(super) fn infer_expression_parameters(
                 let left_expected = if boolean {
                     Some(BaseType::Bool)
                 } else {
-                    executor::infer_expression_type(right, schema).ok()
+                    executor::infer_expression_type(right, schema)
+                        .ok()
+                        .map(|base| {
+                            if base == BaseType::Varchar {
+                                BaseType::Text
+                            } else {
+                                base
+                            }
+                        })
                 };
                 let right_expected = if boolean {
                     Some(BaseType::Bool)
                 } else {
-                    executor::infer_expression_type(left, schema).ok()
+                    executor::infer_expression_type(left, schema)
+                        .ok()
+                        .map(|base| {
+                            if base == BaseType::Varchar {
+                                BaseType::Text
+                            } else {
+                                base
+                            }
+                        })
                 };
                 constrain_parameter_type(left, left_expected, types)
                     .and_then(|()| constrain_parameter_type(right, right_expected, types))

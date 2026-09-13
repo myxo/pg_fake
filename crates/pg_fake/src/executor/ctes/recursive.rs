@@ -340,7 +340,8 @@ pub(super) fn materialize_recursive_query_ctes(
         }
         reachable = expanded;
     }
-    let skips_rows = has_zero_limit(&query);
+    let skips_rows = has_zero_limit(&query)
+        || matches!(query.body.as_ref(), ast::SetExpr::Select(select) if crate::executor::lateral::skips_lateral_rows(select.selection.as_ref(), context));
     let mut pending = with.cte_tables.into_iter().map(Some).collect::<Vec<_>>();
     let mut ctes = Vec::new();
     while ctes.len() < reachable.len() {
@@ -414,7 +415,7 @@ pub(super) fn materialize_recursive_query_ctes(
             ctes.push(MaterializedCte {
                 name: name.clone(),
                 alias: cte.alias,
-                result,
+                source: super::CteSource::Rows(result),
             });
             progressed = true;
         }
@@ -537,10 +538,10 @@ pub(super) fn describe_recursive_cte_columns(
         &[MaterializedCte {
             name: name.to_owned(),
             alias: alias.clone(),
-            result: QueryResult {
+            source: super::CteSource::Rows(QueryResult {
                 columns: seed_columns.clone(),
                 rows: Vec::new(),
-            },
+            }),
         }],
     );
     let recursive_columns =
@@ -594,33 +595,40 @@ pub(super) fn execute_recursive_cte(
             (None, Some(output_demand)) => offset.saturating_add(output_demand),
             (None, None) => usize::MAX,
         });
-    let StatementResult::Query(mut seed) = execute_query(
-        state,
-        &create_set_expression_query((**left).clone()),
-        xid,
-        snapshot,
-        context,
-    )?
-    else {
-        unreachable!("recursive seed produces query rows");
+    let initplan = crate::executor::lateral::InitplanKey::Cte(alias.name.span, name.to_owned());
+    let cached = context
+        .lateral_initplans
+        .lock()
+        .expect("lateral initplans mutex is poisoned")
+        .take_recursive_rows(&initplan);
+    let (mut rows, mut working) = if let Some(cached) = cached {
+        (cached.rows, cached.working)
+    } else {
+        let StatementResult::Query(mut seed) = execute_query(
+            state,
+            &create_set_expression_query((**left).clone()),
+            xid,
+            snapshot,
+            context,
+        )?
+        else {
+            unreachable!("recursive seed produces query rows");
+        };
+        if alias.columns.len() > seed.columns.len() {
+            return Err(PgError::create(
+                SqlState::InvalidColumnReference,
+                "WITH query has fewer columns than specified in column list",
+            ));
+        }
+        for (column, alias) in seed.columns.iter_mut().zip(&alias.columns) {
+            column.name = normalize_identifier(&alias.name);
+        }
+        let mut rows = coerce_set_rows(seed.rows, &seed.columns, &columns)?;
+        if distinct {
+            rows = remove_set_duplicates(rows)?;
+        }
+        (rows.clone(), rows)
     };
-    if alias.columns.len() > seed.columns.len() {
-        return Err(PgError::create(
-            SqlState::InvalidColumnReference,
-            "WITH query has fewer columns than specified in column list",
-        ));
-    }
-    for (column, alias) in seed.columns.iter_mut().zip(&alias.columns) {
-        column.name = normalize_identifier(&alias.name);
-    }
-    let mut rows = coerce_set_rows(seed.rows, &seed.columns, &columns)?;
-    if distinct {
-        rows = remove_set_duplicates(rows)?;
-    }
-    if let Some(generation_demand) = generation_demand {
-        rows.truncate(generation_demand);
-    }
-    let mut working = rows.clone();
     while !working.is_empty()
         && generation_demand.is_none_or(|generation_demand| rows.len() < generation_demand)
     {
@@ -630,10 +638,10 @@ pub(super) fn execute_recursive_cte(
             &[MaterializedCte {
                 name: name.to_owned(),
                 alias: alias.clone(),
-                result: QueryResult {
+                source: super::CteSource::Rows(QueryResult {
                     columns: columns.clone(),
                     rows: working,
-                },
+                }),
             }],
         );
         let StatementResult::Query(result) =
@@ -660,18 +668,30 @@ pub(super) fn execute_recursive_cte(
             }
             working = new_rows;
         }
-        if let Some(generation_demand) = generation_demand {
-            working.truncate(generation_demand - rows.len());
-        }
         rows.extend(working.iter().cloned());
     }
+    context
+        .lateral_initplans
+        .lock()
+        .expect("lateral initplans mutex is poisoned")
+        .set_recursive_rows(
+            initplan,
+            crate::executor::lateral::RecursiveRows {
+                rows: rows.clone(),
+                working,
+            },
+        );
     let mut result = QueryResult { columns, rows };
     sort_set_rows(&mut result.rows, &result.columns, query)?;
     result.rows = result
         .rows
         .into_iter()
         .skip(offset)
-        .take(limit.unwrap_or(usize::MAX))
+        .take(
+            limit
+                .unwrap_or(usize::MAX)
+                .min(output_demand.unwrap_or(usize::MAX)),
+        )
         .collect();
     Ok(result)
 }
