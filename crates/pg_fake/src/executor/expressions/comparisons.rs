@@ -77,7 +77,7 @@ pub(in crate::executor) fn compare_values(left: &Value, right: &Value) -> Result
 }
 
 pub(in crate::executor) fn validate_equality_type(data_type: BaseType) -> Result<()> {
-    if data_type == BaseType::Json {
+    if matches!(data_type, BaseType::Json | BaseType::Void) {
         Err(create_missing_operator_error(data_type))
     } else {
         Ok(())

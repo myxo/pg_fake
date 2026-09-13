@@ -116,6 +116,16 @@ pub(crate) fn collect_required_cte_row_locks(
                         context.take_row_lock_recheck_locks();
                         return Ok(locks);
                     }
+                    if update.returning.is_some()
+                        && crate::advisory::contains_advisory_function(update)
+                    {
+                        context.defer_cte_mutation(
+                            cte.alias.name.span,
+                            name.clone(),
+                            statement.clone(),
+                        );
+                        return Ok(locks);
+                    }
                     continue;
                 }
                 ast::Statement::Delete(delete) => {
@@ -124,6 +134,16 @@ pub(crate) fn collect_required_cte_row_locks(
                     )?);
                     if context.requires_row_lock_recheck() {
                         context.take_row_lock_recheck_locks();
+                        return Ok(locks);
+                    }
+                    if delete.returning.is_some()
+                        && crate::advisory::contains_advisory_function(delete)
+                    {
+                        context.defer_cte_mutation(
+                            cte.alias.name.span,
+                            name.clone(),
+                            statement.clone(),
+                        );
                         return Ok(locks);
                     }
                     continue;

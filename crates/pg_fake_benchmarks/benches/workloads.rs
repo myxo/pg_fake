@@ -315,7 +315,7 @@ fn benchmark_sqlx_migration_chain(
         CREATE VIEW migration_chain_view AS \
             SELECT id, number FROM migration_chain_entries WHERE number IS NOT NULL; \
         COMMENT ON VIEW migration_chain_view IS 'migration benchmark'";
-    let mut migrator = Migrator::with_migrations(vec![
+    let migrator = Migrator::with_migrations(vec![
         Migration::new(
             1,
             Cow::Borrowed("create migration benchmark schema"),
@@ -347,7 +347,6 @@ fn benchmark_sqlx_migration_chain(
             false,
         ),
     ]);
-    migrator.set_locking(false);
     let mut group =
         criterion.benchmark_group(benchmarks::find_benchmark("sqlx_migration_chain").name);
     for (name, connection) in connections.iter_mut() {

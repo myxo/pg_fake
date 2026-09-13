@@ -69,11 +69,14 @@ ambiguity, selects wildcard outputs, and reads merged JOIN/USING columns.
 ## Statement state
 
 [`executor/context.rs`](../crates/pg_fake/src/executor/context.rs) owns
-`StatementContext`: statement timestamps, timeout, random and sequence execution,
+`StatementContext`: statement timestamps, timeout, random, sequence and advisory execution,
 source snapshots, and cached evaluations shared by locking and execution. INSERT
 preparations, UPDATE rows, mutation targets, CTE results, and subquery results keep
 their existing occurrence and snapshot keys. Row-lock recheck requests preserve
-progress when execution must wait.
+progress when execution must wait. Expression cursors retain completed operands;
+query and mutation cursors retain bounds, grouped inputs, VALUES cells, source
+rows, and pending RETURNING rows. Correlated scalar invocations receive distinct
+identities even when their outer values are equal.
 
 ## Query execution
 
@@ -98,7 +101,8 @@ ordering, distinctness, and limits.
   lock waits and consumer requests. Derived projections retain their original
   source rows for tuple refresh and predicate rechecks.
 - [`limits.rs`](../crates/pg_fake/src/executor/query/limits.rs) resolves
-  `LIMIT` and `OFFSET`, including NULL, `ALL`, and invalid row counts.
+  `LIMIT` and `OFFSET`, including NULL, `ALL`, and invalid row counts, retaining
+  resolved bounds across lock waits.
 - [`expressions.rs`](../crates/pg_fake/src/executor/query/expressions.rs) compares
   bound expressions, prunes constant CASE branches, detects volatility, and
   substitutes aggregate values before expression evaluation.
@@ -150,7 +154,9 @@ equality used by grouping and duplicate handling.
 [`executor/subqueries.rs`](../crates/pg_fake/src/executor/subqueries.rs) evaluates
 scalar, `EXISTS`, `IN`, `ANY`, and `ALL` subqueries, preserving result types and
 reusing results prepared during lock discovery. Correlated expressions first
-substitute values from the outer row.
+substitute values from the outer row. Eligible EXISTS queries validate their
+original projections before discarding unneeded target, grouping, distinct, and
+ordering expressions.
 [`conditionals.rs`](../crates/pg_fake/src/executor/subqueries/conditionals.rs)
 evaluates only the selected conditional branches when they contain subqueries.
 
@@ -196,7 +202,7 @@ handles ordering, comparison eligibility, and row/list membership.
 
 [`runtime.rs`](../crates/pg_fake/src/executor/expressions/runtime.rs) shares scalar
 runtime signatures with parameter inference and dispatches temporal, floor, and
-regex functions. [`temporal.rs`](../crates/pg_fake/src/executor/expressions/temporal.rs)
+regex and advisory functions. [`temporal.rs`](../crates/pg_fake/src/executor/expressions/temporal.rs)
 implements epoch conversion and bounded timestamp formatting/truncation.
 [`coercion/time_zones.rs`](../crates/pg_fake/src/coercion/time_zones.rs) resolves
 zones and supplies conversions shared by casts and `AT TIME ZONE`. Execution
@@ -204,6 +210,10 @@ passes the session time zone into central coercion. [`patterns.rs`](../crates/pg
 implements LIKE escaping and the supported ASCII regular-expression predicates.
 The exact runtime scope is recorded under Task 21 in `plan.md` and exercised by
 `tests/fixtures/runtime_expressions.sql` in the SQLx crate.
+
+[`resume.rs`](../crates/pg_fake/src/executor/expressions/resume.rs) journals completed
+expression nodes and resumes aggregate inputs, defaults, assignments, and
+RETURNING without repeating volatile operations after advisory waits.
 
 [`column_defaults.rs`](../crates/pg_fake/src/executor/column_defaults.rs) validates
 and evaluates column defaults, including sequence allocation.
@@ -300,6 +310,8 @@ INSERT, UPDATE, and DELETE execution and shares assignment binding and coercion.
 - [`targets.rs`](../crates/pg_fake/src/executor/writes/targets.rs) binds mutation
   scopes, selects target versions using FROM or USING, and prepares CTE row locks.
   It tracks rows already changed by the same command.
+- [`resume.rs`](../crates/pg_fake/src/executor/writes/resume.rs) retains UPDATE
+  and DELETE targets, affected counts, and the current RETURNING row across waits.
 - [`returning.rs`](../crates/pg_fake/src/executor/writes/returning.rs) binds and
   evaluates RETURNING and constructs query or affected-row results.
 
@@ -316,6 +328,15 @@ required by the isolation level.
   changes and their dependent objects.
 - [`foreign_keys.rs`](../crates/pg_fake/src/session/locking/foreign_keys.rs)
   follows foreign-key checks and cascading mutations to related tables.
+
+[`advisory.rs`](../crates/pg_fake/src/advisory.rs) defines bigint and integer-pair
+keys, shared/exclusive modes, transaction and session ownership, reentrancy,
+queues, and the supported SQL functions. Its manager has a separate mutex so
+scalar functions can request locks during statement execution.
+[`session/locking/advisory.rs`](../crates/pg_fake/src/session/locking/advisory.rs)
+releases the database mutex while waiting and connects advisory blockers to the
+shared timeout and deadlock machinery. Commit, rollback, and session teardown
+release the appropriate ownership scopes.
 
 [`executor/locks/mod.rs`](../crates/pg_fake/src/executor/locks/mod.rs) discovers
 rows to lock, retains mutation candidates, and checks concurrent row changes.
@@ -385,5 +406,7 @@ holds object definitions and visible object lookups;
 
 The session's existing behavior and concurrency tests are in
 [`session/tests.rs`](../crates/pg_fake/src/session/tests.rs). Public API
-integration tests live in `crates/pg_fake/tests`; SQLx and PostgreSQL differential
+integration tests live in `crates/pg_fake/tests`;
+[`session/advisory_tests.rs`](../crates/pg_fake/src/session/advisory_tests.rs) checks
+controlled advisory waits, mixed deadlocks, and session teardown; SQLx and PostgreSQL differential
 tests live in `crates/pg_fake_sqlx/tests`.

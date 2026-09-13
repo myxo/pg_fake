@@ -19,6 +19,7 @@ mod comparisons;
 mod functions;
 mod literals;
 mod patterns;
+mod resume;
 mod runtime;
 mod temporal;
 mod types;
@@ -29,6 +30,10 @@ pub(super) use comparisons::{
 pub(super) use functions::{infer_window_return_type, validate_function_argument};
 pub(super) use literals::{evaluate_literal, extract_number_literal};
 pub(crate) use literals::{extract_unknown_string_literal, is_null_literal};
+pub(crate) use resume::{EvaluationCursor, PendingEvaluation, PendingOperation};
+pub(super) use resume::{
+    EvaluationOperation, evaluate, evaluate_in_cursor, resume_evaluation, resume_operation,
+};
 pub(crate) use runtime::resolve_runtime_function;
 pub(super) use types::resolve_operator_type;
 pub(crate) use types::{infer_expression_data_type, infer_expression_type};
@@ -74,7 +79,7 @@ pub(crate) fn create_constant_expression_schema() -> TableSchema {
 }
 
 #[cfg_attr(feature = "execution-log", tracing::instrument(skip_all))]
-pub(super) fn evaluate(
+fn evaluate_inner(
     expr: &ast::Expr,
     schema: RowScope<'_>,
     row: &[Value],

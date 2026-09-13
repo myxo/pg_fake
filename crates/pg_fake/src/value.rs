@@ -54,6 +54,7 @@ pub struct PgInterval {
 /// declared type (and its typmod) lives in the catalog.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum BaseType {
+    Void,
     Bool,
     Int2,
     Int4,
@@ -81,6 +82,7 @@ impl BaseType {
     #[cfg_attr(feature = "execution-log", tracing::instrument(skip_all))]
     pub fn map_to_oid(self) -> Oid {
         match self {
+            BaseType::Void => 2278,
             BaseType::Bool => 16,
             BaseType::Bytea => 17,
             BaseType::Int8 => 20,
@@ -108,6 +110,7 @@ impl BaseType {
     #[cfg_attr(feature = "execution-log", tracing::instrument(skip_all))]
     pub fn get_postgres_name(self) -> &'static str {
         match self {
+            BaseType::Void => "void",
             BaseType::Bool => "bool",
             BaseType::Int2 => "int2",
             BaseType::Int4 => "int4",
@@ -135,6 +138,7 @@ impl BaseType {
     #[cfg_attr(feature = "execution-log", tracing::instrument(skip_all))]
     pub fn resolve_oid(oid: Oid) -> Option<BaseType> {
         match oid {
+            2278 => Some(BaseType::Void),
             16 => Some(BaseType::Bool),
             17 => Some(BaseType::Bytea),
             20 => Some(BaseType::Int8),
@@ -164,6 +168,7 @@ impl BaseType {
     #[cfg_attr(feature = "execution-log", tracing::instrument(skip_all))]
     pub(crate) fn parse_sql_name(name: &str) -> Option<BaseType> {
         match name.trim().to_ascii_lowercase().as_str() {
+            "void" => Some(BaseType::Void),
             "bool" | "boolean" => Some(BaseType::Bool),
             "int2" | "smallint" => Some(BaseType::Int2),
             "int4" | "integer" | "int" => Some(BaseType::Int4),
@@ -230,6 +235,7 @@ impl PgType {
 #[derive(Debug, Clone, PartialEq)]
 pub enum Value {
     Null,
+    Void,
     Bool(bool),
     Int2(i16),
     Int4(i32),
@@ -264,6 +270,7 @@ impl Value {
     pub fn get_base_type(&self) -> Option<BaseType> {
         match self {
             Value::Null => None,
+            Value::Void => Some(BaseType::Void),
             Value::Bool(_) => Some(BaseType::Bool),
             Value::Int2(_) => Some(BaseType::Int2),
             Value::Int4(_) => Some(BaseType::Int4),
@@ -292,7 +299,7 @@ impl Value {
     #[cfg_attr(feature = "execution-log", tracing::instrument(skip_all))]
     pub fn format_postgres_text(&self) -> String {
         match self {
-            Value::Null => String::new(),
+            Value::Null | Value::Void => String::new(),
             Value::Bool(b) => {
                 if *b {
                     "t".into()
@@ -362,6 +369,7 @@ impl Value {
     #[cfg_attr(feature = "execution-log", tracing::instrument(skip_all))]
     pub(crate) fn parse(base: BaseType, input: &str) -> Result<Value> {
         match base {
+            BaseType::Void => Ok(Value::Void),
             BaseType::Bool => parse_bool(input).map(Value::Bool),
             BaseType::Int2 => parse_int::<i16>(input).map(Value::Int2),
             BaseType::Int4 => parse_int::<i32>(input).map(Value::Int4),

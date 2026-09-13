@@ -1,3 +1,4 @@
+mod advisory;
 mod analyzer;
 mod catalog;
 mod catalog_inspection;

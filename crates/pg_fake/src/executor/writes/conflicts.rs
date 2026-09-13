@@ -23,6 +23,7 @@ use sqlparser::ast;
 use std::collections::BTreeSet;
 
 pub(super) struct ConflictUpdatePlan<'a> {
+    source: &'a ast::DoUpdate,
     pub(super) scope: BoundScope,
     assigned: BTreeSet<usize>,
     pub(super) assignments: Vec<MutationAssignment<'a>>,
@@ -250,6 +251,7 @@ pub(super) fn build_conflict_update_plan<'a>(
     let (assigned, assignments) =
         build_mutation_assignments(state, schema, &scope, &update.assignments)?;
     Ok(ConflictUpdatePlan {
+        source: update,
         scope,
         assigned,
         assignments,
@@ -295,54 +297,68 @@ pub(super) fn prepare_conflict_update(
     let current = version.row.clone();
     let mut bound_row = current.clone();
     bound_row.extend_from_slice(row);
-    if !matches_mutation_row(
-        state,
-        update.selection,
-        &update.scope,
-        &bound_row,
-        xid,
-        snapshot,
+    crate::executor::expressions::resume_operation(
+        crate::executor::expressions::EvaluationOperation::ConflictUpdate(
+            Box::new(update.source.clone()),
+            bound_row.clone(),
+        ),
         context,
-    )? {
-        return Ok(Some(PreparedConflictUpdate {
-            row_id,
-            version_xmin: version.xmin,
-            current,
-            updated: None,
-        }));
-    }
-    let mut updated = current.clone();
-    for assignment in &update.assignments {
-        updated[assignment.index] = if is_default_expression(assignment.expression) {
-            evaluate_column_default(&schema.columns[assignment.index], context)?
-        } else if let Some(prepared) = &assignment.prepared {
-            prepared::evaluate_prepared_expression(prepared, &bound_row, &[], context.deadline)?
-        } else {
-            evaluate_mutation_assignment(
+        |context| {
+            if !matches_mutation_row(
                 state,
-                assignment.expression,
-                schema.columns[assignment.index].data_type,
+                update.selection,
                 &update.scope,
                 &bound_row,
                 xid,
                 snapshot,
                 context,
-            )?
-        };
-    }
-    let updated = procedural::execute_before_row_triggers(
-        state,
-        schema,
-        procedural::TriggerEventKind::Update,
-        updated,
-        context,
-    )?;
-    Ok(Some(PreparedConflictUpdate {
-        row_id,
-        version_xmin: version.xmin,
-        current,
-        updated,
-    }))
+            )? {
+                return Ok(Some(PreparedConflictUpdate {
+                    row_id,
+                    version_xmin: version.xmin,
+                    current,
+                    updated: None,
+                }));
+            }
+            let mut updated = current.clone();
+            for assignment in &update.assignments {
+                updated[assignment.index] = if is_default_expression(assignment.expression) {
+                    evaluate_column_default(&schema.columns[assignment.index], context)?
+                } else if let Some(prepared) = &assignment.prepared {
+                    prepared::evaluate_prepared_expression(
+                        prepared,
+                        &bound_row,
+                        &[],
+                        context.deadline,
+                    )?
+                } else {
+                    evaluate_mutation_assignment(
+                        state,
+                        assignment.expression,
+                        schema.columns[assignment.index].data_type,
+                        &update.scope,
+                        &bound_row,
+                        xid,
+                        snapshot,
+                        context,
+                    )?
+                };
+            }
+            let updated = procedural::execute_before_row_triggers(
+                state,
+                schema,
+                procedural::TriggerEventKind::Update,
+                updated,
+                context,
+            )?;
+            Ok(Some(PreparedConflictUpdate {
+                row_id,
+                version_xmin: version.xmin,
+                current,
+                updated,
+            }))
+        },
+    )
 }
 
 #[cfg_attr(feature = "execution-log", tracing::instrument(skip_all))]

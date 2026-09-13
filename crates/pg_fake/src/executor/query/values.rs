@@ -1,9 +1,9 @@
 use std::cmp::Ordering;
 
-use sqlparser::ast;
+use sqlparser::ast::{self, Spanned as _};
 
 use crate::{
-    ColumnMeta, QueryResult, StatementResult,
+    ColumnMeta, QueryResult,
     coercion::{self, CastContext},
     error::{PgError, Result, SqlState, reject_unsupported},
     executor::{
@@ -19,7 +19,14 @@ use crate::{
     value::{BaseType, PgType, Value},
 };
 
-use super::limits::{RowCountClause, evaluate_row_count};
+use super::limits::resolve_select_limit;
+
+#[derive(Clone)]
+pub(crate) struct PreparedValues {
+    occurrence: sqlparser::tokenizer::Span,
+    sql: String,
+    rows: Vec<Vec<Value>>,
+}
 
 #[cfg_attr(feature = "execution-log", tracing::instrument(skip_all))]
 pub(super) fn bind_values_scope(values: &ast::Values) -> Result<BoundScope> {
@@ -94,7 +101,8 @@ pub(super) fn execute_values_query(
     query: &ast::Query,
     values: &ast::Values,
     context: &StatementContext,
-) -> Result<StatementResult> {
+    maximum_rows: Option<usize>,
+) -> Result<super::QueryOutput> {
     let scope = bind_values_scope(values)?;
     let columns = scope
         .columns
@@ -153,26 +161,79 @@ pub(super) fn execute_values_query(
     } else {
         None
     };
+    let (limit, offset) = resolve_select_limit(query, context)?;
+    let complete = maximum_rows.is_none_or(|maximum| {
+        maximum
+            >= values
+                .rows
+                .len()
+                .saturating_sub(offset)
+                .min(limit.unwrap_or(usize::MAX))
+    });
+    let limit = match (limit, maximum_rows) {
+        (Some(left), Some(right)) => Some(left.min(right)),
+        (Some(limit), None) | (None, Some(limit)) => Some(limit),
+        (None, None) => None,
+    };
+    let demand = if limit == Some(0) {
+        0
+    } else if orders.is_none() {
+        limit
+            .map(|limit| limit.saturating_add(offset))
+            .unwrap_or(values.rows.len())
+    } else {
+        values.rows.len()
+    };
+    let cache_key = context.capture_lock_queries.then(|| {
+        (
+            query.span(),
+            format!("{:?} {query}", context.query_invocation),
+        )
+    });
+    let mut rows = if let Some((occurrence, sql)) = &cache_key {
+        let mut cached = context
+            .prepared_values
+            .lock()
+            .expect("prepared VALUES mutex is poisoned");
+        cached
+            .iter()
+            .position(|cached| cached.occurrence == *occurrence && cached.sql == *sql)
+            .map(|index| cached.remove(index).rows)
+            .unwrap_or_default()
+    } else {
+        Vec::new()
+    };
     let constants = create_constant_expression_schema();
-    let mut rows = values
-        .rows
-        .iter()
-        .map(|row| {
-            row.iter()
-                .zip(&scope.columns)
-                .map(|(expression, column)| {
-                    evaluate_and_coerce(
-                        expression,
-                        column.data_type.base,
-                        CastContext::Implicit,
-                        RowScope::Table(&constants),
-                        &[],
-                        context,
-                    )
-                })
-                .collect::<Result<Vec<_>>>()
-        })
-        .collect::<Result<Vec<_>>>()?;
+    let evaluated = (|| {
+        for (index, expressions) in values.rows.iter().take(demand).enumerate() {
+            if rows.len() == index {
+                rows.push(Vec::new());
+            }
+            for slot in rows[index].len()..expressions.len() {
+                rows[index].push(evaluate_and_coerce(
+                    &expressions[slot],
+                    scope.columns[slot].data_type.base,
+                    CastContext::Implicit,
+                    RowScope::Table(&constants),
+                    &[],
+                    context,
+                )?);
+            }
+        }
+        Ok(())
+    })();
+    if let Some((occurrence, sql)) = cache_key {
+        context
+            .prepared_values
+            .lock()
+            .expect("prepared VALUES mutex is poisoned")
+            .push(PreparedValues {
+                occurrence,
+                sql,
+                rows: rows.clone(),
+            });
+    }
+    evaluated?;
     if let Some(orders) = &orders {
         rows.sort_by(|left, right| {
             orders
@@ -209,35 +270,14 @@ pub(super) fn execute_values_query(
                 .unwrap_or(Ordering::Equal)
         });
     }
-    let (limit, offset) = match &query.limit_clause {
-        None => (None, 0),
-        Some(ast::LimitClause::LimitOffset {
-            limit,
-            offset,
-            limit_by,
-        }) if limit_by.is_empty() => (
-            limit
-                .as_ref()
-                .map(|limit| evaluate_row_count(limit, RowCountClause::Limit, context))
-                .transpose()?
-                .flatten(),
-            offset
-                .as_ref()
-                .map(|offset| evaluate_row_count(&offset.value, RowCountClause::Offset, context))
-                .transpose()?
-                .flatten()
-                .unwrap_or(0),
-        ),
-        _ => {
-            return reject_unsupported("LIMIT clause is not implemented");
-        }
-    };
-    Ok(StatementResult::Query(QueryResult {
+    let mut output = super::QueryOutput::create(QueryResult {
         columns,
         rows: rows
             .into_iter()
             .skip(offset)
             .take(limit.unwrap_or(usize::MAX))
             .collect(),
-    }))
+    });
+    output.complete = complete;
+    Ok(output)
 }

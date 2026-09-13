@@ -34,6 +34,7 @@ pub(crate) struct PendingExpression {
     invocation: Vec<usize>,
     row: Vec<Value>,
     prepared: ast::Expr,
+    invocation_id: usize,
 }
 
 impl ast::Visitor for SubqueryDetector {
@@ -160,7 +161,7 @@ impl ast::VisitorMut for SubqueryMaterializer<'_> {
 
     #[cfg_attr(feature = "execution-log", tracing::instrument(skip_all))]
     fn pre_visit_expr(&mut self, expr: &mut ast::Expr) -> std::ops::ControlFlow<Self::Break> {
-        if self.defer_unresolved && super::query::contains_row_locks(expr) {
+        if self.defer_unresolved && super::query::contains_locking_operations(expr) {
             return std::ops::ControlFlow::Continue(());
         }
         if self.lateral_depth > 0 {
@@ -294,7 +295,11 @@ impl ast::VisitorMut for SubqueryMaterializer<'_> {
                     data_type,
                 )))
             }
-            ast::Expr::Exists { subquery, negated } => {
+            ast::Expr::Exists {
+                mut subquery,
+                negated,
+            } => {
+                super::query::simplify_exists_query(self.state, &mut subquery, self.context)?;
                 Ok(Some(crate::analyzer::create_typed_literal(
                     Value::Bool(self.execute(&subquery, Some(1))?.rows.is_empty() == negated),
                     PgType::create(BaseType::Bool),
@@ -494,6 +499,25 @@ pub(super) fn evaluate_query_expression(
     if !contains_subquery(expression) {
         return evaluate(expression, RowScope::Bound(scope), row, context);
     }
+    if let Some(cursor) = &context.evaluation_cursor {
+        return super::expressions::evaluate_in_cursor(cursor, || {
+            let mut nested = context.clone();
+            nested.evaluation_cursor = None;
+            evaluate_subquery_expression(state, expression, scope, row, xid, snapshot, &nested)
+        });
+    }
+    evaluate_subquery_expression(state, expression, scope, row, xid, snapshot, context)
+}
+
+fn evaluate_subquery_expression(
+    state: &DatabaseState,
+    expression: &ast::Expr,
+    scope: &BoundScope,
+    row: &[Value],
+    xid: Xid,
+    snapshot: &Snapshot,
+    context: &StatementContext,
+) -> Result<Value> {
     let mut pending = context
         .pending_expressions
         .lock()
@@ -506,10 +530,22 @@ pub(super) fn evaluate_query_expression(
                 && cached.invocation == context.query_invocation
                 && cached.row == row
         })
-        .map(|index| pending.remove(index).prepared);
+        .map(|index| pending.remove(index));
     drop(pending);
     let original = expression;
-    let mut expression = prepared.unwrap_or_else(|| expression.clone());
+    let (mut expression, invocation_id) = prepared
+        .map(|prepared| (prepared.prepared, prepared.invocation_id))
+        .unwrap_or_else(|| {
+            (
+                expression.clone(),
+                context
+                    .next_subquery_invocation
+                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed),
+            )
+        });
+    let mut invocation = context.clone();
+    invocation.query_invocation.push(invocation_id);
+
     substitute_outer_references(
         &state.catalog,
         &mut expression,
@@ -523,12 +559,13 @@ pub(super) fn evaluate_query_expression(
         &mut expression,
         xid,
         snapshot,
-        context,
+        &invocation,
         false,
         Vec::new(),
-    );
+    )
+    .and_then(|()| evaluate(&expression, RowScope::Bound(scope), row, &invocation));
     if let Err(error) = result {
-        if error.sqlstate == SqlState::InternalError && error.message == super::ROW_LOCK_PENDING {
+        if error.sqlstate == SqlState::InternalError && error.message == super::LOCK_PENDING {
             context
                 .pending_expressions
                 .lock()
@@ -538,9 +575,10 @@ pub(super) fn evaluate_query_expression(
                     invocation: context.query_invocation.clone(),
                     row: row.to_vec(),
                     prepared: expression,
+                    invocation_id,
                 });
         }
         return Err(error);
     }
-    evaluate(&expression, RowScope::Bound(scope), row, context)
+    result
 }

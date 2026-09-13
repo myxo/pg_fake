@@ -8,7 +8,15 @@ use crate::{
     },
     value::{BaseType, Value},
 };
-use sqlparser::ast;
+use sqlparser::ast::{self, Spanned as _};
+
+#[derive(Clone)]
+pub(crate) struct PreparedLimit {
+    occurrence: sqlparser::tokenizer::Span,
+    sql: String,
+    result: Option<(Option<usize>, usize)>,
+    cursor: super::super::expressions::EvaluationCursor,
+}
 
 pub(super) enum RowCountClause {
     Limit,
@@ -28,6 +36,48 @@ pub(in crate::executor) fn has_zero_limit(query: &ast::Query) -> bool {
 
 #[cfg_attr(feature = "execution-log", tracing::instrument(skip_all))]
 pub(in crate::executor) fn resolve_select_limit(
+    query: &ast::Query,
+    context: &StatementContext,
+) -> Result<(Option<usize>, usize)> {
+    if query.limit_clause.is_none() {
+        return Ok((None, 0));
+    }
+    if !context.capture_lock_queries {
+        return evaluate_select_limit(query, context);
+    }
+    let sql = format!("{:?} {query}", context.query_invocation);
+    let mut cached = context
+        .prepared_limits
+        .lock()
+        .expect("prepared limit mutex is poisoned");
+    let mut prepared = cached
+        .iter()
+        .position(|entry| entry.occurrence == query.span() && entry.sql == sql)
+        .map(|index| cached.remove(index))
+        .unwrap_or_else(|| PreparedLimit {
+            occurrence: query.span(),
+            sql,
+            result: None,
+            cursor: Default::default(),
+        });
+    drop(cached);
+    let result = if let Some(result) = prepared.result {
+        Ok(result)
+    } else {
+        super::super::expressions::resume_evaluation(&mut prepared.cursor, context, |context| {
+            evaluate_select_limit(query, context)
+        })
+    };
+    prepared.result = result.as_ref().ok().copied();
+    context
+        .prepared_limits
+        .lock()
+        .expect("prepared limit mutex is poisoned")
+        .push(prepared);
+    result
+}
+
+fn evaluate_select_limit(
     query: &ast::Query,
     context: &StatementContext,
 ) -> Result<(Option<usize>, usize)> {

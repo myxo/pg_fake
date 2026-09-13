@@ -26,6 +26,18 @@ pub(crate) fn resolve_runtime_function(
             format!("function {name} is not unique"),
         )
     };
+    if let Some(function) = crate::advisory::resolve_advisory_function(name) {
+        let result = match function {
+            crate::advisory::AdvisoryFunction::TryXactLock(_)
+            | crate::advisory::AdvisoryFunction::SessionUnlock => Bool,
+            _ => Void,
+        };
+        return Some(match arguments {
+            [_] => Ok((vec![Int8], result)),
+            [_, _] => Ok((vec![Int4, Int4], result)),
+            _ => Err(signature_error()),
+        });
+    }
     Some(match (name, arguments) {
         ("to_timestamp", [_]) => Ok((vec![Float8], TimestampTz)),
         ("to_timestamp", [_, _]) => {
@@ -73,7 +85,8 @@ pub(super) fn infer_runtime_function(
     if !matches!(
         name,
         "to_timestamp" | "floor" | "to_char" | "date_trunc" | "regexp_like"
-    ) {
+    ) && crate::advisory::resolve_advisory_function(name).is_none()
+    {
         return Ok(None);
     }
     let types = arguments
@@ -123,6 +136,9 @@ pub(super) fn evaluate_runtime_function(
         .collect::<Result<Vec<_>>>()?;
     if values.iter().any(Value::is_null) {
         return Ok(Value::Null);
+    }
+    if let Some(function) = crate::advisory::resolve_advisory_function(name) {
+        return context.advisory.evaluate(function, &values);
     }
     match (name, values.as_slice()) {
         ("floor", [Value::Float8(value)]) => Ok(Value::Float8(value.floor())),

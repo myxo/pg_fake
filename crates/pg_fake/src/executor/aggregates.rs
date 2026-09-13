@@ -340,6 +340,7 @@ where
     })
 }
 
+#[derive(Clone)]
 pub(super) struct AggregateState {
     inputs: Option<Vec<AggregateInput>>,
     count: usize,

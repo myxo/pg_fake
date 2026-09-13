@@ -19,36 +19,43 @@ pub(super) fn evaluate_column_default(
     column: &ColumnDef,
     context: &StatementContext,
 ) -> Result<Value> {
-    if let Some(sequence) = &column.default_sequence {
-        let value = context.sequences.get_next_resolved_value(sequence)?;
-        return coercion::coerce(
-            Value::Int8(value),
-            BaseType::Int8,
-            column.data_type,
-            CastContext::Assignment,
-            &context.timezone,
-        );
-    }
-    let Some(expr) = &column.default else {
-        return Ok(Value::Null);
-    };
-    evaluate_assignment_expression(
-        expr,
-        column.data_type,
-        &create_constant_expression_schema(),
-        &[],
-        context,
-    )
-    .map_err(|error| {
-        if error.sqlstate == SqlState::UndefinedColumn {
-            PgError::create(
-                SqlState::FeatureNotSupported,
-                "cannot use column reference in DEFAULT expression",
-            )
-        } else {
-            error
+    let evaluate_default = || {
+        if let Some(sequence) = &column.default_sequence {
+            let value = context.sequences.get_next_resolved_value(sequence)?;
+            return coercion::coerce(
+                Value::Int8(value),
+                BaseType::Int8,
+                column.data_type,
+                CastContext::Assignment,
+                &context.timezone,
+            );
         }
-    })
+        let Some(expr) = &column.default else {
+            return Ok(Value::Null);
+        };
+        evaluate_assignment_expression(
+            expr,
+            column.data_type,
+            &create_constant_expression_schema(),
+            &[],
+            context,
+        )
+        .map_err(|error| {
+            if error.sqlstate == SqlState::UndefinedColumn {
+                PgError::create(
+                    SqlState::FeatureNotSupported,
+                    "cannot use column reference in DEFAULT expression",
+                )
+            } else {
+                error
+            }
+        })
+    };
+    if let Some(cursor) = &context.evaluation_cursor {
+        super::expressions::evaluate_in_cursor(cursor, evaluate_default)
+    } else {
+        evaluate_default()
+    }
 }
 
 #[cfg_attr(feature = "execution-log", tracing::instrument(skip_all))]

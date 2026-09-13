@@ -1,5 +1,5 @@
 use crate::{
-    QueryResult, StatementResult,
+    QueryResult,
     error::{PgError, Result, SqlState, reject_unsupported},
     executor::{
         DatabaseState, StatementContext,
@@ -29,13 +29,16 @@ mod windows;
 use distinct::{DistinctPlan, compare_distinct_keys, remove_duplicate_rows, resolve_distinct_plan};
 pub(super) use expressions::contains_volatile_expression;
 pub(super) use expressions::infer_query_expression_type;
-pub(crate) use grouping::collect_query_primary_key_dependencies;
 pub(super) use grouping::contains_query_aggregate;
+pub(crate) use grouping::{
+    PreparedGroupOutput, PreparedGrouping, collect_query_primary_key_dependencies,
+};
 use grouping::{execute_grouped_select_rows, inspect_aggregate_usage, resolve_grouping_plan};
+pub(crate) use limits::PreparedLimit;
 pub(super) use limits::{has_zero_limit, resolve_select_limit};
 pub(crate) use locking::SelectLock;
 pub(super) use locking::{
-    contains_row_locks, requires_nested_locking, resolve_query_lock_targets,
+    contains_locking_operations, requires_nested_locking, resolve_query_lock_targets,
     resolve_select_lock_mode,
 };
 use ordering::{RowOrderSpec, compare_ordered_rows, resolve_order_specs, sort_ordered_rows};
@@ -48,6 +51,7 @@ pub(crate) use select::PreparedPlainRows;
 use select::execute_plain_select_rows;
 pub(super) use select::validate_select_predicates;
 pub(super) use streaming::{QueryStreamState, stream_query_rows};
+pub(crate) use values::PreparedValues;
 use values::execute_values_query;
 use windows::{collect_window_functions, execute_windowed_select_rows};
 
@@ -89,7 +93,7 @@ pub(crate) fn detect_statement_features(statement: &ast::Statement) -> (bool, bo
     (detector.cte, detector.subquery)
 }
 
-pub(crate) const ROW_LOCK_PENDING: &str = "pg_fake pending SELECT row lock";
+pub(crate) const LOCK_PENDING: &str = "pg_fake pending lock";
 
 #[derive(Clone)]
 pub(crate) struct PreparedSelectRows {
@@ -192,11 +196,12 @@ pub(super) fn execute_query(
     let maximum_rows = context.query_row_demand;
     let inherited = context.inherited_row_lock;
     let mut context = context.clone();
+    context.advisory.enabled |= crate::advisory::contains_advisory_function(query);
     context.query_row_demand = None;
     context.inherited_row_lock = None;
     context.source_row_locks.clear();
     context.capture_lock_queries |= inherited.is_some()
-        || contains_row_locks(query)
+        || contains_locking_operations(query)
         || context
             .prepared_lock_queries
             .lock()
@@ -294,17 +299,7 @@ pub(super) fn execute_query(
     let lock_mode = resolve_select_lock_mode(query);
     let ast::SetExpr::Select(select) = query.body.as_ref() else {
         if let ast::SetExpr::Values(values) = query.body.as_ref() {
-            let StatementResult::Query(result) = execute_values_query(query, values, context)?
-            else {
-                unreachable!("VALUES produces rows")
-            };
-            let mut output = QueryOutput::create(result);
-            if let Some(maximum) = maximum_rows {
-                output.complete = output.result.rows.len() <= maximum;
-                output.result.rows.truncate(maximum);
-                output.origins.truncate(maximum);
-            }
-            return Ok(output);
+            return execute_values_query(query, values, context, maximum_rows);
         }
         if lock_mode.is_some() {
             return reject_unsupported("FOR UPDATE is not allowed with set operations");
@@ -651,7 +646,7 @@ pub(super) fn execute_query(
                     .expect("prepared SELECT rows mutex is poisoned")
                     .push(prepared);
                 context.request_row_lock_recheck_with_locks(pending);
-                return Err(PgError::create(SqlState::InternalError, ROW_LOCK_PENDING));
+                return Err(PgError::create(SqlState::InternalError, LOCK_PENDING));
             }
             prepared.next += 1;
             if !skip {
@@ -718,4 +713,156 @@ pub(super) fn execute_query(
         });
     }
     Ok(output)
+}
+
+pub(in crate::executor) fn simplify_exists_query(
+    state: &DatabaseState,
+    query: &mut ast::Query,
+    context: &StatementContext,
+) -> Result<()> {
+    let ast::SetExpr::Select(select) = query.body.as_ref() else {
+        return Ok(());
+    };
+    if !query.locks.is_empty()
+        || query.fetch.is_some()
+        || query.with.as_ref().is_some_and(|with| {
+            with.cte_tables.iter().any(|cte| {
+                matches!(
+                    cte.query.body.as_ref(),
+                    ast::SetExpr::Insert(_) | ast::SetExpr::Update(_) | ast::SetExpr::Delete(_)
+                )
+            })
+        })
+        || select.having.is_some()
+        || contains_query_aggregate(query)
+    {
+        return Ok(());
+    }
+    let ast::GroupByExpr::Expressions(group_by, modifiers) = &select.group_by else {
+        return Ok(());
+    };
+    if !modifiers.is_empty()
+        || group_by.iter().any(|expr| {
+            matches!(
+                expr,
+                ast::Expr::GroupingSets(_) | ast::Expr::Cube(_) | ast::Expr::Rollup(_)
+            )
+        })
+    {
+        return Ok(());
+    }
+    let mut has_special_function = false;
+    let _ = ast::visit_expressions(&select.projection, |expr| {
+        if let ast::Expr::Function(function) = expr {
+            has_special_function |= function.over.is_some()
+                || super::normalize_unqualified_object_name(&function.name)
+                    .is_ok_and(|name| matches!(name.as_str(), "generate_series" | "unnest"));
+        }
+        std::ops::ControlFlow::<()>::Continue(())
+    });
+    if has_special_function {
+        return Ok(());
+    }
+    let analysis = super::ctes::inline_query_ctes(query, &state.catalog, Some(state), true)?;
+    let ast::SetExpr::Select(select) = analysis.body.as_ref() else {
+        unreachable!()
+    };
+    let ast::GroupByExpr::Expressions(group_by, _) = &select.group_by else {
+        unreachable!()
+    };
+    let scope = bind_select_scope(state, select)?;
+    validate_select_predicates(state, select, &scope)?;
+    let (projections, columns) = build_projection_plan(state, &select.projection, &scope)?;
+    let order_specs = resolve_order_specs(state, &analysis, &projections, &columns, &scope)?;
+    let distinct =
+        resolve_distinct_plan(state, select, &projections, &columns, &order_specs, &scope)?;
+    resolve_grouping_plan(
+        state,
+        select,
+        group_by,
+        &projections,
+        &columns,
+        &order_specs,
+        &distinct,
+        &scope,
+    )?;
+    if let Some(clause) = &query.limit_clause {
+        match clause {
+            ast::LimitClause::LimitOffset {
+                limit,
+                offset: None,
+                limit_by,
+            } if limit_by.is_empty() => {
+                if let Some(limit) = limit {
+                    let mut constant = true;
+                    let _ = ast::visit_expressions(limit, |expr| {
+                        constant &= match expr {
+                            ast::Expr::Function(function) => {
+                                super::normalize_unqualified_object_name(&function.name).is_ok_and(
+                                    |name| {
+                                        matches!(
+                                            name.as_str(),
+                                            "abs"
+                                                | "floor"
+                                                | "ceil"
+                                                | "ceiling"
+                                                | "round"
+                                                | "trunc"
+                                                | "length"
+                                                | "char_length"
+                                                | "octet_length"
+                                                | "btrim"
+                                                | "regexp_like"
+                                                | "to_timestamp"
+                                                | "jsonb_typeof"
+                                                | "jsonb_array_length"
+                                                | "lower"
+                                                | "upper"
+                                                | "coalesce"
+                                                | "nullif"
+                                                | "greatest"
+                                                | "least"
+                                        )
+                                    },
+                                )
+                            }
+                            ast::Expr::Subquery(_)
+                            | ast::Expr::Exists { .. }
+                            | ast::Expr::InSubquery { .. }
+                            | ast::Expr::CompoundIdentifier(_) => false,
+                            ast::Expr::Identifier(identifier) => {
+                                identifier.value.eq_ignore_ascii_case("all")
+                            }
+                            ast::Expr::Value(value) => {
+                                !matches!(value.value, ast::Value::Placeholder(_))
+                            }
+                            _ => true,
+                        };
+                        std::ops::ControlFlow::<()>::Continue(())
+                    });
+                    if !constant
+                        || limits::evaluate_row_count(
+                            limit,
+                            limits::RowCountClause::Limit,
+                            context,
+                        )? == Some(0)
+                    {
+                        return Ok(());
+                    }
+                }
+            }
+            _ => return Ok(()),
+        }
+    }
+    let ast::SetExpr::Select(select) = query.body.as_mut() else {
+        unreachable!()
+    };
+    select.projection = vec![ast::SelectItem::UnnamedExpr(ast::Expr::Value(
+        ast::Value::Number("1".into(), false).with_empty_span(),
+    ))];
+    select.group_by = ast::GroupByExpr::Expressions(Vec::new(), Vec::new());
+    select.distinct = None;
+    query.order_by = None;
+    query.limit_clause = None;
+    Ok(())
 }

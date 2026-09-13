@@ -1,4 +1,4 @@
-use sqlparser::ast::{self, VisitMut as _};
+use sqlparser::ast::{self, Spanned as _, VisitMut as _};
 use std::{cell::Cell, collections::BTreeSet};
 
 use crate::{
@@ -11,6 +11,7 @@ use crate::{
             parse_aggregate_call, prepare_aggregate_function_input,
         },
         equality::are_rows_not_distinct,
+        expressions::{EvaluationCursor, resume_evaluation},
         from::visit_query_source_rows,
         scope::{BoundScope, RowScope, substitute_typed_subqueries},
         subqueries::evaluate_query_expression,
@@ -56,6 +57,7 @@ pub(super) struct CollectedAggregateFunction {
     volatile: bool,
 }
 
+#[derive(Clone)]
 pub(in crate::executor) struct GroupedAggregateValue {
     function: ast::Function,
     owner: AggregateOwner,
@@ -67,10 +69,30 @@ pub(in crate::executor) struct GroupedAggregateValue {
 
 pub(in crate::executor) type GroupedAggregateValues = Vec<GroupedAggregateValue>;
 
+#[derive(Clone)]
 struct CollectedGroup {
     key: Vec<Value>,
     source: Option<Vec<Value>>,
     aggregate_states: Vec<Option<AggregateState>>,
+}
+
+#[derive(Clone)]
+pub(crate) struct PreparedGrouping {
+    occurrence: sqlparser::tokenizer::Span,
+    sql: String,
+    groups: Vec<CollectedGroup>,
+    next: usize,
+    cursor: EvaluationCursor,
+    complete: bool,
+}
+
+#[derive(Clone)]
+pub(crate) struct PreparedGroupOutput {
+    occurrence: sqlparser::tokenizer::Span,
+    sql: String,
+    rows: Vec<SelectRow>,
+    next: usize,
+    cursor: EvaluationCursor,
 }
 
 struct AggregateMaterializer<'a> {
@@ -323,7 +345,7 @@ pub(super) fn collect_grouped_select_rows(
         .collect::<Result<Vec<_>>>()?;
     let mut aggregate_calls: Vec<Option<AggregateCall<'_>>> =
         (0..aggregate_functions.len()).map(|_| None).collect();
-    let mut groups = if grouped_expressions.is_empty() {
+    let groups = if grouped_expressions.is_empty() {
         vec![CollectedGroup {
             key: Vec::new(),
             source: None,
@@ -332,83 +354,138 @@ pub(super) fn collect_grouped_select_rows(
     } else {
         Vec::new()
     };
-    visit_query_source_rows(
-        state,
-        select,
-        scope,
-        xid,
-        snapshot,
-        context,
-        select.selection.as_ref(),
-        &mut |row, _origins| {
-            if !evaluate_where_clause(
-                state,
-                select.selection.as_ref(),
-                scope,
-                row,
-                xid,
-                snapshot,
-                context,
-            )? {
-                return Ok(());
-            }
-            let key = grouped_expressions
-                .iter()
-                .map(|(expression, _)| {
-                    evaluate_query_expression(state, expression, scope, row, xid, snapshot, context)
-                })
-                .collect::<Result<Vec<_>>>()?;
-            let mut matching = None;
-            for (index, group) in groups.iter().enumerate() {
-                if are_rows_not_distinct(&group.key, &key)? {
-                    matching = Some(index);
-                    break;
+    let sql = format!("{:?} {select}", context.query_invocation);
+    let mut cached = context
+        .prepared_groups
+        .lock()
+        .expect("prepared groups mutex is poisoned");
+    let mut prepared = cached
+        .iter()
+        .position(|entry| entry.occurrence == select.span() && entry.sql == sql)
+        .map(|index| cached.remove(index))
+        .unwrap_or_else(|| PreparedGrouping {
+            occurrence: select.span(),
+            sql,
+            groups,
+            next: 0,
+            cursor: Default::default(),
+            complete: false,
+        });
+    drop(cached);
+    let mut source_index = 0;
+    let evaluated = if prepared.complete {
+        Ok(())
+    } else {
+        visit_query_source_rows(
+            state,
+            select,
+            scope,
+            xid,
+            snapshot,
+            context,
+            select.selection.as_ref(),
+            &mut |row, _origins| {
+                let index = source_index;
+                source_index += 1;
+                if index < prepared.next {
+                    return Ok(());
                 }
-            }
-            let index = match matching {
-                Some(index) => index,
-                None => {
-                    groups.push(CollectedGroup {
-                        key,
-                        source: None,
-                        aggregate_states: (0..aggregate_functions.len()).map(|_| None).collect(),
-                    });
-                    groups.len() - 1
+                let evaluated = resume_evaluation(&mut prepared.cursor, context, |context| {
+                    if !evaluate_where_clause(
+                        state,
+                        select.selection.as_ref(),
+                        scope,
+                        row,
+                        xid,
+                        snapshot,
+                        context,
+                    )? {
+                        return Ok(None);
+                    }
+                    let key = grouped_expressions
+                        .iter()
+                        .map(|(expression, _)| {
+                            evaluate_query_expression(
+                                state, expression, scope, row, xid, snapshot, context,
+                            )
+                        })
+                        .collect::<Result<Vec<_>>>()?;
+                    let inputs = aggregate_functions
+                        .iter()
+                        .zip(&typed_aggregate_functions)
+                        .zip(&mut aggregate_calls)
+                        .map(|((collected, typed), call)| {
+                            if call.is_none() {
+                                *call = Some(parse_aggregate_call(typed, RowScope::Bound(scope))?);
+                            }
+                            prepare_group_aggregate_input(
+                                state,
+                                &collected.function,
+                                typed,
+                                call.as_ref().unwrap(),
+                                scope,
+                                row,
+                                xid,
+                                snapshot,
+                                context,
+                            )
+                        })
+                        .collect::<Result<Vec<_>>>()?;
+                    Ok(Some((key, inputs)))
+                })?;
+                prepared.next += 1;
+                let Some((key, inputs)) = evaluated else {
+                    return Ok(());
+                };
+                let groups = &mut prepared.groups;
+                let mut matching = None;
+                for (index, group) in groups.iter().enumerate() {
+                    if are_rows_not_distinct(&group.key, &key)? {
+                        matching = Some(index);
+                        break;
+                    }
                 }
-            };
-            let group = &mut groups[index];
-            for (((collected, typed), call), prepared) in aggregate_functions
-                .iter()
-                .zip(&typed_aggregate_functions)
-                .zip(&mut aggregate_calls)
-                .zip(&mut group.aggregate_states)
-            {
-                if call.is_none() {
-                    *call = Some(parse_aggregate_call(typed, RowScope::Bound(scope))?);
+                let index = match matching {
+                    Some(index) => index,
+                    None => {
+                        groups.push(CollectedGroup {
+                            key,
+                            source: None,
+                            aggregate_states: (0..aggregate_functions.len())
+                                .map(|_| None)
+                                .collect(),
+                        });
+                        groups.len() - 1
+                    }
+                };
+                let group = &mut groups[index];
+                for ((input, call), aggregate) in inputs
+                    .into_iter()
+                    .zip(&aggregate_calls)
+                    .zip(&mut group.aggregate_states)
+                {
+                    let call = call.as_ref().expect("aggregate call was initialized");
+                    aggregate
+                        .get_or_insert_with(|| AggregateState::create(&call.descriptor))
+                        .add_input(&call.descriptor, input);
                 }
-                let call = call.as_ref().expect("aggregate call was initialized");
-                let input = prepare_group_aggregate_input(
-                    state,
-                    &collected.function,
-                    typed,
-                    call,
-                    scope,
-                    row,
-                    xid,
-                    snapshot,
-                    context,
-                )?;
-                prepared
-                    .get_or_insert_with(|| AggregateState::create(&call.descriptor))
-                    .add_input(&call.descriptor, input);
-            }
-            if group.source.is_none() {
-                group.source = Some(row.to_vec());
-            }
-            Ok(())
-        },
-    )?;
-
+                if group.source.is_none() {
+                    group.source = Some(row.to_vec());
+                }
+                Ok(())
+            },
+        )
+    };
+    prepared.complete = evaluated.is_ok();
+    let groups = prepared.groups.clone();
+    if context.capture_lock_queries {
+        context
+            .prepared_groups
+            .lock()
+            .expect("prepared groups mutex is poisoned")
+            .push(prepared);
+    }
+    evaluated?;
     let groups = sort_groups_by_postgres_visitation(groups);
     groups
         .into_iter()
@@ -502,61 +579,95 @@ pub(super) fn execute_grouped_select_rows(
         snapshot,
         context,
     )?;
-    let mut rows = Vec::new();
-    for (row, aggregate_values) in groups {
-        if !evaluate_group_having(
-            state,
-            select,
-            scope,
-            &row,
-            &aggregate_values,
-            xid,
-            snapshot,
-            context,
-        )? {
-            continue;
-        }
-        let values = evaluate_projection_values(
-            state,
-            projections,
-            scope,
-            &row,
-            Some(&aggregate_values),
-            xid,
-            snapshot,
-            context,
-        )?;
-        let keys = evaluate_order_keys(
-            state,
-            order_specs,
-            &values,
-            scope,
-            &row,
-            Some(&aggregate_values),
-            xid,
-            snapshot,
-            context,
-        )?;
-        let distinct_keys = evaluate_distinct_keys(
-            state,
-            distinct,
-            &values,
-            &keys,
-            scope,
-            &row,
-            Some(&aggregate_values),
-            xid,
-            snapshot,
-            context,
-        )?;
-        rows.push(SelectRow {
-            origins: Vec::new(),
-            values,
-            keys,
-            distinct_keys,
-            deferred_source: None,
-            evaluated_projections: None,
+    let sql = format!("{:?} {select}", context.query_invocation);
+    let mut cached = context
+        .prepared_group_outputs
+        .lock()
+        .expect("prepared group output mutex is poisoned");
+    let mut prepared = cached
+        .iter()
+        .position(|entry| entry.occurrence == select.span() && entry.sql == sql)
+        .map(|index| cached.remove(index))
+        .unwrap_or_else(|| PreparedGroupOutput {
+            occurrence: select.span(),
+            sql,
+            rows: Vec::new(),
+            next: 0,
+            cursor: Default::default(),
         });
+    drop(cached);
+    let evaluated = (|| {
+        for (row, aggregate_values) in groups.into_iter().skip(prepared.next) {
+            let output = resume_evaluation(&mut prepared.cursor, context, |context| {
+                if !evaluate_group_having(
+                    state,
+                    select,
+                    scope,
+                    &row,
+                    &aggregate_values,
+                    xid,
+                    snapshot,
+                    context,
+                )? {
+                    return Ok(None);
+                }
+                let values = evaluate_projection_values(
+                    state,
+                    projections,
+                    scope,
+                    &row,
+                    Some(&aggregate_values),
+                    xid,
+                    snapshot,
+                    context,
+                )?;
+                let keys = evaluate_order_keys(
+                    state,
+                    order_specs,
+                    &values,
+                    scope,
+                    &row,
+                    Some(&aggregate_values),
+                    xid,
+                    snapshot,
+                    context,
+                )?;
+                let distinct_keys = evaluate_distinct_keys(
+                    state,
+                    distinct,
+                    &values,
+                    &keys,
+                    scope,
+                    &row,
+                    Some(&aggregate_values),
+                    xid,
+                    snapshot,
+                    context,
+                )?;
+                Ok(Some(SelectRow {
+                    origins: Vec::new(),
+                    values,
+                    keys,
+                    distinct_keys,
+                    deferred_source: None,
+                    evaluated_projections: None,
+                }))
+            })?;
+            prepared.next += 1;
+            if let Some(row) = output {
+                prepared.rows.push(row);
+            }
+        }
+        Ok(())
+    })();
+    let rows = prepared.rows.clone();
+    if context.capture_lock_queries {
+        context
+            .prepared_group_outputs
+            .lock()
+            .expect("prepared group output mutex is poisoned")
+            .push(prepared);
     }
+    evaluated?;
     Ok(rows)
 }

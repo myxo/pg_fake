@@ -2921,3 +2921,91 @@ fn matches_generated_skip_locked_queues() {
         );
     });
 }
+
+#[test]
+fn matches_generated_advisory_transactions() {
+    let server = start_isolated_postgres_server();
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap();
+    let postgres = RefCell::new(
+        (0..3)
+            .map(|_| {
+                runtime
+                    .block_on(PgConnection::connect(&server.url))
+                    .unwrap()
+            })
+            .collect::<Vec<_>>(),
+    );
+    let db = Db::create();
+    let fake = RefCell::new(
+        (0..3)
+            .map(|_| PgFakeConnection::new(db.clone()))
+            .collect::<Vec<_>>(),
+    );
+    check(|src| {
+        let mut postgres = postgres.borrow_mut();
+        let mut fake = fake.borrow_mut();
+        for session in 0..3 {
+            assert_statement(
+                &runtime,
+                &mut postgres[session],
+                &mut fake[session],
+                "BEGIN",
+                RowOrder::Ordered,
+            );
+        }
+        let steps = src.any_of("steps", int_in(1..=16));
+        for _ in 0..steps {
+            let session = src.any_of("session", int_in(0..=2));
+            let operation = src.any_of("operation", int_in(0..=5));
+            if operation >= 4 {
+                for sql in [if operation == 4 { "COMMIT" } else { "ROLLBACK" }, "BEGIN"] {
+                    assert_statement(
+                        &runtime,
+                        &mut postgres[session],
+                        &mut fake[session],
+                        sql,
+                        RowOrder::Ordered,
+                    );
+                }
+                continue;
+            }
+            let first = src.any_of("first_key", int_in(-2..=2));
+            let second = src.any_of("second_key", int_in(-2..=2));
+            let key = if src.any("integer_pair") {
+                format!("{first},{second}")
+            } else {
+                let key = (i64::from(first) << 32) | i64::from(second as u32);
+                format!("'{key}'::BIGINT")
+            };
+            let function = if operation % 2 == 0 {
+                "pg_try_advisory_xact_lock"
+            } else {
+                "pg_try_advisory_xact_lock_shared"
+            };
+            let sql = if operation >= 2 {
+                format!("SELECT {function}({key}),{function}({key})")
+            } else {
+                format!("SELECT {function}({key})")
+            };
+            assert_statement(
+                &runtime,
+                &mut postgres[session],
+                &mut fake[session],
+                &sql,
+                RowOrder::Ordered,
+            );
+        }
+        for session in 0..3 {
+            assert_statement(
+                &runtime,
+                &mut postgres[session],
+                &mut fake[session],
+                "ROLLBACK",
+                RowOrder::Ordered,
+            );
+        }
+    });
+}

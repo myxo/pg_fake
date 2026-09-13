@@ -18,6 +18,8 @@ use crate::{
 
 use super::{IsolationLevel, StatementResult, catalog_dependencies::CatalogDependency};
 
+mod advisory;
+pub(super) use advisory::acquire_advisory_lock;
 mod ddl;
 mod foreign_keys;
 mod relations;
@@ -191,12 +193,28 @@ pub(super) fn acquire_row_locks<'a>(
             Ok(required) => required,
             Err(error)
                 if error.sqlstate == SqlState::InternalError
-                    && error.message == executor::ROW_LOCK_PENDING =>
+                    && error.message == executor::LOCK_PENDING =>
             {
                 context.take_row_lock_recheck_locks()
             }
             Err(error) => return Err(error),
         };
+        let pending = *context
+            .advisory
+            .pending
+            .lock()
+            .expect("pending advisory mutex is poisoned");
+        if let crate::advisory::PendingAdvisory::Waiting(request) = pending {
+            state = advisory::acquire_advisory_lock(
+                condvar,
+                timeout,
+                statement_deadline,
+                state,
+                request,
+                context,
+            )?;
+            continue;
+        }
         let mut blocked = None;
         for required_lock in &required {
             match state
@@ -237,16 +255,41 @@ pub(super) fn acquire_row_locks<'a>(
                 continue;
             }
             if let Some(pending) = context.take_pending_cte_mutation() {
-                let result = executor::execute_statement(
-                    &mut state,
-                    &pending.statement,
-                    xid,
-                    &snapshot,
-                    deferred_constraints,
-                    defer_all,
-                    context,
-                    None,
-                )?;
+                let result = loop {
+                    let result = executor::execute_statement(
+                        &mut state,
+                        &pending.statement,
+                        xid,
+                        &snapshot,
+                        deferred_constraints,
+                        defer_all,
+                        context,
+                        None,
+                    );
+                    if result.as_ref().is_err_and(|error| {
+                        error.sqlstate == SqlState::InternalError
+                            && error.message == executor::LOCK_PENDING
+                    }) {
+                        let advisory = *context
+                            .advisory
+                            .pending
+                            .lock()
+                            .expect("pending advisory mutex is poisoned");
+                        if let crate::advisory::PendingAdvisory::Waiting(request) = advisory {
+                            state = acquire_advisory_lock(
+                                condvar,
+                                timeout,
+                                statement_deadline,
+                                state,
+                                request,
+                                context,
+                            )?;
+                            state.load_catalog(Some(xid), snapshot, Some(temporary_schema_id));
+                            continue;
+                        }
+                    }
+                    break result?;
+                };
                 let StatementResult::Query(result) = result else {
                     return Err(PgError::create(
                         SqlState::FeatureNotSupported,

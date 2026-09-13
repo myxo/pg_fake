@@ -1,5 +1,6 @@
 use super::{
     build_mutation_assignments, evaluate_mutation_assignment, require_mutation_table,
+    resume::PreparedWrite,
     returning::{build_returning_plan, create_write_result, evaluate_returning_row},
     targets::{
         collect_mutation_targets, create_mutation_scope, has_mutated_target_in_command,
@@ -81,88 +82,97 @@ pub(in crate::executor) fn execute_update(
         }
     }
     let (assigned, assignments) = build_mutation_assignments(state, &schema, &scope, assignments)?;
-    let prepared_updates = context.take_prepared_update(update).map(|updates| {
-        updates
-            .into_iter()
-            .filter(|prepared| {
-                !has_mutated_target_in_command(
-                    state,
-                    schema.id,
-                    prepared.row_id,
-                    prepared.version_xmin,
-                    xid,
-                    context.command_id,
-                )
-            })
-            .collect::<Vec<_>>()
-    });
-    let prepared_targets =
-        context.take_prepared_mutation_targets(update.span(), snapshot.commit_seq);
-    let targets = match &prepared_updates {
-        Some(prepared) => prepared
-            .iter()
-            .map(|prepared| {
-                (
-                    prepared.row_id,
-                    prepared.version_xmin,
-                    prepared.current.clone(),
-                    prepared.bound_row.clone(),
-                )
-            })
-            .collect(),
-        None => match prepared_targets {
-            Some(targets) => targets
-                .into_iter()
-                .filter(|target| {
-                    !has_mutated_target_in_command(
-                        state,
-                        schema.id,
-                        target.row_id,
-                        target.version_xmin,
-                        xid,
-                        context.command_id,
-                    )
-                })
-                .map(|target| {
-                    (
-                        target.row_id,
-                        target.version_xmin,
-                        target.current,
-                        target.bound_row,
-                    )
-                })
-                .collect(),
-            None => {
-                let source_rows = materialize_mutation_source_rows(
-                    state,
-                    from,
-                    &scope,
-                    schema.columns.len(),
-                    xid,
-                    snapshot,
-                    context,
-                )?;
-                collect_mutation_targets(
-                    state,
-                    &schema,
-                    selection,
-                    &scope,
-                    &source_rows,
-                    xid,
-                    snapshot,
-                    context,
-                    mutation_targets,
-                )?
-            }
-        },
-    };
+    let mut progress =
+        if let Some(progress) = PreparedWrite::take(context, update.span(), &update.to_string()) {
+            progress
+        } else {
+            let prepared_updates = context.take_prepared_update(update).map(|updates| {
+                updates
+                    .into_iter()
+                    .filter(|prepared| {
+                        !has_mutated_target_in_command(
+                            state,
+                            schema.id,
+                            prepared.row_id,
+                            prepared.version_xmin,
+                            xid,
+                            context.command_id,
+                        )
+                    })
+                    .collect::<Vec<_>>()
+            });
+            let prepared_targets =
+                context.take_prepared_mutation_targets(update.span(), snapshot.commit_seq);
+            let targets = match &prepared_updates {
+                Some(prepared) => prepared
+                    .iter()
+                    .map(|prepared| {
+                        (
+                            prepared.row_id,
+                            prepared.version_xmin,
+                            prepared.current.clone(),
+                            prepared.bound_row.clone(),
+                        )
+                    })
+                    .collect(),
+                None => match prepared_targets {
+                    Some(targets) => targets
+                        .into_iter()
+                        .filter(|target| {
+                            !has_mutated_target_in_command(
+                                state,
+                                schema.id,
+                                target.row_id,
+                                target.version_xmin,
+                                xid,
+                                context.command_id,
+                            )
+                        })
+                        .map(|target| {
+                            (
+                                target.row_id,
+                                target.version_xmin,
+                                target.current,
+                                target.bound_row,
+                            )
+                        })
+                        .collect(),
+                    None => {
+                        let source_rows = materialize_mutation_source_rows(
+                            state,
+                            from,
+                            &scope,
+                            schema.columns.len(),
+                            xid,
+                            snapshot,
+                            context,
+                        )?;
+                        collect_mutation_targets(
+                            state,
+                            &schema,
+                            selection,
+                            &scope,
+                            &source_rows,
+                            xid,
+                            snapshot,
+                            context,
+                            mutation_targets,
+                        )?
+                    }
+                },
+            };
+            PreparedWrite::create(update.span(), update.to_string(), targets, prepared_updates)
+        };
+    let targets = progress.targets.clone();
+    let prepared_updates = progress.updates.clone();
     let updates_were_prepared = prepared_updates.is_some();
     let mut prepared_updates = prepared_updates.map(|updates| {
         updates
             .into_iter()
+            .skip(progress.next)
             .map(|prepared| (prepared.row_id, prepared.updated))
     });
-    let mut affected = 0;
+
     let has_referencing_foreign_keys = state.catalog.has_referencing_foreign_keys(schema.id);
     let has_foreign_keys = schema
         .constraints
@@ -170,90 +180,128 @@ pub(in crate::executor) fn execute_update(
         .any(|constraint| matches!(constraint, Constraint::ForeignKey(_)));
     let can_move_updated_row =
         !has_referencing_foreign_keys && !has_foreign_keys && returning.is_none();
-    let mut returned_rows = Vec::new();
-    for (row_id, version_xmin, row, mut bound_row) in targets {
-        let (old_row, mut updated) = if has_referencing_foreign_keys {
-            (Some(row.clone()), row)
-        } else {
-            (None, row)
-        };
-        let updated = if let Some(prepared_updates) = &mut prepared_updates {
-            let (prepared_row_id, updated) = prepared_updates
-                .next()
-                .expect("prepared trigger UPDATE retains every target row");
-            assert_eq!(prepared_row_id, row_id);
-            let Some(updated) = updated else {
+    let executed = (|| {
+        for (row_id, version_xmin, row, mut bound_row) in targets.into_iter().skip(progress.next) {
+            if let Some(row) = &progress.pending_returning {
+                evaluate_returning_row(
+                    state,
+                    returning.as_ref(),
+                    row,
+                    &mut progress.returned_rows,
+                    xid,
+                    snapshot,
+                    context,
+                )?;
+                if let Some(updates) = &mut prepared_updates {
+                    updates
+                        .next()
+                        .expect("pending row retains its prepared update");
+                }
+                progress.pending_returning = None;
+                progress.next += 1;
                 continue;
-            };
-            updated
-        } else {
-            let assignment_row = bound_row.as_deref().unwrap_or(&updated).to_vec();
-            for assignment in &assignments {
-                let target = schema.columns[assignment.index].data_type;
-                updated[assignment.index] = if is_default_expression(assignment.expression) {
-                    evaluate_column_default(&schema.columns[assignment.index], context)?
-                } else if let Some(prepared) = &assignment.prepared {
-                    prepared::evaluate_prepared_expression(
-                        prepared,
-                        &assignment_row,
-                        &[],
-                        context.deadline,
-                    )?
-                } else {
-                    evaluate_mutation_assignment(
-                        state,
-                        assignment.expression,
-                        target,
-                        &scope,
-                        &assignment_row,
-                        xid,
-                        snapshot,
-                        context,
-                    )?
-                };
             }
-            let Some(updated) = procedural::execute_before_row_triggers(
-                state,
-                &schema,
-                procedural::TriggerEventKind::Update,
-                updated,
-                context,
-            )?
-            else {
-                continue;
+
+            let (old_row, mut updated) = if has_referencing_foreign_keys {
+                (Some(row.clone()), row)
+            } else {
+                (None, row)
             };
-            updated
-        };
-        affected += 1;
-        if !updates_were_prepared {
-            validate_not_null(&schema, &updated)?;
-            validate_check_constraints(&schema, &updated, context)?;
-        }
-        if state
-            .tables
-            .get(&schema.id)
-            .expect("catalog table must have storage")
-            .has_visible_unique_conflict(
-                &updated,
-                snapshot,
-                xid,
-                &state.transactions,
-                Some(row_id),
-                schema.triggers.is_empty().then_some(&assigned),
-                None,
-                None,
-                context,
-            )
-        {
-            return Err(PgError::create(
-                SqlState::UniqueViolation,
-                format!(
-                    "duplicate key value violates unique constraint on {:?}",
-                    schema.name
-                ),
-            ));
-        }
-        if can_move_updated_row {
+            let updated = if let Some(prepared_updates) = &mut prepared_updates {
+                let (prepared_row_id, updated) = prepared_updates
+                    .next()
+                    .expect("prepared trigger UPDATE retains every target row");
+                assert_eq!(prepared_row_id, row_id);
+                let Some(updated) = updated else {
+                    progress.next += 1;
+                    continue;
+                };
+                updated
+            } else {
+                let assignment_row = bound_row.as_deref().unwrap_or(&updated).to_vec();
+                for assignment in &assignments {
+                    let target = schema.columns[assignment.index].data_type;
+                    updated[assignment.index] = if is_default_expression(assignment.expression) {
+                        evaluate_column_default(&schema.columns[assignment.index], context)?
+                    } else if let Some(prepared) = &assignment.prepared {
+                        prepared::evaluate_prepared_expression(
+                            prepared,
+                            &assignment_row,
+                            &[],
+                            context.deadline,
+                        )?
+                    } else {
+                        evaluate_mutation_assignment(
+                            state,
+                            assignment.expression,
+                            target,
+                            &scope,
+                            &assignment_row,
+                            xid,
+                            snapshot,
+                            context,
+                        )?
+                    };
+                }
+                let Some(updated) = procedural::execute_before_row_triggers(
+                    state,
+                    &schema,
+                    procedural::TriggerEventKind::Update,
+                    updated,
+                    context,
+                )?
+                else {
+                    progress.next += 1;
+                    continue;
+                };
+                updated
+            };
+            progress.affected += 1;
+            if !updates_were_prepared {
+                validate_not_null(&schema, &updated)?;
+                validate_check_constraints(&schema, &updated, context)?;
+            }
+            if state
+                .tables
+                .get(&schema.id)
+                .expect("catalog table must have storage")
+                .has_visible_unique_conflict(
+                    &updated,
+                    snapshot,
+                    xid,
+                    &state.transactions,
+                    Some(row_id),
+                    schema.triggers.is_empty().then_some(&assigned),
+                    None,
+                    None,
+                    context,
+                )
+            {
+                return Err(PgError::create(
+                    SqlState::UniqueViolation,
+                    format!(
+                        "duplicate key value violates unique constraint on {:?}",
+                        schema.name
+                    ),
+                ));
+            }
+            if can_move_updated_row {
+                state
+                    .tables
+                    .get_mut(&schema.id)
+                    .expect("catalog table must have storage")
+                    .append_updated_version(
+                        row_id,
+                        version_xmin,
+                        xid,
+                        context.command_id,
+                        updated,
+                        schema.triggers.is_empty().then_some(&assigned),
+                    );
+                state.mark_table_touched(xid, schema.id);
+                progress.next += 1;
+                continue;
+            }
             state
                 .tables
                 .get_mut(&schema.id)
@@ -263,66 +311,65 @@ pub(in crate::executor) fn execute_update(
                     version_xmin,
                     xid,
                     context.command_id,
-                    updated,
+                    updated.clone(),
                     schema.triggers.is_empty().then_some(&assigned),
                 );
             state.mark_table_touched(xid, schema.id);
-            continue;
-        }
-        state
-            .tables
-            .get_mut(&schema.id)
-            .expect("catalog table must have storage")
-            .append_updated_version(
-                row_id,
-                version_xmin,
-                xid,
-                context.command_id,
-                updated.clone(),
-                schema.triggers.is_empty().then_some(&assigned),
-            );
-        state.mark_table_touched(xid, schema.id);
-        validate_row_foreign_keys(
-            state,
-            &schema,
-            &updated,
-            xid,
-            snapshot,
-            deferred_constraints,
-            defer_all,
-            &[],
-        )?;
-        if has_referencing_foreign_keys {
-            apply_referencing_foreign_key_actions(
+            validate_row_foreign_keys(
                 state,
                 &schema,
-                old_row
-                    .as_ref()
-                    .expect("referencing foreign keys retain the old row"),
-                Some(&updated),
+                &updated,
                 xid,
                 snapshot,
                 deferred_constraints,
                 defer_all,
-                &mut BTreeSet::new(),
+                &[],
+            )?;
+            if has_referencing_foreign_keys {
+                apply_referencing_foreign_key_actions(
+                    state,
+                    &schema,
+                    old_row
+                        .as_ref()
+                        .expect("referencing foreign keys retain the old row"),
+                    Some(&updated),
+                    xid,
+                    snapshot,
+                    deferred_constraints,
+                    defer_all,
+                    &mut BTreeSet::new(),
+                    context,
+                )?;
+            }
+            if let Some(bound_row) = &mut bound_row {
+                bound_row[..schema.columns.len()].clone_from_slice(&updated);
+            }
+            progress.pending_returning = Some(bound_row.as_deref().unwrap_or(&updated).to_vec());
+            evaluate_returning_row(
+                state,
+                returning.as_ref(),
+                bound_row.as_deref().unwrap_or(&updated),
+                &mut progress.returned_rows,
+                xid,
+                snapshot,
                 context,
             )?;
+            progress.pending_returning = None;
+            progress.next += 1;
         }
-        if let Some(bound_row) = &mut bound_row {
-            bound_row[..schema.columns.len()].clone_from_slice(&updated);
-        }
-        evaluate_returning_row(
-            state,
-            returning.as_ref(),
-            bound_row.as_deref().unwrap_or(&updated),
-            &mut returned_rows,
-            xid,
-            snapshot,
-            context,
-        )?;
+        Ok(())
+    })();
+    if let Err(error) = executed {
+        progress.save(context);
+        return Err(error);
     }
+
     assert!(prepared_updates.is_none_or(|mut rows| rows.next().is_none()));
-    Ok(create_write_result(affected, returning, returned_rows))
+    Ok(create_write_result(
+        progress.affected,
+        returning,
+        progress.returned_rows,
+    ))
 }
 
 pub(in crate::executor) fn prepare_update_rows(
@@ -402,38 +449,82 @@ pub(in crate::executor) fn prepare_update_rows(
         .expect("catalog table must have storage")
         .clone();
     for (row_id, version_xmin, current, bound_row) in targets {
-        let mut updated = current.clone();
-        let assignment_row = bound_row.as_deref().unwrap_or(&current);
-        for assignment in &assignments {
-            updated[assignment.index] = if is_default_expression(assignment.expression) {
-                evaluate_column_default(&schema.columns[assignment.index], context)?
-            } else if let Some(prepared) = &assignment.prepared {
-                prepared::evaluate_prepared_expression(
-                    prepared,
-                    assignment_row,
-                    &[],
-                    context.deadline,
-                )?
-            } else {
-                evaluate_mutation_assignment(
-                    state,
-                    assignment.expression,
-                    schema.columns[assignment.index].data_type,
-                    &scope,
-                    assignment_row,
-                    xid,
-                    snapshot,
-                    context,
-                )?
-            };
-        }
-        let updated = procedural::execute_before_row_triggers(
-            state,
-            schema,
-            procedural::TriggerEventKind::Update,
-            updated,
-            context,
-        )?;
+        let cached = context
+            .prepared_update_inputs
+            .lock()
+            .expect("prepared update input mutex is poisoned")
+            .iter()
+            .find(|(statement, row)| {
+                statement.span() == update.span()
+                    && statement == update
+                    && row.row_id == row_id
+                    && row.version_xmin == version_xmin
+                    && row.current == current
+                    && row.bound_row == bound_row
+            })
+            .map(|(_, row)| row.updated.clone());
+        let updated = if let Some(updated) = cached {
+            updated
+        } else {
+            let updated = crate::executor::expressions::resume_operation(
+                crate::executor::expressions::EvaluationOperation::UpdateRow(
+                    Box::new(update.clone()),
+                    row_id,
+                ),
+                context,
+                |context| {
+                    let mut updated = current.clone();
+                    let assignment_row = bound_row.as_deref().unwrap_or(&current);
+                    for assignment in &assignments {
+                        updated[assignment.index] = if is_default_expression(assignment.expression)
+                        {
+                            evaluate_column_default(&schema.columns[assignment.index], context)?
+                        } else if let Some(prepared) = &assignment.prepared {
+                            prepared::evaluate_prepared_expression(
+                                prepared,
+                                assignment_row,
+                                &[],
+                                context.deadline,
+                            )?
+                        } else {
+                            evaluate_mutation_assignment(
+                                state,
+                                assignment.expression,
+                                schema.columns[assignment.index].data_type,
+                                &scope,
+                                assignment_row,
+                                xid,
+                                snapshot,
+                                context,
+                            )?
+                        };
+                    }
+                    let updated = procedural::execute_before_row_triggers(
+                        state,
+                        schema,
+                        procedural::TriggerEventKind::Update,
+                        updated,
+                        context,
+                    )?;
+                    Ok(updated)
+                },
+            )?;
+            context
+                .prepared_update_inputs
+                .lock()
+                .expect("prepared update input mutex is poisoned")
+                .push((
+                    update.clone(),
+                    PreparedUpdateRow {
+                        row_id,
+                        version_xmin,
+                        current: current.clone(),
+                        bound_row: bound_row.clone(),
+                        updated: updated.clone(),
+                    },
+                ));
+            updated
+        };
         if let Some(updated) = &updated {
             validate_not_null(schema, updated)?;
             validate_check_constraints(schema, updated, context)?;

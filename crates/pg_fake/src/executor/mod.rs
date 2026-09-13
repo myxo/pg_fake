@@ -62,7 +62,7 @@ pub(crate) use locks::{
 };
 pub(crate) use prepared::{PreparedQueryPlan, build_prepared_query_plan, execute_prepared_query};
 pub(crate) use procedural::{coerce_procedural_value, substitute_procedural_references};
-pub(crate) use query::ROW_LOCK_PENDING;
+pub(crate) use query::LOCK_PENDING;
 pub(crate) use query::{describe_query_result_columns, detect_statement_features};
 pub(crate) use scope::{
     BoundScope, RowScope, bind_from_scope, bind_join, bind_query_scope, bind_table_factor,

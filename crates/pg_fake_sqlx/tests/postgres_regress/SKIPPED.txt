@@ -1,4 +1,4 @@
-advisory_lock:2
+advisory_lock:3
 aggregates:1
 alter_generic:2
 alter_operator:1

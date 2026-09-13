@@ -86,6 +86,12 @@ pub(super) fn execute_create_table(
             Some(base) => PgType::create(base),
             None => coercion::convert_ast_data_type(&column.data_type)?,
         };
+        if data_type.base == BaseType::Void {
+            return Err(PgError::create(
+                SqlState::InvalidTableDefinition,
+                "column has pseudo-type void",
+            ));
+        }
         let mut nullable = true;
         let mut default = None;
         let mut default_sequence = None;

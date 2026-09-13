@@ -1175,7 +1175,25 @@ surface.
 - Differential/property and controlled multi-session tests include work-queue
   queries and a `SKIP LOCKED` benchmark.
 
-### Task 24 — Advisory locks
+### Task 24 — Advisory locks [COMPLETE]
+
+**Progress:** Added exclusive/shared transaction locks and try forms, both
+integer signatures, separate advisory identities, session reentrancy and
+release, and PostgreSQL `void` results through SQLx. The manifest now explicitly
+requires the session `pg_advisory_lock`/`pg_advisory_unlock` pair already used
+by SQLx's migrator; migration tests use normal locking. Seven advisory
+differential tests, including 46 controlled waits, and all 12 migration-chain
+tests pass. Resumption now preserves aggregate inputs, grouped projections,
+LIMIT/OFFSET, INSERT source/default values, and DML RETURNING across waits;
+correlated invocations retain distinct identities. All review findings are
+resolved. The fourth independent review is clean, including 28
+compositions with successive waits. Workspace tests pass (241 native unit tests
+and 681 upstream behavioral statements), along with strict Clippy, formatting,
+and whitespace checks. The exact `CHAOS_THEORY_CHECK_ITERS=10000
+CHAOS_THEORY_CHECK_TIME=600s` property gate passes all 17 tests in 776.93 seconds.
+After replacing the vendored parser with the fork revision, all 29 focused
+LATERAL, row-lock, advisory-lock, and migration tests pass. Workspace checking,
+strict Clippy, and formatting also pass with the Git dependency.
 
 **Goal:** Support transaction-scoped application coordination.
 

@@ -275,7 +275,10 @@ impl Session {
             };
         }
         let statement_contains_dml = contains_dml(statement);
-        let sequences = if statement_contains_dml || contains_sequence_function(statement) {
+        let sequences = if statement_contains_dml
+            || contains_sequence_function(statement)
+            || state.catalog.iterate_views().next().is_some()
+        {
             executor::SequenceExecutionContext::create(
                 &state.catalog,
                 state.sequence_values.clone(),
@@ -296,17 +299,32 @@ impl Session {
             deadline: statement_deadline,
             rng: self.db.rng.clone(),
             sequences,
+            advisory: crate::advisory::AdvisoryExecutionContext {
+                enabled: crate::advisory::contains_advisory_function(statement),
+                locks: state.advisory_locks.clone(),
+                session: self.temporary_schema_id,
+                xid: transaction.xid,
+                condvar: condvar.clone(),
+                pending: Default::default(),
+            },
             source_state: contains_triggered_insert(&state, statement)
                 .then(|| Arc::new(state.clone())),
             source_snapshot: snapshot,
+            pending_insert_sources: Default::default(),
             prepared_inserts: Arc::new(Mutex::new(Default::default())),
+            prepared_update_inputs: Default::default(),
+            prepared_writes: Default::default(),
             prepared_updates: Arc::new(Mutex::new(Default::default())),
             prepared_mutation_targets: Arc::new(Mutex::new(Default::default())),
             prepared_cte_results: Arc::new(Mutex::new(Vec::new())),
             executed_ctes: Arc::new(Mutex::new(Vec::new())),
             pending_cte_mutations: Arc::new(Mutex::new(Vec::new())),
             prepared_subquery_results: Arc::new(Mutex::new(Default::default())),
+            next_subquery_invocation: Default::default(),
             pending_expressions: Default::default(),
+            pending_operations: Default::default(),
+            pending_evaluations: Default::default(),
+            evaluation_cursor: None,
             lateral_initplans: Arc::new(Mutex::new(executor::collect_lateral_initplans(
                 &state.catalog,
                 statement,
@@ -320,6 +338,10 @@ impl Session {
             source_row_locks: Vec::new(),
             cte_query_barriers: Default::default(),
             prepared_plain_rows: Default::default(),
+            prepared_groups: Default::default(),
+            prepared_group_outputs: Default::default(),
+            prepared_limits: Default::default(),
+            prepared_values: Default::default(),
             capture_lock_queries: false,
             select_row_locks: Default::default(),
             prepared_select_rows: Default::default(),
@@ -408,20 +430,52 @@ impl Session {
         acquired_row_locks |= !locked_rows.is_empty();
         let mutation_targets =
             executor::mutation_locks_cover_targets(statement).then_some(locked_rows);
-        let result = executor::execute_statement(
-            &mut state,
-            statement,
-            transaction.xid,
-            &snapshot,
-            &self.deferred_constraints,
-            self.defer_all_constraints,
-            &context,
-            mutation_targets,
-        )
-        .and_then(|result| {
-            context.check_timeout()?;
-            Ok(result)
-        });
+        let result = loop {
+            let result = executor::execute_statement(
+                &mut state,
+                statement,
+                transaction.xid,
+                &snapshot,
+                &self.deferred_constraints,
+                self.defer_all_constraints,
+                &context,
+                mutation_targets.clone(),
+            )
+            .and_then(|result| {
+                context.check_timeout()?;
+                Ok(result)
+            });
+            if result.as_ref().is_err_and(|error| {
+                error.sqlstate == crate::error::SqlState::InternalError
+                    && error.message == executor::LOCK_PENDING
+            }) {
+                let pending = *context
+                    .advisory
+                    .pending
+                    .lock()
+                    .expect("pending advisory mutex is poisoned");
+                if let crate::advisory::PendingAdvisory::Waiting(request) = pending {
+                    state = match locking::acquire_advisory_lock(
+                        &condvar,
+                        self.lock_timeout,
+                        statement_deadline,
+                        state,
+                        request,
+                        &context,
+                    ) {
+                        Ok(state) => state,
+                        Err(error) => return self.abort_with_error(error),
+                    };
+                    state.load_catalog(
+                        Some(transaction.xid),
+                        snapshot,
+                        Some(self.temporary_schema_id),
+                    );
+                    continue;
+                }
+            }
+            break result;
+        };
         match result {
             Ok(result) => {
                 if let Some(catalog_before) = catalog_before {
@@ -542,5 +596,7 @@ fn contains_sequence_function(statement: &ast::Statement) -> bool {
     found
 }
 
+#[cfg(test)]
+mod advisory_tests;
 #[cfg(test)]
 mod tests;

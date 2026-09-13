@@ -697,6 +697,32 @@ pub const FEATURES: &[Feature] = &[
         ],
     },
     Feature {
+        name: "advisory coordination",
+        cases: &[
+            Case {
+                id: "transaction_advisory_signatures",
+                source: "advisory_lock.sql plus focused coordination fixture",
+                setup: &[],
+                sql: "SELECT pg_advisory_xact_lock(1), pg_advisory_xact_lock_shared(2), pg_advisory_xact_lock(1,1), pg_advisory_xact_lock_shared(2,2)",
+                blocker: BlockerKind::Implementation,
+            },
+            Case {
+                id: "transaction_advisory_try_signatures",
+                source: "focused advisory coordination fixture",
+                setup: &[],
+                sql: "SELECT pg_try_advisory_xact_lock(1), pg_try_advisory_xact_lock_shared(2), pg_try_advisory_xact_lock(1,1), pg_try_advisory_xact_lock_shared(2,2)",
+                blocker: BlockerKind::Implementation,
+            },
+            Case {
+                id: "sqlx_migrator_session_advisory_pair",
+                source: "PgFakeConnection Migrate lock/unlock and migration_chains.rs",
+                setup: &["SELECT pg_advisory_lock(0)"],
+                sql: "SELECT pg_advisory_unlock(0)",
+                blocker: BlockerKind::Implementation,
+            },
+        ],
+    },
+    Feature {
         name: "procedural migrations and triggers",
         cases: &[
             Case {

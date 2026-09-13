@@ -8,6 +8,7 @@ use crate::{
 use sqlparser::ast;
 
 pub(super) struct ReturningPlan<'a> {
+    items: &'a [ast::SelectItem],
     scope: BoundScope,
     projections: Vec<query::ProjectionSource<'a>>,
     columns: Vec<ColumnMeta>,
@@ -26,6 +27,7 @@ pub(super) fn build_returning_plan<'a>(
     let (projections, columns) =
         query::build_mutation_projection_plan(state, returning, &scope, target_columns)?;
     Ok(Some(ReturningPlan {
+        items: returning,
         scope,
         projections,
         columns,
@@ -45,15 +47,24 @@ pub(super) fn evaluate_returning_row(
     let Some(returning) = returning else {
         return Ok(());
     };
-    rows.push(query::evaluate_projection_values(
-        state,
-        &returning.projections,
-        &returning.scope,
-        row,
-        None,
-        xid,
-        snapshot,
+    rows.push(crate::executor::expressions::resume_operation(
+        crate::executor::expressions::EvaluationOperation::Returning(
+            returning.items.to_vec(),
+            row.to_vec(),
+        ),
         context,
+        |context| {
+            query::evaluate_projection_values(
+                state,
+                &returning.projections,
+                &returning.scope,
+                row,
+                None,
+                xid,
+                snapshot,
+                context,
+            )
+        },
     )?);
     Ok(())
 }

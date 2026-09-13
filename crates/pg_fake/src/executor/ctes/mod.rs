@@ -212,7 +212,7 @@ pub(super) fn materialize_query_ctes(
             continue;
         }
         replace_cte_references(&mut cte_query, &ctes, Some(context));
-        if context.lateral_invocation || super::query::contains_row_locks(&cte_query) {
+        if context.lateral_invocation || super::query::contains_locking_operations(&cte_query) {
             let analysis = inline_query_ctes(&cte_query, &state.catalog, Some(state), true)?;
             let mut columns =
                 describe_query_result_columns(state, &ast::Statement::Query(Box::new(analysis)))?;

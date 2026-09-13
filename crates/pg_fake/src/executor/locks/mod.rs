@@ -55,10 +55,16 @@ pub(crate) fn collect_required_row_locks(
             .map(|source| super::views::expand_query_views(&state.catalog, source))
             .transpose()?
             .flatten()
-            .is_some_and(|source| query::contains_row_locks(&source));
+            .is_some_and(|source| query::contains_locking_operations(&source));
         if !schema.triggers.is_empty()
+            || schema.columns.iter().any(|column| {
+                column
+                    .default
+                    .as_ref()
+                    .is_some_and(query::contains_locking_operations)
+            })
             || source_locks
-            || query::contains_row_locks(insert)
+            || query::contains_locking_operations(insert)
             || matches!(
                 insert.on,
                 Some(ast::OnInsert::OnConflict(ast::OnConflict {
@@ -148,7 +154,7 @@ pub(crate) fn collect_required_row_locks(
         ast::Statement::Query(query) => {
             let expanded = super::views::expand_query_views(&state.catalog, query)?;
             let query = expanded.as_ref().unwrap_or(query);
-            if query::contains_row_locks(query) {
+            if query::contains_locking_operations(query) {
                 let mut invocation = context.clone();
                 invocation.capture_lock_queries = true;
                 query::execute_query(state, query, xid, snapshot, &invocation)?;

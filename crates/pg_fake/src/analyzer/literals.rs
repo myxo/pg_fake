@@ -5,6 +5,7 @@ use sqlparser::ast;
 pub(crate) fn create_typed_literal(value: Value, data_type: PgType) -> ast::Expr {
     let literal = match value {
         Value::Null => ast::Value::Null,
+        Value::Void => ast::Value::SingleQuotedString(String::new()),
         Value::Bool(value) => ast::Value::Boolean(value),
         Value::Int2(value) => ast::Value::Number(value.to_string(), false),
         Value::Int4(value) => ast::Value::Number(value.to_string(), false),
@@ -57,6 +58,7 @@ pub(crate) fn create_typed_cast(expression: ast::Expr, data_type: PgType) -> ast
 #[cfg_attr(feature = "execution-log", tracing::instrument(skip_all))]
 fn convert_to_ast_data_type(data_type: PgType) -> ast::DataType {
     match data_type.base {
+        BaseType::Void => ast::DataType::Custom(ast::Ident::new("void").into(), Vec::new()),
         BaseType::Bool => ast::DataType::Boolean,
         BaseType::Int2 => ast::DataType::SmallInt(None),
         BaseType::Int4 => ast::DataType::Integer(None),

@@ -5,7 +5,10 @@ use super::{
 use crate::executor::{
     DatabaseState, PreparedConflictUpdate, PreparedInsert, StatementContext,
     column_defaults::{evaluate_column_default, is_default_expression},
-    expressions::{create_constant_expression_schema, evaluate_assignment_expression},
+    expressions::{
+        EvaluationOperation, create_constant_expression_schema, evaluate_assignment_expression,
+        resume_operation,
+    },
     prepared, procedural, query, resolve_insert_table_name,
     row_constraints::{validate_check_constraints, validate_not_null},
     scope::{bind_target_scope, identify_unknown_query_columns},
@@ -18,7 +21,7 @@ use crate::{
     txn::{RowLockKey, RowLockMode, Snapshot, Xid},
     value::{BaseType, Value},
 };
-use sqlparser::ast;
+use sqlparser::ast::{self, Spanned as _};
 use std::{collections::BTreeSet, sync::Arc};
 
 #[cfg_attr(feature = "execution-log", tracing::instrument(skip_all))]
@@ -54,51 +57,57 @@ pub(super) fn evaluate_insert_rows(
             }
         })
         .collect::<Result<Vec<_>>>()?;
-    let evaluate_default = |index: usize| -> Result<Value> {
+    let evaluate_default = |index: usize, context: &StatementContext| -> Result<Value> {
         static_defaults[index].clone().map_or_else(
             || evaluate_column_default(&schema.columns[index], context),
             Ok,
         )
     };
-    let build_row = |expressions: &[ast::Expr]| -> Result<Vec<Value>> {
-        if expressions.len() != column_indexes.len() {
-            return Err(PgError::create(
-                SqlState::SyntaxError,
-                "INSERT has wrong number of values",
-            ));
-        }
-        let mut row = vec![Value::Null; schema.columns.len()];
-        for (index, value) in row.iter_mut().enumerate() {
-            if !provided.contains(&index) {
-                *value = evaluate_default(index)?;
-            }
-        }
-        let constants = create_constant_expression_schema();
-        for (expression, index) in expressions.iter().zip(column_indexes) {
-            if schema.columns[*index].identity == Some(IdentityKind::Always)
-                && !is_default_expression(expression)
-            {
-                return Err(PgError::create(
-                    SqlState::GeneratedAlways,
-                    format!(
-                        "cannot insert a non-DEFAULT value into column {:?}",
-                        schema.columns[*index].name
-                    ),
-                ));
-            }
-            row[*index] = if is_default_expression(expression) {
-                evaluate_default(*index)?
-            } else {
-                evaluate_assignment_expression(
-                    expression,
-                    schema.columns[*index].data_type,
-                    &constants,
-                    &[],
-                    context,
-                )?
-            };
-        }
-        Ok(row)
+    let build_row = |row_index: usize, expressions: &[ast::Expr]| -> Result<Vec<Value>> {
+        resume_operation(
+            EvaluationOperation::InsertRow(Box::new(insert.clone()), row_index),
+            context,
+            |context| {
+                if expressions.len() != column_indexes.len() {
+                    return Err(PgError::create(
+                        SqlState::SyntaxError,
+                        "INSERT has wrong number of values",
+                    ));
+                }
+                let mut row = vec![Value::Null; schema.columns.len()];
+                for (index, value) in row.iter_mut().enumerate() {
+                    if !provided.contains(&index) {
+                        *value = evaluate_default(index, context)?;
+                    }
+                }
+                let constants = create_constant_expression_schema();
+                for (expression, index) in expressions.iter().zip(column_indexes) {
+                    if schema.columns[*index].identity == Some(IdentityKind::Always)
+                        && !is_default_expression(expression)
+                    {
+                        return Err(PgError::create(
+                            SqlState::GeneratedAlways,
+                            format!(
+                                "cannot insert a non-DEFAULT value into column {:?}",
+                                schema.columns[*index].name
+                            ),
+                        ));
+                    }
+                    row[*index] = if is_default_expression(expression) {
+                        evaluate_default(*index, context)?
+                    } else {
+                        evaluate_assignment_expression(
+                            expression,
+                            schema.columns[*index].data_type,
+                            &constants,
+                            &[],
+                            context,
+                        )?
+                    };
+                }
+                Ok(row)
+            },
+        )
     };
     let execute_triggers = |row| -> Result<Option<Vec<Value>>> {
         let Some(row) = procedural::execute_before_row_triggers(
@@ -247,8 +256,15 @@ pub(super) fn evaluate_insert_rows(
                            returned_rows: &mut Vec<Option<Vec<Value>>>|
      -> Result<()> {
         validate_prepared_row(&row, rows)?;
-        if let Some(cached_conflict) =
-            resume.and_then(|cached| cached.conflicts.get(prepared_row_index))
+        if let Some(cached_conflict) = resume
+            .filter(|cached| {
+                !prepares_returning
+                    || cached
+                        .returned_rows
+                        .as_ref()
+                        .is_some_and(|rows| rows.len() > prepared_row_index)
+            })
+            .and_then(|cached| cached.conflicts.get(prepared_row_index))
         {
             let skips_do_nothing_conflict = conflict_arbiter.as_ref().is_some_and(|arbiter| {
                 conflict_update.is_none()
@@ -457,13 +473,19 @@ pub(super) fn evaluate_insert_rows(
         assert!(insert.columns.is_empty());
         let evaluated = match resume.and_then(|cached| cached.source_rows.first()) {
             Some(row) => Ok(row.clone()),
-            None => schema
-                .columns
-                .iter()
-                .enumerate()
-                .map(|(index, _)| evaluate_default(index))
-                .collect::<Result<Vec<_>>>()
-                .and_then(&execute_triggers),
+            None => resume_operation(
+                EvaluationOperation::InsertRow(Box::new(insert.clone()), 0),
+                context,
+                |context| {
+                    schema
+                        .columns
+                        .iter()
+                        .enumerate()
+                        .map(|(index, _)| evaluate_default(index, context))
+                        .collect::<Result<Vec<_>>>()
+                        .and_then(&execute_triggers)
+                },
+            ),
         };
         let mut rows = Vec::new();
         let mut conflicts = Vec::new();
@@ -500,7 +522,7 @@ pub(super) fn evaluate_insert_rows(
         for (row_index, expressions) in values.rows.iter().enumerate() {
             let evaluated = match resume.and_then(|cached| cached.source_rows.get(row_index)) {
                 Some(row) => Ok(row.clone()),
-                None => build_row(expressions).and_then(&execute_triggers),
+                None => build_row(row_index, expressions).and_then(&execute_triggers),
             };
             match &evaluated {
                 Ok(Some(row)) => {
@@ -622,33 +644,29 @@ pub(super) fn evaluate_insert_rows(
             }
         }
     }
-    let streamed = query::stream_query_rows(
-        &source_state,
-        source,
-        xid,
-        source_snapshot,
-        context,
-        None,
-        &mut source_query,
-        &mut |values, columns| {
-            if columns.len() != column_indexes.len() {
-                return Err(PgError::create(
-                    SqlState::SyntaxError,
-                    "INSERT has wrong number of values",
-                ));
-            }
-            let source_index = streamed_source_rows.len();
-            let evaluated = match resume.and_then(|cached| cached.source_rows.get(source_index)) {
-                Some(row) => Ok(row.clone()),
-                None => (|| {
+    let mut consume = |values: Vec<Value>, columns: &[crate::ColumnMeta]| {
+        if columns.len() != column_indexes.len() {
+            return Err(PgError::create(
+                SqlState::SyntaxError,
+                "INSERT has wrong number of values",
+            ));
+        }
+        let source_index = streamed_source_rows.len();
+        let evaluated = match resume.and_then(|cached| cached.source_rows.get(source_index)) {
+            Some(row) => Ok(row.clone()),
+            None => resume_operation(
+                EvaluationOperation::InsertRow(Box::new(insert.clone()), source_index),
+                context,
+                |context| {
                     let mut row = vec![Value::Null; schema.columns.len()];
                     for (index, value) in row.iter_mut().enumerate() {
                         if !provided.contains(&index) {
-                            *value = evaluate_default(index)?;
+                            *value = evaluate_default(index, context)?;
                         }
                     }
                     for (((value, source_column), unknown), index) in values
-                        .into_iter()
+                        .iter()
+                        .cloned()
                         .zip(columns)
                         .zip(&unknown_columns)
                         .zip(column_indexes)
@@ -677,38 +695,81 @@ pub(super) fn evaluate_insert_rows(
                         };
                     }
                     execute_triggers(row)
-                })(),
-            };
-            match &evaluated {
-                Ok(Some(row)) => {
-                    let row_index = streamed_rows.len();
-                    if let Err(error) = prepare_row(
-                        row_index,
-                        row.clone(),
-                        &mut streamed_rows,
-                        &mut streamed_conflicts,
-                        &mut streamed_returned_rows,
-                    ) {
-                        streamed_error = Some(error.clone());
-                        return Err(error);
-                    }
+                },
+            ),
+        };
+        match &evaluated {
+            Ok(Some(row)) => {
+                let row_index = streamed_rows.len();
+                if let Err(error) = prepare_row(
+                    row_index,
+                    row.clone(),
+                    &mut streamed_rows,
+                    &mut streamed_conflicts,
+                    &mut streamed_returned_rows,
+                ) {
                     streamed_source_rows.push(evaluated.expect("evaluated row is successful"));
-                    if stopped.get() {
-                        return Err(PgError::create(
-                            SqlState::QueryCanceled,
-                            "trigger INSERT preparation stopped",
-                        ));
-                    }
-                }
-                Ok(None) => streamed_source_rows.push(None),
-                Err(error) => {
                     streamed_error = Some(error.clone());
-                    return Err(error.clone());
+                    return Err(error);
+                }
+                streamed_source_rows.push(evaluated.expect("evaluated row is successful"));
+                if stopped.get() {
+                    return Err(PgError::create(
+                        SqlState::QueryCanceled,
+                        "trigger INSERT preparation stopped",
+                    ));
                 }
             }
-            Ok(())
-        },
-    );
+            Ok(None) => streamed_source_rows.push(None),
+            Err(error) => {
+                if error.sqlstate == SqlState::InternalError
+                    && error.message == crate::executor::LOCK_PENDING
+                {
+                    context
+                        .pending_insert_sources
+                        .lock()
+                        .expect("pending insert source mutex is poisoned")
+                        .push((
+                            insert.clone(),
+                            crate::QueryResult {
+                                columns: columns.to_vec(),
+                                rows: vec![values],
+                            },
+                        ));
+                }
+                streamed_error = Some(error.clone());
+                return Err(error.clone());
+            }
+        }
+        Ok(())
+    };
+    let mut pending = context
+        .pending_insert_sources
+        .lock()
+        .expect("pending insert source mutex is poisoned");
+    let pending_source = pending
+        .iter()
+        .position(|(cached, _)| cached.span() == insert.span() && cached == insert)
+        .map(|index| pending.remove(index).1);
+    drop(pending);
+    let resumed = pending_source.map_or(Ok(()), |mut pending| {
+        consume(
+            pending.rows.pop().expect("pending source retains one row"),
+            &pending.columns,
+        )
+    });
+    let streamed = resumed.and_then(|()| {
+        query::stream_query_rows(
+            &source_state,
+            source,
+            xid,
+            source_snapshot,
+            context,
+            None,
+            &mut source_query,
+            &mut consume,
+        )
+    });
     match streamed {
         Err(_) if stopped.get() => {
             return Ok(PreparedInsert {
@@ -771,46 +832,50 @@ pub(super) fn evaluate_insert_rows(
         ));
     }
     for values in source.rows.iter().skip(streamed_source_rows.len()) {
-        let evaluated = (|| -> Result<Option<Vec<Value>>> {
-            let mut row = vec![Value::Null; schema.columns.len()];
-            for (index, value) in row.iter_mut().enumerate() {
-                if !provided.contains(&index) {
-                    *value = evaluate_default(index)?;
+        let evaluated = resume_operation(
+            EvaluationOperation::InsertRow(Box::new(insert.clone()), streamed_source_rows.len()),
+            context,
+            |context| -> Result<Option<Vec<Value>>> {
+                let mut row = vec![Value::Null; schema.columns.len()];
+                for (index, value) in row.iter_mut().enumerate() {
+                    if !provided.contains(&index) {
+                        *value = evaluate_default(index, context)?;
+                    }
                 }
-            }
-            for (((value, source_column), unknown), index) in values
-                .iter()
-                .cloned()
-                .zip(&source.columns)
-                .zip(&unknown_columns)
-                .zip(column_indexes)
-            {
-                let value = if *unknown {
-                    match value {
-                        Value::Text(text) => coercion::coerce_unknown(
-                            &text,
+                for (((value, source_column), unknown), index) in values
+                    .iter()
+                    .cloned()
+                    .zip(&source.columns)
+                    .zip(&unknown_columns)
+                    .zip(column_indexes)
+                {
+                    let value = if *unknown {
+                        match value {
+                            Value::Text(text) => coercion::coerce_unknown(
+                                &text,
+                                schema.columns[*index].data_type,
+                                CastContext::Assignment,
+                                &context.timezone,
+                            )?,
+                            Value::Null => Value::Null,
+                            _ => unreachable!("unknown literals evaluate to text or null"),
+                        }
+                    } else {
+                        let source_type = BaseType::resolve_oid(source_column.type_oid)
+                            .expect("query columns use supported PostgreSQL types");
+                        coercion::coerce(
+                            value,
+                            source_type,
                             schema.columns[*index].data_type,
                             CastContext::Assignment,
                             &context.timezone,
-                        )?,
-                        Value::Null => Value::Null,
-                        _ => unreachable!("unknown literals evaluate to text or null"),
-                    }
-                } else {
-                    let source_type = BaseType::resolve_oid(source_column.type_oid)
-                        .expect("query columns use supported PostgreSQL types");
-                    coercion::coerce(
-                        value,
-                        source_type,
-                        schema.columns[*index].data_type,
-                        CastContext::Assignment,
-                        &context.timezone,
-                    )?
-                };
-                row[*index] = value;
-            }
-            execute_triggers(row)
-        })();
+                        )?
+                    };
+                    row[*index] = value;
+                }
+                execute_triggers(row)
+            },
+        );
         match evaluated {
             Ok(Some(row)) => {
                 let row_index = streamed_rows.len();
@@ -888,7 +953,7 @@ pub(in crate::executor) fn prepare_insert_rows(
         insert.returning.as_deref(),
     )?;
     let resume = context.get_prepared_insert(insert);
-    let prepared = match resume {
+    let mut prepared = match resume {
         Some(prepared) if prepared.complete => prepared,
         resume => evaluate_insert_rows(
             state,
@@ -903,7 +968,22 @@ pub(in crate::executor) fn prepare_insert_rows(
             context,
         )?,
     };
+    let pending = prepared
+        .error
+        .as_ref()
+        .filter(|error| {
+            error.sqlstate == SqlState::InternalError
+                && error.message == crate::executor::LOCK_PENDING
+        })
+        .cloned();
+    if pending.is_some() {
+        prepared.complete = false;
+        prepared.error = None;
+    }
     context.set_prepared_insert(insert, prepared.clone());
+    if let Some(error) = pending {
+        return Err(error);
+    }
     if !prepared.complete {
         context.request_row_lock_recheck();
     } else if let Some(error) = prepared.error.clone() {

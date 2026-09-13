@@ -95,6 +95,15 @@ pub(crate) fn execute_create_view(
         unreachable!("view definition is a query")
     };
     let inferred = infer_query_output_columns(&state.catalog, expanded)?;
+    if inferred
+        .iter()
+        .any(|(_, data_type)| data_type.base == crate::value::BaseType::Void)
+    {
+        return Err(PgError::create(
+            SqlState::InvalidTableDefinition,
+            "view column has pseudo-type void",
+        ));
+    }
     if create.columns.len() > inferred.len() {
         return Err(PgError::create(
             SqlState::InvalidTableDefinition,

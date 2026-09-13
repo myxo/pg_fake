@@ -173,7 +173,7 @@ pub(super) fn evaluate_select_expression(
 pub(in crate::executor) fn contains_volatile_expression(expression: &ast::Expr) -> bool {
     let mut expression = expression.clone();
     prune_constant_cases(&mut expression, None).expect("untyped CASE pruning cannot fail");
-    let mut found = false;
+    let mut found = crate::advisory::contains_advisory_function(&expression);
     let _ = ast::visit_expressions(&expression, |nested| {
         let ast::Expr::Function(function) = nested else {
             return std::ops::ControlFlow::Continue(());

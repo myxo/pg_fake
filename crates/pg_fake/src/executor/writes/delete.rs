@@ -1,5 +1,6 @@
 use super::{
     require_mutation_table,
+    resume::PreparedWrite,
     returning::{build_returning_plan, create_write_result, evaluate_returning_row},
     targets::{
         collect_mutation_targets, create_mutation_scope, has_mutated_target_in_command,
@@ -76,113 +77,147 @@ pub(in crate::executor) fn execute_delete(
         }
     }
     let has_referencing_foreign_keys = state.catalog.has_referencing_foreign_keys(schema.id);
-    let prepared_targets =
-        context.take_prepared_mutation_targets(delete.span(), snapshot.commit_seq);
-    if using.is_empty()
-        && returning.is_none()
-        && !has_referencing_foreign_keys
-        && let Some(mutation_targets) = mutation_targets.take()
-    {
-        let targets = mutation_targets
-            .into_iter()
-            .filter(|required| required.key.table_id == schema.id)
-            .collect::<Vec<_>>();
-        let affected = targets.len() as u64;
-        for required in targets {
-            let candidate = required
-                .mutation_candidate
-                .expect("mutation target locks retain their selected version");
+    let mut progress =
+        if let Some(progress) = PreparedWrite::take(context, delete.span(), &delete.to_string()) {
+            progress
+        } else {
+            let prepared_targets =
+                context.take_prepared_mutation_targets(delete.span(), snapshot.commit_seq);
+            if using.is_empty()
+                && returning.is_none()
+                && !has_referencing_foreign_keys
+                && let Some(mutation_targets) = mutation_targets.take()
+            {
+                let targets = mutation_targets
+                    .into_iter()
+                    .filter(|required| required.key.table_id == schema.id)
+                    .collect::<Vec<_>>();
+                let affected = targets.len() as u64;
+                for required in targets {
+                    let candidate = required
+                        .mutation_candidate
+                        .expect("mutation target locks retain their selected version");
+                    state
+                        .tables
+                        .get_mut(&schema.id)
+                        .expect("catalog table must have storage")
+                        .mark_version_deleted(
+                            required.key.row_id,
+                            candidate.version_xmin,
+                            xid,
+                            context.command_id,
+                        );
+                }
+                if affected != 0 {
+                    state.mark_table_touched(xid, schema.id);
+                }
+                return Ok(StatementResult::Affected(affected));
+            }
+            let source_rows = materialize_mutation_source_rows(
+                state,
+                using,
+                &scope,
+                schema.columns.len(),
+                xid,
+                snapshot,
+                context,
+            )?;
+            let targets = match prepared_targets {
+                Some(targets) => targets
+                    .into_iter()
+                    .filter(|target| {
+                        !has_mutated_target_in_command(
+                            state,
+                            schema.id,
+                            target.row_id,
+                            target.version_xmin,
+                            xid,
+                            context.command_id,
+                        )
+                    })
+                    .map(|target| {
+                        (
+                            target.row_id,
+                            target.version_xmin,
+                            target.current,
+                            target.bound_row,
+                        )
+                    })
+                    .collect(),
+                None => collect_mutation_targets(
+                    state,
+                    &schema,
+                    delete.selection.as_ref(),
+                    &scope,
+                    &source_rows,
+                    xid,
+                    snapshot,
+                    context,
+                    mutation_targets,
+                )?,
+            };
+            PreparedWrite::create(delete.span(), delete.to_string(), targets, None)
+        };
+    let targets = progress.targets.clone();
+    let executed = (|| {
+        for (row_id, version_xmin, row, bound_row) in targets.into_iter().skip(progress.next) {
+            if let Some(row) = &progress.pending_returning {
+                evaluate_returning_row(
+                    state,
+                    returning.as_ref(),
+                    row,
+                    &mut progress.returned_rows,
+                    xid,
+                    snapshot,
+                    context,
+                )?;
+                progress.pending_returning = None;
+                progress.next += 1;
+                continue;
+            }
+            if has_referencing_foreign_keys {
+                apply_referencing_foreign_key_actions(
+                    state,
+                    &schema,
+                    &row,
+                    None,
+                    xid,
+                    snapshot,
+                    deferred_constraints,
+                    defer_all,
+                    &mut BTreeSet::new(),
+                    context,
+                )?;
+            }
             state
                 .tables
                 .get_mut(&schema.id)
                 .expect("catalog table must have storage")
-                .mark_version_deleted(
-                    required.key.row_id,
-                    candidate.version_xmin,
-                    xid,
-                    context.command_id,
-                );
-        }
-        if affected != 0 {
+                .mark_version_deleted(row_id, version_xmin, xid, context.command_id);
             state.mark_table_touched(xid, schema.id);
-        }
-        return Ok(StatementResult::Affected(affected));
-    }
-    let source_rows = materialize_mutation_source_rows(
-        state,
-        using,
-        &scope,
-        schema.columns.len(),
-        xid,
-        snapshot,
-        context,
-    )?;
-    let targets = match prepared_targets {
-        Some(targets) => targets
-            .into_iter()
-            .filter(|target| {
-                !has_mutated_target_in_command(
-                    state,
-                    schema.id,
-                    target.row_id,
-                    target.version_xmin,
-                    xid,
-                    context.command_id,
-                )
-            })
-            .map(|target| {
-                (
-                    target.row_id,
-                    target.version_xmin,
-                    target.current,
-                    target.bound_row,
-                )
-            })
-            .collect(),
-        None => collect_mutation_targets(
-            state,
-            &schema,
-            delete.selection.as_ref(),
-            &scope,
-            &source_rows,
-            xid,
-            snapshot,
-            context,
-            mutation_targets,
-        )?,
-    };
-    let affected = targets.len() as u64;
-    let mut returned_rows = Vec::new();
-    for (row_id, version_xmin, row, bound_row) in targets {
-        if has_referencing_foreign_keys {
-            apply_referencing_foreign_key_actions(
+            progress.affected += 1;
+            progress.pending_returning = Some(bound_row.as_deref().unwrap_or(&row).to_vec());
+            evaluate_returning_row(
                 state,
-                &schema,
-                &row,
-                None,
+                returning.as_ref(),
+                bound_row.as_deref().unwrap_or(&row),
+                &mut progress.returned_rows,
                 xid,
                 snapshot,
-                deferred_constraints,
-                defer_all,
-                &mut BTreeSet::new(),
                 context,
             )?;
+            progress.pending_returning = None;
+            progress.next += 1;
         }
-        state
-            .tables
-            .get_mut(&schema.id)
-            .expect("catalog table must have storage")
-            .mark_version_deleted(row_id, version_xmin, xid, context.command_id);
-        state.mark_table_touched(xid, schema.id);
-        evaluate_returning_row(
-            state,
-            returning.as_ref(),
-            bound_row.as_deref().unwrap_or(&row),
-            &mut returned_rows,
-            xid,
-            snapshot,
-            context,
-        )?;
+        Ok(())
+    })();
+    if let Err(error) = executed {
+        progress.save(context);
+        return Err(error);
     }
-    Ok(create_write_result(affected, returning, returned_rows))
+    Ok(create_write_result(
+        progress.affected,
+        returning,
+        progress.returned_rows,
+    ))
 }

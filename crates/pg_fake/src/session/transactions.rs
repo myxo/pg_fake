@@ -200,8 +200,15 @@ impl Session {
         self.settings_undo = Some(settings.clone());
         self.settings_on_commit = Some(settings);
         let mut state = self.db.state.lock().expect("database mutex is poisoned");
+        let xid = state.transactions.begin();
+        state
+            .advisory_locks
+            .lock()
+            .expect("advisory lock mutex is poisoned")
+            .register_transaction(self.temporary_schema_id, xid);
+        self.db.condvar.notify_all();
         self.transaction = Some(SessionTransactionState::Active(ActiveTransaction {
-            xid: state.transactions.begin(),
+            xid,
             isolation,
             snapshot: None,
             statement_started: false,
@@ -263,6 +270,11 @@ impl Session {
             state.transactions.finish_read_only(transaction.xid);
             state.row_locks.release_transaction_locks(transaction.xid);
             state
+                .advisory_locks
+                .lock()
+                .expect("advisory lock mutex is poisoned")
+                .release_transaction_locks(transaction.xid);
+            state
                 .relation_locks
                 .release_transaction_locks(transaction.xid);
             state.wait_for.remove_transaction(transaction.xid);
@@ -311,6 +323,11 @@ impl Session {
         }
         prune_database_versions(&mut state);
         state.row_locks.release_transaction_locks(transaction.xid);
+        state
+            .advisory_locks
+            .lock()
+            .expect("advisory lock mutex is poisoned")
+            .release_transaction_locks(transaction.xid);
         state
             .relation_locks
             .release_transaction_locks(transaction.xid);
@@ -460,6 +477,11 @@ impl Drop for Session {
         let reclaimed = state
             .catalog_history
             .drop_temporary_schema(self.temporary_schema_id);
+        state
+            .advisory_locks
+            .lock()
+            .expect("advisory lock mutex is poisoned")
+            .release_session_locks(self.temporary_schema_id);
         for table_id in reclaimed.tables {
             state.tables.remove(&table_id);
         }
@@ -531,6 +553,11 @@ fn abort_database_transaction(state: &mut DatabaseState, xid: Xid) {
     }
     prune_database_versions(state);
     state.row_locks.release_transaction_locks(xid);
+    state
+        .advisory_locks
+        .lock()
+        .expect("advisory lock mutex is poisoned")
+        .release_transaction_locks(xid);
     state.relation_locks.release_transaction_locks(xid);
     state.wait_for.remove_transaction(xid);
 }

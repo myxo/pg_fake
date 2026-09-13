@@ -131,9 +131,7 @@ fn create_migrator(scenario: &Scenario) -> Migrator {
             )
         })
         .collect();
-    let mut migrator = Migrator::with_migrations(migrations);
-    migrator.set_locking(false);
-    migrator
+    Migrator::with_migrations(migrations)
 }
 
 fn get_migration_sqlstate(error: MigrateError) -> String {
@@ -1032,7 +1030,7 @@ fn sqlx_migrator_reverts_and_skips_versions() {
         .block_on(PgConnection::connect(&server.url))
         .unwrap();
     let mut fake = PgFakeConnection::new(Db::create());
-    let mut migrator = Migrator::with_migrations(vec![
+    let migrator = Migrator::with_migrations(vec![
         Migration::new(
             1,
             Cow::Borrowed("reversible marker"),
@@ -1055,7 +1053,6 @@ fn sqlx_migrator_reverts_and_skips_versions() {
             false,
         ),
     ]);
-    migrator.set_locking(false);
 
     runtime.block_on(migrator.run_to(1, &mut postgres)).unwrap();
     runtime.block_on(migrator.run_to(1, &mut fake)).unwrap();
@@ -1234,7 +1231,7 @@ fn rolls_back_failed_sqlx_migration_catalog_and_rows() {
             failure_sql.into_sql_str(),
             false,
         )]);
-        failing.set_ignore_missing(true).set_locking(false);
+        failing.set_ignore_missing(true);
         let expected = failing
             .run_direct(None, &mut postgres, false)
             .await

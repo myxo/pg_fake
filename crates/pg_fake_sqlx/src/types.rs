@@ -45,6 +45,7 @@ impl TypeInfo for PgFakeTypeInfo {
 
     fn name(&self) -> &str {
         match self.base {
+            Some(BaseType::Void) => "VOID",
             Some(BaseType::Bool) => "BOOL",
             Some(BaseType::Int2) => "INT2",
             Some(BaseType::Int4) => "INT4",
@@ -369,6 +370,22 @@ impl<'r> Decode<'r, PgFake> for String {
         match value.value {
             Value::Null => Err(Box::new(UnexpectedNullError)),
             value => Ok(value.format_postgres_text()),
+        }
+    }
+}
+
+impl Type<PgFake> for () {
+    fn type_info() -> PgFakeTypeInfo {
+        PgFakeTypeInfo::new(BaseType::Void)
+    }
+}
+
+impl<'r> Decode<'r, PgFake> for () {
+    fn decode(value: PgFakeValueRef<'r>) -> Result<Self, BoxDynError> {
+        match value.value {
+            Value::Void => Ok(()),
+            Value::Null => Err(Box::new(UnexpectedNullError)),
+            value => Err(format!("cannot decode {value:?} as void").into()),
         }
     }
 }

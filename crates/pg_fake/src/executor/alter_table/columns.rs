@@ -36,6 +36,12 @@ pub(super) fn create_column_definition(
         Some(base) => PgType::create(base),
         None => coercion::convert_ast_data_type(&definition.data_type)?,
     };
+    if data_type.base == BaseType::Void {
+        return Err(PgError::create(
+            SqlState::InvalidTableDefinition,
+            "column has pseudo-type void",
+        ));
+    }
     let mut nullable = true;
     let mut default = None;
     let mut default_sequence = None;
@@ -207,6 +213,12 @@ pub(super) fn alter_column(
                 ));
             }
             let target = coercion::convert_ast_data_type(data_type)?;
+            if target.base == BaseType::Void {
+                return Err(PgError::create(
+                    SqlState::InvalidTableDefinition,
+                    "column has pseudo-type void",
+                ));
+            }
             if schema.constraints.iter().any(|constraint| {
                 matches!(
                     constraint,

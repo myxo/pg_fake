@@ -20,7 +20,9 @@ mod conflicts;
 mod delete;
 mod insert;
 mod insert_preparation;
+mod resume;
 mod returning;
+pub(crate) use resume::PreparedWrite;
 mod targets;
 mod update;
 
