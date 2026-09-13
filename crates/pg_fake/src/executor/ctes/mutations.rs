@@ -110,7 +110,7 @@ pub(in crate::executor) fn prepare_cte_mutation_for_locking(
                 continue;
             }
             let mut cte_query = cte.query.as_ref().clone();
-            replace_cte_references(&mut cte_query, &materialized);
+            replace_cte_references(&mut cte_query, &materialized, Some(context));
             let occurrence = cte.alias.name.span;
             let mut result = match context.get_prepared_cte_result(occurrence, &names[index]) {
                 Some(result) => result,
@@ -125,12 +125,7 @@ pub(in crate::executor) fn prepare_cte_mutation_for_locking(
                         context.defer_cte_mutation(occurrence, names[index].clone(), statement);
                         return Ok(None);
                     } else {
-                        let StatementResult::Query(result) =
-                            execute_query(state, &cte_query, xid, snapshot, context)?
-                        else {
-                            unreachable!("read CTE returns query rows")
-                        };
-                        result
+                        execute_query(state, &cte_query, xid, snapshot, context)?.result
                     };
                     context.set_prepared_cte_result(
                         occurrence,
@@ -161,7 +156,7 @@ pub(in crate::executor) fn prepare_cte_mutation_for_locking(
         }
     }
     let mut target_query = target.query.as_ref().clone();
-    replace_cte_references(&mut target_query, &materialized);
+    replace_cte_references(&mut target_query, &materialized, Some(context));
     let statement = convert_query_to_statement(target_query);
     context.set_prepares_subquery_results(true);
     let prepared = materialize_uncorrelated_subqueries(state, &statement, xid, snapshot, context);
@@ -182,7 +177,11 @@ pub(crate) fn materialize_statement_ctes(
     let ast::Statement::Query(query) = statement else {
         return Ok(statement.clone());
     };
-    if query.with.is_none() {
+    if query.with.as_ref().is_none_or(|with| {
+        with.cte_tables
+            .iter()
+            .all(|cte| !is_data_modifying_query(&cte.query))
+    }) {
         return Ok(convert_query_to_statement(materialize_query_ctes(
             state, query, xid, snapshot, context,
         )?));
@@ -264,7 +263,7 @@ pub(crate) fn materialize_statement_ctes(
         if !reachable.contains(&name) {
             continue;
         }
-        replace_cte_references(&mut cte_query, &ctes);
+        replace_cte_references(&mut cte_query, &ctes, Some(context));
         let result = if modifying {
             if let Some(result) = context.get_executed_cte_result(cte.alias.name.span, &name) {
                 result
@@ -336,7 +335,7 @@ pub(crate) fn materialize_statement_ctes(
             source: super::CteSource::Rows(result),
         });
     }
-    replace_cte_references(&mut query, &ctes);
+    replace_cte_references(&mut query, &ctes, Some(context));
     Ok(convert_query_to_statement(materialize_query_ctes(
         state, &query, xid, snapshot, context,
     )?))
@@ -445,7 +444,7 @@ fn materialize_recursive_data_modifying_ctes(
                 ));
             }
             let mut cte_query = *cte.query;
-            replace_cte_references(&mut cte_query, &ctes);
+            replace_cte_references(&mut cte_query, &ctes, Some(context));
             let recursive = !modifying && validate_recursive_cte(&cte_query, name)?;
             let demand = if recursive {
                 resolve_direct_cte_demand(&mut query, name, context)?
@@ -535,6 +534,6 @@ fn materialize_recursive_data_modifying_ctes(
             return reject_unsupported("mutual recursion between WITH items is not implemented");
         }
     }
-    replace_cte_references(&mut query, &ctes);
+    replace_cte_references(&mut query, &ctes, Some(context));
     Ok(query)
 }

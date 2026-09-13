@@ -1,6 +1,6 @@
 use crate::executor::{
     DatabaseState, PreparedMutationTarget, StatementContext,
-    expressions::{evaluate, infer_expression_type, is_null_literal},
+    expressions::is_null_literal,
     from::resolve_unique_point_lookup,
     normalize_relation_name, prepared, query, resolve_insert_table_name,
     scope::{RowScope, bind_target_scope},
@@ -49,7 +49,24 @@ pub(crate) fn collect_required_row_locks(
             return Ok(Vec::new());
         }
         let schema = state.catalog.require_named_table(&name)?;
-        if !schema.triggers.is_empty() {
+        let source_locks = insert
+            .source
+            .as_ref()
+            .map(|source| super::views::expand_query_views(&state.catalog, source))
+            .transpose()?
+            .flatten()
+            .is_some_and(|source| query::contains_row_locks(&source));
+        if !schema.triggers.is_empty()
+            || source_locks
+            || query::contains_row_locks(insert)
+            || matches!(
+                insert.on,
+                Some(ast::OnInsert::OnConflict(ast::OnConflict {
+                    action: ast::OnConflictAction::DoUpdate(_),
+                    ..
+                }))
+            )
+        {
             return collect_triggered_insert_locks(state, insert, schema, xid, snapshot, context);
         }
         let mut locks = collect_insert_foreign_key_locks(state, insert, xid, snapshot, context)?;
@@ -75,6 +92,9 @@ pub(crate) fn collect_required_row_locks(
             if state.catalog.require_named_view(&name).is_ok() {
                 return Ok(Vec::new());
             }
+            if update.from.is_some() {
+                return writes::collect_update_cte_locks(state, update, xid, snapshot, context);
+            }
             (
                 state.catalog.require_named_table(&name)?,
                 alias.as_ref().map(|alias| &alias.name),
@@ -83,7 +103,7 @@ pub(crate) fn collect_required_row_locks(
                     .is_none()
                     .then_some(update.selection.as_ref())
                     .flatten(),
-                RowLockMode::Update,
+                RowLockMode::NoKeyUpdate,
                 update.from.is_none(),
                 true,
             )
@@ -108,6 +128,9 @@ pub(crate) fn collect_required_row_locks(
             if state.catalog.require_named_view(&name).is_ok() {
                 return Ok(Vec::new());
             }
+            if delete.using.is_some() {
+                return writes::collect_delete_cte_locks(state, delete, xid, snapshot, context);
+            }
             let schema = state.catalog.require_named_table(&name)?;
             (
                 schema,
@@ -123,40 +146,30 @@ pub(crate) fn collect_required_row_locks(
             )
         }
         ast::Statement::Query(query) => {
-            let Some(mode) = query::resolve_select_lock_mode(query)? else {
-                return Ok(Vec::new());
-            };
-            let ast::SetExpr::Select(select) = query.body.as_ref() else {
-                return Ok(Vec::new());
-            };
-            if select.from.len() != 1 || !select.from[0].joins.is_empty() {
-                return Ok(Vec::new());
+            let expanded = super::views::expand_query_views(&state.catalog, query)?;
+            let query = expanded.as_ref().unwrap_or(query);
+            if query::contains_row_locks(query) {
+                let mut invocation = context.clone();
+                invocation.capture_lock_queries = true;
+                query::execute_query(state, query, xid, snapshot, &invocation)?;
             }
-            let ast::TableFactor::Table {
-                name: table_name,
-                alias,
-                args: None,
-                ..
-            } = &select.from[0].relation
-            else {
-                return Ok(Vec::new());
-            };
-            (
-                state
-                    .catalog
-                    .require_named_table(&normalize_relation_name(table_name)?)?,
-                alias.as_ref().map(|alias| &alias.name),
-                select.selection.as_ref(),
-                mode,
-                false,
-                false,
-            )
+            return Ok(std::mem::take(
+                &mut *context
+                    .select_row_locks
+                    .lock()
+                    .expect("select locks mutex is poisoned"),
+            ));
         }
         _ => return Ok(Vec::new()),
     };
     let (schema, alias, selection, mode, retain_mutation_candidates, retain_mutation_row) = target;
     if let Some(selection) = selection {
-        let base = infer_expression_type(selection, RowScope::Table(schema))?;
+        let base = query::infer_query_expression_type(
+            state,
+            selection,
+            &bind_target_scope(schema, alias),
+        )?
+        .base;
         if base != BaseType::Bool && !is_null_literal(selection) {
             return Ok(Vec::new());
         }
@@ -238,7 +251,15 @@ pub(crate) fn collect_required_row_locks(
                             context.deadline,
                         )?
                     } else {
-                        evaluate(selection, RowScope::Table(schema), &version.row, context)?
+                        super::subqueries::evaluate_query_expression(
+                            state,
+                            selection,
+                            &bound_scope,
+                            &version.row,
+                            xid,
+                            snapshot,
+                            context,
+                        )?
                     };
                     match value {
                         Value::Bool(true) => {}
@@ -292,29 +313,22 @@ pub(crate) fn collect_required_row_locks(
             }
         }
     }
-    if let ast::Statement::Update(update) = statement
-        && schema
-            .constraints
-            .iter()
-            .any(|constraint| matches!(constraint, crate::catalog::Constraint::ForeignKey(_)))
-        && schema.triggers.iter().any(|trigger| {
-            trigger
-                .definition
-                .events
-                .iter()
-                .any(|event| matches!(event, ast::TriggerEvent::Update(_)))
-        })
-    {
+    if let ast::Statement::Update(update) = statement {
         if locks.iter().any(|required| {
             required.key.table_id == schema.id
-                && !state
-                    .row_locks
-                    .is_held(required.key, xid, RowLockMode::Update)
+                && !state.row_locks.is_held(required.key, xid, required.mode)
         }) {
             context.request_row_lock_recheck();
             return Ok(locks);
         }
         let rows = writes::prepare_update_rows(state, update, schema, xid, snapshot, context)?;
+        for lock in &mut locks {
+            if let Some(row) = rows.iter().find(|row| row.row_id == lock.key.row_id)
+                && let Some(updated) = &row.updated
+            {
+                lock.mode = resolve_update_lock_mode(schema, &row.current, updated);
+            }
+        }
         locks.extend(collect_foreign_key_locks_for_rows(
             state,
             schema,
@@ -370,4 +384,47 @@ pub(super) fn check_concurrent_update(
         ));
     }
     Ok(())
+}
+
+pub(super) fn resolve_update_lock_mode(
+    schema: &crate::catalog::TableSchema,
+    current: &[Value],
+    updated: &[Value],
+) -> RowLockMode {
+    let keys = schema
+        .constraints
+        .iter()
+        .filter_map(|constraint| match constraint {
+            crate::catalog::Constraint::PrimaryKey { columns, .. }
+            | crate::catalog::Constraint::Unique { columns, .. } => {
+                Some(columns.iter().map(String::as_str).collect::<Vec<_>>())
+            }
+            _ => None,
+        })
+        .chain(
+            schema
+                .indexes
+                .iter()
+                .filter(|index| index.unique && index.predicate.is_none())
+                .map(|index| {
+                    index
+                        .columns
+                        .iter()
+                        .map(|column| column.name.as_str())
+                        .collect()
+                }),
+        );
+    for columns in keys {
+        for name in columns {
+            let index = schema
+                .columns
+                .iter()
+                .position(|column| column.name == name)
+                .expect("index column exists");
+            if current[index] != updated[index] {
+                return RowLockMode::Update;
+            }
+        }
+    }
+    RowLockMode::NoKeyUpdate
 }

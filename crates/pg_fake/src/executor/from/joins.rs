@@ -14,7 +14,7 @@ use crate::{
 };
 use sqlparser::ast;
 
-use super::{materialize_table_factor_rows, scans::visit_table_factor_rows};
+use super::{SourceRow, materialize_table_factor_rows, scans::visit_table_factor_rows};
 
 #[cfg_attr(feature = "execution-log", tracing::instrument(skip_all))]
 pub(super) fn can_stream_join(table: &ast::TableWithJoins) -> bool {
@@ -355,8 +355,8 @@ pub(super) fn materialize_table_with_joins_rows(
     context: &StatementContext,
     selection: Option<&ast::Expr>,
     next_slot: &mut usize,
-    prefix: &[Value],
-) -> Result<Vec<Vec<Value>>> {
+    prefix: &SourceRow,
+) -> Result<Vec<SourceRow>> {
     let left_start = *next_slot;
     let mut rows = materialize_table_factor_rows(
         state,
@@ -370,7 +370,16 @@ pub(super) fn materialize_table_with_joins_rows(
         prefix,
     )?;
     for row in &mut rows {
-        for (value, prefix) in row.iter_mut().zip(prefix) {
+        for origin in &prefix.origins {
+            if !row
+                .origins
+                .iter()
+                .any(|existing| existing.source == origin.source && existing.key == origin.key)
+            {
+                row.origins.push(origin.clone());
+            }
+        }
+        for (value, prefix) in row.values.iter_mut().zip(&prefix.values) {
             if value.is_null() {
                 *value = prefix.clone();
             }
@@ -392,7 +401,12 @@ pub(super) fn materialize_table_with_joins_rows(
             scope::bind_table_factor(&state.catalog, &join.relation, &mut bound)?;
             *next_slot = bound.columns.len();
             let mut joined = Vec::new();
-            for left in rows {
+            for (index, left) in rows.into_iter().enumerate() {
+                let mut context = context.clone();
+                if context.capture_lock_queries {
+                    context.query_invocation.push(index);
+                }
+                let context = &context;
                 let mut matched = false;
                 let mut slot = right_start;
                 for row in materialize_table_factor_rows(
@@ -409,7 +423,7 @@ pub(super) fn materialize_table_with_joins_rows(
                     if evaluate_join_condition(
                         state,
                         &join.join_operator,
-                        &row,
+                        &row.values,
                         scope,
                         left_start,
                         right_start,
@@ -449,21 +463,11 @@ pub(super) fn materialize_table_with_joins_rows(
         for left in &rows {
             let mut matched_left = false;
             for (index, right) in right_rows.iter().enumerate() {
-                let row = left
-                    .iter()
-                    .zip(right)
-                    .map(|(left, right)| {
-                        if left.is_null() {
-                            right.clone()
-                        } else {
-                            left.clone()
-                        }
-                    })
-                    .collect::<Vec<_>>();
+                let row = left.combine(right);
                 if evaluate_join_condition(
                     state,
                     &join.join_operator,
-                    &row,
+                    &row.values,
                     scope,
                     left_start,
                     right_start,
@@ -506,7 +510,7 @@ pub(super) fn materialize_table_with_joins_rows(
 }
 
 #[cfg_attr(feature = "execution-log", tracing::instrument(skip_all))]
-fn evaluate_join_condition(
+pub(super) fn evaluate_join_condition(
     state: &DatabaseState,
     operator: &ast::JoinOperator,
     row: &[Value],

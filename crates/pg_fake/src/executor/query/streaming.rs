@@ -20,7 +20,7 @@ use super::{
     set_operations::{coerce_set_rows, create_set_operand_query},
 };
 use crate::{
-    ColumnMeta, QueryResult, StatementResult,
+    ColumnMeta, QueryResult,
     error::{PgError, Result, SqlState},
     executor::{
         DatabaseState, StatementContext,
@@ -296,18 +296,12 @@ pub(in crate::executor) fn stream_query_rows(
         }
     }
     let ast::SetExpr::Select(select) = query.body.as_ref() else {
-        let StatementResult::Query(result) = execute_query(state, query, xid, snapshot, context)?
-        else {
-            unreachable!("query execution returns rows")
-        };
+        let result = execute_query(state, query, xid, snapshot, context)?.result;
         *prepared = Some(QueryStreamState::Materialized { result, next: 0 });
         return Ok(None);
     };
     let ast::GroupByExpr::Expressions(group_by, modifiers) = &select.group_by else {
-        let StatementResult::Query(result) = execute_query(state, query, xid, snapshot, context)?
-        else {
-            unreachable!("query execution returns rows")
-        };
+        let result = execute_query(state, query, xid, snapshot, context)?.result;
         *prepared = Some(QueryStreamState::Materialized { result, next: 0 });
         return Ok(None);
     };
@@ -316,10 +310,7 @@ pub(in crate::executor) fn stream_query_rows(
         || select.distinct.is_some()
         || !modifiers.is_empty()
     {
-        let StatementResult::Query(result) = execute_query(state, query, xid, snapshot, context)?
-        else {
-            unreachable!("query execution returns rows")
-        };
+        let result = execute_query(state, query, xid, snapshot, context)?.result;
         *prepared = Some(QueryStreamState::Materialized { result, next: 0 });
         return Ok(None);
     }
@@ -511,7 +502,7 @@ pub(in crate::executor) fn stream_query_rows(
                 snapshot,
                 context,
                 select.selection.as_ref(),
-                &mut |row| {
+                &mut |row, _origins| {
                     if !evaluate_where_clause(
                         state,
                         remaining_selection,
@@ -548,6 +539,7 @@ pub(in crate::executor) fn stream_query_rows(
                         context,
                     )?;
                     rows.push(SelectRow {
+                        origins: Vec::new(),
                         values,
                         keys,
                         distinct_keys: Vec::new(),
@@ -625,7 +617,7 @@ pub(in crate::executor) fn stream_query_rows(
         snapshot,
         context,
         select.selection.as_ref(),
-        &mut |row| {
+        &mut |row, _origins| {
             if seen < already_visited {
                 seen += 1;
                 return Ok(());

@@ -52,6 +52,7 @@ pub(super) fn materialize_mutation_source_rows(
         context,
         None,
     )
+    .map(|rows| rows.into_iter().map(|row| row.values).collect())
 }
 
 #[cfg_attr(feature = "execution-log", tracing::instrument(skip_all))]
@@ -318,13 +319,28 @@ pub(in crate::executor) fn collect_update_cte_locks(
                 table_id: schema.id,
                 row_id: target.row_id,
             },
-            mode: RowLockMode::Update,
+            mode: RowLockMode::NoKeyUpdate,
             mutation_candidate: Some(MutationCandidate {
                 version_xmin: target.version_xmin,
                 row: Some(target.current.clone()),
             }),
         })
         .collect::<Vec<_>>();
+    if locks
+        .iter()
+        .any(|lock| !state.row_locks.is_held(lock.key, xid, lock.mode))
+    {
+        context.request_row_lock_recheck_with_locks(locks.clone());
+        return Ok(locks);
+    }
+    let prepared = prepare_update_rows(state, update, schema, xid, snapshot, context)?;
+    for lock in &mut locks {
+        if let Some(row) = prepared.iter().find(|row| row.row_id == lock.key.row_id)
+            && let Some(updated) = &row.updated
+        {
+            lock.mode = locks::resolve_update_lock_mode(schema, &row.current, updated);
+        }
+    }
     if locks
         .iter()
         .any(|lock| !state.row_locks.is_held(lock.key, xid, lock.mode))

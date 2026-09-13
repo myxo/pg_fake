@@ -1,5 +1,4 @@
 use crate::{
-    StatementResult,
     coercion::{self, CastContext},
     error::{Result, reject_unsupported},
     executor::{
@@ -12,17 +11,65 @@ use crate::{
         scope::{self, BoundScope, RowScope},
         subqueries::evaluate_query_expression,
     },
-    txn::{Snapshot, Xid, find_visible_version},
+    txn::{RowLockKey, Snapshot, Xid, find_visible_version},
     value::{PgType, Value},
 };
-use sqlparser::ast;
+use sqlparser::ast::{self, Spanned as _};
+use sqlparser::tokenizer::Span;
 
 mod joins;
 mod scans;
+mod streaming;
+mod subqueries;
+pub(super) use streaming::recheck_join_conditions;
+
+type RowConsumer<'a> = dyn FnMut(&[Value], &[RowOrigin]) -> Result<()> + 'a;
 
 use joins::{can_stream_join, materialize_table_with_joins_rows, visit_streamed_join_rows};
 use scans::collect_pushdown_filters;
 pub(super) use scans::{is_selection_fully_pushed, resolve_unique_point_lookup};
+
+#[derive(Clone)]
+pub(crate) struct RowOrigin {
+    pub(crate) source: Span,
+    pub(crate) key: RowLockKey,
+    pub(crate) version_xmin: Xid,
+    pub(crate) start: Option<usize>,
+    pub(crate) projection: Option<std::sync::Arc<super::query::DerivedProjection>>,
+}
+
+#[derive(Clone)]
+pub(super) struct SourceRow {
+    pub(super) values: Vec<Value>,
+    pub(super) origins: Vec<RowOrigin>,
+}
+
+impl SourceRow {
+    fn create(values: Vec<Value>) -> Self {
+        Self {
+            values,
+            origins: Vec::new(),
+        }
+    }
+
+    fn combine(&self, right: &Self) -> Self {
+        Self {
+            values: self
+                .values
+                .iter()
+                .zip(&right.values)
+                .map(|(left, right)| {
+                    if left.is_null() {
+                        right.clone()
+                    } else {
+                        left.clone()
+                    }
+                })
+                .collect(),
+            origins: self.origins.iter().chain(&right.origins).cloned().collect(),
+        }
+    }
+}
 
 #[cfg_attr(feature = "execution-log", tracing::instrument(skip_all))]
 pub(super) fn materialize_from_rows(
@@ -34,12 +81,12 @@ pub(super) fn materialize_from_rows(
     snapshot: &Snapshot,
     context: &StatementContext,
     selection: Option<&ast::Expr>,
-) -> Result<Vec<Vec<Value>>> {
+) -> Result<Vec<SourceRow>> {
     if from.is_empty() {
-        return Ok(vec![Vec::new()]);
+        return Ok(vec![SourceRow::create(Vec::new())]);
     }
     let mut next_slot = start_slot;
-    let mut rows = vec![vec![Value::Null; scope.columns.len()]];
+    let mut rows = vec![SourceRow::create(vec![Value::Null; scope.columns.len()])];
     for table in from {
         let functions = contains_lateral_source(&table.relation)
             || table
@@ -73,24 +120,11 @@ pub(super) fn materialize_from_rows(
             context,
             selection,
             &mut next_slot,
-            &vec![Value::Null; scope.columns.len()],
+            &SourceRow::create(vec![Value::Null; scope.columns.len()]),
         )?;
         rows = rows
             .into_iter()
-            .flat_map(|left| {
-                source.iter().map(move |right| {
-                    left.iter()
-                        .zip(right)
-                        .map(|(left, right)| {
-                            if left.is_null() {
-                                right.clone()
-                            } else {
-                                left.clone()
-                            }
-                        })
-                        .collect()
-                })
-            })
+            .flat_map(|left| source.iter().map(move |right| left.combine(right)))
             .collect();
     }
     Ok(rows)
@@ -105,16 +139,29 @@ pub(super) fn visit_query_source_rows(
     snapshot: &Snapshot,
     context: &StatementContext,
     selection: Option<&ast::Expr>,
-    visit: &mut dyn FnMut(&[Value]) -> Result<()>,
+    visit: &mut RowConsumer<'_>,
 ) -> Result<()> {
     if crate::executor::lateral::skips_lateral_rows(selection, context) {
         return Ok(());
     }
+    if context.capture_lock_queries {
+        return streaming::visit_demand_source_rows(
+            state, select, scope, xid, snapshot, context, selection, visit,
+        );
+    }
     if let [table] = select.from.as_slice()
         && can_stream_join(table)
+        && !context.retain_row_origins
     {
         return visit_streamed_join_rows(
-            state, table, scope, xid, snapshot, context, selection, visit,
+            state,
+            table,
+            scope,
+            xid,
+            snapshot,
+            context,
+            selection,
+            &mut |row| visit(row, &[]),
         );
     }
     for row in materialize_from_rows(
@@ -127,7 +174,7 @@ pub(super) fn visit_query_source_rows(
         context,
         selection,
     )? {
-        visit(&row)?;
+        visit(&row.values, &row.origins)?;
     }
     Ok(())
 }
@@ -142,8 +189,8 @@ fn materialize_table_factor_rows(
     context: &StatementContext,
     selection: Option<&ast::Expr>,
     next_slot: &mut usize,
-    prefix: &[Value],
-) -> Result<Vec<Vec<Value>>> {
+    prefix: &SourceRow,
+) -> Result<Vec<SourceRow>> {
     if let Some(json::JsonTableFunction {
         name,
         argument,
@@ -171,7 +218,7 @@ fn materialize_table_factor_rows(
                 state,
                 argument,
                 &argument_scope,
-                prefix,
+                &prefix.values,
                 xid,
                 snapshot,
                 context,
@@ -187,8 +234,8 @@ fn materialize_table_factor_rows(
         return Ok(json::evaluate_json_expansion(&name, value, ordinality)?
             .into_iter()
             .map(|values| {
-                let mut row = prefix.to_vec();
-                row[start..*next_slot].clone_from_slice(&values);
+                let mut row = prefix.clone();
+                row.values[start..*next_slot].clone_from_slice(&values);
                 row
             })
             .collect());
@@ -228,58 +275,100 @@ fn materialize_table_factor_rows(
                 columns: scope.columns[..*next_slot].to_vec(),
             };
             let slots;
-            (bound, slots) = bind_lateral_query(&state.catalog, subquery, &outer, prefix)?;
+            (bound, slots) = bind_lateral_query(&state.catalog, subquery, &outer, &prefix.values)?;
             correlated = !slots.is_empty();
             &bound
         } else {
             subquery.as_ref()
         };
+        let mut context = context.clone();
+        if !correlated {
+            context.query_invocation.clear();
+        }
+        let context = &context;
+        let is_cte = context
+            .cte_query_barriers
+            .lock()
+            .expect("locking CTE mutex is poisoned")
+            .contains(query);
+        let inherited = (!is_cte && super::query::requires_nested_locking(query))
+            .then(|| {
+                context
+                    .source_row_locks
+                    .iter()
+                    .find(|(source, _)| *source == factor.span())
+                    .map(|(_, lock)| *lock)
+            })
+            .flatten();
+        let filtered = if is_cte {
+            None
+        } else {
+            subqueries::push_derived_filters(
+                state,
+                query,
+                scope,
+                *next_slot,
+                selection,
+                inherited.is_some(),
+            )?
+        };
+        let query = filtered.as_ref().unwrap_or(query);
         let InitplanKey::Scalar(projection) = InitplanKey::create_scalar(query) else {
             unreachable!("scalar key")
         };
         let initplan = InitplanKey::DerivedCte(projection);
-        let cached = context
-            .lateral_initplans
-            .lock()
-            .expect("lateral initplans mutex is poisoned")
-            .get_result(&initplan)
-            .or_else(|| {
-                (!correlated)
-                    .then(|| context.get_prepared_subquery_result(query))
-                    .flatten()
-            });
+        let cached = (!context.capture_lock_queries && inherited.is_none())
+            .then(|| {
+                context
+                    .lateral_initplans
+                    .lock()
+                    .expect("lateral initplans mutex is poisoned")
+                    .get_result(&initplan)
+                    .map(super::query::QueryOutput::create)
+                    .or_else(|| {
+                        (!correlated)
+                            .then(|| context.get_prepared_subquery_result(query))
+                            .flatten()
+                    })
+            })
+            .flatten();
         let result = if let Some(result) = cached {
             result
         } else {
             let mut invocation = context.clone();
             invocation.lateral_invocation |= *lateral;
+            invocation.inherited_row_lock = inherited;
             if correlated {
                 invocation.prepared_subquery_results = Default::default();
+
                 invocation.prepared_cte_results = Default::default();
             }
-            let StatementResult::Query(result) =
-                execute_query(state, query, xid, snapshot, &invocation)?
-            else {
-                unreachable!("derived query execution returns query rows");
-            };
-            if !correlated {
+            let result = execute_query(state, query, xid, snapshot, &invocation)?;
+            if !correlated && !context.capture_lock_queries {
                 context.set_prepared_subquery_result(query, result.clone());
             }
             context
                 .lateral_initplans
                 .lock()
                 .expect("lateral initplans mutex is poisoned")
-                .set_result(&initplan, result.clone());
+                .set_result(&initplan, result.result.clone());
             result
         };
         let start = *next_slot;
-        *next_slot += result.columns.len();
+        *next_slot += result.result.columns.len();
         return Ok(result
+            .result
             .rows
             .into_iter()
-            .map(|values| {
-                let mut row = prefix.to_vec();
-                row[start..start + values.len()].clone_from_slice(&values);
+            .zip(result.origins)
+            .map(|(values, origins)| {
+                let mut row = prefix.clone();
+                row.values[start..start + values.len()].clone_from_slice(&values);
+                row.origins.extend(origins.into_iter().map(|mut origin| {
+                    origin.source = factor.span();
+                    origin.start = Some(start);
+                    origin
+                }));
                 row
             })
             .collect());
@@ -310,13 +399,27 @@ fn materialize_table_factor_rows(
             &mut filters,
         );
     }
-    state
+    let frozen = context
+        .query_source_state
+        .lock()
+        .expect("query source mutex is poisoned")
+        .clone();
+    let source_state = frozen.as_deref().unwrap_or(state);
+    let source_snapshot = if frozen.is_some() {
+        &context.source_snapshot
+    } else {
+        snapshot
+    };
+    source_state
         .tables
         .get(&schema.id)
         .expect("catalog table must have storage")
         .iterate_version_chains()
-        .filter_map(|(_, chain)| find_visible_version(chain, snapshot, xid, &state.transactions))
-        .map(|version| {
+        .filter_map(|(row_id, chain)| {
+            find_visible_version(chain, source_snapshot, xid, &source_state.transactions)
+                .map(|version| (row_id, version))
+        })
+        .map(|(row_id, version)| {
             let mut row = vec![Value::Null; scope.columns.len()];
             row[start..start + version.row.len()].clone_from_slice(&version.row);
             let passes = filters.iter().try_fold(true, |passes, filter| {
@@ -328,7 +431,23 @@ fn materialize_table_factor_rows(
                     Value::Bool(true)
                 ))
             })?;
-            Ok(passes.then_some(row))
+            Ok(passes.then_some(SourceRow {
+                values: row,
+                origins: if context.retain_row_origins {
+                    vec![RowOrigin {
+                        source: factor.span(),
+                        key: RowLockKey {
+                            table_id: schema.id,
+                            row_id,
+                        },
+                        version_xmin: version.xmin,
+                        start: Some(start),
+                        projection: None,
+                    }]
+                } else {
+                    Vec::new()
+                },
+            }))
         })
         .collect::<Result<Vec<_>>>()
         .map(|rows| rows.into_iter().flatten().collect())

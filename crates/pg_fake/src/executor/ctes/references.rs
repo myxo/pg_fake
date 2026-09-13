@@ -156,7 +156,26 @@ pub(in crate::executor) fn collect_reachable_cte_names(query: &ast::Query) -> BT
     reachable
 }
 
-pub(super) fn replace_cte_references(query: &mut ast::Query, ctes: &[MaterializedCte]) {
+pub(super) fn replace_cte_references(
+    query: &mut ast::Query,
+    ctes: &[MaterializedCte],
+    context: Option<&crate::executor::StatementContext>,
+) {
+    if let Some(context) = context {
+        let mut queries = context
+            .cte_query_barriers
+            .lock()
+            .expect("CTE query mutex is poisoned");
+        for cte in ctes {
+            let query = match &cte.source {
+                super::CteSource::Rows(rows) => create_cte_values_query(rows),
+                super::CteSource::Query { query, .. } => query.as_ref().clone(),
+            };
+            if !queries.contains(&query) {
+                queries.push(query);
+            }
+        }
+    }
     let _ = query.visit(&mut CteReferenceReplacer {
         ctes,
         masked: Vec::new(),

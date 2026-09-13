@@ -6,7 +6,7 @@ use sqlparser::{
 };
 
 use crate::{
-    QueryResult, StatementResult,
+    QueryResult,
     error::{PgError, Result, SqlState},
     executor::{
         DatabaseState, StatementContext, normalize_identifier,
@@ -86,10 +86,7 @@ fn execute_prepared_cte_query(
     if let Some(result) = context.get_prepared_cte_result(occurrence, name) {
         return Ok(result);
     }
-    let StatementResult::Query(result) = execute_query(state, query, xid, snapshot, context)?
-    else {
-        unreachable!("CTE query produces query rows")
-    };
+    let result = execute_query(state, query, xid, snapshot, context)?.result;
     context
         .lateral_initplans
         .lock()
@@ -214,8 +211,8 @@ pub(super) fn materialize_query_ctes(
         if !reachable.contains(&name) {
             continue;
         }
-        replace_cte_references(&mut cte_query, &ctes);
-        if context.lateral_invocation {
+        replace_cte_references(&mut cte_query, &ctes, Some(context));
+        if context.lateral_invocation || super::query::contains_row_locks(&cte_query) {
             let analysis = inline_query_ctes(&cte_query, &state.catalog, Some(state), true)?;
             let mut columns =
                 describe_query_result_columns(state, &ast::Statement::Query(Box::new(analysis)))?;
@@ -273,6 +270,6 @@ pub(super) fn materialize_query_ctes(
             source: CteSource::Rows(result),
         });
     }
-    replace_cte_references(&mut query, &ctes);
+    replace_cte_references(&mut query, &ctes, Some(context));
     Ok(query)
 }

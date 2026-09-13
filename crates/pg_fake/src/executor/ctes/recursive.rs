@@ -3,7 +3,7 @@ use std::collections::BTreeSet;
 use sqlparser::ast::{self, VisitMut as _};
 
 use crate::{
-    ColumnMeta, QueryResult, StatementResult,
+    ColumnMeta, QueryResult,
     catalog::Catalog,
     coercion,
     error::{PgError, Result, SqlState, reject_unsupported},
@@ -369,7 +369,7 @@ pub(super) fn materialize_recursive_query_ctes(
                 .take()
                 .expect("pending CTE was checked as present");
             let mut cte_query = *cte.query;
-            replace_cte_references(&mut cte_query, &ctes);
+            replace_cte_references(&mut cte_query, &ctes, Some(context));
             let recursive = validate_recursive_cte(&cte_query, name)?;
             let demand = if recursive {
                 resolve_direct_cte_demand(&mut query, name, context)?
@@ -423,7 +423,7 @@ pub(super) fn materialize_recursive_query_ctes(
             return reject_unsupported("mutual recursion between WITH items is not implemented");
         }
     }
-    replace_cte_references(&mut query, &ctes);
+    replace_cte_references(&mut query, &ctes, Some(context));
     Ok(query)
 }
 
@@ -543,6 +543,7 @@ pub(super) fn describe_recursive_cte_columns(
                 rows: Vec::new(),
             }),
         }],
+        None,
     );
     let recursive_columns =
         describe_query_result_columns(state, &ast::Statement::Query(Box::new(recursive_query)))?;
@@ -604,16 +605,14 @@ pub(super) fn execute_recursive_cte(
     let (mut rows, mut working) = if let Some(cached) = cached {
         (cached.rows, cached.working)
     } else {
-        let StatementResult::Query(mut seed) = execute_query(
+        let mut seed = execute_query(
             state,
             &create_set_expression_query((**left).clone()),
             xid,
             snapshot,
             context,
         )?
-        else {
-            unreachable!("recursive seed produces query rows");
-        };
+        .result;
         if alias.columns.len() > seed.columns.len() {
             return Err(PgError::create(
                 SqlState::InvalidColumnReference,
@@ -643,12 +642,9 @@ pub(super) fn execute_recursive_cte(
                     rows: working,
                 }),
             }],
+            Some(context),
         );
-        let StatementResult::Query(result) =
-            execute_query(state, &recursive_query, xid, snapshot, context)?
-        else {
-            unreachable!("recursive term produces query rows");
-        };
+        let result = execute_query(state, &recursive_query, xid, snapshot, context)?.result;
         working = coerce_set_rows(result.rows, &result.columns, &columns)?;
         if distinct {
             working = remove_set_duplicates(working)?;

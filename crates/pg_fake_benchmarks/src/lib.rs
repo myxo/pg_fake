@@ -27,6 +27,11 @@ pub fn find_benchmark(name: &str) -> Benchmark {
 pub fn list_benchmarks() -> Vec<Benchmark> {
     vec![
         build_benchmark(
+            "skip_locked_queue_100_rows",
+            postgres_values(),
+            postgres_comparisons(),
+        ),
+        build_benchmark(
             "lateral_latest_per_parent_100_rows",
             postgres_values(),
             postgres_comparisons(),

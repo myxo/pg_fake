@@ -63,7 +63,7 @@ pub(in crate::executor) fn collect_foreign_key_locks_for_rows<'a>(
                         table_id: foreign_schema.id,
                         row_id,
                     },
-                    mode: RowLockMode::Share,
+                    mode: RowLockMode::KeyShare,
                     mutation_candidate: None,
                 });
             }
@@ -110,7 +110,7 @@ pub(super) fn collect_insert_foreign_key_locks(
                             table_id: foreign_schema.id,
                             row_id,
                         },
-                        mode: RowLockMode::Share,
+                        mode: RowLockMode::KeyShare,
                         mutation_candidate: None,
                     });
                 }
@@ -228,7 +228,7 @@ pub(super) fn collect_insert_foreign_key_locks(
                         table_id: foreign_schema.id,
                         row_id,
                     },
-                    mode: RowLockMode::Share,
+                    mode: RowLockMode::KeyShare,
                     mutation_candidate: None,
                 });
             }

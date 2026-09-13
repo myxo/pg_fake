@@ -1590,6 +1590,7 @@ fn benchmarks(criterion: &mut Criterion) {
         foreign_key_insert_benchmark(criterion, &runtime, &mut connections);
         inner_join_benchmark(criterion, &runtime, &mut connections);
         benchmark_lateral(criterion, &runtime, &mut connections);
+        benchmark_skip_locked(criterion, &runtime, &mut connections);
         derived_and_scalar_subquery_benchmark(criterion, &runtime, &mut connections);
         materialized_cte_benchmark(criterion, &runtime, &mut connections);
         data_modifying_cte_benchmark(criterion, &runtime, &mut connections);
@@ -2056,6 +2057,42 @@ fn benchmark_lateral(
     group.finish();
     for (_, connection) in connections.iter_mut() {
         connection.execute(runtime, "DROP TABLE lateral_benchmark_items");
+    }
+}
+
+fn benchmark_skip_locked(
+    criterion: &mut Criterion,
+    runtime: &Runtime,
+    connections: &mut [NamedBenchmarkConnection<'_>],
+) {
+    let values = (0..100)
+        .map(|id| format!("({id},{})", 100 - id))
+        .collect::<Vec<_>>()
+        .join(",");
+    for (_, connection) in connections.iter_mut() {
+        connection.execute(
+            runtime,
+            "CREATE TABLE benchmark_queue(id INT PRIMARY KEY, priority INT)",
+        );
+        connection.execute(
+            runtime,
+            &format!("INSERT INTO benchmark_queue VALUES {values}"),
+        );
+    }
+    let mut group =
+        criterion.benchmark_group(benchmarks::find_benchmark("skip_locked_queue_100_rows").name);
+    group.throughput(Throughput::Elements(10));
+    for (name, connection) in connections.iter_mut() {
+        group.bench_function(*name, |benchmark| {
+            benchmark.iter(|| {
+                connection.fetch(runtime,
+            "SELECT id FROM benchmark_queue ORDER BY priority DESC LIMIT 10 FOR UPDATE SKIP LOCKED")
+            })
+        });
+    }
+    group.finish();
+    for (_, connection) in connections.iter_mut() {
+        connection.execute(runtime, "DROP TABLE benchmark_queue");
     }
 }
 

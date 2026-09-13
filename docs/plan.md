@@ -1121,7 +1121,42 @@ No benchmark baseline was changed.
 - Differential/property tests cover zero/one/many inner rows, nested scopes,
   NULLs, volatile expressions, metadata, and errors.
 
-### Task 23 — Complete `SELECT` row-locking clauses
+### Task 23 — Complete `SELECT` row-locking clauses [IN PROGRESS]
+
+**Progress:** Implemented the four lock strengths, portable sqlparser grammar
+fixes, and base-row provenance through query execution. Differential tests cover
+the compatibility matrix, work queues, locked identities, volatile expressions,
+key changes, foreign keys, and errors. Controlled native tests cover waits and
+isolation outcomes; generated queues and an execution benchmark are added.
+Review fixes preserve candidate order and volatile evaluations through waits,
+merge inherited clauses before bounded child queries, consume nested locking
+queries on demand, and release locks from implicit nested queries. Expanded
+three-session generators compare exact locked identities. Pending expressions
+preserve completed volatile predicates and conditional branches across retries.
+
+- [x] Complete the row-locking implementation, parser patch, differential and
+  generated tests, and work-queue benchmark.
+- [x] Resolve all review findings. The final independent review replayed 128
+  statements against PostgreSQL 18 with no mismatches.
+- [x] Pass the workspace tests, including 238 core tests, seven focused row-lock
+  tests, and the updated upstream UPDATE regression boundary (`update:12`).
+- [x] Pass strict workspace Clippy, formatting, and whitespace checks.
+- [x] Pass the exact `CHAOS_THEORY_CHECK_ITERS=10000
+  CHAOS_THEORY_CHECK_TIME=600s` property gate: all 16 tests passed in 837.05
+  seconds on the final reviewed implementation.
+- [x] Measure the final release benchmark without competing test/build load:
+  `skip_locked_queue_100_rows` measured approximately 279 microseconds for
+  `pg_fake` and 45.2 microseconds for PostgreSQL 18. This misses the speed target;
+  no benchmark baseline was changed to hide the result.
+
+The parser fix is maintained in the `myxo/datafusion-sqlparser-rs` fork. Focused
+checks pass with every parser feature enabled across 15 dialects, and 10,000
+fuzz inputs pass. Independent review and formatting are clean. The fork's full
+all-feature tests and Clippy could not run: the `matches` development dependency
+is not cached, and the online download attempt failed with proxy HTTP 403.
+The project pins fork revision `1bcc091c6b9a49df73e2ed9348f85471a33a985e` through
+Git. Its 49 parser implementation files match the previously validated source.
+The fork commit is local; publication still awaits remote-push approval.
 
 **Goal:** Implement work queues and the remaining planned PostgreSQL row-lock
 surface.

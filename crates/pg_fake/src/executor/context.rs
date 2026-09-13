@@ -38,8 +38,21 @@ pub(crate) struct StatementContext {
     pub(crate) executed_ctes: Arc<Mutex<Vec<(Span, String)>>>,
     pub(crate) pending_cte_mutations: Arc<Mutex<Vec<PendingCteMutation>>>,
     pub(crate) prepared_subquery_results: Arc<Mutex<SubqueryResultCache>>,
+    pub(crate) pending_expressions: Arc<Mutex<Vec<super::subqueries::PendingExpression>>>,
     pub(crate) lateral_initplans: Arc<Mutex<super::lateral::InitplanCache>>,
     pub(crate) lateral_invocation: bool,
+    pub(crate) retain_row_origins: bool,
+    pub(crate) query_row_demand: Option<usize>,
+    pub(crate) query_invocation: Vec<usize>,
+    pub(crate) query_source_state: Arc<Mutex<Option<Arc<DatabaseState>>>>,
+    pub(crate) inherited_row_lock: Option<super::query::SelectLock>,
+    pub(crate) source_row_locks: Vec<(Span, super::query::SelectLock)>,
+    pub(crate) cte_query_barriers: Arc<Mutex<Vec<ast::Query>>>,
+    pub(crate) prepared_plain_rows: Arc<Mutex<Vec<super::query::PreparedPlainRows>>>,
+    pub(crate) capture_lock_queries: bool,
+    pub(crate) select_row_locks: Arc<Mutex<Vec<RequiredRowLock>>>,
+    pub(crate) prepared_select_rows: Arc<Mutex<Vec<super::query::PreparedSelectRows>>>,
+    pub(crate) prepared_lock_queries: Arc<Mutex<Vec<super::query::PreparedLockQuery>>>,
     pub(crate) prepares_subquery_results: Arc<AtomicBool>,
     pub(crate) row_lock_recheck: Arc<AtomicBool>,
     pub(crate) row_lock_recheck_locks: Arc<Mutex<Vec<RequiredRowLock>>>,
@@ -78,7 +91,7 @@ pub(crate) struct PendingCteMutation {
 
 #[derive(Clone, Default)]
 pub(crate) struct SubqueryResultCache {
-    entries: Vec<(Span, String, QueryResult)>,
+    entries: Vec<(Span, String, super::query::QueryOutput)>,
 }
 
 #[derive(Clone)]
@@ -254,9 +267,12 @@ impl StatementContext {
         executed.push((occurrence, name));
     }
 
-    pub(super) fn get_prepared_subquery_result(&self, query: &ast::Query) -> Option<QueryResult> {
+    pub(super) fn get_prepared_subquery_result(
+        &self,
+        query: &ast::Query,
+    ) -> Option<super::query::QueryOutput> {
         let occurrence = query.span();
-        let sql = query.to_string();
+        let sql = format!("{:?} {query}", self.query_invocation);
         self.prepared_subquery_results
             .lock()
             .expect("prepared subquery results mutex is poisoned")
@@ -267,9 +283,13 @@ impl StatementContext {
             })
     }
 
-    pub(super) fn set_prepared_subquery_result(&self, query: &ast::Query, result: QueryResult) {
+    pub(super) fn set_prepared_subquery_result(
+        &self,
+        query: &ast::Query,
+        result: super::query::QueryOutput,
+    ) {
         let occurrence = query.span();
-        let sql = query.to_string();
+        let sql = format!("{:?} {query}", self.query_invocation);
         let mut prepared = self
             .prepared_subquery_results
             .lock()
@@ -296,7 +316,7 @@ impl StatementContext {
         self.row_lock_recheck.swap(false, AtomicOrdering::Relaxed)
     }
 
-    pub(super) fn take_row_lock_recheck_locks(&self) -> Vec<RequiredRowLock> {
+    pub(crate) fn take_row_lock_recheck_locks(&self) -> Vec<RequiredRowLock> {
         std::mem::take(
             &mut *self
                 .row_lock_recheck_locks

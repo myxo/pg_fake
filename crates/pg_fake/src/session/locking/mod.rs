@@ -180,12 +180,22 @@ pub(super) fn acquire_row_locks<'a>(
     loop {
         state.load_catalog(Some(xid), snapshot, Some(temporary_schema_id));
         let required = match target {
-            RowLockTarget::Ctes(statement) => executor::collect_required_cte_row_locks(
-                &state, statement, xid, &snapshot, context,
-            )?,
-            RowLockTarget::Statement(statement) => {
-                executor::collect_required_row_locks(&state, statement, xid, &snapshot, context)?
+            RowLockTarget::Ctes(statement) => {
+                executor::collect_required_cte_row_locks(&state, statement, xid, &snapshot, context)
             }
+            RowLockTarget::Statement(statement) => {
+                executor::collect_required_row_locks(&state, statement, xid, &snapshot, context)
+            }
+        };
+        let required = match required {
+            Ok(required) => required,
+            Err(error)
+                if error.sqlstate == SqlState::InternalError
+                    && error.message == executor::ROW_LOCK_PENDING =>
+            {
+                context.take_row_lock_recheck_locks()
+            }
+            Err(error) => return Err(error),
         };
         let mut blocked = None;
         for required_lock in &required {
@@ -298,17 +308,13 @@ pub(super) fn acquire_row_locks<'a>(
             );
         }
         if isolation == IsolationLevel::RepeatableRead
-            && conflicts.iter().any(|holder| {
-                matches!(
-                    state.transactions.get_status(*holder),
-                    Some(TransactionStatus::Committed(_))
-                )
+            && state.tables.get(&key.table_id).is_some_and(|table| {
+                table.iterate_version_chains().find(|(row_id, _)| *row_id == key.row_id)
+                    .and_then(|(_, chain)| crate::txn::find_visible_version(chain, &snapshot, xid, &state.transactions))
+                    .is_some_and(|version| version.xmax.is_some_and(|writer| matches!(state.transactions.get_status(writer), Some(TransactionStatus::Committed(commit_seq)) if commit_seq > snapshot.commit_seq)))
             })
         {
-            return Err(PgError::create(
-                SqlState::SerializationFailure,
-                "could not serialize access due to concurrent update",
-            ));
+            return Err(PgError::create(SqlState::SerializationFailure, "could not serialize access due to concurrent update"));
         }
         if isolation == IsolationLevel::ReadCommitted
             && conflicts.iter().any(|holder| {
@@ -319,6 +325,10 @@ pub(super) fn acquire_row_locks<'a>(
             })
         {
             snapshot = Snapshot::create(&state.transactions).use_command(snapshot.command_id);
+            *context
+                .prepared_subquery_results
+                .lock()
+                .expect("prepared subqueries mutex is poisoned") = Default::default();
         }
     }
 }

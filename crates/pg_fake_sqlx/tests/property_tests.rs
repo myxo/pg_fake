@@ -2794,3 +2794,130 @@ fn matches_generated_lateral_joins() {
         );
     });
 }
+
+#[test]
+fn matches_generated_skip_locked_queues() {
+    let server = start_isolated_postgres_server();
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap();
+    let holder = RefCell::new(
+        runtime
+            .block_on(PgConnection::connect(&server.url))
+            .unwrap(),
+    );
+    let worker = RefCell::new(
+        runtime
+            .block_on(PgConnection::connect(&server.url))
+            .unwrap(),
+    );
+    let db = Db::create();
+    let fake_holder = RefCell::new(PgFakeConnection::new(db.clone()));
+    let fake_worker = RefCell::new(PgFakeConnection::new(db.clone()));
+    let observer = RefCell::new(
+        runtime
+            .block_on(PgConnection::connect(&server.url))
+            .unwrap(),
+    );
+    let fake_observer = RefCell::new(PgFakeConnection::new(db));
+    for sql in [
+        "CREATE TABLE generated_queue(id INT PRIMARY KEY, priority INT)",
+        "INSERT INTO generated_queue VALUES(1,5),(2,2),(3,8),(4,4),(5,7),(6,1),(7,3),(8,6)",
+    ] {
+        assert_statement(
+            &runtime,
+            &mut holder.borrow_mut(),
+            &mut fake_holder.borrow_mut(),
+            sql,
+            RowOrder::Ordered,
+        );
+    }
+    check(|src| {
+        let held =
+            ["KEY SHARE", "SHARE", "NO KEY UPDATE", "UPDATE"][src.any_of("held", int_in(0..=3))];
+        let requested = ["KEY SHARE", "SHARE", "NO KEY UPDATE", "UPDATE"]
+            [src.any_of("requested", int_in(0..=3))];
+        let divisor = src.any_of("divisor", int_in(2..=5));
+        let remainder = src.any_of("remainder", int_in(0..=1));
+        let limit = src.any_of("limit", int_in(0..=5));
+        let offset = src.any_of("offset", int_in(0..=3));
+        let order = if src.any("descending") { "DESC" } else { "ASC" };
+        let shape = src.any_of("shape", int_in(0..=6));
+        let inner_limit = src.any_of("inner_limit", int_in(0..=8));
+        let inner_offset = src.any_of("inner_offset", int_in(0..=3));
+        let locked = format!(
+            "SELECT * FROM generated_queue ORDER BY priority {order},id LIMIT {inner_limit} OFFSET {inner_offset} FOR {requested} SKIP LOCKED"
+        );
+        let sql = match shape {
+            0 | 1 => {
+                let source = if shape == 0 {
+                    "generated_queue q"
+                } else {
+                    "(SELECT * FROM generated_queue) q"
+                };
+                format!(
+                    "SELECT q.id FROM {source} ORDER BY q.priority {order},q.id LIMIT {limit} OFFSET {offset} FOR {requested} OF q SKIP LOCKED"
+                )
+            }
+            2 => format!(
+                "SELECT id FROM ({locked}) q WHERE id%2={remainder} LIMIT {limit} OFFSET {offset}"
+            ),
+            3 => format!("SELECT id FROM ({locked}) q LIMIT {limit} FOR {held} SKIP LOCKED"),
+            4 => format!("WITH q AS ({locked}) SELECT id FROM q LIMIT {limit}"),
+            5 => format!("SELECT q.id FROM ({locked}) q CROSS JOIN (VALUES(1)) v(n) LIMIT {limit}"),
+            _ => format!("SELECT EXISTS({locked}) AS present"),
+        };
+        for sql in [
+            "BEGIN".to_owned(),
+            format!(
+                "SELECT id FROM generated_queue WHERE id%{divisor}={remainder} ORDER BY id FOR {held}"
+            ),
+        ] {
+            assert_statement(
+                &runtime,
+                &mut holder.borrow_mut(),
+                &mut fake_holder.borrow_mut(),
+                &sql,
+                RowOrder::Ordered,
+            );
+        }
+        assert_statement(
+            &runtime,
+            &mut worker.borrow_mut(),
+            &mut fake_worker.borrow_mut(),
+            "BEGIN",
+            RowOrder::Ordered,
+        );
+        assert_statement(
+            &runtime,
+            &mut worker.borrow_mut(),
+            &mut fake_worker.borrow_mut(),
+            &sql,
+            RowOrder::Ordered,
+        );
+        for id in 1..=8 {
+            assert_statement_allow_error(
+                &runtime,
+                &mut observer.borrow_mut(),
+                &mut fake_observer.borrow_mut(),
+                &format!("SELECT id FROM generated_queue WHERE id={id} FOR UPDATE NOWAIT"),
+                RowOrder::Ordered,
+            );
+        }
+        assert_statement(
+            &runtime,
+            &mut worker.borrow_mut(),
+            &mut fake_worker.borrow_mut(),
+            "ROLLBACK",
+            RowOrder::Ordered,
+        );
+        assert_statement(
+            &runtime,
+            &mut holder.borrow_mut(),
+            &mut fake_holder.borrow_mut(),
+            "ROLLBACK",
+            RowOrder::Ordered,
+        );
+    });
+}

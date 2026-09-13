@@ -5705,7 +5705,7 @@ fn locks_foreign_keys_after_before_insert_triggers() {
         .unwrap();
     holder.execute("BEGIN").unwrap();
     holder
-        .execute("UPDATE triggered_parents SET id = id WHERE id = 1")
+        .execute("SELECT id FROM triggered_parents WHERE id = 1 FOR UPDATE")
         .unwrap();
     assert_eq!(
         writer
@@ -9784,4 +9784,139 @@ fn executes_unreferenced_mutations_and_rolls_back_a_failing_cte_statement() {
             .rows,
         vec![vec![Value::Int4(1)]]
     );
+}
+
+#[test]
+fn rechecks_limited_row_locks_after_controlled_waits() {
+    for repeatable in [false, true] {
+        for changes_row in [false, true] {
+            for commits in [false, true] {
+                let db = Db::create_builder()
+                    .set_lock_timeout(Duration::from_secs(3))
+                    .build();
+                let mut holder = db.create_session();
+                let mut worker = db.create_session();
+                holder.execute("CREATE TABLE lock_waits(id INT PRIMARY KEY, amount INT); INSERT INTO lock_waits VALUES(1,1),(2,2)").unwrap();
+                worker
+                    .execute(if repeatable {
+                        "BEGIN ISOLATION LEVEL REPEATABLE READ"
+                    } else {
+                        "BEGIN"
+                    })
+                    .unwrap();
+                worker.query("SELECT * FROM lock_waits", &[]).unwrap();
+                holder.execute("BEGIN").unwrap();
+                holder
+                    .execute(if changes_row {
+                        "UPDATE lock_waits SET amount=5 WHERE id=1"
+                    } else {
+                        "SELECT id FROM lock_waits WHERE id=1 FOR UPDATE"
+                    })
+                    .unwrap();
+                let waiting = thread::spawn(move || {
+                    worker.query("SELECT id FROM lock_waits WHERE amount<5 ORDER BY id LIMIT 1 FOR NO KEY UPDATE", &[])
+                });
+                wait_until_blocked(&db);
+                holder
+                    .execute(if commits { "COMMIT" } else { "ROLLBACK" })
+                    .unwrap();
+                let result = waiting.join().unwrap();
+                if repeatable && changes_row && commits {
+                    assert_eq!(result.unwrap_err().sqlstate, SqlState::SerializationFailure);
+                } else {
+                    let id = if changes_row && commits { 2 } else { 1 };
+                    assert_eq!(result.unwrap().rows, vec![vec![Value::Int4(id)]]);
+                }
+            }
+        }
+    }
+}
+
+#[test]
+fn refreshes_derived_projections_and_join_predicates_after_waits() {
+    for (query, expected) in [
+        (
+            "SELECT a.id,b.id FROM (refresh_rows a JOIN refresh_rows b ON a.v=b.v) WHERE a.id=1 FOR UPDATE OF a",
+            vec![],
+        ),
+        (
+            "SELECT a.id,b.id FROM refresh_rows a LEFT JOIN refresh_rows b ON a.v=b.v WHERE a.id=1 FOR UPDATE OF a",
+            vec![vec![Value::Int4(1), Value::Null]],
+        ),
+        (
+            "SELECT a.id,b.id FROM refresh_rows a LEFT JOIN refresh_rows b ON a.v=-b.v WHERE a.id=1 FOR UPDATE OF a",
+            vec![vec![Value::Int4(1), Value::Null]],
+        ),
+        (
+            "SELECT id,w FROM (SELECT id,v*2 w FROM refresh_rows) x ORDER BY w LIMIT 1 FOR UPDATE",
+            vec![vec![Value::Int4(1), Value::Int4(198)]],
+        ),
+        (
+            "SELECT id,w FROM (SELECT id,v*2 w FROM refresh_rows) x WHERE w<100 ORDER BY w LIMIT 1 FOR UPDATE",
+            vec![vec![Value::Int4(2), Value::Int4(40)]],
+        ),
+        (
+            "SELECT a.id,b.id FROM refresh_rows a JOIN refresh_rows b ON a.v=b.v WHERE a.id=1 FOR UPDATE OF a",
+            vec![],
+        ),
+    ] {
+        let db = Db::create_builder()
+            .set_lock_timeout(Duration::from_secs(3))
+            .build();
+        let mut holder = db.create_session();
+        let mut waiter = db.create_session();
+        holder.execute("CREATE TABLE refresh_rows(id INT PRIMARY KEY,v INT); INSERT INTO refresh_rows VALUES(1,10),(2,20)").unwrap();
+        holder
+            .execute("BEGIN; SELECT id FROM refresh_rows WHERE id=1 FOR UPDATE")
+            .unwrap();
+        let waiting = thread::spawn(move || waiter.query(query, &[]));
+        wait_until_blocked(&db);
+        holder
+            .execute("UPDATE refresh_rows SET v=99 WHERE id=1; COMMIT")
+            .unwrap();
+        assert_eq!(waiting.join().unwrap().unwrap().rows, expected, "{query}");
+    }
+}
+
+#[test]
+fn grants_compatible_row_locks_while_an_update_waits() {
+    for (held, requested) in [
+        ("KEY SHARE", "KEY SHARE"),
+        ("KEY SHARE", "SHARE"),
+        ("KEY SHARE", "NO KEY UPDATE"),
+        ("SHARE", "KEY SHARE"),
+        ("SHARE", "SHARE"),
+        ("NO KEY UPDATE", "KEY SHARE"),
+    ] {
+        let db = Db::create_builder()
+            .set_lock_timeout(Duration::from_secs(3))
+            .build();
+        let mut holder = db.create_session();
+        let mut waiter = db.create_session();
+        let mut compatible = db.create_session();
+        holder
+            .execute("CREATE TABLE queued_locks(id INT); INSERT INTO queued_locks VALUES(1)")
+            .unwrap();
+        holder
+            .execute(&format!("BEGIN; SELECT id FROM queued_locks FOR {held}"))
+            .unwrap();
+        let waiting =
+            thread::spawn(move || waiter.query("SELECT id FROM queued_locks FOR UPDATE", &[]));
+        wait_until_blocked(&db);
+        assert_eq!(
+            compatible
+                .query(
+                    &format!("SELECT id FROM queued_locks FOR {requested} NOWAIT"),
+                    &[]
+                )
+                .unwrap()
+                .rows,
+            vec![vec![Value::Int4(1)]]
+        );
+        holder.execute("COMMIT").unwrap();
+        assert_eq!(
+            waiting.join().unwrap().unwrap().rows,
+            vec![vec![Value::Int4(1)]]
+        );
+    }
 }

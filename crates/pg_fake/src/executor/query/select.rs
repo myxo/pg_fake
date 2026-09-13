@@ -22,7 +22,17 @@ use crate::{
     txn::{Snapshot, Xid, find_visible_version},
     value::{BaseType, Value},
 };
-use sqlparser::ast;
+use sqlparser::ast::{self, Spanned as _};
+
+const SOURCE_ROW_LIMIT_REACHED: &str = "pg_fake source row limit reached";
+
+#[derive(Clone)]
+pub(crate) struct PreparedPlainRows {
+    occurrence: sqlparser::tokenizer::Span,
+    sql: String,
+    visited: usize,
+    rows: Vec<SelectRow>,
+}
 
 #[cfg_attr(feature = "execution-log", tracing::instrument(skip_all))]
 pub(in crate::executor) fn validate_select_predicates(
@@ -85,84 +95,157 @@ pub(super) fn execute_plain_select_rows(
     snapshot: &Snapshot,
     context: &StatementContext,
     top_k: Option<usize>,
+    locking: bool,
 ) -> Result<Vec<SelectRow>> {
-    if let Some(rows) = execute_correlated_exists_rows(
-        state,
-        select,
-        scope,
-        projections,
-        order_specs,
-        distinct,
-        xid,
-        snapshot,
-        context,
-    ) {
+    if !locking
+        && !context.retain_row_origins
+        && let Some(rows) = execute_correlated_exists_rows(
+            state,
+            select,
+            scope,
+            projections,
+            order_specs,
+            distinct,
+            xid,
+            snapshot,
+            context,
+        )
+    {
         return rows;
     }
-    if let Some(rows) = execute_any_membership_rows(
-        state,
-        select,
-        scope,
-        projections,
-        order_specs,
-        distinct,
-        xid,
-        snapshot,
-        context,
-    ) {
+    if !locking
+        && !context.retain_row_origins
+        && let Some(rows) = execute_any_membership_rows(
+            state,
+            select,
+            scope,
+            projections,
+            order_specs,
+            distinct,
+            xid,
+            snapshot,
+            context,
+        )
+    {
         return rows;
     }
-    let mut rows = Vec::new();
-    let defer_projection = !order_specs.is_empty() && matches!(distinct, DistinctPlan::None);
+    let occurrence = select.span();
+    let sql = format!("{:?} {select}", context.query_invocation);
+    let mut cached = context
+        .prepared_plain_rows
+        .lock()
+        .expect("prepared source mutex is poisoned");
+    let prepared = cached
+        .iter()
+        .position(|cached| cached.occurrence == occurrence && cached.sql == sql)
+        .map(|index| cached.remove(index));
+    drop(cached);
+    let (mut visited, mut rows) = prepared.map_or((0, Vec::new()), |prepared| {
+        (prepared.visited, prepared.rows)
+    });
+    let already_visited = visited;
+    let mut seen = 0;
+    let defer_projection = locking
+        || context.retain_row_origins
+        || (!order_specs.is_empty() && matches!(distinct, DistinctPlan::None));
     let remaining_selection = if is_selection_fully_pushed(select, scope) {
         None
     } else {
         select.selection.as_ref()
     };
-    visit_query_source_rows(
-        state,
-        select,
-        scope,
-        xid,
-        snapshot,
-        context,
-        select.selection.as_ref(),
-        &mut |row| {
-            if order_specs.is_empty() && top_k.is_some_and(|top_k| rows.len() >= top_k) {
-                return Ok(());
-            }
-            if !evaluate_where_clause(
-                state,
-                remaining_selection,
-                scope,
-                row,
-                xid,
-                snapshot,
-                context,
-            )? {
-                return Ok(());
-            }
-            if defer_projection {
-                let mut values = vec![Value::Null; projections.len()];
-                let mut evaluated = vec![false; projections.len()];
-                for index in order_specs.iter().filter_map(|order| match order.key {
-                    OrderKey::Output(index) => Some(index),
-                    OrderKey::Input(_, _) | OrderKey::Expression(_) => None,
-                }) {
-                    if !evaluated[index] {
-                        values[index] = evaluate_projection_value(
-                            state,
-                            &projections[index],
-                            scope,
-                            row,
-                            None,
-                            xid,
-                            snapshot,
-                            context,
-                        )?;
-                        evaluated[index] = true;
-                    }
+    let result = if order_specs.is_empty() && top_k.is_some_and(|top_k| rows.len() >= top_k) {
+        Ok(())
+    } else {
+        visit_query_source_rows(
+            state,
+            select,
+            scope,
+            xid,
+            snapshot,
+            context,
+            select.selection.as_ref(),
+            &mut |row, origins| {
+                if seen < already_visited {
+                    seen += 1;
+                    return Ok(());
                 }
+                seen += 1;
+                if !evaluate_where_clause(
+                    state,
+                    remaining_selection,
+                    scope,
+                    row,
+                    xid,
+                    snapshot,
+                    context,
+                )? {
+                    visited += 1;
+                    return Ok(());
+                }
+                if defer_projection {
+                    let mut values = vec![Value::Null; projections.len()];
+                    let mut evaluated = vec![false; projections.len()];
+                    for index in order_specs.iter().filter_map(|order| match order.key {
+                        OrderKey::Output(index) => Some(index),
+                        OrderKey::Input(_, _) | OrderKey::Expression(_) => None,
+                    }) {
+                        if !evaluated[index] {
+                            values[index] = evaluate_projection_value(
+                                state,
+                                &projections[index],
+                                scope,
+                                row,
+                                None,
+                                xid,
+                                snapshot,
+                                context,
+                            )?;
+                            evaluated[index] = true;
+                        }
+                    }
+                    let keys = evaluate_order_keys(
+                        state,
+                        order_specs,
+                        &values,
+                        scope,
+                        row,
+                        None,
+                        xid,
+                        snapshot,
+                        context,
+                    )?;
+                    retain_top_ordered_row(
+                        &mut rows,
+                        SelectRow {
+                            origins: origins.to_vec(),
+                            values,
+                            keys,
+                            distinct_keys: Vec::new(),
+                            deferred_source: Some(row.to_vec()),
+                            evaluated_projections: Some(evaluated),
+                        },
+                        top_k,
+                        order_specs,
+                    );
+                    visited += 1;
+                    if order_specs.is_empty() && top_k.is_some_and(|top_k| rows.len() >= top_k) {
+                        return Err(PgError::create(
+                            SqlState::InternalError,
+                            SOURCE_ROW_LIMIT_REACHED,
+                        ));
+                    }
+                    return Ok(());
+                }
+                let values = evaluate_projection_values(
+                    state,
+                    projections,
+                    scope,
+                    row,
+                    None,
+                    xid,
+                    snapshot,
+                    context,
+                )?;
                 let keys = evaluate_order_keys(
                     state,
                     order_specs,
@@ -174,79 +257,87 @@ pub(super) fn execute_plain_select_rows(
                     snapshot,
                     context,
                 )?;
+                let distinct_keys = evaluate_distinct_keys(
+                    state, distinct, &values, &keys, scope, row, None, xid, snapshot, context,
+                )?;
                 retain_top_ordered_row(
                     &mut rows,
                     SelectRow {
+                        origins: origins.to_vec(),
                         values,
                         keys,
-                        distinct_keys: Vec::new(),
-                        deferred_source: Some(row.to_vec()),
-                        evaluated_projections: Some(evaluated),
+                        distinct_keys,
+                        deferred_source: None,
+                        evaluated_projections: None,
                     },
                     top_k,
                     order_specs,
                 );
-                return Ok(());
-            }
-            let values = evaluate_projection_values(
-                state,
-                projections,
-                scope,
-                row,
-                None,
-                xid,
-                snapshot,
-                context,
-            )?;
-            let keys = evaluate_order_keys(
-                state,
-                order_specs,
-                &values,
-                scope,
-                row,
-                None,
-                xid,
-                snapshot,
-                context,
-            )?;
-            let distinct_keys = evaluate_distinct_keys(
-                state, distinct, &values, &keys, scope, row, None, xid, snapshot, context,
-            )?;
-            retain_top_ordered_row(
-                &mut rows,
-                SelectRow {
-                    values,
-                    keys,
-                    distinct_keys,
-                    deferred_source: None,
-                    evaluated_projections: None,
-                },
-                top_k,
-                order_specs,
-            );
-            Ok(())
-        },
-    )?;
-    if defer_projection {
-        sort_ordered_rows(&mut rows, order_specs);
-        for row in &mut rows {
-            let source = row
-                .deferred_source
-                .take()
-                .expect("deferred projection retains its source row");
-            let evaluated = row
-                .evaluated_projections
-                .take()
-                .expect("deferred projection tracks evaluated outputs");
-            for (index, projection) in projections.iter().enumerate() {
-                if !evaluated[index] {
-                    row.values[index] = evaluate_projection_value(
-                        state, projection, scope, &source, None, xid, snapshot, context,
-                    )?;
+                visited += 1;
+                if order_specs.is_empty() && top_k.is_some_and(|top_k| rows.len() >= top_k) {
+                    return Err(PgError::create(
+                        SqlState::InternalError,
+                        SOURCE_ROW_LIMIT_REACHED,
+                    ));
+                }
+                Ok(())
+            },
+        )
+    };
+    if let Err(error) = result
+        && (error.sqlstate != SqlState::InternalError || error.message != SOURCE_ROW_LIMIT_REACHED)
+    {
+        if context.capture_lock_queries {
+            context
+                .prepared_plain_rows
+                .lock()
+                .expect("prepared source mutex is poisoned")
+                .push(PreparedPlainRows {
+                    occurrence,
+                    sql,
+                    visited,
+                    rows,
+                });
+        }
+        return Err(error);
+    }
+    let projected = (|| {
+        if defer_projection && !locking {
+            sort_ordered_rows(&mut rows, order_specs);
+            for row in &mut rows {
+                let source = row
+                    .deferred_source
+                    .as_ref()
+                    .expect("deferred projection retains its source row");
+                let evaluated = row
+                    .evaluated_projections
+                    .as_mut()
+                    .expect("deferred projection tracks evaluated outputs");
+                for (index, projection) in projections.iter().enumerate() {
+                    if !evaluated[index] {
+                        row.values[index] = evaluate_projection_value(
+                            state, projection, scope, source, None, xid, snapshot, context,
+                        )?;
+                        evaluated[index] = true;
+                    }
                 }
             }
         }
+        Ok(())
+    })();
+    if context.capture_lock_queries {
+        context
+            .prepared_plain_rows
+            .lock()
+            .expect("prepared source mutex is poisoned")
+            .push(PreparedPlainRows {
+                occurrence,
+                sql,
+                visited,
+                rows: rows.clone(),
+            });
     }
+    projected?;
     Ok(rows)
 }
 
@@ -356,7 +447,7 @@ fn execute_correlated_exists_rows(
         snapshot,
         context,
         None,
-        &mut |row| {
+        &mut |row, origins| {
             let Some(key) = create_equality_key(&row[outer_slot]) else {
                 return Ok(());
             };
@@ -388,6 +479,7 @@ fn execute_correlated_exists_rows(
                 state, distinct, &values, &keys, scope, row, None, xid, snapshot, context,
             )?;
             rows.push(SelectRow {
+                origins: origins.to_vec(),
                 values,
                 keys,
                 distinct_keys,
@@ -474,7 +566,7 @@ fn execute_any_membership_rows(
         snapshot,
         context,
         None,
-        &mut |row| {
+        &mut |row, origins| {
             let value = evaluate_and_coerce(
                 left,
                 left_type.base,
@@ -514,6 +606,7 @@ fn execute_any_membership_rows(
                 state, distinct, &values, &keys, scope, row, None, xid, snapshot, context,
             )?;
             rows.push(SelectRow {
+                origins: origins.to_vec(),
                 values,
                 keys,
                 distinct_keys,

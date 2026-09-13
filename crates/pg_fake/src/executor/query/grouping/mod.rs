@@ -340,7 +340,7 @@ pub(super) fn collect_grouped_select_rows(
         snapshot,
         context,
         select.selection.as_ref(),
-        &mut |row| {
+        &mut |row, _origins| {
             if !evaluate_where_clause(
                 state,
                 select.selection.as_ref(),
@@ -550,6 +550,7 @@ pub(super) fn execute_grouped_select_rows(
             context,
         )?;
         rows.push(SelectRow {
+            origins: Vec::new(),
             values,
             keys,
             distinct_keys,

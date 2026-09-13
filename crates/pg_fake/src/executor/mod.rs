@@ -62,6 +62,7 @@ pub(crate) use locks::{
 };
 pub(crate) use prepared::{PreparedQueryPlan, build_prepared_query_plan, execute_prepared_query};
 pub(crate) use procedural::{coerce_procedural_value, substitute_procedural_references};
+pub(crate) use query::ROW_LOCK_PENDING;
 pub(crate) use query::{describe_query_result_columns, detect_statement_features};
 pub(crate) use scope::{
     BoundScope, RowScope, bind_from_scope, bind_join, bind_query_scope, bind_table_factor,
@@ -206,7 +207,8 @@ pub(crate) fn execute_statement(
             context,
             mutation_targets,
         ),
-        ast::Statement::Query(query) => query::execute_query(state, query, xid, snapshot, context),
+        ast::Statement::Query(query) => query::execute_query(state, query, xid, snapshot, context)
+            .map(|output| StatementResult::Query(output.result)),
         ast::Statement::Lock(_) => Ok(StatementResult::Affected(0)),
         _ => reject_unsupported("statement is not implemented"),
     }

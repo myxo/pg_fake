@@ -34,7 +34,7 @@ pub(super) fn collect_triggered_insert_fallback_locks(
                         table_id: schema.id,
                         row_id,
                     },
-                    mode: RowLockMode::Update,
+                    mode: RowLockMode::NoKeyUpdate,
                     mutation_candidate: None,
                 }),
         );
@@ -59,7 +59,7 @@ pub(super) fn collect_triggered_insert_fallback_locks(
                         table_id: foreign_schema.id,
                         row_id,
                     },
-                    mode: RowLockMode::Share,
+                    mode: RowLockMode::KeyShare,
                     mutation_candidate: None,
                 }),
         );
@@ -106,7 +106,47 @@ pub(super) fn collect_triggered_insert_locks(
                         table_id: schema.id,
                         row_id,
                     },
-                    mode: RowLockMode::Update,
+                    mode: preview_conflicts
+                        .get(index)
+                        .and_then(Option::as_ref)
+                        .and_then(|conflict| {
+                            conflict.updated.as_ref().map(|updated| {
+                                super::resolve_update_lock_mode(schema, &conflict.current, updated)
+                            })
+                        })
+                        .unwrap_or(RowLockMode::NoKeyUpdate),
+                    mutation_candidate: None,
+                });
+            }
+        }
+    }
+    let table = state
+        .tables
+        .get(&schema.id)
+        .expect("catalog table must have storage");
+    for update in preview_conflicts.iter().flatten() {
+        let Some(updated) = &update.updated else {
+            continue;
+        };
+        for (row_id, chain) in table.iterate_version_chains() {
+            if row_id == update.row_id {
+                continue;
+            }
+            let key = RowLockKey {
+                table_id: schema.id,
+                row_id,
+            };
+            if state
+                .row_locks
+                .would_block(key, xid, RowLockMode::NoKeyUpdate)
+                && chain
+                    .versions
+                    .iter()
+                    .any(|version| table.rows_have_unique_conflict(&version.row, updated, context))
+            {
+                locks.push(RequiredRowLock {
+                    key,
+                    mode: RowLockMode::NoKeyUpdate,
                     mutation_candidate: None,
                 });
             }
@@ -132,9 +172,7 @@ pub(super) fn collect_triggered_insert_locks(
     {
         if locks.iter().any(|required| {
             required.key.table_id == schema.id
-                && !state
-                    .row_locks
-                    .is_held(required.key, xid, RowLockMode::Update)
+                && !state.row_locks.is_held(required.key, xid, required.mode)
         }) {
             context.request_row_lock_recheck();
         } else {
@@ -270,7 +308,7 @@ pub(super) fn collect_insert_conflict_locks(
                     table_id: schema.id,
                     row_id,
                 },
-                mode: RowLockMode::Update,
+                mode: RowLockMode::NoKeyUpdate,
                 mutation_candidate: None,
             });
         }
@@ -286,7 +324,7 @@ pub(super) fn collect_insert_conflict_locks(
                         table_id: schema.id,
                         row_id,
                     },
-                    mode: RowLockMode::Update,
+                    mode: RowLockMode::NoKeyUpdate,
                     mutation_candidate: None,
                 }),
         );

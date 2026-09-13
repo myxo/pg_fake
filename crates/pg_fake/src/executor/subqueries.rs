@@ -1,9 +1,9 @@
-use sqlparser::ast;
+use sqlparser::ast::{self, Spanned as _};
 
 mod conditionals;
 
 use crate::{
-    QueryResult, StatementResult,
+    QueryResult,
     error::{PgError, Result, SqlState},
     executor::{
         DatabaseState, StatementContext,
@@ -26,6 +26,14 @@ use crate::{
 
 struct SubqueryDetector {
     found: bool,
+}
+
+#[derive(Clone)]
+pub(crate) struct PendingExpression {
+    original: ast::Expr,
+    invocation: Vec<usize>,
+    row: Vec<Value>,
+    prepared: ast::Expr,
 }
 
 impl ast::Visitor for SubqueryDetector {
@@ -58,7 +66,7 @@ struct SubqueryMaterializer<'a> {
 
 impl SubqueryMaterializer<'_> {
     #[cfg_attr(feature = "execution-log", tracing::instrument(skip_all))]
-    fn execute(&self, query: &ast::Query) -> Result<QueryResult> {
+    fn execute(&self, query: &ast::Query, maximum_rows: Option<usize>) -> Result<QueryResult> {
         let initplan = InitplanKey::create_scalar(query);
         if let Some(result) = self
             .context
@@ -70,7 +78,7 @@ impl SubqueryMaterializer<'_> {
             return Ok(result);
         }
         if let Some(result) = self.context.get_prepared_subquery_result(query) {
-            return Ok(result);
+            return Ok(result.result);
         }
         let original = query.clone();
         let query = if self.context.lateral_invocation {
@@ -87,14 +95,15 @@ impl SubqueryMaterializer<'_> {
         let ast::Statement::Query(query) = query else {
             unreachable!("subquery statement remains a query");
         };
-        let StatementResult::Query(result) =
-            execute_query(self.state, &query, self.xid, self.snapshot, self.context)?
-        else {
-            unreachable!("subquery execution returns query rows");
-        };
+        let mut invocation = self.context.clone();
+        invocation.query_row_demand = maximum_rows;
+        let result =
+            execute_query(self.state, &query, self.xid, self.snapshot, &invocation)?.result;
         if self.context.prepares_subquery_results() {
-            self.context
-                .set_prepared_subquery_result(&original, result.clone());
+            self.context.set_prepared_subquery_result(
+                &original,
+                super::query::QueryOutput::create(result.clone()),
+            );
         }
         self.context
             .lateral_initplans
@@ -151,10 +160,13 @@ impl ast::VisitorMut for SubqueryMaterializer<'_> {
 
     #[cfg_attr(feature = "execution-log", tracing::instrument(skip_all))]
     fn pre_visit_expr(&mut self, expr: &mut ast::Expr) -> std::ops::ControlFlow<Self::Break> {
+        if self.defer_unresolved && super::query::contains_row_locks(expr) {
+            return std::ops::ControlFlow::Continue(());
+        }
         if self.lateral_depth > 0 {
             return std::ops::ControlFlow::Continue(());
         }
-        if self.context.lateral_invocation && !self.defer_unresolved && contains_subquery(expr) {
+        if !self.defer_unresolved && contains_subquery(expr) {
             match conditionals::materialize_selected_branch(
                 self.state,
                 expr,
@@ -192,7 +204,7 @@ impl ast::VisitorMut for SubqueryMaterializer<'_> {
                 let ast::Expr::Subquery(subquery) = right.as_ref() else {
                     return Ok(None);
                 };
-                let result = self.execute(subquery)?;
+                let result = self.execute(subquery, None)?;
                 if result.columns.len() != 1 {
                     return Err(PgError::create(
                         SqlState::SyntaxError,
@@ -227,7 +239,7 @@ impl ast::VisitorMut for SubqueryMaterializer<'_> {
                 let ast::Expr::Subquery(subquery) = right.as_ref() else {
                     return Ok(None);
                 };
-                let result = self.execute(subquery)?;
+                let result = self.execute(subquery, None)?;
                 if result.columns.len() != 1 {
                     return Err(PgError::create(
                         SqlState::SyntaxError,
@@ -254,7 +266,7 @@ impl ast::VisitorMut for SubqueryMaterializer<'_> {
                 }))
             }
             ast::Expr::Subquery(query) => {
-                let result = self.execute(&query)?;
+                let result = self.execute(&query, Some(2))?;
                 if result.columns.len() != 1 {
                     return Err(PgError::create(
                         SqlState::SyntaxError,
@@ -284,7 +296,7 @@ impl ast::VisitorMut for SubqueryMaterializer<'_> {
             }
             ast::Expr::Exists { subquery, negated } => {
                 Ok(Some(crate::analyzer::create_typed_literal(
-                    Value::Bool(self.execute(&subquery)?.rows.is_empty() == negated),
+                    Value::Bool(self.execute(&subquery, Some(1))?.rows.is_empty() == negated),
                     PgType::create(BaseType::Bool),
                 )))
             }
@@ -293,7 +305,7 @@ impl ast::VisitorMut for SubqueryMaterializer<'_> {
                 subquery,
                 negated,
             } => {
-                let result = self.execute(&subquery)?;
+                let result = self.execute(&subquery, None)?;
                 let left_width = match expr.as_ref() {
                     ast::Expr::Tuple(fields) => fields.len(),
                     _ => 1,
@@ -365,7 +377,11 @@ impl ast::VisitorMut for SubqueryMaterializer<'_> {
             }
             Err(error) => self.error = Some(error),
         }
-        std::ops::ControlFlow::Continue(())
+        if self.error.is_some() {
+            std::ops::ControlFlow::Break(())
+        } else {
+            std::ops::ControlFlow::Continue(())
+        }
     }
 }
 
@@ -478,7 +494,22 @@ pub(super) fn evaluate_query_expression(
     if !contains_subquery(expression) {
         return evaluate(expression, RowScope::Bound(scope), row, context);
     }
-    let mut expression = expression.clone();
+    let mut pending = context
+        .pending_expressions
+        .lock()
+        .expect("pending expression mutex is poisoned");
+    let prepared = pending
+        .iter()
+        .position(|cached| {
+            cached.original.span() == expression.span()
+                && cached.original == *expression
+                && cached.invocation == context.query_invocation
+                && cached.row == row
+        })
+        .map(|index| pending.remove(index).prepared);
+    drop(pending);
+    let original = expression;
+    let mut expression = prepared.unwrap_or_else(|| expression.clone());
     substitute_outer_references(
         &state.catalog,
         &mut expression,
@@ -487,7 +518,7 @@ pub(super) fn evaluate_query_expression(
         Vec::new(),
         OuterReferenceContext::Subquery,
     )?;
-    materialize_subqueries(
+    let result = materialize_subqueries(
         state,
         &mut expression,
         xid,
@@ -495,6 +526,21 @@ pub(super) fn evaluate_query_expression(
         context,
         false,
         Vec::new(),
-    )?;
+    );
+    if let Err(error) = result {
+        if error.sqlstate == SqlState::InternalError && error.message == super::ROW_LOCK_PENDING {
+            context
+                .pending_expressions
+                .lock()
+                .expect("pending expression mutex is poisoned")
+                .push(PendingExpression {
+                    original: original.clone(),
+                    invocation: context.query_invocation.clone(),
+                    row: row.to_vec(),
+                    prepared: expression,
+                });
+        }
+        return Err(error);
+    }
     evaluate(&expression, RowScope::Bound(scope), row, context)
 }

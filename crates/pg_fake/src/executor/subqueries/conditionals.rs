@@ -7,7 +7,7 @@ use sqlparser::ast;
 
 pub(super) fn materialize_selected_branch(
     state: &DatabaseState,
-    expression: &ast::Expr,
+    expression: &mut ast::Expr,
     xid: Xid,
     snapshot: &Snapshot,
     context: &StatementContext,
@@ -25,7 +25,7 @@ pub(super) fn materialize_selected_branch(
             else_result,
             ..
         } => {
-            let operand = operand
+            let evaluated_operand = operand
                 .as_ref()
                 .map(|operand| {
                     let data_type = infer_expression_data_type(&state.catalog, operand, &scope)?;
@@ -35,18 +35,24 @@ pub(super) fn materialize_selected_branch(
                     ))
                 })
                 .transpose()?;
-            let mut selected = else_result.as_deref().cloned();
-            for condition in conditions {
-                let comparison = if let Some(operand) = &operand {
-                    ast::Expr::BinaryOp {
-                        left: Box::new(operand.clone()),
+            if let Some(evaluated_operand) = evaluated_operand {
+                for condition in conditions.iter_mut() {
+                    condition.condition = ast::Expr::BinaryOp {
+                        left: Box::new(evaluated_operand.clone()),
                         op: ast::BinaryOperator::Eq,
                         right: Box::new(condition.condition.clone()),
-                    }
-                } else {
-                    condition.condition.clone()
-                };
-                if matches!(evaluate(&comparison)?, Value::Bool(true)) {
+                    };
+                }
+                *operand = None;
+            }
+            let mut selected = else_result.as_deref().cloned();
+            for condition in conditions {
+                let value = evaluate(&condition.condition)?;
+                condition.condition = crate::analyzer::create_typed_literal(
+                    value.clone(),
+                    crate::value::PgType::create(crate::value::BaseType::Bool),
+                );
+                if matches!(value, Value::Bool(true)) {
                     selected = Some(condition.result.clone());
                     break;
                 }
@@ -56,21 +62,20 @@ pub(super) fn materialize_selected_branch(
         ast::Expr::Function(function)
             if function.name.to_string().eq_ignore_ascii_case("coalesce") =>
         {
-            let ast::FunctionArguments::List(arguments) = &function.args else {
+            let ast::FunctionArguments::List(arguments) = &mut function.args else {
                 return Ok(None);
             };
             let mut selected = None;
-            for argument in &arguments.args {
+            for argument in &mut arguments.args {
                 let ast::FunctionArg::Unnamed(ast::FunctionArgExpr::Expr(argument)) = argument
                 else {
                     return Ok(None);
                 };
                 let value = evaluate(argument)?;
+                let data_type = infer_expression_data_type(&state.catalog, argument, &scope)?;
+                *argument = crate::analyzer::create_typed_literal(value.clone(), data_type);
                 if !value.is_null() {
-                    selected = Some(crate::analyzer::create_typed_literal(
-                        value,
-                        infer_expression_data_type(&state.catalog, argument, &scope)?,
-                    ));
+                    selected = Some(argument.clone());
                     break;
                 }
             }
@@ -79,13 +84,17 @@ pub(super) fn materialize_selected_branch(
         ast::Expr::BinaryOp { left, op, right }
             if matches!(op, ast::BinaryOperator::And | ast::BinaryOperator::Or) =>
         {
-            let left = evaluate(left)?;
-            let value = match (op, &left) {
+            let left_value = evaluate(left)?;
+            **left = crate::analyzer::create_typed_literal(
+                left_value.clone(),
+                crate::value::PgType::create(crate::value::BaseType::Bool),
+            );
+            let value = match (&*op, &left_value) {
                 (ast::BinaryOperator::And, Value::Bool(false))
-                | (ast::BinaryOperator::Or, Value::Bool(true)) => left,
+                | (ast::BinaryOperator::Or, Value::Bool(true)) => left_value,
                 _ => crate::executor::arithmetic::evaluate_boolean_operator(
                     op,
-                    left,
+                    left_value,
                     evaluate(right)?,
                 )?,
             };

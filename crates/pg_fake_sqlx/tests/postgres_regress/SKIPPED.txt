@@ -131,7 +131,7 @@ tuplesort:1
 typed_table:1
 union:26
 updatable_views:1
-update:8
+update:12
 uuid:10
 varchar:20
 window:3

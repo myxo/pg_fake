@@ -35,8 +35,22 @@ pub(crate) struct RowLockKey {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 pub(crate) enum RowLockMode {
+    KeyShare,
     Share,
+    NoKeyUpdate,
     Update,
+}
+
+impl RowLockMode {
+    pub(crate) fn conflicts_with(self, other: Self) -> bool {
+        matches!(
+            (self, other),
+            (Self::Update, _)
+                | (_, Self::Update)
+                | (Self::NoKeyUpdate, Self::Share | Self::NoKeyUpdate)
+                | (Self::Share, Self::NoKeyUpdate)
+        )
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -142,7 +156,7 @@ impl RowLockManager {
             waiters: VecDeque::new(),
         });
         if let Some(held) = lock.holders.get(&xid)
-            && (*held == RowLockMode::Update || mode == RowLockMode::Share)
+            && *held >= mode
         {
             return RowLockAttempt::Acquired;
         }
@@ -150,15 +164,14 @@ impl RowLockManager {
             .holders
             .iter()
             .filter_map(|(holder, held)| {
-                (*holder != xid && (*held == RowLockMode::Update || mode == RowLockMode::Update))
-                    .then_some(*holder)
+                (*holder != xid && held.conflicts_with(mode)).then_some(*holder)
             })
             .collect::<Vec<_>>();
         let first_waiter = lock.waiters.front().copied();
-        if holder_conflicts.is_empty() && first_waiter.is_none_or(|waiter| waiter == xid) {
-            if first_waiter == Some(xid) {
-                lock.waiters.pop_front();
-            }
+        if holder_conflicts.is_empty()
+            && (!lock.holders.is_empty() || first_waiter.is_none_or(|waiter| waiter == xid))
+        {
+            lock.waiters.retain(|waiter| *waiter != xid);
             lock.holders.insert(xid, mode);
             return RowLockAttempt::Acquired;
         }
@@ -176,16 +189,21 @@ impl RowLockManager {
         self.locks
             .get(&key)
             .and_then(|lock| lock.holders.get(&xid))
-            .is_some_and(|held| *held == RowLockMode::Update || mode == RowLockMode::Share)
+            .is_some_and(|held| *held >= mode)
     }
 
     pub(crate) fn would_block(&self, key: RowLockKey, xid: Xid, mode: RowLockMode) -> bool {
+        if self.is_held(key, xid, mode) {
+            return false;
+        }
         let Some(lock) = self.locks.get(&key) else {
             return false;
         };
-        lock.holders.iter().any(|(holder, held)| {
-            *holder != xid && (*held == RowLockMode::Update || mode == RowLockMode::Update)
-        }) || lock.waiters.front().is_some_and(|waiter| *waiter != xid)
+        lock.holders
+            .iter()
+            .any(|(holder, held)| *holder != xid && held.conflicts_with(mode))
+            || (lock.holders.is_empty()
+                && lock.waiters.front().is_some_and(|waiter| *waiter != xid))
     }
 
     #[cfg_attr(feature = "execution-log", tracing::instrument(skip_all))]

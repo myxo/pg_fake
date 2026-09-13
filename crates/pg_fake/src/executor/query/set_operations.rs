@@ -3,7 +3,7 @@ use std::cmp::Ordering;
 use sqlparser::ast;
 
 use crate::{
-    ColumnMeta, QueryResult, StatementResult,
+    ColumnMeta, QueryResult,
     coercion::{self, CastContext},
     error::{PgError, Result, SqlState, reject_unsupported},
     executor::{
@@ -29,18 +29,85 @@ pub(super) fn execute_set_query(
     xid: Xid,
     snapshot: &Snapshot,
     context: &StatementContext,
-) -> Result<QueryResult> {
+    maximum_rows: Option<usize>,
+) -> Result<super::QueryOutput> {
+    let (query_limit, offset) = resolve_select_limit(query, context)?;
+    let limit = match (query_limit, maximum_rows) {
+        (Some(left), Some(right)) => Some(left.min(right)),
+        (Some(value), None) | (None, Some(value)) => Some(value),
+        (None, None) => None,
+    };
+    if query.order_by.is_none()
+        && context.capture_lock_queries
+        && let ast::SetExpr::SetOperation {
+            op: ast::SetOperator::Union,
+            set_quantifier: ast::SetQuantifier::All,
+            left,
+            right,
+        } = query.body.as_ref()
+    {
+        let metadata = build_set_expression_metadata(state, query, &query.body)?;
+        let (left_metadata, right_metadata) = metadata
+            .operands
+            .as_ref()
+            .expect("set operation has two operands");
+        validate_unknown_set_operand_columns(left, &left_metadata.unknown, &metadata.columns)?;
+        validate_unknown_set_operand_columns(right, &right_metadata.unknown, &metadata.columns)?;
+        let mut rows = Vec::new();
+        let mut complete = true;
+        if limit != Some(0) {
+            let demand = limit.map(|limit| offset.saturating_add(limit));
+            for operand in [left, right] {
+                if demand.is_some_and(|demand| rows.len() >= demand) {
+                    complete = false;
+                    break;
+                }
+                let mut invocation = context.clone();
+                invocation.query_row_demand = demand.map(|demand| demand - rows.len());
+                let output = execute_query(
+                    state,
+                    &create_set_operand_query(query, operand),
+                    xid,
+                    snapshot,
+                    &invocation,
+                )?;
+                rows.extend(coerce_set_rows(
+                    output.result.rows,
+                    &output.result.columns,
+                    &metadata.columns,
+                )?);
+                if !output.complete {
+                    complete = false;
+                    break;
+                }
+            }
+        }
+        let mut output = super::QueryOutput::create(QueryResult {
+            columns: metadata.columns,
+            rows: rows
+                .into_iter()
+                .skip(offset)
+                .take(limit.unwrap_or(usize::MAX))
+                .collect(),
+        });
+        output.complete =
+            complete || query_limit.is_some_and(|limit| output.result.rows.len() >= limit);
+        return Ok(output);
+    }
     let mut result =
         execute_set_expression(state, query, &query.body, None, xid, snapshot, context)?;
     sort_set_rows(&mut result.rows, &result.columns, query)?;
-    let (limit, offset) = resolve_select_limit(query, context)?;
+    let complete = limit.is_none_or(|limit| result.rows.len() <= offset.saturating_add(limit))
+        || query_limit == limit;
     result.rows = result
         .rows
         .into_iter()
         .skip(offset)
         .take(limit.unwrap_or(usize::MAX))
         .collect();
-    Ok(result)
+    let mut output = super::QueryOutput::create(result);
+    output.complete = complete;
+    Ok(output)
 }
 
 struct SetExpressionMetadata {
@@ -178,11 +245,7 @@ fn execute_set_expression(
 ) -> Result<QueryResult> {
     match expression {
         ast::SetExpr::Query(query) => {
-            let StatementResult::Query(result) =
-                execute_query(state, query, xid, snapshot, context)?
-            else {
-                unreachable!("query expression produces query rows")
-            };
+            let result = execute_query(state, query, xid, snapshot, context)?.result;
             Ok(result)
         }
         ast::SetExpr::SetOperation {
@@ -239,11 +302,7 @@ fn execute_set_expression(
         }
         ast::SetExpr::Select(_) | ast::SetExpr::Values(_) => {
             let operand = create_set_operand_query(query, expression);
-            let StatementResult::Query(result) =
-                execute_query(state, &operand, xid, snapshot, context)?
-            else {
-                unreachable!("set operand produces query rows")
-            };
+            let result = execute_query(state, &operand, xid, snapshot, context)?.result;
             Ok(result)
         }
         _ => reject_unsupported("set-operation input is not implemented"),

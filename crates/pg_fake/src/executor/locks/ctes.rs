@@ -22,6 +22,7 @@ pub(crate) fn collect_required_cte_row_locks(
     let ast::Statement::Query(query) = statement else {
         return Ok(Vec::new());
     };
+    query::resolve_query_lock_targets(&state.catalog, query, None, &[], &[])?;
     if query::has_zero_limit(query)
         && query.with.as_ref().is_none_or(|with| {
             with.cte_tables.iter().all(|cte| {
@@ -54,6 +55,12 @@ pub(crate) fn collect_required_cte_row_locks(
                     .get_executed_cte_result(cte.alias.name.span, &name)
                     .is_some()
             {
+                continue;
+            }
+            if !matches!(
+                cte.query.body.as_ref(),
+                ast::SetExpr::Insert(_) | ast::SetExpr::Update(_) | ast::SetExpr::Delete(_)
+            ) {
                 continue;
             }
             let prepared = ctes::prepare_cte_mutation_for_locking(

@@ -92,6 +92,11 @@ ordering, distinctness, and limits.
   `ORDER BY` keys and performs sorting and bounded top-row selection.
 - [`distinct.rs`](../crates/pg_fake/src/executor/query/distinct.rs) validates
   `DISTINCT` and `DISTINCT ON`, reuses output/order keys, and removes duplicates.
+- [`locking.rs`](../crates/pg_fake/src/executor/query/locking.rs) resolves lock
+  strengths, wait policies, source aliases, and invalid query compositions.
+  The query coordinator preserves candidate order and projection progress across
+  lock waits and consumer requests. Derived projections retain their original
+  source rows for tuple refresh and predicate rechecks.
 - [`limits.rs`](../crates/pg_fake/src/executor/query/limits.rs) resolves
   `LIMIT` and `OFFSET`, including NULL, `ALL`, and invalid row counts.
 - [`expressions.rs`](../crates/pg_fake/src/executor/query/expressions.rs) compares
@@ -118,11 +123,16 @@ The query coordinator delegates CTE handling to `executor/ctes` and source-row
 production to `executor/from`.
 
 [`executor/from/mod.rs`](../crates/pg_fake/src/executor/from/mod.rs) combines `FROM`
-sources, including derived tables and JSON expansion. Queries and mutations share
+sources, including derived tables and JSON expansion, and carries base-row
+provenance through materialized joins and derived projections. Queries and mutations share
 this source-row interface. Its [`scans.rs`](../crates/pg_fake/src/executor/from/scans.rs)
 owns visible table scans, index lookups, and predicate pushdown;
 [`joins.rs`](../crates/pg_fake/src/executor/from/joins.rs) owns join conditions,
 hash and nested-loop evaluation, and unmatched rows in outer joins.
+[`streaming.rs`](../crates/pg_fake/src/executor/from/streaming.rs) consumes derived
+sources and join chains on demand, retaining invocation identities for correlated
+queries. [`subqueries.rs`](../crates/pg_fake/src/executor/from/subqueries.rs)
+pushes eligible outer filters into locking derived queries.
 
 [`lateral.rs`](../crates/pg_fake/src/executor/lateral.rs) binds correlated derived
 sources to each preceding FROM row, preserves projected names, and gives set

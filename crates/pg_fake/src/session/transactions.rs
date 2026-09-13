@@ -261,6 +261,7 @@ impl Session {
             assert!(!self.deferred_foreign_keys_dirty);
             assert!(!state.has_touched_tables(transaction.xid));
             state.transactions.finish_read_only(transaction.xid);
+            state.row_locks.release_transaction_locks(transaction.xid);
             state
                 .relation_locks
                 .release_transaction_locks(transaction.xid);

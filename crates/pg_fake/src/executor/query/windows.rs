@@ -236,7 +236,7 @@ pub(super) fn execute_windowed_select_rows(
         snapshot,
         context,
         select.selection.as_ref(),
-        &mut |row| {
+        &mut |row, _origins| {
             if evaluate_where_clause(
                 state,
                 select.selection.as_ref(),
@@ -339,6 +339,7 @@ pub(super) fn execute_windowed_select_rows(
                 DistinctPlan::None | DistinctPlan::Rows => Vec::new(),
             };
             Ok(SelectRow {
+                origins: Vec::new(),
                 values,
                 keys,
                 distinct_keys,

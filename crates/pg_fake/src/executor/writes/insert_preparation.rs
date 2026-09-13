@@ -317,7 +317,7 @@ pub(super) fn evaluate_insert_rows(
                             row_id: *row_id,
                         },
                         xid,
-                        RowLockMode::Update,
+                        RowLockMode::NoKeyUpdate,
                     )
                 })
         });

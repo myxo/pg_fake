@@ -721,16 +721,28 @@ pub const FEATURES: &[Feature] = &[
     },
     Feature {
         name: "SELECT row locks",
-        cases: &[Case {
-            id: "no_key_update_nowait",
-            source: "focused local row-lock scenario",
-            setup: &[
-                "CREATE TABLE phase3_row_lock (id INTEGER PRIMARY KEY)",
-                "INSERT INTO phase3_row_lock VALUES (1)",
-            ],
-            sql: "SELECT * FROM phase3_row_lock FOR NO KEY UPDATE NOWAIT",
-            blocker: BlockerKind::Implementation,
-        }],
+        cases: &[
+            Case {
+                id: "skip_locked_ordered_queue",
+                source: "tests/row_lock_differential.rs",
+                setup: &[
+                    "CREATE TABLE phase3_queue(id INT PRIMARY KEY, priority INT)",
+                    "INSERT INTO phase3_queue VALUES(1,10),(2,30),(3,20)",
+                ],
+                sql: "SELECT id FROM phase3_queue ORDER BY priority DESC LIMIT 1 OFFSET 1 FOR UPDATE SKIP LOCKED",
+                blocker: BlockerKind::Implementation,
+            },
+            Case {
+                id: "no_key_update_nowait",
+                source: "focused local row-lock scenario",
+                setup: &[
+                    "CREATE TABLE phase3_row_lock (id INTEGER PRIMARY KEY)",
+                    "INSERT INTO phase3_row_lock VALUES (1)",
+                ],
+                sql: "SELECT * FROM phase3_row_lock FOR NO KEY UPDATE NOWAIT",
+                blocker: BlockerKind::Implementation,
+            },
+        ],
     },
     Feature {
         name: "serializable dependency tracking",
