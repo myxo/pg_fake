@@ -9,185 +9,206 @@
 | criterion | 0.5 |
 | logical_cpus | 8 |
 | os | macos |
-| os_version | Darwin 23.6.0 |
+| os_version | Darwin 24.6.0 |
 | performance_levels | level 0: 4 physical / 4 logical; level 1: 4 physical / 4 logical |
 | physical_cores | 8 |
 | postgres_target | 18 |
-| recorded_at | 2026-09-06T06:10:16Z |
+| recorded_at | 2026-09-14T05:22:22Z |
 | rust | rustc 1.96.0 (ac68faa20 2026-05-25) |
 
 ## Benchmarks
 
 | Benchmark | Average | Change vs previous |
 | --- | ---: | ---: |
-| create_table/pg_fake | 35.09 us | -36.97% |
-| create_table/postgres_18 | 832.95 us | -3.93% |
-| transactional_ddl_create_rollback/pg_fake | 31.05 us | -14.49% |
-| transactional_ddl_create_rollback/postgres_18 | 1.23 ms | +3.51% |
-| migration_table_lock_two_relations/pg_fake | 22.59 us | -15.55% |
-| migration_table_lock_two_relations/postgres_18 | 75.98 us | -0.88% |
-| procedural_trigger_insert_update/pg_fake | 22.48 ms | +18.99% |
-| procedural_trigger_insert_update/postgres_18 | 112.91 us | -17.38% |
-| alter_table_rewrite_100_rows/pg_fake | 297.53 us | -36.87% |
-| alter_table_rewrite_100_rows/postgres_18 | 385.07 us | +21.08% |
-| partial_unique_index_100_rows/pg_fake | 63.61 us | -57.64% |
-| partial_unique_index_100_rows/postgres_18 | 460.34 us | -9.97% |
-| temporary_table_on_commit_drop/pg_fake | 15.21 us | -13.41% |
-| temporary_table_on_commit_drop/postgres_18 | 215.70 us | -17.87% |
-| insert_row/pg_fake | 38.32 us | -99.39% |
-| insert_row/postgres_18 | 85.32 us | -0.08% |
-| insert_row_returning/pg_fake | 49.98 us | -99.34% |
-| insert_row_returning/postgres_18 | 91.01 us | +1.11% |
-| insert_row_with_defaults/pg_fake | 40.29 us | -99.53% |
-| insert_row_with_defaults/postgres_18 | 87.38 us | -0.36% |
-| insert_on_conflict_do_nothing/pg_fake | 17.50 us | -40.68% |
-| insert_on_conflict_do_nothing/postgres_18 | 28.17 us | +0.78% |
-| insert_on_conflict_conflict_free/pg_fake | 38.43 us | -38.71% |
-| insert_on_conflict_conflict_free/postgres_18 | 62.30 us | +0.31% |
-| insert_on_conflict_do_update/pg_fake | 23.04 us | -38.23% |
-| insert_on_conflict_do_update/postgres_18 | 31.98 us | +0.10% |
-| update_row/pg_fake | 20.87 us | -51.56% |
-| update_row/postgres_18 | 86.83 us | -1.24% |
-| update_from_row/pg_fake | 22.77 us | -50.35% |
-| update_from_row/postgres_18 | 94.20 us | -0.49% |
-| delete_row/pg_fake | 15.82 us | -36.45% |
-| delete_row/postgres_18 | 127.12 us | +0.83% |
-| sequence_nextval/pg_fake | 15.35 us | -39.22% |
-| sequence_nextval/postgres_18 | 26.67 us | +1.21% |
-| serial_identity_insert/pg_fake | 17.62 us | -98.54% |
-| serial_identity_insert/postgres_18 | 30.38 us | -0.68% |
-| uuid_temporal_select/pg_fake | 19.05 us | -82.17% |
-| uuid_temporal_select/postgres_18 | 28.77 us | +0.29% |
-| json_insert_returning/pg_fake | 31.51 us | -33.82% |
-| json_insert_returning/postgres_18 | 135.23 us | +11.82% |
-| jsonb_insert_returning/pg_fake | 35.71 us | -46.21% |
-| jsonb_insert_returning/postgres_18 | 99.96 us | -18.26% |
-| jsonb_extraction/pg_fake | 78.80 us | -18.52% |
-| jsonb_extraction/postgres_18 | 64.93 us | +0.42% |
-| jsonb_containment/pg_fake | 195.96 us | -9.11% |
-| jsonb_containment/postgres_18 | 40.95 us | -0.19% |
-| jsonb_join_group/pg_fake | 410.23 us | -26.07% |
-| jsonb_join_group/postgres_18 | 329.75 us | -0.32% |
-| transaction_insert/pg_fake | 42.39 us | -96.85% |
-| transaction_insert/postgres_18 | 123.32 us | -1.66% |
-| transaction_repeatable_read_select_for_update/pg_fake | 42.29 us | +6.41% |
-| transaction_repeatable_read_select_for_update/postgres_18 | 77.16 us | -0.84% |
-| select_100_rows/pg_fake | 29.84 us | -69.49% |
-| select_100_rows/postgres_18 | 57.52 us | +0.63% |
-| select_where_100_rows/pg_fake | 17.17 us | -80.86% |
-| select_where_100_rows/postgres_18 | 32.39 us | +0.41% |
-| select_where_indexed_100_rows/pg_fake | 9.80 us | -88.37% |
-| select_where_indexed_100_rows/postgres_18 | 28.14 us | -12.74% |
-| limit_offset_ordered_100_rows/pg_fake | 55.00 us | -61.72% |
-| limit_offset_ordered_100_rows/postgres_18 | 38.64 us | -0.18% |
-| nested_filtered_view_100_rows/pg_fake | 178.60 us | -24.23% |
-| nested_filtered_view_100_rows/postgres_18 | 33.39 us | +1.64% |
-| order_by_100_rows/pg_fake | 57.19 us | -18.26% |
-| order_by_100_rows/postgres_18 | 64.78 us | -0.76% |
-| foreign_key_insert/pg_fake | 60.10 us | -99.46% |
-| foreign_key_insert/postgres_18 | 171.98 us | +2.37% |
-| selective_inner_join/pg_fake | 64.55 us | -34.14% |
-| selective_inner_join/postgres_18 | 37.92 us | +0.06% |
-| many_match_inner_join/pg_fake | 107.94 us | -23.50% |
-| many_match_inner_join/postgres_18 | 64.37 us | +0.53% |
-| derived_and_scalar_subquery_100_rows/pg_fake | 205.94 us | -24.15% |
-| derived_and_scalar_subquery_100_rows/postgres_18 | 71.41 us | -16.11% |
-| materialized_cte_100_rows/pg_fake | 3.23 ms | -7.88% |
-| materialized_cte_100_rows/postgres_18 | 77.15 us | -0.86% |
-| data_modifying_cte_update_100_rows/pg_fake | 335.36 us | -44.34% |
-| data_modifying_cte_update_100_rows/postgres_18 | 103.37 us | +0.59% |
-| recursive_cte_numeric_series_100_rows/pg_fake | 769.25 us | -37.88% |
-| recursive_cte_numeric_series_100_rows/postgres_18 | 72.96 us | +0.85% |
-| recursive_cte_branching_traversal_127_rows/pg_fake | 4.97 ms | -15.01% |
-| recursive_cte_branching_traversal_127_rows/postgres_18 | 118.90 us | -1.52% |
-| correlated_exists_100_rows/pg_fake | 67.14 us | -27.43% |
-| correlated_exists_100_rows/postgres_18 | 67.04 us | -17.99% |
-| global_aggregate_100_rows/pg_fake | 38.03 us | -70.33% |
-| global_aggregate_100_rows/postgres_18 | 38.15 us | -0.34% |
-| grouped_aggregate_100_rows/pg_fake | 87.06 us | -30.10% |
-| grouped_aggregate_100_rows/postgres_18 | 45.43 us | -1.29% |
-| select_distinct_100_rows/pg_fake | 43.46 us | -24.49% |
-| select_distinct_100_rows/postgres_18 | 41.40 us | -0.93% |
-| union_all_100_rows/pg_fake | 215.00 us | -56.04% |
-| union_all_100_rows/postgres_18 | 84.57 us | -1.59% |
-| union_100_rows/pg_fake | 237.60 us | -53.81% |
-| union_100_rows/postgres_18 | 84.72 us | +0.19% |
-| adapter_overhead_select_100_rows/core | 39.93 us | -29.43% |
-| adapter_overhead_select_100_rows/sqlx | 48.39 us | -18.85% |
-| core_parsed_vs_prepared_point_select/parse_and_analyze | 15.06 us | -79.36% |
-| core_parsed_vs_prepared_point_select/prepared_reuse | 397.72 ns | -98.96% |
-| transaction_history_point_select/1 | 206.02 ns | -96.78% |
-| transaction_history_point_select/100 | 205.52 ns | -96.71% |
-| transaction_history_point_select/10,000 | 207.12 ns | -96.13% |
-| transaction_history_point_select/100,000 | 207.54 ns | -96.11% |
-| mvcc_old_snapshot_read/1 | 430.31 ns | -94.31% |
-| mvcc_old_snapshot_read/100 | 1.68 us | -93.14% |
-| mvcc_old_snapshot_read/10,000 | 675.30 us | -75.75% |
-| point_lookup_index_vs_scan/heap_scan/100 | 2.65 us | -75.24% |
-| point_lookup_index_vs_scan/unique_index/100 | 446.44 ns | -98.83% |
-| point_lookup_index_vs_scan/heap_scan/10,000 | 246.64 us | -38.21% |
-| point_lookup_index_vs_scan/unique_index/10,000 | 494.70 ns | -99.99% |
-| concurrent_uncontended_reads/sequential | 17.76 us | -74.19% |
-| concurrent_uncontended_reads/parallel | 16.13 us | -74.26% |
-| concurrent_same_row_contention/wait_then_rollback | 1.70 ms | +2.00% |
+| skip_locked_queue_100_rows/pg_fake | 108.86 ms | N/A |
+| skip_locked_queue_100_rows/postgres_18 | 48.66 us | N/A |
+| lateral_latest_per_parent_100_rows/pg_fake | 5.85 ms | N/A |
+| lateral_latest_per_parent_100_rows/postgres_18 | 599.23 us | N/A |
+| runtime_temporal_100_rows/pg_fake | 1.02 ms | N/A |
+| runtime_temporal_100_rows/postgres_18 | 117.54 us | N/A |
+| runtime_patterns_100_rows/pg_fake | 4.16 ms | N/A |
+| runtime_patterns_100_rows/postgres_18 | 117.61 us | N/A |
+| create_table/pg_fake | 36.66 us | +4.49% |
+| create_table/postgres_18 | 893.53 us | +7.27% |
+| transactional_ddl_create_rollback/pg_fake | 31.77 us | +2.32% |
+| transactional_ddl_create_rollback/postgres_18 | 1.43 ms | +15.62% |
+| migration_table_lock_two_relations/pg_fake | 25.70 us | +13.79% |
+| migration_table_lock_two_relations/postgres_18 | 74.53 us | -1.91% |
+| sqlx_migration_chain/pg_fake | 84.39 ms | N/A |
+| sqlx_migration_chain/postgres_18 | 6.87 ms | N/A |
+| procedural_trigger_insert_update/pg_fake | 21.26 ms | -5.45% |
+| procedural_trigger_insert_update/postgres_18 | 122.22 us | +8.25% |
+| alter_table_rewrite_100_rows/pg_fake | 301.66 us | +1.39% |
+| alter_table_rewrite_100_rows/postgres_18 | 357.90 us | -7.06% |
+| partial_unique_index_100_rows/pg_fake | 64.76 us | +1.82% |
+| partial_unique_index_100_rows/postgres_18 | 490.46 us | +6.54% |
+| temporary_table_on_commit_drop/pg_fake | 17.29 us | +13.63% |
+| temporary_table_on_commit_drop/postgres_18 | 213.41 us | -1.07% |
+| insert_row/pg_fake | 44.52 us | +16.18% |
+| insert_row/postgres_18 | 92.79 us | +8.75% |
+| insert_row_returning/pg_fake | 51.15 us | +2.34% |
+| insert_row_returning/postgres_18 | 97.60 us | +7.24% |
+| insert_row_with_defaults/pg_fake | 44.95 us | +11.55% |
+| insert_row_with_defaults/postgres_18 | 94.73 us | +8.41% |
+| insert_on_conflict_do_nothing/pg_fake | 21.73 us | +24.18% |
+| insert_on_conflict_do_nothing/postgres_18 | 30.81 us | +9.37% |
+| insert_on_conflict_conflict_free/pg_fake | 50.53 us | +31.47% |
+| insert_on_conflict_conflict_free/postgres_18 | 67.64 us | +8.57% |
+| insert_on_conflict_do_update/pg_fake | 35.60 us | +54.53% |
+| insert_on_conflict_do_update/postgres_18 | 34.86 us | +8.99% |
+| update_row/pg_fake | 36.31 us | +73.99% |
+| update_row/postgres_18 | 93.75 us | +7.97% |
+| update_from_row/pg_fake | 42.18 us | +85.25% |
+| update_from_row/postgres_18 | 101.13 us | +7.36% |
+| delete_row/pg_fake | 18.76 us | +18.60% |
+| delete_row/postgres_18 | 119.37 us | -6.09% |
+| sequence_nextval/pg_fake | 22.70 us | +47.87% |
+| sequence_nextval/postgres_18 | 27.93 us | +4.71% |
+| serial_identity_insert/pg_fake | 22.43 us | +27.32% |
+| serial_identity_insert/postgres_18 | 32.36 us | +6.52% |
+| uuid_temporal_select/pg_fake | 25.41 us | +33.41% |
+| uuid_temporal_select/postgres_18 | 30.75 us | +6.88% |
+| json_insert_returning/pg_fake | 38.76 us | +22.99% |
+| json_insert_returning/postgres_18 | 145.94 us | +7.92% |
+| jsonb_insert_returning/pg_fake | 45.01 us | +26.07% |
+| jsonb_insert_returning/postgres_18 | 145.03 us | +45.08% |
+| jsonb_extraction/pg_fake | 93.14 us | +18.21% |
+| jsonb_extraction/postgres_18 | 67.28 us | +3.63% |
+| jsonb_containment/pg_fake | 204.91 us | +4.56% |
+| jsonb_containment/postgres_18 | 43.55 us | +6.35% |
+| jsonb_join_group/pg_fake | 707.79 us | +72.54% |
+| jsonb_join_group/postgres_18 | 338.70 us | +2.72% |
+| window_row_number_100_rows/pg_fake | 128.50 us | N/A |
+| window_row_number_100_rows/postgres_18 | 84.46 us | N/A |
+| ordered_string_agg_100_rows/pg_fake | 231.77 us | N/A |
+| ordered_string_agg_100_rows/postgres_18 | 71.00 us | N/A |
+| transaction_insert/pg_fake | 66.13 us | +56.01% |
+| transaction_insert/postgres_18 | 136.27 us | +10.51% |
+| transaction_repeatable_read_select_for_update/pg_fake | 105.13 ms | +248520.07% |
+| transaction_repeatable_read_select_for_update/postgres_18 | 85.72 us | +11.09% |
+| select_100_rows/pg_fake | 30.66 us | +2.72% |
+| select_100_rows/postgres_18 | 59.53 us | +3.49% |
+| select_where_100_rows/pg_fake | 17.27 us | +0.55% |
+| select_where_100_rows/postgres_18 | 34.55 us | +6.68% |
+| select_where_indexed_100_rows/pg_fake | 9.94 us | +1.50% |
+| select_where_indexed_100_rows/postgres_18 | 33.97 us | +20.71% |
+| limit_offset_ordered_100_rows/pg_fake | 71.65 us | +30.28% |
+| limit_offset_ordered_100_rows/postgres_18 | 42.08 us | +8.90% |
+| nested_filtered_view_100_rows/pg_fake | 452.05 us | +153.12% |
+| nested_filtered_view_100_rows/postgres_18 | 35.37 us | +5.95% |
+| order_by_100_rows/pg_fake | 107.21 us | +87.47% |
+| order_by_100_rows/postgres_18 | 67.12 us | +3.61% |
+| foreign_key_insert/pg_fake | 70.37 us | +17.09% |
+| foreign_key_insert/postgres_18 | 179.30 us | +4.26% |
+| selective_inner_join/pg_fake | 82.90 us | +28.42% |
+| selective_inner_join/postgres_18 | 38.74 us | +2.17% |
+| many_match_inner_join/pg_fake | 136.48 us | +26.43% |
+| many_match_inner_join/postgres_18 | 66.47 us | +3.26% |
+| derived_and_scalar_subquery_100_rows/pg_fake | 317.60 us | +54.22% |
+| derived_and_scalar_subquery_100_rows/postgres_18 | 85.71 us | +20.02% |
+| materialized_cte_100_rows/pg_fake | 8.35 ms | +158.30% |
+| materialized_cte_100_rows/postgres_18 | 78.46 us | +1.69% |
+| data_modifying_cte_update_100_rows/pg_fake | 2.10 ms | +527.17% |
+| data_modifying_cte_update_100_rows/postgres_18 | 100.87 us | -2.42% |
+| recursive_cte_numeric_series_100_rows/pg_fake | 2.17 ms | +182.23% |
+| recursive_cte_numeric_series_100_rows/postgres_18 | 74.44 us | +2.02% |
+| recursive_cte_branching_traversal_127_rows/pg_fake | 6.60 ms | +32.81% |
+| recursive_cte_branching_traversal_127_rows/postgres_18 | 121.34 us | +2.06% |
+| correlated_exists_100_rows/pg_fake | 72.80 us | +8.43% |
+| correlated_exists_100_rows/postgres_18 | 76.94 us | +14.78% |
+| global_aggregate_100_rows/pg_fake | 38.86 us | +2.21% |
+| global_aggregate_100_rows/postgres_18 | 39.68 us | +4.00% |
+| grouped_aggregate_100_rows/pg_fake | 166.62 us | +91.40% |
+| grouped_aggregate_100_rows/postgres_18 | 49.11 us | +8.09% |
+| select_distinct_100_rows/pg_fake | 49.85 us | +14.71% |
+| select_distinct_100_rows/postgres_18 | 45.12 us | +8.98% |
+| union_all_100_rows/pg_fake | 407.31 us | +89.45% |
+| union_all_100_rows/postgres_18 | 86.35 us | +2.11% |
+| union_100_rows/pg_fake | 429.51 us | +80.77% |
+| union_100_rows/postgres_18 | 85.78 us | +1.26% |
+| adapter_overhead_select_100_rows/core | 92.99 us | +132.87% |
+| adapter_overhead_select_100_rows/sqlx | 100.54 us | +107.76% |
+| core_parsed_vs_prepared_point_select/parse_and_analyze | 15.09 us | +0.25% |
+| core_parsed_vs_prepared_point_select/prepared_reuse | 381.90 ns | -3.98% |
+| transaction_history_point_select/1 | 204.69 ns | -0.64% |
+| transaction_history_point_select/100 | 204.66 ns | -0.42% |
+| transaction_history_point_select/10,000 | 204.72 ns | -1.16% |
+| transaction_history_point_select/100,000 | 205.25 ns | -1.10% |
+| mvcc_old_snapshot_read/1 | 430.49 ns | +0.04% |
+| mvcc_old_snapshot_read/100 | 1.70 us | +0.91% |
+| mvcc_old_snapshot_read/10,000 | 672.08 us | -0.48% |
+| point_lookup_index_vs_scan/heap_scan/100 | 2.64 us | -0.32% |
+| point_lookup_index_vs_scan/unique_index/100 | 419.26 ns | -6.09% |
+| point_lookup_index_vs_scan/heap_scan/10,000 | 250.37 us | +1.51% |
+| point_lookup_index_vs_scan/unique_index/10,000 | 470.24 ns | -4.95% |
+| concurrent_uncontended_reads/sequential | 17.48 us | -1.57% |
+| concurrent_uncontended_reads/parallel | 15.79 us | -2.13% |
+| concurrent_same_row_contention/wait_then_rollback | 1.88 ms | +10.81% |
 
 ## Comparisons
 
 | Benchmark | Baseline | Candidate | Relative |
 | --- | --- | --- | ---: |
-| create_table | postgres_18 | pg_fake | 🟢 ↑ 23.74x |
-| transactional_ddl_create_rollback | postgres_18 | pg_fake | 🟢 ↑ 39.70x |
-| migration_table_lock_two_relations | postgres_18 | pg_fake | 🟢 ↑ 3.36x |
-| procedural_trigger_insert_update | postgres_18 | pg_fake | 🔴 ↓ 199.10x |
-| alter_table_rewrite_100_rows | postgres_18 | pg_fake | 🟢 ↑ 1.29x |
-| partial_unique_index_100_rows | postgres_18 | pg_fake | 🟢 ↑ 7.24x |
-| temporary_table_on_commit_drop | postgres_18 | pg_fake | 🟢 ↑ 14.18x |
-| insert_row | postgres_18 | pg_fake | 🟢 ↑ 2.23x |
-| insert_row_returning | postgres_18 | pg_fake | 🟢 ↑ 1.82x |
-| insert_row_with_defaults | postgres_18 | pg_fake | 🟢 ↑ 2.17x |
-| insert_on_conflict_do_nothing | postgres_18 | pg_fake | 🟢 ↑ 1.61x |
-| insert_on_conflict_conflict_free | postgres_18 | pg_fake | 🟢 ↑ 1.62x |
-| insert_on_conflict_do_update | postgres_18 | pg_fake | 🟢 ↑ 1.39x |
-| update_row | postgres_18 | pg_fake | 🟢 ↑ 4.16x |
-| update_from_row | postgres_18 | pg_fake | 🟢 ↑ 4.14x |
-| delete_row | postgres_18 | pg_fake | 🟢 ↑ 8.04x |
-| sequence_nextval | postgres_18 | pg_fake | 🟢 ↑ 1.74x |
-| serial_identity_insert | postgres_18 | pg_fake | 🟢 ↑ 1.72x |
-| uuid_temporal_select | postgres_18 | pg_fake | 🟢 ↑ 1.51x |
-| json_insert_returning | postgres_18 | pg_fake | 🟢 ↑ 4.29x |
-| jsonb_insert_returning | postgres_18 | pg_fake | 🟢 ↑ 2.80x |
-| jsonb_extraction | postgres_18 | pg_fake | 🔴 ↓ 1.21x |
-| jsonb_containment | postgres_18 | pg_fake | 🔴 ↓ 4.79x |
-| jsonb_join_group | postgres_18 | pg_fake | 🔴 ↓ 1.24x |
-| transaction_insert | postgres_18 | pg_fake | 🟢 ↑ 2.91x |
-| transaction_repeatable_read_select_for_update | postgres_18 | pg_fake | 🟢 ↑ 1.82x |
-| select_100_rows | postgres_18 | pg_fake | 🟢 ↑ 1.93x |
-| select_where_100_rows | postgres_18 | pg_fake | 🟢 ↑ 1.89x |
-| select_where_indexed_100_rows | postgres_18 | pg_fake | 🟢 ↑ 2.87x |
-| limit_offset_ordered_100_rows | postgres_18 | pg_fake | 🔴 ↓ 1.42x |
-| nested_filtered_view_100_rows | postgres_18 | pg_fake | 🔴 ↓ 5.35x |
-| order_by_100_rows | postgres_18 | pg_fake | 🟢 ↑ 1.13x |
-| foreign_key_insert | postgres_18 | pg_fake | 🟢 ↑ 2.86x |
-| selective_inner_join | postgres_18 | pg_fake | 🔴 ↓ 1.70x |
-| many_match_inner_join | postgres_18 | pg_fake | 🔴 ↓ 1.68x |
-| derived_and_scalar_subquery_100_rows | postgres_18 | pg_fake | 🔴 ↓ 2.88x |
-| materialized_cte_100_rows | postgres_18 | pg_fake | 🔴 ↓ 41.90x |
-| data_modifying_cte_update_100_rows | postgres_18 | pg_fake | 🔴 ↓ 3.24x |
-| recursive_cte_numeric_series_100_rows | postgres_18 | pg_fake | 🔴 ↓ 10.54x |
-| recursive_cte_branching_traversal_127_rows | postgres_18 | pg_fake | 🔴 ↓ 41.79x |
-| correlated_exists_100_rows | postgres_18 | pg_fake | 🔴 ↓ 1.00x |
-| global_aggregate_100_rows | postgres_18 | pg_fake | 🟢 ↑ 1.00x |
-| grouped_aggregate_100_rows | postgres_18 | pg_fake | 🔴 ↓ 1.92x |
-| select_distinct_100_rows | postgres_18 | pg_fake | 🔴 ↓ 1.05x |
-| union_all_100_rows | postgres_18 | pg_fake | 🔴 ↓ 2.54x |
-| union_100_rows | postgres_18 | pg_fake | 🔴 ↓ 2.80x |
-| adapter_overhead_select_100_rows | core | sqlx | 🔴 ↓ 1.21x |
-| core_parsed_vs_prepared_point_select | parse_and_analyze | prepared_reuse | 🟢 ↑ 37.85x |
+| skip_locked_queue_100_rows | postgres_18 | pg_fake | 🔴 ↓ 2237.04x |
+| lateral_latest_per_parent_100_rows | postgres_18 | pg_fake | 🔴 ↓ 9.76x |
+| runtime_temporal_100_rows | postgres_18 | pg_fake | 🔴 ↓ 8.65x |
+| runtime_patterns_100_rows | postgres_18 | pg_fake | 🔴 ↓ 35.35x |
+| create_table | postgres_18 | pg_fake | 🟢 ↑ 24.37x |
+| transactional_ddl_create_rollback | postgres_18 | pg_fake | 🟢 ↑ 44.86x |
+| migration_table_lock_two_relations | postgres_18 | pg_fake | 🟢 ↑ 2.90x |
+| sqlx_migration_chain | postgres_18 | pg_fake | 🔴 ↓ 12.28x |
+| procedural_trigger_insert_update | postgres_18 | pg_fake | 🔴 ↓ 173.91x |
+| alter_table_rewrite_100_rows | postgres_18 | pg_fake | 🟢 ↑ 1.19x |
+| partial_unique_index_100_rows | postgres_18 | pg_fake | 🟢 ↑ 7.57x |
+| temporary_table_on_commit_drop | postgres_18 | pg_fake | 🟢 ↑ 12.35x |
+| insert_row | postgres_18 | pg_fake | 🟢 ↑ 2.08x |
+| insert_row_returning | postgres_18 | pg_fake | 🟢 ↑ 1.91x |
+| insert_row_with_defaults | postgres_18 | pg_fake | 🟢 ↑ 2.11x |
+| insert_on_conflict_do_nothing | postgres_18 | pg_fake | 🟢 ↑ 1.42x |
+| insert_on_conflict_conflict_free | postgres_18 | pg_fake | 🟢 ↑ 1.34x |
+| insert_on_conflict_do_update | postgres_18 | pg_fake | 🔴 ↓ 1.02x |
+| update_row | postgres_18 | pg_fake | 🟢 ↑ 2.58x |
+| update_from_row | postgres_18 | pg_fake | 🟢 ↑ 2.40x |
+| delete_row | postgres_18 | pg_fake | 🟢 ↑ 6.36x |
+| sequence_nextval | postgres_18 | pg_fake | 🟢 ↑ 1.23x |
+| serial_identity_insert | postgres_18 | pg_fake | 🟢 ↑ 1.44x |
+| uuid_temporal_select | postgres_18 | pg_fake | 🟢 ↑ 1.21x |
+| json_insert_returning | postgres_18 | pg_fake | 🟢 ↑ 3.77x |
+| jsonb_insert_returning | postgres_18 | pg_fake | 🟢 ↑ 3.22x |
+| jsonb_extraction | postgres_18 | pg_fake | 🔴 ↓ 1.38x |
+| jsonb_containment | postgres_18 | pg_fake | 🔴 ↓ 4.71x |
+| jsonb_join_group | postgres_18 | pg_fake | 🔴 ↓ 2.09x |
+| window_row_number_100_rows | postgres_18 | pg_fake | 🔴 ↓ 1.52x |
+| ordered_string_agg_100_rows | postgres_18 | pg_fake | 🔴 ↓ 3.26x |
+| transaction_insert | postgres_18 | pg_fake | 🟢 ↑ 2.06x |
+| transaction_repeatable_read_select_for_update | postgres_18 | pg_fake | 🔴 ↓ 1226.52x |
+| select_100_rows | postgres_18 | pg_fake | 🟢 ↑ 1.94x |
+| select_where_100_rows | postgres_18 | pg_fake | 🟢 ↑ 2.00x |
+| select_where_indexed_100_rows | postgres_18 | pg_fake | 🟢 ↑ 3.42x |
+| limit_offset_ordered_100_rows | postgres_18 | pg_fake | 🔴 ↓ 1.70x |
+| nested_filtered_view_100_rows | postgres_18 | pg_fake | 🔴 ↓ 12.78x |
+| order_by_100_rows | postgres_18 | pg_fake | 🔴 ↓ 1.60x |
+| foreign_key_insert | postgres_18 | pg_fake | 🟢 ↑ 2.55x |
+| selective_inner_join | postgres_18 | pg_fake | 🔴 ↓ 2.14x |
+| many_match_inner_join | postgres_18 | pg_fake | 🔴 ↓ 2.05x |
+| derived_and_scalar_subquery_100_rows | postgres_18 | pg_fake | 🔴 ↓ 3.71x |
+| materialized_cte_100_rows | postgres_18 | pg_fake | 🔴 ↓ 106.43x |
+| data_modifying_cte_update_100_rows | postgres_18 | pg_fake | 🔴 ↓ 20.85x |
+| recursive_cte_numeric_series_100_rows | postgres_18 | pg_fake | 🔴 ↓ 29.17x |
+| recursive_cte_branching_traversal_127_rows | postgres_18 | pg_fake | 🔴 ↓ 54.39x |
+| correlated_exists_100_rows | postgres_18 | pg_fake | 🟢 ↑ 1.06x |
+| global_aggregate_100_rows | postgres_18 | pg_fake | 🟢 ↑ 1.02x |
+| grouped_aggregate_100_rows | postgres_18 | pg_fake | 🔴 ↓ 3.39x |
+| select_distinct_100_rows | postgres_18 | pg_fake | 🔴 ↓ 1.10x |
+| union_all_100_rows | postgres_18 | pg_fake | 🔴 ↓ 4.72x |
+| union_100_rows | postgres_18 | pg_fake | 🔴 ↓ 5.01x |
+| adapter_overhead_select_100_rows | core | sqlx | 🔴 ↓ 1.08x |
+| core_parsed_vs_prepared_point_select | parse_and_analyze | prepared_reuse | 🟢 ↑ 39.52x |
 | transaction_history_point_select | 1 | 100 | 🟢 ↑ 1.00x |
-| transaction_history_point_select | 1 | 10,000 | 🔴 ↓ 1.01x |
-| transaction_history_point_select | 1 | 100,000 | 🔴 ↓ 1.01x |
-| mvcc_old_snapshot_read | 1 | 100 | 🔴 ↓ 3.91x |
-| mvcc_old_snapshot_read | 1 | 10,000 | 🔴 ↓ 1569.33x |
-| point_lookup_index_vs_scan | heap_scan/100 | unique_index/100 | 🟢 ↑ 5.93x |
-| point_lookup_index_vs_scan | heap_scan/10,000 | unique_index/10,000 | 🟢 ↑ 498.56x |
-| concurrent_uncontended_reads | sequential | parallel | 🟢 ↑ 1.10x |
+| transaction_history_point_select | 1 | 10,000 | 🔴 ↓ 1.00x |
+| transaction_history_point_select | 1 | 100,000 | 🔴 ↓ 1.00x |
+| mvcc_old_snapshot_read | 1 | 100 | 🔴 ↓ 3.94x |
+| mvcc_old_snapshot_read | 1 | 10,000 | 🔴 ↓ 1561.21x |
+| point_lookup_index_vs_scan | heap_scan/100 | unique_index/100 | 🟢 ↑ 6.29x |
+| point_lookup_index_vs_scan | heap_scan/10,000 | unique_index/10,000 | 🟢 ↑ 532.43x |
+| concurrent_uncontended_reads | sequential | parallel | 🟢 ↑ 1.11x |
