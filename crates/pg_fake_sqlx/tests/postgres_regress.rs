@@ -3,8 +3,7 @@ use std::{fs, path::PathBuf, sync::Mutex};
 use pg_fake::parser::{self, Statement};
 use pg_fake_sqlx::{Db, PgFake, PgFakeConnection};
 use sqlx::{
-    AssertSqlSafe, ColumnIndex, Connection, Database, Decode, Executor, IntoArguments, Row, Type,
-    ValueRef,
+    ColumnIndex, Connection, Database, Decode, Executor, IntoArguments, Row, Type, ValueRef,
 };
 use sqlx_postgres::{PgConnection, Postgres};
 use tokio::runtime::Runtime;
@@ -75,21 +74,13 @@ where
     DB: Database,
     for<'connection> &'connection mut DB::Connection: Executor<'connection, Database = DB>,
     for<'row> String: Decode<'row, DB> + Type<DB>,
-    DB::Arguments: IntoArguments<DB>,
+    for<'query> DB::Arguments<'query>: IntoArguments<'query, DB>,
     usize: ColumnIndex<DB::Row>,
 {
     match statement {
         Statement::Query(_) | Statement::ShowVariable { .. } => match match mode {
-            ExecutionMode::Prepared => {
-                sqlx::query(AssertSqlSafe(sql))
-                    .fetch_all(&mut *connection)
-                    .await
-            }
-            ExecutionMode::Raw => {
-                sqlx::raw_sql(AssertSqlSafe(sql))
-                    .fetch_all(&mut *connection)
-                    .await
-            }
+            ExecutionMode::Prepared => sqlx::query(sql).fetch_all(&mut *connection).await,
+            ExecutionMode::Raw => sqlx::raw_sql(sql).fetch_all(&mut *connection).await,
         } {
             Ok(rows) => Outcome::Rows(
                 rows.iter()
@@ -110,16 +101,8 @@ where
             Err(error) => make_error_outcome(error),
         },
         _ => match match mode {
-            ExecutionMode::Prepared => {
-                sqlx::query(AssertSqlSafe(sql))
-                    .execute(&mut *connection)
-                    .await
-            }
-            ExecutionMode::Raw => {
-                sqlx::raw_sql(AssertSqlSafe(sql))
-                    .execute(&mut *connection)
-                    .await
-            }
+            ExecutionMode::Prepared => sqlx::query(sql).execute(&mut *connection).await,
+            ExecutionMode::Raw => sqlx::raw_sql(sql).execute(&mut *connection).await,
         } {
             Ok(result) => Outcome::Affected(rows_affected(result)),
             Err(error) => make_error_outcome(error),
@@ -301,30 +284,28 @@ fn compare_source_statement(
     let mut parsed = match parser::parse(sql) {
         Ok(parsed) if parsed.len() == 1 => parsed,
         Ok(_) => return Err("does not contain exactly one SQL statement".into()),
-        Err(fake_error) => {
-            match runtime.block_on(sqlx::raw_sql(AssertSqlSafe(sql)).execute(&mut *postgres)) {
-                Err(postgres_error)
-                    if postgres_error
+        Err(fake_error) => match runtime.block_on(sqlx::raw_sql(sql).execute(&mut *postgres)) {
+            Err(postgres_error)
+                if postgres_error
+                    .as_database_error()
+                    .and_then(|error| error.code())
+                    .is_some_and(|code| code == fake_error.sqlstate.get_code()) =>
+            {
+                return Ok(());
+            }
+            Err(postgres_error) => {
+                return Err(format!(
+                    "pg_fake cannot parse it ({}) while PostgreSQL returns {}",
+                    fake_error.sqlstate.get_code(),
+                    postgres_error
                         .as_database_error()
                         .and_then(|error| error.code())
-                        .is_some_and(|code| code == fake_error.sqlstate.get_code()) =>
-                {
-                    return Ok(());
-                }
-                Err(postgres_error) => {
-                    return Err(format!(
-                        "pg_fake cannot parse it ({}) while PostgreSQL returns {}",
-                        fake_error.sqlstate.get_code(),
-                        postgres_error
-                            .as_database_error()
-                            .and_then(|error| error.code())
-                            .as_deref()
-                            .unwrap_or("no SQLSTATE")
-                    ));
-                }
-                Ok(_) => return Err("pg_fake cannot parse a PostgreSQL-valid statement".into()),
+                        .as_deref()
+                        .unwrap_or("no SQLSTATE")
+                ));
             }
-        }
+            Ok(_) => return Err("pg_fake cannot parse a PostgreSQL-valid statement".into()),
+        },
     };
     let statement = parsed.pop().unwrap();
     let [expected, actual] = [
@@ -347,7 +328,7 @@ fn collect_phase2_report(
     let database = format!("pg_fake_regress_phase2_{}", std::process::id());
     let sql = format!("CREATE DATABASE {database}");
     runtime
-        .block_on(sqlx::raw_sql(AssertSqlSafe(sql.as_str())).execute(&mut *admin))
+        .block_on(sqlx::raw_sql(sql.as_str()).execute(&mut *admin))
         .expect("must create PostgreSQL Phase 2 regression database");
     let database_url = database_url(server_url, &database);
     let mut postgres = runtime
@@ -392,7 +373,7 @@ fn collect_phase2_report(
     drop(postgres);
     let sql = format!("DROP DATABASE {database} WITH (FORCE)");
     runtime
-        .block_on(sqlx::raw_sql(AssertSqlSafe(sql.as_str())).execute(&mut *admin))
+        .block_on(sqlx::raw_sql(sql.as_str()).execute(&mut *admin))
         .expect("must drop PostgreSQL Phase 2 regression database");
     (passed, blockers, regressions)
 }
@@ -405,7 +386,7 @@ fn collect_phase3_report(
     let database = format!("pg_fake_regress_phase3_{}", std::process::id());
     let sql = format!("CREATE DATABASE {database}");
     runtime
-        .block_on(sqlx::raw_sql(AssertSqlSafe(sql.as_str())).execute(&mut *admin))
+        .block_on(sqlx::raw_sql(sql.as_str()).execute(&mut *admin))
         .expect("must create PostgreSQL Phase 3 regression database");
     let database_url = database_url(server_url, &database);
     let mut postgres = runtime
@@ -453,7 +434,7 @@ fn collect_phase3_report(
     drop(postgres);
     let sql = format!("DROP DATABASE {database} WITH (FORCE)");
     runtime
-        .block_on(sqlx::raw_sql(AssertSqlSafe(sql.as_str())).execute(&mut *admin))
+        .block_on(sqlx::raw_sql(sql.as_str()).execute(&mut *admin))
         .expect("must drop PostgreSQL Phase 3 regression database");
     (passed, total, blockers)
 }
@@ -510,7 +491,7 @@ fn reports_phase2_regression_progress() {
         let database = format!("pg_fake_regress_source_{}_{}", std::process::id(), index);
         let sql = format!("CREATE DATABASE {database}");
         runtime
-            .block_on(sqlx::raw_sql(AssertSqlSafe(sql.as_str())).execute(&mut admin))
+            .block_on(sqlx::raw_sql(sql.as_str()).execute(&mut admin))
             .expect("must create PostgreSQL regression database");
         let database_url = database_url(&server.url, &database);
         let mut postgres = runtime
@@ -539,7 +520,7 @@ fn reports_phase2_regression_progress() {
         drop(postgres);
         let sql = format!("DROP DATABASE {database} WITH (FORCE)");
         runtime
-            .block_on(sqlx::raw_sql(AssertSqlSafe(sql.as_str())).execute(&mut admin))
+            .block_on(sqlx::raw_sql(sql.as_str()).execute(&mut admin))
             .expect("must drop PostgreSQL regression database");
 
         if let Some(blocker) = first_blocker {

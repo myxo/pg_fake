@@ -1,5 +1,5 @@
 use pg_fake_sqlx::{Db, PgFakeConnection, PgFakeDatabaseError};
-use sqlx::{AssertSqlSafe, Column, Connection, Row, TypeInfo};
+use sqlx::{Column, Connection, Row, TypeInfo};
 use sqlx_postgres::{PgConnection, PgDatabaseError};
 
 mod common;
@@ -13,12 +13,12 @@ fn get_sqlstate(error: sqlx::Error) -> String {
 }
 
 async fn execute_both(postgres: &mut PgConnection, fake: &mut PgFakeConnection, sql: &str) {
-    let expected = sqlx::raw_sql(AssertSqlSafe(sql))
+    let expected = sqlx::raw_sql(sql)
         .execute(&mut *postgres)
         .await
         .map(|result| result.rows_affected())
         .map_err(get_sqlstate);
-    let actual = sqlx::raw_sql(AssertSqlSafe(sql))
+    let actual = sqlx::raw_sql(sql)
         .execute(&mut *fake)
         .await
         .map(|result| result.rows_affected())
@@ -27,7 +27,7 @@ async fn execute_both(postgres: &mut PgConnection, fake: &mut PgFakeConnection, 
 }
 
 async fn query_rows_postgres(connection: &mut PgConnection, sql: &str) -> Vec<(i64, i64, String)> {
-    sqlx::raw_sql(AssertSqlSafe(sql))
+    sqlx::raw_sql(sql)
         .fetch_all(connection)
         .await
         .unwrap()
@@ -37,7 +37,7 @@ async fn query_rows_postgres(connection: &mut PgConnection, sql: &str) -> Vec<(i
 }
 
 async fn query_rows_fake(connection: &mut PgFakeConnection, sql: &str) -> Vec<(i64, i64, String)> {
-    sqlx::raw_sql(AssertSqlSafe(sql))
+    sqlx::raw_sql(sql)
         .fetch_all(connection)
         .await
         .unwrap()
@@ -47,14 +47,8 @@ async fn query_rows_fake(connection: &mut PgFakeConnection, sql: &str) -> Vec<(i
 }
 
 async fn compare_raise_error(postgres: &mut PgConnection, fake: &mut PgFakeConnection, sql: &str) {
-    let expected = sqlx::raw_sql(AssertSqlSafe(sql))
-        .execute(postgres)
-        .await
-        .unwrap_err();
-    let actual = sqlx::raw_sql(AssertSqlSafe(sql))
-        .execute(fake)
-        .await
-        .unwrap_err();
+    let expected = sqlx::raw_sql(sql).execute(postgres).await.unwrap_err();
+    let actual = sqlx::raw_sql(sql).execute(fake).await.unwrap_err();
     let expected = expected.as_database_error().unwrap();
     let actual = actual.as_database_error().unwrap();
     assert_eq!(actual.code(), expected.code());
@@ -78,15 +72,15 @@ fn trigger_and_do_behavior_matches_postgres() {
         let suffix = std::process::id();
         let table = format!("procedural_items_{suffix}");
         let function = format!("procedural_normalize_{suffix}");
-        sqlx::raw_sql(AssertSqlSafe(
+        sqlx::raw_sql(
             format!("DROP TABLE IF EXISTS {table} CASCADE").as_str(),
-        ))
+        )
         .execute(&mut postgres)
         .await
         .unwrap();
-        sqlx::raw_sql(AssertSqlSafe(
+        sqlx::raw_sql(
             format!("DROP FUNCTION IF EXISTS {function}()").as_str(),
-        ))
+        )
         .execute(&mut postgres)
         .await
         .unwrap();
@@ -332,14 +326,14 @@ fn procedural_catalog_and_edge_behavior_matches_postgres() {
         let sql = format!(
             "INSERT INTO public.{source} VALUES ($1, $2, $3) RETURNING id, value, label"
         );
-        let expected = sqlx::query(AssertSqlSafe(sql.clone()))
+        let expected = sqlx::query(&sql)
             .bind(4_i64)
             .bind(4_i64)
             .bind("four")
             .fetch_one(&mut postgres)
             .await
             .unwrap();
-        let actual = sqlx::query(AssertSqlSafe(sql))
+        let actual = sqlx::query(&sql)
             .bind(4_i64)
             .bind(4_i64)
             .bind("four")
@@ -373,14 +367,14 @@ fn procedural_catalog_and_edge_behavior_matches_postgres() {
         let sql = format!(
             "INSERT INTO public.{source} VALUES ($1, $2, $3) RETURNING id, value, label"
         );
-        let expected = sqlx::query(AssertSqlSafe(sql.clone()))
+        let expected = sqlx::query(&sql)
             .bind(5_i64)
             .bind(5_i64)
             .bind("five")
             .fetch_one(&mut postgres)
             .await
             .unwrap();
-        let actual = sqlx::query(AssertSqlSafe(sql))
+        let actual = sqlx::query(&sql)
             .bind(5_i64)
             .bind(5_i64)
             .bind("five")
@@ -501,13 +495,13 @@ fn trigger_catalog_changes_and_errors_match_postgres() {
 
         let insert = format!("INSERT INTO {table} VALUES ($1, $2) RETURNING id, value");
         for (id, value, expected_value) in [(1_i64, 2_i64, 2_i64)] {
-            let expected = sqlx::query(AssertSqlSafe(insert.clone()))
+            let expected = sqlx::query(&insert)
                 .bind(id)
                 .bind(value)
                 .fetch_one(&mut postgres)
                 .await
                 .unwrap();
-            let actual = sqlx::query(AssertSqlSafe(insert.clone()))
+            let actual = sqlx::query(&insert)
                 .bind(id)
                 .bind(value)
                 .fetch_one(&mut fake)
@@ -538,13 +532,13 @@ fn trigger_catalog_changes_and_errors_match_postgres() {
             execute_both(&mut postgres, &mut fake, &sql).await;
         }
         for (id, expected_value) in [(2_i64, 3_i64)] {
-            let expected = sqlx::query(AssertSqlSafe(insert.clone()))
+            let expected = sqlx::query(&insert)
                 .bind(id)
                 .bind(2_i64)
                 .fetch_one(&mut postgres)
                 .await
                 .unwrap();
-            let actual = sqlx::query(AssertSqlSafe(insert.clone()))
+            let actual = sqlx::query(&insert)
                 .bind(id)
                 .bind(2_i64)
                 .fetch_one(&mut fake)
@@ -565,13 +559,13 @@ fn trigger_catalog_changes_and_errors_match_postgres() {
             &format!("DROP TRIGGER renamed_trigger ON {table}"),
         )
         .await;
-        let expected = sqlx::query(AssertSqlSafe(insert.clone()))
+        let expected = sqlx::query(&insert)
             .bind(3_i64)
             .bind(2_i64)
             .fetch_one(&mut postgres)
             .await
             .unwrap();
-        let actual = sqlx::query(AssertSqlSafe(insert.clone()))
+        let actual = sqlx::query(&insert)
             .bind(3_i64)
             .bind(2_i64)
             .fetch_one(&mut fake)

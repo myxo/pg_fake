@@ -1,5 +1,5 @@
 use pg_fake_sqlx::{Db, PgFakeConnection};
-use sqlx::{AssertSqlSafe, Column, Connection, Row, TypeInfo};
+use sqlx::{Column, Connection, Row, TypeInfo};
 use sqlx_postgres::PgConnection;
 
 mod common;
@@ -47,14 +47,14 @@ fn matches_json_storage_parameters_metadata_and_unsupported_operations() {
     );
     let postgres_row = runtime
         .block_on(
-            sqlx::query(AssertSqlSafe(insert.as_str()))
+            sqlx::query(insert.as_str())
                 .bind(document)
                 .fetch_one(&mut postgres),
         )
         .unwrap();
     let fake_row = runtime
         .block_on(
-            sqlx::query(AssertSqlSafe(insert.as_str()))
+            sqlx::query(insert.as_str())
                 .bind(document)
                 .fetch_one(&mut fake),
         )
@@ -368,7 +368,7 @@ fn matches_json_prepared_parameters_and_metadata() {
     let query = "SELECT $1 ->> $2";
     let expected: String = runtime
         .block_on(
-            sqlx::query_scalar(AssertSqlSafe(query))
+            sqlx::query_scalar(query)
                 .bind(&indexed)
                 .bind(1_i32)
                 .fetch_one(&mut postgres),
@@ -376,7 +376,7 @@ fn matches_json_prepared_parameters_and_metadata() {
         .unwrap();
     let actual: String = runtime
         .block_on(
-            sqlx::query_scalar(AssertSqlSafe(query))
+            sqlx::query_scalar(query)
                 .bind(&indexed)
                 .bind(1_i32)
                 .fetch_one(&mut fake),
@@ -389,7 +389,7 @@ fn matches_json_prepared_parameters_and_metadata() {
         "SELECT $1 #> $2 AS value, $1 #>> $2 AS text, jsonb_set($1,$2,'42') AS updated, $2 AS path";
     let real = runtime
         .block_on(
-            sqlx::query(AssertSqlSafe(sql))
+            sqlx::query(sql)
                 .bind(&document)
                 .bind(&path)
                 .fetch_one(&mut postgres),
@@ -397,7 +397,7 @@ fn matches_json_prepared_parameters_and_metadata() {
         .unwrap();
     let actual = runtime
         .block_on(
-            sqlx::query(AssertSqlSafe(sql))
+            sqlx::query(sql)
                 .bind(&document)
                 .bind(&path)
                 .fetch_one(&mut fake),
@@ -425,18 +425,10 @@ fn matches_json_prepared_parameters_and_metadata() {
     );
     let sql = "SELECT * FROM jsonb_each($1) AS item";
     let real = runtime
-        .block_on(
-            sqlx::query(AssertSqlSafe(sql))
-                .bind(&document)
-                .fetch_one(&mut postgres),
-        )
+        .block_on(sqlx::query(sql).bind(&document).fetch_one(&mut postgres))
         .unwrap();
     let actual = runtime
-        .block_on(
-            sqlx::query(AssertSqlSafe(sql))
-                .bind(&document)
-                .fetch_one(&mut fake),
-        )
+        .block_on(sqlx::query(sql).bind(&document).fetch_one(&mut fake))
         .unwrap();
     for (real, actual) in real.columns().iter().zip(actual.columns()) {
         assert_eq!(real.name(), actual.name());

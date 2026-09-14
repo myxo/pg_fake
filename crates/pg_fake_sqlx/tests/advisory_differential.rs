@@ -1,5 +1,5 @@
 use pg_fake_sqlx::{Db, PgFakeConnection};
-use sqlx::{AssertSqlSafe, Column, Connection, Row, TypeInfo};
+use sqlx::{Column, Connection, Row, TypeInfo};
 use sqlx_postgres::PgConnection;
 
 mod common;
@@ -278,12 +278,12 @@ fn preserves_advisory_sqlx_metadata_and_prepared_transactions() {
             let mut pg_tx = postgres.begin().await.unwrap();
             let mut fake_tx = fake.begin().await.unwrap();
             let sql = "SELECT pg_advisory_xact_lock($1) AS held";
-            let pg_row = sqlx::query(AssertSqlSafe(sql))
+            let pg_row = sqlx::query(sql)
                 .bind(i64::MIN)
                 .fetch_one(&mut *pg_tx)
                 .await
                 .unwrap();
-            let fake_row = sqlx::query(AssertSqlSafe(sql))
+            let fake_row = sqlx::query(sql)
                 .bind(i64::MIN)
                 .fetch_one(&mut *fake_tx)
                 .await
@@ -293,25 +293,25 @@ fn preserves_advisory_sqlx_metadata_and_prepared_transactions() {
             pg_row.try_get::<(), _>(0).unwrap();
             fake_row.try_get::<(), _>(0).unwrap();
             let sql = "SELECT pg_try_advisory_xact_lock($1)";
-            let pg_held: bool = sqlx::query_scalar(AssertSqlSafe(sql))
+            let pg_held: bool = sqlx::query_scalar(sql)
                 .bind(i64::MIN)
                 .fetch_one(&mut observer)
                 .await
                 .unwrap();
-            let fake_held: bool = sqlx::query_scalar(AssertSqlSafe(sql))
+            let fake_held: bool = sqlx::query_scalar(sql)
                 .bind(i64::MIN)
                 .fetch_one(&mut fake_observer)
                 .await
                 .unwrap();
             assert!(!pg_held && !fake_held);
             let sql = "SELECT pg_advisory_xact_lock_shared($1,$2)";
-            sqlx::query_scalar::<_, ()>(AssertSqlSafe(sql))
+            sqlx::query_scalar::<_, ()>(sql)
                 .bind(i32::MIN)
                 .bind(i32::MAX)
                 .fetch_one(&mut *pg_tx)
                 .await
                 .unwrap();
-            sqlx::query_scalar::<_, ()>(AssertSqlSafe(sql))
+            sqlx::query_scalar::<_, ()>(sql)
                 .bind(i32::MIN)
                 .bind(i32::MAX)
                 .fetch_one(&mut *fake_tx)
@@ -461,10 +461,8 @@ fn matches_advisory_wait_resumption_and_mutation_results() {
             let mut fake_holder = PgFakeConnection::new(db.clone());
             runtime
                 .block_on(
-                    sqlx::raw_sql(AssertSqlSafe(
-                        "DROP SCHEMA public CASCADE; CREATE SCHEMA public",
-                    ))
-                    .execute(&mut postgres_holder),
+                    sqlx::raw_sql("DROP SCHEMA public CASCADE; CREATE SCHEMA public")
+                        .execute(&mut postgres_holder),
                 )
                 .unwrap();
             for sql in [
@@ -493,14 +491,11 @@ fn matches_advisory_wait_resumption_and_mutation_results() {
                     .unwrap();
                 let mut postgres_worker = runtime.block_on(PgConnection::connect(&url)).unwrap();
                 runtime
-                    .block_on(
-                        sqlx::raw_sql(AssertSqlSafe("SET lock_timeout='5s'"))
-                            .execute(&mut postgres_worker),
-                    )
+                    .block_on(sqlx::raw_sql("SET lock_timeout='5s'").execute(&mut postgres_worker))
                     .unwrap();
                 let pid: i32 = runtime
                     .block_on(
-                        sqlx::query_scalar(AssertSqlSafe("SELECT pg_backend_pid()"))
+                        sqlx::query_scalar("SELECT pg_backend_pid()")
                             .fetch_one(&mut postgres_worker),
                     )
                     .unwrap();
@@ -535,7 +530,7 @@ fn matches_advisory_wait_resumption_and_mutation_results() {
                     .sequences
                     .iter()
                     .any(|sequence| sequence.is_called);
-                let pg_waiting: bool = runtime.block_on(sqlx::query_scalar(AssertSqlSafe("SELECT EXISTS(SELECT 1 FROM pg_stat_activity WHERE pid=$1 AND wait_event='advisory')")).bind(pid).fetch_one(&mut postgres_holder)).unwrap();
+                let pg_waiting: bool = runtime.block_on(sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM pg_stat_activity WHERE pid=$1 AND wait_event='advisory')").bind(pid).fetch_one(&mut postgres_holder)).unwrap();
                 if fake_started && pg_waiting {
                     break;
                 }

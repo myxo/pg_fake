@@ -1,4 +1,5 @@
 use std::{
+    borrow::Cow,
     fmt,
     future::Future,
     str::FromStr,
@@ -15,7 +16,7 @@ use pg_fake::error::SqlState;
 use pg_fake::value::BaseType;
 use pg_fake::{Db, PreparedStatement as CoreStatement, Session, StatementResult};
 use sqlx::{
-    ColumnIndex, ConnectOptions, Connection, Database, Execute, Executor, SqlStr, Statement,
+    ColumnIndex, ConnectOptions, Connection, Database, Describe, Execute, Executor, Statement,
     database::HasStatementCache,
 };
 use sqlx_core::{connection::LogSettings, transaction::TransactionManager};
@@ -39,9 +40,9 @@ impl Database for PgFake {
     type TypeInfo = PgFakeTypeInfo;
     type Value = PgFakeValue;
     type ValueRef<'r> = crate::PgFakeValueRef<'r>;
-    type Arguments = PgFakeArguments;
-    type ArgumentBuffer = Vec<pg_fake::value::Value>;
-    type Statement = PgFakeStatement;
+    type Arguments<'q> = PgFakeArguments;
+    type ArgumentBuffer<'q> = Vec<pg_fake::value::Value>;
+    type Statement<'q> = PgFakeStatement<'q>;
 
     const NAME: &'static str = "pg_fake";
     const URL_SCHEMES: &'static [&'static str] = &["pg-fake"];
@@ -132,10 +133,10 @@ impl ConnectOptions for PgFakeConnectOptions {
         Url::parse("pg-fake://localhost").expect("constant pg-fake URL must parse")
     }
 
-    fn connect(&self) -> impl Future<Output = Result<PgFakeConnection, sqlx::Error>> + Send + '_ {
+    fn connect(&self) -> BoxFuture<'_, Result<PgFakeConnection, sqlx::Error>> {
         let connection =
             PgFakeConnection::create(self.db.clone(), self.statement_cache_limit_bytes);
-        async move { Ok(connection) }
+        Box::pin(async move { Ok(connection) })
     }
 
     fn log_statements(mut self, level: LevelFilter) -> Self {
@@ -223,7 +224,7 @@ impl PgFakeConnection {
         &mut self,
         sql: String,
         arguments: Option<PgFakeArguments>,
-        statement: Option<PgFakeStatement>,
+        statement: Option<PgFakeStatement<'static>>,
         persistent: bool,
     ) -> impl Future<Output = Result<Vec<Either<PgFakeQueryResult, PgFakeRow>>, sqlx::Error>>
     + Send
@@ -369,21 +370,21 @@ impl Connection for PgFakeConnection {
     type Database = PgFake;
     type Options = PgFakeConnectOptions;
 
-    async fn close(self) -> Result<(), sqlx::Error> {
-        Ok(())
+    fn close(self) -> BoxFuture<'static, Result<(), sqlx::Error>> {
+        Box::pin(async { Ok(()) })
     }
 
-    async fn close_hard(self) -> Result<(), sqlx::Error> {
-        Ok(())
+    fn close_hard(self) -> BoxFuture<'static, Result<(), sqlx::Error>> {
+        Box::pin(async { Ok(()) })
     }
 
-    fn ping(&mut self) -> impl Future<Output = Result<(), sqlx::Error>> + Send + '_ {
+    fn ping(&mut self) -> BoxFuture<'_, Result<(), sqlx::Error>> {
         // Since rust don't have async Drop, we need to do rollback somewhere. This is the place.
         // In `PgFakeTransactionManager::start_rollback` we set pending_rollback to true
         // and make actual rollback next time runtime call this function
         let rollback = self.take_pending_rollback();
         let state = self.state.clone();
-        async move {
+        Box::pin(async move {
             if rollback {
                 tokio::task::spawn_blocking(move || {
                     state
@@ -398,12 +399,10 @@ impl Connection for PgFakeConnection {
                 .map_err(|error| sqlx::Error::Protocol(error.to_string()))??;
             }
             Ok(())
-        }
+        })
     }
 
-    fn begin(
-        &mut self,
-    ) -> impl Future<Output = Result<sqlx::Transaction<'_, PgFake>, sqlx::Error>> + Send + '_ {
+    fn begin(&mut self) -> BoxFuture<'_, Result<sqlx::Transaction<'_, PgFake>, sqlx::Error>> {
         sqlx::Transaction::begin(self, None)
     }
 
@@ -415,19 +414,17 @@ impl Connection for PgFakeConnection {
             .len()
     }
 
-    fn clear_cached_statements(
-        &mut self,
-    ) -> impl Future<Output = Result<(), sqlx::Error>> + Send + '_ {
+    fn clear_cached_statements(&mut self) -> BoxFuture<'_, Result<(), sqlx::Error>> {
         let mut state = self.state.lock().expect("connection mutex is poisoned");
         state.statements.clear();
         state.statement_cache_bytes = 0;
-        async { Ok(()) }
+        Box::pin(async { Ok(()) })
     }
 
     fn shrink_buffers(&mut self) {}
 
-    async fn flush(&mut self) -> Result<(), sqlx::Error> {
-        Ok(())
+    fn flush(&mut self) -> BoxFuture<'_, Result<(), sqlx::Error>> {
+        Box::pin(async { Ok(()) })
     }
 
     fn should_flush(&self) -> bool {
@@ -446,13 +443,13 @@ impl<'c> Executor<'c> for &'c mut PgFakeConnection {
         'c: 'e,
         E: 'q + Execute<'q, PgFake>,
     {
-        let statement = query.statement().cloned();
+        let statement = query.statement().map(Statement::to_owned);
         let arguments = match query.take_arguments() {
             Ok(arguments) => arguments,
             Err(error) => return Box::pin(stream::once(async { Err(sqlx::Error::Encode(error)) })),
         };
         let persistent = query.persistent();
-        let sql = query.sql().as_str().to_owned();
+        let sql = query.sql().to_owned();
         Box::pin(
             stream::once(self.run(sql, arguments, statement, persistent))
                 .map_ok(|items| stream::iter(items.into_iter().map(Ok)))
@@ -468,13 +465,13 @@ impl<'c> Executor<'c> for &'c mut PgFakeConnection {
         'c: 'e,
         E: 'q + Execute<'q, PgFake>,
     {
-        let statement = query.statement().cloned();
+        let statement = query.statement().map(Statement::to_owned);
         let arguments = match query.take_arguments() {
             Ok(arguments) => arguments,
             Err(error) => return Box::pin(async { Err(sqlx::Error::Encode(error)) }),
         };
         let persistent = query.persistent();
-        let sql = query.sql().as_str().to_owned();
+        let sql = query.sql().to_owned();
         Box::pin(async move {
             Ok(self
                 .run(sql, arguments, statement, persistent)
@@ -484,17 +481,17 @@ impl<'c> Executor<'c> for &'c mut PgFakeConnection {
         })
     }
 
-    fn prepare_with<'e>(
+    fn prepare_with<'e, 'q: 'e>(
         self,
-        sql: SqlStr,
+        sql: &'q str,
         parameters: &'e [PgFakeTypeInfo],
-    ) -> BoxFuture<'e, Result<PgFakeStatement, sqlx::Error>>
+    ) -> BoxFuture<'e, Result<PgFakeStatement<'q>, sqlx::Error>>
     where
         'c: 'e,
     {
         let state = self.state.clone();
         let rollback_first = self.take_pending_rollback();
-        let query = sql.as_str().to_owned();
+        let query = sql.to_owned();
         let supplied_parameters = parameters.to_vec();
         let parameter_types = supplied_parameters
             .iter()
@@ -536,7 +533,7 @@ impl<'c> Executor<'c> for &'c mut PgFakeConnection {
                 .await
                 .map_err(|error| sqlx::Error::Protocol(error.to_string()))??;
             Ok(PgFakeStatement {
-                sql,
+                sql: Cow::Borrowed(sql),
                 statement,
                 parameters: if supplied_parameters.is_empty() {
                     inferred_parameters
@@ -547,6 +544,23 @@ impl<'c> Executor<'c> for &'c mut PgFakeConnection {
             })
         })
     }
+
+    fn describe<'e, 'q: 'e>(
+        self,
+        sql: &'q str,
+    ) -> BoxFuture<'e, Result<Describe<PgFake>, sqlx::Error>>
+    where
+        'c: 'e,
+    {
+        Box::pin(async move {
+            let statement = self.prepare_with(sql, &[]).await?;
+            Ok(Describe {
+                nullable: vec![None; statement.columns.len()],
+                parameters: Some(Either::Left(statement.parameters.clone())),
+                columns: statement.columns.clone(),
+            })
+        })
+    }
 }
 
 pub struct PgFakeTransactionManager;
@@ -554,42 +568,42 @@ pub struct PgFakeTransactionManager;
 impl TransactionManager for PgFakeTransactionManager {
     type Database = PgFake;
 
-    async fn begin(
-        connection: &mut PgFakeConnection,
-        statement: Option<SqlStr>,
-    ) -> Result<(), sqlx::Error> {
-        if connection.transaction_depth != 0 {
-            return Err(sqlx::Error::InvalidSavePointStatement);
-        }
-        connection
-            .run_control(
-                statement
-                    .as_ref()
-                    .map(SqlStr::as_str)
-                    .unwrap_or("BEGIN")
-                    .to_owned(),
-            )
-            .await?;
-        connection.transaction_depth = 1;
-        Ok(())
+    fn begin<'conn>(
+        connection: &'conn mut PgFakeConnection,
+        statement: Option<Cow<'static, str>>,
+    ) -> BoxFuture<'conn, Result<(), sqlx::Error>> {
+        Box::pin(async move {
+            if connection.transaction_depth != 0 {
+                return Err(sqlx::Error::InvalidSavePointStatement);
+            }
+            connection
+                .run_control(statement.as_deref().unwrap_or("BEGIN").to_owned())
+                .await?;
+            connection.transaction_depth = 1;
+            Ok(())
+        })
     }
 
-    async fn commit(connection: &mut PgFakeConnection) -> Result<(), sqlx::Error> {
-        if connection.transaction_depth == 0 {
-            return Err(sqlx::Error::Protocol("no transaction to commit".into()));
-        }
-        connection.run_control("COMMIT".into()).await?;
-        connection.transaction_depth = 0;
-        Ok(())
+    fn commit(connection: &mut PgFakeConnection) -> BoxFuture<'_, Result<(), sqlx::Error>> {
+        Box::pin(async move {
+            if connection.transaction_depth == 0 {
+                return Err(sqlx::Error::Protocol("no transaction to commit".into()));
+            }
+            connection.run_control("COMMIT".into()).await?;
+            connection.transaction_depth = 0;
+            Ok(())
+        })
     }
 
-    async fn rollback(connection: &mut PgFakeConnection) -> Result<(), sqlx::Error> {
-        if connection.transaction_depth == 0 {
-            return Err(sqlx::Error::Protocol("no transaction to roll back".into()));
-        }
-        connection.run_control("ROLLBACK".into()).await?;
-        connection.transaction_depth = 0;
-        Ok(())
+    fn rollback(connection: &mut PgFakeConnection) -> BoxFuture<'_, Result<(), sqlx::Error>> {
+        Box::pin(async move {
+            if connection.transaction_depth == 0 {
+                return Err(sqlx::Error::Protocol("no transaction to roll back".into()));
+            }
+            connection.run_control("ROLLBACK".into()).await?;
+            connection.transaction_depth = 0;
+            Ok(())
+        })
     }
 
     fn start_rollback(connection: &mut PgFakeConnection) {
@@ -605,21 +619,26 @@ impl TransactionManager for PgFakeTransactionManager {
 }
 
 #[derive(Debug, Clone)]
-pub struct PgFakeStatement {
-    sql: SqlStr,
+pub struct PgFakeStatement<'q> {
+    sql: Cow<'q, str>,
     statement: CoreStatement,
     parameters: Vec<PgFakeTypeInfo>,
     columns: Vec<PgFakeColumn>,
 }
 
-impl Statement for PgFakeStatement {
+impl<'q> Statement<'q> for PgFakeStatement<'q> {
     type Database = PgFake;
 
-    fn into_sql(self) -> SqlStr {
-        self.sql
+    fn to_owned(&self) -> PgFakeStatement<'static> {
+        PgFakeStatement {
+            sql: Cow::Owned(self.sql.clone().into_owned()),
+            statement: self.statement.clone(),
+            parameters: self.parameters.clone(),
+            columns: self.columns.clone(),
+        }
     }
 
-    fn sql(&self) -> &SqlStr {
+    fn sql(&self) -> &str {
         &self.sql
     }
 
@@ -636,8 +655,8 @@ impl Statement for PgFakeStatement {
 
 sqlx_core::impl_column_index_for_statement!(PgFakeStatement);
 
-impl ColumnIndex<PgFakeStatement> for str {
-    fn index(&self, statement: &PgFakeStatement) -> Result<usize, sqlx::Error> {
+impl ColumnIndex<PgFakeStatement<'_>> for str {
+    fn index(&self, statement: &PgFakeStatement<'_>) -> Result<usize, sqlx::Error> {
         statement
             .columns
             .iter()

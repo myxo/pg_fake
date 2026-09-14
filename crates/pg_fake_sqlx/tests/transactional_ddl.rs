@@ -1,5 +1,5 @@
 use pg_fake_sqlx::{Db, PgFakeConnection};
-use sqlx::{AssertSqlSafe, Connection, Row};
+use sqlx::{Connection, Row};
 use sqlx_postgres::PgConnection;
 
 mod common;
@@ -17,12 +17,12 @@ async fn assert_execution_matches(
     fake: &mut PgFakeConnection,
     sql: &str,
 ) {
-    let expected = sqlx::raw_sql(AssertSqlSafe(sql))
+    let expected = sqlx::raw_sql(sql)
         .execute(&mut *postgres)
         .await
         .map(|_| ())
         .map_err(get_sqlstate);
-    let actual = sqlx::raw_sql(AssertSqlSafe(sql))
+    let actual = sqlx::raw_sql(sql)
         .execute(&mut *fake)
         .await
         .map(|_| ())
@@ -31,7 +31,7 @@ async fn assert_execution_matches(
 }
 
 async fn get_i64_postgres(connection: &mut PgConnection, sql: &str) -> i64 {
-    sqlx::raw_sql(AssertSqlSafe(sql))
+    sqlx::raw_sql(sql)
         .fetch_one(connection)
         .await
         .unwrap()
@@ -40,7 +40,7 @@ async fn get_i64_postgres(connection: &mut PgConnection, sql: &str) -> i64 {
 }
 
 async fn get_i64_fake(connection: &mut PgFakeConnection, sql: &str) -> i64 {
-    sqlx::raw_sql(AssertSqlSafe(sql))
+    sqlx::raw_sql(sql)
         .fetch_one(connection)
         .await
         .unwrap()
@@ -49,7 +49,7 @@ async fn get_i64_fake(connection: &mut PgFakeConnection, sql: &str) -> i64 {
 }
 
 async fn get_text_postgres(connection: &mut PgConnection, sql: &str) -> String {
-    sqlx::raw_sql(AssertSqlSafe(sql))
+    sqlx::raw_sql(sql)
         .fetch_one(connection)
         .await
         .unwrap()
@@ -58,7 +58,7 @@ async fn get_text_postgres(connection: &mut PgConnection, sql: &str) -> String {
 }
 
 async fn get_text_fake(connection: &mut PgFakeConnection, sql: &str) -> String {
-    sqlx::raw_sql(AssertSqlSafe(sql))
+    sqlx::raw_sql(sql)
         .fetch_one(connection)
         .await
         .unwrap()
@@ -130,7 +130,7 @@ fn explicit_table_and_sequence_ddl_matches_postgres() {
         let table = format!("pg_fake_transactional_ddl_{}", std::process::id());
         let sequence = format!("{table}_id_seq");
         let cleanup = format!("DROP TABLE IF EXISTS {table}");
-        sqlx::raw_sql(AssertSqlSafe(cleanup.as_str()))
+        sqlx::raw_sql(cleanup.as_str())
             .execute(&mut postgres)
             .await
             .unwrap();
@@ -165,7 +165,7 @@ fn explicit_table_and_sequence_ddl_matches_postgres() {
             get_i64_postgres(&mut postgres, &first).await
         );
 
-        sqlx::raw_sql(AssertSqlSafe(cleanup.as_str()))
+        sqlx::raw_sql(cleanup.as_str())
             .execute(&mut postgres)
             .await
             .unwrap();
@@ -187,7 +187,7 @@ fn repeatable_read_ddl_conflicts_match_postgres() {
         let mut fake_writer = PgFakeConnection::new(db);
         let table = format!("pg_fake_repeatable_ddl_{}", std::process::id());
         let cleanup = format!("DROP TABLE IF EXISTS {table}");
-        sqlx::raw_sql(AssertSqlSafe(cleanup.as_str()))
+        sqlx::raw_sql(cleanup.as_str())
             .execute(&mut postgres)
             .await
             .unwrap();
@@ -229,7 +229,7 @@ fn repeatable_read_ddl_conflicts_match_postgres() {
         assert_execution_matches(&mut postgres, &mut fake, &format!("DROP TABLE {table}")).await;
         assert_execution_matches(&mut postgres, &mut fake, "ROLLBACK").await;
 
-        sqlx::raw_sql(AssertSqlSafe(cleanup.as_str()))
+        sqlx::raw_sql(cleanup.as_str())
             .execute(&mut postgres)
             .await
             .unwrap();
@@ -251,7 +251,7 @@ fn qualified_and_temporary_relations_match_postgres() {
         let mut fake_second = PgFakeConnection::new(db);
         let table = format!("pg_fake_temp_{}", std::process::id());
         let cleanup = format!("DROP TABLE IF EXISTS public.{table}");
-        sqlx::raw_sql(AssertSqlSafe(cleanup.as_str()))
+        sqlx::raw_sql(cleanup.as_str())
             .execute(&mut postgres_first)
             .await
             .unwrap();
@@ -394,7 +394,7 @@ fn qualified_and_temporary_relations_match_postgres() {
             "DROP TABLE IF EXISTS public.{table}, public.{serial_table}, \
              public.{permanent_parent}, public.{default_table}, public.\"{quoted_table}\""
         );
-        sqlx::raw_sql(AssertSqlSafe(cleanup.as_str()))
+        sqlx::raw_sql(cleanup.as_str())
             .execute(&mut postgres_first)
             .await
             .unwrap();
@@ -405,14 +405,14 @@ fn qualified_and_temporary_relations_match_postgres() {
 async fn closing_a_connection_aborts_open_ddl() {
     let db = Db::create();
     let mut abandoned = PgFakeConnection::new(db.clone());
-    sqlx::raw_sql(AssertSqlSafe("BEGIN; CREATE TABLE abandoned (id INTEGER)"))
+    sqlx::raw_sql("BEGIN; CREATE TABLE abandoned (id INTEGER)")
         .execute(&mut abandoned)
         .await
         .unwrap();
     abandoned.close().await.unwrap();
 
     let mut successor = PgFakeConnection::new(db);
-    sqlx::raw_sql(AssertSqlSafe("CREATE TABLE abandoned (id INTEGER)"))
+    sqlx::raw_sql("CREATE TABLE abandoned (id INTEGER)")
         .execute(&mut successor)
         .await
         .unwrap();
@@ -451,7 +451,7 @@ fn ordinary_views_match_postgres_through_sqlx() {
         }
 
         let prepared = format!("SELECT name FROM public.{view} WHERE key > $1 ORDER BY key");
-        let expected = sqlx::query(AssertSqlSafe(prepared.as_str()))
+        let expected = sqlx::query(prepared.as_str())
             .bind(1_i32)
             .fetch_all(&mut postgres)
             .await
@@ -459,7 +459,7 @@ fn ordinary_views_match_postgres_through_sqlx() {
             .into_iter()
             .map(|row| row.get::<String, _>(0))
             .collect::<Vec<_>>();
-        let actual = sqlx::query(AssertSqlSafe(prepared.as_str()))
+        let actual = sqlx::query(prepared.as_str())
             .bind(1_i32)
             .fetch_all(&mut fake)
             .await
@@ -470,14 +470,14 @@ fn ordinary_views_match_postgres_through_sqlx() {
         assert_eq!(actual, expected);
 
         let aggregate = format!("SELECT bucket, total FROM public.{nested} ORDER BY bucket");
-        let expected = sqlx::raw_sql(AssertSqlSafe(aggregate.as_str()))
+        let expected = sqlx::raw_sql(aggregate.as_str())
             .fetch_all(&mut postgres)
             .await
             .unwrap()
             .into_iter()
             .map(|row| (row.get::<i32, _>(0), row.get::<i64, _>(1)))
             .collect::<Vec<_>>();
-        let actual = sqlx::raw_sql(AssertSqlSafe(aggregate.as_str()))
+        let actual = sqlx::raw_sql(aggregate.as_str())
             .fetch_all(&mut fake)
             .await
             .unwrap()
@@ -545,11 +545,11 @@ fn view_catalog_edge_cases_match_postgres() {
             assert_execution_matches(&mut postgres, &mut fake, &sql).await;
         }
         let select = format!("SELECT * FROM {view}");
-        let expected = sqlx::raw_sql(AssertSqlSafe(select.as_str()))
+        let expected = sqlx::raw_sql(select.as_str())
             .fetch_one(&mut postgres)
             .await
             .unwrap();
-        let actual = sqlx::raw_sql(AssertSqlSafe(select.as_str()))
+        let actual = sqlx::raw_sql(select.as_str())
             .fetch_one(&mut fake)
             .await
             .unwrap();
@@ -567,12 +567,12 @@ fn view_catalog_edge_cases_match_postgres() {
         }
 
         let prepared_sql = format!("SELECT a FROM {view}");
-        let expected = sqlx::query(AssertSqlSafe(prepared_sql.as_str()))
+        let expected = sqlx::query(prepared_sql.as_str())
             .fetch_one(&mut postgres)
             .await
             .unwrap()
             .get::<i32, _>(0);
-        let actual = sqlx::query(AssertSqlSafe(prepared_sql.as_str()))
+        let actual = sqlx::query(prepared_sql.as_str())
             .fetch_one(&mut fake)
             .await
             .unwrap()
@@ -580,12 +580,12 @@ fn view_catalog_edge_cases_match_postgres() {
         assert_eq!(actual, expected);
         let comment = format!("COMMENT ON VIEW {view} IS 'documentation only'");
         assert_execution_matches(&mut postgres, &mut fake, &comment).await;
-        let expected = sqlx::query(AssertSqlSafe(prepared_sql.as_str()))
+        let expected = sqlx::query(prepared_sql.as_str())
             .fetch_one(&mut postgres)
             .await
             .unwrap()
             .get::<i32, _>(0);
-        let actual = sqlx::query(AssertSqlSafe(prepared_sql.as_str()))
+        let actual = sqlx::query(prepared_sql.as_str())
             .fetch_one(&mut fake)
             .await
             .unwrap()
@@ -598,38 +598,37 @@ fn view_catalog_edge_cases_match_postgres() {
 async fn migration_view_and_trigger_renames_execute_through_sqlx() {
     let db = Db::create();
     let mut connection = PgFakeConnection::new(db.clone());
-    sqlx::raw_sql(AssertSqlSafe(
+    sqlx::raw_sql(
         "CREATE TABLE migration_source (id INTEGER); \
          CREATE FUNCTION migration_audit() RETURNS TRIGGER AS $$ \
          BEGIN RETURN NEW; END; $$ LANGUAGE plpgsql; \
          CREATE TRIGGER migration_audit BEFORE INSERT ON migration_source \
          FOR EACH ROW EXECUTE FUNCTION migration_audit()",
-    ))
+    )
     .execute(&mut connection)
     .await
     .unwrap();
-    sqlx::raw_sql(AssertSqlSafe(
+    sqlx::raw_sql(
         "BEGIN; \
          CREATE VIEW migration_view AS SELECT id FROM migration_source; \
          COMMENT ON VIEW migration_view IS 'read compatibility'; \
          DROP VIEW IF EXISTS migration_view; \
          ALTER TRIGGER migration_audit ON migration_source RENAME TO migration_audit_v2; \
          COMMIT",
-    ))
+    )
     .execute(&mut connection)
     .await
     .unwrap();
 
-    let error = sqlx::raw_sql(AssertSqlSafe(
-        "ALTER TRIGGER migration_audit ON migration_source RENAME TO ignored",
-    ))
-    .execute(&mut connection)
-    .await
-    .unwrap_err();
+    let error =
+        sqlx::raw_sql("ALTER TRIGGER migration_audit ON migration_source RENAME TO ignored")
+            .execute(&mut connection)
+            .await
+            .unwrap_err();
     assert_eq!(get_sqlstate(error), "42704");
-    sqlx::raw_sql(AssertSqlSafe(
+    sqlx::raw_sql(
         "ALTER TRIGGER migration_audit_v2 ON migration_source RENAME TO migration_audit_v3",
-    ))
+    )
     .execute(&mut connection)
     .await
     .unwrap();

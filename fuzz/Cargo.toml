@@ -17,8 +17,8 @@ dotenvy = "0.15"
 libfuzzer-sys = { package = "chaos_theory_libfuzzer", version = "0.4.13" }
 pg_fake = { path = "../crates/pg_fake" }
 pg_fake_sqlx = { path = "../crates/pg_fake_sqlx" }
-sqlx = { version = "0.9", default-features = false, features = ["bigdecimal", "runtime-tokio"] }
-sqlx-postgres = "0.9"
+sqlx = { version = "0.8.6", default-features = false, features = ["bigdecimal", "runtime-tokio"] }
+sqlx-postgres = "0.8.6"
 tokio = { version = "1", features = ["rt", "sync", "time"] }
 
 [[bin]]
@@ -30,3 +30,6 @@ bench = false
 
 [workspace]
 members = ["."]
+
+[patch.crates-io]
+sqlparser = { git = "https://github.com/myxo/datafusion-sqlparser-rs", rev = "1bcc091c6b9a49df73e2ed9348f85471a33a985e" }

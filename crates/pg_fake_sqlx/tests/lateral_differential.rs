@@ -1,5 +1,5 @@
 use pg_fake_sqlx::{Db, PgFakeConnection};
-use sqlx::{Column, Connection, Executor, Row, SqlStr, Statement, TypeInfo};
+use sqlx::{Column, Connection, Executor, Row, Statement, TypeInfo};
 use sqlx_postgres::PgConnection;
 
 mod common;
@@ -89,11 +89,9 @@ fn matches_lateral_prepared_parameters() {
         "SELECT x.v FROM (VALUES (1)) p(id) CROSS JOIN LATERAL (WITH y AS (SELECT p.id AS v) SELECT v FROM y) x",
         "SELECT p.id, x.v FROM (VALUES (1), (2)) p(id) CROSS JOIN LATERAL (WITH y AS (SELECT p.id AS v) SELECT z.v FROM (WITH y AS (SELECT v + 10 AS v FROM y) SELECT v FROM y) z) x ORDER BY p.id",
     ] {
-        let expected = runtime
-            .block_on(postgres.prepare(SqlStr::from_static(sql)))
-            .unwrap();
+        let expected = runtime.block_on(postgres.prepare(sql)).unwrap();
         let actual = runtime
-            .block_on(fake.prepare(SqlStr::from_static(sql)))
+            .block_on(fake.prepare(sql))
             .unwrap_or_else(|e| panic!("{sql}: {e}"));
         assert_eq!(
             actual

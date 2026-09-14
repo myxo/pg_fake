@@ -9,7 +9,7 @@ use criterion::{BenchmarkId, Criterion, Throughput, black_box, criterion_group, 
 use pg_fake::{IsolationLevel, Session, value::Value};
 use pg_fake_benchmarks as benchmarks;
 use pg_fake_sqlx::{Db, PgFakeConnection};
-use sqlx::{AssertSqlSafe, Connection, SqlSafeStr};
+use sqlx::Connection;
 use sqlx_core::migrate::{Migration, MigrationType, Migrator};
 use sqlx_postgres::PgConnection;
 use testcontainers::{Container, ImageExt, runners::SyncRunner};
@@ -28,13 +28,13 @@ impl BenchmarkConnection<'_> {
         match self {
             Self::PgFake(connection) => {
                 let result = runtime
-                    .block_on(sqlx::query(AssertSqlSafe(sql)).execute(&mut **connection))
+                    .block_on(sqlx::query(sql).execute(&mut **connection))
                     .unwrap();
                 black_box(result);
             }
             Self::Postgres(connection) => {
                 let result = runtime
-                    .block_on(sqlx::query(AssertSqlSafe(sql)).execute(&mut **connection))
+                    .block_on(sqlx::query(sql).execute(&mut **connection))
                     .unwrap();
                 black_box(result);
             }
@@ -62,13 +62,13 @@ impl BenchmarkConnection<'_> {
         match self {
             Self::PgFake(connection) => {
                 let rows = runtime
-                    .block_on(sqlx::query(AssertSqlSafe(sql)).fetch_all(&mut **connection))
+                    .block_on(sqlx::query(sql).fetch_all(&mut **connection))
                     .unwrap();
                 black_box(rows);
             }
             Self::Postgres(connection) => {
                 let rows = runtime
-                    .block_on(sqlx::query(AssertSqlSafe(sql)).fetch_all(&mut **connection))
+                    .block_on(sqlx::query(sql).fetch_all(&mut **connection))
                     .unwrap();
                 black_box(rows);
             }
@@ -80,10 +80,7 @@ impl BenchmarkConnection<'_> {
             Self::PgFake(connection) => {
                 let result = runtime.block_on(async {
                     let mut transaction = connection.begin().await.unwrap();
-                    let result = sqlx::query(AssertSqlSafe(sql))
-                        .execute(&mut *transaction)
-                        .await
-                        .unwrap();
+                    let result = sqlx::query(sql).execute(&mut *transaction).await.unwrap();
                     transaction.commit().await.unwrap();
                     result
                 });
@@ -92,10 +89,7 @@ impl BenchmarkConnection<'_> {
             Self::Postgres(connection) => {
                 let result = runtime.block_on(async {
                     let mut transaction = connection.begin().await.unwrap();
-                    let result = sqlx::query(AssertSqlSafe(sql))
-                        .execute(&mut *transaction)
-                        .await
-                        .unwrap();
+                    let result = sqlx::query(sql).execute(&mut *transaction).await.unwrap();
                     transaction.commit().await.unwrap();
                     result
                 });
@@ -107,20 +101,14 @@ impl BenchmarkConnection<'_> {
     fn fetch_in_transaction(&mut self, runtime: &Runtime, begin: &str, sql: &str) {
         match self {
             Self::PgFake(connection) => runtime.block_on(async {
-                let mut transaction = connection.begin_with(AssertSqlSafe(begin)).await.unwrap();
-                let rows = sqlx::query(AssertSqlSafe(sql))
-                    .fetch_all(&mut *transaction)
-                    .await
-                    .unwrap();
+                let mut transaction = connection.begin_with(begin.to_owned()).await.unwrap();
+                let rows = sqlx::query(sql).fetch_all(&mut *transaction).await.unwrap();
                 transaction.commit().await.unwrap();
                 black_box(rows);
             }),
             Self::Postgres(connection) => runtime.block_on(async {
-                let mut transaction = connection.begin_with(AssertSqlSafe(begin)).await.unwrap();
-                let rows = sqlx::query(AssertSqlSafe(sql))
-                    .fetch_all(&mut *transaction)
-                    .await
-                    .unwrap();
+                let mut transaction = connection.begin_with(begin.to_owned()).await.unwrap();
+                let rows = sqlx::query(sql).fetch_all(&mut *transaction).await.unwrap();
                 transaction.commit().await.unwrap();
                 black_box(rows);
             }),
@@ -130,14 +118,14 @@ impl BenchmarkConnection<'_> {
 
 fn fake_execute(runtime: &Runtime, connection: &mut PgFakeConnection, sql: &str) {
     let result = runtime
-        .block_on(sqlx::query(AssertSqlSafe(sql)).execute(connection))
+        .block_on(sqlx::query(sql).execute(connection))
         .unwrap();
     black_box(result);
 }
 
 fn fake_query(runtime: &Runtime, connection: &mut PgFakeConnection, sql: &str) {
     let rows = runtime
-        .block_on(sqlx::query(AssertSqlSafe(sql)).fetch_all(connection))
+        .block_on(sqlx::query(sql).fetch_all(connection))
         .unwrap();
     black_box(rows);
 }
@@ -201,7 +189,7 @@ fn postgres_benchmark(runtime: &Runtime) -> PostgresBenchmark {
         "SET search_path TO pgfake_benchmark",
     ] {
         runtime
-            .block_on(sqlx::query(AssertSqlSafe(sql)).execute(&mut connection))
+            .block_on(sqlx::query(sql).execute(&mut connection))
             .unwrap();
     }
     PostgresBenchmark {
@@ -315,38 +303,41 @@ fn benchmark_sqlx_migration_chain(
         CREATE VIEW migration_chain_view AS \
             SELECT id, number FROM migration_chain_entries WHERE number IS NOT NULL; \
         COMMENT ON VIEW migration_chain_view IS 'migration benchmark'";
-    let migrator = Migrator::with_migrations(vec![
-        Migration::new(
-            1,
-            Cow::Borrowed("create migration benchmark schema"),
-            MigrationType::ReversibleUp,
-            first_up.into_sql_str(),
-            false,
-        ),
-        Migration::new(
-            1,
-            Cow::Borrowed("create migration benchmark schema"),
-            MigrationType::ReversibleDown,
-            "DROP TABLE migration_chain_entries, migration_chain_accounts; \
+    let migrator = Migrator {
+        migrations: Cow::Owned(vec![
+            Migration::new(
+                1,
+                Cow::Borrowed("create migration benchmark schema"),
+                MigrationType::ReversibleUp,
+                first_up.into(),
+                false,
+            ),
+            Migration::new(
+                1,
+                Cow::Borrowed("create migration benchmark schema"),
+                MigrationType::ReversibleDown,
+                "DROP TABLE migration_chain_entries, migration_chain_accounts; \
              DROP SEQUENCE migration_chain_number_seq"
-                .into_sql_str(),
-            false,
-        ),
-        Migration::new(
-            2,
-            Cow::Borrowed("evolve migration benchmark schema"),
-            MigrationType::ReversibleUp,
-            second_up.into_sql_str(),
-            false,
-        ),
-        Migration::new(
-            2,
-            Cow::Borrowed("evolve migration benchmark schema"),
-            MigrationType::ReversibleDown,
-            "DROP VIEW migration_chain_view".into_sql_str(),
-            false,
-        ),
-    ]);
+                    .into(),
+                false,
+            ),
+            Migration::new(
+                2,
+                Cow::Borrowed("evolve migration benchmark schema"),
+                MigrationType::ReversibleUp,
+                second_up.into(),
+                false,
+            ),
+            Migration::new(
+                2,
+                Cow::Borrowed("evolve migration benchmark schema"),
+                MigrationType::ReversibleDown,
+                "DROP VIEW migration_chain_view".into(),
+                false,
+            ),
+        ]),
+        ..Migrator::DEFAULT
+    };
     let mut group =
         criterion.benchmark_group(benchmarks::find_benchmark("sqlx_migration_chain").name);
     for (name, connection) in connections.iter_mut() {

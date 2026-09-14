@@ -1,5 +1,5 @@
 use pg_fake_sqlx::{Db, PgFakeConnection};
-use sqlx::{Column, Connection, Executor, Row, SqlStr, Statement, TypeInfo};
+use sqlx::{Column, Connection, Executor, Row, Statement, TypeInfo};
 use sqlx_postgres::PgConnection;
 
 mod common;
@@ -160,11 +160,9 @@ fn matches_runtime_prepared_metadata_and_decoding() {
         "SELECT regexp_like($1, $2, $3)",
         "SELECT string_agg($1::text, $2 ORDER BY value) FROM (VALUES (1), (2)) AS input(value)",
     ] {
-        let expected = runtime
-            .block_on(postgres.prepare(SqlStr::from_static(sql)))
-            .unwrap();
+        let expected = runtime.block_on(postgres.prepare(sql)).unwrap();
         let actual = runtime
-            .block_on(fake.prepare(SqlStr::from_static(sql)))
+            .block_on(fake.prepare(sql))
             .unwrap_or_else(|error| panic!("{sql}: {error}"));
         assert_eq!(
             actual
@@ -203,12 +201,8 @@ fn matches_runtime_prepared_metadata_and_decoding() {
         "SELECT $1::integer AS value, $1 ~* '%'",
         "SELECT $1::integer AS value, '2000-01-01'::timestamp AT TIME ZONE $1",
     ] {
-        let expected = runtime
-            .block_on(postgres.prepare(SqlStr::from_static(sql)))
-            .unwrap_err();
-        let actual = runtime
-            .block_on(fake.prepare(SqlStr::from_static(sql)))
-            .unwrap_err();
+        let expected = runtime.block_on(postgres.prepare(sql)).unwrap_err();
+        let actual = runtime.block_on(fake.prepare(sql)).unwrap_err();
         assert_eq!(
             actual.as_database_error().unwrap().code(),
             expected.as_database_error().unwrap().code(),

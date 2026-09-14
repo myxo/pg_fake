@@ -1,4 +1,4 @@
-use std::{borrow::Cow, collections::BTreeMap, str::FromStr};
+use std::{borrow::Cow, collections::BTreeMap, ops::Deref, str::FromStr};
 
 use bigdecimal::BigDecimal;
 use chrono::{DateTime, NaiveDate, Utc};
@@ -9,16 +9,86 @@ use pg_fake::{
 };
 use pg_fake_sqlx::{Db, PgFakeConnection, PgFakeDatabaseError};
 use serde_json::json;
-use sqlx::{
-    AssertSqlSafe, Column, Connection, Executor, Row, SqlSafeStr, Statement as _, TypeInfo,
+use sqlx::{Acquire, Column, Connection, Executor, Row, Statement as _, TypeInfo};
+use sqlx_core::migrate::{
+    Migrate, MigrateError, Migration, MigrationType, Migrator as SqlxMigrator,
 };
-use sqlx_core::migrate::{MigrateError, Migration, MigrationType, Migrator};
 use sqlx_postgres::{PgConnection, PgDatabaseError, types::PgInterval as PostgresInterval};
 use uuid::Uuid;
 
 mod common;
 #[path = "common/differential.rs"]
 mod differential;
+
+struct Migrator {
+    inner: SqlxMigrator,
+}
+
+impl Migrator {
+    fn with_migrations(mut migrations: Vec<Migration>) -> Self {
+        migrations.sort_by_key(|migration| migration.version);
+        Self {
+            inner: SqlxMigrator {
+                migrations: Cow::Owned(migrations),
+                ..SqlxMigrator::DEFAULT
+            },
+        }
+    }
+
+    fn set_ignore_missing(&mut self, ignore_missing: bool) {
+        self.inner.set_ignore_missing(ignore_missing);
+    }
+
+    async fn run<'a, A>(&self, connection: A) -> Result<(), MigrateError>
+    where
+        A: Acquire<'a>,
+        <A::Connection as Deref>::Target: Migrate,
+    {
+        self.inner.run(connection).await
+    }
+
+    async fn run_to<C>(&self, target: i64, connection: &mut C) -> Result<(), MigrateError>
+    where
+        C: Migrate,
+    {
+        self.run_direct(Some(target), connection, false).await
+    }
+
+    async fn run_direct<C>(
+        &self,
+        target: Option<i64>,
+        connection: &mut C,
+        skip: bool,
+    ) -> Result<(), MigrateError>
+    where
+        C: Migrate,
+    {
+        assert!(!skip);
+        let migrations = self
+            .inner
+            .migrations
+            .iter()
+            .filter(|migration| target.is_none_or(|target| migration.version <= target))
+            .cloned()
+            .collect();
+        SqlxMigrator {
+            migrations: Cow::Owned(migrations),
+            ignore_missing: self.inner.ignore_missing,
+            locking: self.inner.locking,
+            no_tx: self.inner.no_tx,
+        }
+        .run_direct(connection)
+        .await
+    }
+
+    async fn undo<'a, A>(&self, connection: A, target: i64) -> Result<(), MigrateError>
+    where
+        A: Acquire<'a>,
+        <A::Connection as Deref>::Target: Migrate,
+    {
+        self.inner.undo(connection, target).await
+    }
+}
 
 use differential::{
     RowOrder, assert_statement, assert_statement_allow_error, fake_statement_outcome,
@@ -126,7 +196,7 @@ fn create_migrator(scenario: &Scenario) -> Migrator {
                 index as i64 + 1,
                 Cow::Borrowed(*description),
                 MigrationType::Simple,
-                (*sql).into_sql_str(),
+                Cow::Borrowed(*sql),
                 false,
             )
         })
@@ -192,9 +262,7 @@ fn diagnose_fake_migration(
     let statements = pg_fake::parser::parse(scenario.migrations[version as usize - 1].1).unwrap();
     for (index, statement) in statements.into_iter().enumerate() {
         let sql = statement.to_string();
-        if let Err(error) =
-            runtime.block_on(sqlx::raw_sql(AssertSqlSafe(sql.as_str())).execute(&mut fake))
-        {
+        if let Err(error) = runtime.block_on(sqlx::raw_sql(sql.as_str()).execute(&mut fake)) {
             return format!("statement {} `{sql}`: {error}", index + 1);
         }
     }
@@ -211,7 +279,7 @@ async fn diagnose_fake_migration_on_connection_async(
     let statements = pg_fake::parser::parse(sql).unwrap();
     for (index, statement) in statements.into_iter().enumerate() {
         let statement_sql = statement.to_string();
-        if let Err(error) = sqlx::raw_sql(AssertSqlSafe(statement_sql.as_str()))
+        if let Err(error) = sqlx::raw_sql(statement_sql.as_str())
             .execute(&mut *connection)
             .await
         {
@@ -267,12 +335,8 @@ fn assert_query_metadata(
         .block_on(postgres.clear_cached_statements())
         .unwrap();
     runtime.block_on(fake.clear_cached_statements()).unwrap();
-    let expected = runtime
-        .block_on(postgres.prepare(AssertSqlSafe(sql).into_sql_str()))
-        .unwrap();
-    let actual = runtime
-        .block_on(fake.prepare(AssertSqlSafe(sql).into_sql_str()))
-        .unwrap();
+    let expected = runtime.block_on(postgres.prepare(sql)).unwrap();
+    let actual = runtime.block_on(fake.prepare(sql)).unwrap();
     let expected = expected
         .columns()
         .iter()
@@ -583,10 +647,10 @@ fn collect_postgres_catalog(
     for sequence in &mut sequences {
         let row = runtime
             .block_on(
-                sqlx::query(AssertSqlSafe(format!(
+                sqlx::query(&format!(
                     "SELECT last_value, is_called FROM public.{}",
                     sequence.name
-                )))
+                ))
                 .fetch_one(&mut *connection),
             )
             .unwrap();
@@ -1020,7 +1084,7 @@ fn migrated_schema_round_trips_required_typed_parameters_and_results() {
 }
 
 #[test]
-fn sqlx_migrator_reverts_and_skips_versions() {
+fn sqlx_migrator_reverts_versions() {
     let server = start_isolated_postgres_server();
     let runtime = tokio::runtime::Builder::new_current_thread()
         .enable_all()
@@ -1035,21 +1099,14 @@ fn sqlx_migrator_reverts_and_skips_versions() {
             1,
             Cow::Borrowed("reversible marker"),
             MigrationType::ReversibleUp,
-            "CREATE TABLE public.reversible_marker (id INTEGER)".into_sql_str(),
+            "CREATE TABLE public.reversible_marker (id INTEGER)".into(),
             false,
         ),
         Migration::new(
             1,
             Cow::Borrowed("reversible marker"),
             MigrationType::ReversibleDown,
-            "DROP TABLE public.reversible_marker".into_sql_str(),
-            false,
-        ),
-        Migration::new(
-            2,
-            Cow::Borrowed("skipped marker"),
-            MigrationType::Simple,
-            "CREATE TABLE public.skipped_marker (id INTEGER)".into_sql_str(),
+            "DROP TABLE public.reversible_marker".into(),
             false,
         ),
     ]);
@@ -1073,21 +1130,11 @@ fn sqlx_migrator_reverts_and_skips_versions() {
         RowOrder::Ordered,
     );
 
-    runtime
-        .block_on(migrator.skip(&mut postgres, Some(2)))
-        .unwrap();
-    runtime.block_on(migrator.skip(&mut fake, Some(2))).unwrap();
-    for sql in [
-        "SELECT * FROM public.reversible_marker",
-        "SELECT * FROM public.skipped_marker",
-    ] {
-        assert_statement_allow_error(&runtime, &mut postgres, &mut fake, sql, RowOrder::Ordered);
-    }
     assert_migration_metadata(&runtime, &mut postgres, &mut fake);
     let versions: i64 = runtime
         .block_on(sqlx::query_scalar("SELECT count(*) FROM _sqlx_migrations").fetch_one(&mut fake))
         .unwrap();
-    assert_eq!(versions, 2);
+    assert_eq!(versions, 0);
 }
 
 #[test]
@@ -1112,10 +1159,10 @@ fn backfills_non_empty_legacy_schema_prefix() {
                   ('10000000-0000-0000-0000-000000000004', \
                    '00000000-0000-0000-0000-000000000001', 30, 'legacy', true)";
     runtime
-        .block_on(sqlx::raw_sql(AssertSqlSafe(legacy)).execute(&mut postgres))
+        .block_on(sqlx::raw_sql(legacy).execute(&mut postgres))
         .unwrap();
     runtime
-        .block_on(sqlx::raw_sql(AssertSqlSafe(legacy)).execute(&mut fake))
+        .block_on(sqlx::raw_sql(legacy).execute(&mut fake))
         .unwrap();
     runtime
         .block_on(migrator.run_direct(Some(2), &mut postgres, false))
@@ -1228,7 +1275,7 @@ fn rolls_back_failed_sqlx_migration_catalog_and_rows() {
             99,
             Cow::Borrowed("atomic failure"),
             MigrationType::Simple,
-            failure_sql.into_sql_str(),
+            failure_sql.into(),
             false,
         )]);
         failing.set_ignore_missing(true);
@@ -1303,10 +1350,10 @@ fn rejects_legacy_currency_and_reapplies_unchanged_migration() {
                   (15, 'alpha', '{\"amount\":{\"currency\":\"EUR\",\"value\":\"7\"}}', \
                    NULL, NULL, 'pending')";
     runtime
-        .block_on(sqlx::raw_sql(AssertSqlSafe(legacy)).execute(&mut postgres))
+        .block_on(sqlx::raw_sql(legacy).execute(&mut postgres))
         .unwrap();
     runtime
-        .block_on(sqlx::raw_sql(AssertSqlSafe(legacy)).execute(&mut fake))
+        .block_on(sqlx::raw_sql(legacy).execute(&mut fake))
         .unwrap();
     let expected = runtime
         .block_on(migrator.run_direct(Some(2), &mut postgres, false))
@@ -1345,10 +1392,10 @@ fn rejects_legacy_currency_and_reapplies_unchanged_migration() {
                   SET payload = '{\"amount\":{\"currency\":\"USD\",\"value\":\"7\"}}' \
                   WHERE id = 15";
     runtime
-        .block_on(sqlx::raw_sql(AssertSqlSafe(repair)).execute(&mut postgres))
+        .block_on(sqlx::raw_sql(repair).execute(&mut postgres))
         .unwrap();
     runtime
-        .block_on(sqlx::raw_sql(AssertSqlSafe(repair)).execute(&mut fake))
+        .block_on(sqlx::raw_sql(repair).execute(&mut fake))
         .unwrap();
     runtime
         .block_on(migrator.run_direct(Some(2), &mut postgres, false))
@@ -1385,10 +1432,10 @@ fn rejects_invalid_foreign_key_and_reapplies_unchanged_migration() {
         .unwrap();
     let invalid = "UPDATE public.imported_records SET identity_id = 999 WHERE id = 12";
     runtime
-        .block_on(sqlx::raw_sql(AssertSqlSafe(invalid)).execute(&mut postgres))
+        .block_on(sqlx::raw_sql(invalid).execute(&mut postgres))
         .unwrap();
     runtime
-        .block_on(sqlx::raw_sql(AssertSqlSafe(invalid)).execute(&mut fake))
+        .block_on(sqlx::raw_sql(invalid).execute(&mut fake))
         .unwrap();
     let expected = runtime
         .block_on(migrator.run_direct(Some(3), &mut postgres, false))
@@ -1411,10 +1458,10 @@ fn rejects_invalid_foreign_key_and_reapplies_unchanged_migration() {
     );
     let repair = "UPDATE public.imported_records SET identity_id = NULL WHERE id = 12";
     runtime
-        .block_on(sqlx::raw_sql(AssertSqlSafe(repair)).execute(&mut postgres))
+        .block_on(sqlx::raw_sql(repair).execute(&mut postgres))
         .unwrap();
     runtime
-        .block_on(sqlx::raw_sql(AssertSqlSafe(repair)).execute(&mut fake))
+        .block_on(sqlx::raw_sql(repair).execute(&mut fake))
         .unwrap();
     runtime
         .block_on(migrator.run_direct(Some(3), &mut postgres, false))
@@ -1444,10 +1491,10 @@ fn rejects_incompatible_trigger_rows_and_restores_catalog() {
         .unwrap();
     let invalid = "UPDATE public.records SET compatible = false WHERE id = 2";
     runtime
-        .block_on(sqlx::raw_sql(AssertSqlSafe(invalid)).execute(&mut postgres))
+        .block_on(sqlx::raw_sql(invalid).execute(&mut postgres))
         .unwrap();
     runtime
-        .block_on(sqlx::raw_sql(AssertSqlSafe(invalid)).execute(&mut fake))
+        .block_on(sqlx::raw_sql(invalid).execute(&mut fake))
         .unwrap();
     let expected = runtime
         .block_on(migrator.run_direct(Some(3), &mut postgres, false))
@@ -1470,10 +1517,10 @@ fn rejects_incompatible_trigger_rows_and_restores_catalog() {
     );
     let repair = "UPDATE public.records SET compatible = true WHERE id = 2";
     runtime
-        .block_on(sqlx::raw_sql(AssertSqlSafe(repair)).execute(&mut postgres))
+        .block_on(sqlx::raw_sql(repair).execute(&mut postgres))
         .unwrap();
     runtime
-        .block_on(sqlx::raw_sql(AssertSqlSafe(repair)).execute(&mut fake))
+        .block_on(sqlx::raw_sql(repair).execute(&mut fake))
         .unwrap();
     runtime
         .block_on(migrator.run_direct(Some(3), &mut postgres, false))

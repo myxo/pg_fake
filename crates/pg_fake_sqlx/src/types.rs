@@ -93,7 +93,7 @@ pub struct PgFakeArguments {
     pub(crate) types: Vec<PgFakeTypeInfo>,
 }
 
-impl Arguments for PgFakeArguments {
+impl<'q> Arguments<'q> for PgFakeArguments {
     type Database = PgFake;
 
     fn reserve(&mut self, additional: usize, _size: usize) {
@@ -101,9 +101,9 @@ impl Arguments for PgFakeArguments {
         self.types.reserve(additional);
     }
 
-    fn add<'t, T>(&mut self, value: T) -> Result<(), BoxDynError>
+    fn add<T>(&mut self, value: T) -> Result<(), BoxDynError>
     where
-        T: Encode<'t, Self::Database> + Type<Self::Database>,
+        T: 'q + Encode<'q, Self::Database> + Type<Self::Database>,
     {
         let type_info = value.produces().unwrap_or_else(T::type_info);
         let previous_len = self.values.len();

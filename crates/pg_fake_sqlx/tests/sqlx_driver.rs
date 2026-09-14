@@ -3,7 +3,7 @@ use std::{str::FromStr, time::Duration};
 use bigdecimal::BigDecimal;
 use pg_fake::Db;
 use pg_fake_sqlx::{PgFakeConnectOptions, PgFakeConnection, PgFakePoolOptions};
-use sqlx::{AssertSqlSafe, Column, Connection, Executor, Row, SqlStr, Statement, TypeInfo};
+use sqlx::{Column, Connection, Executor, Row, Statement, TypeInfo};
 use sqlx_postgres::PgConnection;
 
 mod common;
@@ -47,10 +47,7 @@ async fn round_trips_jsonb_wrappers_and_metadata() {
         );
     }
     assert_eq!(fake_row.get::<Option<serde_json::Value>, _>(1), None);
-    let described = fake
-        .prepare(SqlStr::from_static("SELECT $1::jsonb AS payload"))
-        .await
-        .unwrap();
+    let described = fake.prepare("SELECT $1::jsonb AS payload").await.unwrap();
     assert_eq!(
         described.columns()[0].type_info().base,
         Some(pg_fake::value::BaseType::Jsonb)
@@ -59,12 +56,12 @@ async fn round_trips_jsonb_wrappers_and_metadata() {
 
     let raw = serde_json::value::RawValue::from_string(r#"{"a":1,"a":1.00}"#.into()).unwrap();
     let postgres_row = sqlx::query("SELECT $1::jsonb AS payload")
-        .bind(&raw)
+        .bind(sqlx::types::Json(&*raw))
         .fetch_one(&mut postgres)
         .await
         .unwrap();
     let fake_row = sqlx::query("SELECT $1::jsonb AS payload")
-        .bind(&raw)
+        .bind(sqlx::types::Json(&*raw))
         .fetch_one(&mut fake)
         .await
         .unwrap();
@@ -107,7 +104,7 @@ async fn round_trips_jsonb_wrappers_and_metadata() {
 
     let typed = fake
         .prepare_with(
-            SqlStr::from_static("SELECT $1 AS payload"),
+            "SELECT $1 AS payload",
             &[pg_fake_sqlx::PgFakeTypeInfo::new(
                 pg_fake::value::BaseType::Jsonb,
             )],
@@ -321,9 +318,7 @@ async fn preserves_json_text_and_metadata_through_sqlx() {
     assert_eq!(row.columns()[0].type_info().name(), "JSON");
 
     let statement = connection
-        .prepare(SqlStr::from_static(
-            "SELECT payload FROM json_values WHERE id = $1",
-        ))
+        .prepare("SELECT payload FROM json_values WHERE id = $1")
         .await
         .unwrap();
     assert_eq!(statement.columns()[0].type_info().name(), "JSON");
@@ -340,10 +335,7 @@ async fn sqlx_prepared_sequence_calls_return_bigints() {
         .execute("CREATE SEQUENCE sqlx_sequence START 7")
         .await
         .unwrap();
-    let statement = connection
-        .prepare(SqlStr::from_static("SELECT nextval($1)"))
-        .await
-        .unwrap();
+    let statement = connection.prepare("SELECT nextval($1)").await.unwrap();
     assert_eq!(
         statement.parameters().unwrap().left().unwrap()[0].name(),
         "TEXT"
@@ -388,7 +380,7 @@ async fn prepared_statements_transactions_and_pools_use_the_sqlx_api() {
 
     let mut connection = pool.acquire().await.unwrap();
     let statement = connection
-        .prepare(SqlStr::from_static("SELECT name FROM users WHERE id = $1"))
+        .prepare("SELECT name FROM users WHERE id = $1")
         .await
         .unwrap();
     let row = statement
@@ -450,9 +442,7 @@ async fn sqlx_fetches_and_executes_returning_mutations() {
     assert_eq!(rows[1].columns()[1].type_info().name(), "VARCHAR");
 
     let statement = connection
-        .prepare(SqlStr::from_static(
-            "UPDATE returning_rows SET label = $1 RETURNING id, label AS updated_label",
-        ))
+        .prepare("UPDATE returning_rows SET label = $1 RETURNING id, label AS updated_label")
         .await
         .unwrap();
     assert_eq!(statement.parameters().unwrap().left().unwrap().len(), 1);
@@ -483,9 +473,9 @@ async fn sqlx_prepares_and_fetches_data_modifying_ctes() {
         .unwrap();
 
     let statement = connection
-        .prepare(SqlStr::from_static(
+        .prepare(
             "WITH inserted AS (INSERT INTO cte_rows VALUES ($1, $2) RETURNING id, label) SELECT id, label FROM inserted",
-        ))
+        )
         .await
         .unwrap();
     assert_eq!(statement.parameters().unwrap().left().unwrap().len(), 2);
@@ -598,10 +588,10 @@ async fn sqlx_error_category_matches_postgres() {
         .await
         .unwrap();
     let mut postgres = PgConnection::connect(&server.url).await.unwrap();
-    sqlx::raw_sql(AssertSqlSafe(
+    sqlx::raw_sql(
         "CREATE TEMP TABLE pg_fake_sqlx_unique_values (id integer UNIQUE);
          INSERT INTO pg_fake_sqlx_unique_values VALUES (1)",
-    ))
+    )
     .execute(&mut postgres)
     .await
     .unwrap();

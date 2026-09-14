@@ -5,9 +5,7 @@ use pg_fake::parser::{self, Statement};
 use pg_fake_sqlx::{PgFake, PgFakeConnection};
 #[cfg(test)]
 use sqlx::Connection;
-use sqlx::{
-    AssertSqlSafe, Column, ColumnIndex, Database, Decode, Executor, Row, Type, TypeInfo, ValueRef,
-};
+use sqlx::{Column, ColumnIndex, Database, Decode, Executor, Row, Type, TypeInfo, ValueRef};
 use sqlx_postgres::{PgConnection, Postgres};
 use tokio::runtime::Runtime;
 
@@ -52,7 +50,7 @@ impl Drop for IsolatedPostgresServer {
         let sql = format!("DROP DATABASE {} WITH (FORCE)", self.database);
         let _ = self
             .runtime
-            .block_on(sqlx::raw_sql(AssertSqlSafe(sql.as_str())).execute(&mut self.connection));
+            .block_on(sqlx::raw_sql(sql.as_str()).execute(&mut self.connection));
     }
 }
 
@@ -68,8 +66,7 @@ pub(super) fn start_isolated_postgres_server() -> IsolatedPostgresServer {
         .expect("must connect to PostgreSQL for differential-test setup");
     let backend = runtime
         .block_on(
-            sqlx::query_scalar::<_, i32>(AssertSqlSafe("SELECT pg_backend_pid()"))
-                .fetch_one(&mut connection),
+            sqlx::query_scalar::<_, i32>("SELECT pg_backend_pid()").fetch_one(&mut connection),
         )
         .expect("must identify differential-test setup connection");
     let database = format!("pg_fake_differential_{}_{backend}", std::process::id());
@@ -77,7 +74,7 @@ pub(super) fn start_isolated_postgres_server() -> IsolatedPostgresServer {
     url.set_path(&database);
     let sql = format!("CREATE DATABASE {database} TEMPLATE template0");
     runtime
-        .block_on(sqlx::raw_sql(AssertSqlSafe(sql.as_str())).execute(&mut connection))
+        .block_on(sqlx::raw_sql(sql.as_str()).execute(&mut connection))
         .expect("must create isolated differential-test database");
     IsolatedPostgresServer {
         url: url.into(),
@@ -152,10 +149,7 @@ where
     usize: ColumnIndex<DB::Row>,
 {
     if returns_rows(statement) {
-        match sqlx::raw_sql(AssertSqlSafe(sql))
-            .fetch_all(&mut *connection)
-            .await
-        {
+        match sqlx::raw_sql(sql).fetch_all(&mut *connection).await {
             Ok(rows) => {
                 let column_types = rows
                     .first()
@@ -187,10 +181,7 @@ where
             Err(error) => make_error_outcome(error),
         }
     } else {
-        match sqlx::raw_sql(AssertSqlSafe(sql))
-            .execute(&mut *connection)
-            .await
-        {
+        match sqlx::raw_sql(sql).execute(&mut *connection).await {
             Ok(result) => Outcome::Affected(rows_affected(result)),
             Err(error) => make_error_outcome(error),
         }

@@ -8,7 +8,7 @@ use std::{
 use chaos_theory::check;
 use chaos_theory::{Effect, Source, make::int_in};
 use pg_fake_sqlx::{Db, PgFakeConnection};
-use sqlx::{AssertSqlSafe, Connection};
+use sqlx::Connection;
 use sqlx_postgres::PgConnection;
 use tokio::runtime::Runtime;
 
@@ -40,18 +40,18 @@ impl Drop for PostgresCase<'_, '_> {
     fn drop(&mut self) {
         let _ = self
             .runtime
-            .block_on(sqlx::raw_sql(AssertSqlSafe("ROLLBACK")).execute(&mut *self.connection));
+            .block_on(sqlx::raw_sql("ROLLBACK").execute(&mut *self.connection));
         let sql = format!(
             "DROP TABLE IF EXISTS {0}_foreign_child, {0}_foreign_parent, {0}_ddl, {0}",
             self.table
         );
         let _ = self
             .runtime
-            .block_on(sqlx::raw_sql(AssertSqlSafe(sql.as_str())).execute(&mut *self.connection));
+            .block_on(sqlx::raw_sql(sql.as_str()).execute(&mut *self.connection));
         let sql = format!("DROP FUNCTION IF EXISTS {}_trigger_fn()", self.table);
         let _ = self
             .runtime
-            .block_on(sqlx::raw_sql(AssertSqlSafe(sql.as_str())).execute(&mut *self.connection));
+            .block_on(sqlx::raw_sql(sql.as_str()).execute(&mut *self.connection));
     }
 }
 
@@ -68,12 +68,12 @@ impl Drop for PostgresSessionsCase<'_, '_> {
         for connection in self.connections.iter_mut() {
             let _ = self
                 .runtime
-                .block_on(sqlx::raw_sql(AssertSqlSafe("ROLLBACK")).execute(&mut *connection));
+                .block_on(sqlx::raw_sql("ROLLBACK").execute(&mut *connection));
         }
         let sql = format!("DROP TABLE IF EXISTS {}", self.table);
         let _ = self
             .runtime
-            .block_on(sqlx::raw_sql(AssertSqlSafe(sql.as_str())).execute(&mut self.connections[0]));
+            .block_on(sqlx::raw_sql(sql.as_str()).execute(&mut self.connections[0]));
     }
 }
 
@@ -1722,7 +1722,7 @@ fn run_generated_sql_case(
         table: table_name.clone(),
     };
     runtime
-        .block_on(sqlx::raw_sql(AssertSqlSafe("RESET ALL")).execute(postgres.get_connection()))
+        .block_on(sqlx::raw_sql("RESET ALL").execute(postgres.get_connection()))
         .expect("must reset PostgreSQL settings for a fresh generated case");
     let mut fake = PgFakeConnection::new(Db::create());
     let table = generate_table(src, table_name);
@@ -1820,7 +1820,7 @@ pub fn fuzz_generated_sql_matches_postgres(src: &mut Source) {
         table_name
     );
     runtime
-        .block_on(sqlx::raw_sql(AssertSqlSafe(sql.as_str())).execute(&mut postgres))
+        .block_on(sqlx::raw_sql(sql.as_str()).execute(&mut postgres))
         .expect("must clean PostgreSQL state before a fuzz input");
     run_generated_sql_case(src, &runtime, &mut postgres, table_name);
 }

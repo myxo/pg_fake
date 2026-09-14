@@ -12,9 +12,9 @@ criterion = "0.5"
 dotenvy = "0.15"
 pg_fake = { path = "../pg_fake" }
 pg_fake_sqlx = { path = "../pg_fake_sqlx" }
-sqlx = { version = "0.9", default-features = false, features = ["runtime-tokio"] }
-sqlx-core = { version = "0.9", features = ["migrate"] }
-sqlx-postgres = { version = "0.9", features = ["migrate"] }
+sqlx = { version = "0.8.6", default-features = false, features = ["runtime-tokio"] }
+sqlx-core = { version = "0.8.6", features = ["migrate"] }
+sqlx-postgres = { version = "0.8.6", features = ["migrate"] }
 testcontainers = { version = "0.27", features = ["blocking"] }
 testcontainers-modules = { version = "0.15", features = ["blocking", "postgres"] }
 tokio = { version = "1", features = ["macros", "rt-multi-thread", "sync", "time"] }
