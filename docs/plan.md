@@ -1,19 +1,21 @@
 # pg_fake — Phase 3 Implementation Plan
 
 Phase 3 delivers the scope from `spec.md` §9. Migration-critical DDL,
-transaction, JSONB, temporal, locking, and query-expression features are
-scheduled before the broader window, array, and SERIALIZABLE work so useful
-SQLx application workloads become runnable earlier.
+transaction, JSONB, temporal, locking, array, and query-expression features are
+scheduled before the broader window and SERIALIZABLE work so useful SQLx
+application workloads become runnable earlier.
 
 The Phase 3 commitments are: CTEs (including recursive and
 data-modifying forms), `INSERT ... ON CONFLICT`, window functions, views,
 JSON/JSONB, arrays, savepoints, general session GUC handling, the remaining
 `SELECT ... FOR UPDATE` family, SERIALIZABLE isolation, and transactional DDL.
 Set operations are included as an adjacent prerequisite for recursive CTEs.
+SQLx `time::OffsetDateTime` compatibility and PostgreSQL `hashtext` functions
+are included as bounded application-compatibility additions.
 
-The plan is a linear sequence of small tasks. Each task has a **Goal**, a
-testable **Definition of Done (DoD)**, and **Notes** describing dependencies and
-scope boundaries. The completed Phase 2 plan is archived in
+The plan is an ordered sequence of small tasks. Each task has a **Goal**, a
+testable **Definition of Done (DoD)**, and **Notes** describing dependencies
+and scope boundaries. The completed Phase 2 plan is archived in
 `plan_phase2_complete.md`.
 
 ## Conventions
@@ -45,9 +47,13 @@ scope boundaries. The completed Phase 2 plan is archived in
 - Features not listed here retain the unsupported-feature behavior from
   `spec.md` §10. Optimization-only clauses may be tolerated only when ignoring
   them cannot change Tier-A behavior, and strict mode must still reject them.
-- Tasks 8 through 26 are the priority track. They must be taken in order before
-  Tasks 27 onward unless a prerequisite defect forces a narrowly documented
-  exception.
+- Tasks 8 through 30 are the priority track and must finish before Tasks 31
+  onward. Task 25 is the first unfinished task. Task 24 retains its
+  completed status from an earlier approved exception. Tasks 25, 26, 27, and
+  29 have no dependency on later milestones and are placed immediately after
+  it for expedited delivery; Task 28 depends on Task 27, and Task 30 gates the
+  completed priority track. Except for the documented Task 24 history, work
+  follows the first-unfinished-task rule from `AGENTS.md`.
 
 ## Phase 3 regression focus
 
@@ -59,6 +65,8 @@ The primary upstream source files for this phase are:
 - windows: `window.sql`;
 - JSON types: `json.sql` and `jsonb.sql`;
 - arrays: `arrays.sql`;
+- SQLx `OffsetDateTime`, text hashes, and required BIGINT/UUID array query
+  shapes: focused local PostgreSQL 18 differential fixtures;
 - views and catalog behavior: `create_view.sql` and applicable cases from
   `updatable_views.sql`;
 - transactions, savepoints, GUCs, and row locking: `transactions.sql`,
@@ -568,7 +576,7 @@ does not expand this task to updatable-view semantics.
 - Lock waits, configured timeouts, deadlock participation, release, and
   concurrent DDL/DML conflicts have controlled multi-session coverage.
 - Modes or settings outside the bounded migration surface remain explicit
-  unsupported features until Tasks 28–29 broaden GUC behavior.
+  unsupported features until Tasks 32–33 broaden GUC behavior.
 
 **Required migration forms:** Accept the literal assignments
 `SET LOCAL lock_timeout = '5s'` and
@@ -751,8 +759,9 @@ baseline; the join/group workload currently misses the project's speed target.
   inner/outer joins, and scalar-subquery arguments. `SELECT`-list expansion
   remains explicitly unsupported, as agreed.
 - Added the bounded `text[]` argument representation needed by JSON paths and
-  key lists, including native/SQLx parameters. Other element types, dimensions,
-  explicit bounds, and general array operations remain Tasks 33–34.
+  key lists, including native/SQLx parameters. Task 27 migrates it to the generic
+  array representation, and Task 37 completes other element types and general
+  array operations.
 - Added focused and generated PostgreSQL differential coverage, prepared-query
   metadata checks, mutation atomicity tests, conformance fixtures, and JSONB
   extraction/containment benchmarks.
@@ -810,8 +819,8 @@ record-population functions remain later work.
 **Required migration forms:** Only `jsonb #> unknown-path-literal`,
 `jsonb #>> unknown-path-literal`, and `jsonb_typeof(jsonb)` are used by the
 required migration workload. Path literals such as `'{amount,value}'` must
-receive the operator's `text[]` type without requiring the general array feature
-from Tasks 33–34. Missing paths, JSON null, SQL NULL, string versus numeric JSON
+receive the operator's `text[]` type without requiring Task 27's generic array
+representation. Missing paths, JSON null, SQL NULL, string versus numeric JSON
 values, and invalid numeric casts require focused differential cases. Extracted
 JSONB strings cast through `numeric` to `bigint`, including nested `amount`,
 `currency`, and `value` fixtures, must match PostgreSQL. The other
@@ -1121,7 +1130,7 @@ No benchmark baseline was changed.
 - Differential/property tests cover zero/one/many inner rows, nested scopes,
   NULLs, volatile expressions, metadata, and errors.
 
-### Task 23 — Complete `SELECT` row-locking clauses [IN PROGRESS]
+### Task 23 — Complete `SELECT` row-locking clauses [COMPLETE]
 
 **Progress:** Implemented the four lock strengths, portable sqlparser grammar
 fixes, and base-row provenance through query execution. Differential tests cover
@@ -1148,6 +1157,9 @@ preserve completed volatile predicates and conditional branches across retries.
   `skip_locked_queue_100_rows` measured approximately 279 microseconds for
   `pg_fake` and 45.2 microseconds for PostgreSQL 18. This misses the speed target;
   no benchmark baseline was changed to hide the result.
+- [x] Publish parser-fork revision
+  `1bcc091c6b9a49df73e2ed9348f85471a33a985e` and verify the locked workspace
+  dependency builds without a local path override.
 
 The parser fix is maintained in the `myxo/datafusion-sqlparser-rs` fork. Focused
 checks pass with every parser feature enabled across 15 dialects, and 10,000
@@ -1156,7 +1168,8 @@ all-feature tests and Clippy could not run: the `matches` development dependency
 is not cached, and the online download attempt failed with proxy HTTP 403.
 The project pins fork revision `1bcc091c6b9a49df73e2ed9348f85471a33a985e` through
 Git. Its 49 parser implementation files match the previously validated source.
-The fork commit is local; publication still awaits remote-push approval.
+The fork commit is published, and the locked workspace dependency builds
+without a local path override.
 
 **Goal:** Implement work queues and the remaining planned PostgreSQL row-lock
 surface.
@@ -1208,7 +1221,154 @@ strict Clippy, and formatting also pass with the Git dependency.
 - Controlled multi-session differential tests cover contention, ordering,
   repeated acquisition, abort, timeouts, deadlocks, and SQLx transactions.
 
-### Task 25 — PostgreSQL compatibility utilities and maintenance statements
+### Task 25 — SQLx `time::OffsetDateTime` timestamptz codecs
+
+**Goal:** Let applications using the `time` crate exchange PostgreSQL
+`timestamptz` values through `pg_fake_sqlx` without changing their domain
+types.
+
+**DoD:**
+
+- `pg_fake_sqlx` exposes an optional `time` Cargo feature backed by an optional
+  `time` 0.3 dependency; the workspace builds and tests both with and without
+  that feature enabled.
+- With the feature enabled, SQLx `Type`, `Encode`, and `Decode` support
+  `time::OffsetDateTime` for `timestamptz`. `Option<OffsetDateTime>` binds and
+  decodes through the same typed path, including SQL `NULL` results.
+- Direct parameter casts and table storage round-trip positive and negative
+  Unix timestamps whose precision is at most one microsecond. A decoded value
+  represents the same instant normalized to UTC; PostgreSQL does not preserve
+  the input's displayed UTC offset. Inputs with finer precision are quantized
+  exactly as PostgreSQL's SQLx `time` codec does, including for negative
+  instants. Range failures and result metadata match PostgreSQL without
+  changing the core `timestamptz` representation.
+- Focused PostgreSQL 18 differential tests cover
+  `SELECT $1::timestamptz`, nullable and `NOT NULL` table columns, positive and
+  negative epochs, exact microseconds, non-UTC offsets, optional values, SQL
+  `NULL`, prepared metadata, and invalid/out-of-range values.
+- A representative SQLx bind/store/fetch benchmark records the adapter cost, or
+  the completion handoff explains with measurements why the existing temporal
+  benchmark already represents it adequately.
+
+**Notes:** This is an SQLx adapter addition over the Phase 2 `timestamptz`
+implementation. It has no dependency on the remaining Phase 3 transaction,
+window, array, or SERIALIZABLE tasks.
+
+### Task 26 — Text hash functions and advisory-lock composition
+
+**Goal:** Support PostgreSQL-compatible text-derived advisory-lock keys.
+
+**DoD:**
+
+- `hashtext(text)` returns `int4`, and `hashtextextended(text, bigint)` returns
+  `int8`, with PostgreSQL-compatible strict NULL behavior and exact PostgreSQL
+  18 results for empty, ASCII, multibyte UTF-8, and long text inputs and for the
+  full supported seed range.
+- Literal and prepared forms, including `hashtext($1::text)`,
+  `hashtextextended($1, 0)`, and `hashtextextended($1, $2)`, infer TEXT for hash
+  input and INT8 for the extended-hash seed and expose the exact result OIDs and
+  SQLx metadata. Shared parameters and invalid argument types follow PostgreSQL
+  overload and coercion behavior.
+- Hash results compose with the existing one-key and two-key
+  `pg_advisory_xact_lock` and `pg_try_advisory_xact_lock` overloads. The one-key
+  form applies the required implicit `int4`-to-`int8` coercion rather than
+  introducing a separate advisory-lock identity.
+- Prepared lock compositions include
+  `pg_advisory_xact_lock(hashtext($1::text))`,
+  `pg_try_advisory_xact_lock(hashtext($1::text))`,
+  `pg_advisory_xact_lock($1, hashtext($2))`, and
+  `pg_advisory_xact_lock(hashtextextended($1, 0))`. The two-key form infers
+  INT4 for its first parameter and TEXT for its second.
+- Controlled two-session tests prove same-text contention, different-text
+  independence, transaction-end release, retry behavior, and composition of
+  both hash functions with blocking and try-lock forms.
+- Focused and property-based PostgreSQL 18 differential tests cover empty text,
+  ASCII and UTF-8 inputs, multiple seeds, prepared parameters, NULLs, result
+  types, implicit coercion, and advisory-lock calls. A benchmark covers hashed
+  advisory-lock acquisition.
+
+**Notes:** This task follows Task 24 because it composes with the completed
+advisory-lock overloads. It does not depend on later Phase 3 work.
+
+### Task 27 — BIGINT and UUID array types, I/O, and SQLx codecs
+
+**Goal:** Add the generic one-dimensional array representation and deliver the
+BIGINT and UUID application paths without waiting for the broader Phase 3 array
+surface.
+
+**DoD:**
+
+- `BaseType`, `PgType`, and `Value` use the specification's single generic
+  `Value::Array { elem_type, Vec<Value> }` representation for typed arrays, NULL
+  elements, NULL arrays, and empty arrays. The existing bounded `TextArray`
+  JSON-path representation is migrated to it rather than retained as a second
+  array model, with all existing JSON path and key-list behavior kept green.
+- BIGINT[]/`_int8` (OID 1016) and UUID[]/`_uuid` (OID 2951) have correct
+  array/element OIDs and PostgreSQL type names through native and SQLx APIs.
+  Literals, `ARRAY[...]`, text parsing/formatting, parameters, table storage,
+  defaults, and casts match PostgreSQL for BIGINT, UUID, and the migrated TEXT
+  element paths.
+- SQLx `Type`, `Encode`, and `Decode` support at least `Vec<i64>`,
+  `Vec<Option<i64>>`, `Vec<uuid::Uuid>`, and `Vec<Option<uuid::Uuid>>`.
+  Corresponding `Option<Vec<_>>` values distinguish a NULL array from an empty
+  array and from an array containing NULL elements.
+- Prepared parameter and result descriptions report array OIDs rather than
+  element or unknown OIDs. Direct parameters and nullable/required BIGINT[] and
+  UUID[] table columns round-trip through SQLx.
+- Other element types remain explicit unsupported cases until Task 37.
+  Unsupported dimensions, non-default lower bounds, and malformed text values
+  fail explicitly. Differential/property tests cover I/O, escaping, coercion,
+  storage, metadata, empty arrays, NULL arrays, NULL elements, JSON-path
+  regressions, and errors; a benchmark covers SQLx BIGINT/UUID array round
+  trips.
+
+**Notes:** Existing scalar BIGINT and UUID support and the bounded JSON-path
+`text[]` representation provide the prerequisites. This task establishes the
+generic representation needed by Task 28; Task 37 later completes the other
+scalar element types and general array operations.
+
+### Task 28 — Required BIGINT aggregation, subscripting, and UUID membership
+
+**Goal:** Support the ordered BIGINT aggregation and UUID membership query
+shapes required by SQLx applications without coupling their delivery to the
+broader array surface.
+
+**DoD:**
+
+- `array_agg(bigint [ORDER BY ...])` preserves PostgreSQL input ordering,
+  includes NULL input values, returns NULL over no input rows, and supports
+  aggregate `FILTER (WHERE ...)`. The exact
+  `array_agg(issued_at ORDER BY issued_at DESC) FILTER (...)` shape composes
+  with `max(issued_at)` in the same projection.
+- One-based BIGINT-array reads match PostgreSQL for literal and prepared
+  subscripts. Out-of-range, zero, negative, NULL-array, and NULL-subscript reads
+  return the PostgreSQL result, and a prepared subscript does not alter the
+  BIGINT element result type.
+- UUID comparisons using `uuid = ANY(uuid[])` and `uuid <> ALL(uuid[])` match
+  PostgreSQL duplicate, empty-array, and three-valued NULL semantics, including
+  arrays containing NULL. Empty `ANY` returns false, empty `ALL` returns true,
+  and a NULL-only candidate set yields NULL when no comparison determines the
+  result.
+- Binding `id = ANY($1)` against a UUID column infers UUID[] for the parameter.
+  The ordered BIGINT aggregation reproduction infers BIGINT for its threshold,
+  INT4 for its subscript, and BIGINT for the nullable result through
+  prepare/describe and SQLx row decoding.
+- Checked-in SQL and SQLx reproductions seed BIGINT values 10, 20, and 30 and
+  return `latest = 30` and the filtered descending second element `20`. UUID
+  fixtures select two of three seeded identifiers through literal and bound
+  arrays, while explicit empty and NULL-element arrays verify false and NULL
+  `ANY` results respectively.
+- Focused and property-based PostgreSQL 18 differential tests cover ordering,
+  filtering, nullable inputs, empty input, empty arrays, NULL arrays/elements,
+  prepared subscripts, UUID prepared parameters, out-of-range access,
+  duplicates, coercion, result metadata, and errors. Benchmarks cover UUID
+  `ANY` and ordered/filtered `array_agg`.
+
+**Notes:** This task depends only on Task 27 plus the existing aggregate
+`ORDER BY`/`FILTER` substrate. Array assignment, general operators/functions,
+other element types, and `unnest` remain Task 37.
+
+### Task 29 — PostgreSQL compatibility utilities and maintenance statements
 
 **Goal:** Cover the small server-facing surface reached on normal startup and
 runtime paths without pretending to be a complete PostgreSQL server.
@@ -1228,7 +1388,7 @@ runtime paths without pretending to be a complete PostgreSQL server.
 - Focused PostgreSQL differential tests cover all accepted utility queries,
   metadata, transaction behavior, and errors.
 
-### Task 26 — SQLx application-workload conformance gate
+### Task 30 — SQLx application-workload conformance gate
 
 **Goal:** Demonstrate that realistic SQLx workloads run on `pg_fake`, not merely
 that isolated SQL parses.
@@ -1242,7 +1402,8 @@ that isolated SQL parses.
   accounting, payment/promotion state, request limits, thread/execution state,
   and append-only logs.
 - Concurrent workflows exercise advisory locks, table/row locks, `SKIP LOCKED`,
-  transactions, triggers, JSONB, temporal expressions, and rollback.
+  transactions, triggers, JSONB, temporal expressions, `OffsetDateTime`, text
+  hash keys, BIGINT/UUID arrays, ordered/filtered `array_agg`, and rollback.
 - Every in-scope manifest entry is either executed by the suite or has a focused
   replay; none remains unsupported, unclassified, or silently skipped.
 - PostgreSQL 18 and `pg_fake` agree on Tier-A results, metadata, affected rows,
@@ -1253,7 +1414,7 @@ that isolated SQL parses.
 
 ## Milestone H — Remaining Phase 3 transaction features
 
-### Task 27 — Savepoints and subtransaction recovery
+### Task 31 — Savepoints and subtransaction recovery
 
 **Goal:** Implement nested transaction checkpoints used by PostgreSQL clients
 and SQLx nested transactions.
@@ -1278,7 +1439,7 @@ and SQLx nested transactions.
   transactions.
 - The benchmark suite includes nested savepoint create/release and rollback.
 
-### Task 28 — Typed GUC registry and general `SET`/`SHOW`/`RESET`
+### Task 32 — Typed GUC registry and general `SET`/`SHOW`/`RESET`
 
 **Goal:** Replace scattered session-variable handling with a typed registry for
 settings that affect supported behavior or driver compatibility.
@@ -1302,7 +1463,7 @@ settings that affect supported behavior or driver compatibility.
 - Differential/property cases cover aliases, units, invalid values, reset,
   session isolation, strict mode, and prepared statements.
 
-### Task 29 — Transaction-local settings and GUC functions
+### Task 33 — Transaction-local settings and GUC functions
 
 **Goal:** Complete transactional GUC behavior and the common functional access
 surface.
@@ -1334,7 +1495,7 @@ Phase 3 functional/session behavior.
 
 ## Milestone I — Complete window functions
 
-### Task 30 — Named windows and remaining ranking functions
+### Task 34 — Named windows and remaining ranking functions
 
 **Goal:** Extend Task 19's migration window substrate to the full planned
 binding, partitioning, ordering, and ranking surface.
@@ -1351,7 +1512,7 @@ binding, partitioning, ordering, and ranking surface.
 - Differential/property cases cover partitions, peers, NULLs, named windows,
   clause ordering, metadata, placement, nesting, and errors.
 
-### Task 31 — Offset and value window functions
+### Task 35 — Offset and value window functions
 
 **Goal:** Add position-sensitive access to rows within a partition or frame.
 
@@ -1364,7 +1525,7 @@ binding, partitioning, ordering, and ranking surface.
 - Differential/property cases cover edges, offsets, defaults, NULLs, peers,
   parameters, metadata, and errors.
 
-### Task 32 — Aggregate windows and frame semantics
+### Task 36 — Aggregate windows and frame semantics
 
 **Goal:** Complete existing aggregates over PostgreSQL window frames.
 
@@ -1382,41 +1543,50 @@ binding, partitioning, ordering, and ranking surface.
 
 ---
 
-## Milestone J — Arrays
+## Milestone J — General array completion
 
-### Task 33 — One-dimensional array type and I/O
+### Task 37 — Remaining one-dimensional array operations
 
-**Goal:** Add one-dimensional arrays of supported scalar PostgreSQL types.
-
-**DoD:**
-
-- `BaseType`, `PgType`, and `Value` represent typed arrays, NULL elements, and
-  empty arrays with correct array/element OIDs through native and SQLx APIs.
-- Literals, `ARRAY[...]`, text I/O, parameters, defaults, casts, common-element
-  resolution, equality, and lexicographic ordering match PostgreSQL.
-- Unsupported dimensions/lower bounds/elements and malformed values fail
-  explicitly; differential/property tests cover I/O, coercion, comparison,
-  metadata, NULLs, and errors.
-
-### Task 34 — Array subscripting, operators, aggregates, and functions
-
-**Goal:** Support common PostgreSQL array expressions end to end.
+**Goal:** Complete the broader one-dimensional array commitment after the
+priority BIGINT/UUID application paths are available.
 
 **DoD:**
 
-- One-based reads/assignments, concatenation, containment, overlap, and
-  `ANY(array)`/`ALL(array)` match PostgreSQL bounds, duplicate, and NULL rules.
-- The planned array inspection/mutation functions, `array_agg`, and supported
-  `unnest` positions work; unsupported table-function forms fail loudly.
-- Differential/property tests cover empty/NULL arrays, NULL elements,
-  expansion, duplicates, coercion, aggregation, and errors; benchmarks cover
-  containment and `array_agg`.
+- Every supported scalar PostgreSQL type can be represented as an array element
+  with its correct element/array OIDs, literals, text I/O, table storage,
+  defaults, casts, prepared metadata, and native API behavior. SQLx `Vec<T>` and
+  `Vec<Option<T>>` codecs are provided wherever the corresponding scalar SQLx
+  codec exists.
+- `ARRAY[...]` common-element resolution and array equality and lexicographic
+  ordering use PostgreSQL coercion and the element type's available operators;
+  element types without required comparison operators remain rejected in the
+  same contexts as PostgreSQL.
+- One-based assignment within the supported lower bound, concatenation (`||`),
+  containment (`@>`/`<@`), and overlap (`&&`) match PostgreSQL duplicate, empty,
+  and NULL-element semantics. `array_agg`, `ANY`, and `ALL` generalize the Task
+  28 behavior to the remaining supported element types.
+- The bounded Phase 3 inspection/mutation functions are exactly
+  `array_length`, `cardinality`, `array_lower`, `array_upper`, `array_append`,
+  `array_prepend`, `array_cat`, `array_position`, `array_positions`,
+  `array_remove`, and `array_replace`, with PostgreSQL dimension, coercion,
+  search, and NULL behavior.
+- `unnest(array)` works as a `FROM` relation, including table/column aliases,
+  `WITH ORDINALITY`, implicit correlation to preceding `FROM` items, and the
+  supported CROSS/INNER/LEFT LATERAL forms. SELECT-list expansion, the
+  multiple-array overload, slices, multidimensional arrays, and non-default
+  lower bounds remain explicit later work.
+- Differential/property tests cover every supported element family, I/O,
+  comparison, operators, functions, expansion, coercion, NULLs, empty arrays,
+  metadata, and errors. Benchmarks cover containment and correlated `unnest`.
+
+**Notes:** This task builds on Tasks 27–28. It is deliberately later because
+none of its remaining forms is required by the expedited application workload.
 
 ---
 
 ## Milestone K — SERIALIZABLE isolation
 
-### Task 35 — SERIALIZABLE dependency tracking
+### Task 38 — SERIALIZABLE dependency tracking
 
 **Goal:** Track the read/write dependencies needed to detect SSI dangerous
 structures without changing READ COMMITTED or REPEATABLE READ behavior.
@@ -1438,7 +1608,7 @@ structures without changing READ COMMITTED or REPEATABLE READ behavior.
   transactions, overlapping snapshots, savepoint rollback, cleanup horizons,
   and unique-key gaps.
 
-### Task 36 — SSI validation and predicate conflicts
+### Task 39 — SSI validation and predicate conflicts
 
 **Goal:** Reject executions that are not serializable while allowing valid
 concurrent histories.
@@ -1467,7 +1637,7 @@ concurrent histories.
 
 ## Milestone L — Phase 3 conformance and release gate
 
-### Task 37 — Phase 3 integration, regression audit, and benchmarks
+### Task 40 — Phase 3 integration, regression audit, and benchmarks
 
 **Goal:** Prove that the complete Phase 3 surface works coherently through the
 native and SQLx APIs.
@@ -1482,24 +1652,26 @@ native and SQLx APIs.
   every remaining blocker as fixture-related, parser-limited, or later/out of
   scope.
 - End-to-end scenarios combine CTEs, `ON CONFLICT`, windows, views, JSONB,
-  arrays, savepoints, session-local GUCs, transactional DDL, row locks, and
-  SERIALIZABLE transactions.
+  arrays, `OffsetDateTime`, text-derived advisory-lock keys, savepoints,
+  session-local GUCs, transactional DDL, row locks, and SERIALIZABLE
+  transactions.
 - SQLx prepared queries, row decoding/encoding, nested transactions, and
-  concurrent transactions cover every Phase 3 type and statement family.
+  concurrent transactions cover every Phase 3 type and statement family plus
+  the Task 25–26 application-compatibility additions.
 - The property suite passes 10,000 iterations with Phase 3 operations enabled,
   and randomized plus focused multi-session tests pass repeatedly.
 - Benchmarks cover set operations, recursive CTEs, conflicting inserts, windows,
-  JSONB, arrays, views, savepoints, transactional DDL, row locking, and SSI;
-  results are compared with PostgreSQL 18 and misses of the project's speed
-  target are reported rather than hidden.
+  JSONB, arrays, `OffsetDateTime`, text hashes, views, savepoints,
+  transactional DDL, row locking, and SSI; results are compared with PostgreSQL
+  18 and misses of the project's speed target are reported rather than hidden.
 - The unsupported-feature registry and user-facing feature documentation
   distinguish completed Phase 3 behavior from later gaps.
-- The Task 26 SQLx application-workload gate remains green and is reported
+- The Task 30 SQLx application-workload gate remains green and is reported
   separately from the broader synthetic/upstream conformance results.
 
 **Notes:** This task fixes integration defects but does not add new SQL families.
 
-### Task 38 — External PostgreSQL-driven fuzzing
+### Task 41 — External PostgreSQL-driven fuzzing
 
 **Goal:** Discover SQL through an external fuzzer running against PostgreSQL,
 then replay the captured workload against `pg_fake` to find behavioral gaps that
@@ -1550,10 +1722,10 @@ stateful workload model are intentionally research outcomes of this task.
 
 ## Phase 3 exit criteria
 
-- All 38 tasks meet their DoD and have been approved before being marked
+- All 41 tasks meet their DoD and have been approved before being marked
   complete.
 - The prioritized migration and SQLx application-workload gates in Tasks 20
-  and 26 pass without unsupported, unclassified, or silently skipped SQL.
+  and 30 pass without unsupported, unclassified, or silently skipped SQL.
 - The Phase 3 conformance manifest passes against PostgreSQL 18 without
   regressing the 32 Phase 2 cases.
 - The embedded regression corpus improves from the 463/141 Phase 2 baseline,
@@ -1561,7 +1733,10 @@ stateful workload model are intentionally research outcomes of this task.
 - CTEs, set operations, conflicting inserts, window functions, ordinary views,
   JSON/JSONB, one-dimensional arrays, savepoints, modeled GUCs, transactional
   DDL, row-lock variants, and SERIALIZABLE isolation work through native and
-  SQLx APIs.
+  SQLx APIs. `time::OffsetDateTime`, BIGINT/UUID array codecs, ordered and
+  filtered `array_agg`, prepared array subscripts and `ANY`/`ALL`, `hashtext`,
+  and `hashtextextended` pass their required SQLx and PostgreSQL 18 differential
+  reproductions.
 - Tier-A behavior for the supported Phase 3 surface matches PostgreSQL for
   results, NULL semantics, types, constraints, catalog visibility, transaction
   recovery, locking, concurrent outcomes, and SQLSTATE.
