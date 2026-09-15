@@ -19,6 +19,7 @@ pub enum SqlState {
     NumericValueOutOfRange,              // 22003
     NullValueNotAllowed,                 // 22004
     DivisionByZero,                      // 22012
+    InvalidDatetimeFormat,               // 22007
     DatetimeFieldOverflow,               // 22008
     IntervalFieldOverflow,               // 22015
     InvalidRegularExpression,            // 2201B
@@ -110,6 +111,7 @@ impl SqlState {
             SqlState::NumericValueOutOfRange => "22003",
             SqlState::NullValueNotAllowed => "22004",
             SqlState::DivisionByZero => "22012",
+            SqlState::InvalidDatetimeFormat => "22007",
             SqlState::DatetimeFieldOverflow => "22008",
             SqlState::IntervalFieldOverflow => "22015",
             SqlState::InvalidRegularExpression => "2201B",

@@ -11,6 +11,9 @@ filtered heap select, the same filtered select over a primary key, and a
 not-null, default, and column- and table-level `CHECK` validation. They also
 cover a sequence-backed identity insert with `RETURNING`, and a UUID key lookup
 that applies timestamp-with-time-zone and interval arithmetic.
+The `offset_datetime_bind_store_fetch` workload measures a `time::OffsetDateTime`
+bind, `timestamptz` store, and decoded `RETURNING` value through each SQLx
+adapter.
 
 Diagnostic groups isolate costs within `pg_fake`:
 

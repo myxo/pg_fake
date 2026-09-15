@@ -364,8 +364,7 @@ impl Value {
     }
 
     /// Parse a text input literal into a `Value` of the given base type
-    /// (the type's `typinput` function). Invalid syntax yields `22P02`;
-    /// out-of-range values yield `22003`.
+    /// (the type's `typinput` function).
     #[cfg_attr(feature = "execution-log", tracing::instrument(skip_all))]
     pub(crate) fn parse(base: BaseType, input: &str) -> Result<Value> {
         match base {
@@ -700,12 +699,20 @@ fn parse_timestamptz(input: &str) -> Result<PgTimestampTz> {
         "-infinity" => return Ok(PgTimestampTz::NegInfinity),
         _ => {}
     }
-    if let Ok(value) = DateTime::parse_from_rfc3339(&normalize_rfc3339_input(input)) {
+    let normalized = normalize_rfc3339_input(input);
+    if let Ok(value) = DateTime::parse_from_rfc3339(&normalized)
+        .or_else(|_| DateTime::parse_from_str(&normalized, "%Y-%m-%dT%H:%M:%S%.f%:z"))
+    {
         return Ok(PgTimestampTz::Finite(value.with_timezone(&Utc)));
     }
     parse_local_timestamp(input)
         .map(|value| PgTimestampTz::Finite(value.and_utc()))
-        .ok_or_else(|| create_invalid_text_error(input, "timestamp with time zone"))
+        .ok_or_else(|| {
+            PgError::create(
+                SqlState::InvalidDatetimeFormat,
+                format!("invalid input syntax for type timestamp with time zone: {input}"),
+            )
+        })
 }
 
 pub(crate) fn parse_local_timestamp(input: &str) -> Option<NaiveDateTime> {

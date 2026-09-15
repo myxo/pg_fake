@@ -7,6 +7,9 @@ license.workspace = true
 [lints]
 workspace = true
 
+[features]
+time = ["dep:time"]
+
 [dependencies]
 bigdecimal = "0.4"
 chrono = { version = "0.4", default-features = false, features = ["std"] }
@@ -21,13 +24,14 @@ serde_json = { version = "1", features = ["raw_value"] }
 sqlx = { version = "0.8.6", default-features = false, features = ["bigdecimal", "runtime-tokio"] }
 sqlx-core = { version = "0.8.6", features = ["bigdecimal", "json", "migrate"] }
 tokio = { version = "1", features = ["rt", "sync"] }
+time = { version = "0.3", optional = true }
 url = "2"
 uuid = "1"
 
 [dev-dependencies]
 chaos_theory = "0.5"
 dotenvy = "0.15"
-sqlx-postgres = { version = "0.8.6", features = ["bigdecimal", "chrono", "json", "migrate", "uuid"] }
+sqlx-postgres = { version = "0.8.6", features = ["bigdecimal", "chrono", "json", "migrate", "time", "uuid"] }
 testcontainers = { version = "0.27", features = ["blocking"] }
 testcontainers-modules = { version = "0.15", features = ["blocking", "postgres"] }
 tokio = { version = "1", features = ["macros", "rt-multi-thread", "sync", "time"] }

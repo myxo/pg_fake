@@ -72,7 +72,7 @@ pub(super) fn start_isolated_postgres_server() -> IsolatedPostgresServer {
     let database = format!("pg_fake_differential_{}_{backend}", std::process::id());
     let mut url = url::Url::parse(&server.url).expect("must parse PostgreSQL test URL");
     url.set_path(&database);
-    let sql = format!("CREATE DATABASE {database} TEMPLATE template0");
+    let sql = format!("CREATE DATABASE {database} TEMPLATE template0 LC_COLLATE 'C' LC_CTYPE 'C'");
     runtime
         .block_on(sqlx::raw_sql(sql.as_str()).execute(&mut connection))
         .expect("must create isolated differential-test database");

@@ -33,6 +33,13 @@ Run the SQLx adapter example:
 cargo run -p pg_fake_sqlx --bin sqlx_example
 ```
 
+Enable the adapter's optional `time` feature to bind and decode
+`time::OffsetDateTime` as PostgreSQL `timestamptz`:
+
+```toml
+pg_fake_sqlx = { version = "0.1", features = ["time"] }
+```
+
 ## Command-line interface
 
 Run a SQL file against a fresh in-memory database:

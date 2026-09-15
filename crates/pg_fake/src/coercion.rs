@@ -585,6 +585,23 @@ fn convert_numeric_to_int(value: BigDecimal, target: BaseType) -> Result<Value> 
 
 #[cfg_attr(feature = "execution-log", tracing::instrument(skip_all))]
 fn apply_typmod(value: Value, target: PgType, context: CastContext) -> Result<Value> {
+    if let Value::TimestampTz(crate::value::PgTimestampTz::Finite(timestamp)) = &value {
+        let postgres_epoch = chrono::NaiveDate::from_ymd_opt(2000, 1, 1)
+            .unwrap()
+            .and_hms_opt(0, 0, 0)
+            .unwrap()
+            .and_utc();
+        let micros = timestamp
+            .signed_duration_since(postgres_epoch)
+            .num_microseconds()
+            .expect("chrono timestamp difference fits i64 microseconds");
+        if !(-211_813_488_000_000_000..9_223_371_331_200_000_000).contains(&micros) {
+            return Err(PgError::create(
+                SqlState::DatetimeFieldOverflow,
+                "timestamp out of range",
+            ));
+        }
+    }
     if target.typmod == PgType::NO_TYPEMOD {
         return Ok(value);
     }

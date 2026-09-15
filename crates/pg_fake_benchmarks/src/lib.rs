@@ -127,6 +127,11 @@ pub fn list_benchmarks() -> Vec<Benchmark> {
             postgres_comparisons(),
         ),
         build_benchmark(
+            "offset_datetime_bind_store_fetch",
+            postgres_values(),
+            postgres_comparisons(),
+        ),
+        build_benchmark(
             "json_insert_returning",
             postgres_values(),
             postgres_comparisons(),

@@ -125,6 +125,13 @@ impl SqlType {
         )
     }
 
+    fn is_exact_numeric(self) -> bool {
+        matches!(
+            self,
+            Self::SmallInt | Self::Integer | Self::BigInt | Self::Numeric
+        )
+    }
+
     fn is_integral(self) -> bool {
         matches!(self, Self::SmallInt | Self::Integer | Self::BigInt)
     }
@@ -947,11 +954,13 @@ fn generate_aggregate(src: &mut Source, table: &TableSchema) -> (String, RowOrde
                     )
                 }
                 "sum" => {
-                    let column = choose_column(src, table, |column| column.data_type.is_numeric());
+                    let column =
+                        choose_column(src, table, |column| column.data_type.is_exact_numeric());
                     format!("sum({0}), coalesce(sum({0}), 0)", column.name)
                 }
                 "average" => {
-                    let column = choose_column(src, table, |column| column.data_type.is_numeric());
+                    let column =
+                        choose_column(src, table, |column| column.data_type.is_exact_numeric());
                     format!("avg({0}), coalesce(avg({0}), 0)", column.name)
                 }
                 "minimum_maximum" => {
@@ -2625,6 +2634,47 @@ fn matches_generated_migration_data_transform_queries() {
                 RowOrder::Ordered,
             );
         }
+    });
+}
+
+#[cfg(feature = "time")]
+#[test]
+fn matches_generated_offset_datetime_parameters() {
+    let server = start_isolated_postgres_server();
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap();
+    let postgres = RefCell::new(
+        runtime
+            .block_on(PgConnection::connect(&server.url))
+            .unwrap(),
+    );
+    let fake = RefCell::new(PgFakeConnection::new(Db::create()));
+    check(|src| {
+        let seconds = src.any_of("unix_seconds", int_in(-2_208_988_800_i64..=4_102_444_800));
+        let nanoseconds = src.any_of("nanoseconds", int_in(0_i64..=999_999_999));
+        let value = time::OffsetDateTime::from_unix_timestamp_nanos(
+            i128::from(seconds) * 1_000_000_000 + i128::from(nanoseconds),
+        )
+        .unwrap();
+        src.log_value("value", &value);
+        let expected = runtime
+            .block_on(
+                sqlx::query_scalar::<_, time::OffsetDateTime>("SELECT $1::timestamptz")
+                    .bind(value)
+                    .fetch_one(&mut *postgres.borrow_mut()),
+            )
+            .unwrap();
+        let actual = runtime
+            .block_on(
+                sqlx::query_scalar::<_, time::OffsetDateTime>("SELECT $1::timestamptz")
+                    .bind(value)
+                    .fetch_one(&mut *fake.borrow_mut()),
+            )
+            .unwrap();
+        assert_eq!(actual, expected);
+        assert_eq!(actual.offset(), time::UtcOffset::UTC);
     });
 }
 

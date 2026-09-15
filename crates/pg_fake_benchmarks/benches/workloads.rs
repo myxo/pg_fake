@@ -75,6 +75,35 @@ impl BenchmarkConnection<'_> {
         }
     }
 
+    fn round_trip_offset_datetime(&mut self, runtime: &Runtime, value: time::OffsetDateTime) {
+        match self {
+            Self::PgFake(connection) => {
+                let value = runtime
+                    .block_on(
+                        sqlx::query_scalar::<_, time::OffsetDateTime>(
+                            "INSERT INTO offset_datetime_bind_store_fetch VALUES (1, $1) ON CONFLICT (id) DO UPDATE SET observed_at = EXCLUDED.observed_at RETURNING observed_at",
+                        )
+                        .bind(value)
+                        .fetch_one(&mut **connection),
+                    )
+                    .unwrap();
+                black_box(value);
+            }
+            Self::Postgres(connection) => {
+                let value = runtime
+                    .block_on(
+                        sqlx::query_scalar::<_, time::OffsetDateTime>(
+                            "INSERT INTO offset_datetime_bind_store_fetch VALUES (1, $1) ON CONFLICT (id) DO UPDATE SET observed_at = EXCLUDED.observed_at RETURNING observed_at",
+                        )
+                        .bind(value)
+                        .fetch_one(&mut **connection),
+                    )
+                    .unwrap();
+                black_box(value);
+            }
+        }
+    }
+
     fn execute_in_transaction(&mut self, runtime: &Runtime, sql: &str) {
         match self {
             Self::PgFake(connection) => {
@@ -587,6 +616,32 @@ fn uuid_temporal_benchmark(
     group.finish();
     for (_, connection) in connections.iter_mut() {
         connection.execute(runtime, "DROP TABLE uuid_temporal_select");
+    }
+}
+
+fn offset_datetime_benchmark(
+    criterion: &mut Criterion,
+    runtime: &Runtime,
+    connections: &mut [NamedBenchmarkConnection<'_>],
+) {
+    for (_, connection) in connections.iter_mut() {
+        connection.execute(
+            runtime,
+            "CREATE TABLE offset_datetime_bind_store_fetch (id INTEGER PRIMARY KEY, observed_at TIMESTAMPTZ NOT NULL)",
+        );
+    }
+    let value = time::OffsetDateTime::from_unix_timestamp_nanos(1_704_164_645_123_456_000).unwrap();
+    let mut group = criterion
+        .benchmark_group(benchmarks::find_benchmark("offset_datetime_bind_store_fetch").name);
+    group.throughput(Throughput::Elements(1));
+    for (name, connection) in connections.iter_mut() {
+        group.bench_function(*name, |benchmark| {
+            benchmark.iter(|| connection.round_trip_offset_datetime(runtime, value));
+        });
+    }
+    group.finish();
+    for (_, connection) in connections.iter_mut() {
+        connection.execute(runtime, "DROP TABLE offset_datetime_bind_store_fetch");
     }
 }
 
@@ -1559,6 +1614,7 @@ fn benchmarks(criterion: &mut Criterion) {
         sequence_benchmark(criterion, &runtime, &mut connections);
         serial_identity_benchmark(criterion, &runtime, &mut connections);
         uuid_temporal_benchmark(criterion, &runtime, &mut connections);
+        offset_datetime_benchmark(criterion, &runtime, &mut connections);
         benchmark_json(criterion, &runtime, &mut connections);
         benchmark_jsonb(criterion, &runtime, &mut connections);
         migration_data_transform_benchmark(criterion, &runtime, &mut connections);

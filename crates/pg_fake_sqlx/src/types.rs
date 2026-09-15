@@ -307,6 +307,53 @@ impl<'r> Decode<'r, PgFake> for chrono::DateTime<chrono::Utc> {
     }
 }
 
+#[cfg(feature = "time")]
+impl Type<PgFake> for time::OffsetDateTime {
+    fn type_info() -> PgFakeTypeInfo {
+        PgFakeTypeInfo::new(BaseType::TimestampTz)
+    }
+}
+
+#[cfg(feature = "time")]
+impl<'q> Encode<'q, PgFake> for time::OffsetDateTime {
+    fn encode_by_ref(&self, buffer: &mut Vec<Value>) -> Result<IsNull, BoxDynError> {
+        const POSTGRES_EPOCH_NANOS: i128 = 946_684_800_000_000_000;
+
+        let postgres_nanos = self.unix_timestamp_nanos() - POSTGRES_EPOCH_NANOS;
+        let postgres_micros = postgres_nanos / 1_000;
+        let unix_nanos = POSTGRES_EPOCH_NANOS + postgres_micros * 1_000;
+        let seconds = unix_nanos.div_euclid(1_000_000_000);
+        let nanoseconds = unix_nanos.rem_euclid(1_000_000_000);
+        let seconds = i64::try_from(seconds)?;
+        let nanoseconds = u32::try_from(nanoseconds)?;
+        let value = chrono::DateTime::from_timestamp(seconds, nanoseconds)
+            .ok_or("OffsetDateTime is outside pg_fake's timestamptz range")?;
+        buffer.push(Value::TimestampTz(pg_fake::value::PgTimestampTz::Finite(
+            value,
+        )));
+        Ok(IsNull::No)
+    }
+}
+
+#[cfg(feature = "time")]
+impl<'r> Decode<'r, PgFake> for time::OffsetDateTime {
+    fn decode(value: PgFakeValueRef<'r>) -> Result<Self, BoxDynError> {
+        match value.value {
+            Value::TimestampTz(pg_fake::value::PgTimestampTz::Finite(value)) => {
+                const POSTGRES_EPOCH_NANOS: i128 = 946_684_800_000_000_000;
+
+                let unix_nanos = i128::from(value.timestamp()) * 1_000_000_000
+                    + i128::from(value.timestamp_subsec_nanos());
+                let postgres_nanos = unix_nanos - POSTGRES_EPOCH_NANOS;
+                let unix_nanos = POSTGRES_EPOCH_NANOS + postgres_nanos / 1_000 * 1_000;
+                Ok(time::OffsetDateTime::from_unix_timestamp_nanos(unix_nanos)?)
+            }
+            Value::Null => Err(Box::new(UnexpectedNullError)),
+            value => Err(format!("cannot decode {value:?} as OffsetDateTime").into()),
+        }
+    }
+}
+
 impl Type<PgFake> for str {
     fn type_info() -> PgFakeTypeInfo {
         PgFakeTypeInfo::new(BaseType::Text)

@@ -1221,7 +1221,33 @@ strict Clippy, and formatting also pass with the Git dependency.
 - Controlled multi-session differential tests cover contention, ordering,
   repeated acquisition, abort, timeouts, deadlocks, and SQLx transactions.
 
-### Task 25 — SQLx `time::OffsetDateTime` timestamptz codecs
+### Task 25 — SQLx `time::OffsetDateTime` timestamptz codecs [COMPLETE]
+
+**Progress:** Implementation is complete and approved. The
+optional `time` feature adds `OffsetDateTime` type, encode, and decode support
+without changing the core timestamp representation. Encoding normalizes to UTC
+and reproduces SQLx's microsecond truncation relative to PostgreSQL's 2000
+epoch, including negative instants. Out-of-range parameters reach core coercion
+and return the same SQLx database-error category and `22008` SQLSTATE as
+PostgreSQL.
+
+Three focused PostgreSQL 18 differential tests cover direct casts, positive and
+negative epochs, exact and finer-than-microsecond precision, non-UTC offsets,
+nullable and required storage, `Option` values, metadata, invalid input, and
+range failure. A generated differential test passed 10,000 timestamps.
+
+Both feature configurations build, their focused test targets pass, all 241
+native unit tests pass, and strict workspace Clippy and formatting pass. The
+exact `CHAOS_THEORY_CHECK_ITERS=10000 CHAOS_THEORY_CHECK_TIME=600s` property
+gate passes all 17 tests in 788.01 seconds on the final reviewed code. The
+independent re-review is clean after verifying range errors, signed-year
+parameter parsing, and decode quantization. The disposable differential
+database now uses `C` collation explicitly, and unordered aggregate generation
+uses exact numeric types so the gate does not depend on PostgreSQL heap order
+or non-associative floating-point accumulation. The new
+`offset_datetime_bind_store_fetch` benchmark measures approximately 43.15
+microseconds for `pg_fake` and 36.13 microseconds for PostgreSQL 18 on the local
+benchmark environment.
 
 **Goal:** Let applications using the `time` crate exchange PostgreSQL
 `timestamptz` values through `pg_fake_sqlx` without changing their domain
