@@ -5,7 +5,7 @@ use chrono::Timelike;
 use sqlparser::ast;
 
 use crate::{
-    error::{PgError, Result, SqlState},
+    error::{PgError, Result, SqlState, reject_unsupported},
     value::{BaseType, MICROSECONDS_PER_DAY, PgType, Value},
 };
 
@@ -66,10 +66,15 @@ pub(crate) fn convert_ast_data_type(data_type: &ast::DataType) -> Result<PgType>
         ast::DataType::Interval { .. } => (BaseType::Interval, PgType::NO_TYPEMOD),
         ast::DataType::JSON => (BaseType::Json, PgType::NO_TYPEMOD),
         ast::DataType::JSONB => (BaseType::Jsonb, PgType::NO_TYPEMOD),
-        ast::DataType::Array(ast::ArrayElemTypeDef::SquareBracket(element, None))
-            if matches!(element.as_ref(), ast::DataType::Text) =>
-        {
-            (BaseType::TextArray, PgType::NO_TYPEMOD)
+        ast::DataType::Array(ast::ArrayElemTypeDef::SquareBracket(element, None)) => {
+            let element = convert_ast_data_type(element)?.base;
+            let Some(base) = element.get_array_type() else {
+                return reject_unsupported("array element type is not implemented");
+            };
+            (base, PgType::NO_TYPEMOD)
+        }
+        ast::DataType::Array(_) => {
+            return reject_unsupported("array dimensions are not implemented");
         }
         ast::DataType::Custom(name, _) => {
             let identifiers = name
@@ -192,6 +197,12 @@ fn resolve_required_cast_context(source: BaseType, target: BaseType) -> Option<C
     if source == target || is_string_type(source) && is_string_type(target) {
         return Some(CastContext::Implicit);
     }
+    if let (Some(source), Some(target)) = (
+        source.get_array_element_type(),
+        target.get_array_element_type(),
+    ) {
+        return resolve_required_cast_context(source, target);
+    }
     if get_numeric_rank(source).is_some() && get_numeric_rank(target).is_some() {
         return Some(if get_numeric_rank(source) <= get_numeric_rank(target) {
             CastContext::Implicit
@@ -205,8 +216,7 @@ fn resolve_required_cast_context(source: BaseType, target: BaseType) -> Option<C
     if is_string_type(source) {
         if matches!(
             target,
-            BaseType::Uuid
-                | BaseType::Date
+            BaseType::Date
                 | BaseType::Time
                 | BaseType::Timestamp
                 | BaseType::TimestampTz
@@ -344,6 +354,29 @@ pub(crate) fn coerce(
         (BaseType::Json, BaseType::Jsonb) | (BaseType::Jsonb, BaseType::Json)
     ) {
         Value::parse(target.base, &value.format_postgres_text())?
+    } else if let (Some(source_element), Some(target_element)) = (
+        source.get_array_element_type(),
+        target.base.get_array_element_type(),
+    ) {
+        let Value::Array { elem_type, values } = value else {
+            unreachable!("array values use Value::Array");
+        };
+        assert_eq!(elem_type, source_element);
+        Value::Array {
+            elem_type: target_element,
+            values: values
+                .into_iter()
+                .map(|value| {
+                    coerce(
+                        value,
+                        source_element,
+                        PgType::create(target_element),
+                        context,
+                        timezone,
+                    )
+                })
+                .collect::<Result<Vec<_>>>()?,
+        }
     } else if source == target.base || is_string_type(source) && is_string_type(target.base) {
         value
     } else if source == BaseType::Json && is_string_type(target.base) {

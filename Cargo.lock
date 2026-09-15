@@ -1898,6 +1898,7 @@ dependencies = [
  "testcontainers-modules",
  "time",
  "tokio",
+ "uuid",
 ]
 
 [[package]]

@@ -1340,11 +1340,28 @@ hashtextextended-derived transaction lock on the local benchmark environment.
 **Notes:** This task follows Task 24 because it composes with the completed
 advisory-lock overloads. It does not depend on later Phase 3 work.
 
-### Task 27 — BIGINT and UUID array types, I/O, and SQLx codecs
+### Task 27 — BIGINT and UUID array types, I/O, and SQLx codecs [COMPLETE]
 
 **Goal:** Add the generic one-dimensional array representation and deliver the
 BIGINT and UUID application paths without waiting for the broader Phase 3 array
 surface.
+
+**Progress:**
+
+- [x] Replace the bounded TEXT-array representation with `Value::Array`, and
+  migrate the JSON/JSONB path and key-list behavior to it.
+- [x] Add TEXT[], BIGINT[]/`_int8`, and UUID[]/`_uuid` type handling, OIDs,
+  parsing, formatting, casts, storage, defaults, parameters, and metadata.
+- [x] Add SQLx codecs for required and nullable BIGINT and UUID array elements,
+  preserving the distinction between NULL arrays, empty arrays, and NULL
+  elements.
+- [x] Infer an `ARRAY[...]` expression independently before applying assignment
+  coercion, so untyped UUID-array assignment correctly returns `42804` while
+  explicitly typed UUID elements succeed.
+- [x] Add focused native, SQLx differential, generated-property, manifest, and
+  benchmark coverage for array I/O and round trips.
+- [x] Run formatting, workspace checks, strict Clippy, focused array suites, and
+  the required 10,000-iteration property gate.
 
 **DoD:**
 

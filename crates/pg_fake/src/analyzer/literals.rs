@@ -39,7 +39,7 @@ pub(crate) fn create_typed_literal(value: Value, data_type: PgType) -> ast::Expr
         }
         Value::Json(value) => ast::Value::SingleQuotedString(value),
         Value::Jsonb(value) => ast::Value::SingleQuotedString(value.get_postgres_text().to_owned()),
-        Value::TextArray(values) => {
+        Value::Array { values, .. } => {
             ast::Value::SingleQuotedString(crate::text_array::format_array(&values))
         }
     };
@@ -114,6 +114,14 @@ fn convert_to_ast_data_type(data_type: PgType) -> ast::DataType {
         BaseType::Jsonb => ast::DataType::JSONB,
         BaseType::TextArray => ast::DataType::Array(ast::ArrayElemTypeDef::SquareBracket(
             Box::new(ast::DataType::Text),
+            None,
+        )),
+        BaseType::Int8Array => ast::DataType::Array(ast::ArrayElemTypeDef::SquareBracket(
+            Box::new(ast::DataType::BigInt(None)),
+            None,
+        )),
+        BaseType::UuidArray => ast::DataType::Array(ast::ArrayElemTypeDef::SquareBracket(
+            Box::new(ast::DataType::Uuid),
             None,
         )),
     }

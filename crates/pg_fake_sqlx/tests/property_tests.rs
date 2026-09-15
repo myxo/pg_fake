@@ -3097,3 +3097,79 @@ fn matches_generated_text_hashes() {
         );
     });
 }
+
+#[test]
+fn matches_generated_bigint_and_uuid_arrays() {
+    let server = start_isolated_postgres_server();
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap();
+    let postgres = RefCell::new(
+        runtime
+            .block_on(PgConnection::connect(&server.url))
+            .unwrap(),
+    );
+    let fake = RefCell::new(PgFakeConnection::new(Db::create()));
+    check(|src| {
+        let integers = (0..src.any_of("integer_count", int_in(1..=8)))
+            .map(|_| {
+                if src.any("integer_null") {
+                    "NULL::BIGINT".to_owned()
+                } else {
+                    format!("{}::BIGINT", src.any_of("integer", int_in(-100_i64..=100)))
+                }
+            })
+            .collect::<Vec<_>>();
+        let uuids = (0..src.any_of("uuid_count", int_in(1..=8)))
+            .map(|_| {
+                if src.any("uuid_null") {
+                    "NULL::UUID".to_owned()
+                } else {
+                    format!(
+                        "'00000000-0000-4000-8000-{:012x}'::UUID",
+                        src.any_of("uuid", int_in(0_u64..=0xffff_ffff))
+                    )
+                }
+            })
+            .collect::<Vec<_>>();
+        let integer_texts = integers
+            .iter()
+            .map(|value| {
+                if value == "NULL::BIGINT" {
+                    "NULL".to_owned()
+                } else {
+                    format!(
+                        "'{}'",
+                        value
+                            .strip_suffix("::BIGINT")
+                            .expect("BIGINT literal has a type suffix")
+                    )
+                }
+            })
+            .collect::<Vec<_>>();
+        let uuid_texts = uuids
+            .iter()
+            .map(|value| {
+                value
+                    .strip_suffix("::UUID")
+                    .map_or_else(|| "NULL".to_owned(), str::to_owned)
+            })
+            .collect::<Vec<_>>();
+        let sql = format!(
+            "SELECT ARRAY[{}], ARRAY[{}], ARRAY[{}]::TEXT[]::BIGINT[], ARRAY[{}]::TEXT[]::UUID[], ARRAY[]::BIGINT[]",
+            integers.join(","),
+            uuids.join(","),
+            integer_texts.join(","),
+            uuid_texts.join(","),
+        );
+        src.log_value("sql", &sql);
+        assert_statement(
+            &runtime,
+            &mut postgres.borrow_mut(),
+            &mut fake.borrow_mut(),
+            &sql,
+            RowOrder::Ordered,
+        );
+    });
+}

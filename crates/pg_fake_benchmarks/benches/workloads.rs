@@ -104,6 +104,42 @@ impl BenchmarkConnection<'_> {
         }
     }
 
+    fn round_trip_arrays(
+        &mut self,
+        runtime: &Runtime,
+        integers: Vec<Option<i64>>,
+        identifiers: Vec<Option<uuid::Uuid>>,
+    ) {
+        match self {
+            Self::PgFake(connection) => {
+                let values = runtime
+                    .block_on(
+                        sqlx::query_scalar::<_, Vec<Option<i64>>>(
+                            "INSERT INTO bigint_uuid_array_bind_store_fetch VALUES (1, $1, $2) ON CONFLICT (id) DO UPDATE SET values = EXCLUDED.values, identifiers = EXCLUDED.identifiers RETURNING values",
+                        )
+                        .bind(integers)
+                        .bind(identifiers)
+                        .fetch_one(&mut **connection),
+                    )
+                    .unwrap();
+                black_box(values);
+            }
+            Self::Postgres(connection) => {
+                let values = runtime
+                    .block_on(
+                        sqlx::query_scalar::<_, Vec<Option<i64>>>(
+                            "INSERT INTO bigint_uuid_array_bind_store_fetch VALUES (1, $1, $2) ON CONFLICT (id) DO UPDATE SET values = EXCLUDED.values, identifiers = EXCLUDED.identifiers RETURNING values",
+                        )
+                        .bind(integers)
+                        .bind(identifiers)
+                        .fetch_one(&mut **connection),
+                    )
+                    .unwrap();
+                black_box(values);
+            }
+        }
+    }
+
     fn execute_in_transaction(&mut self, runtime: &Runtime, sql: &str) {
         match self {
             Self::PgFake(connection) => {
@@ -642,6 +678,39 @@ fn offset_datetime_benchmark(
     group.finish();
     for (_, connection) in connections.iter_mut() {
         connection.execute(runtime, "DROP TABLE offset_datetime_bind_store_fetch");
+    }
+}
+
+fn bigint_uuid_array_benchmark(
+    criterion: &mut Criterion,
+    runtime: &Runtime,
+    connections: &mut [NamedBenchmarkConnection<'_>],
+) {
+    for (_, connection) in connections.iter_mut() {
+        connection.execute(
+            runtime,
+            "CREATE TABLE bigint_uuid_array_bind_store_fetch (id INTEGER PRIMARY KEY, values BIGINT[] NOT NULL, identifiers UUID[] NOT NULL)",
+        );
+    }
+    let integers = vec![Some(-9_i64), None, Some(7_i64)];
+    let identifiers = vec![
+        Some(uuid::Uuid::parse_str("a0eebc99-9c0b-4ef8-bba9-6a6c0f3b0af7").unwrap()),
+        None,
+        Some(uuid::Uuid::parse_str("018f0f60-4bc5-7d4c-8a4b-23e99e0d3a90").unwrap()),
+    ];
+    let mut group = criterion
+        .benchmark_group(benchmarks::find_benchmark("bigint_uuid_array_bind_store_fetch").name);
+    group.throughput(Throughput::Elements(1));
+    for (name, connection) in connections.iter_mut() {
+        group.bench_function(*name, |benchmark| {
+            benchmark.iter(|| {
+                connection.round_trip_arrays(runtime, integers.clone(), identifiers.clone());
+            });
+        });
+    }
+    group.finish();
+    for (_, connection) in connections.iter_mut() {
+        connection.execute(runtime, "DROP TABLE bigint_uuid_array_bind_store_fetch");
     }
 }
 
@@ -1636,6 +1705,7 @@ fn benchmarks(criterion: &mut Criterion) {
         serial_identity_benchmark(criterion, &runtime, &mut connections);
         uuid_temporal_benchmark(criterion, &runtime, &mut connections);
         offset_datetime_benchmark(criterion, &runtime, &mut connections);
+        bigint_uuid_array_benchmark(criterion, &runtime, &mut connections);
         hashed_advisory_lock_benchmark(criterion, &runtime, &mut connections);
         benchmark_json(criterion, &runtime, &mut connections);
         benchmark_jsonb(criterion, &runtime, &mut connections);

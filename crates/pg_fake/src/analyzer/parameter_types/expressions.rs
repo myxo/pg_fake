@@ -32,12 +32,27 @@ pub(super) fn infer_expression_parameters(
             ast::Expr::Cast {
                 expr, data_type, ..
             } => coercion::convert_ast_data_type(data_type).and_then(|target| {
-                if infer_parameter_expression_type(expr, schema, types).is_none() {
+                if let ast::Expr::Array(array) = expr.as_ref()
+                    && let Some(elem_type) = target.base.get_array_element_type()
+                {
+                    array.elem.iter().try_for_each(|element| {
+                        constrain_parameter_type(element, Some(elem_type), types)
+                    })
+                } else if infer_parameter_expression_type(expr, schema, types).is_none() {
                     constrain_parameter_type(expr, Some(target.base), types)
                 } else {
                     Ok(())
                 }
             }),
+            ast::Expr::Array(array) => {
+                if let Some(elem_type) = expected.and_then(BaseType::get_array_element_type) {
+                    array.elem.iter().try_for_each(|element| {
+                        constrain_parameter_type(element, Some(elem_type), types)
+                    })
+                } else {
+                    Ok(())
+                }
+            }
             ast::Expr::UnaryOp { op, expr } => constrain_parameter_type(
                 expr,
                 matches!(op, ast::UnaryOperator::Not).then_some(BaseType::Bool),

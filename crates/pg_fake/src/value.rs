@@ -75,6 +75,8 @@ pub enum BaseType {
     Json,
     Jsonb,
     TextArray,
+    Int8Array,
+    UuidArray,
 }
 
 impl BaseType {
@@ -103,6 +105,8 @@ impl BaseType {
             BaseType::Json => 114,
             BaseType::Jsonb => 3802,
             BaseType::TextArray => 1009,
+            BaseType::Int8Array => 1016,
+            BaseType::UuidArray => 2951,
         }
     }
 
@@ -131,6 +135,8 @@ impl BaseType {
             BaseType::Json => "json",
             BaseType::Jsonb => "jsonb",
             BaseType::TextArray => "_text",
+            BaseType::Int8Array => "_int8",
+            BaseType::UuidArray => "_uuid",
         }
     }
 
@@ -159,6 +165,8 @@ impl BaseType {
             114 => Some(BaseType::Json),
             3802 => Some(BaseType::Jsonb),
             1009 => Some(BaseType::TextArray),
+            1016 => Some(BaseType::Int8Array),
+            2951 => Some(BaseType::UuidArray),
             _ => None,
         }
     }
@@ -189,6 +197,28 @@ impl BaseType {
             "json" => Some(BaseType::Json),
             "jsonb" => Some(BaseType::Jsonb),
             "text[]" | "_text" => Some(BaseType::TextArray),
+            "bigint[]" | "int8[]" | "_int8" => Some(BaseType::Int8Array),
+            "uuid[]" | "_uuid" => Some(BaseType::UuidArray),
+            _ => None,
+        }
+    }
+
+    #[cfg_attr(feature = "execution-log", tracing::instrument(skip_all))]
+    pub(crate) fn get_array_element_type(self) -> Option<BaseType> {
+        match self {
+            BaseType::TextArray => Some(BaseType::Text),
+            BaseType::Int8Array => Some(BaseType::Int8),
+            BaseType::UuidArray => Some(BaseType::Uuid),
+            _ => None,
+        }
+    }
+
+    #[cfg_attr(feature = "execution-log", tracing::instrument(skip_all))]
+    pub(crate) fn get_array_type(self) -> Option<BaseType> {
+        match self {
+            BaseType::Text => Some(BaseType::TextArray),
+            BaseType::Int8 => Some(BaseType::Int8Array),
+            BaseType::Uuid => Some(BaseType::UuidArray),
             _ => None,
         }
     }
@@ -253,7 +283,10 @@ pub enum Value {
     Interval(PgInterval),
     Json(String),
     Jsonb(crate::jsonb::Jsonb),
-    TextArray(Vec<Option<String>>),
+    Array {
+        elem_type: BaseType,
+        values: Vec<Value>,
+    },
 }
 
 impl Value {
@@ -288,7 +321,11 @@ impl Value {
             Value::Interval(_) => Some(BaseType::Interval),
             Value::Json(_) => Some(BaseType::Json),
             Value::Jsonb(_) => Some(BaseType::Jsonb),
-            Value::TextArray(_) => Some(BaseType::TextArray),
+            Value::Array { elem_type, .. } => Some(
+                elem_type
+                    .get_array_type()
+                    .expect("arrays have supported element types"),
+            ),
         }
     }
 
@@ -359,7 +396,7 @@ impl Value {
             Value::Interval(value) => format_interval(*value),
             Value::Json(value) => value.clone(),
             Value::Jsonb(value) => value.get_postgres_text().to_owned(),
-            Value::TextArray(values) => crate::text_array::format_array(values),
+            Value::Array { values, .. } => crate::text_array::format_array(values),
         }
     }
 
@@ -394,7 +431,13 @@ impl Value {
                 .map(|()| Value::Json(input.to_owned()))
                 .map_err(|()| create_invalid_text_error(input, "json")),
             BaseType::Jsonb => crate::jsonb::Jsonb::parse(input).map(Value::Jsonb),
-            BaseType::TextArray => crate::text_array::parse_array(input).map(Value::TextArray),
+            BaseType::TextArray | BaseType::Int8Array | BaseType::UuidArray => {
+                let elem_type = base
+                    .get_array_element_type()
+                    .expect("array base type has an element type");
+                crate::text_array::parse_array(input, elem_type)
+                    .map(|values| Value::Array { elem_type, values })
+            }
         }
     }
 }

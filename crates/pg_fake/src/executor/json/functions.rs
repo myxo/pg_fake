@@ -116,15 +116,12 @@ fn encode_json_value(value: &Value) -> Result<String> {
         }
         Value::Float4(v) if v.is_finite() => v.to_string(),
         Value::Float8(v) if v.is_finite() => v.to_string(),
-        Value::TextArray(values) => format!(
+        Value::Array { values, .. } => format!(
             "[{}]",
             values
                 .iter()
-                .map(|v| v
-                    .as_ref()
-                    .map(|v| encode_string(v))
-                    .unwrap_or_else(|| "null".into()))
-                .collect::<Vec<_>>()
+                .map(encode_json_value)
+                .collect::<Result<Vec<_>>>()?
                 .join(",")
         ),
         Value::TimestampTz(crate::value::PgTimestampTz::Finite(_)) => encode_string(&format!(
@@ -196,12 +193,24 @@ pub(in crate::executor) fn evaluate_json_function(
         ));
     }
     if name == "jsonb_set" {
-        let Value::TextArray(path) = &values[1] else {
+        let Value::Array {
+            elem_type: BaseType::Text,
+            values: path,
+        } = &values[1]
+        else {
             unreachable!()
         };
+        let path = path
+            .iter()
+            .map(|value| match value {
+                Value::Null => None,
+                Value::Text(value) => Some(value.clone()),
+                _ => unreachable!(),
+            })
+            .collect::<Vec<_>>();
         return modify_path(
             get_json_text(&values[0]),
-            path,
+            &path,
             Some(get_json_text(&values[2])),
             values.get(3) != Some(&Value::Bool(false)),
         );
@@ -227,7 +236,7 @@ pub(in crate::executor) fn evaluate_json_function(
             }
             if matches!(
                 pair[0],
-                Value::Json(_) | Value::Jsonb(_) | Value::TextArray(_)
+                Value::Json(_) | Value::Jsonb(_) | Value::Array { .. }
             ) {
                 return Err(PgError::create(
                     SqlState::InvalidParameterValue,

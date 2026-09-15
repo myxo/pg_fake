@@ -167,7 +167,21 @@ pub(in crate::executor) fn evaluate_json_operator(
             let (path, index_only, key_only) = match right {
                 Value::Text(key) => (vec![Some(key)], false, true),
                 Value::Int4(index) => (vec![Some(index.to_string())], true, false),
-                Value::TextArray(path) => (path, false, false),
+                Value::Array {
+                    elem_type: BaseType::Text,
+                    values,
+                } => (
+                    values
+                        .into_iter()
+                        .map(|value| match value {
+                            Value::Null => None,
+                            Value::Text(value) => Some(value),
+                            _ => unreachable!(),
+                        })
+                        .collect(),
+                    false,
+                    false,
+                ),
                 _ => unreachable!("JSON path was coerced"),
             };
             let mut selected = text;
@@ -199,7 +213,17 @@ pub(in crate::executor) fn evaluate_json_operator(
         Question | QuestionAnd | QuestionPipe => {
             let keys = match right {
                 Value::Text(key) => vec![Some(key)],
-                Value::TextArray(keys) => keys,
+                Value::Array {
+                    elem_type: BaseType::Text,
+                    values,
+                } => values
+                    .into_iter()
+                    .map(|value| match value {
+                        Value::Null => None,
+                        Value::Text(value) => Some(value),
+                        _ => unreachable!(),
+                    })
+                    .collect(),
                 _ => unreachable!(),
             };
             let candidates = match text.as_bytes()[0] {
@@ -307,9 +331,21 @@ pub(in crate::executor) fn evaluate_json_operator(
             Value::parse(BaseType::Jsonb, &output)
         }
         HashMinus => {
-            let Value::TextArray(path) = right else {
+            let Value::Array {
+                elem_type: BaseType::Text,
+                values: path,
+            } = right
+            else {
                 unreachable!()
             };
+            let path = path
+                .into_iter()
+                .map(|value| match value {
+                    Value::Null => None,
+                    Value::Text(value) => Some(value),
+                    _ => unreachable!(),
+                })
+                .collect::<Vec<_>>();
             modify_path(text, &path, None, false)
         }
         _ => unreachable!("JSON operator was resolved"),

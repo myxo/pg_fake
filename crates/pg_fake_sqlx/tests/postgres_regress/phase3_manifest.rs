@@ -448,13 +448,25 @@ pub const FEATURES: &[Feature] = &[
     },
     Feature {
         name: "array type and I/O",
-        cases: &[Case {
-            id: "array_literal",
-            source: "arrays.sql:276",
-            setup: &[],
-            sql: "SELECT ARRAY[1, NULL, 3]",
-            blocker: BlockerKind::Implementation,
-        }],
+        cases: &[
+            Case {
+                id: "bigint_uuid_array_literals",
+                source: "tests/array_differential.rs",
+                setup: &[],
+                sql: "SELECT ARRAY[1::BIGINT, NULL, -3], ARRAY['a0eebc99-9c0b-4ef8-bba9-6a6c0f3b0af7'::UUID, NULL], ARRAY['1',NULL,'-3']::TEXT[]::BIGINT[], ARRAY['a0eebc99-9c0b-4ef8-bba9-6a6c0f3b0af7',NULL]::TEXT[]::UUID[], ARRAY[]::BIGINT[]",
+                blocker: BlockerKind::Implementation,
+            },
+            Case {
+                id: "array_storage_and_text_io",
+                source: "tests/array_differential.rs",
+                setup: &[
+                    "CREATE TABLE phase3_arrays (id INTEGER PRIMARY KEY, values BIGINT[] NOT NULL DEFAULT ARRAY[1::BIGINT, 2], identifiers UUID[], labels TEXT[])",
+                    "INSERT INTO phase3_arrays (id, identifiers, labels) VALUES (1, ARRAY['a0eebc99-9c0b-4ef8-bba9-6a6c0f3b0af7'::UUID, NULL], '{plain,\"comma,value\",NULL}')",
+                ],
+                sql: "SELECT values, identifiers, labels FROM phase3_arrays",
+                blocker: BlockerKind::Implementation,
+            },
+        ],
     },
     Feature {
         name: "array expressions",

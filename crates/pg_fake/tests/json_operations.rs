@@ -17,7 +17,10 @@ fn executes_prepared_json_paths_and_lateral_expansion() {
         session.prepare("SELECT $1 ->> 'a'").unwrap_err().sqlstate,
         SqlState::AmbiguousFunction
     );
-    let path = Value::TextArray(vec![Some("amount".into()), Some("value".into())]);
+    let path = Value::Array {
+        elem_type: pg_fake::value::BaseType::Text,
+        values: vec![Value::Text("amount".into()), Value::Text("value".into())],
+    };
     let query = session
         .prepare("SELECT ($1::jsonb #>> $2)::numeric::bigint AS amount")
         .unwrap();

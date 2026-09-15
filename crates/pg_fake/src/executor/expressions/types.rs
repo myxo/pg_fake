@@ -141,17 +141,7 @@ pub(crate) fn infer_expression_type(expr: &ast::Expr, schema: RowScope<'_>) -> R
             }
             Ok(BaseType::Bool)
         }
-        ast::Expr::Array(array) => {
-            for element in &array.elem {
-                validate_function_argument(element, BaseType::Text, schema, &|| {
-                    PgError::create(
-                        SqlState::DatatypeMismatch,
-                        "text array element has incompatible type",
-                    )
-                })?;
-            }
-            Ok(BaseType::TextArray)
-        }
+        ast::Expr::Array(array) => infer_array_type(array, schema),
         ast::Expr::Interval(interval)
             if interval.leading_field.is_none()
                 && interval.leading_precision.is_none()
@@ -343,6 +333,24 @@ pub(crate) fn infer_expression_type(expr: &ast::Expr, schema: RowScope<'_>) -> R
                 return reject_unsupported("cast variant is not implemented");
             }
             let target = coercion::convert_ast_data_type(data_type)?;
+            if let ast::Expr::Array(array) = expr.as_ref()
+                && let Some(elem_type) = target.base.get_array_element_type()
+            {
+                for element in &array.elem {
+                    if is_null_literal(element) || extract_unknown_string_literal(element).is_some()
+                    {
+                        continue;
+                    }
+                    let source = infer_expression_type(element, schema)?;
+                    if !coercion::can_cast(source, elem_type, CastContext::Explicit) {
+                        return Err(PgError::create(
+                            SqlState::CannotCoerce,
+                            "array element types cannot be cast",
+                        ));
+                    }
+                }
+                return Ok(target.base);
+            }
             if matches!(target.base, BaseType::Json | BaseType::Jsonb)
                 && let Some(text) = extract_unknown_string_literal(expr)
             {
@@ -381,6 +389,23 @@ pub(crate) fn infer_expression_type(expr: &ast::Expr, schema: RowScope<'_>) -> R
         }
         _ => reject_unsupported("expression is not implemented"),
     }
+}
+
+#[cfg_attr(feature = "execution-log", tracing::instrument(skip_all))]
+pub(super) fn infer_array_type(array: &ast::Array, schema: RowScope<'_>) -> Result<BaseType> {
+    if array.elem.is_empty() {
+        return Err(PgError::create(
+            SqlState::IndeterminateDatatype,
+            "cannot determine type of empty array",
+        ));
+    }
+    let elem_type = resolve_expression_list_type(&array.elem.iter().collect::<Vec<_>>(), schema)?;
+    elem_type.get_array_type().ok_or_else(|| {
+        PgError::create(
+            SqlState::FeatureNotSupported,
+            "array element type is not implemented",
+        )
+    })
 }
 
 #[cfg_attr(feature = "execution-log", tracing::instrument(skip_all))]

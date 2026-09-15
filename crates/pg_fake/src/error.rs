@@ -60,18 +60,19 @@ pub enum SqlState {
     QueryCanceled, // 57014
 
     // 42 — Syntax Error / Access Rule
-    UndefinedTable,     // 42P01
-    DuplicateTable,     // 42P07
-    DuplicateSchema,    // 42P06
-    DuplicateColumn,    // 42701
-    DuplicateFunction,  // 42723
-    DuplicateObject,    // 42710
-    AmbiguousColumn,    // 42702
-    SyntaxError,        // 42601
-    UndefinedColumn,    // 42703
-    UndefinedFunction,  // 42883
-    UndefinedObject,    // 42704
-    UndefinedParameter, // 42P02
+    UndefinedTable,        // 42P01
+    DuplicateTable,        // 42P07
+    DuplicateSchema,       // 42P06
+    DuplicateColumn,       // 42701
+    DuplicateFunction,     // 42723
+    DuplicateObject,       // 42710
+    AmbiguousColumn,       // 42702
+    SyntaxError,           // 42601
+    UndefinedColumn,       // 42703
+    UndefinedFunction,     // 42883
+    UndefinedObject,       // 42704
+    UndefinedParameter,    // 42P02
+    IndeterminateDatatype, // 42P18
     AmbiguousFunction,
     AmbiguousParameter,        // 42P08
     CannotCoerce,              // 42846
@@ -148,6 +149,7 @@ impl SqlState {
             SqlState::UndefinedFunction => "42883",
             SqlState::UndefinedObject => "42704",
             SqlState::UndefinedParameter => "42P02",
+            SqlState::IndeterminateDatatype => "42P18",
             SqlState::AmbiguousParameter => "42P08",
             SqlState::AmbiguousFunction => "42725",
             SqlState::CannotCoerce => "42846",

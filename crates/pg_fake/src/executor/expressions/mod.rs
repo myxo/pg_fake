@@ -42,7 +42,7 @@ pub(crate) use types::{infer_expression_data_type, infer_expression_type};
 use comparisons::{evaluate_membership, evaluate_quantified};
 use functions::{evaluate_function, extract_datetime_field};
 use literals::parse_integer_literal;
-use types::resolve_expression_list_type;
+use types::{infer_array_type, resolve_expression_list_type};
 
 #[cfg_attr(feature = "execution-log", tracing::instrument(skip_all))]
 pub(super) fn evaluate_assignment_expression(
@@ -116,26 +116,18 @@ fn evaluate_inner(
             evaluate_unary_operator(*op, evaluate(expr, schema, row, context)?)
         }
         ast::Expr::Array(array) => {
-            let values = array
-                .elem
-                .iter()
-                .map(|element| {
-                    let value = evaluate_and_coerce(
-                        element,
-                        BaseType::Text,
-                        CastContext::Implicit,
-                        schema,
-                        row,
-                        context,
-                    )?;
-                    Ok(match value {
-                        Value::Null => None,
-                        Value::Text(value) => Some(value),
-                        _ => unreachable!(),
-                    })
-                })
-                .collect::<Result<Vec<_>>>()?;
-            Ok(Value::TextArray(values))
+            let array_type = infer_array_type(array, schema)?;
+            let elem_type = array_type
+                .get_array_element_type()
+                .expect("array type has an element type");
+            evaluate_array(
+                array,
+                elem_type,
+                CastContext::Implicit,
+                schema,
+                row,
+                context,
+            )
         }
         ast::Expr::Interval(interval)
             if interval.leading_field.is_none()
@@ -491,6 +483,18 @@ fn evaluate_inner(
                 return reject_unsupported("cast variant is not implemented");
             }
             let target = coercion::convert_ast_data_type(data_type)?;
+            if let ast::Expr::Array(array) = expr.as_ref()
+                && let Some(elem_type) = target.base.get_array_element_type()
+            {
+                return evaluate_array(
+                    array,
+                    elem_type,
+                    CastContext::Explicit,
+                    schema,
+                    row,
+                    context,
+                );
+            }
             if let Some(text) = extract_unknown_string_literal(expr) {
                 coercion::coerce_unknown(text, target, CastContext::Explicit, &context.timezone)
             } else {
@@ -511,6 +515,23 @@ fn evaluate_inner(
 }
 
 #[cfg_attr(feature = "execution-log", tracing::instrument(skip_all))]
+fn evaluate_array(
+    array: &ast::Array,
+    elem_type: BaseType,
+    cast_context: CastContext,
+    schema: RowScope<'_>,
+    row: &[Value],
+    context: &StatementContext,
+) -> Result<Value> {
+    let values = array
+        .elem
+        .iter()
+        .map(|element| evaluate_and_coerce(element, elem_type, cast_context, schema, row, context))
+        .collect::<Result<Vec<_>>>()?;
+    Ok(Value::Array { elem_type, values })
+}
+
+#[cfg_attr(feature = "execution-log", tracing::instrument(skip_all))]
 pub(super) fn evaluate_and_coerce(
     expression: &ast::Expr,
     target: BaseType,
@@ -519,6 +540,11 @@ pub(super) fn evaluate_and_coerce(
     row: &[Value],
     execution: &StatementContext,
 ) -> Result<Value> {
+    if let ast::Expr::Array(array) = expression
+        && let Some(elem_type) = target.get_array_element_type()
+    {
+        return evaluate_array(array, elem_type, context, schema, row, execution);
+    }
     if let Some(text) = extract_unknown_string_literal(expression) {
         coercion::coerce_unknown(text, PgType::create(target), context, &execution.timezone)
     } else {

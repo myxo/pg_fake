@@ -66,6 +66,8 @@ impl TypeInfo for PgFakeTypeInfo {
             Some(BaseType::Json) => "JSON",
             Some(BaseType::Jsonb) => "JSONB",
             Some(BaseType::TextArray) => "TEXT[]",
+            Some(BaseType::Int8Array) => "INT8[]",
+            Some(BaseType::UuidArray) => "UUID[]",
             None => "NULL",
         }
     }
@@ -497,14 +499,31 @@ impl Type<PgFake> for Vec<Option<String>> {
 }
 impl<'q> Encode<'q, PgFake> for Vec<Option<String>> {
     fn encode_by_ref(&self, buf: &mut Vec<Value>) -> Result<IsNull, BoxDynError> {
-        buf.push(Value::TextArray(self.clone()));
+        buf.push(Value::Array {
+            elem_type: BaseType::Text,
+            values: self
+                .iter()
+                .map(|value| value.clone().map(Value::Text).unwrap_or(Value::Null))
+                .collect(),
+        });
         Ok(IsNull::No)
     }
 }
 impl<'r> Decode<'r, PgFake> for Vec<Option<String>> {
     fn decode(value: PgFakeValueRef<'r>) -> Result<Self, BoxDynError> {
         match value.value {
-            Value::TextArray(values) => Ok(values.clone()),
+            Value::Array {
+                elem_type: BaseType::Text,
+                values,
+            } => values
+                .iter()
+                .map(|value| match value {
+                    Value::Null => Ok(None),
+                    Value::Text(value) => Ok(Some(value.clone())),
+                    _ => Err("expected text array".into()),
+                })
+                .collect(),
+            Value::Null => Err(Box::new(UnexpectedNullError)),
             _ => Err("expected text array".into()),
         }
     }
@@ -516,7 +535,10 @@ impl Type<PgFake> for Vec<String> {
 }
 impl<'q> Encode<'q, PgFake> for Vec<String> {
     fn encode_by_ref(&self, buf: &mut Vec<Value>) -> Result<IsNull, BoxDynError> {
-        buf.push(Value::TextArray(self.iter().cloned().map(Some).collect()));
+        buf.push(Value::Array {
+            elem_type: BaseType::Text,
+            values: self.iter().cloned().map(Value::Text).collect(),
+        });
         Ok(IsNull::No)
     }
 }
@@ -525,6 +547,124 @@ impl<'r> Decode<'r, PgFake> for Vec<String> {
         <Vec<Option<String>> as Decode<PgFake>>::decode(value)?
             .into_iter()
             .map(|v| v.ok_or_else(|| "unexpected null array element".into()))
+            .collect()
+    }
+}
+
+impl Type<PgFake> for Vec<Option<i64>> {
+    fn type_info() -> PgFakeTypeInfo {
+        PgFakeTypeInfo::new(BaseType::Int8Array)
+    }
+}
+impl<'q> Encode<'q, PgFake> for Vec<Option<i64>> {
+    fn encode_by_ref(&self, buf: &mut Vec<Value>) -> Result<IsNull, BoxDynError> {
+        buf.push(Value::Array {
+            elem_type: BaseType::Int8,
+            values: self
+                .iter()
+                .map(|value| value.map(Value::Int8).unwrap_or(Value::Null))
+                .collect(),
+        });
+        Ok(IsNull::No)
+    }
+}
+impl<'r> Decode<'r, PgFake> for Vec<Option<i64>> {
+    fn decode(value: PgFakeValueRef<'r>) -> Result<Self, BoxDynError> {
+        match value.value {
+            Value::Array {
+                elem_type: BaseType::Int8,
+                values,
+            } => values
+                .iter()
+                .map(|value| match value {
+                    Value::Null => Ok(None),
+                    Value::Int8(value) => Ok(Some(*value)),
+                    _ => Err("expected bigint array".into()),
+                })
+                .collect(),
+            Value::Null => Err(Box::new(UnexpectedNullError)),
+            _ => Err("expected bigint array".into()),
+        }
+    }
+}
+impl Type<PgFake> for Vec<i64> {
+    fn type_info() -> PgFakeTypeInfo {
+        <Vec<Option<i64>> as Type<PgFake>>::type_info()
+    }
+}
+impl<'q> Encode<'q, PgFake> for Vec<i64> {
+    fn encode_by_ref(&self, buf: &mut Vec<Value>) -> Result<IsNull, BoxDynError> {
+        buf.push(Value::Array {
+            elem_type: BaseType::Int8,
+            values: self.iter().copied().map(Value::Int8).collect(),
+        });
+        Ok(IsNull::No)
+    }
+}
+impl<'r> Decode<'r, PgFake> for Vec<i64> {
+    fn decode(value: PgFakeValueRef<'r>) -> Result<Self, BoxDynError> {
+        <Vec<Option<i64>> as Decode<PgFake>>::decode(value)?
+            .into_iter()
+            .map(|value| value.ok_or_else(|| "unexpected null array element".into()))
+            .collect()
+    }
+}
+
+impl Type<PgFake> for Vec<Option<uuid::Uuid>> {
+    fn type_info() -> PgFakeTypeInfo {
+        PgFakeTypeInfo::new(BaseType::UuidArray)
+    }
+}
+impl<'q> Encode<'q, PgFake> for Vec<Option<uuid::Uuid>> {
+    fn encode_by_ref(&self, buf: &mut Vec<Value>) -> Result<IsNull, BoxDynError> {
+        buf.push(Value::Array {
+            elem_type: BaseType::Uuid,
+            values: self
+                .iter()
+                .map(|value| value.map(Value::Uuid).unwrap_or(Value::Null))
+                .collect(),
+        });
+        Ok(IsNull::No)
+    }
+}
+impl<'r> Decode<'r, PgFake> for Vec<Option<uuid::Uuid>> {
+    fn decode(value: PgFakeValueRef<'r>) -> Result<Self, BoxDynError> {
+        match value.value {
+            Value::Array {
+                elem_type: BaseType::Uuid,
+                values,
+            } => values
+                .iter()
+                .map(|value| match value {
+                    Value::Null => Ok(None),
+                    Value::Uuid(value) => Ok(Some(*value)),
+                    _ => Err("expected UUID array".into()),
+                })
+                .collect(),
+            Value::Null => Err(Box::new(UnexpectedNullError)),
+            _ => Err("expected UUID array".into()),
+        }
+    }
+}
+impl Type<PgFake> for Vec<uuid::Uuid> {
+    fn type_info() -> PgFakeTypeInfo {
+        <Vec<Option<uuid::Uuid>> as Type<PgFake>>::type_info()
+    }
+}
+impl<'q> Encode<'q, PgFake> for Vec<uuid::Uuid> {
+    fn encode_by_ref(&self, buf: &mut Vec<Value>) -> Result<IsNull, BoxDynError> {
+        buf.push(Value::Array {
+            elem_type: BaseType::Uuid,
+            values: self.iter().copied().map(Value::Uuid).collect(),
+        });
+        Ok(IsNull::No)
+    }
+}
+impl<'r> Decode<'r, PgFake> for Vec<uuid::Uuid> {
+    fn decode(value: PgFakeValueRef<'r>) -> Result<Self, BoxDynError> {
+        <Vec<Option<uuid::Uuid>> as Decode<PgFake>>::decode(value)?
+            .into_iter()
+            .map(|value| value.ok_or_else(|| "unexpected null array element".into()))
             .collect()
     }
 }

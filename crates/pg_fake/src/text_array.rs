@@ -1,6 +1,9 @@
-use crate::error::{PgError, Result, SqlState, reject_unsupported};
+use crate::{
+    error::{PgError, Result, SqlState, reject_unsupported},
+    value::{BaseType, Value},
+};
 
-pub(crate) fn parse_array(input: &str) -> Result<Vec<Option<String>>> {
+pub(crate) fn parse_array(input: &str, elem_type: BaseType) -> Result<Vec<Value>> {
     let invalid = || {
         PgError::create(
             SqlState::InvalidTextRepresentation,
@@ -72,9 +75,9 @@ pub(crate) fn parse_array(input: &str) -> Result<Vec<Option<String>>> {
         }
         values.push(
             if !quoted && !escaped && value.eq_ignore_ascii_case("null") {
-                None
+                Value::Null
             } else {
-                Some(value)
+                Value::parse(elem_type, &value)?
             },
         );
         match chars.next() {
@@ -86,21 +89,26 @@ pub(crate) fn parse_array(input: &str) -> Result<Vec<Option<String>>> {
     Ok(values)
 }
 
-pub(crate) fn format_array(values: &[Option<String>]) -> String {
+pub(crate) fn format_array(values: &[Value]) -> String {
     format!(
         "{{{}}}",
         values
             .iter()
             .map(|value| match value {
-                None => "NULL".to_owned(),
-                Some(value)
+                Value::Null => "NULL".to_owned(),
+                value => {
+                    let value = value.format_postgres_text();
                     if !value.is_empty()
                         && !value.eq_ignore_ascii_case("null")
-                        && !value.chars().any(
-                            |c| c.is_whitespace() || matches!(c, ',' | '{' | '}' | '"' | '\\')
-                        ) =>
-                    value.clone(),
-                Some(value) => format!("\"{}\"", value.replace('\\', "\\\\").replace('"', "\\\"")),
+                        && !value
+                            .chars()
+                            .any(|c| c.is_whitespace() || matches!(c, ',' | '{' | '}' | '"' | '\\'))
+                    {
+                        value
+                    } else {
+                        format!("\"{}\"", value.replace('\\', "\\\\").replace('"', "\\\""))
+                    }
+                }
             })
             .collect::<Vec<_>>()
             .join(",")

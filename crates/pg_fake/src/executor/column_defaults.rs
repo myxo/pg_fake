@@ -4,7 +4,6 @@ use super::{
         create_constant_expression_schema, evaluate_assignment_expression,
         extract_unknown_string_literal, infer_expression_type,
     },
-    scope::RowScope,
 };
 use crate::{
     catalog::ColumnDef,
@@ -69,7 +68,7 @@ pub(super) fn validate_column_default(column: &ColumnDef) -> Result<()> {
     }
     let source = infer_expression_type(
         expression,
-        RowScope::Table(&create_constant_expression_schema()),
+        super::scope::RowScope::Table(&create_constant_expression_schema()),
     )
     .map_err(|error| {
         if error.sqlstate == SqlState::UndefinedColumn {
