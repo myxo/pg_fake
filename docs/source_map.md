@@ -201,8 +201,11 @@ function signatures and values, including window-call validation;
 handles ordering, comparison eligibility, and row/list membership.
 
 [`runtime.rs`](../crates/pg_fake/src/executor/expressions/runtime.rs) shares scalar
-runtime signatures with parameter inference and dispatches temporal, floor, and
-regex and advisory functions. [`temporal.rs`](../crates/pg_fake/src/executor/expressions/temporal.rs)
+runtime signatures with parameter inference and dispatches temporal, floor,
+regex, text-hash, and advisory functions.
+[`hashing.rs`](../crates/pg_fake/src/executor/expressions/hashing.rs) implements
+PostgreSQL-compatible text hashing and extended seeded hashing.
+[`temporal.rs`](../crates/pg_fake/src/executor/expressions/temporal.rs)
 implements epoch conversion and bounded timestamp formatting/truncation.
 [`coercion/time_zones.rs`](../crates/pg_fake/src/coercion/time_zones.rs) resolves
 zones and supplies conversions shared by casts and `AT TIME ZONE`. Execution

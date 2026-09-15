@@ -13,7 +13,9 @@ cover a sequence-backed identity insert with `RETURNING`, and a UUID key lookup
 that applies timestamp-with-time-zone and interval arithmetic.
 The `offset_datetime_bind_store_fetch` workload measures a `time::OffsetDateTime`
 bind, `timestamptz` store, and decoded `RETURNING` value through each SQLx
-adapter.
+adapter. The `hashed_advisory_lock_acquisition` workload measures an explicit
+transaction that derives an advisory key with `hashtextextended` and acquires
+the corresponding transaction lock.
 
 Diagnostic groups isolate costs within `pg_fake`:
 

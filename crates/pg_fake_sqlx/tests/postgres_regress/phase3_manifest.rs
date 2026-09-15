@@ -771,6 +771,25 @@ pub const FEATURES: &[Feature] = &[
         ],
     },
     Feature {
+        name: "text hash functions and advisory locks",
+        cases: &[
+            Case {
+                id: "text_hash_values",
+                source: "tests/text_hash_differential.rs",
+                setup: &[],
+                sql: "SELECT hashtext(''), hashtext('Привет'), hashtextextended('extended',-9223372036854775808)",
+                blocker: BlockerKind::Implementation,
+            },
+            Case {
+                id: "hashed_advisory_lock",
+                source: "tests/text_hash_differential.rs",
+                setup: &[],
+                sql: "SELECT pg_try_advisory_xact_lock(hashtext('resource')), pg_try_advisory_xact_lock(hashtextextended('resource',0)), pg_try_advisory_xact_lock(17,hashtext('resource'))",
+                blocker: BlockerKind::Implementation,
+            },
+        ],
+    },
+    Feature {
         name: "serializable dependency tracking",
         cases: &[Case {
             id: "serializable_transaction",
@@ -857,6 +876,12 @@ pub const SCENARIOS: &[Scenario] = &[
         feature: "SELECT row locks",
         name: "skip_locked_work_queue",
         source: "limit.sql:179 plus focused two-session scenario",
+        blocker: BlockerKind::Implementation,
+    },
+    Scenario {
+        feature: "text hash functions and advisory locks",
+        name: "hashed_advisory_contention",
+        source: "tests/text_hash_differential.rs",
         blocker: BlockerKind::Implementation,
     },
     Scenario {

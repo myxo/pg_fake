@@ -132,6 +132,11 @@ pub fn list_benchmarks() -> Vec<Benchmark> {
             postgres_comparisons(),
         ),
         build_benchmark(
+            "hashed_advisory_lock_acquisition",
+            postgres_values(),
+            postgres_comparisons(),
+        ),
+        build_benchmark(
             "json_insert_returning",
             postgres_values(),
             postgres_comparisons(),

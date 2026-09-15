@@ -1280,7 +1280,31 @@ types.
 implementation. It has no dependency on the remaining Phase 3 transaction,
 window, array, or SERIALIZABLE tasks.
 
-### Task 26 — Text hash functions and advisory-lock composition
+### Task 26 — Text hash functions and advisory-lock composition [COMPLETE]
+
+**Progress:** Implementation, validation, independent re-review, and user
+approval are complete. Added PostgreSQL 18-compatible `hashtext` and `hashtextextended`
+execution over UTF-8 text bytes, strict NULL propagation, exact INT4/INT8
+metadata, full signed-seed handling, and order-sensitive shared-parameter
+inference. Both hash results compose with prepared one-key and integer-pair
+transaction advisory-lock calls without introducing a separate lock identity.
+
+Three focused PostgreSQL 18 differential tests cover empty, ASCII, multibyte,
+and long text; minimum and maximum seeds; NULLs; invalid overloads; prepared
+metadata and execution; shared parameters; and controlled two-session lock
+contention, independence, retry, commit, and rollback. The Phase 3 manifest has
+two passing cases plus a named contention scenario. The generated hash and
+advisory comparison passed 10,000 cases, and the exact
+`CHAOS_THEORY_CHECK_ITERS=10000 CHAOS_THEORY_CHECK_TIME=600s` property gate
+passed all 18 tests in 752.82 seconds. All 240 core unit tests pass, the existing
+runtime/advisory prepared tests pass, and strict workspace Clippy and formatting
+are clean. The full legacy workspace differential run remains blocked by its
+pre-existing local-database collation mismatch; the isolated C-collation suites
+and all new hash comparisons pass.
+
+The `hashed_advisory_lock_acquisition` benchmark measures approximately 48.7
+microseconds for `pg_fake` and 79.0 microseconds for PostgreSQL 18 over a
+hashtextextended-derived transaction lock on the local benchmark environment.
 
 **Goal:** Support PostgreSQL-compatible text-derived advisory-lock keys.
 

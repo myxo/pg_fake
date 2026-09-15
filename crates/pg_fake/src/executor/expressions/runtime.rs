@@ -70,9 +70,13 @@ pub(crate) fn resolve_runtime_function(
         ("date_trunc", [_, _, _]) => Ok((vec![Text, TimestampTz, Text], TimestampTz)),
         ("regexp_like", [_, _]) => Ok((vec![Text, Text], Bool)),
         ("regexp_like", [_, _, _]) => Ok((vec![Text, Text, Text], Bool)),
-        ("to_timestamp" | "floor" | "to_char" | "date_trunc" | "regexp_like", _) => {
-            Err(signature_error())
-        }
+        ("hashtext", [_]) => Ok((vec![Text], Int4)),
+        ("hashtextextended", [_, _]) => Ok((vec![Text, Int8], Int8)),
+        (
+            "to_timestamp" | "floor" | "to_char" | "date_trunc" | "regexp_like" | "hashtext"
+            | "hashtextextended",
+            _,
+        ) => Err(signature_error()),
         _ => return None,
     })
 }
@@ -84,7 +88,13 @@ pub(super) fn infer_runtime_function(
 ) -> Result<Option<(Vec<BaseType>, BaseType)>> {
     if !matches!(
         name,
-        "to_timestamp" | "floor" | "to_char" | "date_trunc" | "regexp_like"
+        "to_timestamp"
+            | "floor"
+            | "to_char"
+            | "date_trunc"
+            | "regexp_like"
+            | "hashtext"
+            | "hashtextextended"
     ) && crate::advisory::resolve_advisory_function(name).is_none()
     {
         return Ok(None);
@@ -161,6 +171,12 @@ pub(super) fn evaluate_runtime_function(
         ("regexp_like", [Value::Text(value), Value::Text(pattern), Value::Text(flags)]) => {
             super::patterns::evaluate_regex(value, pattern, flags)
         }
+        ("hashtext", [Value::Text(value)]) => {
+            Ok(Value::Int4(super::hashing::calculate_text_hash(value)))
+        }
+        ("hashtextextended", [Value::Text(value), Value::Int8(seed)]) => Ok(Value::Int8(
+            super::hashing::calculate_extended_text_hash(value, *seed),
+        )),
         _ => unreachable!("runtime function arguments were coerced"),
     }
 }

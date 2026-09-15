@@ -645,6 +645,27 @@ fn offset_datetime_benchmark(
     }
 }
 
+fn hashed_advisory_lock_benchmark(
+    criterion: &mut Criterion,
+    runtime: &Runtime,
+    connections: &mut [NamedBenchmarkConnection<'_>],
+) {
+    let mut group = criterion
+        .benchmark_group(benchmarks::find_benchmark("hashed_advisory_lock_acquisition").name);
+    group.throughput(Throughput::Elements(1));
+    for (name, connection) in connections.iter_mut() {
+        group.bench_function(*name, |benchmark| {
+            benchmark.iter(|| {
+                connection.execute_in_transaction(
+                    runtime,
+                    "SELECT pg_advisory_xact_lock(hashtextextended('benchmark-resource',0))",
+                );
+            });
+        });
+    }
+    group.finish();
+}
+
 fn benchmark_json(
     criterion: &mut Criterion,
     runtime: &Runtime,
@@ -1615,6 +1636,7 @@ fn benchmarks(criterion: &mut Criterion) {
         serial_identity_benchmark(criterion, &runtime, &mut connections);
         uuid_temporal_benchmark(criterion, &runtime, &mut connections);
         offset_datetime_benchmark(criterion, &runtime, &mut connections);
+        hashed_advisory_lock_benchmark(criterion, &runtime, &mut connections);
         benchmark_json(criterion, &runtime, &mut connections);
         benchmark_jsonb(criterion, &runtime, &mut connections);
         migration_data_transform_benchmark(criterion, &runtime, &mut connections);

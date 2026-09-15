@@ -17,6 +17,7 @@ use sqlparser::ast;
 
 mod comparisons;
 mod functions;
+mod hashing;
 mod literals;
 mod patterns;
 mod resume;

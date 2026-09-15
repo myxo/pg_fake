@@ -31,8 +31,13 @@ pub(super) fn infer_expression_parameters(
             ast::Expr::Nested(inner) => constrain_parameter_type(inner, expected, types),
             ast::Expr::Cast {
                 expr, data_type, ..
-            } => coercion::convert_ast_data_type(data_type)
-                .and_then(|target| constrain_parameter_type(expr, Some(target.base), types)),
+            } => coercion::convert_ast_data_type(data_type).and_then(|target| {
+                if infer_parameter_expression_type(expr, schema, types).is_none() {
+                    constrain_parameter_type(expr, Some(target.base), types)
+                } else {
+                    Ok(())
+                }
+            }),
             ast::Expr::UnaryOp { op, expr } => constrain_parameter_type(
                 expr,
                 matches!(op, ast::UnaryOperator::Not).then_some(BaseType::Bool),
@@ -259,8 +264,9 @@ fn infer_function_parameters(
         .collect::<Vec<_>>();
     if let Some(signature) = executor::resolve_runtime_function(&name, &argument_types) {
         let (targets, _) = signature?;
-        for (argument, target) in arguments.iter().zip(targets) {
-            if infer_parameter_expression_type(argument, schema, types).is_none() {
+        for ((argument, argument_type), target) in arguments.iter().zip(argument_types).zip(targets)
+        {
+            if argument_type.is_none() {
                 constrain_parameter_type(argument, Some(target), types)?;
             }
         }

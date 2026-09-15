@@ -3059,3 +3059,41 @@ fn matches_generated_advisory_transactions() {
         }
     });
 }
+
+#[test]
+fn matches_generated_text_hashes() {
+    let server = start_isolated_postgres_server();
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap();
+    let postgres = RefCell::new(
+        runtime
+            .block_on(PgConnection::connect(&server.url))
+            .unwrap(),
+    );
+    let fake = RefCell::new(PgFakeConnection::new(Db::create()));
+    check(|src| {
+        let alphabet = ['a', 'Z', '0', '-', 'é', 'Ж', '🙂'];
+        let length = src.any_of("length", int_in(0..=128));
+        let value = (0..length)
+            .map(|_| alphabet[src.any_of("character", int_in(0..=alphabet.len() - 1))])
+            .collect::<String>();
+        let seed = src.any_of("seed", int_in(i64::MIN..=i64::MAX));
+        let pair = src.any_of("pair", int_in(i32::MIN..=i32::MAX));
+        let sql = format!(
+            "SELECT hashtext('{value}'), hashtextextended('{value}',{seed}), \
+                    pg_try_advisory_xact_lock(hashtext('{value}')), \
+                    pg_try_advisory_xact_lock(hashtextextended('{value}',{seed})), \
+                    pg_try_advisory_xact_lock({pair},hashtext('{value}'))"
+        );
+        src.log_value("sql", &sql);
+        assert_statement(
+            &runtime,
+            &mut postgres.borrow_mut(),
+            &mut fake.borrow_mut(),
+            &sql,
+            RowOrder::Ordered,
+        );
+    });
+}
