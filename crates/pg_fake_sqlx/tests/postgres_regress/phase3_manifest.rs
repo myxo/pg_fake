@@ -469,6 +469,28 @@ pub const FEATURES: &[Feature] = &[
         ],
     },
     Feature {
+        name: "required array queries",
+        cases: &[
+            Case {
+                id: "ordered_filtered_bigint_array_agg_subscript",
+                source: "tests/array_differential.rs",
+                setup: &[
+                    "CREATE TABLE phase3_array_aggregate (issued_at BIGINT)",
+                    "INSERT INTO phase3_array_aggregate VALUES (10), (20), (30)",
+                ],
+                sql: "SELECT max(issued_at) AS latest, (array_agg(issued_at ORDER BY issued_at DESC) FILTER (WHERE issued_at <= 30))[2] AS second FROM phase3_array_aggregate",
+                blocker: BlockerKind::Implementation,
+            },
+            Case {
+                id: "uuid_any_all_membership",
+                source: "tests/array_differential.rs",
+                setup: &[],
+                sql: "SELECT '00000000-0000-4000-8000-000000000001'::UUID = ANY(ARRAY['00000000-0000-4000-8000-000000000001'::UUID, NULL]), '00000000-0000-4000-8000-000000000002'::UUID <> ALL(ARRAY[]::UUID[])",
+                blocker: BlockerKind::Implementation,
+            },
+        ],
+    },
+    Feature {
         name: "array expressions",
         cases: &[Case {
             id: "array_containment",

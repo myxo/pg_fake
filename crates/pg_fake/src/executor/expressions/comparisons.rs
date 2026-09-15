@@ -8,7 +8,7 @@ use crate::executor::{
     scope::RowScope,
 };
 use crate::{
-    coercion::CastContext,
+    coercion::{self, CastContext},
     error::{PgError, Result, SqlState},
     value::{BaseType, DAYS_PER_MONTH, MICROSECONDS_PER_DAY, Value},
 };
@@ -225,6 +225,69 @@ pub(super) fn evaluate_quantified(
     row: &[Value],
     context: &StatementContext,
 ) -> Result<Value> {
+    if let Ok(Some(element_type)) =
+        infer_expression_type(right, schema).map(BaseType::get_array_element_type)
+    {
+        if element_type != BaseType::Uuid
+            || !matches!(
+                (all, compare_op),
+                (false, ast::BinaryOperator::Eq) | (true, ast::BinaryOperator::NotEq)
+            )
+        {
+            return crate::error::reject_unsupported(
+                "quantified array comparison is not implemented",
+            );
+        }
+        let left_type = infer_expression_type(left, schema)?;
+        let comparison_type =
+            coercion::resolve_common_type(left_type, element_type).ok_or_else(|| {
+                PgError::create(
+                    SqlState::UndefinedFunction,
+                    "operator does not exist for quantified comparison",
+                )
+            })?;
+        validate_comparison_type(compare_op, comparison_type)?;
+        let left = evaluate_and_coerce(
+            left,
+            comparison_type,
+            CastContext::Implicit,
+            schema,
+            row,
+            context,
+        )?;
+        let array = super::evaluate(right, schema, row, context)?;
+        let Value::Array { values, .. } = array else {
+            return Ok(Value::Null);
+        };
+        let mut result = Value::Bool(all);
+        for candidate in values {
+            let candidate = coercion::coerce(
+                candidate,
+                element_type,
+                crate::value::PgType::create(comparison_type),
+                CastContext::Implicit,
+                &context.timezone,
+            )?;
+            let comparison = if left.is_null() || candidate.is_null() {
+                Value::Null
+            } else {
+                evaluate_comparison(compare_op, &left, &candidate)?
+            };
+            result = evaluate_boolean_operator(
+                if all {
+                    &ast::BinaryOperator::And
+                } else {
+                    &ast::BinaryOperator::Or
+                },
+                result,
+                comparison,
+            )?;
+            if result == Value::Bool(!all) {
+                break;
+            }
+        }
+        return Ok(result);
+    }
     let candidates = extract_row_fields(right);
     let mut result = Value::Bool(all);
     for candidate in candidates {

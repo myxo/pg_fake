@@ -1394,11 +1394,31 @@ surface.
 generic representation needed by Task 28; Task 37 later completes the other
 scalar element types and general array operations.
 
-### Task 28 — Required BIGINT aggregation, subscripting, and UUID membership
+### Task 28 — Required BIGINT aggregation, subscripting, and UUID membership [COMPLETE]
 
 **Goal:** Support the ordered BIGINT aggregation and UUID membership query
 shapes required by SQLx applications without coupling their delivery to the
 broader array surface.
+
+**Progress:**
+
+- [x] Add ordered/filtered BIGINT `array_agg`, including NULL inputs and the
+  PostgreSQL NULL-on-empty result.
+- [x] Add one-based BIGINT-array subscripting with literal and prepared INT4
+  indexes, including NULL and out-of-range behavior.
+- [x] Add UUID `= ANY(uuid[])` and `<> ALL(uuid[])` with PostgreSQL empty-array,
+  duplicate, and three-valued NULL semantics while explicitly rejecting the
+  broader quantified-array forms reserved for Task 37.
+- [x] Infer UUID[] membership parameters and the BIGINT threshold, INT4
+  subscript, and nullable BIGINT result metadata for the required prepared
+  query shapes.
+- [x] Add focused native and SQLx differential tests, 10,000-case generated
+  PostgreSQL differential coverage, and passing Phase 3 manifest cases.
+- [x] Add UUID membership and ordered/filtered aggregation benchmarks.
+- [x] Pass focused array suites, formatting, strict workspace Clippy, and the
+  mandatory 10,000-iteration full property gate (20 tests in 815.04 seconds).
+- [x] Complete independent iterative review with no remaining findings.
+- [x] Obtain user approval before marking Task 28 complete.
 
 **DoD:**
 

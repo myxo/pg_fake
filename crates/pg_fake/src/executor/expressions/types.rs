@@ -47,6 +47,28 @@ pub(crate) fn infer_expression_type(expr: &ast::Expr, schema: RowScope<'_>) -> R
             Ok(schema.resolve_column(std::slice::from_ref(column))?.1.base)
         }
         ast::Expr::CompoundIdentifier(columns) => Ok(schema.resolve_column(columns)?.1.base),
+        ast::Expr::CompoundFieldAccess { root, access_chain } => {
+            let [ast::AccessExpr::Subscript(ast::Subscript::Index { index })] =
+                access_chain.as_slice()
+            else {
+                return reject_unsupported("array access shape is not implemented");
+            };
+            if infer_expression_type(root, schema)? != BaseType::Int8Array {
+                return reject_unsupported("array subscript element type is not implemented");
+            }
+            let index_type = infer_expression_type(index, schema)?;
+            if !is_null_literal(index)
+                && extract_unknown_string_literal(index).is_none()
+                && !is_parameter_placeholder(index)
+                && !coercion::can_cast(index_type, BaseType::Int4, CastContext::Assignment)
+            {
+                return Err(PgError::create(
+                    SqlState::DatatypeMismatch,
+                    "array subscript must have type integer",
+                ));
+            }
+            Ok(BaseType::Int8)
+        }
         ast::Expr::Nested(expr) => infer_expression_type(expr, schema),
         ast::Expr::UnaryOp {
             op: ast::UnaryOperator::Minus,
@@ -247,6 +269,29 @@ pub(crate) fn infer_expression_type(expr: &ast::Expr, schema: RowScope<'_>) -> R
             compare_op,
             right,
         } => {
+            if let Ok(Some(element_type)) =
+                infer_expression_type(right, schema).map(BaseType::get_array_element_type)
+            {
+                if element_type != BaseType::Uuid
+                    || !matches!(
+                        (expr, compare_op),
+                        (ast::Expr::AnyOp { .. }, ast::BinaryOperator::Eq)
+                            | (ast::Expr::AllOp { .. }, ast::BinaryOperator::NotEq)
+                    )
+                {
+                    return reject_unsupported("quantified array comparison is not implemented");
+                }
+                let left_type = infer_expression_type(left, schema)?;
+                let Some(comparison_type) = coercion::resolve_common_type(left_type, element_type)
+                else {
+                    return Err(PgError::create(
+                        SqlState::UndefinedFunction,
+                        "operator does not exist for quantified comparison",
+                    ));
+                };
+                validate_comparison_type(compare_op, comparison_type)?;
+                return Ok(BaseType::Bool);
+            }
             if let ast::Expr::Tuple(candidates) = right.as_ref() {
                 if candidates.is_empty() {
                     for field in extract_row_fields(left) {

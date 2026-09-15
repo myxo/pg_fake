@@ -103,4 +103,76 @@ fn rejects_unsupported_array_shapes_and_malformed_input() {
             .sqlstate,
         SqlState::InvalidTextRepresentation
     );
+    for sql in [
+        "SELECT 1::BIGINT = ANY(ARRAY[1::BIGINT])",
+        "SELECT '00000000-0000-4000-8000-000000000001'::UUID = ALL(ARRAY[]::UUID[])",
+        "SELECT '00000000-0000-4000-8000-000000000001'::UUID > ANY(ARRAY[]::UUID[])",
+    ] {
+        assert_eq!(
+            session.query(sql, &[]).unwrap_err().sqlstate,
+            SqlState::FeatureNotSupported,
+            "{sql}"
+        );
+    }
+}
+
+#[test]
+fn aggregates_subscripts_and_compares_required_arrays() {
+    let db = Db::create();
+    let mut session = db.create_session();
+    session
+        .execute(
+            "CREATE TABLE array_queries (id INTEGER PRIMARY KEY, issued_at BIGINT, identifier UUID); \
+             INSERT INTO array_queries VALUES \
+                (1, 10, '00000000-0000-4000-8000-000000000001'), \
+                (2, 20, '00000000-0000-4000-8000-000000000002'), \
+                (3, 30, '00000000-0000-4000-8000-000000000003'), \
+                (4, NULL, NULL)",
+        )
+        .unwrap();
+    let result = session
+        .query(
+            "SELECT max(issued_at), \
+                    (array_agg(issued_at ORDER BY issued_at DESC) \
+                        FILTER (WHERE issued_at <= 30))[2], \
+                    array_agg(issued_at ORDER BY id) \
+             FROM array_queries",
+            &[],
+        )
+        .unwrap();
+    assert_eq!(
+        result.rows,
+        vec![vec![
+            Value::Int8(30),
+            Value::Int8(20),
+            Value::Array {
+                elem_type: BaseType::Int8,
+                values: vec![
+                    Value::Int8(10),
+                    Value::Int8(20),
+                    Value::Int8(30),
+                    Value::Null,
+                ],
+            },
+        ]]
+    );
+    let result = session
+        .query(
+            "SELECT identifier = ANY(ARRAY[\
+                        '00000000-0000-4000-8000-000000000001'::UUID, \
+                        '00000000-0000-4000-8000-000000000003'::UUID]), \
+                    identifier <> ALL(ARRAY[]::UUID[]) \
+             FROM array_queries ORDER BY id",
+            &[],
+        )
+        .unwrap();
+    assert_eq!(
+        result.rows,
+        vec![
+            vec![Value::Bool(true), Value::Bool(true)],
+            vec![Value::Bool(false), Value::Bool(true)],
+            vec![Value::Bool(true), Value::Bool(true)],
+            vec![Value::Null, Value::Bool(true)],
+        ]
+    );
 }

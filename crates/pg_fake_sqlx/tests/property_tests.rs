@@ -3173,3 +3173,67 @@ fn matches_generated_bigint_and_uuid_arrays() {
         );
     });
 }
+
+#[test]
+fn matches_generated_required_array_queries() {
+    let server = start_isolated_postgres_server();
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap();
+    let postgres = RefCell::new(
+        runtime
+            .block_on(PgConnection::connect(&server.url))
+            .unwrap(),
+    );
+    let fake = RefCell::new(PgFakeConnection::new(Db::create()));
+    check(|src| {
+        let rows = (0..src.any_of("row_count", int_in(1..=8)))
+            .map(|index| {
+                let value = if src.any("value_null") {
+                    "NULL::BIGINT".to_owned()
+                } else {
+                    format!("{}::BIGINT", src.any_of("value", int_in(-100_i64..=100)))
+                };
+                let included: bool = src.any("included");
+                format!("({value},{index},{included})")
+            })
+            .collect::<Vec<_>>();
+        let target = src.any_of("target", int_in(0_u64..=15));
+        let candidates = (0..src.any_of("candidate_count", int_in(0..=8)))
+            .map(|_| {
+                if src.any("candidate_null") {
+                    "NULL::UUID".to_owned()
+                } else {
+                    format!(
+                        "'00000000-0000-4000-8000-{:012x}'::UUID",
+                        src.any_of("candidate", int_in(0_u64..=15))
+                    )
+                }
+            })
+            .collect::<Vec<_>>();
+        let candidates = if candidates.is_empty() {
+            "ARRAY[]::UUID[]".to_owned()
+        } else {
+            format!("ARRAY[{}]", candidates.join(","))
+        };
+        let index = src.any_of("subscript", int_in(-2_i32..=10));
+        let target = format!("'00000000-0000-4000-8000-{target:012x}'::UUID");
+        let sql = format!(
+            "SELECT (SELECT (array_agg(value ORDER BY ordering DESC) \
+                                FILTER (WHERE included))[{index}] \
+                     FROM (VALUES {}) input(value,ordering,included)), \
+                    {target} = ANY({candidates}), \
+                    {target} <> ALL({candidates})",
+            rows.join(",")
+        );
+        src.log_value("sql", &sql);
+        assert_statement(
+            &runtime,
+            &mut postgres.borrow_mut(),
+            &mut fake.borrow_mut(),
+            &sql,
+            RowOrder::Ordered,
+        );
+    });
+}

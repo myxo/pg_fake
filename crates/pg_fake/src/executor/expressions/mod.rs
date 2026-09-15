@@ -30,7 +30,9 @@ pub(super) use comparisons::{
 };
 pub(super) use functions::{infer_window_return_type, validate_function_argument};
 pub(super) use literals::{evaluate_literal, extract_number_literal};
-pub(crate) use literals::{extract_unknown_string_literal, is_null_literal};
+pub(crate) use literals::{
+    extract_unknown_string_literal, is_null_literal, is_parameter_placeholder,
+};
 pub(crate) use resume::{EvaluationCursor, PendingEvaluation, PendingOperation};
 pub(super) use resume::{
     EvaluationOperation, evaluate, evaluate_in_cursor, resume_evaluation, resume_operation,
@@ -92,6 +94,38 @@ fn evaluate_inner(
             schema.resolve_column_value(std::slice::from_ref(column), row)
         }
         ast::Expr::CompoundIdentifier(columns) => schema.resolve_column_value(columns, row),
+        ast::Expr::CompoundFieldAccess { root, access_chain } => {
+            infer_expression_type(expr, schema)?;
+            let [ast::AccessExpr::Subscript(ast::Subscript::Index { index })] =
+                access_chain.as_slice()
+            else {
+                unreachable!("array access shape was type-checked");
+            };
+            let array = evaluate(root, schema, row, context)?;
+            let index = evaluate_and_coerce(
+                index,
+                BaseType::Int4,
+                CastContext::Assignment,
+                schema,
+                row,
+                context,
+            )?;
+            let (
+                Value::Array {
+                    elem_type: BaseType::Int8,
+                    values,
+                },
+                Value::Int4(index),
+            ) = (array, index)
+            else {
+                return Ok(Value::Null);
+            };
+            Ok(index
+                .checked_sub(1)
+                .and_then(|index| usize::try_from(index).ok())
+                .and_then(|index| values.get(index).cloned())
+                .unwrap_or(Value::Null))
+        }
         ast::Expr::TypedString(typed) if !typed.uses_odbc_syntax => {
             let base = infer_expression_type(expr, schema)?;
             let ast::Value::SingleQuotedString(text) = &typed.value.value else {

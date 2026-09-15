@@ -114,7 +114,7 @@ impl BenchmarkConnection<'_> {
             Self::PgFake(connection) => {
                 let values = runtime
                     .block_on(
-                        sqlx::query_scalar::<_, Vec<Option<i64>>>(
+                        sqlx::query_scalar::<pg_fake_sqlx::PgFake, Vec<Option<i64>>>(
                             "INSERT INTO bigint_uuid_array_bind_store_fetch VALUES (1, $1, $2) ON CONFLICT (id) DO UPDATE SET values = EXCLUDED.values, identifiers = EXCLUDED.identifiers RETURNING values",
                         )
                         .bind(integers)
@@ -127,7 +127,7 @@ impl BenchmarkConnection<'_> {
             Self::Postgres(connection) => {
                 let values = runtime
                     .block_on(
-                        sqlx::query_scalar::<_, Vec<Option<i64>>>(
+                        sqlx::query_scalar::<sqlx_postgres::Postgres, Vec<Option<i64>>>(
                             "INSERT INTO bigint_uuid_array_bind_store_fetch VALUES (1, $1, $2) ON CONFLICT (id) DO UPDATE SET values = EXCLUDED.values, identifiers = EXCLUDED.identifiers RETURNING values",
                         )
                         .bind(integers)
@@ -136,6 +136,35 @@ impl BenchmarkConnection<'_> {
                     )
                     .unwrap();
                 black_box(values);
+            }
+        }
+    }
+
+    fn fetch_uuid_membership(&mut self, runtime: &Runtime, identifiers: Vec<uuid::Uuid>) {
+        match self {
+            Self::PgFake(connection) => {
+                let rows = runtime
+                    .block_on(
+                        sqlx::query::<pg_fake_sqlx::PgFake>(
+                            "SELECT id FROM required_array_query_100_rows WHERE id = ANY($1)",
+                        )
+                        .bind(identifiers)
+                        .fetch_all(&mut **connection),
+                    )
+                    .unwrap();
+                black_box(rows);
+            }
+            Self::Postgres(connection) => {
+                let rows = runtime
+                    .block_on(
+                        sqlx::query::<sqlx_postgres::Postgres>(
+                            "SELECT id FROM required_array_query_100_rows WHERE id = ANY($1)",
+                        )
+                        .bind(identifiers)
+                        .fetch_all(&mut **connection),
+                    )
+                    .unwrap();
+                black_box(rows);
             }
         }
     }
@@ -711,6 +740,57 @@ fn bigint_uuid_array_benchmark(
     group.finish();
     for (_, connection) in connections.iter_mut() {
         connection.execute(runtime, "DROP TABLE bigint_uuid_array_bind_store_fetch");
+    }
+}
+
+fn required_array_query_benchmarks(
+    criterion: &mut Criterion,
+    runtime: &Runtime,
+    connections: &mut [NamedBenchmarkConnection<'_>],
+) {
+    let values = (1..=100)
+        .map(|value| format!("('00000000-0000-4000-8000-{value:012x}', {value})"))
+        .collect::<Vec<_>>()
+        .join(",");
+    for (_, connection) in connections.iter_mut() {
+        connection.execute(
+            runtime,
+            "CREATE TABLE required_array_query_100_rows (id UUID PRIMARY KEY, issued_at BIGINT)",
+        );
+        connection.execute(
+            runtime,
+            &format!("INSERT INTO required_array_query_100_rows VALUES {values}"),
+        );
+    }
+    let identifiers = (1..=50)
+        .map(|value| {
+            uuid::Uuid::parse_str(&format!("00000000-0000-4000-8000-{value:012x}")).unwrap()
+        })
+        .collect::<Vec<_>>();
+    let mut group = criterion.benchmark_group(benchmarks::find_benchmark("uuid_any_100_rows").name);
+    group.throughput(Throughput::Elements(100));
+    for (name, connection) in connections.iter_mut() {
+        group.bench_function(*name, |benchmark| {
+            benchmark.iter(|| connection.fetch_uuid_membership(runtime, identifiers.clone()));
+        });
+    }
+    group.finish();
+
+    let query = "SELECT max(issued_at), \
+                        (array_agg(issued_at ORDER BY issued_at DESC) \
+                            FILTER (WHERE issued_at <= 75))[2] \
+                 FROM required_array_query_100_rows";
+    let mut group = criterion
+        .benchmark_group(benchmarks::find_benchmark("ordered_filtered_array_agg_100_rows").name);
+    group.throughput(Throughput::Elements(100));
+    for (name, connection) in connections.iter_mut() {
+        group.bench_function(*name, |benchmark| {
+            benchmark.iter(|| connection.fetch(runtime, query));
+        });
+    }
+    group.finish();
+    for (_, connection) in connections.iter_mut() {
+        connection.execute(runtime, "DROP TABLE required_array_query_100_rows");
     }
 }
 
@@ -1706,6 +1786,7 @@ fn benchmarks(criterion: &mut Criterion) {
         uuid_temporal_benchmark(criterion, &runtime, &mut connections);
         offset_datetime_benchmark(criterion, &runtime, &mut connections);
         bigint_uuid_array_benchmark(criterion, &runtime, &mut connections);
+        required_array_query_benchmarks(criterion, &runtime, &mut connections);
         hashed_advisory_lock_benchmark(criterion, &runtime, &mut connections);
         benchmark_json(criterion, &runtime, &mut connections);
         benchmark_jsonb(criterion, &runtime, &mut connections);

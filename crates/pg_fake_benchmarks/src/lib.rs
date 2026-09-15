@@ -137,6 +137,16 @@ pub fn list_benchmarks() -> Vec<Benchmark> {
             postgres_comparisons(),
         ),
         build_benchmark(
+            "uuid_any_100_rows",
+            postgres_values(),
+            postgres_comparisons(),
+        ),
+        build_benchmark(
+            "ordered_filtered_array_agg_100_rows",
+            postgres_values(),
+            postgres_comparisons(),
+        ),
+        build_benchmark(
             "hashed_advisory_lock_acquisition",
             postgres_values(),
             postgres_comparisons(),

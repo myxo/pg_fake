@@ -228,3 +228,247 @@ async fn matches_array_assignment_element_casts() {
         );
     }
 }
+
+#[tokio::test]
+async fn matches_required_bigint_aggregation_and_subscripts() {
+    let server = start_postgres_server();
+    let mut postgres = PgConnection::connect(&server.url).await.unwrap();
+    let mut fake = PgFakeConnection::new(Db::create());
+    let create = "CREATE TABLE required_bigint_arrays (id INTEGER PRIMARY KEY, issued_at BIGINT)";
+    postgres
+        .execute("DROP TABLE IF EXISTS required_bigint_arrays")
+        .await
+        .unwrap();
+    postgres.execute(create).await.unwrap();
+    fake.execute(create).await.unwrap();
+    let insert = "INSERT INTO required_bigint_arrays VALUES (1, 10), (2, 20), (3, 30), (4, NULL)";
+    postgres.execute(insert).await.unwrap();
+    fake.execute(insert).await.unwrap();
+    let sql = "SELECT max(issued_at) AS latest, \
+                      (array_agg(issued_at ORDER BY issued_at DESC) \
+                          FILTER (WHERE issued_at <= $1))[$2] AS second \
+               FROM required_bigint_arrays";
+    let expected_statement = postgres.prepare(sql).await.unwrap();
+    let actual_statement = fake.prepare(sql).await.unwrap();
+    assert_eq!(
+        actual_statement
+            .parameters()
+            .unwrap()
+            .left()
+            .unwrap()
+            .iter()
+            .map(|data_type| data_type.base.unwrap().map_to_oid())
+            .collect::<Vec<_>>(),
+        expected_statement
+            .parameters()
+            .unwrap()
+            .left()
+            .unwrap()
+            .iter()
+            .map(|data_type| data_type.oid().unwrap().0)
+            .collect::<Vec<_>>()
+    );
+    let expected = sqlx::query(sql)
+        .bind(30_i64)
+        .bind(2_i32)
+        .fetch_one(&mut postgres)
+        .await
+        .unwrap();
+    let actual = sqlx::query(sql)
+        .bind(30_i64)
+        .bind(2_i32)
+        .fetch_one(&mut fake)
+        .await
+        .unwrap();
+    assert_eq!(actual.get::<Option<i64>, _>(0), expected.get(0));
+    assert_eq!(actual.get::<Option<i64>, _>(1), expected.get(1));
+    assert_eq!(actual.columns()[0].type_info().name(), "INT8");
+    assert_eq!(actual.columns()[1].type_info().name(), "INT8");
+
+    let sql = "SELECT array_agg(issued_at ORDER BY id), \
+                      array_agg(issued_at ORDER BY id) FILTER (WHERE false) \
+               FROM required_bigint_arrays";
+    let expected = sqlx::query(sql).fetch_one(&mut postgres).await.unwrap();
+    let actual = sqlx::query(sql).fetch_one(&mut fake).await.unwrap();
+    assert_eq!(
+        actual.get::<Vec<Option<i64>>, _>(0),
+        expected.get::<Vec<Option<i64>>, _>(0)
+    );
+    assert_eq!(
+        actual.get::<Option<Vec<Option<i64>>>, _>(1),
+        expected.get::<Option<Vec<Option<i64>>>, _>(1)
+    );
+    let sql =
+        "SELECT array_agg(issued_at ORDER BY issued_at) FROM required_bigint_arrays WHERE false";
+    let expected = sqlx::query(sql).fetch_one(&mut postgres).await.unwrap();
+    let actual = sqlx::query(sql).fetch_one(&mut fake).await.unwrap();
+    assert_eq!(
+        actual.get::<Option<Vec<Option<i64>>>, _>(0),
+        expected.get::<Option<Vec<Option<i64>>>, _>(0)
+    );
+
+    let sql = "SELECT (ARRAY[10::BIGINT, 20, 30])[$1]";
+    let expected_statement = postgres.prepare(sql).await.unwrap();
+    let actual_statement = fake.prepare(sql).await.unwrap();
+    assert_eq!(
+        actual_statement.parameters().unwrap().left().unwrap()[0]
+            .base
+            .unwrap()
+            .map_to_oid(),
+        expected_statement.parameters().unwrap().left().unwrap()[0]
+            .oid()
+            .unwrap()
+            .0
+    );
+    assert_eq!(actual_statement.columns()[0].type_info().name(), "INT8");
+    for index in [1_i32, 2, 4, 0, -1, i32::MIN] {
+        let expected = sqlx::query(sql)
+            .bind(index)
+            .fetch_one(&mut postgres)
+            .await
+            .unwrap()
+            .get::<Option<i64>, _>(0);
+        let actual = sqlx::query(sql)
+            .bind(index)
+            .fetch_one(&mut fake)
+            .await
+            .unwrap()
+            .get::<Option<i64>, _>(0);
+        assert_eq!(actual, expected, "index {index}");
+    }
+    let sql = "SELECT (ARRAY[10::BIGINT, 20])[NULL::INTEGER], (NULL::BIGINT[])[1]";
+    let expected = sqlx::query(sql).fetch_one(&mut postgres).await.unwrap();
+    let actual = sqlx::query(sql).fetch_one(&mut fake).await.unwrap();
+    assert_eq!(actual.get::<Option<i64>, _>(0), expected.get(0));
+    assert_eq!(actual.get::<Option<i64>, _>(1), expected.get(1));
+    for sql in [
+        "SELECT (ARRAY[10::BIGINT])['bad']",
+        "SELECT (ARRAY[10::BIGINT])[1.5]",
+    ] {
+        let expected = postgres
+            .execute(sql)
+            .await
+            .map(|_| ())
+            .map_err(get_sqlstate);
+        let actual = fake.execute(sql).await.map(|_| ()).map_err(get_sqlstate);
+        assert_eq!(actual, expected, "{sql}");
+    }
+}
+
+#[tokio::test]
+async fn matches_required_uuid_any_and_all() {
+    let server = start_postgres_server();
+    let mut postgres = PgConnection::connect(&server.url).await.unwrap();
+    let mut fake = PgFakeConnection::new(Db::create());
+    let create = "CREATE TABLE required_uuid_membership (id UUID PRIMARY KEY)";
+    postgres
+        .execute("DROP TABLE IF EXISTS required_uuid_membership")
+        .await
+        .unwrap();
+    postgres.execute(create).await.unwrap();
+    fake.execute(create).await.unwrap();
+    let ids = [
+        Uuid::parse_str("00000000-0000-4000-8000-000000000001").unwrap(),
+        Uuid::parse_str("00000000-0000-4000-8000-000000000002").unwrap(),
+        Uuid::parse_str("00000000-0000-4000-8000-000000000003").unwrap(),
+    ];
+    for id in ids {
+        sqlx::query("INSERT INTO required_uuid_membership VALUES ($1)")
+            .bind(id)
+            .execute(&mut postgres)
+            .await
+            .unwrap();
+        sqlx::query("INSERT INTO required_uuid_membership VALUES ($1)")
+            .bind(id)
+            .execute(&mut fake)
+            .await
+            .unwrap();
+    }
+    let any_sql = "SELECT id FROM required_uuid_membership WHERE id = ANY((($1))) ORDER BY id";
+    let expected_statement = postgres.prepare(any_sql).await.unwrap();
+    let actual_statement = fake.prepare(any_sql).await.unwrap();
+    assert_eq!(
+        actual_statement.parameters().unwrap().left().unwrap()[0]
+            .base
+            .unwrap()
+            .map_to_oid(),
+        expected_statement.parameters().unwrap().left().unwrap()[0]
+            .oid()
+            .unwrap()
+            .0
+    );
+    let candidates = vec![Some(ids[2]), Some(ids[0]), None, Some(ids[2])];
+    let expected = sqlx::query(any_sql)
+        .bind(candidates.clone())
+        .fetch_all(&mut postgres)
+        .await
+        .unwrap();
+    let actual = sqlx::query(any_sql)
+        .bind(candidates)
+        .fetch_all(&mut fake)
+        .await
+        .unwrap();
+    assert_eq!(
+        actual
+            .iter()
+            .map(|row| row.get::<Uuid, _>(0))
+            .collect::<Vec<_>>(),
+        expected
+            .iter()
+            .map(|row| row.get::<Uuid, _>(0))
+            .collect::<Vec<_>>()
+    );
+
+    let sql = "SELECT id FROM required_uuid_membership WHERE id <> ALL($1) ORDER BY id";
+    let excluded = vec![ids[0], ids[2]];
+    let expected = sqlx::query(sql)
+        .bind(excluded.clone())
+        .fetch_all(&mut postgres)
+        .await
+        .unwrap();
+    let actual = sqlx::query(sql)
+        .bind(excluded)
+        .fetch_all(&mut fake)
+        .await
+        .unwrap();
+    assert_eq!(
+        actual
+            .iter()
+            .map(|row| row.get::<Uuid, _>(0))
+            .collect::<Vec<_>>(),
+        expected
+            .iter()
+            .map(|row| row.get::<Uuid, _>(0))
+            .collect::<Vec<_>>()
+    );
+    let sql = "SELECT \
+        '00000000-0000-4000-8000-000000000001'::UUID = ANY(ARRAY[]::UUID[]), \
+        '00000000-0000-4000-8000-000000000001'::UUID <> ALL(ARRAY[]::UUID[]), \
+        '00000000-0000-4000-8000-000000000001'::UUID = ANY(ARRAY['00000000-0000-4000-8000-000000000002'::UUID, NULL]), \
+        '00000000-0000-4000-8000-000000000001'::UUID <> ALL(ARRAY['00000000-0000-4000-8000-000000000002'::UUID, NULL]), \
+        '00000000-0000-4000-8000-000000000001'::UUID = ANY(NULL::UUID[])";
+    let expected = sqlx::query(sql).fetch_one(&mut postgres).await.unwrap();
+    let actual = sqlx::query(sql).fetch_one(&mut fake).await.unwrap();
+    for index in 0..5 {
+        assert_eq!(
+            actual.get::<Option<bool>, _>(index),
+            expected.get::<Option<bool>, _>(index),
+            "column {index}"
+        );
+    }
+    for sql in [
+        "SELECT '00000000-0000-4000-8000-000000000001'::UUID = ALL($1)",
+        "SELECT '00000000-0000-4000-8000-000000000001'::UUID <> ANY($1)",
+        "SELECT '00000000-0000-4000-8000-000000000001'::UUID > ANY($1)",
+        "SELECT 1::INTEGER = ANY($1)",
+        "SELECT $1 = ANY($2)",
+        "SELECT 1::INTEGER = ANY((($1)))",
+        "SELECT '00000000-0000-4000-8000-000000000001'::UUID = ALL((($1)))",
+    ] {
+        assert_eq!(
+            get_sqlstate(fake.prepare(sql).await.unwrap_err()),
+            "0A000",
+            "{sql}"
+        );
+    }
+}

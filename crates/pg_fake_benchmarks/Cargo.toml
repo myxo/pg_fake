@@ -14,7 +14,7 @@ pg_fake = { path = "../pg_fake" }
 pg_fake_sqlx = { path = "../pg_fake_sqlx", features = ["time"] }
 sqlx = { version = "0.8.6", default-features = false, features = ["runtime-tokio"] }
 sqlx-core = { version = "0.8.6", features = ["migrate"] }
-sqlx-postgres = { version = "0.8.6", features = ["migrate", "time"] }
+sqlx-postgres = { version = "0.8.6", features = ["migrate", "time", "uuid"] }
 testcontainers = { version = "0.27", features = ["blocking"] }
 testcontainers-modules = { version = "0.15", features = ["blocking", "postgres"] }
 time = "0.3"

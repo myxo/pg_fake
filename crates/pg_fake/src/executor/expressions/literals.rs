@@ -23,8 +23,11 @@ pub(in crate::executor) fn extract_number_literal(expr: &ast::Expr) -> Option<&s
 }
 
 #[cfg_attr(feature = "execution-log", tracing::instrument(skip_all))]
-pub(super) fn is_parameter_placeholder(expr: &ast::Expr) -> bool {
-    matches!(extract_ast_value(expr), Some(ast::Value::Placeholder(_)))
+pub(crate) fn is_parameter_placeholder(expr: &ast::Expr) -> bool {
+    match expr {
+        ast::Expr::Nested(inner) => is_parameter_placeholder(inner),
+        _ => matches!(extract_ast_value(expr), Some(ast::Value::Placeholder(_))),
+    }
 }
 
 #[cfg_attr(feature = "execution-log", tracing::instrument(skip_all))]

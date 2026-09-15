@@ -27,6 +27,7 @@ enum AggregateKind {
     BooleanAnd,
     BooleanOr,
     StringAgg,
+    ArrayAgg(BaseType),
 }
 
 #[derive(Debug, Clone)]
@@ -45,6 +46,8 @@ pub(super) struct AggregateCall<'a> {
     order_by: Vec<&'a ast::Expr>,
     filter: Option<&'a ast::Expr>,
 }
+
+type AggregateOrder<'a> = (Vec<(bool, bool)>, Vec<&'a ast::Expr>);
 
 #[derive(Clone)]
 pub(super) struct AggregateInput {
@@ -65,7 +68,15 @@ pub(super) fn is_aggregate_function(function: &ast::Function) -> bool {
             function.name.0.len() == 1
                 && matches!(
                     normalize_identifier(name).as_str(),
-                    "count" | "sum" | "avg" | "min" | "max" | "bool_and" | "bool_or" | "string_agg"
+                    "count"
+                        | "sum"
+                        | "avg"
+                        | "min"
+                        | "max"
+                        | "bool_and"
+                        | "bool_or"
+                        | "string_agg"
+                        | "array_agg"
                 )
                 && function.over.is_none()
         })
@@ -109,7 +120,7 @@ pub(super) fn parse_aggregate_call<'a>(
     let ast::FunctionArguments::List(arguments) = &function.args else {
         return Err(signature_error());
     };
-    if name != "string_agg" && !arguments.clauses.is_empty() {
+    if !matches!(name.as_str(), "string_agg" | "array_agg") && !arguments.clauses.is_empty() {
         return reject_unsupported("aggregate argument feature is not implemented");
     }
     if let Some(filter) = &function.filter {
@@ -179,31 +190,7 @@ pub(super) fn parse_aggregate_call<'a>(
                 return Err(signature_error());
             }
         }
-        let orders = match arguments.clauses.as_slice() {
-            [] => &[][..],
-            [ast::FunctionArgumentClause::OrderBy(orders)] => orders.as_slice(),
-            _ => return reject_unsupported("aggregate argument feature is not implemented"),
-        };
-        let mut order = Vec::with_capacity(orders.len());
-        let mut order_by = Vec::with_capacity(orders.len());
-        for expression in orders {
-            if expression.with_fill.is_some() {
-                return reject_unsupported("aggregate order feature is not implemented");
-            }
-            validate_ordering_type(infer_expression_type(&expression.expr, schema)?)?;
-            let ascending = match &expression.options.sort {
-                None | Some(ast::OrderBySort::Asc) => true,
-                Some(ast::OrderBySort::Desc) => false,
-                Some(ast::OrderBySort::Using(_)) => {
-                    return reject_unsupported("aggregate order feature is not implemented");
-                }
-            };
-            order.push((
-                ascending,
-                expression.options.nulls_first.unwrap_or(!ascending),
-            ));
-            order_by.push(&expression.expr);
-        }
+        let (order, order_by) = parse_aggregate_order(&arguments.clauses, schema)?;
         return Ok(AggregateCall {
             descriptor: AggregateDescriptor {
                 kind: AggregateKind::StringAgg,
@@ -214,6 +201,34 @@ pub(super) fn parse_aggregate_call<'a>(
             },
             argument: Some(argument),
             delimiter: Some(delimiter),
+            order_by,
+            filter: function.filter.as_deref(),
+        });
+    }
+    if name == "array_agg" {
+        if distinct {
+            return reject_unsupported("DISTINCT array_agg is not implemented");
+        }
+        let [ast::FunctionArg::Unnamed(ast::FunctionArgExpr::Expr(argument))] =
+            arguments.args.as_slice()
+        else {
+            return Err(signature_error());
+        };
+        let argument_type = infer_expression_type(argument, schema)?;
+        if argument_type != BaseType::Int8 {
+            return Err(signature_error());
+        }
+        let (order, order_by) = parse_aggregate_order(&arguments.clauses, schema)?;
+        return Ok(AggregateCall {
+            descriptor: AggregateDescriptor {
+                kind: AggregateKind::ArrayAgg(BaseType::Int8),
+                distinct,
+                argument_type: Some(BaseType::Int8),
+                result_type: BaseType::Int8Array,
+                order,
+            },
+            argument: Some(argument),
+            delimiter: None,
             order_by,
             filter: function.filter.as_deref(),
         });
@@ -307,6 +322,38 @@ pub(super) fn parse_aggregate_call<'a>(
     })
 }
 
+fn parse_aggregate_order<'a>(
+    clauses: &'a [ast::FunctionArgumentClause],
+    schema: RowScope<'_>,
+) -> Result<AggregateOrder<'a>> {
+    let orders = match clauses {
+        [] => &[][..],
+        [ast::FunctionArgumentClause::OrderBy(orders)] => orders.as_slice(),
+        _ => return reject_unsupported("aggregate argument feature is not implemented"),
+    };
+    let mut order = Vec::with_capacity(orders.len());
+    let mut order_by = Vec::with_capacity(orders.len());
+    for expression in orders {
+        if expression.with_fill.is_some() {
+            return reject_unsupported("aggregate order feature is not implemented");
+        }
+        validate_ordering_type(infer_expression_type(&expression.expr, schema)?)?;
+        let ascending = match &expression.options.sort {
+            None | Some(ast::OrderBySort::Asc) => true,
+            Some(ast::OrderBySort::Desc) => false,
+            Some(ast::OrderBySort::Using(_)) => {
+                return reject_unsupported("aggregate order feature is not implemented");
+            }
+        };
+        order.push((
+            ascending,
+            expression.options.nulls_first.unwrap_or(!ascending),
+        ));
+        order_by.push(&expression.expr);
+    }
+    Ok((order, order_by))
+}
+
 pub(super) fn prepare_aggregate_function_input<F>(
     call: &AggregateCall<'_>,
     mut evaluate_expression: F,
@@ -351,7 +398,12 @@ pub(super) struct AggregateState {
 impl AggregateState {
     pub(super) fn create(call: &AggregateDescriptor) -> Self {
         Self {
-            inputs: (call.distinct || matches!(call.kind, AggregateKind::StringAgg)).then(Vec::new),
+            inputs: (call.distinct
+                || matches!(
+                    call.kind,
+                    AggregateKind::StringAgg | AggregateKind::ArrayAgg(_)
+                ))
+            .then(Vec::new),
             count: 0,
             value: None,
             error: None,
@@ -360,7 +412,9 @@ impl AggregateState {
 
     pub(super) fn add_input(&mut self, call: &AggregateDescriptor, input: AggregateInput) {
         if let Some(inputs) = &mut self.inputs {
-            inputs.push(input);
+            if input.included {
+                inputs.push(input);
+            }
         } else if self.error.is_none() {
             self.error = self.accumulate_input(call, input).err();
         }
@@ -381,6 +435,26 @@ impl AggregateState {
         let value = input
             .argument
             .expect("included aggregate input has an argument");
+        if let AggregateKind::ArrayAgg(elem_type) = call.kind {
+            self.count += 1;
+            match &mut self.value {
+                Some(Value::Array {
+                    elem_type: stored_type,
+                    values,
+                }) => {
+                    assert_eq!(*stored_type, elem_type);
+                    values.push(value);
+                }
+                None => {
+                    self.value = Some(Value::Array {
+                        elem_type,
+                        values: vec![value],
+                    });
+                }
+                Some(_) => unreachable!("array_agg accumulator contains an array"),
+            }
+            return Ok(());
+        }
         if value.is_null() {
             return Ok(());
         }
@@ -446,6 +520,9 @@ impl AggregateState {
                     _ => unreachable!("string_agg accumulator contains text"),
                 }))
             }
+            AggregateKind::ArrayAgg(_) => {
+                unreachable!("array_agg returned before scalar accumulation")
+            }
             AggregateKind::CountAll => {
                 unreachable!("count all returned before argument evaluation")
             }
@@ -458,7 +535,11 @@ impl AggregateState {
             return Err(error);
         }
         if let Some(mut inputs) = self.inputs.take() {
-            if matches!(call.kind, AggregateKind::StringAgg) && !call.order.is_empty() {
+            if matches!(
+                call.kind,
+                AggregateKind::StringAgg | AggregateKind::ArrayAgg(_)
+            ) && !call.order.is_empty()
+            {
                 inputs.sort_by(|left, right| {
                     call.order
                         .iter()
@@ -500,7 +581,7 @@ impl AggregateState {
                 let value = input
                     .argument
                     .expect("included aggregate input has an argument");
-                if !value.is_null() {
+                if !value.is_null() || matches!(call.kind, AggregateKind::ArrayAgg(_)) {
                     let duplicate = call.distinct
                         && values.iter().try_fold(false, |duplicate, existing| {
                             Ok(duplicate || compare_values(existing, &value)? == Ordering::Equal)

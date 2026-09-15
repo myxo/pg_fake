@@ -1,7 +1,7 @@
 use super::super::parse_placeholder_index;
 use crate::{
     coercion,
-    error::{PgError, Result, SqlState},
+    error::{PgError, Result, SqlState, reject_unsupported},
     executor,
     value::BaseType,
 };
@@ -28,7 +28,16 @@ pub(super) fn infer_expression_parameters(
             ast::Expr::Identifier(_) => {
                 executor::infer_expression_type(expression, schema).map(|_| ())
             }
-            ast::Expr::Nested(inner) => constrain_parameter_type(inner, expected, types),
+            ast::Expr::Nested(_) => Ok(()),
+            ast::Expr::CompoundFieldAccess { root, access_chain } => {
+                let [ast::AccessExpr::Subscript(ast::Subscript::Index { index })] =
+                    access_chain.as_slice()
+                else {
+                    return ControlFlow::Continue(());
+                };
+                constrain_parameter_type(root, expected, types)
+                    .and_then(|()| constrain_parameter_type(index, Some(BaseType::Int4), types))
+            }
             ast::Expr::Cast {
                 expr, data_type, ..
             } => coercion::convert_ast_data_type(data_type).and_then(|target| {
@@ -196,18 +205,18 @@ pub(super) fn infer_expression_parameters(
                 Ok(())
             })(),
             ast::Expr::AnyOp { left, right, .. } | ast::Expr::AllOp { left, right, .. } => {
-                constrain_parameter_type(
-                    left,
-                    executor::infer_expression_type(right, schema).ok(),
-                    types,
-                )
-                .and_then(|()| {
-                    constrain_parameter_type(
-                        right,
-                        executor::infer_expression_type(left, schema).ok(),
-                        types,
-                    )
-                })
+                let left_type = infer_parameter_expression_type(left, schema, types);
+                let right_type = infer_parameter_expression_type(right, schema, types);
+                if let Some(element_type) = right_type.and_then(BaseType::get_array_element_type) {
+                    constrain_parameter_type(left, Some(element_type), types)
+                } else if let Some(array_type) = left_type.and_then(BaseType::get_array_type) {
+                    constrain_parameter_type(right, Some(array_type), types)
+                } else if executor::is_parameter_placeholder(right) {
+                    reject_unsupported("quantified array parameter type is not implemented")
+                } else {
+                    constrain_parameter_type(left, right_type, types)
+                        .and_then(|()| constrain_parameter_type(right, left_type, types))
+                }
             }
             ast::Expr::IsTrue(inner)
             | ast::Expr::IsFalse(inner)
@@ -341,10 +350,10 @@ pub(super) fn constrain_parameter_type(
     let Some(expected) = expected else {
         return Ok(());
     };
-    let expression = match expression {
-        ast::Expr::Nested(inner) => inner.as_ref(),
-        expression => expression,
-    };
+    let mut expression = expression;
+    while let ast::Expr::Nested(inner) = expression {
+        expression = inner;
+    }
     let ast::Expr::Value(value) = expression else {
         return Ok(());
     };
