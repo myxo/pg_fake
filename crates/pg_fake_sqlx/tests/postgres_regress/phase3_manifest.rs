@@ -26,11 +26,13 @@ pub struct Case {
 }
 
 pub struct Feature {
+    pub task: u8,
     pub name: &'static str,
     pub cases: &'static [Case],
 }
 
 pub struct Scenario {
+    pub task: u8,
     pub feature: &'static str,
     pub name: &'static str,
     pub source: &'static str,
@@ -39,6 +41,7 @@ pub struct Scenario {
 
 pub const FEATURES: &[Feature] = &[
     Feature {
+        task: 22,
         name: "bounded LATERAL joins",
         cases: &[
             Case {
@@ -58,6 +61,7 @@ pub const FEATURES: &[Feature] = &[
         ],
     },
     Feature {
+        task: 21,
         name: "runtime temporal, numeric, and pattern expressions",
         cases: &[
             Case {
@@ -91,6 +95,7 @@ pub const FEATURES: &[Feature] = &[
         ],
     },
     Feature {
+        task: 10,
         name: "qualified and temporary relations",
         cases: &[
             Case {
@@ -128,6 +133,7 @@ pub const FEATURES: &[Feature] = &[
         ],
     },
     Feature {
+        task: 2,
         name: "set operations",
         cases: &[Case {
             id: "union_distinct",
@@ -138,6 +144,7 @@ pub const FEATURES: &[Feature] = &[
         }],
     },
     Feature {
+        task: 3,
         name: "non-recursive CTEs",
         cases: &[
             Case {
@@ -171,6 +178,7 @@ pub const FEATURES: &[Feature] = &[
         ],
     },
     Feature {
+        task: 4,
         name: "recursive CTEs",
         cases: &[
             Case {
@@ -207,6 +215,7 @@ pub const FEATURES: &[Feature] = &[
         ],
     },
     Feature {
+        task: 5,
         name: "data-modifying CTEs",
         cases: &[
             Case {
@@ -253,6 +262,7 @@ pub const FEATURES: &[Feature] = &[
         ],
     },
     Feature {
+        task: 6,
         name: "ON CONFLICT DO NOTHING",
         cases: &[Case {
             id: "unique_arbiter",
@@ -266,6 +276,7 @@ pub const FEATURES: &[Feature] = &[
         }],
     },
     Feature {
+        task: 7,
         name: "ON CONFLICT DO UPDATE",
         cases: &[Case {
             id: "excluded_row",
@@ -279,6 +290,7 @@ pub const FEATURES: &[Feature] = &[
         }],
     },
     Feature {
+        task: 19,
         name: "window ranking",
         cases: &[Case {
             id: "row_number",
@@ -292,6 +304,7 @@ pub const FEATURES: &[Feature] = &[
         }],
     },
     Feature {
+        task: 19,
         name: "migration data transforms",
         cases: &[
             Case {
@@ -336,6 +349,7 @@ pub const FEATURES: &[Feature] = &[
         ],
     },
     Feature {
+        task: 35,
         name: "window offset and value functions",
         cases: &[Case {
             id: "lag",
@@ -349,6 +363,7 @@ pub const FEATURES: &[Feature] = &[
         }],
     },
     Feature {
+        task: 36,
         name: "window aggregate frames",
         cases: &[Case {
             id: "running_sum",
@@ -362,6 +377,7 @@ pub const FEATURES: &[Feature] = &[
         }],
     },
     Feature {
+        task: 16,
         name: "json",
         cases: &[
             Case {
@@ -395,6 +411,7 @@ pub const FEATURES: &[Feature] = &[
         ],
     },
     Feature {
+        task: 17,
         name: "jsonb",
         cases: &[
             Case {
@@ -421,6 +438,7 @@ pub const FEATURES: &[Feature] = &[
         ],
     },
     Feature {
+        task: 18,
         name: "json and jsonb operators",
         cases: &[
             Case {
@@ -447,6 +465,7 @@ pub const FEATURES: &[Feature] = &[
         ],
     },
     Feature {
+        task: 27,
         name: "array type and I/O",
         cases: &[
             Case {
@@ -469,6 +488,7 @@ pub const FEATURES: &[Feature] = &[
         ],
     },
     Feature {
+        task: 28,
         name: "required array queries",
         cases: &[
             Case {
@@ -491,6 +511,7 @@ pub const FEATURES: &[Feature] = &[
         ],
     },
     Feature {
+        task: 37,
         name: "array expressions",
         cases: &[Case {
             id: "array_containment",
@@ -501,6 +522,7 @@ pub const FEATURES: &[Feature] = &[
         }],
     },
     Feature {
+        task: 8,
         name: "MVCC-versioned catalog",
         cases: &[Case {
             id: "own_uncommitted_table",
@@ -511,6 +533,7 @@ pub const FEATURES: &[Feature] = &[
         }],
     },
     Feature {
+        task: 9,
         name: "transactional DDL",
         cases: &[Case {
             id: "create_then_rollback",
@@ -521,6 +544,7 @@ pub const FEATURES: &[Feature] = &[
         }],
     },
     Feature {
+        task: 11,
         name: "migration ALTER TABLE",
         cases: &[
             Case {
@@ -559,6 +583,7 @@ pub const FEATURES: &[Feature] = &[
         ],
     },
     Feature {
+        task: 12,
         name: "index DDL and partial unique indexes",
         cases: &[
             Case {
@@ -604,6 +629,7 @@ pub const FEATURES: &[Feature] = &[
         ],
     },
     Feature {
+        task: 13,
         name: "ordinary views",
         cases: &[
             Case {
@@ -650,6 +676,7 @@ pub const FEATURES: &[Feature] = &[
         ],
     },
     Feature {
+        task: 31,
         name: "savepoints",
         cases: &[Case {
             id: "create_savepoint",
@@ -660,6 +687,7 @@ pub const FEATURES: &[Feature] = &[
         }],
     },
     Feature {
+        task: 32,
         name: "session GUC registry",
         cases: &[
             Case {
@@ -679,15 +707,20 @@ pub const FEATURES: &[Feature] = &[
         ],
     },
     Feature {
+        task: 33,
         name: "transaction-local GUCs",
+        cases: &[Case {
+            id: "set_local_timezone",
+            source: "json.sql:154",
+            setup: &["BEGIN"],
+            sql: "SET LOCAL TIME ZONE 'UTC'",
+            blocker: BlockerKind::Implementation,
+        }],
+    },
+    Feature {
+        task: 14,
+        name: "migration-local GUCs",
         cases: &[
-            Case {
-                id: "set_local_timezone",
-                source: "json.sql:154",
-                setup: &["BEGIN"],
-                sql: "SET LOCAL TIME ZONE 'UTC'",
-                blocker: BlockerKind::Implementation,
-            },
             Case {
                 id: "set_local_lock_timeout",
                 source: "focused local GUC scenario",
@@ -705,6 +738,7 @@ pub const FEATURES: &[Feature] = &[
         ],
     },
     Feature {
+        task: 14,
         name: "migration table locks",
         cases: &[
             Case {
@@ -731,6 +765,7 @@ pub const FEATURES: &[Feature] = &[
         ],
     },
     Feature {
+        task: 24,
         name: "advisory coordination",
         cases: &[
             Case {
@@ -757,6 +792,7 @@ pub const FEATURES: &[Feature] = &[
         ],
     },
     Feature {
+        task: 15,
         name: "procedural migrations and triggers",
         cases: &[
             Case {
@@ -780,6 +816,7 @@ pub const FEATURES: &[Feature] = &[
         ],
     },
     Feature {
+        task: 23,
         name: "SELECT row locks",
         cases: &[
             Case {
@@ -805,6 +842,7 @@ pub const FEATURES: &[Feature] = &[
         ],
     },
     Feature {
+        task: 26,
         name: "text hash functions and advisory locks",
         cases: &[
             Case {
@@ -824,6 +862,7 @@ pub const FEATURES: &[Feature] = &[
         ],
     },
     Feature {
+        task: 29,
         name: "PostgreSQL compatibility utilities and TRUNCATE",
         cases: &[
             Case {
@@ -862,6 +901,7 @@ pub const FEATURES: &[Feature] = &[
         ],
     },
     Feature {
+        task: 38,
         name: "serializable dependency tracking",
         cases: &[Case {
             id: "serializable_transaction",
@@ -872,6 +912,7 @@ pub const FEATURES: &[Feature] = &[
         }],
     },
     Feature {
+        task: 39,
         name: "serializable validation",
         cases: &[Case {
             id: "serializable_setting",
@@ -885,84 +926,105 @@ pub const FEATURES: &[Feature] = &[
 
 pub const SCENARIOS: &[Scenario] = &[
     Scenario {
+        task: 20,
         feature: "transactional migration chain",
         name: "schema_evolution",
         source: "tests/migrations/schema_evolution",
         blocker: BlockerKind::Implementation,
     },
     Scenario {
+        task: 20,
         feature: "transactional migration chain",
         name: "procedural_triggers",
         source: "tests/migrations/procedural_triggers",
         blocker: BlockerKind::Implementation,
     },
     Scenario {
+        task: 20,
         feature: "transactional migration chain",
         name: "data_reconciliation",
         source: "tests/migrations/data_reconciliation",
         blocker: BlockerKind::Implementation,
     },
     Scenario {
+        task: 6,
         feature: "ON CONFLICT DO NOTHING",
         name: "concurrent_unique_insert",
         source: "focused two-session scenario",
         blocker: BlockerKind::Implementation,
     },
     Scenario {
+        task: 7,
         feature: "ON CONFLICT DO UPDATE",
         name: "concurrent_conflict_recheck",
         source: "focused two-session scenario",
         blocker: BlockerKind::Implementation,
     },
     Scenario {
+        task: 8,
         feature: "MVCC-versioned catalog",
         name: "uncommitted_ddl_visibility",
         source: "transactions.sql:120 plus focused two-session scenario",
         blocker: BlockerKind::Implementation,
     },
     Scenario {
+        task: 9,
         feature: "transactional DDL",
         name: "drop_and_recreate_visibility",
         source: "transactions.sql:120 plus focused two-session scenario",
         blocker: BlockerKind::Implementation,
     },
     Scenario {
+        task: 31,
         feature: "savepoints",
         name: "rollback_releases_subtransaction_locks",
         source: "transactions.sql:73 plus focused two-session scenario",
         blocker: BlockerKind::Implementation,
     },
     Scenario {
+        task: 33,
         feature: "transaction-local GUCs",
         name: "savepoint_local_setting_restore",
         source: "transactions.sql:73 plus focused session scenario",
         blocker: BlockerKind::Implementation,
     },
     Scenario {
+        task: 23,
         feature: "SELECT row locks",
         name: "lock_mode_compatibility_matrix",
         source: "lock.sql plus focused two-session scenario",
         blocker: BlockerKind::Implementation,
     },
     Scenario {
+        task: 23,
         feature: "SELECT row locks",
         name: "skip_locked_work_queue",
         source: "limit.sql:179 plus focused two-session scenario",
         blocker: BlockerKind::Implementation,
     },
     Scenario {
+        task: 26,
         feature: "text hash functions and advisory locks",
         name: "hashed_advisory_contention",
         source: "tests/text_hash_differential.rs",
         blocker: BlockerKind::Implementation,
     },
     Scenario {
+        task: 30,
+        feature: "SQLx application workload",
+        name: "priority_application_workload",
+        source: "tests/application_workload.rs",
+        blocker: BlockerKind::Implementation,
+    },
+    Scenario {
+        task: 38,
         feature: "serializable dependency tracking",
         name: "write_skew_dependency_graph",
         source: "focused two-session scenario",
         blocker: BlockerKind::Implementation,
     },
     Scenario {
+        task: 39,
         feature: "serializable validation",
         name: "phantom_insert_serialization_failure",
         source: "focused two-session scenario",
@@ -972,24 +1034,28 @@ pub const SCENARIOS: &[Scenario] = &[
 
 pub const LIMITATIONS: &[Scenario] = &[
     Scenario {
+        task: 5,
         feature: "data-modifying CTEs",
         name: "upstream_relation_fixture",
         source: "with.sql:383",
         blocker: BlockerKind::Fixture,
     },
     Scenario {
+        task: 37,
         feature: "array type and I/O",
         name: "multidimensional_arrays",
         source: "arrays.sql:121",
         blocker: BlockerKind::Later,
     },
     Scenario {
+        task: 18,
         feature: "json and jsonb operators",
         name: "SQL_JSON_path_surface",
         source: "jsonpath.sql:1",
         blocker: BlockerKind::Later,
     },
     Scenario {
+        task: 1,
         feature: "parser coverage",
         name: "valid_PostgreSQL_syntax_without_sqlparser_AST",
         source: "record when encountered by the corpus runner",

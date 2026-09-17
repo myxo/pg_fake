@@ -48,7 +48,7 @@ and scope boundaries. The completed Phase 2 plan is archived in
   `spec.md` §10. Optimization-only clauses may be tolerated only when ignoring
   them cannot change Tier-A behavior, and strict mode must still reject them.
 - Tasks 8 through 30 are the priority track and must finish before Tasks 31
-  onward. Task 25 is the first unfinished task. Task 24 retains its
+  onward. Task 31 is the first unfinished task. Task 24 retains its
   completed status from an earlier approved exception. Tasks 25, 26, 27, and
   29 have no dependency on later milestones and are placed immediately after
   it for expedited delivery; Task 28 depends on Task 27, and Task 30 gates the
@@ -1507,10 +1507,45 @@ runtime paths without pretending to be a complete PostgreSQL server.
 - Focused PostgreSQL differential tests cover all accepted utility queries,
   metadata, transaction behavior, and errors.
 
-### Task 30 — SQLx application-workload conformance gate
+### Task 30 — SQLx application-workload conformance gate [COMPLETE]
 
 **Goal:** Demonstrate that realistic SQLx workloads run on `pg_fake`, not merely
 that isolated SQL parses.
+
+**Progress:**
+
+- [x] Add a checked-in application schema and apply it after all three unchanged
+  Task 20 migration chains through SQLx migrators on PostgreSQL 18 and
+  `pg_fake` pools.
+- [x] Run typed identity/session, work claiming/accounting,
+  payment/promotion, request-limit, thread/execution, and append-only-log
+  workflows through prepared queries and explicit transactions.
+- [x] Exercise advisory, table, and row locking, `SKIP LOCKED`, triggers,
+  JSONB, temporal expressions, `OffsetDateTime`, text hashes, BIGINT/UUID
+  arrays, ordered/filtered `array_agg`, and rollback in one differential gate.
+- [x] Compare typed results, prepared metadata, affected rows, transaction
+  outcomes, and SQLSTATE, and add a machine-checked classification for every
+  in-scope manifest entry and scenario.
+- [x] Pass workspace regression, strict Clippy, formatting, and the required
+  10,000-iteration property gate; resolve independent review findings.
+- [x] Obtain user approval before marking Task 30 complete.
+
+**Validation:** The application gate passes all three tests: the realistic
+workload matches PostgreSQL 18, every manifest case owned by Tasks 1–30 is
+replayed directly with ordered results preserved where requested, and every
+priority scenario has an exact Application or FocusedReplay classification.
+The complete SQLx test suite and the non-generated all-feature workspace suite
+pass against PostgreSQL 18 using `C` collation. Formatting and strict workspace
+Clippy pass. The final
+`CHAOS_THEORY_CHECK_ITERS=10000 CHAOS_THEORY_CHECK_TIME=600s` property gate,
+including the `time` feature, passes all 22 tests in 775.12 seconds. Repeated
+independent review is clean after resolving the full-gate and manifest-coverage
+findings.
+
+Task 30 is a fixed integration gate rather than a new SQL execution family, so
+it adds no separate property generator or benchmark. Existing generators and
+benchmarks continue to cover its component SQL families; this gate covers their
+composition through SQLx.
 
 **DoD:**
 

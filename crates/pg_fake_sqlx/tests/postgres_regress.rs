@@ -415,7 +415,8 @@ fn collect_phase3_report(
                 Ok(()) => passed += 1,
                 Err(error) if first_blocker.is_none() => {
                     first_blocker = Some(format!(
-                        "{} ({}) at {} [{}]: {error}",
+                        "Task {}: {} ({}) at {} [{}]: {error}",
+                        feature.task,
                         case.id,
                         feature.name,
                         case.source,
@@ -425,7 +426,10 @@ fn collect_phase3_report(
                 Err(_) => {}
             }
         }
-        blockers.push(first_blocker.unwrap_or_else(|| format!("{}: none", feature.name)));
+        blockers.push(
+            first_blocker
+                .unwrap_or_else(|| format!("Task {}: {}: none", feature.task, feature.name)),
+        );
         runtime
             .block_on(sqlx::raw_sql("ROLLBACK").execute(&mut postgres))
             .expect("must clean up Phase 3 transaction state");
@@ -547,7 +551,8 @@ fn reports_phase2_regression_progress() {
     }
     for scenario in phase3_manifest::SCENARIOS {
         eprintln!(
-            "PHASE3 SCENARIO {}:{} at {} [{}]",
+            "PHASE3 SCENARIO Task {} {}:{} at {} [{}]",
+            scenario.task,
             scenario.feature,
             scenario.name,
             scenario.source,
@@ -556,7 +561,8 @@ fn reports_phase2_regression_progress() {
     }
     for limitation in phase3_manifest::LIMITATIONS {
         eprintln!(
-            "PHASE3 LIMITATION {}:{} at {} [{}]",
+            "PHASE3 LIMITATION Task {} {}:{} at {} [{}]",
+            limitation.task,
             limitation.feature,
             limitation.name,
             limitation.source,

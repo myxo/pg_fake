@@ -40,3 +40,10 @@ fmt:
 
 # Full CI check: fmt, clippy, test
 check: fmt-check lint test
+
+# Run the complete Task 30 application-workload conformance gate
+task30-gate:
+    cargo fmt --all -- --check
+    cargo clippy --workspace --all-targets --all-features -- -D warnings
+    cargo test --workspace --all-features -- --skip generated_
+    CHAOS_THEORY_CHECK_ITERS=10000 CHAOS_THEORY_CHECK_TIME=600s cargo test -p pg_fake_sqlx --features time --test property_tests
