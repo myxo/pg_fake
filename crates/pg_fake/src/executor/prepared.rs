@@ -206,6 +206,9 @@ pub(crate) fn build_prepared_query_plan(
         return Ok(None);
     }
     let relation_name = normalize_relation_name(name)?;
+    if super::describe_visible_system_relation(&state.catalog, &relation_name).is_some() {
+        return Ok(None);
+    }
     if state.catalog.require_named_view(&relation_name).is_ok() {
         return Ok(None);
     }

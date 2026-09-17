@@ -4,7 +4,7 @@ use crate::executor::{
     column_defaults::is_default_expression,
     expressions::{create_constant_expression_schema, evaluate_assignment_expression},
     foreign_keys::resolve_foreign_key_column_indexes,
-    normalize_unqualified_object_name, resolve_insert_table_name,
+    normalize_function_name, normalize_unqualified_object_name, resolve_insert_table_name,
 };
 use crate::{
     catalog::TableSchema,
@@ -168,7 +168,7 @@ pub(super) fn collect_insert_foreign_key_locks(
                 let mut has_side_effect = false;
                 let _ = ast::visit_expressions(expression, |nested| {
                     if let ast::Expr::Function(function) = nested
-                        && normalize_unqualified_object_name(&function.name).is_ok_and(|name| {
+                        && normalize_function_name(&function.name).is_ok_and(|name| {
                             matches!(
                                 name.as_str(),
                                 "gen_random_uuid" | "uuidv4" | "uuidv7" | "nextval" | "setval"

@@ -18,8 +18,8 @@ pub(crate) use functions::{FunctionId, FunctionSchema};
 pub(crate) use names::{RelationName, ResolvedRelationName};
 pub(crate) use sequences::{SequenceId, SequenceSchema};
 pub(crate) use tables::{
-    ColumnDef, IdentityKind, IndexColumnDefinition, IndexSchema, TableId, TablePersistence,
-    TableSchema, TriggerSchema,
+    ColumnDef, IdentityKind, IndexColumnDefinition, IndexId, IndexSchema, TableId,
+    TablePersistence, TableSchema, TriggerSchema,
 };
 pub(crate) use views::{ViewColumn, ViewDependency, ViewId, ViewSchema};
 
@@ -44,6 +44,7 @@ pub(crate) struct Schema {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct Catalog {
     relations: Arc<CatalogRelations>,
+    pub(crate) search_path: Vec<String>,
     next_schema_id: u64,
     next_table_id: u64,
     next_sequence_id: u64,
@@ -96,6 +97,7 @@ impl Catalog {
                 deferrable_foreign_keys: Vec::new(),
                 referencing_foreign_keys: BTreeMap::new(),
             }),
+            search_path: vec![DEFAULT_SCHEMA.into()],
             next_schema_id: 2,
             next_table_id: 1,
             next_sequence_id: 1,
@@ -105,6 +107,10 @@ impl Catalog {
             next_trigger_id: 1,
             next_function_id: 1,
         }
+    }
+
+    pub(crate) fn set_search_path(&mut self, search_path: &[String]) {
+        self.search_path = search_path.to_vec();
     }
 
     fn get_default_schema(&self) -> &Schema {
@@ -137,6 +143,10 @@ impl Catalog {
 
     pub(crate) fn get_schema_name(&self, id: SchemaId) -> &str {
         &self.get_schema_by_id(id).name
+    }
+
+    pub(crate) fn iterate_schemas(&self) -> impl Iterator<Item = &Schema> {
+        self.relations.schemas.values()
     }
 
     #[cfg_attr(not(test), allow(dead_code))]

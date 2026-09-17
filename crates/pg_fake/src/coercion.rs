@@ -50,6 +50,7 @@ pub(crate) fn convert_ast_data_type(data_type: &ast::DataType) -> Result<PgType>
         }
         ast::DataType::Bytea => (BaseType::Bytea, PgType::NO_TYPEMOD),
         ast::DataType::Uuid => (BaseType::Uuid, PgType::NO_TYPEMOD),
+        ast::DataType::Regclass => (BaseType::Regclass, PgType::NO_TYPEMOD),
         ast::DataType::Date => (BaseType::Date, PgType::NO_TYPEMOD),
         ast::DataType::Time(
             precision,
@@ -172,6 +173,18 @@ pub(crate) fn resolve_common_type(left: BaseType, right: BaseType) -> Option<Bas
     if is_string_type(left) && is_string_type(right) {
         return Some(BaseType::Text);
     }
+    if matches!(
+        (left, right),
+        (BaseType::Oid, BaseType::Regclass) | (BaseType::Regclass, BaseType::Oid)
+    ) {
+        return Some(BaseType::Regclass);
+    }
+    if matches!(
+        (left, right),
+        (BaseType::Oid, BaseType::Int4) | (BaseType::Int4, BaseType::Oid)
+    ) {
+        return Some(BaseType::Oid);
+    }
     let left_rank = get_numeric_rank(left)?;
     let right_rank = get_numeric_rank(right)?;
     Some(if left_rank > right_rank { left } else { right })
@@ -234,6 +247,9 @@ fn resolve_required_cast_context(source: BaseType, target: BaseType) -> Option<C
             | BaseType::Timestamp
             | BaseType::TimestampTz
             | BaseType::Interval
+            | BaseType::PgLsn
+            | BaseType::Oid
+            | BaseType::Regclass
     ) && is_string_type(target)
     {
         return Some(CastContext::Assignment);
@@ -267,6 +283,14 @@ fn resolve_required_cast_context(source: BaseType, target: BaseType) -> Option<C
             )
     ) {
         return Some(CastContext::Explicit);
+    }
+    if matches!(
+        (source, target),
+        (BaseType::Oid, BaseType::Regclass)
+            | (BaseType::Regclass, BaseType::Oid)
+            | (BaseType::Int4, BaseType::Oid)
+    ) {
+        return Some(CastContext::Implicit);
     }
     None
 }
@@ -551,6 +575,11 @@ fn convert_non_string_value(value: Value, target: BaseType) -> Result<Value> {
             .ok_or_else(|| create_out_of_range_error(BaseType::Float8)),
         (Value::Int4(value), BaseType::Bool) => Ok(Value::Bool(value != 0)),
         (Value::Bool(value), BaseType::Int4) => Ok(Value::Int4(i32::from(value))),
+        (Value::Int4(value), BaseType::Oid) => Ok(Value::Oid(value as u32)),
+        (Value::Oid(value), BaseType::Regclass) => {
+            Ok(Value::Regclass(crate::value::PgRegclass(value)))
+        }
+        (Value::Regclass(crate::value::PgRegclass(value)), BaseType::Oid) => Ok(Value::Oid(value)),
         (Value::Int2(value), BaseType::Bytea) => Ok(Value::Bytea(value.to_be_bytes().into())),
         (Value::Int4(value), BaseType::Bytea) => Ok(Value::Bytea(value.to_be_bytes().into())),
         (Value::Int8(value), BaseType::Bytea) => Ok(Value::Bytea(value.to_be_bytes().into())),

@@ -113,6 +113,7 @@ impl Session {
                 None => (None, Snapshot::create(&state.transactions)),
             };
             state.load_catalog(xid, snapshot, Some(self.temporary_schema_id));
+            state.catalog.set_search_path(&self.search_path);
             analyzer::count_parameters(&statement)
                 .and_then(|parameter_count| {
                     let parameter_count = parameter_count.max(parameter_types.len());

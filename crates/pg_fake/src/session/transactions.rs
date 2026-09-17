@@ -311,6 +311,7 @@ impl Session {
             snapshot,
             Some(self.temporary_schema_id),
         );
+        state.commit_sequence_resets(transaction.xid);
         for table_id in state.take_touched_tables(transaction.xid) {
             let has_reclamation = state
                 .tables
@@ -533,6 +534,7 @@ fn parse_isolation_level(modes: &[ast::TransactionMode]) -> Result<Option<Isolat
 
 #[cfg_attr(feature = "execution-log", tracing::instrument(skip_all))]
 fn abort_database_transaction(state: &mut DatabaseState, xid: Xid) {
+    state.abort_sequence_resets(xid);
     let reclaimed = state.catalog_history.discard_transaction(xid);
     for table_id in reclaimed.tables {
         state.tables.remove(&table_id);

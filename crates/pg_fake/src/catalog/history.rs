@@ -219,6 +219,7 @@ impl CatalogHistory {
                 deferrable_foreign_keys: Vec::new(),
                 referencing_foreign_keys: BTreeMap::new(),
             }),
+            search_path: vec![DEFAULT_SCHEMA.into()],
             next_schema_id: self.next_schema_id,
             next_table_id: self.next_table_id,
             next_sequence_id: self.next_sequence_id,

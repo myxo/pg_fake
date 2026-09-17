@@ -8,10 +8,13 @@ pub(super) enum EqualityKey {
     Bool(bool),
     Int2(i16),
     Int4(i32),
+    Oid(u32),
     Int8(i64),
     Text(String),
     Bytea(Vec<u8>),
     Uuid(uuid::Uuid),
+    PgLsn(crate::value::PgLsn),
+    Regclass(crate::value::PgRegclass),
 }
 
 #[cfg_attr(feature = "execution-log", tracing::instrument(skip_all))]
@@ -22,10 +25,13 @@ pub(super) fn create_equality_key(value: &Value) -> Option<EqualityKey> {
         Value::Bool(value) => Some(EqualityKey::Bool(*value)),
         Value::Int2(value) => Some(EqualityKey::Int2(*value)),
         Value::Int4(value) => Some(EqualityKey::Int4(*value)),
+        Value::Oid(value) => Some(EqualityKey::Oid(*value)),
         Value::Int8(value) => Some(EqualityKey::Int8(*value)),
         Value::Text(value) => Some(EqualityKey::Text(value.clone())),
         Value::Bytea(value) => Some(EqualityKey::Bytea(value.clone())),
         Value::Uuid(value) => Some(EqualityKey::Uuid(*value)),
+        Value::PgLsn(value) => Some(EqualityKey::PgLsn(*value)),
+        Value::Regclass(value) => Some(EqualityKey::Regclass(*value)),
         _ => None,
     }
 }

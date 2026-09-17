@@ -41,9 +41,10 @@ pub(crate) fn classify(statement: &ast::Statement) -> StatementKind {
         | ast::Statement::AlterView { .. }
         | ast::Statement::Comment { .. }
         | ast::Statement::Drop { .. } => StatementKind::Ddl,
-        ast::Statement::Insert(_) | ast::Statement::Update(_) | ast::Statement::Delete(_) => {
-            StatementKind::Dml
-        }
+        ast::Statement::Insert(_)
+        | ast::Statement::Update(_)
+        | ast::Statement::Delete(_)
+        | ast::Statement::Truncate(_) => StatementKind::Dml,
         ast::Statement::Query(_) => StatementKind::Query,
         ast::Statement::StartTransaction { .. }
         | ast::Statement::Commit { .. }

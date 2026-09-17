@@ -41,6 +41,7 @@ pub struct Session {
     lock_timeout: Duration,
     statement_timeout: Duration,
     timezone: String,
+    search_path: Vec<String>,
     settings_undo: Option<SessionSettings>,
     settings_on_commit: Option<SessionSettings>,
     deferred_constraints: BTreeSet<ConstraintId>,
@@ -65,6 +66,7 @@ impl Session {
             lock_timeout,
             statement_timeout: Duration::ZERO,
             timezone: "UTC".into(),
+            search_path: vec!["public".into()],
             settings_undo: None,
             settings_on_commit: None,
             deferred_constraints: BTreeSet::new(),
@@ -188,6 +190,7 @@ impl Session {
             snapshot,
             Some(self.temporary_schema_id),
         );
+        state.catalog.set_search_path(&self.search_path);
         let acquired = match acquire_relation_locks(
             &condvar,
             self.lock_timeout,
@@ -275,21 +278,11 @@ impl Session {
             };
         }
         let statement_contains_dml = contains_dml(statement);
-        let sequences = if statement_contains_dml
-            || contains_sequence_function(statement)
-            || state.catalog.iterate_views().next().is_some()
-        {
-            executor::SequenceExecutionContext::create(
-                &state.catalog,
-                state.sequence_values.clone(),
-                self.sequence_session.clone(),
-            )
-        } else {
-            executor::SequenceExecutionContext::create_empty(
-                state.sequence_values.clone(),
-                self.sequence_session.clone(),
-            )
-        };
+        let sequences = executor::SequenceExecutionContext::create(
+            &state.catalog,
+            state.sequence_values.clone(),
+            self.sequence_session.clone(),
+        );
         let context = executor::StatementContext {
             command_id,
             transaction_timestamp: transaction.transaction_timestamp,
@@ -515,7 +508,10 @@ impl Session {
 
 fn contains_dml(statement: &ast::Statement) -> bool {
     match statement {
-        ast::Statement::Insert(_) | ast::Statement::Update(_) | ast::Statement::Delete(_) => true,
+        ast::Statement::Insert(_)
+        | ast::Statement::Update(_)
+        | ast::Statement::Delete(_)
+        | ast::Statement::Truncate(_) => true,
         ast::Statement::Query(query) => {
             matches!(
                 query.body.as_ref(),
@@ -582,7 +578,7 @@ fn contains_sequence_function(statement: &ast::Statement) -> bool {
         let ast::Expr::Function(function) = expression else {
             return std::ops::ControlFlow::Continue(());
         };
-        if executor::normalize_unqualified_object_name(&function.name).is_ok_and(|name| {
+        if executor::normalize_function_name(&function.name).is_ok_and(|name| {
             matches!(
                 name.as_str(),
                 "nextval" | "currval" | "lastval" | "setval" | "pg_get_serial_sequence"

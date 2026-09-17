@@ -9,6 +9,7 @@ pub(crate) fn create_typed_literal(value: Value, data_type: PgType) -> ast::Expr
         Value::Bool(value) => ast::Value::Boolean(value),
         Value::Int2(value) => ast::Value::Number(value.to_string(), false),
         Value::Int4(value) => ast::Value::Number(value.to_string(), false),
+        Value::Oid(value) => ast::Value::Number(value.to_string(), false),
         Value::Int8(value) => ast::Value::Number(value.to_string(), false),
         Value::Float4(value) => {
             ast::Value::SingleQuotedString(Value::Float4(value).format_postgres_text())
@@ -39,6 +40,12 @@ pub(crate) fn create_typed_literal(value: Value, data_type: PgType) -> ast::Expr
         }
         Value::Json(value) => ast::Value::SingleQuotedString(value),
         Value::Jsonb(value) => ast::Value::SingleQuotedString(value.get_postgres_text().to_owned()),
+        Value::PgLsn(value) => {
+            ast::Value::SingleQuotedString(Value::PgLsn(value).format_postgres_text())
+        }
+        Value::Regclass(value) => {
+            ast::Value::SingleQuotedString(Value::Regclass(value).format_postgres_text())
+        }
         Value::Array { values, .. } => {
             ast::Value::SingleQuotedString(crate::text_array::format_array(&values))
         }
@@ -62,6 +69,7 @@ fn convert_to_ast_data_type(data_type: PgType) -> ast::DataType {
         BaseType::Bool => ast::DataType::Boolean,
         BaseType::Int2 => ast::DataType::SmallInt(None),
         BaseType::Int4 => ast::DataType::Integer(None),
+        BaseType::Oid => ast::DataType::Custom(ast::Ident::new("oid").into(), Vec::new()),
         BaseType::Int8 => ast::DataType::BigInt(None),
         BaseType::Float4 => ast::DataType::Real,
         BaseType::Float8 => ast::DataType::DoublePrecision,
@@ -112,6 +120,8 @@ fn convert_to_ast_data_type(data_type: PgType) -> ast::DataType {
         },
         BaseType::Json => ast::DataType::JSON,
         BaseType::Jsonb => ast::DataType::JSONB,
+        BaseType::PgLsn => ast::DataType::Custom(ast::Ident::new("pg_lsn").into(), Vec::new()),
+        BaseType::Regclass => ast::DataType::Regclass,
         BaseType::TextArray => ast::DataType::Array(ast::ArrayElemTypeDef::SquareBracket(
             Box::new(ast::DataType::Text),
             None,

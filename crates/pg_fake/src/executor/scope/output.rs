@@ -217,7 +217,7 @@ pub(super) fn describe_bound_query_columns(
                             |data_type| {
                                 let name = match expr {
                                     ast::Expr::Function(function) => {
-                                        normalize_unqualified_object_name(&function.name)?
+                                        super::super::normalize_function_name(&function.name)?
                                     }
                                     ast::Expr::Extract { .. } => "extract".into(),
                                     _ => "?column?".into(),

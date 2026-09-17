@@ -1455,20 +1455,52 @@ broader array surface.
 `ORDER BY`/`FILTER` substrate. Array assignment, general operators/functions,
 other element types, and `unnest` remain Task 37.
 
-### Task 29 — PostgreSQL compatibility utilities and maintenance statements
+### Task 29 — PostgreSQL compatibility utilities and maintenance statements [COMPLETE]
 
 **Goal:** Cover the small server-facing surface reached on normal startup and
 runtime paths without pretending to be a complete PostgreSQL server.
 
+**Progress:**
+
+- [x] Add the bounded `regclass` type, lookup rules, catalog functions, and
+  foundational catalog relations described below.
+- [x] Add the bounded `pg_lsn` scalar surface and SQLx codecs described below.
+- [x] Add deterministic primary-server recovery reporting.
+- [x] Add transactional, foreign-key-aware, identity-aware, locking `TRUNCATE`.
+- [x] Add focused differential, property, manifest, and benchmark coverage and
+  pass the required validation and review gates.
+
 **DoD:**
 
-- `pg_is_in_recovery()` returns a deterministic primary-server result for
-  startup and migration logic.
-- `regclass`, `pg_lsn`, and the explicitly supported catalog
-  functions/relations have PostgreSQL-compatible types and observable
-  semantics recorded in the conformance manifest.
-- `TRUNCATE` supports relation lists, identity, foreign-key,
-  transaction, and locking behavior.
+- `pg_is_in_recovery()` and its `pg_catalog`-qualified form return non-null
+  `FALSE`, modeling a deterministic primary server for startup and migration
+  logic. WAL generation, replay progress, and replication administration are
+  not simulated.
+- `regclass` uses PostgreSQL OID 2205 and resolves tables, views, sequences,
+  indexes, and the supported system-catalog relations. Text-to-`regclass` and
+  `regclass`-to-text casts plus `to_regclass(text)` obey `search_path`, schema
+  qualification, quoted names, temporary-object shadowing, and transactional
+  catalog visibility. A missing object raises `42P01` through a cast and yields
+  NULL through `to_regclass`.
+- The supported catalog functions are `to_regclass(text)`,
+  `format_type(oid, typmod)`, and the existing
+  `pg_get_serial_sequence(text, text)`. The supported catalog relations are
+  `pg_catalog.pg_namespace`, `pg_catalog.pg_class`,
+  `pg_catalog.pg_attribute`, and `pg_catalog.pg_type`, limited to columns
+  required for relation existence and column/type introspection. Unsupported
+  columns, functions, `information_schema` relations, statistics, privileges,
+  and dependency catalogs fail explicitly.
+- `pg_lsn` uses PostgreSQL OID 3220 and a `u64` value model. Canonical
+  hexadecimal input/output, text casts, SQLx parameter/result codecs,
+  comparison and ordering, `MIN`/`MAX`, LSN subtraction, and integral-numeric
+  offset addition/subtraction match PostgreSQL, including malformed and
+  out-of-range errors. No artificial WAL advancement is introduced.
+- `TRUNCATE` supports one or more ordinary or temporary tables, transactional
+  commit and rollback, `RESTRICT`, transitive `CASCADE` through foreign keys,
+  `CONTINUE IDENTITY`, transactional `RESTART IDENTITY` for owned serial and
+  identity sequences, and PostgreSQL-compatible table locking. Views and other
+  unsupported relation kinds fail explicitly. Inheritance, partitioning, and
+  `ON TRUNCATE` triggers remain outside this task.
 - Unsupported catalog columns/functions and server-management statements fail
   explicitly; `CREATE DATABASE` and `DROP DATABASE` remain harness concerns,
   not SQL executed by `pg_fake`.

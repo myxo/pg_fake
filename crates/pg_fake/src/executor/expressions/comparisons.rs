@@ -39,6 +39,7 @@ pub(in crate::executor) fn compare_values(left: &Value, right: &Value) -> Result
         (Value::Bool(left), Value::Bool(right)) => left.cmp(right),
         (Value::Int2(left), Value::Int2(right)) => left.cmp(right),
         (Value::Int4(left), Value::Int4(right)) => left.cmp(right),
+        (Value::Oid(left), Value::Oid(right)) => left.cmp(right),
         (Value::Int8(left), Value::Int8(right)) => left.cmp(right),
         (Value::Float4(left), Value::Float4(right)) => compare_float4(*left, *right),
         (Value::Float8(left), Value::Float8(right)) => compare_float8(*left, *right),
@@ -67,6 +68,8 @@ pub(in crate::executor) fn compare_values(left: &Value, right: &Value) -> Result
             return Err(create_missing_operator_error(BaseType::Json));
         }
         (Value::Jsonb(left), Value::Jsonb(right)) => left.compare(right),
+        (Value::PgLsn(left), Value::PgLsn(right)) => left.cmp(right),
+        (Value::Regclass(left), Value::Regclass(right)) => left.cmp(right),
         _ => {
             return Err(PgError::create(
                 SqlState::DatatypeMismatch,

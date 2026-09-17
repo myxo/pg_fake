@@ -4,7 +4,7 @@ use super::{
     foreign_keys::{
         convert_referential_action, resolve_foreign_key_name, validate_foreign_key_definitions,
     },
-    normalize_identifier, normalize_relation_name, normalize_unqualified_object_name,
+    normalize_function_name, normalize_identifier, normalize_relation_name,
     resolve_index_column_name,
     row_constraints::validate_check_constraint_types,
     sequences, validate_btree_key_type,
@@ -62,6 +62,8 @@ pub(super) fn execute_create_table(
     let resolved_name = state
         .catalog
         .resolve_creation_name(&relation_name, temporary)?;
+    let temporary = temporary
+        || state.catalog.get_schema_name(resolved_name.schema_id) == crate::catalog::TEMP_SCHEMA;
     let table_name = resolved_name.name.clone();
     let persistence = if temporary {
         TablePersistence::Temporary { on_commit_drop }
@@ -118,7 +120,15 @@ pub(super) fn execute_create_table(
                             .name
                             .as_ref()
                             .map(normalize_identifier)
-                            .unwrap_or_else(|| format!("{table_name}_pkey")),
+                            .unwrap_or_else(|| {
+                                generate_index_constraint_name(
+                                    &state.catalog,
+                                    resolved_name.schema_id,
+                                    None,
+                                    format!("{table_name}_pkey"),
+                                    &constraints,
+                                )
+                            }),
                         columns,
                     });
                 }
@@ -130,7 +140,15 @@ pub(super) fn execute_create_table(
                             .name
                             .as_ref()
                             .map(normalize_identifier)
-                            .unwrap_or_else(|| format!("{table_name}_{column_name}_key")),
+                            .unwrap_or_else(|| {
+                                generate_index_constraint_name(
+                                    &state.catalog,
+                                    resolved_name.schema_id,
+                                    None,
+                                    format!("{table_name}_{column_name}_key"),
+                                    &constraints,
+                                )
+                            }),
                         columns,
                     });
                 }
@@ -288,7 +306,15 @@ pub(super) fn execute_create_table(
                         .name
                         .as_ref()
                         .map(normalize_identifier)
-                        .unwrap_or_else(|| format!("{table_name}_pkey")),
+                        .unwrap_or_else(|| {
+                            generate_index_constraint_name(
+                                &state.catalog,
+                                resolved_name.schema_id,
+                                None,
+                                format!("{table_name}_pkey"),
+                                &constraints,
+                            )
+                        }),
                     columns,
                 })
             }
@@ -298,14 +324,21 @@ pub(super) fn execute_create_table(
                     .iter()
                     .map(resolve_index_column_name)
                     .collect::<Result<Vec<_>>>()?;
-                let default_name = format!("{table_name}_{}_key", columns.join("_"));
                 constraints.push(crate::catalog::Constraint::Unique {
                     id: ConstraintId(0),
                     name: unique
                         .name
                         .as_ref()
                         .map(normalize_identifier)
-                        .unwrap_or(default_name),
+                        .unwrap_or_else(|| {
+                            generate_index_constraint_name(
+                                &state.catalog,
+                                resolved_name.schema_id,
+                                None,
+                                format!("{table_name}_{}_key", columns.join("_")),
+                                &constraints,
+                            )
+                        }),
                     columns,
                 })
             }
@@ -529,6 +562,57 @@ pub(super) fn generate_constraint_name(
     }
 }
 
+pub(super) fn generate_index_constraint_name(
+    catalog: &Catalog,
+    schema_id: crate::catalog::SchemaId,
+    table_id: Option<TableId>,
+    base: String,
+    constraints: &[crate::catalog::Constraint],
+) -> String {
+    let mut suffix = 0;
+    loop {
+        let name = if suffix == 0 {
+            base.clone()
+        } else {
+            format!("{base}{suffix}")
+        };
+        if index_constraint_name_is_available(catalog, schema_id, table_id, constraints, &name) {
+            return name;
+        }
+        suffix += 1;
+    }
+}
+
+pub(super) fn index_constraint_name_is_available(
+    catalog: &Catalog,
+    schema_id: crate::catalog::SchemaId,
+    table_id: Option<TableId>,
+    constraints: &[crate::catalog::Constraint],
+    name: &str,
+) -> bool {
+    if constraints
+        .iter()
+        .any(|constraint| constraint.get_name() == Some(name))
+    {
+        return false;
+    }
+    let relation_name = ResolvedRelationName {
+        schema_id,
+        name: name.to_owned(),
+    };
+    if !catalog.has_resolved_relation(&relation_name) {
+        return true;
+    }
+    catalog
+        .resolve_constraint_index(&relation_name)
+        .is_some_and(|(owner_id, constraint_id)| {
+            Some(owner_id) == table_id
+                && !constraints
+                    .iter()
+                    .any(|constraint| constraint.get_id() == constraint_id)
+        })
+}
+
 #[cfg_attr(feature = "execution-log", tracing::instrument(skip_all))]
 pub(super) fn create_generated_sequence_name(
     catalog: &Catalog,
@@ -566,7 +650,7 @@ pub(super) fn resolve_default_sequence(
             let ast::Expr::Function(function) = nested else {
                 return std::ops::ControlFlow::Continue(());
             };
-            if normalize_unqualified_object_name(&function.name)
+            if normalize_function_name(&function.name)
                 .is_ok_and(|name| matches!(name.as_str(), "nextval" | "currval" | "setval"))
             {
                 contains_sequence_call = true;
@@ -605,7 +689,7 @@ fn extract_default_sequence_name(expression: &ast::Expr) -> Option<&str> {
     match expression {
         ast::Expr::Nested(expr) => extract_default_sequence_name(expr),
         ast::Expr::Function(function)
-            if normalize_unqualified_object_name(&function.name).as_deref() == Ok("nextval") =>
+            if normalize_function_name(&function.name).as_deref() == Ok("nextval") =>
         {
             let ast::FunctionArguments::List(arguments) = &function.args else {
                 return None;

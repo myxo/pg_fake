@@ -21,6 +21,70 @@ pub(in crate::session) fn collect_relation_locks(
     statement: &ast::Statement,
     prepared_dependencies: Option<&[CatalogDependency]>,
 ) -> Result<Vec<(String, RelationLockMode)>> {
+    if let ast::Statement::Truncate(truncate) = statement {
+        if truncate
+            .table_names
+            .iter()
+            .any(|target| target.only || target.has_asterisk)
+        {
+            return reject_unsupported("TRUNCATE inheritance targets are not implemented");
+        }
+        let cascade = matches!(truncate.cascade, Some(ast::CascadeOption::Cascade));
+        let mut tables = truncate
+            .table_names
+            .iter()
+            .map(|target| {
+                let name = executor::normalize_relation_name(&target.name)?;
+                state.catalog.require_named_table(&name).cloned()
+            })
+            .collect::<Result<Vec<_>>>()?;
+        if cascade {
+            let mut index = 0;
+            while index < tables.len() {
+                for (referencing, _) in state
+                    .catalog
+                    .collect_referencing_foreign_keys(tables[index].id)
+                {
+                    if !tables.iter().any(|table| table.id == referencing.id) {
+                        tables.push(referencing);
+                    }
+                }
+                index += 1;
+            }
+        }
+        let mut locks = std::collections::BTreeMap::new();
+        for table in &tables {
+            locks.insert(
+                ResolvedRelationName {
+                    schema_id: table.schema_id,
+                    name: table.name.clone(),
+                }
+                .get_lock_name(),
+                RelationLockMode::Exclusive,
+            );
+        }
+        if matches!(
+            truncate.identity,
+            Some(ast::TruncateIdentityOption::Restart)
+        ) {
+            for sequence in state.catalog.iterate_sequences().filter(|sequence| {
+                sequence
+                    .owned_by
+                    .as_ref()
+                    .is_some_and(|(owner, _)| tables.iter().any(|table| table.id == *owner))
+            }) {
+                locks.insert(
+                    ResolvedRelationName {
+                        schema_id: sequence.schema_id,
+                        name: sequence.name.clone(),
+                    }
+                    .get_lock_name(),
+                    RelationLockMode::Exclusive,
+                );
+            }
+        }
+        return Ok(locks.into_iter().collect());
+    }
     if let ast::Statement::Lock(lock) = statement {
         if lock.nowait {
             return reject_unsupported("LOCK TABLE NOWAIT is not implemented");
@@ -175,7 +239,7 @@ pub(in crate::session) fn collect_relation_locks(
         let ast::Expr::Function(function) = expression else {
             return std::ops::ControlFlow::Continue(());
         };
-        let Ok(name) = executor::normalize_unqualified_object_name(&function.name) else {
+        let Ok(name) = executor::normalize_function_name(&function.name) else {
             return std::ops::ControlFlow::Continue(());
         };
         if !matches!(name.as_str(), "nextval" | "currval" | "setval") {

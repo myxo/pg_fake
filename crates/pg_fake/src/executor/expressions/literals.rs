@@ -61,6 +61,9 @@ pub(in crate::executor) fn evaluate_literal(expr: &ast::Expr) -> Result<Value> {
                     | BaseType::Date
                     | BaseType::Timestamp
                     | BaseType::TimestampTz
+                    | BaseType::PgLsn
+                    | BaseType::Oid
+                    | BaseType::Regclass
             ) {
                 return reject_unsupported("typed literal is not implemented");
             }

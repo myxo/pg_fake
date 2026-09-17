@@ -11,8 +11,8 @@ use crate::{
     coercion::{self, CastContext},
     error::{PgError, Result, SqlState, reject_unsupported},
     executor::{
-        DatabaseState, StatementContext, normalize_identifier, normalize_relation_name,
-        normalize_unqualified_object_name, resolve_insert_table_name,
+        DatabaseState, StatementContext, normalize_function_name, normalize_identifier,
+        normalize_relation_name, normalize_unqualified_object_name, resolve_insert_table_name,
         scope::{
             BoundScope, bind_from_scope, bind_select_scope, bind_target_scope, combine_bound_scopes,
         },
@@ -344,9 +344,7 @@ pub(in crate::executor) fn build_projection_plan<'a>(
                 projections.push(ProjectionSource::Expression(expr));
                 columns.push(ColumnMeta {
                     name: match expr {
-                        ast::Expr::Function(function) => {
-                            normalize_unqualified_object_name(&function.name)?
-                        }
+                        ast::Expr::Function(function) => normalize_function_name(&function.name)?,
                         ast::Expr::Extract { .. } => "extract".into(),
                         ast::Expr::Floor { .. } => "floor".into(),
                         ast::Expr::AtTimeZone { .. } => "timezone".into(),

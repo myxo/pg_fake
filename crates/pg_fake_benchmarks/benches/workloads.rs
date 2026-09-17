@@ -615,6 +615,35 @@ fn sequence_benchmark(
     }
 }
 
+fn catalog_regclass_benchmark(
+    criterion: &mut Criterion,
+    runtime: &Runtime,
+    connections: &mut [NamedBenchmarkConnection<'_>],
+) {
+    for (_, connection) in connections.iter_mut() {
+        connection.execute(
+            runtime,
+            "CREATE TABLE catalog_regclass_lookup (id SERIAL PRIMARY KEY, label VARCHAR(32) NOT NULL)",
+        );
+    }
+    let query = "SELECT a.attname, format_type(a.atttypid, a.atttypmod), a.attnotnull \
+                 FROM pg_catalog.pg_attribute AS a \
+                 WHERE a.attrelid = 'catalog_regclass_lookup'::regclass AND a.attnum > 0 \
+                 ORDER BY a.attnum";
+    let mut group =
+        criterion.benchmark_group(benchmarks::find_benchmark("catalog_regclass_lookup").name);
+    group.throughput(Throughput::Elements(2));
+    for (name, connection) in connections.iter_mut() {
+        group.bench_function(*name, |benchmark| {
+            benchmark.iter(|| connection.fetch(runtime, query));
+        });
+    }
+    group.finish();
+    for (_, connection) in connections.iter_mut() {
+        connection.execute(runtime, "DROP TABLE catalog_regclass_lookup");
+    }
+}
+
 fn serial_identity_benchmark(
     criterion: &mut Criterion,
     runtime: &Runtime,
@@ -1782,6 +1811,7 @@ fn benchmarks(criterion: &mut Criterion) {
         partial_unique_index_benchmark(criterion, &runtime, &mut connections);
         temporary_table_benchmark(criterion, &runtime, &mut connections);
         sequence_benchmark(criterion, &runtime, &mut connections);
+        catalog_regclass_benchmark(criterion, &runtime, &mut connections);
         serial_identity_benchmark(criterion, &runtime, &mut connections);
         uuid_temporal_benchmark(criterion, &runtime, &mut connections);
         offset_datetime_benchmark(criterion, &runtime, &mut connections);

@@ -9,7 +9,7 @@ use crate::{
         equality::are_rows_not_distinct,
         expressions::{compare_values, infer_window_return_type},
         from::visit_query_source_rows,
-        normalize_unqualified_object_name, resolve_order_ascending,
+        normalize_function_name, resolve_order_ascending,
         scope::{BoundScope, RowScope},
         subqueries::evaluate_query_expression,
     },
@@ -138,7 +138,7 @@ fn calculate_window_values(
     let mut values = vec![vec![Value::Null; functions.len()]; rows.len()];
     for (function_index, function) in functions.iter().enumerate() {
         infer_window_return_type(function, RowScope::Bound(scope))?;
-        let name = normalize_unqualified_object_name(&function.name)?;
+        let name = normalize_function_name(&function.name)?;
         let ast::WindowType::WindowSpec(window) = function
             .over
             .as_ref()

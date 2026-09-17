@@ -32,7 +32,7 @@ pub(crate) fn contains_advisory_function(value: &impl sqlparser::ast::Visit) -> 
             expression: &sqlparser::ast::Expr,
         ) -> std::ops::ControlFlow<()> {
             if let sqlparser::ast::Expr::Function(function) = expression {
-                self.0 |= crate::executor::normalize_unqualified_object_name(&function.name)
+                self.0 |= crate::executor::normalize_function_name(&function.name)
                     .ok()
                     .and_then(|name| resolve_advisory_function(&name))
                     .is_some();

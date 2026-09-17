@@ -27,7 +27,10 @@ impl Catalog {
     pub(crate) fn require_named_sequence(&self, name: &RelationName) -> Result<&SequenceSchema> {
         let name = self.resolve_relation_name(name)?;
         let schema = self.get_schema_by_id(name.schema_id);
-        if schema.tables.contains_key(&name.name) || schema.views.contains_key(&name.name) {
+        if schema.tables.contains_key(&name.name)
+            || schema.views.contains_key(&name.name)
+            || self.resolve_constraint_index(&name).is_some()
+        {
             return Err(PgError::create(
                 SqlState::WrongObjectType,
                 format!("{:?} is not a sequence", name.name),

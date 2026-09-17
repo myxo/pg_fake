@@ -2,7 +2,7 @@ use super::{
     StatementContext,
     arithmetic::{
         evaluate_boolean_operator, evaluate_distinctness, evaluate_numeric_operator,
-        evaluate_temporal_arithmetic, evaluate_unary_operator,
+        evaluate_pg_lsn_arithmetic, evaluate_temporal_arithmetic, evaluate_unary_operator,
     },
     json,
     scope::RowScope,
@@ -10,7 +10,7 @@ use super::{
 use crate::{
     catalog::{TableId, TableSchema},
     coercion::{self, CastContext},
-    error::{Result, reject_unsupported},
+    error::{PgError, Result, SqlState, reject_unsupported},
     value::{BaseType, PgType, Value},
 };
 use sqlparser::ast;
@@ -131,6 +131,18 @@ fn evaluate_inner(
             let ast::Value::SingleQuotedString(text) = &typed.value.value else {
                 unreachable!("typed literal was validated");
             };
+            if base == BaseType::Regclass {
+                return context
+                    .sequences
+                    .resolve_regclass(text)?
+                    .map(Value::Regclass)
+                    .ok_or_else(|| {
+                        PgError::create(
+                            SqlState::UndefinedTable,
+                            format!("relation {text:?} does not exist"),
+                        )
+                    });
+            }
             coercion::coerce_unknown(
                 text,
                 PgType::create(base),
@@ -320,6 +332,16 @@ fn evaluate_inner(
                     return Ok(Value::Null);
                 }
                 return evaluate_temporal_arithmetic(op, left, right);
+            }
+            if matches!(op, ast::BinaryOperator::Plus | ast::BinaryOperator::Minus)
+                && (left_type == BaseType::PgLsn || right_type == BaseType::PgLsn)
+            {
+                let left = evaluate(left, schema, row, context)?;
+                let right = evaluate(right, schema, row, context)?;
+                if left.is_null() || right.is_null() {
+                    return Ok(Value::Null);
+                }
+                return evaluate_pg_lsn_arithmetic(op, left, right);
             }
             let target = match op {
                 ast::BinaryOperator::And | ast::BinaryOperator::Or => BaseType::Bool,
@@ -517,6 +539,44 @@ fn evaluate_inner(
                 return reject_unsupported("cast variant is not implemented");
             }
             let target = coercion::convert_ast_data_type(data_type)?;
+            if target.base == BaseType::Regclass {
+                if let Some(text) = extract_unknown_string_literal(expr) {
+                    return context
+                        .sequences
+                        .resolve_regclass(text)?
+                        .map(Value::Regclass)
+                        .ok_or_else(|| {
+                            PgError::create(
+                                SqlState::UndefinedTable,
+                                format!("relation {text:?} does not exist"),
+                            )
+                        });
+                }
+                let value = evaluate(expr, schema, row, context)?;
+                if let Value::Text(text) = value {
+                    return context
+                        .sequences
+                        .resolve_regclass(&text)?
+                        .map(Value::Regclass)
+                        .ok_or_else(|| {
+                            PgError::create(
+                                SqlState::UndefinedTable,
+                                format!("relation {text:?} does not exist"),
+                            )
+                        });
+                }
+            }
+            if target.base == BaseType::Text
+                && infer_expression_type(expr, schema)? == BaseType::Regclass
+            {
+                return match evaluate(expr, schema, row, context)? {
+                    Value::Regclass(crate::value::PgRegclass(oid)) => {
+                        context.sequences.format_regclass(oid).map(Value::Text)
+                    }
+                    Value::Null => Ok(Value::Null),
+                    _ => unreachable!("regclass expression has regclass value"),
+                };
+            }
             if let ast::Expr::Array(array) = expr.as_ref()
                 && let Some(elem_type) = target.base.get_array_element_type()
             {

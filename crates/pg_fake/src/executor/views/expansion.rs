@@ -88,6 +88,10 @@ impl ast::VisitorMut for ViewExpander<'_> {
         {
             return std::ops::ControlFlow::Continue(());
         }
+        if crate::executor::describe_visible_system_relation(self.catalog, &relation_name).is_some()
+        {
+            return std::ops::ControlFlow::Continue(());
+        }
         let view = match self.catalog.require_named_view(&relation_name) {
             Ok(view) => view,
             Err(error)

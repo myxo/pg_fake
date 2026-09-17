@@ -251,6 +251,47 @@ pub(crate) fn bind_table_factor(
         return reject_unsupported("table functions are not implemented");
     }
     let name = normalize_relation_name(table_name)?;
+    if let Some(columns) = crate::executor::describe_visible_system_relation(catalog, &name) {
+        if alias
+            .as_ref()
+            .is_some_and(|alias| alias.columns.len() > columns.len())
+        {
+            return Err(PgError::create(
+                SqlState::InvalidColumnReference,
+                "relation has fewer columns than specified in its alias list",
+            ));
+        }
+        let qualifier = alias
+            .as_ref()
+            .map(|alias| normalize_identifier(&alias.name))
+            .unwrap_or_else(|| name.name.clone());
+        let start = scope.columns.len();
+        scope
+            .columns
+            .extend(columns.iter().enumerate().map(|(index, column)| {
+                let source_name = column.name.to_owned();
+                BoundColumn {
+                    name: alias
+                        .as_ref()
+                        .and_then(|alias| alias.columns.get(index))
+                        .map(|alias| normalize_identifier(&alias.name))
+                        .unwrap_or_else(|| source_name.clone()),
+                    data_type: column.data_type,
+                    qualifier: qualifier.clone(),
+                    slot: start + index,
+                    output_order: start + index,
+                    qualified_order: start + index,
+                    qualified_merged: None,
+                    merged: None,
+                    unqualified: true,
+                    wildcard: true,
+                    depth: 0,
+                    table_id: None,
+                    source_name,
+                }
+            }));
+        return Ok(());
+    }
     let relation = match catalog.require_named_table(&name) {
         Ok(table) => BoundScope::bind_table(table, alias.as_ref(), scope.columns.len())?,
         Err(error) if error.sqlstate == SqlState::WrongObjectType => BoundScope::bind_view(

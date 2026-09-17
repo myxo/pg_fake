@@ -575,7 +575,7 @@ pub(super) fn collect_ddl_relation_locks(
         let ast::Expr::Function(function) = expression else {
             return std::ops::ControlFlow::Continue(());
         };
-        let Ok(function_name) = executor::normalize_unqualified_object_name(&function.name) else {
+        let Ok(function_name) = executor::normalize_function_name(&function.name) else {
             return std::ops::ControlFlow::Continue(());
         };
         if !matches!(function_name.as_str(), "nextval" | "currval" | "setval") {

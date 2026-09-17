@@ -2,7 +2,7 @@ use super::text::{
     create_json_result, decode_string, get_json_text, parse_elements, parse_object,
     validate_json_strings,
 };
-use crate::executor::normalize_unqualified_object_name;
+use crate::executor::normalize_function_name;
 use crate::{
     error::{PgError, Result, SqlState, reject_unsupported},
     value::{BaseType, Value},
@@ -57,7 +57,7 @@ pub(crate) fn extract_json_table_function(
         } => (name, args, alias.as_ref(), *with_ordinality),
         _ => return Ok(None),
     };
-    let name = normalize_unqualified_object_name(name)?;
+    let name = normalize_function_name(name)?;
     if !is_json_expansion(&name) {
         return reject_unsupported("table function is not implemented");
     }

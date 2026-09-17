@@ -48,15 +48,6 @@ impl SequenceExecutionContext {
         }
     }
 
-    #[cfg_attr(feature = "execution-log", tracing::instrument(skip_all))]
-    pub(crate) fn create_empty(values: SequenceStorage, session: SequenceSessionStorage) -> Self {
-        SequenceExecutionContext {
-            catalog: Catalog::create(),
-            values,
-            session,
-        }
-    }
-
     pub(crate) fn replace_catalog(&self, catalog: &Catalog) -> Self {
         SequenceExecutionContext {
             catalog: catalog.clone(),
@@ -226,6 +217,22 @@ impl SequenceExecutionContext {
             })
         }))
     }
+
+    pub(crate) fn resolve_regclass(&self, name: &str) -> Result<Option<crate::value::PgRegclass>> {
+        super::resolve_regclass(&self.catalog, name).map(|oid| oid.map(crate::value::PgRegclass))
+    }
+
+    pub(crate) fn resolve_regclass_lenient(
+        &self,
+        name: &str,
+    ) -> Result<Option<crate::value::PgRegclass>> {
+        super::resolve_regclass_lenient(&self.catalog, name)
+            .map(|oid| oid.map(crate::value::PgRegclass))
+    }
+
+    pub(crate) fn format_regclass(&self, oid: crate::value::Oid) -> Result<String> {
+        super::format_regclass(&self.catalog, oid)
+    }
 }
 
 #[cfg_attr(feature = "execution-log", tracing::instrument(skip_all))]
@@ -366,59 +373,75 @@ fn extract_unsigned_integer(expression: &ast::Expr) -> Result<&str> {
 
 #[cfg_attr(feature = "execution-log", tracing::instrument(skip_all))]
 pub(crate) fn normalize_sequence_name(name: &str) -> Result<RelationName> {
+    fn invalid_name(name: &str) -> PgError {
+        PgError::create(
+            SqlState::InvalidName,
+            format!("invalid name syntax: {name}"),
+        )
+    }
+
     let mut parts = Vec::new();
-    let mut current = String::new();
-    let mut quoted = false;
-    let mut part_quoted = false;
     let mut characters = name.trim().chars().peekable();
-    while let Some(character) = characters.next() {
-        match character {
-            '"' if quoted && characters.peek() == Some(&'"') => {
-                current.push('"');
-                characters.next();
+    loop {
+        while characters
+            .next_if(|character| character.is_whitespace())
+            .is_some()
+        {}
+        let quoted = characters.peek() == Some(&'"');
+        let mut current = String::new();
+        if quoted {
+            characters.next();
+            let mut closed = false;
+            while let Some(character) = characters.next() {
+                if character != '"' {
+                    current.push(character);
+                } else if characters.peek() == Some(&'"') {
+                    current.push('"');
+                    characters.next();
+                } else {
+                    closed = true;
+                    break;
+                }
             }
-            '"' => {
-                quoted = !quoted;
-                part_quoted = true;
+            if !closed || current.is_empty() {
+                return Err(invalid_name(name));
             }
-            '.' if !quoted => {
-                parts.push((current, part_quoted));
-                current = String::new();
-                part_quoted = false;
-            }
-            character => current.push(character),
-        }
-    }
-    if quoted || current.is_empty() {
-        return Err(PgError::create(
-            SqlState::InvalidTextRepresentation,
-            format!("invalid name syntax: {name}"),
-        ));
-    }
-    parts.push((current, part_quoted));
-    let normalize = |part: &(String, bool)| {
-        let (part, quoted) = part;
-        let part = part.trim();
-        if *quoted {
-            part.to_string()
+            while characters
+                .next_if(|character| character.is_whitespace())
+                .is_some()
+            {}
         } else {
-            part.to_ascii_lowercase()
+            while let Some(character) = characters.next_if(|character| *character != '.') {
+                current.push(character);
+            }
+            current = current.trim().to_owned();
+            if current.is_empty()
+                || current
+                    .chars()
+                    .any(|character| character.is_whitespace() || character == '"')
+            {
+                return Err(invalid_name(name));
+            }
+            current.make_ascii_lowercase();
         }
-    };
+        parts.push(current);
+        match characters.next() {
+            Some('.') => {}
+            Some(_) => return Err(invalid_name(name)),
+            None => break,
+        }
+    }
     match parts.as_slice() {
-        [name] => Ok(RelationName::create_unqualified(normalize(name))),
-        [schema, name] => Ok(RelationName::create(
-            Some(normalize(schema)),
-            normalize(name),
-        )),
+        [name] => Ok(RelationName::create_unqualified(name.clone())),
+        [schema, name] => Ok(RelationName::create(Some(schema.clone()), name.clone())),
         _ => Err(PgError::create(
-            SqlState::InvalidTextRepresentation,
-            format!("invalid name syntax: {name}"),
+            SqlState::FeatureNotSupported,
+            "cross-database references are not implemented",
         )),
     }
 }
 
-fn format_postgres_identifier(identifier: &str) -> String {
+pub(super) fn format_postgres_identifier(identifier: &str) -> String {
     let mut characters = identifier.chars();
     let lexical = characters
         .next()

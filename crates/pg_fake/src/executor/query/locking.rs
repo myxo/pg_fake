@@ -293,7 +293,7 @@ pub(in crate::executor) fn contains_locking_operations(value: &impl ast::Visit) 
         }
         fn pre_visit_expr(&mut self, expression: &ast::Expr) -> std::ops::ControlFlow<()> {
             if let ast::Expr::Function(function) = expression {
-                self.0 |= crate::executor::normalize_unqualified_object_name(&function.name)
+                self.0 |= crate::executor::normalize_function_name(&function.name)
                     .ok()
                     .and_then(|name| crate::advisory::resolve_advisory_function(&name))
                     .is_some();

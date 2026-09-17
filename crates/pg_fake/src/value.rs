@@ -47,6 +47,12 @@ pub struct PgInterval {
     pub micros: i64,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct PgLsn(pub u64);
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct PgRegclass(pub Oid);
+
 /// Phase-1 PostgreSQL base types (§3.1).
 ///
 /// Each variant maps to a distinct `pg_type` OID. The character types
@@ -59,6 +65,7 @@ pub enum BaseType {
     Int2,
     Int4,
     Int8,
+    Oid,
     Float4,
     Float8,
     Numeric,
@@ -74,6 +81,8 @@ pub enum BaseType {
     Interval,
     Json,
     Jsonb,
+    PgLsn,
+    Regclass,
     TextArray,
     Int8Array,
     UuidArray,
@@ -90,6 +99,7 @@ impl BaseType {
             BaseType::Int8 => 20,
             BaseType::Int2 => 21,
             BaseType::Int4 => 23,
+            BaseType::Oid => 26,
             BaseType::Text => 25,
             BaseType::Bpchar => 1042,
             BaseType::Varchar => 1043,
@@ -104,6 +114,8 @@ impl BaseType {
             BaseType::Interval => 1186,
             BaseType::Json => 114,
             BaseType::Jsonb => 3802,
+            BaseType::PgLsn => 3220,
+            BaseType::Regclass => 2205,
             BaseType::TextArray => 1009,
             BaseType::Int8Array => 1016,
             BaseType::UuidArray => 2951,
@@ -118,6 +130,7 @@ impl BaseType {
             BaseType::Bool => "bool",
             BaseType::Int2 => "int2",
             BaseType::Int4 => "int4",
+            BaseType::Oid => "oid",
             BaseType::Int8 => "int8",
             BaseType::Float4 => "float4",
             BaseType::Float8 => "float8",
@@ -134,6 +147,8 @@ impl BaseType {
             BaseType::Interval => "interval",
             BaseType::Json => "json",
             BaseType::Jsonb => "jsonb",
+            BaseType::PgLsn => "pg_lsn",
+            BaseType::Regclass => "regclass",
             BaseType::TextArray => "_text",
             BaseType::Int8Array => "_int8",
             BaseType::UuidArray => "_uuid",
@@ -150,6 +165,7 @@ impl BaseType {
             20 => Some(BaseType::Int8),
             21 => Some(BaseType::Int2),
             23 => Some(BaseType::Int4),
+            26 => Some(BaseType::Oid),
             25 => Some(BaseType::Text),
             1042 => Some(BaseType::Bpchar),
             1043 => Some(BaseType::Varchar),
@@ -164,6 +180,8 @@ impl BaseType {
             1186 => Some(BaseType::Interval),
             114 => Some(BaseType::Json),
             3802 => Some(BaseType::Jsonb),
+            3220 => Some(BaseType::PgLsn),
+            2205 => Some(BaseType::Regclass),
             1009 => Some(BaseType::TextArray),
             1016 => Some(BaseType::Int8Array),
             2951 => Some(BaseType::UuidArray),
@@ -180,6 +198,7 @@ impl BaseType {
             "bool" | "boolean" => Some(BaseType::Bool),
             "int2" | "smallint" => Some(BaseType::Int2),
             "int4" | "integer" | "int" => Some(BaseType::Int4),
+            "oid" => Some(BaseType::Oid),
             "int8" | "bigint" => Some(BaseType::Int8),
             "float4" | "real" => Some(BaseType::Float4),
             "float8" | "double precision" | "double" => Some(BaseType::Float8),
@@ -196,6 +215,8 @@ impl BaseType {
             "interval" => Some(BaseType::Interval),
             "json" => Some(BaseType::Json),
             "jsonb" => Some(BaseType::Jsonb),
+            "pg_lsn" => Some(BaseType::PgLsn),
+            "regclass" => Some(BaseType::Regclass),
             "text[]" | "_text" => Some(BaseType::TextArray),
             "bigint[]" | "int8[]" | "_int8" => Some(BaseType::Int8Array),
             "uuid[]" | "_uuid" => Some(BaseType::UuidArray),
@@ -269,6 +290,7 @@ pub enum Value {
     Bool(bool),
     Int2(i16),
     Int4(i32),
+    Oid(Oid),
     Int8(i64),
     Float4(f32),
     Float8(f64),
@@ -283,6 +305,8 @@ pub enum Value {
     Interval(PgInterval),
     Json(String),
     Jsonb(crate::jsonb::Jsonb),
+    PgLsn(PgLsn),
+    Regclass(PgRegclass),
     Array {
         elem_type: BaseType,
         values: Vec<Value>,
@@ -307,6 +331,7 @@ impl Value {
             Value::Bool(_) => Some(BaseType::Bool),
             Value::Int2(_) => Some(BaseType::Int2),
             Value::Int4(_) => Some(BaseType::Int4),
+            Value::Oid(_) => Some(BaseType::Oid),
             Value::Int8(_) => Some(BaseType::Int8),
             Value::Float4(_) => Some(BaseType::Float4),
             Value::Float8(_) => Some(BaseType::Float8),
@@ -321,6 +346,8 @@ impl Value {
             Value::Interval(_) => Some(BaseType::Interval),
             Value::Json(_) => Some(BaseType::Json),
             Value::Jsonb(_) => Some(BaseType::Jsonb),
+            Value::PgLsn(_) => Some(BaseType::PgLsn),
+            Value::Regclass(_) => Some(BaseType::Regclass),
             Value::Array { elem_type, .. } => Some(
                 elem_type
                     .get_array_type()
@@ -346,6 +373,7 @@ impl Value {
             }
             Value::Int2(n) => n.to_string(),
             Value::Int4(n) => n.to_string(),
+            Value::Oid(n) => n.to_string(),
             Value::Int8(n) => n.to_string(),
             Value::Float4(f) if f.is_nan() => "NaN".into(),
             Value::Float4(f) if f.is_infinite() => {
@@ -396,6 +424,10 @@ impl Value {
             Value::Interval(value) => format_interval(*value),
             Value::Json(value) => value.clone(),
             Value::Jsonb(value) => value.get_postgres_text().to_owned(),
+            Value::PgLsn(PgLsn(value)) => {
+                format!("{:X}/{:X}", value >> 32, value & 0xffff_ffff)
+            }
+            Value::Regclass(PgRegclass(oid)) => oid.to_string(),
             Value::Array { values, .. } => crate::text_array::format_array(values),
         }
     }
@@ -409,6 +441,7 @@ impl Value {
             BaseType::Bool => parse_bool(input).map(Value::Bool),
             BaseType::Int2 => parse_int::<i16>(input).map(Value::Int2),
             BaseType::Int4 => parse_int::<i32>(input).map(Value::Int4),
+            BaseType::Oid => parse_int::<u32>(input).map(Value::Oid),
             BaseType::Int8 => parse_int::<i64>(input).map(Value::Int8),
             BaseType::Float4 => parse_float::<f32>(input).map(Value::Float4),
             BaseType::Float8 => parse_float::<f64>(input).map(Value::Float8),
@@ -431,6 +464,10 @@ impl Value {
                 .map(|()| Value::Json(input.to_owned()))
                 .map_err(|()| create_invalid_text_error(input, "json")),
             BaseType::Jsonb => crate::jsonb::Jsonb::parse(input).map(Value::Jsonb),
+            BaseType::PgLsn => parse_pg_lsn(input).map(Value::PgLsn),
+            BaseType::Regclass => {
+                parse_int::<u32>(input).map(|oid| Value::Regclass(PgRegclass(oid)))
+            }
             BaseType::TextArray | BaseType::Int8Array | BaseType::UuidArray => {
                 let elem_type = base
                     .get_array_element_type()
@@ -440,6 +477,26 @@ impl Value {
             }
         }
     }
+}
+
+fn parse_pg_lsn(input: &str) -> Result<PgLsn> {
+    let Some((high, low)) = input.split_once('/') else {
+        return Err(create_invalid_text_error(input, "pg_lsn"));
+    };
+    if high.is_empty()
+        || low.is_empty()
+        || high.len() > 8
+        || low.len() > 8
+        || !high.bytes().all(|byte| byte.is_ascii_hexdigit())
+        || !low.bytes().all(|byte| byte.is_ascii_hexdigit())
+    {
+        return Err(create_invalid_text_error(input, "pg_lsn"));
+    }
+    let high =
+        u32::from_str_radix(high, 16).map_err(|_| create_invalid_text_error(input, "pg_lsn"))?;
+    let low =
+        u32::from_str_radix(low, 16).map_err(|_| create_invalid_text_error(input, "pg_lsn"))?;
+    Ok(PgLsn((u64::from(high) << 32) | u64::from(low)))
 }
 
 fn validate_json(input: &str) -> std::result::Result<(), ()> {

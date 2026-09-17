@@ -280,7 +280,10 @@ pub(super) fn parse_aggregate_call<'a>(
                 | BaseType::Time
                 | BaseType::Timestamp
                 | BaseType::TimestampTz
-                | BaseType::Interval => argument_type,
+                | BaseType::Interval
+                | BaseType::PgLsn
+                | BaseType::Oid
+                | BaseType::Regclass => argument_type,
                 BaseType::Varchar => BaseType::Text,
                 _ => return Err(signature_error()),
             };

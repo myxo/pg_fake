@@ -62,6 +62,7 @@ pub(crate) fn execute_create_view(
     let name = normalize_relation_name(&create.name)?;
     let temporary = create.temporary || name.schema.as_deref() == Some(TEMP_SCHEMA);
     let resolved = state.catalog.resolve_creation_name(&name, temporary)?;
+    let temporary = temporary || state.catalog.get_schema_name(resolved.schema_id) == TEMP_SCHEMA;
     let resolved_name = RelationName::create(
         Some(state.catalog.get_schema_name(resolved.schema_id).to_owned()),
         resolved.name.clone(),

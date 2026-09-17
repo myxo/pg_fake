@@ -49,6 +49,7 @@ impl TypeInfo for PgFakeTypeInfo {
             Some(BaseType::Bool) => "BOOL",
             Some(BaseType::Int2) => "INT2",
             Some(BaseType::Int4) => "INT4",
+            Some(BaseType::Oid) => "OID",
             Some(BaseType::Int8) => "INT8",
             Some(BaseType::Float4) => "FLOAT4",
             Some(BaseType::Float8) => "FLOAT8",
@@ -65,6 +66,8 @@ impl TypeInfo for PgFakeTypeInfo {
             Some(BaseType::Interval) => "INTERVAL",
             Some(BaseType::Json) => "JSON",
             Some(BaseType::Jsonb) => "JSONB",
+            Some(BaseType::PgLsn) => "PG_LSN",
+            Some(BaseType::Regclass) => "REGCLASS",
             Some(BaseType::TextArray) => "TEXT[]",
             Some(BaseType::Int8Array) => "INT8[]",
             Some(BaseType::UuidArray) => "UUID[]",
@@ -193,12 +196,19 @@ macro_rules! scalar_type {
 scalar_type!(bool, BaseType::Bool, Value::Bool);
 scalar_type!(i16, BaseType::Int2, Value::Int2);
 scalar_type!(i32, BaseType::Int4, Value::Int4);
+scalar_type!(u32, BaseType::Oid, Value::Oid);
 scalar_type!(i64, BaseType::Int8, Value::Int8);
 scalar_type!(f32, BaseType::Float4, Value::Float4);
 scalar_type!(f64, BaseType::Float8, Value::Float8);
 scalar_type!(BigDecimal, BaseType::Numeric, Value::Numeric);
 scalar_type!(pg_fake::jsonb::Jsonb, BaseType::Jsonb, Value::Jsonb);
 scalar_type!(uuid::Uuid, BaseType::Uuid, Value::Uuid);
+scalar_type!(pg_fake::value::PgLsn, BaseType::PgLsn, Value::PgLsn);
+scalar_type!(
+    pg_fake::value::PgRegclass,
+    BaseType::Regclass,
+    Value::Regclass
+);
 scalar_type!(
     pg_fake::value::PgInterval,
     BaseType::Interval,

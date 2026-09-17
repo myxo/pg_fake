@@ -1463,13 +1463,7 @@ fn rejects_unsupported_relation_namespaces_explicitly() {
             .sqlstate,
         SqlState::InvalidTableDefinition
     );
-    assert_eq!(
-        session
-            .execute("SET search_path TO public")
-            .unwrap_err()
-            .sqlstate,
-        SqlState::FeatureNotSupported
-    );
+    session.execute("SET search_path TO public").unwrap();
     assert_eq!(
         session
             .query("SELECT pg_get_serial_sequence('private.items', 'id')", &[])

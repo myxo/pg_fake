@@ -123,6 +123,9 @@ impl CatalogDependencyCollector<'_> {
 
     fn collect_relation(&mut self, relation: &ast::ObjectName) -> Result<()> {
         let name = executor::normalize_relation_name(relation)?;
+        if executor::describe_visible_system_relation(self.catalog, &name).is_some() {
+            return Ok(());
+        }
         let table = match self.catalog.require_named_table(&name) {
             Ok(table) => table.clone(),
             Err(error) if error.sqlstate == SqlState::WrongObjectType => {
@@ -227,7 +230,7 @@ impl ast::Visitor for CatalogDependencyCollector<'_> {
         let ast::Expr::Function(function) = expression else {
             return std::ops::ControlFlow::Continue(());
         };
-        let Ok(name) = executor::normalize_unqualified_object_name(&function.name) else {
+        let Ok(name) = executor::normalize_function_name(&function.name) else {
             return std::ops::ControlFlow::Continue(());
         };
         if !matches!(name.as_str(), "nextval" | "currval" | "setval") {

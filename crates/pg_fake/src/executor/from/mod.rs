@@ -151,6 +151,16 @@ pub(super) fn visit_query_source_rows(
     }
     if let [table] = select.from.as_slice()
         && can_stream_join(table)
+        && std::iter::once(&table.relation)
+            .chain(table.joins.iter().map(|join| &join.relation))
+            .all(|factor| {
+                let ast::TableFactor::Table { name, .. } = factor else {
+                    return true;
+                };
+                normalize_relation_name(name).ok().is_none_or(|name| {
+                    super::describe_visible_system_relation(&state.catalog, &name).is_none()
+                })
+            })
         && !context.retain_row_origins
     {
         return visit_streamed_join_rows(
@@ -384,9 +394,37 @@ fn materialize_table_factor_rows(
     if args.is_some() {
         return reject_unsupported("table functions are not implemented");
     }
-    let schema = state
-        .catalog
-        .require_named_table(&normalize_relation_name(table_name)?)?;
+    let relation_name = normalize_relation_name(table_name)?;
+    if let Some(rows) = super::materialize_system_relation(&state.catalog, &relation_name) {
+        let column_count = super::describe_visible_system_relation(&state.catalog, &relation_name)
+            .expect("materialized system relation has columns")
+            .len();
+        let start = *next_slot;
+        *next_slot += column_count;
+        let mut filters = Vec::new();
+        if let Some(selection) = selection {
+            collect_pushdown_filters(selection, scope, start, *next_slot, &mut filters);
+        }
+        return rows
+            .into_iter()
+            .map(|values| {
+                let mut row = vec![Value::Null; scope.columns.len()];
+                row[start..start + values.len()].clone_from_slice(&values);
+                let passes = filters.iter().try_fold(true, |passes, filter| {
+                    if !passes {
+                        return Ok(false);
+                    }
+                    Ok(matches!(
+                        evaluate(filter, RowScope::Bound(scope), &row, context)?,
+                        Value::Bool(true)
+                    ))
+                })?;
+                Ok(passes.then_some(SourceRow::create(row)))
+            })
+            .collect::<Result<Vec<_>>>()
+            .map(|rows| rows.into_iter().flatten().collect());
+    }
+    let schema = state.catalog.require_named_table(&relation_name)?;
     let start = *next_slot;
     *next_slot += schema.columns.len();
     let mut filters = Vec::new();

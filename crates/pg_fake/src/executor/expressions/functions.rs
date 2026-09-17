@@ -7,7 +7,7 @@ use super::{
 use crate::executor::{
     StatementContext,
     aggregates::{infer_aggregate_return_type, is_aggregate_function},
-    json, normalize_unqualified_object_name,
+    json, normalize_function_name,
     scope::RowScope,
 };
 use crate::{
@@ -64,7 +64,7 @@ pub(in crate::executor) fn infer_window_return_type(
         }
         return Ok(None);
     };
-    let name = normalize_unqualified_object_name(&function.name)?;
+    let name = normalize_function_name(&function.name)?;
     if function.uses_odbc_syntax
         || !matches!(function.parameters, ast::FunctionArguments::None)
         || function.filter.is_some()
@@ -145,7 +145,7 @@ pub(super) fn infer_function_return_type(
     if let Some(result) = infer_aggregate_return_type(function, schema)? {
         return Ok(result);
     }
-    let function_name = normalize_unqualified_object_name(&function.name)?;
+    let function_name = normalize_function_name(&function.name)?;
     let arguments = extract_function_arguments(function)?;
     let signature_error = || {
         PgError::create(
@@ -197,6 +197,7 @@ pub(super) fn infer_function_return_type(
             Ok(base)
         }
         "gen_random_uuid" | "uuidv4" | "uuidv7" if arguments.is_empty() => Ok(BaseType::Uuid),
+        "pg_is_in_recovery" if arguments.is_empty() => Ok(BaseType::Bool),
         "now"
         | "current_timestamp"
         | "transaction_timestamp"
@@ -213,6 +214,22 @@ pub(super) fn infer_function_return_type(
         "pg_get_serial_sequence" if arguments.len() == 2 => {
             validate_function_argument(arguments[0], BaseType::Text, schema, &signature_error)?;
             validate_function_argument(arguments[1], BaseType::Text, schema, &signature_error)?;
+            Ok(BaseType::Text)
+        }
+        "to_regclass" if arguments.len() == 1 => {
+            validate_function_argument(arguments[0], BaseType::Text, schema, &signature_error)?;
+            Ok(BaseType::Regclass)
+        }
+        "format_type" if arguments.len() == 2 => {
+            let oid = infer_expression_type(arguments[0], schema)?;
+            let typmod = infer_expression_type(arguments[1], schema)?;
+            if !matches!(
+                oid,
+                BaseType::Oid | BaseType::Int4 | BaseType::Int8 | BaseType::Regclass
+            ) || typmod != BaseType::Int4
+            {
+                return Err(signature_error());
+            }
             Ok(BaseType::Text)
         }
         "lastval" if arguments.is_empty() => Ok(BaseType::Int8),
@@ -237,7 +254,10 @@ pub(super) fn infer_function_return_type(
         | "currval"
         | "lastval"
         | "setval"
-        | "pg_get_serial_sequence" => Err(signature_error()),
+        | "pg_get_serial_sequence"
+        | "pg_is_in_recovery"
+        | "to_regclass"
+        | "format_type" => Err(signature_error()),
         _ => Err(PgError::create(
             SqlState::UndefinedFunction,
             format!("function {function_name} does not exist"),
@@ -284,7 +304,7 @@ pub(super) fn evaluate_function(
         ));
     }
     infer_function_return_type(function, schema)?;
-    let function_name = normalize_unqualified_object_name(&function.name)?;
+    let function_name = normalize_function_name(&function.name)?;
     let arguments = extract_function_arguments(function)?;
     let result_type = infer_function_return_type(function, schema)?;
     if json::infer_json_function(&function_name, &arguments, schema)?.is_some() {
@@ -310,6 +330,50 @@ pub(super) fn evaluate_function(
         );
     }
     match function_name.as_str() {
+        "pg_is_in_recovery" => Ok(Value::Bool(false)),
+        "to_regclass" => {
+            let name = evaluate_and_coerce(
+                arguments[0],
+                BaseType::Text,
+                CastContext::Implicit,
+                schema,
+                row,
+                context,
+            )?;
+            let Value::Text(name) = name else {
+                return Ok(Value::Null);
+            };
+            Ok(context
+                .sequences
+                .resolve_regclass_lenient(&name)?
+                .map(Value::Regclass)
+                .unwrap_or(Value::Null))
+        }
+        "format_type" => {
+            let oid = evaluate(arguments[0], schema, row, context)?;
+            let typmod = evaluate_and_coerce(
+                arguments[1],
+                BaseType::Int4,
+                CastContext::Implicit,
+                schema,
+                row,
+                context,
+            )?;
+            let oid = match oid {
+                Value::Oid(oid) => oid,
+                Value::Int4(oid) => oid as u32,
+                Value::Int8(oid) => u32::try_from(oid).map_err(|_| {
+                    PgError::create(SqlState::NumericValueOutOfRange, "OID out of range")
+                })?,
+                Value::Regclass(crate::value::PgRegclass(oid)) => oid,
+                Value::Null => return Ok(Value::Null),
+                _ => unreachable!("format_type arguments were type-checked"),
+            };
+            let Value::Int4(typmod) = typmod else {
+                return Ok(Value::Null);
+            };
+            Ok(Value::Text(super::super::format_type(oid, typmod)?))
+        }
         "gen_random_uuid" | "uuidv4" => {
             let mut bytes = [0; 16];
             context

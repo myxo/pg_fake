@@ -5,12 +5,15 @@ use super::{
     },
     functions::{infer_function_return_type, validate_function_argument},
     literals::{
-        evaluate_literal, extract_ast_value, extract_number_literal,
-        extract_unknown_string_literal, is_null_literal, is_parameter_placeholder,
-        parse_integer_literal,
+        extract_ast_value, extract_number_literal, extract_unknown_string_literal, is_null_literal,
+        is_parameter_placeholder, parse_integer_literal,
     },
 };
-use crate::executor::{arithmetic::infer_interval_arithmetic_type, json, scope::RowScope};
+use crate::executor::{
+    arithmetic::{infer_interval_arithmetic_type, infer_pg_lsn_arithmetic_type},
+    json,
+    scope::RowScope,
+};
 use crate::{
     coercion::{self, CastContext},
     error::{PgError, Result, SqlState, reject_unsupported},
@@ -38,10 +41,7 @@ pub(crate) fn infer_expression_type(expr: &ast::Expr, schema: RowScope<'_>) -> R
     }
     match expr {
         ast::Expr::TypedString(typed) if !typed.uses_odbc_syntax => {
-            let value = evaluate_literal(expr)?;
-            Ok(value
-                .get_base_type()
-                .expect("typed string literal is not NULL"))
+            Ok(coercion::convert_ast_data_type(&typed.data_type)?.base)
         }
         ast::Expr::Identifier(column) => {
             Ok(schema.resolve_column(std::slice::from_ref(column))?.1.base)
@@ -187,6 +187,9 @@ pub(crate) fn infer_expression_type(expr: &ast::Expr, schema: RowScope<'_>) -> R
                     || matches!(right_type, BaseType::Interval)
                 {
                     return infer_interval_arithmetic_type(op, left_type, right_type);
+                }
+                if left_type == BaseType::PgLsn || right_type == BaseType::PgLsn {
+                    return infer_pg_lsn_arithmetic_type(op, left_type, right_type);
                 }
                 let base = resolve_operator_type(left, right, schema)?;
                 if is_numeric_type(base) {

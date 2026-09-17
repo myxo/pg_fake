@@ -44,6 +44,30 @@ struct VersionReclamation {
     committed: BTreeMap<CommitSeq, BTreeSet<RowId>>,
 }
 
+#[derive(Debug, Clone, PartialEq)]
+struct TruncatedStorage {
+    version_chains: VersionChainStore,
+    reclamation: VersionReclamation,
+}
+
+fn discard_transaction_versions(
+    store: &mut VersionChainStore,
+    reclamation: &mut VersionReclamation,
+    xid: Xid,
+) {
+    reclamation.pending.remove(&xid);
+    store.chains.retain(|_, chain| {
+        chain.versions.retain(|version| version.xmin != xid);
+        for version in &mut chain.versions {
+            if version.xmax == Some(xid) {
+                version.xmax = None;
+                version.xmax_command_id = None;
+            }
+        }
+        !chain.versions.is_empty()
+    });
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
 enum NormalizedIndexValue {
     Jsonb(crate::jsonb::Jsonb),
@@ -80,6 +104,7 @@ pub(crate) struct Table {
     version_chains: VersionChainStore,
     indexes: Vec<UniqueIndex>,
     reclamation: Box<VersionReclamation>,
+    truncated: BTreeMap<Xid, Vec<TruncatedStorage>>,
     next_rowid: u64,
 }
 
@@ -126,6 +151,7 @@ impl Table {
                 pending: BTreeMap::new(),
                 committed: BTreeMap::new(),
             }),
+            truncated: BTreeMap::new(),
             next_rowid: 1,
         }
     }
@@ -189,6 +215,26 @@ impl Table {
                     .map(|version| (*row_id, version))
             })
             .collect()
+    }
+
+    pub(crate) fn truncate_all(&mut self, xid: Xid) {
+        let storage = TruncatedStorage {
+            version_chains: std::mem::replace(
+                &mut self.version_chains,
+                VersionChainStore {
+                    chains: BTreeMap::new(),
+                },
+            ),
+            reclamation: std::mem::replace(
+                self.reclamation.as_mut(),
+                VersionReclamation {
+                    pending: BTreeMap::new(),
+                    committed: BTreeMap::new(),
+                },
+            ),
+        };
+        self.truncated.entry(xid).or_default().push(storage);
+        self.rebuild_indexes();
     }
 
     #[cfg_attr(feature = "execution-log", tracing::instrument(skip_all))]
@@ -270,22 +316,41 @@ impl Table {
 
     #[cfg_attr(feature = "execution-log", tracing::instrument(skip_all))]
     pub(crate) fn discard_transaction_versions(&mut self, xid: Xid) {
-        self.reclamation.pending.remove(&xid);
-        self.version_chains.chains.retain(|_, chain| {
-            chain.versions.retain(|version| version.xmin != xid);
-            for version in &mut chain.versions {
-                if version.xmax == Some(xid) {
-                    version.xmax = None;
-                    version.xmax_command_id = None;
+        discard_transaction_versions(&mut self.version_chains, &mut self.reclamation, xid);
+        if let Some(mut storages) = self.truncated.remove(&xid) {
+            for storage in &mut storages {
+                discard_transaction_versions(
+                    &mut storage.version_chains,
+                    &mut storage.reclamation,
+                    xid,
+                );
+            }
+            for storage in storages {
+                self.version_chains
+                    .chains
+                    .extend(storage.version_chains.chains);
+                for (pending_xid, rows) in storage.reclamation.pending {
+                    self.reclamation
+                        .pending
+                        .entry(pending_xid)
+                        .or_default()
+                        .extend(rows);
+                }
+                for (commit_seq, rows) in storage.reclamation.committed {
+                    self.reclamation
+                        .committed
+                        .entry(commit_seq)
+                        .or_default()
+                        .extend(rows);
                 }
             }
-            !chain.versions.is_empty()
-        });
+        }
         self.rebuild_indexes();
     }
 
     #[cfg_attr(feature = "execution-log", tracing::instrument(skip_all))]
     pub(crate) fn commit_transaction_versions(&mut self, xid: Xid, commit_seq: CommitSeq) -> bool {
+        let truncated = self.truncated.remove(&xid).is_some();
         if let Some(row_ids) = self.reclamation.pending.remove(&xid) {
             self.reclamation
                 .committed
@@ -294,7 +359,7 @@ impl Table {
                 .extend(row_ids);
             true
         } else {
-            false
+            truncated
         }
     }
 

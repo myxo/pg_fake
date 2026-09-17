@@ -3237,3 +3237,43 @@ fn matches_generated_required_array_queries() {
         );
     });
 }
+
+#[test]
+fn matches_generated_pg_lsn_values_and_arithmetic() {
+    let server = start_isolated_postgres_server();
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap();
+    let postgres = RefCell::new(
+        runtime
+            .block_on(PgConnection::connect(&server.url))
+            .expect("must connect SQLx to PostgreSQL 18 once"),
+    );
+    let fake = RefCell::new(PgFakeConnection::new(Db::create()));
+    check(|src| {
+        let value = src.any_of("lsn", int_in(1_000_u64..=u64::MAX - 1_000));
+        let other = src.any_of("other_lsn", int_in(0_u64..=u64::MAX));
+        let offset = src.any_of("offset", int_in(-1_000_i64..=1_000));
+        let format_lsn = |value: u64| format!("{:X}/{:X}", value >> 32, value as u32);
+        let value = format_lsn(value);
+        let other = format_lsn(other);
+        let sql = format!(
+            "SELECT '{value}'::pg_lsn::text, \
+                    '{value}'::pg_lsn < '{other}'::pg_lsn, \
+                    '{value}'::pg_lsn - '{other}'::pg_lsn, \
+                    ('{value}'::pg_lsn + {offset}::numeric)::text, \
+                    minimum::text, maximum::text \
+             FROM (SELECT min(position) AS minimum, max(position) AS maximum \
+                   FROM (VALUES ('{value}'::pg_lsn), ('{other}'::pg_lsn)) AS positions(position)) AS bounds"
+        );
+        src.log_value("sql", &sql);
+        assert_statement(
+            &runtime,
+            &mut postgres.borrow_mut(),
+            &mut fake.borrow_mut(),
+            &sql,
+            RowOrder::Ordered,
+        );
+    });
+}

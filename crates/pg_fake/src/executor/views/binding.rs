@@ -1,8 +1,8 @@
 use super::quote_identifier;
 use crate::executor::ctes::scope::{CteNameScope, enter_cte_scope};
 use crate::executor::{
-    DatabaseState, create_relation_object_name, normalize_relation_name, normalize_sequence_name,
-    normalize_unqualified_object_name, query,
+    DatabaseState, create_relation_object_name, normalize_function_name, normalize_relation_name,
+    normalize_sequence_name, query,
 };
 use crate::{
     catalog::{Catalog, RelationName, TEMP_SCHEMA, TablePersistence, ViewDependency, ViewId},
@@ -124,7 +124,7 @@ impl ast::VisitorMut for ViewDependencyCollector<'_> {
         let ast::Expr::Function(function) = expression else {
             return std::ops::ControlFlow::Continue(());
         };
-        let Ok(function_name) = normalize_unqualified_object_name(&function.name) else {
+        let Ok(function_name) = normalize_function_name(&function.name) else {
             return std::ops::ControlFlow::Continue(());
         };
         if !matches!(function_name.as_str(), "nextval" | "currval" | "setval") {

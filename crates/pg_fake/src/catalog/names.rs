@@ -1,4 +1,4 @@
-use super::{Catalog, SchemaId, TEMP_SCHEMA};
+use super::{Catalog, Constraint, ConstraintId, Schema, SchemaId, TEMP_SCHEMA, TableId};
 use crate::error::{PgError, Result, SqlState};
 
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
@@ -46,18 +46,29 @@ impl Catalog {
         let schema = match &name.schema {
             Some(schema) => self.require_schema(schema)?,
             None => {
-                self.relations
-                    .schemas
-                    .get(TEMP_SCHEMA)
-                    .filter(|schema| {
-                        schema.tables.contains_key(&name.name)
-                            || schema.views.contains_key(&name.name)
-                            || schema.sequences.contains_key(&name.name)
-                            || schema.tables.values().any(|table| {
-                                table.indexes.iter().any(|index| index.name == name.name)
-                            })
+                let contains = |schema: &&Schema| schema_has_relation(schema, &name.name);
+                let implicit_temp = (!self.search_path.iter().any(|schema| schema == TEMP_SCHEMA))
+                    .then(|| self.relations.schemas.get(TEMP_SCHEMA))
+                    .flatten()
+                    .filter(contains);
+                implicit_temp
+                    .or_else(|| {
+                        self.search_path
+                            .iter()
+                            .filter_map(|name| self.relations.schemas.get(name))
+                            .find(contains)
                     })
-                    .unwrap_or_else(|| self.get_default_schema())
+                    .or_else(|| {
+                        self.search_path
+                            .iter()
+                            .find_map(|name| self.relations.schemas.get(name))
+                    })
+                    .ok_or_else(|| {
+                        PgError::create(
+                            SqlState::UndefinedTable,
+                            format!("relation {:?} does not exist", name.name),
+                        )
+                    })?
             }
         };
         Ok(ResolvedRelationName {
@@ -83,7 +94,16 @@ impl Catalog {
             }
         } else {
             match name.schema.as_deref() {
-                None => self.get_default_schema(),
+                None => self
+                    .search_path
+                    .iter()
+                    .find_map(|name| self.relations.schemas.get(name))
+                    .ok_or_else(|| {
+                        PgError::create(
+                            SqlState::InvalidSchemaName,
+                            "no schema has been selected to create in",
+                        )
+                    })?,
                 Some(schema) => self.require_schema(schema)?,
             }
         };
@@ -95,21 +115,61 @@ impl Catalog {
 
     pub(crate) fn has_resolved_relation(&self, name: &ResolvedRelationName) -> bool {
         let schema = self.get_schema_by_id(name.schema_id);
-        schema.tables.contains_key(&name.name)
-            || schema.views.contains_key(&name.name)
-            || schema.sequences.contains_key(&name.name)
-            || schema
-                .tables
-                .values()
-                .any(|table| table.indexes.iter().any(|index| index.name == name.name))
+        schema_has_relation(schema, &name.name)
+    }
+
+    pub(crate) fn resolve_constraint_index(
+        &self,
+        name: &ResolvedRelationName,
+    ) -> Option<(TableId, ConstraintId)> {
+        self.get_schema_by_id(name.schema_id)
+            .tables
+            .values()
+            .find_map(|table| {
+                table
+                    .constraints
+                    .iter()
+                    .find_map(|constraint| match constraint {
+                        Constraint::PrimaryKey {
+                            id,
+                            name: constraint_name,
+                            ..
+                        }
+                        | Constraint::Unique {
+                            id,
+                            name: constraint_name,
+                            ..
+                        } if constraint_name == &name.name => Some((table.id, *id)),
+                        _ => None,
+                    })
+            })
     }
 
     #[cfg(test)]
     #[cfg_attr(feature = "execution-log", tracing::instrument(skip_all))]
     pub(crate) fn has_relation(&self, name: &str) -> bool {
         let schema = self.get_default_schema();
-        schema.tables.contains_key(name)
-            || schema.views.contains_key(name)
-            || schema.sequences.contains_key(name)
+        schema_has_relation(schema, name)
     }
+}
+
+fn schema_has_relation(schema: &Schema, name: &str) -> bool {
+    schema.tables.contains_key(name)
+        || schema.views.contains_key(name)
+        || schema.sequences.contains_key(name)
+        || schema.tables.values().any(|table| {
+            table.indexes.iter().any(|index| index.name == name)
+                || table.constraints.iter().any(|constraint| {
+                    matches!(
+                        constraint,
+                        Constraint::PrimaryKey {
+                            name: constraint_name,
+                            ..
+                        } | Constraint::Unique {
+                            name: constraint_name,
+                            ..
+                        } if constraint_name == name
+                    )
+                })
+        })
 }

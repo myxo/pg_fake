@@ -68,6 +68,7 @@ pub enum SqlState {
     DuplicateObject,       // 42710
     AmbiguousColumn,       // 42702
     SyntaxError,           // 42601
+    InvalidName,           // 42602
     UndefinedColumn,       // 42703
     UndefinedFunction,     // 42883
     UndefinedObject,       // 42704
@@ -145,6 +146,7 @@ impl SqlState {
             SqlState::DuplicateObject => "42710",
             SqlState::AmbiguousColumn => "42702",
             SqlState::SyntaxError => "42601",
+            SqlState::InvalidName => "42602",
             SqlState::UndefinedColumn => "42703",
             SqlState::UndefinedFunction => "42883",
             SqlState::UndefinedObject => "42704",

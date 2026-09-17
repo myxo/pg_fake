@@ -203,6 +203,73 @@ pub(super) fn evaluate_numeric_operator(
     }
 }
 
+pub(super) fn infer_pg_lsn_arithmetic_type(
+    operator: &ast::BinaryOperator,
+    left: BaseType,
+    right: BaseType,
+) -> Result<BaseType> {
+    match (operator, left, right) {
+        (ast::BinaryOperator::Minus, BaseType::PgLsn, BaseType::PgLsn) => Ok(BaseType::Numeric),
+        (
+            ast::BinaryOperator::Plus | ast::BinaryOperator::Minus,
+            BaseType::PgLsn,
+            BaseType::Numeric,
+        )
+        | (ast::BinaryOperator::Plus, BaseType::Numeric, BaseType::PgLsn) => Ok(BaseType::PgLsn),
+        _ => Err(PgError::create(
+            SqlState::UndefinedFunction,
+            "operator does not exist for pg_lsn argument types",
+        )),
+    }
+}
+
+pub(super) fn evaluate_pg_lsn_arithmetic(
+    operator: &ast::BinaryOperator,
+    left: Value,
+    right: Value,
+) -> Result<Value> {
+    let apply_offset = |lsn: u64, offset: BigDecimal, subtract: bool| {
+        let Some(integer) = offset.to_i128() else {
+            return Err(PgError::create(
+                SqlState::NumericValueOutOfRange,
+                "pg_lsn out of range",
+            ));
+        };
+        if offset != integer {
+            return Err(PgError::create(
+                SqlState::InvalidParameterValue,
+                "pg_lsn offset must be an integer",
+            ));
+        }
+        let value = if subtract {
+            i128::from(lsn).checked_sub(integer)
+        } else {
+            i128::from(lsn).checked_add(integer)
+        };
+        let value = value
+            .and_then(|value| u64::try_from(value).ok())
+            .ok_or_else(|| {
+                PgError::create(SqlState::InvalidParameterValue, "pg_lsn out of range")
+            })?;
+        Ok(Value::PgLsn(crate::value::PgLsn(value)))
+    };
+    match (operator, left, right) {
+        (ast::BinaryOperator::Minus, Value::PgLsn(left), Value::PgLsn(right)) => Ok(
+            Value::Numeric(BigDecimal::from(left.0) - BigDecimal::from(right.0)),
+        ),
+        (ast::BinaryOperator::Plus, Value::PgLsn(lsn), Value::Numeric(offset)) => {
+            apply_offset(lsn.0, offset, false)
+        }
+        (ast::BinaryOperator::Minus, Value::PgLsn(lsn), Value::Numeric(offset)) => {
+            apply_offset(lsn.0, offset, true)
+        }
+        (ast::BinaryOperator::Plus, Value::Numeric(offset), Value::PgLsn(lsn)) => {
+            apply_offset(lsn.0, offset, false)
+        }
+        _ => unreachable!("pg_lsn arithmetic was type-checked"),
+    }
+}
+
 // BigDecimal division chooses its own fixed precision. PostgreSQL instead derives
 // NUMERIC division scale from normalized base-10000 weights, keeps at least 16
 // significant decimal digits and both input scales, clamps it to 0..=1000, and

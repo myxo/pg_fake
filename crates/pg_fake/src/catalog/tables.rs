@@ -86,11 +86,21 @@ impl Catalog {
                 format!("{:?} is not a table", name.name),
             ));
         }
-        if schema
-            .tables
-            .values()
-            .any(|table| table.indexes.iter().any(|index| index.name == name.name))
-        {
+        if schema.tables.values().any(|table| {
+            table.indexes.iter().any(|index| index.name == name.name)
+                || table.constraints.iter().any(|constraint| {
+                    matches!(
+                        constraint,
+                        Constraint::PrimaryKey {
+                            name: constraint_name,
+                            ..
+                        } | Constraint::Unique {
+                            name: constraint_name,
+                            ..
+                        } if constraint_name == &name.name
+                    )
+                })
+        }) {
             return Err(PgError::create(
                 SqlState::WrongObjectType,
                 format!("{:?} is not a table", name.name),
@@ -175,6 +185,29 @@ impl Catalog {
                 SqlState::DuplicateTable,
                 format!("relation {:?} already exists", name.name),
             ));
+        }
+
+        let mut index_names = BTreeSet::new();
+        for constraint_name in constraints
+            .iter()
+            .filter_map(|constraint| match constraint {
+                Constraint::PrimaryKey { name, .. } | Constraint::Unique { name, .. } => Some(name),
+                Constraint::Check { .. } | Constraint::ForeignKey(_) => None,
+            })
+        {
+            let index_name = ResolvedRelationName {
+                schema_id: name.schema_id,
+                name: constraint_name.clone(),
+            };
+            if index_name.name == name.name
+                || self.has_resolved_relation(&index_name)
+                || !index_names.insert(index_name.name.clone())
+            {
+                return Err(PgError::create(
+                    SqlState::DuplicateTable,
+                    format!("relation {:?} already exists", index_name.name),
+                ));
+            }
         }
 
         let id = TableId(self.next_table_id);
@@ -322,7 +355,11 @@ impl Catalog {
     ) -> Result<(&TableSchema, &IndexSchema)> {
         let name = self.resolve_relation_name(name)?;
         let schema = self.get_schema_by_id(name.schema_id);
-        if schema.tables.contains_key(&name.name) || schema.sequences.contains_key(&name.name) {
+        if schema.tables.contains_key(&name.name)
+            || schema.views.contains_key(&name.name)
+            || schema.sequences.contains_key(&name.name)
+            || self.resolve_constraint_index(&name).is_some()
+        {
             return Err(PgError::create(
                 SqlState::WrongObjectType,
                 format!("{:?} is not an index", name.name),

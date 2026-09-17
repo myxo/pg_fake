@@ -27,7 +27,7 @@ pub(super) enum RowOrder {
 
 fn returns_rows(statement: &Statement) -> bool {
     match statement {
-        Statement::Query(_) => true,
+        Statement::Query(_) | Statement::ShowVariable { .. } => true,
         Statement::Insert(insert) => insert.returning.is_some(),
         Statement::Update(update) => update.returning.is_some(),
         Statement::Delete(delete) => delete.returning.is_some(),

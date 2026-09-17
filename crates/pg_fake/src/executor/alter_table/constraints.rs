@@ -2,7 +2,9 @@ use crate::executor::{
     DatabaseState,
     foreign_keys::{convert_referential_action, resolve_foreign_key_name},
     normalize_identifier, normalize_relation_name, resolve_index_column_name,
-    table_ddl::{find_first_referenced_column, generate_constraint_name},
+    table_ddl::{
+        find_first_referenced_column, generate_constraint_name, generate_index_constraint_name,
+    },
     validate_btree_key_type,
 };
 use crate::{
@@ -45,7 +47,15 @@ pub(super) fn create_table_constraint(
                     .name
                     .as_ref()
                     .map(normalize_identifier)
-                    .unwrap_or_else(|| format!("{}_pkey", schema.name)),
+                    .unwrap_or_else(|| {
+                        generate_index_constraint_name(
+                            &state.catalog,
+                            schema.schema_id,
+                            Some(schema.id),
+                            format!("{}_pkey", schema.name),
+                            &schema.constraints,
+                        )
+                    }),
                 columns,
             })
         }
@@ -76,7 +86,15 @@ pub(super) fn create_table_constraint(
                     .name
                     .as_ref()
                     .map(normalize_identifier)
-                    .unwrap_or_else(|| format!("{}_{}_key", schema.name, columns.join("_"))),
+                    .unwrap_or_else(|| {
+                        generate_index_constraint_name(
+                            &state.catalog,
+                            schema.schema_id,
+                            Some(schema.id),
+                            format!("{}_{}_key", schema.name, columns.join("_")),
+                            &schema.constraints,
+                        )
+                    }),
                 columns,
             })
         }

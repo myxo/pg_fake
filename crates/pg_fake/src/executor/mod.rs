@@ -34,7 +34,9 @@ mod scope;
 mod sequence_ddl;
 mod sequences;
 mod subqueries;
+mod system_catalog;
 mod table_ddl;
+mod truncate;
 mod views;
 mod writes;
 
@@ -74,6 +76,10 @@ pub(crate) use sequences::{
     SequenceValueState, normalize_sequence_name,
 };
 pub(crate) use subqueries::materialize_uncorrelated_subqueries;
+pub(crate) use system_catalog::{
+    describe_visible_system_relation, format_regclass, format_type, materialize_system_relation,
+    resolve_regclass, resolve_regclass_lenient,
+};
 
 #[cfg_attr(feature = "execution-log", tracing::instrument(skip_all))]
 pub(crate) fn execute_statement(
@@ -207,6 +213,9 @@ pub(crate) fn execute_statement(
             context,
             mutation_targets,
         ),
+        ast::Statement::Truncate(truncate) => {
+            truncate::execute_truncate(state, truncate, xid, snapshot, context)
+        }
         ast::Statement::Query(query) => query::execute_query(state, query, xid, snapshot, context)
             .map(|output| StatementResult::Query(output.result)),
         ast::Statement::Lock(_) => Ok(StatementResult::Affected(0)),
@@ -229,13 +238,37 @@ fn create_relation_object_name(name: RelationName) -> ast::ObjectName {
 
 #[cfg_attr(feature = "execution-log", tracing::instrument(skip_all))]
 pub(crate) fn normalize_unqualified_object_name(name: &ast::ObjectName) -> Result<String> {
-    if name.0.len() != 1 {
-        return reject_unsupported("schemas are not implemented");
+    match name.0.as_slice() {
+        [name] => {
+            let Some(identifier) = name.as_ident() else {
+                return reject_unsupported("dynamic object names are not implemented");
+            };
+            Ok(normalize_identifier(identifier))
+        }
+        _ => reject_unsupported("schemas are not implemented"),
     }
-    let Some(identifier) = name.0[0].as_ident() else {
-        return reject_unsupported("dynamic object names are not implemented");
-    };
-    Ok(normalize_identifier(identifier))
+}
+
+pub(crate) fn normalize_function_name(name: &ast::ObjectName) -> Result<String> {
+    match name.0.as_slice() {
+        [name] => {
+            let Some(name) = name.as_ident() else {
+                return reject_unsupported("dynamic function names are not implemented");
+            };
+            Ok(normalize_identifier(name))
+        }
+        [schema, name]
+            if schema
+                .as_ident()
+                .is_some_and(|schema| normalize_identifier(schema) == "pg_catalog") =>
+        {
+            let Some(name) = name.as_ident() else {
+                return reject_unsupported("dynamic function names are not implemented");
+            };
+            Ok(normalize_identifier(name))
+        }
+        _ => reject_unsupported("function schemas are not implemented"),
+    }
 }
 
 #[cfg_attr(feature = "execution-log", tracing::instrument(skip_all))]

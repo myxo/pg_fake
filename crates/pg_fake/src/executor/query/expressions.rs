@@ -2,7 +2,7 @@ use super::grouping::{AggregateOwner, GroupedAggregateValues, materialize_aggreg
 use crate::{
     error::{PgError, Result},
     executor::{
-        DatabaseState, StatementContext, normalize_unqualified_object_name,
+        DatabaseState, StatementContext, normalize_function_name,
         scope::{BoundScope, infer_expression_data_type},
         subqueries::evaluate_query_expression,
     },
@@ -178,7 +178,7 @@ pub(in crate::executor) fn contains_volatile_expression(expression: &ast::Expr) 
         let ast::Expr::Function(function) = nested else {
             return std::ops::ControlFlow::Continue(());
         };
-        if normalize_unqualified_object_name(&function.name).is_ok_and(|name| {
+        if normalize_function_name(&function.name).is_ok_and(|name| {
             matches!(
                 name.as_str(),
                 "gen_random_uuid"

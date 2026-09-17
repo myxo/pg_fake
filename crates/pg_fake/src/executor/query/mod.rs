@@ -755,7 +755,7 @@ pub(in crate::executor) fn simplify_exists_query(
     let _ = ast::visit_expressions(&select.projection, |expr| {
         if let ast::Expr::Function(function) = expr {
             has_special_function |= function.over.is_some()
-                || super::normalize_unqualified_object_name(&function.name)
+                || super::normalize_function_name(&function.name)
                     .is_ok_and(|name| matches!(name.as_str(), "generate_series" | "unnest"));
         }
         std::ops::ControlFlow::<()>::Continue(())
@@ -798,33 +798,31 @@ pub(in crate::executor) fn simplify_exists_query(
                     let _ = ast::visit_expressions(limit, |expr| {
                         constant &= match expr {
                             ast::Expr::Function(function) => {
-                                super::normalize_unqualified_object_name(&function.name).is_ok_and(
-                                    |name| {
-                                        matches!(
-                                            name.as_str(),
-                                            "abs"
-                                                | "floor"
-                                                | "ceil"
-                                                | "ceiling"
-                                                | "round"
-                                                | "trunc"
-                                                | "length"
-                                                | "char_length"
-                                                | "octet_length"
-                                                | "btrim"
-                                                | "regexp_like"
-                                                | "to_timestamp"
-                                                | "jsonb_typeof"
-                                                | "jsonb_array_length"
-                                                | "lower"
-                                                | "upper"
-                                                | "coalesce"
-                                                | "nullif"
-                                                | "greatest"
-                                                | "least"
-                                        )
-                                    },
-                                )
+                                super::normalize_function_name(&function.name).is_ok_and(|name| {
+                                    matches!(
+                                        name.as_str(),
+                                        "abs"
+                                            | "floor"
+                                            | "ceil"
+                                            | "ceiling"
+                                            | "round"
+                                            | "trunc"
+                                            | "length"
+                                            | "char_length"
+                                            | "octet_length"
+                                            | "btrim"
+                                            | "regexp_like"
+                                            | "to_timestamp"
+                                            | "jsonb_typeof"
+                                            | "jsonb_array_length"
+                                            | "lower"
+                                            | "upper"
+                                            | "coalesce"
+                                            | "nullif"
+                                            | "greatest"
+                                            | "least"
+                                    )
+                                })
                             }
                             ast::Expr::Subquery(_)
                             | ast::Expr::Exists { .. }

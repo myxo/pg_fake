@@ -17,6 +17,7 @@ pub(super) struct SessionSettings {
     pub(super) lock_timeout: Duration,
     pub(super) statement_timeout: Duration,
     pub(super) timezone: String,
+    pub(super) search_path: Vec<String>,
 }
 
 impl Session {
@@ -52,6 +53,18 @@ impl Session {
                     rows: vec![vec![Value::Text(self.timezone.clone())]],
                 })));
             }
+            ast::Statement::ShowVariable { variable }
+                if variable.len() == 1 && variable[0].value.eq_ignore_ascii_case("search_path") =>
+            {
+                return Ok(Some(StatementResult::Query(QueryResult {
+                    columns: vec![ColumnMeta {
+                        name: "search_path".into(),
+                        type_oid: crate::value::BaseType::Text.map_to_oid(),
+                        typmod: -1,
+                    }],
+                    rows: vec![vec![Value::Text(self.search_path.join(", "))]],
+                })));
+            }
             ast::Statement::Set(ast::Set::SingleAssignment {
                 scope,
                 hivevar,
@@ -59,10 +72,23 @@ impl Session {
                 values,
             }) => {
                 if variable.to_string().eq_ignore_ascii_case("search_path") {
-                    return self.abort_with_error(PgError::create(
-                        SqlState::FeatureNotSupported,
-                        "changing search_path is not implemented",
-                    ));
+                    if *hivevar || values.is_empty() {
+                        return self.abort_with_error(PgError::create(
+                            SqlState::SyntaxError,
+                            "invalid search_path",
+                        ));
+                    }
+                    self.search_path = values
+                        .iter()
+                        .map(parse_search_path_entry)
+                        .collect::<Result<Vec<_>>>()?;
+                    if *scope != Some(ast::ContextModifier::Local) {
+                        self.settings_on_commit
+                            .as_mut()
+                            .expect("SET runs in a transaction")
+                            .search_path = self.search_path.clone();
+                    }
+                    return Ok(Some(StatementResult::Affected(0)));
                 }
                 if variable.to_string().eq_ignore_ascii_case("timezone") {
                     if *hivevar || values.len() != 1 {
@@ -149,6 +175,7 @@ impl Session {
             lock_timeout: self.lock_timeout,
             statement_timeout: self.statement_timeout,
             timezone: self.timezone.clone(),
+            search_path: self.search_path.clone(),
         }
     }
 
@@ -157,6 +184,26 @@ impl Session {
         self.lock_timeout = settings.lock_timeout;
         self.statement_timeout = settings.statement_timeout;
         self.timezone = settings.timezone;
+        self.search_path = settings.search_path;
+    }
+}
+
+fn parse_search_path_entry(expression: &ast::Expr) -> Result<String> {
+    match expression {
+        ast::Expr::Identifier(identifier) => Ok(crate::executor::normalize_identifier(identifier)),
+        ast::Expr::Value(value) => match &value.value {
+            ast::Value::SingleQuotedString(value) | ast::Value::DoubleQuotedString(value) => {
+                Ok(value.clone())
+            }
+            _ => Err(PgError::create(
+                SqlState::SyntaxError,
+                "invalid search_path",
+            )),
+        },
+        _ => Err(PgError::create(
+            SqlState::SyntaxError,
+            "invalid search_path",
+        )),
     }
 }
 

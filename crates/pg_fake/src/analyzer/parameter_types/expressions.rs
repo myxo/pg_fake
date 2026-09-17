@@ -273,7 +273,7 @@ fn infer_function_parameters(
             _ => None,
         })
         .collect::<Vec<_>>();
-    let name = executor::normalize_unqualified_object_name(&function.name)?;
+    let name = executor::normalize_function_name(&function.name)?;
     let argument_types = arguments
         .iter()
         .map(|argument| {

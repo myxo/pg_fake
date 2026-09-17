@@ -46,6 +46,7 @@ impl Catalog {
         let schema = self.get_schema_by_id(name.schema_id);
         if schema.tables.contains_key(&name.name)
             || schema.sequences.contains_key(&name.name)
+            || self.resolve_constraint_index(&name).is_some()
             || schema
                 .tables
                 .values()

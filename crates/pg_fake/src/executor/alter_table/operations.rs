@@ -13,7 +13,10 @@ use crate::executor::{
     column_defaults::{evaluate_column_default, validate_column_default},
     normalize_identifier, normalize_relation_name,
     row_constraints::validate_check_constraint_types,
-    table_ddl::generate_constraint_name,
+    table_ddl::{
+        generate_constraint_name, generate_index_constraint_name,
+        index_constraint_name_is_available,
+    },
     validate_btree_key_type, views,
 };
 use crate::{
@@ -66,27 +69,47 @@ pub(super) fn apply_table_operation(
                     ast::ColumnOption::PrimaryKey(_) => {
                         validate_btree_key_type(column.data_type.base)?;
                         column.nullable = false;
+                        let constraint_name = option
+                            .name
+                            .as_ref()
+                            .map(normalize_identifier)
+                            .unwrap_or_else(|| {
+                                generate_index_constraint_name(
+                                    &state.catalog,
+                                    schema.schema_id,
+                                    Some(schema.id),
+                                    format!("{}_pkey", schema.name),
+                                    &schema.constraints,
+                                )
+                            });
+                        require_available_index_constraint_name(state, schema, &constraint_name)?;
                         schema
                             .constraints
                             .push(crate::catalog::Constraint::PrimaryKey {
                                 id: state.catalog.allocate_constraint_id(),
-                                name: option
-                                    .name
-                                    .as_ref()
-                                    .map(normalize_identifier)
-                                    .unwrap_or_else(|| format!("{}_pkey", schema.name)),
+                                name: constraint_name,
                                 columns: vec![name.clone()],
                             });
                     }
                     ast::ColumnOption::Unique(_) => {
                         validate_btree_key_type(column.data_type.base)?;
+                        let constraint_name = option
+                            .name
+                            .as_ref()
+                            .map(normalize_identifier)
+                            .unwrap_or_else(|| {
+                                generate_index_constraint_name(
+                                    &state.catalog,
+                                    schema.schema_id,
+                                    Some(schema.id),
+                                    format!("{}_{}_key", schema.name, name),
+                                    &schema.constraints,
+                                )
+                            });
+                        require_available_index_constraint_name(state, schema, &constraint_name)?;
                         schema.constraints.push(crate::catalog::Constraint::Unique {
                             id: state.catalog.allocate_constraint_id(),
-                            name: option
-                                .name
-                                .as_ref()
-                                .map(normalize_identifier)
-                                .unwrap_or_else(|| format!("{}_{}_key", schema.name, name)),
+                            name: constraint_name,
                             columns: vec![name.clone()],
                         });
                     }
@@ -256,6 +279,13 @@ pub(super) fn apply_table_operation(
                     format!("constraint {name:?} already exists"),
                 ));
             }
+            if matches!(
+                constraint,
+                crate::catalog::Constraint::PrimaryKey { .. }
+                    | crate::catalog::Constraint::Unique { .. }
+            ) {
+                require_available_index_constraint_name(state, schema, name)?;
+            }
             if let crate::catalog::Constraint::PrimaryKey { columns, .. } = &constraint {
                 for name in columns {
                     schema
@@ -371,5 +401,37 @@ pub(super) fn apply_table_operation(
         ));
     }
     validate_check_constraint_types(schema)?;
+    Ok(())
+}
+
+fn require_available_index_constraint_name(
+    state: &DatabaseState,
+    schema: &TableSchema,
+    name: &str,
+) -> Result<()> {
+    if schema
+        .constraints
+        .iter()
+        .any(|constraint| constraint.get_name() == Some(name))
+    {
+        return Err(PgError::create(
+            SqlState::DuplicateObject,
+            format!("constraint {name:?} already exists"),
+        ));
+    }
+    if name == schema.name
+        || !index_constraint_name_is_available(
+            &state.catalog,
+            schema.schema_id,
+            Some(schema.id),
+            &schema.constraints,
+            name,
+        )
+    {
+        return Err(PgError::create(
+            SqlState::DuplicateTable,
+            format!("relation {name:?} already exists"),
+        ));
+    }
     Ok(())
 }
