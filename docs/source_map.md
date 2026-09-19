@@ -20,6 +20,7 @@ and named after their responsibilities.
 | [`session/prepared.rs`](../crates/pg_fake/src/session/prepared.rs) | Parameter inference and binding, prepared handles, and cached read-lock requirements. |
 | [`session/catalog_dependencies.rs`](../crates/pg_fake/src/session/catalog_dependencies.rs) | Discover tables, views, sequences, and constraints referenced by SQL; validate saved dependencies against the visible catalog. |
 | [`session/transactions.rs`](../crates/pg_fake/src/session/transactions.rs) | SQL transaction control, the transaction guard, commit/abort cleanup, version reclamation, and session teardown. |
+| [`session/savepoints.rs`](../crates/pg_fake/src/session/savepoints.rs) | Named transaction checkpoints, partial version rollback, error recovery, and restoration of settings, constraints, and locks. |
 | [`session/settings.rs`](../crates/pg_fake/src/session/settings.rs) | Session settings, parsing their values, and saving/restoring settings around transactions. |
 | [`session/constraint_timing.rs`](../crates/pg_fake/src/session/constraint_timing.rs) | `SET CONSTRAINTS` and switching deferred checks to immediate checks. |
 | [`session/do_block.rs`](../crates/pg_fake/src/session/do_block.rs) | Anonymous PL/pgSQL blocks: local variables, control flow, and nested SQL sharing the block's deadline and statement timestamp. |

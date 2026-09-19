@@ -48,7 +48,7 @@ and scope boundaries. The completed Phase 2 plan is archived in
   `spec.md` §10. Optimization-only clauses may be tolerated only when ignoring
   them cannot change Tier-A behavior, and strict mode must still reject them.
 - Tasks 8 through 30 are the priority track and must finish before Tasks 31
-  onward. Task 31 is the first unfinished task. Task 24 retains its
+  onward. Task 32 is the first unfinished task. Task 24 retains its
   completed status from an earlier approved exception. Tasks 25, 26, 27, and
   29 have no dependency on later milestones and are placed immediately after
   it for expedited delivery; Task 28 depends on Task 27, and Task 30 gates the
@@ -1568,10 +1568,56 @@ composition through SQLx.
 
 ## Milestone H — Remaining Phase 3 transaction features
 
-### Task 31 — Savepoints and subtransaction recovery
+### Task 31 — Savepoints and subtransaction recovery [COMPLETE]
 
 **Goal:** Implement nested transaction checkpoints used by PostgreSQL clients
 and SQLx nested transactions.
+
+**Progress:** Implementation, validation, independent review, and user approval
+are complete.
+
+- [x] Add named savepoint checkpoints, partial row/catalog rollback, and error recovery.
+- [x] Restore settings and deferred constraints and release subtransaction locks.
+- [x] Connect SQLx nested commit, rollback, and drop to savepoints.
+- [x] Add differential/property coverage, controlled lock tests, and benchmarks.
+- [x] Run regression checks and the required property gate; resolve independent review findings.
+- [x] Obtain user approval before marking Task 31 complete.
+
+Savepoints record monotonically increasing command boundaries over existing
+row and catalog versions. Partial rollback removes only this transaction's
+later versions and restores its saved settings, deferred checks, and lock
+ownership. Released savepoints remain covered by their enclosing checkpoint.
+Sequence allocation remains nontransactional; `TRUNCATE ... RESTART IDENTITY`
+keeps its separate transactional undo history.
+
+SQLx rollback requests survive unpolled query streams, ping, and preparation.
+A separate queue keeps transaction drop independent of the execution mutex;
+requests are captured immediately before worker submission so they cannot
+overtake the submitted operation. Independent review findings about isolation
+changes within savepoints and cancellation ordering have been fixed, covered
+by regression tests, and re-reviewed without further findings.
+
+**Validation:** All four savepoint differential tests pass against PostgreSQL
+18, including SQLx nested transactions and repeatable-read recovery. Native
+tests verify row/table lock wakeups and settings/prepared recovery; controlled
+SQLx tests verify unpolled and submitted-operation cancellation. The workspace
+regression run passes 518 tests using a temporary `C`-collation database, and
+the additional core catalog property passes. The final SQLx regression rerun
+passes all 93 non-generated tests, including the Task 30 application gate.
+Formatting and strict all-target, all-feature workspace Clippy pass.
+
+The final `CHAOS_THEORY_CHECK_ITERS=10000 CHAOS_THEORY_CHECK_TIME=600s cargo test
+-p pg_fake_sqlx --features time --test property_tests` gate passes all 23 suites
+in 955.63 seconds. The new savepoint generator also independently passes 10,000
+histories. Its shrinking path cleans up aborted transactions. An existing
+omitted-trailing-column INSERT limitation discovered during generation is
+recorded in `known_bugs.md`; the generator explicitly names its input columns.
+
+The final short Criterion run (10 samples, one-second warmup and measurement)
+measures nested savepoint release at approximately 68.7 microseconds for
+`pg_fake` versus 179.8 for PostgreSQL, and rollback at 69.1 versus 183.7.
+These are approximately 2.6x improvements, not orders-of-magnitude gains;
+the run does not replace the committed benchmark baseline.
 
 **DoD:**
 

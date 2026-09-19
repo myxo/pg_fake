@@ -46,6 +46,7 @@ struct VersionReclamation {
 
 #[derive(Debug, Clone, PartialEq)]
 struct TruncatedStorage {
+    command_id: CommandId,
     version_chains: VersionChainStore,
     reclamation: VersionReclamation,
 }
@@ -54,18 +55,37 @@ fn discard_transaction_versions(
     store: &mut VersionChainStore,
     reclamation: &mut VersionReclamation,
     xid: Xid,
+    boundary: CommandId,
 ) {
-    reclamation.pending.remove(&xid);
     store.chains.retain(|_, chain| {
-        chain.versions.retain(|version| version.xmin != xid);
+        chain
+            .versions
+            .retain(|version| version.xmin != xid || version.xmin_command_id < boundary);
         for version in &mut chain.versions {
-            if version.xmax == Some(xid) {
+            if version.xmax == Some(xid)
+                && version
+                    .xmax_command_id
+                    .is_some_and(|command| command >= boundary)
+            {
                 version.xmax = None;
                 version.xmax_command_id = None;
             }
         }
         !chain.versions.is_empty()
     });
+    if let Some(rows) = reclamation.pending.get_mut(&xid) {
+        rows.retain(|row| {
+            store.chains.get(row).is_some_and(|chain| {
+                chain
+                    .versions
+                    .iter()
+                    .any(|version| version.xmin == xid || version.xmax == Some(xid))
+            })
+        });
+        if rows.is_empty() {
+            reclamation.pending.remove(&xid);
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
@@ -217,8 +237,9 @@ impl Table {
             .collect()
     }
 
-    pub(crate) fn truncate_all(&mut self, xid: Xid) {
+    pub(crate) fn truncate_all(&mut self, xid: Xid, command_id: CommandId) {
         let storage = TruncatedStorage {
+            command_id,
             version_chains: std::mem::replace(
                 &mut self.version_chains,
                 VersionChainStore {
@@ -316,35 +337,29 @@ impl Table {
 
     #[cfg_attr(feature = "execution-log", tracing::instrument(skip_all))]
     pub(crate) fn discard_transaction_versions(&mut self, xid: Xid) {
-        discard_transaction_versions(&mut self.version_chains, &mut self.reclamation, xid);
-        if let Some(mut storages) = self.truncated.remove(&xid) {
-            for storage in &mut storages {
-                discard_transaction_versions(
-                    &mut storage.version_chains,
-                    &mut storage.reclamation,
-                    xid,
-                );
+        self.discard_versions_since(xid, CommandId(0));
+    }
+
+    pub(crate) fn discard_versions_since(&mut self, xid: Xid, boundary: CommandId) {
+        if let Some(storages) = self.truncated.get_mut(&xid) {
+            while storages
+                .last()
+                .is_some_and(|storage| storage.command_id >= boundary)
+            {
+                let storage = storages.pop().expect("selected truncate exists");
+                self.version_chains = storage.version_chains;
+                *self.reclamation = storage.reclamation;
             }
-            for storage in storages {
-                self.version_chains
-                    .chains
-                    .extend(storage.version_chains.chains);
-                for (pending_xid, rows) in storage.reclamation.pending {
-                    self.reclamation
-                        .pending
-                        .entry(pending_xid)
-                        .or_default()
-                        .extend(rows);
-                }
-                for (commit_seq, rows) in storage.reclamation.committed {
-                    self.reclamation
-                        .committed
-                        .entry(commit_seq)
-                        .or_default()
-                        .extend(rows);
-                }
+            if storages.is_empty() {
+                self.truncated.remove(&xid);
             }
         }
+        discard_transaction_versions(
+            &mut self.version_chains,
+            &mut self.reclamation,
+            xid,
+            boundary,
+        );
         self.rebuild_indexes();
     }
 

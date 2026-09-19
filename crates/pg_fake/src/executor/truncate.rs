@@ -15,7 +15,7 @@ pub(super) fn execute_truncate(
     truncate: &ast::Truncate,
     xid: Xid,
     _snapshot: &Snapshot,
-    _context: &StatementContext,
+    context: &StatementContext,
 ) -> Result<StatementResult> {
     if truncate.if_exists || truncate.partitions.is_some() || truncate.on_cluster.is_some() {
         return reject_unsupported("TRUNCATE option is not implemented");
@@ -83,11 +83,11 @@ pub(super) fn execute_truncate(
             .tables
             .get_mut(&table_id)
             .expect("catalog table must have storage")
-            .truncate_all(xid);
+            .truncate_all(xid, context.command_id);
         state.mark_table_touched(xid, table_id);
     }
     for sequence in &sequences {
-        state.reset_sequence_transactionally(xid, sequence);
+        state.reset_sequence_transactionally(xid, sequence, context.command_id);
     }
     Ok(StatementResult::Affected(0))
 }

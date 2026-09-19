@@ -50,6 +50,7 @@ pub enum SqlState {
     DependentObjectsStillExist, // 2BP01
 
     // 3F — Invalid Schema Name
+    InvalidSavepointSpecification,
     InvalidSchemaName, // 3F000
 
     // 40 — Transaction Rollback
@@ -134,6 +135,7 @@ impl SqlState {
             SqlState::NoActiveSqlTransaction => "25P01",
             SqlState::InFailedSqlTransaction => "25P02",
             SqlState::DependentObjectsStillExist => "2BP01",
+            SqlState::InvalidSavepointSpecification => "3B001",
             SqlState::InvalidSchemaName => "3F000",
             SqlState::SerializationFailure => "40001",
             SqlState::DeadlockDetected => "40P01",

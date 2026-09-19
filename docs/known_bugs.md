@@ -11,23 +11,17 @@ sorts `MiXeD` first.
 Differential properties should use collation-independent order keys until the
 project defines and implements a collation contract.
 
-## Deferred SQLx rollback can be lost before polling
+## INSERT with omitted trailing columns
 
-Dropping an open SQLx transaction calls `PgFakeTransactionManager::start_rollback`,
-which resets the driver's transaction depth and records `pending_rollback` so the
-core `Session` can be rolled back by the next asynchronous connection operation.
+Without an explicit column list, PostgreSQL allows a VALUES row to omit trailing
+columns and supplies their defaults. `pg_fake` instead rejects the value count
+with `42601`. For example:
 
-`PgFakeConnection::run`, `ping`, and `prepare_with` currently consume
-`pending_rollback` before constructing their returned future. If that future, or
-the stream containing it, is dropped without ever being polled, the captured
-rollback flag is dropped too and no blocking task executes `ROLLBACK`.
+```sql
+CREATE TABLE omitted_columns (id INTEGER PRIMARY KEY, value INTEGER, extra INTEGER DEFAULT 1);
+INSERT INTO omitted_columns VALUES (1, 0);
+```
 
-The driver then reports no active transaction while the core `Session` remains
-inside the abandoned transaction. Uncommitted changes and row locks can remain,
-and later operations may execute in the wrong transaction or encounter lock
-timeouts. Once `spawn_blocking` has been submitted, dropping the outer future is
-not this bug because the blocking task continues independently.
-
-The fix must keep the rollback pending until its execution is guaranteed, with
-regression coverage for unpolled or cancelled query streams, `ping`, and
-statement preparation.
+Using `INSERT INTO omitted_columns (id, value) VALUES (1, 0)` works. This existing
+limitation was exposed by the Task 31 savepoint generator after adding a column;
+that generator now names its input columns explicitly.

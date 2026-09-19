@@ -334,6 +334,46 @@ fn transactional_ddl_benchmark(
     group.finish();
 }
 
+fn benchmark_savepoints(
+    criterion: &mut Criterion,
+    runtime: &Runtime,
+    connections: &mut [NamedBenchmarkConnection<'_>],
+) {
+    for (_, connection) in connections.iter_mut() {
+        connection.execute(runtime, "CREATE TABLE savepoint_rows(id INT)");
+    }
+    for (name, operation) in [
+        ("nested_savepoint_release", "RELEASE SAVEPOINT inner_sp"),
+        (
+            "nested_savepoint_rollback",
+            "ROLLBACK TO SAVEPOINT outer_sp",
+        ),
+    ] {
+        let mut group = criterion.benchmark_group(benchmarks::find_benchmark(name).name);
+        for (backend, connection) in connections.iter_mut() {
+            group.bench_function(*backend, |benchmark| {
+                benchmark.iter(|| {
+                    for sql in [
+                        "BEGIN",
+                        "SAVEPOINT outer_sp",
+                        "INSERT INTO savepoint_rows VALUES(1)",
+                        "SAVEPOINT inner_sp",
+                        "INSERT INTO savepoint_rows VALUES(2)",
+                        operation,
+                        "ROLLBACK",
+                    ] {
+                        connection.execute(runtime, sql);
+                    }
+                });
+            });
+        }
+        group.finish();
+    }
+    for (_, connection) in connections.iter_mut() {
+        connection.execute(runtime, "DROP TABLE savepoint_rows");
+    }
+}
+
 fn migration_table_lock_benchmark(
     criterion: &mut Criterion,
     runtime: &Runtime,
@@ -1804,6 +1844,7 @@ fn benchmarks(criterion: &mut Criterion) {
 
         create_table_benchmark(criterion, &runtime, &mut connections);
         transactional_ddl_benchmark(criterion, &runtime, &mut connections);
+        benchmark_savepoints(criterion, &runtime, &mut connections);
         migration_table_lock_benchmark(criterion, &runtime, &mut connections);
         benchmark_sqlx_migration_chain(criterion, &runtime, &mut connections);
         procedural_trigger_benchmark(criterion, &runtime, &mut connections);

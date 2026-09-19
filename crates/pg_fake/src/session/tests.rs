@@ -9914,3 +9914,86 @@ fn grants_compatible_row_locks_while_an_update_waits() {
         );
     }
 }
+
+#[test]
+fn wakes_waiters_after_savepoint_rollback_and_error() {
+    for fail in [false, true] {
+        let db = Db::create();
+        let mut holder = db.create_session();
+        holder.execute("CREATE TABLE savepoint_wait(id INT PRIMARY KEY, value INT); INSERT INTO savepoint_wait VALUES(1, 10)").unwrap();
+        holder
+            .execute("BEGIN; SAVEPOINT s; UPDATE savepoint_wait SET value = 20")
+            .unwrap();
+        let mut waiter = db.create_session();
+        let (sender, receiver) = mpsc::channel();
+        let thread = thread::spawn(move || {
+            sender
+                .send(waiter.execute("UPDATE savepoint_wait SET value = value + 1"))
+                .unwrap();
+        });
+        wait_until_blocked(&db);
+        if fail {
+            assert_eq!(
+                holder.execute("SELECT 1 / 0").unwrap_err().sqlstate,
+                SqlState::DivisionByZero
+            );
+        } else {
+            holder.execute("ROLLBACK TO s").unwrap();
+        }
+        receiver
+            .recv_timeout(Duration::from_secs(1))
+            .unwrap()
+            .unwrap();
+        thread.join().unwrap();
+        holder.execute("ROLLBACK TO s; COMMIT").unwrap();
+        assert_eq!(
+            holder
+                .query("SELECT value FROM savepoint_wait", &[])
+                .unwrap()
+                .rows,
+            vec![vec![Value::Int4(11)]]
+        );
+    }
+}
+
+#[test]
+fn wakes_relation_waiter_after_savepoint_rollback() {
+    let db = Db::create();
+    let mut holder = db.create_session();
+    holder
+        .execute("CREATE TABLE savepoint_relation(id INT)")
+        .unwrap();
+    holder
+        .execute("BEGIN; SAVEPOINT s; LOCK TABLE savepoint_relation IN ACCESS EXCLUSIVE MODE")
+        .unwrap();
+    let mut waiter = db.create_session();
+    let (sender, receiver) = mpsc::channel();
+    let thread = thread::spawn(move || {
+        sender
+            .send(waiter.execute("INSERT INTO savepoint_relation VALUES(1)"))
+            .unwrap();
+    });
+    wait_until_relation_blocked(&db);
+    holder.execute("ROLLBACK TO s").unwrap();
+    receiver
+        .recv_timeout(Duration::from_secs(1))
+        .unwrap()
+        .unwrap();
+    thread.join().unwrap();
+    holder.execute("COMMIT").unwrap();
+}
+
+#[test]
+fn restores_timeout_settings_and_prepared_recovery_at_savepoints() {
+    let db = Db::create();
+    let mut session = db.create_session();
+    session.execute("BEGIN; SET LOCAL lock_timeout = '2s'; SAVEPOINT s; SET lock_timeout = '3s'; SET LOCAL statement_timeout = '4s'").unwrap();
+    assert_eq!(session.lock_timeout, Duration::from_secs(3));
+    assert_eq!(session.statement_timeout, Duration::from_secs(4));
+    session.query("SELECT 1 / 0", &[]).unwrap_err();
+    session.execute_params("ROLLBACK TO s", &[]).unwrap();
+    assert_eq!(session.lock_timeout, Duration::from_secs(2));
+    assert_eq!(session.statement_timeout, Duration::ZERO);
+    session.execute("COMMIT").unwrap();
+    assert_eq!(session.lock_timeout, Duration::from_secs(1));
+}

@@ -158,6 +158,13 @@ struct ConnectionState {
 }
 
 impl ConnectionState {
+    fn execute_pending_rollbacks(&mut self, pending: Vec<String>) -> Result<(), sqlx::Error> {
+        for rollback in pending {
+            self.session.execute(&rollback).map_err(database_error)?;
+        }
+        Ok(())
+    }
+
     fn prune_cached_statements(&mut self) {
         while self.statement_cache_bytes > self.statement_cache_limit_bytes {
             let ((sql, _), _) = self
@@ -172,7 +179,7 @@ impl ConnectionState {
 pub struct PgFakeConnection {
     state: Arc<Mutex<ConnectionState>>,
     transaction_depth: usize,
-    pending_rollback: bool,
+    pending_rollback: Arc<Mutex<Vec<String>>>,
 }
 
 impl PgFakeConnection {
@@ -197,22 +204,21 @@ impl PgFakeConnection {
                 statement_cache_limit_bytes,
             })),
             transaction_depth: 0,
-            pending_rollback: false,
+            pending_rollback: Arc::new(Mutex::new(Vec::new())),
         }
-    }
-
-    fn take_pending_rollback(&mut self) -> bool {
-        std::mem::take(&mut self.pending_rollback)
     }
 
     async fn run_control(&mut self, sql: String) -> Result<(), sqlx::Error> {
         let state = self.state.clone();
-        let rollback_first = self.take_pending_rollback();
+        let pending = std::mem::take(
+            &mut *self
+                .pending_rollback
+                .lock()
+                .expect("rollback queue mutex is poisoned"),
+        );
         tokio::task::spawn_blocking(move || {
             let mut state = state.lock().expect("connection mutex is poisoned");
-            if rollback_first {
-                state.session.execute("ROLLBACK").map_err(database_error)?;
-            }
+            state.execute_pending_rollbacks(pending)?;
             state.session.execute(&sql).map_err(database_error)?;
             Ok(())
         })
@@ -230,13 +236,16 @@ impl PgFakeConnection {
     + Send
     + 'static {
         let state = self.state.clone();
-        let rollback_first = self.take_pending_rollback();
+        let pending_rollback = self.pending_rollback.clone();
         async move {
+            let pending = std::mem::take(
+                &mut *pending_rollback
+                    .lock()
+                    .expect("rollback queue mutex is poisoned"),
+            );
             tokio::task::spawn_blocking(move || {
                 let mut state = state.lock().expect("connection mutex is poisoned");
-                if rollback_first {
-                    state.session.execute("ROLLBACK").map_err(database_error)?;
-                }
+                state.execute_pending_rollbacks(pending)?;
                 let results = if let Some(arguments) = arguments {
                     let parameter_types = arguments
                         .types
@@ -311,7 +320,6 @@ impl fmt::Debug for PgFakeConnection {
         formatter
             .debug_struct("PgFakeConnection")
             .field("transaction_depth", &self.transaction_depth)
-            .field("pending_rollback", &self.pending_rollback)
             .finish_non_exhaustive()
     }
 }
@@ -379,21 +387,18 @@ impl Connection for PgFakeConnection {
     }
 
     fn ping(&mut self) -> BoxFuture<'_, Result<(), sqlx::Error>> {
-        // Since rust don't have async Drop, we need to do rollback somewhere. This is the place.
-        // In `PgFakeTransactionManager::start_rollback` we set pending_rollback to true
-        // and make actual rollback next time runtime call this function
-        let rollback = self.take_pending_rollback();
+        let pending_rollback = self.pending_rollback.clone();
         let state = self.state.clone();
         Box::pin(async move {
-            if rollback {
+            let pending = std::mem::take(
+                &mut *pending_rollback
+                    .lock()
+                    .expect("rollback queue mutex is poisoned"),
+            );
+            if !pending.is_empty() {
                 tokio::task::spawn_blocking(move || {
-                    state
-                        .lock()
-                        .expect("connection mutex is poisoned")
-                        .session
-                        .execute("ROLLBACK")
-                        .map_err(database_error)
-                        .map(|_| ())
+                    let mut state = state.lock().expect("connection mutex is poisoned");
+                    state.execute_pending_rollbacks(pending)
                 })
                 .await
                 .map_err(|error| sqlx::Error::Protocol(error.to_string()))??;
@@ -490,7 +495,7 @@ impl<'c> Executor<'c> for &'c mut PgFakeConnection {
         'c: 'e,
     {
         let state = self.state.clone();
-        let rollback_first = self.take_pending_rollback();
+        let pending_rollback = self.pending_rollback.clone();
         let query = sql.to_owned();
         let supplied_parameters = parameters.to_vec();
         let parameter_types = supplied_parameters
@@ -498,12 +503,15 @@ impl<'c> Executor<'c> for &'c mut PgFakeConnection {
             .map(|info| info.base)
             .collect::<Vec<_>>();
         Box::pin(async move {
+            let pending = std::mem::take(
+                &mut *pending_rollback
+                    .lock()
+                    .expect("rollback queue mutex is poisoned"),
+            );
             let (statement, inferred_parameters, columns) =
                 tokio::task::spawn_blocking(move || {
                     let mut state = state.lock().expect("connection mutex is poisoned");
-                    if rollback_first {
-                        state.session.execute("ROLLBACK").map_err(database_error)?;
-                    }
+                    state.execute_pending_rollbacks(pending)?;
                     let statement = state
                         .session
                         .prepare_with_parameter_types(&query, &parameter_types)
@@ -563,6 +571,14 @@ impl<'c> Executor<'c> for &'c mut PgFakeConnection {
     }
 }
 
+fn create_rollback_statement(depth: usize) -> String {
+    if depth == 1 {
+        "ROLLBACK".into()
+    } else {
+        format!("ROLLBACK TO SAVEPOINT _sqlx_savepoint_{}", depth - 1)
+    }
+}
+
 pub struct PgFakeTransactionManager;
 
 impl TransactionManager for PgFakeTransactionManager {
@@ -573,13 +589,17 @@ impl TransactionManager for PgFakeTransactionManager {
         statement: Option<Cow<'static, str>>,
     ) -> BoxFuture<'conn, Result<(), sqlx::Error>> {
         Box::pin(async move {
-            if connection.transaction_depth != 0 {
+            let depth = connection.transaction_depth;
+            if depth != 0 && statement.is_some() {
                 return Err(sqlx::Error::InvalidSavePointStatement);
             }
-            connection
-                .run_control(statement.as_deref().unwrap_or("BEGIN").to_owned())
-                .await?;
-            connection.transaction_depth = 1;
+            let sql = if depth == 0 {
+                statement.as_deref().unwrap_or("BEGIN").to_owned()
+            } else {
+                format!("SAVEPOINT _sqlx_savepoint_{depth}")
+            };
+            connection.run_control(sql).await?;
+            connection.transaction_depth += 1;
             Ok(())
         })
     }
@@ -589,8 +609,14 @@ impl TransactionManager for PgFakeTransactionManager {
             if connection.transaction_depth == 0 {
                 return Err(sqlx::Error::Protocol("no transaction to commit".into()));
             }
-            connection.run_control("COMMIT".into()).await?;
-            connection.transaction_depth = 0;
+            let depth = connection.transaction_depth;
+            let sql = if depth == 1 {
+                "COMMIT".into()
+            } else {
+                format!("RELEASE SAVEPOINT _sqlx_savepoint_{}", depth - 1)
+            };
+            connection.run_control(sql).await?;
+            connection.transaction_depth -= 1;
             Ok(())
         })
     }
@@ -600,16 +626,22 @@ impl TransactionManager for PgFakeTransactionManager {
             if connection.transaction_depth == 0 {
                 return Err(sqlx::Error::Protocol("no transaction to roll back".into()));
             }
-            connection.run_control("ROLLBACK".into()).await?;
-            connection.transaction_depth = 0;
+            let depth = connection.transaction_depth;
+            let sql = create_rollback_statement(depth);
+            connection.run_control(sql).await?;
+            connection.transaction_depth -= 1;
             Ok(())
         })
     }
 
     fn start_rollback(connection: &mut PgFakeConnection) {
         if connection.transaction_depth != 0 {
-            connection.pending_rollback = true;
-            connection.transaction_depth = 0;
+            connection
+                .pending_rollback
+                .lock()
+                .expect("rollback queue mutex is poisoned")
+                .push(create_rollback_statement(connection.transaction_depth));
+            connection.transaction_depth -= 1;
         }
     }
 

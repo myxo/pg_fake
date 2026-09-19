@@ -40,6 +40,22 @@ Enable the adapter's optional `time` feature to bind and decode
 pg_fake_sqlx = { version = "0.1", features = ["time"] }
 ```
 
+Transactions support nested `SAVEPOINT`, `ROLLBACK TO SAVEPOINT`, and
+`RELEASE SAVEPOINT`, including recovery after an error. SQLx nested
+transactions use the same savepoint state, including rollback on drop.
+
+```sql
+BEGIN;
+CREATE TABLE items (id INTEGER PRIMARY KEY);
+INSERT INTO items VALUES (1);
+SAVEPOINT retry;
+INSERT INTO items VALUES (2);
+ROLLBACK TO SAVEPOINT retry;
+RELEASE SAVEPOINT retry;
+COMMIT;
+SELECT * FROM items; -- returns 1
+```
+
 ## Command-line interface
 
 Run a SQL file against a fresh in-memory database:

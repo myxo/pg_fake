@@ -459,14 +459,24 @@ impl CatalogHistory {
 
     #[cfg_attr(feature = "execution-log", tracing::instrument(skip_all))]
     pub(crate) fn discard_transaction(&mut self, xid: Xid) -> ReclaimedCatalogObjects {
+        self.discard_versions_since(xid, CommandId(0))
+    }
+
+    pub(crate) fn discard_versions_since(
+        &mut self,
+        xid: Xid,
+        boundary: CommandId,
+    ) -> ReclaimedCatalogObjects {
         self.generation += 1;
-        self.pending_transactions.remove(&xid);
-        discard_catalog_transaction(&mut self.schemas, xid);
-        discard_catalog_transaction(&mut self.views, xid);
-        discard_catalog_transaction(&mut self.functions, xid);
+        if boundary == CommandId(0) {
+            self.pending_transactions.remove(&xid);
+        }
+        discard_catalog_transaction(&mut self.schemas, xid, boundary);
+        discard_catalog_transaction(&mut self.views, xid, boundary);
+        discard_catalog_transaction(&mut self.functions, xid, boundary);
         ReclaimedCatalogObjects {
-            tables: discard_catalog_transaction(&mut self.tables, xid),
-            sequences: discard_catalog_transaction(&mut self.sequences, xid),
+            tables: discard_catalog_transaction(&mut self.tables, xid, boundary),
+            sequences: discard_catalog_transaction(&mut self.sequences, xid, boundary),
         }
     }
 
@@ -620,14 +630,19 @@ fn record_catalog_changes<'a, Id, T>(
 fn discard_catalog_transaction<Id, T>(
     histories: &mut BTreeMap<Id, Vec<CatalogVersion<T>>>,
     xid: Xid,
+    boundary: CommandId,
 ) -> Vec<Id>
 where
     Id: Copy + Ord,
 {
     for versions in histories.values_mut() {
-        versions.retain(|version| version.xmin != Some(xid));
+        versions.retain(|version| version.xmin != Some(xid) || version.xmin_command_id < boundary);
         for version in versions {
-            if version.xmax == Some(xid) {
+            if version.xmax == Some(xid)
+                && version
+                    .xmax_command_id
+                    .is_some_and(|command| command >= boundary)
+            {
                 version.xmax = None;
                 version.xmax_command_id = None;
             }

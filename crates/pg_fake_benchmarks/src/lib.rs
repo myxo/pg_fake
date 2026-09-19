@@ -27,6 +27,16 @@ pub fn find_benchmark(name: &str) -> Benchmark {
 pub fn list_benchmarks() -> Vec<Benchmark> {
     vec![
         build_benchmark(
+            "nested_savepoint_release",
+            postgres_values(),
+            postgres_comparisons(),
+        ),
+        build_benchmark(
+            "nested_savepoint_rollback",
+            postgres_values(),
+            postgres_comparisons(),
+        ),
+        build_benchmark(
             "skip_locked_queue_100_rows",
             postgres_values(),
             postgres_comparisons(),

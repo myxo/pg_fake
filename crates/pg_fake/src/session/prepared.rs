@@ -109,7 +109,11 @@ impl Session {
                         .unwrap_or_else(|| Snapshot::create(&state.transactions))
                         .use_command(crate::txn::CommandId(transaction.next_command_id)),
                 ),
-                Some(SessionTransactionState::Aborted { .. }) => unreachable!(),
+                Some(SessionTransactionState::Aborted { transaction }) => (
+                    Some(transaction.xid),
+                    Snapshot::create(&state.transactions)
+                        .use_command(crate::txn::CommandId(transaction.next_command_id)),
+                ),
                 None => (None, Snapshot::create(&state.transactions)),
             };
             state.load_catalog(xid, snapshot, Some(self.temporary_schema_id));

@@ -181,6 +181,38 @@ pub(crate) enum AdvisoryAttempt {
 }
 
 impl AdvisoryLockManager {
+    pub(crate) fn capture_transaction_locks(
+        &self,
+        xid: Xid,
+    ) -> BTreeSet<(AdvisoryKey, SchemaId, AdvisoryMode)> {
+        self.locks
+            .iter()
+            .flat_map(|(key, lock)| {
+                lock.holders
+                    .keys()
+                    .filter_map(move |(session, scope, mode)| {
+                        (*scope == AdvisoryScope::Transaction(xid))
+                            .then_some((*key, *session, *mode))
+                    })
+            })
+            .collect()
+    }
+
+    pub(crate) fn restore_transaction_locks(
+        &mut self,
+        xid: Xid,
+        saved: &BTreeSet<(AdvisoryKey, SchemaId, AdvisoryMode)>,
+    ) {
+        self.locks.retain(|key, lock| {
+            lock.holders.retain(|(session, scope, mode), _| {
+                *scope != AdvisoryScope::Transaction(xid)
+                    || saved.contains(&(*key, *session, *mode))
+            });
+            lock.waiters.retain(|waiter| waiter.xid != xid);
+            !lock.holders.is_empty() || !lock.waiters.is_empty()
+        });
+    }
+
     pub(crate) fn register_transaction(&mut self, session: SchemaId, xid: Xid) {
         self.sessions.insert(session, xid);
     }

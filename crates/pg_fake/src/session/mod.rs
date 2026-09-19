@@ -21,6 +21,7 @@ mod constraint_timing;
 mod do_block;
 mod locking;
 mod prepared;
+mod savepoints;
 mod settings;
 mod transactions;
 
@@ -37,6 +38,7 @@ pub struct Session {
     db: Db,
     temporary_schema_id: SchemaId,
     transaction: Option<SessionTransactionState>,
+    savepoints: Vec<savepoints::Savepoint>,
     default_isolation: IsolationLevel,
     lock_timeout: Duration,
     statement_timeout: Duration,
@@ -62,6 +64,7 @@ impl Session {
             db,
             temporary_schema_id,
             transaction: None,
+            savepoints: Vec::new(),
             default_isolation: IsolationLevel::ReadCommitted,
             lock_timeout,
             statement_timeout: Duration::ZERO,
@@ -114,13 +117,27 @@ impl Session {
         prepared_statement: Option<&PreparedStatement>,
         procedural: Option<DoBlockContext>,
     ) -> Result<StatementResult> {
+        if matches!(
+            self.transaction,
+            Some(SessionTransactionState::Aborted { .. })
+        ) && !matches!(
+            statement,
+            ast::Statement::Commit { .. } | ast::Statement::Rollback { .. }
+        ) {
+            return Err(PgError::create(
+                SqlState::InFailedSqlTransaction,
+                "current transaction is aborted",
+            ));
+        }
         let prepared_dependencies =
             prepared_statement.map(|statement| statement.catalog_dependencies.as_slice());
         if matches!(statement, ast::Statement::Analyze(_)) && !self.db.strict {
             return Ok(StatementResult::Affected(0));
         }
-        if let Some(result) = self.try_execute_setting(statement)? {
-            return Ok(result);
+        match self.try_execute_setting(statement) {
+            Ok(Some(result)) => return Ok(result),
+            Ok(None) => {}
+            Err(error) => return self.abort_with_error(error),
         }
         if let Some(result) = self.try_execute_transaction_command(statement)? {
             return Ok(result);

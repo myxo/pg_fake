@@ -19,7 +19,7 @@ pub enum IsolationLevel {
 #[derive(Clone, Copy)]
 pub(super) enum SessionTransactionState {
     Active(ActiveTransaction),
-    Aborted { xid: Xid, implicit_batch: bool },
+    Aborted { transaction: ActiveTransaction },
 }
 
 #[derive(Clone, Copy)]
@@ -44,6 +44,9 @@ impl Session {
         &mut self,
         statement: &ast::Statement,
     ) -> Result<Option<StatementResult>> {
+        if let Some(result) = self.try_execute_savepoint_command(statement)? {
+            return Ok(Some(result));
+        }
         match statement {
             ast::Statement::Lock(_)
                 if matches!(
@@ -71,7 +74,9 @@ impl Session {
                         if transaction.implicit_batch =>
                     {
                         if let Some(isolation) = parse_isolation_level(modes)? {
-                            if transaction.statement_started && isolation != transaction.isolation {
+                            if (transaction.statement_started || !self.savepoints.is_empty())
+                                && isolation != transaction.isolation
+                            {
                                 return self.abort_with_error(PgError::create(
                                     SqlState::ActiveSqlTransaction,
                                     "transaction isolation level must be set before any query",
@@ -134,7 +139,9 @@ impl Session {
                 else {
                     return Ok(Some(StatementResult::Affected(0)));
                 };
-                if transaction.statement_started && isolation != transaction.isolation {
+                if (transaction.statement_started || !self.savepoints.is_empty())
+                    && isolation != transaction.isolation
+                {
                     return self.abort_with_error(PgError::create(
                         SqlState::ActiveSqlTransaction,
                         "transaction isolation level must be set before any query",
@@ -193,6 +200,7 @@ impl Session {
     pub(super) fn start_transaction(&mut self, isolation: IsolationLevel, implicit_batch: bool) {
         assert!(self.settings_undo.is_none());
         assert!(self.settings_on_commit.is_none());
+        self.savepoints.clear();
         self.deferred_constraints.clear();
         self.defer_all_constraints = false;
         self.deferred_foreign_keys_dirty = false;
@@ -221,6 +229,7 @@ impl Session {
 
     #[cfg_attr(feature = "execution-log", tracing::instrument(skip_all))]
     pub(super) fn commit_transaction(&mut self) -> Result<()> {
+        self.savepoints.clear();
         let Some(transaction) = self.transaction.take() else {
             return Ok(());
         };
@@ -348,6 +357,7 @@ impl Session {
 
     #[cfg_attr(feature = "execution-log", tracing::instrument(skip_all))]
     pub(super) fn rollback_transaction(&mut self) -> Result<()> {
+        self.savepoints.clear();
         let Some(transaction) = self.transaction.take() else {
             return Ok(());
         };
@@ -358,7 +368,7 @@ impl Session {
     fn rollback_transaction_state(&mut self, transaction: SessionTransactionState) -> Result<()> {
         let xid = match transaction {
             SessionTransactionState::Active(transaction) => transaction.xid,
-            SessionTransactionState::Aborted { xid, .. } => xid,
+            SessionTransactionState::Aborted { transaction } => transaction.xid,
         };
         let state_lock = self.db.state.clone();
         let mut state = state_lock.lock().expect("database mutex is poisoned");
@@ -389,10 +399,10 @@ impl Session {
     #[cfg_attr(feature = "execution-log", tracing::instrument(skip_all))]
     pub(super) fn mark_transaction_aborted(&mut self) {
         if let Some(SessionTransactionState::Active(transaction)) = self.transaction {
-            self.transaction = Some(SessionTransactionState::Aborted {
-                xid: transaction.xid,
-                implicit_batch: transaction.implicit_batch,
-            });
+            if !self.savepoints.is_empty() {
+                self.rollback_savepoint_state(self.savepoints.len() - 1);
+            }
+            self.transaction = Some(SessionTransactionState::Aborted { transaction });
         }
     }
 
@@ -400,7 +410,7 @@ impl Session {
     pub(super) fn is_transaction_implicit_batch(&self) -> bool {
         match self.transaction {
             Some(SessionTransactionState::Active(transaction)) => transaction.implicit_batch,
-            Some(SessionTransactionState::Aborted { implicit_batch, .. }) => implicit_batch,
+            Some(SessionTransactionState::Aborted { transaction }) => transaction.implicit_batch,
             None => false,
         }
     }

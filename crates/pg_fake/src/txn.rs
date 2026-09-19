@@ -137,6 +137,29 @@ impl Default for WaitForGraph {
 }
 
 impl RowLockManager {
+    pub(crate) fn capture_transaction_locks(&self, xid: Xid) -> BTreeMap<RowLockKey, RowLockMode> {
+        self.locks
+            .iter()
+            .filter_map(|(key, lock)| lock.holders.get(&xid).map(|mode| (*key, *mode)))
+            .collect()
+    }
+
+    pub(crate) fn restore_transaction_locks(
+        &mut self,
+        xid: Xid,
+        saved: &BTreeMap<RowLockKey, RowLockMode>,
+    ) {
+        self.locks.retain(|key, lock| {
+            if let Some(mode) = saved.get(key) {
+                lock.holders.insert(xid, *mode);
+            } else {
+                lock.holders.remove(&xid);
+            }
+            lock.waiters.retain(|waiter| *waiter != xid);
+            !lock.holders.is_empty() || !lock.waiters.is_empty()
+        });
+    }
+
     #[cfg_attr(feature = "execution-log", tracing::instrument(skip_all))]
     pub(crate) fn create() -> Self {
         RowLockManager {
@@ -234,6 +257,29 @@ impl RowLockManager {
 }
 
 impl RelationLockManager {
+    pub(crate) fn capture_transaction_locks(&self, xid: Xid) -> BTreeMap<String, RelationLockMode> {
+        self.locks
+            .iter()
+            .filter_map(|(key, lock)| lock.holders.get(&xid).map(|mode| (key.clone(), *mode)))
+            .collect()
+    }
+
+    pub(crate) fn restore_transaction_locks(
+        &mut self,
+        xid: Xid,
+        saved: &BTreeMap<String, RelationLockMode>,
+    ) {
+        self.locks.retain(|key, lock| {
+            if let Some(mode) = saved.get(key) {
+                lock.holders.insert(xid, *mode);
+            } else {
+                lock.holders.remove(&xid);
+            }
+            lock.waiters.retain(|waiter| waiter.0 != xid);
+            !lock.holders.is_empty() || !lock.waiters.is_empty()
+        });
+    }
+
     #[cfg_attr(feature = "execution-log", tracing::instrument(skip_all))]
     pub(crate) fn create() -> Self {
         RelationLockManager {

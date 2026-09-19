@@ -16,6 +16,8 @@ bind, `timestamptz` store, and decoded `RETURNING` value through each SQLx
 adapter. The `hashed_advisory_lock_acquisition` workload measures an explicit
 transaction that derives an advisory key with `hashtextextended` and acquires
 the corresponding transaction lock.
+The `nested_savepoint_release` and `nested_savepoint_rollback` workloads measure
+two nested savepoints with inserts, followed by release or partial rollback.
 
 Diagnostic groups isolate costs within `pg_fake`:
 

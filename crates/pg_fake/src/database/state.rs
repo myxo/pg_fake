@@ -25,7 +25,8 @@ pub(crate) struct DatabaseState {
     pub(crate) relation_locks: RelationLockManager,
     pub(crate) wait_for: WaitForGraph,
     pub(crate) sequence_values: SequenceStorage,
-    sequence_resets: BTreeMap<Xid, BTreeMap<crate::catalog::SequenceId, SequenceValueState>>,
+    sequence_resets:
+        BTreeMap<Xid, Vec<(CommandId, crate::catalog::SequenceId, SequenceValueState)>>,
     touched_tables: BTreeMap<Xid, Vec<TableId>>,
     reclaimable_tables: Vec<TableId>,
 }
@@ -171,6 +172,7 @@ impl DatabaseState {
         &mut self,
         xid: Xid,
         sequence: &crate::catalog::SequenceSchema,
+        command_id: CommandId,
     ) {
         let mut values = self
             .sequence_values
@@ -182,8 +184,7 @@ impl DatabaseState {
         self.sequence_resets
             .entry(xid)
             .or_default()
-            .entry(sequence.id)
-            .or_insert(*value);
+            .push((command_id, sequence.id, *value));
         *value = SequenceValueState {
             last_value: sequence.start_value,
             is_called: false,
@@ -195,13 +196,27 @@ impl DatabaseState {
     }
 
     pub(crate) fn abort_sequence_resets(&mut self, xid: Xid) {
-        let Some(restored) = self.sequence_resets.remove(&xid) else {
+        self.rollback_sequence_resets_since(xid, CommandId(0));
+    }
+
+    pub(crate) fn rollback_sequence_resets_since(&mut self, xid: Xid, boundary: CommandId) {
+        let Some(resets) = self.sequence_resets.get_mut(&xid) else {
             return;
         };
-        self.sequence_values
+        let mut values = self
+            .sequence_values
             .lock()
-            .expect("sequence storage is poisoned")
-            .extend(restored);
+            .expect("sequence storage is poisoned");
+        while resets
+            .last()
+            .is_some_and(|(command, _, _)| *command >= boundary)
+        {
+            let (_, sequence, value) = resets.pop().expect("selected reset exists");
+            values.insert(sequence, value);
+        }
+        if resets.is_empty() {
+            self.sequence_resets.remove(&xid);
+        }
     }
 
     #[cfg_attr(feature = "execution-log", tracing::instrument(skip_all))]

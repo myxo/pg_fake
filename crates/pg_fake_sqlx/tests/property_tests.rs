@@ -3277,3 +3277,62 @@ fn matches_generated_pg_lsn_values_and_arithmetic() {
         );
     });
 }
+
+#[test]
+fn generated_savepoint_histories_match_postgres() {
+    let server = start_isolated_postgres_server();
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap();
+    let postgres = RefCell::new(
+        runtime
+            .block_on(PgConnection::connect(&server.url))
+            .unwrap(),
+    );
+    check(|src| {
+        let mut connection = postgres.borrow_mut();
+        let mut case = PostgresCase {
+            connection: &mut connection,
+            runtime: &runtime,
+            table: "generated_savepoint".to_owned(),
+        };
+        let postgres = case.get_connection();
+        let mut fake = PgFakeConnection::new(Db::create());
+        let mut statements = vec![
+            "BEGIN".to_owned(),
+            "CREATE TABLE generated_savepoint(id INT PRIMARY KEY, value INT)".to_owned(),
+            "INSERT INTO generated_savepoint(id, value) VALUES(1, 0),(2, 0)".to_owned(),
+            "SAVEPOINT root".to_owned(),
+        ];
+        let count = src.any_of("steps", int_in(1..=16));
+        for _ in 0..count {
+            let id = src.any_of("id", int_in(1..=3));
+            let value = integer(src, "value");
+            let statement = match src.any_of("operation", int_in(0..=10)) {
+                0 => "SAVEPOINT repeated".to_owned(),
+                1 => "RELEASE repeated".to_owned(),
+                2 => "ROLLBACK TO repeated".to_owned(),
+                3 => "ROLLBACK TO root".to_owned(),
+                4 => format!("INSERT INTO generated_savepoint(id, value) VALUES({id}, {value})"),
+                5 => format!("UPDATE generated_savepoint SET value = {value} WHERE id = {id}"),
+                6 => format!("DELETE FROM generated_savepoint WHERE id = {id}"),
+                7 => "TRUNCATE generated_savepoint".to_owned(),
+                8 => "ALTER TABLE generated_savepoint ADD COLUMN extra INT DEFAULT 1".to_owned(),
+                9 => "SELECT 1 / 0".to_owned(),
+                _ => "SELECT * FROM generated_savepoint ORDER BY id".to_owned(),
+            };
+            statements.push(statement);
+            statements.push("SELECT * FROM generated_savepoint ORDER BY id".to_owned());
+        }
+        statements.extend([
+            "ROLLBACK TO root".to_owned(),
+            "SELECT * FROM generated_savepoint ORDER BY id".to_owned(),
+            "ROLLBACK".to_owned(),
+        ]);
+        for sql in statements {
+            src.log_value("sql", &sql);
+            assert_statement_allow_error(&runtime, postgres, &mut fake, &sql, RowOrder::Ordered);
+        }
+    });
+}
