@@ -150,3 +150,51 @@ fn classifies_statement_families() {
         assert_eq!(classify(&statement), expected, "{sql}");
     }
 }
+
+mod postgres_guc_grammar {
+    use sqlparser::{
+        ast::{ContextModifier, Set, Statement},
+        dialect::PostgreSqlDialect,
+        parser::Parser,
+    };
+
+    #[test]
+    fn parse_postgres_schema_and_reset_aliases() {
+        for scope in ["", "SESSION ", "LOCAL "] {
+            let statements = Parser::parse_sql(
+                &PostgreSqlDialect {},
+                &format!("SET {scope}SCHEMA 'public'"),
+            )
+            .unwrap();
+            assert_eq!(
+                statements[0].to_string(),
+                format!("SET {scope}search_path = 'public'")
+            );
+        }
+        let statements = Parser::parse_sql(
+            &PostgreSqlDialect {},
+            "SET LOCAL SCHEMA 'public'; RESET TIME ZONE",
+        )
+        .unwrap();
+        let Statement::Set(Set::SingleAssignment {
+            scope,
+            variable,
+            values,
+            ..
+        }) = &statements[0]
+        else {
+            panic!("expected SET assignment");
+        };
+        assert_eq!(*scope, Some(ContextModifier::Local));
+        assert_eq!(variable.to_string(), "search_path");
+        assert_eq!(values[0].to_string(), "'public'");
+        assert_eq!(statements[1].to_string(), "RESET TimeZone");
+        for sql in [
+            "SET SCHEMA DEFAULT",
+            "SET SCHEMA 'public', 'other'",
+            "RESET TIME ZONE extra",
+        ] {
+            assert!(Parser::parse_sql(&PostgreSqlDialect {}, sql).is_err());
+        }
+    }
+}

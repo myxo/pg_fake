@@ -1,14 +1,17 @@
-use std::time::Duration;
+use std::{collections::BTreeMap, time::Duration};
 
 use sqlparser::ast;
 
+use super::{ColumnMeta, IsolationLevel, QueryResult, Session, StatementResult};
 use crate::{
     error::{PgError, Result, SqlState},
     value::Value,
 };
 
-use super::{
-    ColumnMeta, IsolationLevel, QueryResult, Session, SessionTransactionState, StatementResult,
+mod registry;
+use registry::{
+    MemoryUnit, SettingContext, SettingDefault, SettingEffect, SettingSpec, SettingType,
+    list_settings, resolve_setting,
 };
 
 #[derive(Clone)]
@@ -18,52 +21,222 @@ pub(super) struct SessionSettings {
     pub(super) statement_timeout: Duration,
     pub(super) timezone: String,
     pub(super) search_path: Vec<String>,
+    values: BTreeMap<&'static str, SettingValue>,
+}
+
+#[derive(Clone)]
+enum SettingValue {
+    Boolean(bool),
+    Integer(i64),
+    Real(f64),
+    Text(String),
+    SearchPath(Vec<String>),
+    Isolation(IsolationLevel),
+}
+
+impl SessionSettings {
+    pub(super) fn create(lock_timeout: Duration) -> Self {
+        let mut settings = Self {
+            default_isolation: IsolationLevel::ReadCommitted,
+            lock_timeout,
+            statement_timeout: Duration::ZERO,
+            timezone: String::new(),
+            search_path: Vec::new(),
+            values: BTreeMap::new(),
+        };
+        for spec in list_settings() {
+            let value = match spec.default {
+                SettingDefault::SearchPath(values) => {
+                    SettingValue::SearchPath(values.iter().map(|value| (*value).into()).collect())
+                }
+                SettingDefault::LockTimeout => SettingValue::Integer(
+                    lock_timeout
+                        .as_millis()
+                        .try_into()
+                        .expect("configured timeout fits milliseconds"),
+                ),
+                SettingDefault::Text(value) => {
+                    parse_setting_value(spec, value).expect("registry defaults must be valid")
+                }
+            };
+            settings.assign_value(spec, value);
+        }
+        settings
+    }
+
+    fn assign_value(&mut self, spec: &SettingSpec, value: SettingValue) {
+        match (&spec.effect, &value) {
+            (SettingEffect::TimeZone, SettingValue::Text(value)) => self.timezone = value.clone(),
+            (SettingEffect::LockTimeout, SettingValue::Integer(value)) => {
+                self.lock_timeout = Duration::from_millis(*value as u64)
+            }
+            (SettingEffect::StatementTimeout, SettingValue::Integer(value)) => {
+                self.statement_timeout = Duration::from_millis(*value as u64)
+            }
+            (SettingEffect::Isolation, SettingValue::Isolation(value)) => {
+                self.default_isolation = *value
+            }
+            (SettingEffect::SearchPath, SettingValue::SearchPath(value)) => {
+                self.search_path = value.clone()
+            }
+            (SettingEffect::Compatibility | SettingEffect::Planner, _) => {
+                self.values.insert(spec.name, value);
+            }
+            _ => unreachable!("registry type must agree with its execution effect"),
+        }
+    }
+
+    fn format_value(&self, spec: &SettingSpec) -> String {
+        let value = match spec.effect {
+            SettingEffect::TimeZone => return self.timezone.clone(),
+            SettingEffect::LockTimeout => {
+                return format_units(
+                    self.lock_timeout.as_millis() as i64,
+                    &[
+                        (86400000, "d"),
+                        (3600000, "h"),
+                        (60000, "min"),
+                        (1000, "s"),
+                        (1, "ms"),
+                    ],
+                );
+            }
+            SettingEffect::StatementTimeout => {
+                return format_units(
+                    self.statement_timeout.as_millis() as i64,
+                    &[
+                        (86400000, "d"),
+                        (3600000, "h"),
+                        (60000, "min"),
+                        (1000, "s"),
+                        (1, "ms"),
+                    ],
+                );
+            }
+            SettingEffect::Isolation => {
+                return match self.default_isolation {
+                    IsolationLevel::ReadCommitted => "read committed",
+                    IsolationLevel::RepeatableRead => "repeatable read",
+                }
+                .into();
+            }
+            SettingEffect::SearchPath => {
+                return self
+                    .search_path
+                    .iter()
+                    .map(|name| {
+                        if !name.is_empty()
+                            && !is_quoted_keyword(name)
+                            && name.bytes().enumerate().all(|(index, byte)| {
+                                byte.is_ascii_lowercase()
+                                    || byte == b'_'
+                                    || (index > 0 && (byte.is_ascii_digit() || byte == b'$'))
+                            })
+                        {
+                            name.clone()
+                        } else {
+                            format!("\"{}\"", name.replace('"', "\"\""))
+                        }
+                    })
+                    .collect::<Vec<_>>()
+                    .join(", ");
+            }
+            SettingEffect::Compatibility | SettingEffect::Planner => self
+                .values
+                .get(spec.name)
+                .expect("registered setting has a value"),
+        };
+        match value {
+            SettingValue::Boolean(value) => if *value { "on" } else { "off" }.into(),
+            SettingValue::Integer(value) => {
+                let multiplier = match spec.kind {
+                    SettingType::Integer {
+                        unit: MemoryUnit::Kilobytes,
+                        ..
+                    } => 1024,
+                    SettingType::Integer {
+                        unit: MemoryUnit::Blocks,
+                        ..
+                    } => 8192,
+                    _ => return value.to_string(),
+                };
+                format_units(
+                    *value * multiplier,
+                    &[
+                        (1099511627776, "TB"),
+                        (1073741824, "GB"),
+                        (1048576, "MB"),
+                        (1024, "kB"),
+                        (1, "B"),
+                    ],
+                )
+            }
+            SettingValue::Real(value) => value.to_string(),
+            SettingValue::Text(value) => value.clone(),
+            _ => unreachable!("semantic settings use their execution fields"),
+        }
+    }
 }
 
 impl Session {
+    pub(super) fn describe_setting_statement(
+        &self,
+        statement: &ast::Statement,
+    ) -> Result<Option<Vec<ColumnMeta>>> {
+        let ast::Statement::ShowVariable { variable } = statement else {
+            return Ok(None);
+        };
+        let spec = resolve_show_setting(variable)?;
+        spec.validate_access(self.db.strict, false)?;
+        Ok(Some(vec![ColumnMeta {
+            name: spec.name.into(),
+            type_oid: crate::value::BaseType::Text.map_to_oid(),
+            typmod: -1,
+        }]))
+    }
+
     pub(super) fn try_execute_setting(
         &mut self,
         statement: &ast::Statement,
     ) -> Result<Option<StatementResult>> {
-        match statement {
-            ast::Statement::Reset(reset)
-                if !self.db.strict && is_tolerated_planner_reset(&reset.reset) =>
-            {
-                return Ok(Some(StatementResult::Affected(0)));
+        let (name, values, local) = match statement {
+            ast::Statement::ShowVariable { variable } => {
+                let spec = resolve_show_setting(variable)?;
+                let columns = self
+                    .describe_setting_statement(statement)?
+                    .expect("SHOW has columns");
+                return Ok(Some(StatementResult::Query(QueryResult {
+                    columns,
+                    rows: vec![vec![Value::Text(self.settings.format_value(spec))]],
+                })));
             }
-            ast::Statement::Set(ast::Set::SetTimeZone { local, value }) => {
-                self.timezone = parse_timezone(value)?;
-                if !local {
-                    self.settings_on_commit
-                        .as_mut()
-                        .expect("SET runs in a transaction")
-                        .timezone = self.timezone.clone();
+            ast::Statement::Reset(reset) => {
+                match &reset.reset {
+                    ast::Reset::ALL => {
+                        let defaults = SessionSettings::create(self.default_lock_timeout);
+                        // RESET ALL skips parameters that cannot change in an established session.
+                        for spec in list_settings()
+                            .iter()
+                            .filter(|spec| matches!(spec.context, SettingContext::Session))
+                        {
+                            if self.db.strict && matches!(spec.effect, SettingEffect::Planner) {
+                                continue;
+                            }
+                            self.reset_setting(spec, &defaults);
+                        }
+                    }
+                    ast::Reset::ConfigurationParameter(name) => {
+                        let name = normalize_setting_name(name)?;
+                        let spec = resolve_setting(&name)?;
+                        spec.validate_access(self.db.strict, true)?;
+                        self.reset_setting(
+                            spec,
+                            &SessionSettings::create(self.default_lock_timeout),
+                        );
+                    }
+                    _ => return Ok(None),
                 }
                 return Ok(Some(StatementResult::Affected(0)));
-            }
-            ast::Statement::ShowVariable { variable }
-                if variable.len() == 1 && variable[0].value.eq_ignore_ascii_case("timezone") =>
-            {
-                return Ok(Some(StatementResult::Query(QueryResult {
-                    columns: vec![ColumnMeta {
-                        name: "TimeZone".into(),
-                        type_oid: crate::value::BaseType::Text.map_to_oid(),
-                        typmod: -1,
-                    }],
-                    rows: vec![vec![Value::Text(self.timezone.clone())]],
-                })));
-            }
-            ast::Statement::ShowVariable { variable }
-                if variable.len() == 1 && variable[0].value.eq_ignore_ascii_case("search_path") =>
-            {
-                return Ok(Some(StatementResult::Query(QueryResult {
-                    columns: vec![ColumnMeta {
-                        name: "search_path".into(),
-                        type_oid: crate::value::BaseType::Text.map_to_oid(),
-                        typmod: -1,
-                    }],
-                    rows: vec![vec![Value::Text(self.search_path.join(", "))]],
-                })));
             }
             ast::Statement::Set(ast::Set::SingleAssignment {
                 scope,
@@ -71,160 +244,394 @@ impl Session {
                 variable,
                 values,
             }) => {
-                if variable.to_string().eq_ignore_ascii_case("search_path") {
-                    if *hivevar || values.is_empty() {
-                        return self.abort_with_error(PgError::create(
-                            SqlState::SyntaxError,
-                            "invalid search_path",
-                        ));
-                    }
-                    self.search_path = values
-                        .iter()
-                        .map(parse_search_path_entry)
-                        .collect::<Result<Vec<_>>>()?;
-                    if *scope != Some(ast::ContextModifier::Local) {
-                        self.settings_on_commit
-                            .as_mut()
-                            .expect("SET runs in a transaction")
-                            .search_path = self.search_path.clone();
-                    }
-                    return Ok(Some(StatementResult::Affected(0)));
-                }
-                if variable.to_string().eq_ignore_ascii_case("timezone") {
-                    if *hivevar || values.len() != 1 {
-                        return self.abort_with_error(PgError::create(
-                            SqlState::FeatureNotSupported,
-                            "TimeZone setting variant is not implemented",
-                        ));
-                    }
-                    self.timezone = parse_timezone(&values[0])?;
-                    if *scope != Some(ast::ContextModifier::Local) {
-                        self.settings_on_commit
-                            .as_mut()
-                            .expect("SET runs in a transaction")
-                            .timezone = self.timezone.clone();
-                    }
-                    return Ok(Some(StatementResult::Affected(0)));
-                }
-                if variable.to_string().eq_ignore_ascii_case("lock_timeout") {
-                    if matches!(
-                        self.transaction,
-                        Some(SessionTransactionState::Aborted { .. })
-                    ) {
-                        return Err(PgError::create(
-                            SqlState::InFailedSqlTransaction,
-                            "current transaction is aborted",
-                        ));
-                    }
-                    if *hivevar || values.len() != 1 {
-                        return self.abort_with_error(PgError::create(
-                            SqlState::FeatureNotSupported,
-                            "lock_timeout setting variant is not implemented",
-                        ));
-                    }
-                    self.lock_timeout = match parse_timeout(&values[0], "lock_timeout") {
-                        Ok(timeout) => timeout,
-                        Err(error) => return self.abort_with_error(error),
-                    };
-                    if *scope != Some(ast::ContextModifier::Local) {
-                        self.settings_on_commit
-                            .as_mut()
-                            .expect("SET runs in a transaction")
-                            .lock_timeout = self.lock_timeout;
-                    }
-                    return Ok(Some(StatementResult::Affected(0)));
-                }
-                if variable
-                    .to_string()
-                    .eq_ignore_ascii_case("statement_timeout")
+                if *hivevar
+                    || !matches!(
+                        scope,
+                        None | Some(ast::ContextModifier::Session | ast::ContextModifier::Local)
+                    )
                 {
-                    if matches!(
-                        self.transaction,
-                        Some(SessionTransactionState::Aborted { .. })
-                    ) {
-                        return Err(PgError::create(
-                            SqlState::InFailedSqlTransaction,
-                            "current transaction is aborted",
-                        ));
-                    }
-                    if *scope != Some(ast::ContextModifier::Local) || *hivevar || values.len() != 1
-                    {
-                        return self.abort_with_error(PgError::create(
-                            SqlState::FeatureNotSupported,
-                            "statement_timeout setting variant is not implemented",
-                        ));
-                    }
-                    self.statement_timeout = match parse_timeout(&values[0], "statement_timeout") {
-                        Ok(timeout) => timeout,
-                        Err(error) => return self.abort_with_error(error),
-                    };
-                    return Ok(Some(StatementResult::Affected(0)));
+                    return Err(PgError::create(SqlState::SyntaxError, "invalid SET scope"));
                 }
-                if !self.db.strict && is_tolerated_planner_setting(variable) {
-                    return Ok(Some(StatementResult::Affected(0)));
-                }
+                (
+                    normalize_setting_name(variable)?,
+                    values.clone(),
+                    *scope == Some(ast::ContextModifier::Local),
+                )
             }
-            _ => {}
+            ast::Statement::Set(ast::Set::SetTimeZone { local, value }) => {
+                ("TimeZone".into(), vec![value.clone()], *local)
+            }
+            ast::Statement::Set(ast::Set::SetNames {
+                charset_name,
+                collation_name: None,
+            }) => (
+                "client_encoding".into(),
+                vec![ast::Expr::Identifier(charset_name.clone())],
+                false,
+            ),
+            ast::Statement::Set(ast::Set::SetNamesDefault {}) => (
+                "client_encoding".into(),
+                vec![ast::Expr::Identifier(ast::Ident::new("DEFAULT"))],
+                false,
+            ),
+            _ => return Ok(None),
+        };
+        let spec = resolve_setting(&name)?;
+        spec.validate_access(self.db.strict, true)?;
+        let reset = matches!(values.as_slice(), [ast::Expr::Identifier(ident)] if ident.quote_style.is_none() && (ident.value.eq_ignore_ascii_case("default") || (matches!(spec.kind, SettingType::TimeZone) && ident.value.eq_ignore_ascii_case("local"))));
+        if reset {
+            let defaults = SessionSettings::create(self.default_lock_timeout);
+            let value = defaults.read_value(spec);
+            self.settings.assign_value(spec, value.clone());
+            if !local {
+                self.settings_on_commit
+                    .as_mut()
+                    .expect("SET runs in a transaction")
+                    .assign_value(spec, value);
+            }
+        } else {
+            let value = if matches!(spec.kind, SettingType::SearchPath) {
+                if values.is_empty() {
+                    return Err(create_invalid_setting_error(spec.name));
+                }
+                SettingValue::SearchPath(
+                    values
+                        .iter()
+                        .map(|expr| parse_setting_text(expr, true))
+                        .collect::<Result<Vec<_>>>()?,
+                )
+            } else {
+                if values.len() != 1 {
+                    return Err(PgError::create(
+                        SqlState::InvalidParameterValue,
+                        "SET requires a single value",
+                    ));
+                }
+                parse_setting_value(spec, &parse_setting_text(&values[0], false)?)?
+            };
+            self.settings.assign_value(spec, value.clone());
+            if !local {
+                self.settings_on_commit
+                    .as_mut()
+                    .expect("SET runs in a transaction")
+                    .assign_value(spec, value);
+            }
         }
-        Ok(None)
+        Ok(Some(StatementResult::Affected(0)))
+    }
+
+    fn reset_setting(&mut self, spec: &SettingSpec, defaults: &SessionSettings) {
+        let value = defaults.read_value(spec);
+        self.settings.assign_value(spec, value.clone());
+        self.settings_on_commit
+            .as_mut()
+            .expect("RESET runs in a transaction")
+            .assign_value(spec, value);
     }
 
     pub(super) fn capture_settings(&self) -> SessionSettings {
-        SessionSettings {
-            default_isolation: self.default_isolation,
-            lock_timeout: self.lock_timeout,
-            statement_timeout: self.statement_timeout,
-            timezone: self.timezone.clone(),
-            search_path: self.search_path.clone(),
+        self.settings.clone()
+    }
+    pub(super) fn restore_settings(&mut self, settings: SessionSettings) {
+        self.settings = settings;
+    }
+}
+
+impl SessionSettings {
+    fn read_value(&self, spec: &SettingSpec) -> SettingValue {
+        match spec.effect {
+            SettingEffect::TimeZone => SettingValue::Text(self.timezone.clone()),
+            SettingEffect::LockTimeout => {
+                SettingValue::Integer(self.lock_timeout.as_millis() as i64)
+            }
+            SettingEffect::StatementTimeout => {
+                SettingValue::Integer(self.statement_timeout.as_millis() as i64)
+            }
+            SettingEffect::Isolation => SettingValue::Isolation(self.default_isolation),
+            SettingEffect::SearchPath => SettingValue::SearchPath(self.search_path.clone()),
+            SettingEffect::Compatibility | SettingEffect::Planner => self
+                .values
+                .get(spec.name)
+                .expect("registered value exists")
+                .clone(),
         }
     }
-
-    pub(super) fn restore_settings(&mut self, settings: SessionSettings) {
-        self.default_isolation = settings.default_isolation;
-        self.lock_timeout = settings.lock_timeout;
-        self.statement_timeout = settings.statement_timeout;
-        self.timezone = settings.timezone;
-        self.search_path = settings.search_path;
-    }
 }
 
-fn parse_search_path_entry(expression: &ast::Expr) -> Result<String> {
+fn normalize_setting_name(name: &ast::ObjectName) -> Result<String> {
+    name.0
+        .iter()
+        .map(|part| {
+            part.as_ident()
+                .map(|ident| ident.value.clone())
+                .ok_or_else(|| PgError::create(SqlState::SyntaxError, "invalid setting name"))
+        })
+        .collect::<Result<Vec<_>>>()
+        .map(|parts| parts.join("."))
+}
+
+fn parse_setting_text(expression: &ast::Expr, identifier: bool) -> Result<String> {
     match expression {
-        ast::Expr::Identifier(identifier) => Ok(crate::executor::normalize_identifier(identifier)),
+        ast::Expr::Identifier(ident) => Ok(if identifier {
+            crate::executor::normalize_identifier(ident)
+        } else {
+            ident.value.clone()
+        }),
         ast::Expr::Value(value) => match &value.value {
-            ast::Value::SingleQuotedString(value) | ast::Value::DoubleQuotedString(value) => {
-                Ok(value.clone())
-            }
-            _ => Err(PgError::create(
-                SqlState::SyntaxError,
-                "invalid search_path",
-            )),
+            ast::Value::SingleQuotedString(value)
+            | ast::Value::EscapedStringLiteral(value)
+            | ast::Value::NationalStringLiteral(value)
+            | ast::Value::DoubleQuotedString(value)
+            | ast::Value::Number(value, _) => Ok(value.clone()),
+            ast::Value::Boolean(value) => Ok(value.to_string()),
+            ast::Value::DollarQuotedString(value) => Ok(value.value.clone()),
+            _ => Err(PgError::create(SqlState::SyntaxError, "invalid SET value")),
         },
-        _ => Err(PgError::create(
-            SqlState::SyntaxError,
-            "invalid search_path",
+        ast::Expr::Interval(_) => Err(PgError::create(
+            SqlState::FeatureNotSupported,
+            "interval-valued settings are not implemented",
         )),
+        ast::Expr::UnaryOp {
+            op: ast::UnaryOperator::Minus,
+            expr,
+        } => Ok(format!("-{}", parse_setting_text(expr, false)?)),
+        ast::Expr::UnaryOp {
+            op: ast::UnaryOperator::Plus,
+            expr,
+        } => parse_setting_text(expr, false),
+        _ => Err(PgError::create(SqlState::SyntaxError, "invalid SET value")),
     }
 }
 
-#[cfg_attr(feature = "execution-log", tracing::instrument(skip_all))]
-fn create_invalid_timeout_error(parameter: &str) -> PgError {
+fn create_invalid_setting_error(name: &str) -> PgError {
     PgError::create(
         SqlState::InvalidParameterValue,
-        format!("invalid value for parameter {parameter}"),
+        format!("invalid value for parameter {name}"),
     )
 }
 
-#[cfg_attr(feature = "execution-log", tracing::instrument(skip_all))]
-fn parse_timeout(expression: &ast::Expr, parameter: &str) -> Result<Duration> {
-    let text = match expression {
-        ast::Expr::Value(value) => match &value.value {
-            ast::Value::Number(value, _) => value.as_str(),
-            ast::Value::SingleQuotedString(value) => value.trim(),
-            _ => return Err(create_invalid_timeout_error(parameter)),
+fn parse_setting_value(spec: &SettingSpec, text: &str) -> Result<SettingValue> {
+    let invalid = || create_invalid_setting_error(spec.name);
+    match spec.kind {
+        SettingType::Timeout => parse_timeout(text, spec.name)
+            .map(|value| SettingValue::Integer(value.as_millis() as i64)),
+        SettingType::TimeZone => {
+            if let Some(zone) = chrono_tz::TZ_VARIANTS
+                .iter()
+                .find(|zone| zone.name().eq_ignore_ascii_case(text))
+            {
+                return Ok(SettingValue::Text(zone.name().into()));
+            }
+            if (text.starts_with(['+', '-']) && text.contains(':'))
+                || text.to_ascii_uppercase().starts_with("UTC")
+                || text.to_ascii_uppercase().starts_with("GMT")
+            {
+                crate::coercion::time_zones::parse_zone(text).map_err(|_| invalid())?;
+                return Ok(SettingValue::Text(text.into()));
+            }
+            if let Ok(hours) = text.parse::<f64>() {
+                if !hours.is_finite() || hours.abs() >= 168.0 {
+                    return Err(invalid());
+                }
+                let seconds = (hours * 3600.0) as i32;
+                let sign = if seconds < 0 { '-' } else { '+' };
+                let inverse = if seconds < 0 { '+' } else { '-' };
+                let seconds = seconds.abs();
+                let mut offset = format!("{:02}", seconds / 3600);
+                if seconds % 3600 != 0 {
+                    offset.push_str(&format!(":{:02}", (seconds / 60) % 60));
+                }
+                if seconds % 60 != 0 {
+                    offset.push_str(&format!(":{:02}", seconds % 60));
+                }
+                return Ok(SettingValue::Text(format!(
+                    "<{sign}{offset}>{inverse}{offset}"
+                )));
+            }
+            Err(invalid())
+        }
+        SettingType::Isolation => match text.to_ascii_lowercase().as_str() {
+            "read committed" => Ok(SettingValue::Isolation(IsolationLevel::ReadCommitted)),
+            "repeatable read" => Ok(SettingValue::Isolation(IsolationLevel::RepeatableRead)),
+            "read uncommitted" | "serializable" => Err(PgError::create(
+                SqlState::FeatureNotSupported,
+                "isolation level is not implemented",
+            )),
+            _ => Err(invalid()),
         },
-        _ => return Err(create_invalid_timeout_error(parameter)),
+        SettingType::Encoding => {
+            let name = text
+                .chars()
+                .filter(|ch| ch.is_ascii_alphanumeric())
+                .collect::<String>()
+                .to_ascii_uppercase();
+            if matches!(name.as_str(), "UTF8" | "UNICODE") {
+                Ok(SettingValue::Text("UTF8".into()))
+            } else if matches!(
+                name.as_str(),
+                "SQLASCII" | "LATIN1" | "LATIN2" | "WIN1252" | "EUCJP" | "SJIS" | "GBK" | "BIG5"
+            ) {
+                Err(PgError::create(
+                    SqlState::FeatureNotSupported,
+                    "only UTF8 client encoding is supported",
+                ))
+            } else {
+                Err(invalid())
+            }
+        }
+        SettingType::ApplicationName => {
+            let mut end = text.len().min(63);
+            while !text.is_char_boundary(end) {
+                end -= 1;
+            }
+            let text = text.as_bytes()[..end]
+                .iter()
+                .map(|byte| {
+                    if (32..=126).contains(byte) {
+                        (*byte as char).to_string()
+                    } else {
+                        format!("\\x{byte:02x}")
+                    }
+                })
+                .collect::<String>();
+            Ok(SettingValue::Text(text))
+        }
+        SettingType::Boolean => {
+            let text = text.to_ascii_lowercase();
+            if text == "1" {
+                return Ok(SettingValue::Boolean(true));
+            }
+            if text == "0" {
+                return Ok(SettingValue::Boolean(false));
+            }
+            let matches = [
+                ("true", true),
+                ("false", false),
+                ("yes", true),
+                ("no", false),
+                ("on", true),
+                ("off", false),
+            ]
+            .into_iter()
+            .filter(|(name, _)| !text.is_empty() && name.starts_with(&text))
+            .collect::<Vec<_>>();
+            if matches.len() == 1 {
+                Ok(SettingValue::Boolean(matches[0].1))
+            } else {
+                Err(invalid())
+            }
+        }
+        SettingType::Integer { min, max, unit } => {
+            let text = text.trim();
+            let (base, units): (f64, &[(f64, &str)]) = match unit {
+                MemoryUnit::None => (1.0, &[]),
+                MemoryUnit::Kilobytes => (
+                    1024.0,
+                    &[
+                        (1099511627776.0, "TB"),
+                        (1073741824.0, "GB"),
+                        (1048576.0, "MB"),
+                        (1024.0, "kB"),
+                        (1.0, "B"),
+                    ],
+                ),
+                MemoryUnit::Blocks => (
+                    8192.0,
+                    &[
+                        (1099511627776.0, "TB"),
+                        (1073741824.0, "GB"),
+                        (1048576.0, "MB"),
+                        (1024.0, "kB"),
+                        (1.0, "B"),
+                    ],
+                ),
+            };
+            let unsigned = text.strip_prefix(['+', '-']).unwrap_or(text);
+            let hexadecimal = unsigned
+                .strip_prefix("0x")
+                .or_else(|| unsigned.strip_prefix("0X"));
+            let is_hex_without_unit = hexadecimal
+                .is_some_and(|digits| digits.bytes().all(|digit| digit.is_ascii_hexdigit()));
+            let (number, multiplier, next) = units
+                .iter()
+                .enumerate()
+                .filter(|_| !is_hex_without_unit)
+                .find_map(|(index, (size, suffix))| {
+                    text.strip_suffix(suffix).map(|number| {
+                        (
+                            number.trim(),
+                            *size / base,
+                            units.get(index + 1).map(|(size, _)| *size / base),
+                        )
+                    })
+                })
+                .unwrap_or((text, 1.0, None));
+            let value = parse_number(number).ok_or_else(invalid)? * multiplier;
+            let value = next
+                .map_or(value, |next| (value / next).round_ties_even() * next)
+                .round_ties_even();
+            if !value.is_finite() || value < min as f64 || value > max as f64 {
+                return Err(invalid());
+            }
+            Ok(SettingValue::Integer(value as i64))
+        }
+        SettingType::Real { min } => {
+            let value = text.trim().parse::<f64>().map_err(|_| invalid())?;
+            if !value.is_finite() || value < min {
+                return Err(invalid());
+            }
+            Ok(SettingValue::Real(value))
+        }
+        SettingType::PlanCacheMode => {
+            let value = text.to_ascii_lowercase();
+            if ["auto", "force_generic_plan", "force_custom_plan"].contains(&value.as_str()) {
+                Ok(SettingValue::Text(value))
+            } else {
+                Err(invalid())
+            }
+        }
+        SettingType::Text => Ok(SettingValue::Text(text.into())),
+        SettingType::SearchPath => {
+            unreachable!("search path is parsed from its SQL identifier list")
+        }
+    }
+}
+
+fn format_units(value: i64, units: &[(i64, &str)]) -> String {
+    if value == 0 {
+        return "0".into();
+    }
+    let (size, suffix) = units
+        .iter()
+        .find(|(size, _)| value % size == 0)
+        .expect("unit list includes base unit");
+    format!("{}{suffix}", value / size)
+}
+
+fn parse_number(text: &str) -> Option<f64> {
+    let digits = text.strip_prefix(['+', '-']).unwrap_or(text);
+    let (digits, radix) = if let Some(hex) = digits
+        .strip_prefix("0x")
+        .or_else(|| digits.strip_prefix("0X"))
+    {
+        (hex, 16)
+    } else if digits.len() > 1 && digits.starts_with('0') {
+        (digits, 8)
+    } else {
+        (digits, 10)
     };
+    if digits.chars().all(|ch| ch.is_digit(radix)) {
+        u64::from_str_radix(digits, radix)
+            .ok()
+            .map(|number| number as f64 * if text.starts_with('-') { -1.0 } else { 1.0 })
+    } else if radix != 16 && digits.contains(['.', 'e', 'E']) {
+        text.parse::<f64>().ok()
+    } else {
+        None
+    }
+}
+
+fn parse_timeout(text: &str, parameter: &str) -> Result<Duration> {
     let text = text.trim();
     let unsigned = text
         .strip_prefix('-')
@@ -263,7 +670,7 @@ fn parse_timeout(expression: &ast::Expr, parameter: &str) -> Result<Duration> {
         Some("s") => (1_000.0, Some(1.0)),
         Some("ms") => (1.0, Some(0.001)),
         Some("us") => (0.001, None),
-        Some(_) => return Err(create_invalid_timeout_error(parameter)),
+        Some(_) => return Err(create_invalid_setting_error(parameter)),
         None => (1.0, None),
     };
     let value = value.trim();
@@ -314,70 +721,29 @@ fn parse_timeout(expression: &ast::Expr, parameter: &str) -> Result<Duration> {
                 .round_ties_even()
         })
         .filter(|milliseconds| *milliseconds >= 0.0 && *milliseconds <= i32::MAX as f64)
-        .ok_or_else(|| create_invalid_timeout_error(parameter))?;
+        .ok_or_else(|| create_invalid_setting_error(parameter))?;
     Ok(Duration::from_millis(milliseconds as u64))
 }
 
-#[cfg_attr(feature = "execution-log", tracing::instrument(skip_all))]
-fn parse_timezone(expression: &ast::Expr) -> Result<String> {
-    let value = match expression {
-        ast::Expr::Value(value) => {
-            let ast::Value::SingleQuotedString(value) = &value.value else {
-                return Err(PgError::create(
-                    SqlState::InvalidParameterValue,
-                    "invalid value for parameter TimeZone",
-                ));
-            };
-            value
-        }
-        ast::Expr::Identifier(ast::Ident { value, .. }) => value,
-        _ => {
-            return Err(PgError::create(
-                SqlState::InvalidParameterValue,
-                "invalid value for parameter TimeZone",
-            ));
-        }
-    };
-    // UTC and numeric offsets are accepted here. Named-zone interpretation is
-    // intentionally validated by the timestamp input layer when it is used.
-    if value.eq_ignore_ascii_case("utc") || value.parse::<chrono::FixedOffset>().is_ok() {
-        Ok(value.to_string())
-    } else {
-        Err(PgError::create(
-            SqlState::InvalidParameterValue,
-            "invalid value for parameter TimeZone",
-        ))
-    }
+fn is_quoted_keyword(name: &str) -> bool {
+    "all analyse analyze and any array as asc asymmetric authorization between bigint binary bit boolean both case cast char character check coalesce collate collation column concurrently constraint create cross current_catalog current_date current_role current_schema current_time current_timestamp current_user dec decimal default deferrable desc distinct do else end except exists extract false fetch float for foreign freeze from full grant greatest group grouping having ilike in initially inner inout int integer intersect interval into is isnull join json json_array json_arrayagg json_exists json_object json_objectagg json_query json_scalar json_serialize json_table json_value lateral leading least left like limit localtime localtimestamp merge_action national natural nchar none normalize not notnull null nullif numeric offset on only or order out outer overlaps overlay placing position precision primary real references returning right row select session_user setof similar smallint some substring symmetric system_user table tablesample then time timestamp to trailing treat trim true union unique user using values varchar variadic verbose when where window with xmlattributes xmlconcat xmlelement xmlexists xmlforest xmlnamespaces xmlparse xmlpi xmlroot xmlserialize xmltable".split_whitespace().any(|keyword| keyword == name)
 }
 
-#[cfg_attr(feature = "execution-log", tracing::instrument(skip_all))]
-fn is_tolerated_planner_setting(variable: &ast::ObjectName) -> bool {
-    let variable = variable.to_string().to_ascii_lowercase();
-    matches!(
-        variable.as_str(),
-        "work_mem"
-            | "effective_cache_size"
-            | "random_page_cost"
-            | "seq_page_cost"
-            | "cpu_tuple_cost"
-            | "cpu_index_tuple_cost"
-            | "cpu_operator_cost"
-            | "parallel_setup_cost"
-            | "parallel_tuple_cost"
-            | "min_parallel_table_scan_size"
-            | "min_parallel_index_scan_size"
-            | "join_collapse_limit"
-            | "from_collapse_limit"
-            | "plan_cache_mode"
-            | "geqo"
-    ) || variable.starts_with("enable_")
-        || variable.starts_with("jit_")
-}
-
-#[cfg_attr(feature = "execution-log", tracing::instrument(skip_all))]
-fn is_tolerated_planner_reset(reset: &ast::Reset) -> bool {
-    match reset {
-        ast::Reset::ALL | ast::Reset::SessionAuthorization => false,
-        ast::Reset::ConfigurationParameter(variable) => is_tolerated_planner_setting(variable),
+fn resolve_show_setting(variable: &[ast::Ident]) -> Result<&'static SettingSpec> {
+    let name = variable
+        .iter()
+        .map(|ident| ident.value.as_str())
+        .collect::<Vec<_>>()
+        .join(" ");
+    if variable.len() > 1
+        && variable.iter().all(|ident| ident.quote_style.is_none())
+        && let Some(spec) = list_settings().iter().find(|spec| {
+            spec.aliases
+                .iter()
+                .any(|alias| alias.eq_ignore_ascii_case(&name))
+        })
+    {
+        return Ok(spec);
     }
+    resolve_setting(&name)
 }

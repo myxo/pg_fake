@@ -95,6 +95,33 @@ impl CatalogHistory {
         }
     }
 
+    pub(crate) fn collect_temporary_schema_ids(&self) -> std::collections::BTreeSet<SchemaId> {
+        self.tables
+            .values()
+            .flatten()
+            .map(|version| version.value.schema_id)
+            .chain(
+                self.sequences
+                    .values()
+                    .flatten()
+                    .map(|version| version.value.schema_id),
+            )
+            .chain(
+                self.views
+                    .values()
+                    .flatten()
+                    .map(|version| version.value.schema_id),
+            )
+            .chain(
+                self.functions
+                    .values()
+                    .flatten()
+                    .map(|version| version.value.schema_id),
+            )
+            .filter(|id| !self.schemas.contains_key(id))
+            .collect()
+    }
+
     pub(crate) fn create_temporary_schema_id(&mut self) -> SchemaId {
         self.generation += 1;
         let id = SchemaId(self.next_schema_id);

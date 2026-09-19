@@ -1,0 +1,478 @@
+use pg_fake::{Db, error::SqlState, value::Value};
+use pg_fake_sqlx::PgFakeConnection;
+use sqlx::{Column, Connection, Executor, TypeInfo};
+use sqlx_postgres::{PgConnectOptions, PgConnection};
+use std::{str::FromStr, time::Duration};
+
+mod common;
+#[path = "common/differential.rs"]
+mod differential;
+use differential::{RowOrder, assert_statement, assert_statement_allow_error};
+
+#[test]
+fn compare_registered_settings_with_postgres() {
+    let server = differential::start_isolated_postgres_server();
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap();
+    let options = PgConnectOptions::from_str(&server.url)
+        .unwrap()
+        .application_name("")
+        .options([("lock_timeout", "1000"), ("timezone", "UTC")]);
+    let mut postgres = runtime
+        .block_on(PgConnection::connect_with(&options))
+        .unwrap();
+    let mut fake = PgFakeConnection::new(Db::create());
+    for (name, values) in [
+        (
+            "lock_timeout",
+            vec![
+                "'1s'",
+                "'1.5min'",
+                "'0.5ms'",
+                "'1.0001min'",
+                "'0x1e'",
+                "2147483647",
+                "0",
+            ],
+        ),
+        ("statement_timeout", vec!["'30min'", "'1.5s'", "0"]),
+        (
+            "TimeZone",
+            vec![
+                "'utc'",
+                "'europe/paris'",
+                "'+03:00'",
+                "3.5",
+                "-7",
+                "24",
+                "100",
+                "167.9999",
+                "3.0001",
+                "'America/New_York'",
+                "'UTC+3'",
+            ],
+        ),
+        (
+            "default_transaction_isolation",
+            vec!["'REPEATABLE READ'", "'read committed'"],
+        ),
+        (
+            "search_path",
+            vec![
+                "public",
+                "'a,b'",
+                "'UPPER'",
+                "'select'",
+                "\"UPPER\", '$user', ''",
+                "'\"a,b\", public'",
+                "pg_temp, public",
+            ],
+        ),
+        (
+            "application_name",
+            vec![
+                "'pg_fake tests'",
+                "E'worker\\tname'",
+                "$$dollar quoted$$",
+                "'héllo'",
+                "''",
+                "true",
+                "123",
+            ],
+        ),
+        ("client_encoding", vec!["'UTF-8'", "unicode", "'uTf8'"]),
+        (
+            "work_mem",
+            vec![
+                "64",
+                "'1.5MB'",
+                "'0100'",
+                "'0x100'",
+                "'0x100B'",
+                "'2GB'",
+                "'1.0005GB'",
+                "'1025kB'",
+            ],
+        ),
+        ("effective_cache_size", vec!["'1GB'", "'100kB'", "'8192B'"]),
+        ("min_parallel_table_scan_size", vec!["0", "'8MB'"]),
+        ("min_parallel_index_scan_size", vec!["0", "'1MB'"]),
+        ("random_page_cost", vec!["0", "1.25", "'2e1'"]),
+        ("seq_page_cost", vec!["0.5"]),
+        ("cpu_tuple_cost", vec!["0.02"]),
+        ("cpu_index_tuple_cost", vec!["0.01"]),
+        ("cpu_operator_cost", vec!["0.005"]),
+        ("parallel_setup_cost", vec!["100"]),
+        ("parallel_tuple_cost", vec!["0.2"]),
+        ("join_collapse_limit", vec!["1", "'0x10'"]),
+        ("from_collapse_limit", vec!["12"]),
+        (
+            "plan_cache_mode",
+            vec!["force_generic_plan", "'FORCE_CUSTOM_PLAN'", "auto"],
+        ),
+        ("geqo", vec!["off", "'yes'", "'n'", "'of'", "1"]),
+        ("enable_hashjoin", vec!["'t'", "false", "0", "'ON'"]),
+        ("enable_partitionwise_join", vec!["true"]),
+        ("jit_above_cost", vec!["-1", "1.5"]),
+        ("jit_inline_above_cost", vec!["0"]),
+        ("jit_optimize_above_cost", vec!["123"]),
+        ("jit_expressions", vec!["off"]),
+        ("jit_tuple_deforming", vec!["off"]),
+    ] {
+        for value in values {
+            assert_statement(
+                &runtime,
+                &mut postgres,
+                &mut fake,
+                &format!("SET SESSION \"{name}\" = {value}"),
+                RowOrder::Unordered,
+            );
+            assert_statement(
+                &runtime,
+                &mut postgres,
+                &mut fake,
+                &format!("SHOW \"{name}\""),
+                RowOrder::Ordered,
+            );
+        }
+        for sql in [
+            format!("RESET \"{name}\""),
+            format!("SHOW \"{name}\""),
+            format!("SET \"{name}\" TO DEFAULT"),
+            format!("SHOW \"{name}\""),
+        ] {
+            assert_statement(&runtime, &mut postgres, &mut fake, &sql, RowOrder::Ordered);
+        }
+    }
+    for sql in [
+        "SET TIME ZONE 'Europe/Paris'",
+        "SHOW TIME ZONE",
+        "SET SCHEMA 'public'",
+        "SHOW search_path",
+        "SET NAMES 'unicode'",
+        "SHOW client_encoding",
+        "SET NAMES DEFAULT",
+        "RESET TIME ZONE",
+        "SHOW TIME ZONE",
+        "SET application_name = 'changed'",
+        "SET enable_seqscan = off",
+        "RESET ALL",
+        "SHOW application_name",
+        "SHOW enable_seqscan",
+        "SHOW lock_timeout",
+        "SHOW search_path",
+    ] {
+        assert_statement(&runtime, &mut postgres, &mut fake, sql, RowOrder::Ordered);
+    }
+    for sql in [
+        "SET lock_timeout = '-1'",
+        "SET lock_timeout = '2147483648'",
+        "SET lock_timeout = '2fortnights'",
+        "SET work_mem = '1mb'",
+        "SET work_mem = '10'",
+        "SET work_mem = 'NaN'",
+        "SET enable_hashjoin = 'o'",
+        "SET enable_hashjoin = 'nope'",
+        "SET random_page_cost = '-1'",
+        "SET plan_cache_mode = nonsense",
+        "SET default_transaction_isolation = 'nonsense'",
+        "SET timezone = 'not/a/zone'",
+        "SET client_encoding = 'nonsense'",
+        "SET enable_nonexistent = on",
+        "SHOW nonexistent",
+        "SHOW \"time zone\"",
+        "SET \"time zone\" = 'UTC'",
+        "RESET nonexistent",
+        "SET jit_provider = 'foo'",
+        "RESET jit_debugging_support",
+    ] {
+        assert_statement_allow_error(&runtime, &mut postgres, &mut fake, sql, RowOrder::Ordered);
+    }
+}
+
+#[test]
+fn compare_transactional_settings_and_prepared_metadata() {
+    let server = differential::start_isolated_postgres_server();
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap();
+    let mut postgres = runtime
+        .block_on(PgConnection::connect(&server.url))
+        .unwrap();
+    let mut fake = PgFakeConnection::new(Db::create());
+    for sql in [
+        "SET application_name = 'base'",
+        "BEGIN",
+        "SET application_name = 'committed'",
+        "SAVEPOINT first",
+        "SET application_name = 'discarded'",
+        "SET LOCAL work_mem = '8MB'",
+        "ROLLBACK TO first",
+        "SHOW application_name",
+        "COMMIT",
+        "SHOW application_name",
+        "BEGIN",
+        "RESET application_name",
+        "SHOW application_name",
+        "ROLLBACK",
+        "SHOW application_name",
+        "BEGIN",
+        "SET LOCAL application_name = 'local'",
+        "SHOW application_name",
+        "COMMIT",
+        "SHOW application_name",
+        "SET timezone = 'America/New_York'",
+        "SELECT TIMESTAMP '2024-01-01 12:00'::timestamptz AT TIME ZONE 'UTC'",
+        "SET timezone = 'CET'",
+        "SELECT to_char(TIMESTAMPTZ '2024-07-01 12:00:00+00', 'YYYY-MM-DD HH24:MI')",
+        "SELECT date_trunc('day', TIMESTAMPTZ '2024-07-01 12:00:00+00') AT TIME ZONE 'UTC'",
+        "SET timezone = 'Europe/Paris'",
+        "SELECT TIMESTAMP '2024-07-01 12:00'::timestamptz AT TIME ZONE 'UTC'",
+    ] {
+        assert_statement(&runtime, &mut postgres, &mut fake, sql, RowOrder::Ordered);
+    }
+    runtime.block_on(async {
+        for sql in [
+            "SHOW TIME ZONE",
+            "SHOW search_path",
+            "SHOW application_name",
+            "SHOW lock_timeout",
+        ] {
+            let expected = postgres.describe(sql).await.unwrap();
+            let actual = fake.describe(sql).await.unwrap();
+            assert_eq!(actual.columns().len(), expected.columns().len());
+            for (actual, expected) in actual.columns().iter().zip(expected.columns()) {
+                assert_eq!(actual.name(), expected.name());
+                assert_eq!(actual.type_info().name(), expected.type_info().name());
+            }
+        }
+        for zone in ["UTC", "America/New_York", "Europe/Paris"] {
+            let sql = format!("SET timezone = '{zone}'");
+            sqlx::raw_sql(&sql).execute(&mut postgres).await.unwrap();
+            sqlx::raw_sql(&sql).execute(&mut fake).await.unwrap();
+            let expected: String = sqlx::query_scalar("SHOW TIME ZONE")
+                .fetch_one(&mut postgres)
+                .await
+                .unwrap();
+            let actual: String = sqlx::query_scalar("SHOW TIME ZONE")
+                .fetch_one(&mut fake)
+                .await
+                .unwrap();
+            assert_eq!(actual, expected);
+            let sql = "SELECT CAST($1 AS timestamp)::timestamptz";
+            let expected: chrono::DateTime<chrono::Utc> = sqlx::query_scalar(sql)
+                .bind(
+                    chrono::NaiveDate::from_ymd_opt(2024, 7, 1)
+                        .unwrap()
+                        .and_hms_opt(12, 0, 0)
+                        .unwrap(),
+                )
+                .fetch_one(&mut postgres)
+                .await
+                .unwrap();
+            let actual: chrono::DateTime<chrono::Utc> = sqlx::query_scalar(sql)
+                .bind(
+                    chrono::NaiveDate::from_ymd_opt(2024, 7, 1)
+                        .unwrap()
+                        .and_hms_opt(12, 0, 0)
+                        .unwrap(),
+                )
+                .fetch_one(&mut fake)
+                .await
+                .unwrap();
+            assert_eq!(actual, expected);
+        }
+    });
+}
+
+#[test]
+fn preserve_session_isolation_snapshot_defaults_and_strict_policy() {
+    let db = Db::create_builder()
+        .set_lock_timeout(Duration::from_millis(42))
+        .build();
+    let mut first = db.create_session();
+    let mut second = db.create_session();
+    let show = first.prepare("SHOW application_name").unwrap();
+    first
+        .execute("SET application_name = 'first'; SET lock_timeout = '3s'; SET work_mem = '8MB'")
+        .unwrap();
+    assert_eq!(
+        first.query_prepared(&show, &[]).unwrap().rows,
+        vec![vec![Value::Text("first".into())]]
+    );
+    for session in [&mut second, &mut db.snapshot().create_session()] {
+        assert_eq!(
+            session.query("SHOW application_name", &[]).unwrap().rows,
+            vec![vec![Value::Text("".into())]]
+        );
+        assert_eq!(
+            session.query("SHOW lock_timeout", &[]).unwrap().rows,
+            vec![vec![Value::Text("42ms".into())]]
+        );
+        assert_eq!(
+            session.query("SHOW work_mem", &[]).unwrap().rows,
+            vec![vec![Value::Text("4MB".into())]]
+        );
+    }
+    first.execute("RESET ALL").unwrap();
+    assert_eq!(
+        first.query("SHOW lock_timeout", &[]).unwrap().rows,
+        vec![vec![Value::Text("42ms".into())]]
+    );
+    let mut strict = Db::create_builder()
+        .set_strict_mode_enabled(true)
+        .build()
+        .create_session();
+    for sql in [
+        "SET enable_seqscan = off",
+        "SHOW enable_seqscan",
+        "RESET enable_seqscan",
+    ] {
+        assert_eq!(
+            strict.execute(sql).unwrap_err().sqlstate,
+            SqlState::FeatureNotSupported
+        );
+    }
+    for sql in [
+        "SET enable_nonexistent = on",
+        "SHOW enable_nonexistent",
+        "RESET enable_nonexistent",
+    ] {
+        assert_eq!(
+            strict.execute(sql).unwrap_err().sqlstate,
+            SqlState::UndefinedObject
+        );
+    }
+    strict
+        .execute("SET application_name = 'strict'; SET client_encoding = 'UTF8'; RESET ALL")
+        .unwrap();
+    assert_eq!(
+        strict
+            .execute("SET client_encoding = 'LATIN1'")
+            .unwrap_err()
+            .sqlstate,
+        SqlState::FeatureNotSupported
+    );
+    assert_eq!(
+        strict
+            .execute("SET default_transaction_isolation = 'serializable'")
+            .unwrap_err()
+            .sqlstate,
+        SqlState::FeatureNotSupported
+    );
+}
+
+#[test]
+fn compare_prepared_literal_capture_and_search_path_rebinding() {
+    let server = differential::start_isolated_postgres_server();
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap();
+    runtime.block_on(async {
+        let mut postgres = PgConnection::connect(&server.url).await.unwrap();
+        let mut fake = PgFakeConnection::new(Db::create());
+        let sql = "SELECT '2024-07-01 12:00'::timestamptz";
+        for zone in ["UTC", "Europe/Paris", "CET"] {
+            let set = format!("SET timezone = '{zone}'");
+            sqlx::raw_sql(&set).execute(&mut postgres).await.unwrap();
+            sqlx::raw_sql(&set).execute(&mut fake).await.unwrap();
+            let expected: chrono::DateTime<chrono::Utc> = sqlx::query_scalar(sql)
+                .fetch_one(&mut postgres)
+                .await
+                .unwrap();
+            let actual: chrono::DateTime<chrono::Utc> =
+                sqlx::query_scalar(sql).fetch_one(&mut fake).await.unwrap();
+            assert_eq!(actual, expected, "cached literal under {zone}");
+        }
+        for sql in [
+            "CREATE TABLE public.items(id INT)",
+            "CREATE TEMP TABLE items(id INT)",
+            "INSERT INTO public.items VALUES(1)",
+            "INSERT INTO pg_temp.items VALUES(2)",
+        ] {
+            sqlx::raw_sql(sql).execute(&mut postgres).await.unwrap();
+            sqlx::raw_sql(sql).execute(&mut fake).await.unwrap();
+        }
+        for path in ["public, pg_temp", "pg_temp, public", "public, pg_temp"] {
+            let sql = format!("SET search_path = {path}");
+            sqlx::raw_sql(&sql).execute(&mut postgres).await.unwrap();
+            sqlx::raw_sql(&sql).execute(&mut fake).await.unwrap();
+            let expected: i32 = sqlx::query_scalar("SELECT id FROM items")
+                .fetch_one(&mut postgres)
+                .await
+                .unwrap();
+            let actual: i32 = sqlx::query_scalar("SELECT id FROM items")
+                .fetch_one(&mut fake)
+                .await
+                .unwrap();
+            assert_eq!(actual, expected);
+        }
+    });
+}
+
+#[test]
+fn compare_replanned_literals_and_aborted_error_precedence() {
+    let server = differential::start_isolated_postgres_server();
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap();
+    runtime.block_on(async {
+        let mut postgres = PgConnection::connect(&server.url).await.unwrap();
+        let mut fake = PgFakeConnection::new(Db::create());
+        let sql = "SELECT '2024-07-01 12:00'::timestamptz AT TIME ZONE 'UTC'";
+        for (zone, path) in [
+            ("UTC", "public"),
+            ("Europe/Paris", "pg_catalog"),
+            ("America/New_York", "pg_catalog"),
+            ("Europe/Paris", "public"),
+        ] {
+            let set = format!("SET timezone = '{zone}'; SET search_path = {path}");
+            sqlx::raw_sql(&set).execute(&mut postgres).await.unwrap();
+            sqlx::raw_sql(&set).execute(&mut fake).await.unwrap();
+            let expected: chrono::NaiveDateTime = sqlx::query_scalar(sql)
+                .fetch_one(&mut postgres)
+                .await
+                .unwrap();
+            let actual: chrono::NaiveDateTime =
+                sqlx::query_scalar(sql).fetch_one(&mut fake).await.unwrap();
+            assert_eq!(actual, expected, "{zone} / {path}");
+        }
+        for sql in [
+            "BEGIN",
+            "SELECT 1 / 0",
+            "SELECT 'bad'::timestamptz",
+            "ROLLBACK",
+        ] {
+            let expected = sqlx::query(sql)
+                .execute(&mut postgres)
+                .await
+                .map(|_| ())
+                .map_err(|error| {
+                    error
+                        .as_database_error()
+                        .unwrap()
+                        .code()
+                        .unwrap()
+                        .into_owned()
+                });
+            let actual = sqlx::query(sql)
+                .execute(&mut fake)
+                .await
+                .map(|_| ())
+                .map_err(|error| {
+                    error
+                        .as_database_error()
+                        .unwrap()
+                        .code()
+                        .unwrap()
+                        .into_owned()
+                });
+            assert_eq!(actual, expected, "{sql}");
+        }
+    });
+}

@@ -131,25 +131,28 @@ fn excludes_nested_writes_and_sequence_calls_from_cached_read_locks() {
 fn applies_and_restores_migration_local_timeouts() {
     let db = Db::create();
     let mut session = db.create_session();
-    assert_eq!(session.lock_timeout, Duration::from_secs(1));
-    assert_eq!(session.statement_timeout, Duration::ZERO);
+    assert_eq!(session.settings.lock_timeout, Duration::from_secs(1));
+    assert_eq!(session.settings.statement_timeout, Duration::ZERO);
 
     session.execute("BEGIN").unwrap();
     session.execute("SET LOCAL lock_timeout = '5s'").unwrap();
     session
         .execute("SET LOCAL statement_timeout = '30min'")
         .unwrap();
-    assert_eq!(session.lock_timeout, Duration::from_secs(5));
-    assert_eq!(session.statement_timeout, Duration::from_secs(30 * 60));
+    assert_eq!(session.settings.lock_timeout, Duration::from_secs(5));
+    assert_eq!(
+        session.settings.statement_timeout,
+        Duration::from_secs(30 * 60)
+    );
     session.execute("COMMIT").unwrap();
-    assert_eq!(session.lock_timeout, Duration::from_secs(1));
-    assert_eq!(session.statement_timeout, Duration::ZERO);
+    assert_eq!(session.settings.lock_timeout, Duration::from_secs(1));
+    assert_eq!(session.settings.statement_timeout, Duration::ZERO);
 
     session.execute("BEGIN").unwrap();
     session.execute("SET lock_timeout = '2s'").unwrap();
     session.execute("SET LOCAL lock_timeout = '20ms'").unwrap();
     session.execute("COMMIT").unwrap();
-    assert_eq!(session.lock_timeout, Duration::from_secs(2));
+    assert_eq!(session.settings.lock_timeout, Duration::from_secs(2));
 
     session.execute("BEGIN").unwrap();
     session.execute("SET lock_timeout = '3s'").unwrap();
@@ -157,42 +160,51 @@ fn applies_and_restores_migration_local_timeouts() {
         .execute("SET LOCAL statement_timeout = '10ms'")
         .unwrap();
     session.execute("ROLLBACK").unwrap();
-    assert_eq!(session.lock_timeout, Duration::from_secs(2));
-    assert_eq!(session.statement_timeout, Duration::ZERO);
+    assert_eq!(session.settings.lock_timeout, Duration::from_secs(2));
+    assert_eq!(session.settings.statement_timeout, Duration::ZERO);
 
     session.execute("BEGIN").unwrap();
     session
         .execute("SET LOCAL statement_timeout = '1us'")
         .unwrap();
-    assert_eq!(session.statement_timeout, Duration::ZERO);
+    assert_eq!(session.settings.statement_timeout, Duration::ZERO);
     session
         .execute("SET LOCAL statement_timeout = '1.5s'")
         .unwrap();
-    assert_eq!(session.statement_timeout, Duration::from_millis(1500));
+    assert_eq!(
+        session.settings.statement_timeout,
+        Duration::from_millis(1500)
+    );
     session
         .execute("SET LOCAL statement_timeout = '0.5ms'")
         .unwrap();
-    assert_eq!(session.statement_timeout, Duration::ZERO);
+    assert_eq!(session.settings.statement_timeout, Duration::ZERO);
     session
         .execute("SET LOCAL statement_timeout = '1.5'")
         .unwrap();
-    assert_eq!(session.statement_timeout, Duration::from_millis(2));
+    assert_eq!(session.settings.statement_timeout, Duration::from_millis(2));
     session
         .execute("SET LOCAL statement_timeout = '1.0001min'")
         .unwrap();
-    assert_eq!(session.statement_timeout, Duration::from_secs(60));
+    assert_eq!(session.settings.statement_timeout, Duration::from_secs(60));
     session
         .execute("SET LOCAL statement_timeout = '-0.5'")
         .unwrap();
-    assert_eq!(session.statement_timeout, Duration::ZERO);
+    assert_eq!(session.settings.statement_timeout, Duration::ZERO);
     session
         .execute("SET LOCAL statement_timeout = '0x1d'")
         .unwrap();
-    assert_eq!(session.statement_timeout, Duration::from_millis(29));
+    assert_eq!(
+        session.settings.statement_timeout,
+        Duration::from_millis(29)
+    );
     session
         .execute("SET LOCAL statement_timeout = '0x1e'")
         .unwrap();
-    assert_eq!(session.statement_timeout, Duration::from_millis(30));
+    assert_eq!(
+        session.settings.statement_timeout,
+        Duration::from_millis(30)
+    );
     session.execute("ROLLBACK").unwrap();
 
     session.execute("BEGIN").unwrap();
@@ -231,13 +243,8 @@ fn applies_and_restores_migration_local_timeouts() {
     );
     session.execute("ROLLBACK").unwrap();
 
-    assert_eq!(
-        session
-            .execute("SET statement_timeout = '1s'")
-            .unwrap_err()
-            .sqlstate,
-        SqlState::FeatureNotSupported
-    );
+    session.execute("SET statement_timeout = '1s'").unwrap();
+    assert_eq!(session.settings.statement_timeout, Duration::from_secs(1));
     assert_eq!(
         session
             .execute("BEGIN; SET LOCAL lock_timeout = '25d'")
@@ -247,7 +254,7 @@ fn applies_and_restores_migration_local_timeouts() {
     );
     session.execute("ROLLBACK").unwrap();
     session.execute("BEGIN").unwrap();
-    session.statement_timeout = Duration::from_nanos(1);
+    session.settings.statement_timeout = Duration::from_nanos(1);
     assert_eq!(
         session.execute("DO $$ BEGIN END; $$").unwrap_err().sqlstate,
         SqlState::QueryCanceled
@@ -476,7 +483,7 @@ fn interrupts_prepared_scans_at_the_statement_deadline() {
         .prepare("SELECT id / ($1 - id) FROM items WHERE id <= $1")
         .unwrap();
     session.execute("BEGIN").unwrap();
-    session.statement_timeout = Duration::from_nanos(1);
+    session.settings.statement_timeout = Duration::from_nanos(1);
     assert_eq!(
         session
             .query_prepared(&query, &[Value::Int4(1)])
@@ -492,7 +499,7 @@ fn applies_one_statement_deadline_to_a_do_block() {
     let db = Db::create();
     let mut session = db.create_session();
     session.execute("BEGIN").unwrap();
-    session.statement_timeout = Duration::from_nanos(1);
+    session.settings.statement_timeout = Duration::from_nanos(1);
     assert_eq!(
         session
             .execute(
@@ -1892,7 +1899,7 @@ fn execute_returns_each_multi_statement_result() {
 fn rolls_back_implicit_batches_at_first_error() {
     let db = Db::create();
     let mut session = db.create_session();
-    let original_timeout = session.lock_timeout;
+    let original_timeout = session.settings.lock_timeout;
     assert_eq!(
         session
             .execute(
@@ -1906,7 +1913,7 @@ fn rolls_back_implicit_batches_at_first_error() {
             .sqlstate,
         SqlState::InvalidTextRepresentation
     );
-    assert_eq!(session.lock_timeout, original_timeout);
+    assert_eq!(session.settings.lock_timeout, original_timeout);
     assert_eq!(
         session
             .query("SELECT * FROM discarded", &[])
@@ -6443,13 +6450,13 @@ fn controls_waits_with_builder_and_session_lock_timeouts() {
         .build();
     let mut first = db.create_session();
     let mut second = db.create_session();
-    assert_eq!(second.lock_timeout, Duration::from_millis(40));
+    assert_eq!(second.settings.lock_timeout, Duration::from_millis(40));
     second.execute("SET lock_timeout = 250").unwrap();
-    assert_eq!(second.lock_timeout, Duration::from_millis(250));
+    assert_eq!(second.settings.lock_timeout, Duration::from_millis(250));
     second.execute("SET lock_timeout = '2s'").unwrap();
-    assert_eq!(second.lock_timeout, Duration::from_secs(2));
+    assert_eq!(second.settings.lock_timeout, Duration::from_secs(2));
     second.execute("SET lock_timeout = '20ms'").unwrap();
-    assert_eq!(second.lock_timeout, Duration::from_millis(20));
+    assert_eq!(second.settings.lock_timeout, Duration::from_millis(20));
 
     first.execute("CREATE TABLE items (id INTEGER)").unwrap();
     first.execute("INSERT INTO items VALUES (1)").unwrap();
@@ -6466,7 +6473,7 @@ fn controls_waits_with_builder_and_session_lock_timeouts() {
     assert!(started.elapsed() >= Duration::from_millis(10));
     first.execute("ROLLBACK").unwrap();
     second.execute("SET lock_timeout = 0").unwrap();
-    assert_eq!(second.lock_timeout, Duration::ZERO);
+    assert_eq!(second.settings.lock_timeout, Duration::ZERO);
 }
 
 #[test]
@@ -9988,12 +9995,12 @@ fn restores_timeout_settings_and_prepared_recovery_at_savepoints() {
     let db = Db::create();
     let mut session = db.create_session();
     session.execute("BEGIN; SET LOCAL lock_timeout = '2s'; SAVEPOINT s; SET lock_timeout = '3s'; SET LOCAL statement_timeout = '4s'").unwrap();
-    assert_eq!(session.lock_timeout, Duration::from_secs(3));
-    assert_eq!(session.statement_timeout, Duration::from_secs(4));
+    assert_eq!(session.settings.lock_timeout, Duration::from_secs(3));
+    assert_eq!(session.settings.statement_timeout, Duration::from_secs(4));
     session.query("SELECT 1 / 0", &[]).unwrap_err();
     session.execute_params("ROLLBACK TO s", &[]).unwrap();
-    assert_eq!(session.lock_timeout, Duration::from_secs(2));
-    assert_eq!(session.statement_timeout, Duration::ZERO);
+    assert_eq!(session.settings.lock_timeout, Duration::from_secs(2));
+    assert_eq!(session.settings.statement_timeout, Duration::ZERO);
     session.execute("COMMIT").unwrap();
-    assert_eq!(session.lock_timeout, Duration::from_secs(1));
+    assert_eq!(session.settings.lock_timeout, Duration::from_secs(1));
 }

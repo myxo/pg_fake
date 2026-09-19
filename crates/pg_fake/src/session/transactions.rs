@@ -3,7 +3,7 @@ use sqlparser::ast;
 use crate::{
     catalog::TablePersistence,
     error::{PgError, Result, SqlState, reject_unsupported},
-    executor::{self, DatabaseState},
+    executor,
     txn::{Snapshot, Xid},
     value::Value,
 };
@@ -65,8 +65,8 @@ impl Session {
             ast::Statement::StartTransaction { modes, .. } => {
                 return match self.transaction {
                     None => {
-                        let isolation =
-                            parse_isolation_level(modes)?.unwrap_or(self.default_isolation);
+                        let isolation = parse_isolation_level(modes)?
+                            .unwrap_or(self.settings.default_isolation);
                         self.start_transaction(isolation, false);
                         Ok(Some(StatementResult::Affected(0)))
                     }
@@ -128,7 +128,7 @@ impl Session {
                     ));
                 };
                 if *session {
-                    self.default_isolation = isolation;
+                    self.settings.default_isolation = isolation;
                     self.settings_on_commit
                         .as_mut()
                         .expect("SET runs in a transaction")
@@ -178,7 +178,7 @@ impl Session {
 
     #[cfg_attr(feature = "execution-log", tracing::instrument(skip_all))]
     pub fn begin(&mut self) -> Result<Transaction<'_>> {
-        self.begin_with(self.default_isolation)
+        self.begin_with(self.settings.default_isolation)
     }
 
     #[cfg_attr(feature = "execution-log", tracing::instrument(skip_all))]
@@ -287,7 +287,7 @@ impl Session {
                 .relation_locks
                 .release_transaction_locks(transaction.xid);
             state.wait_for.remove_transaction(transaction.xid);
-            prune_database_versions(&mut state);
+            state.prune_versions();
             self.settings_undo = None;
             let settings = self
                 .settings_on_commit
@@ -311,7 +311,7 @@ impl Session {
             self.deferred_constraints.clear();
             self.defer_all_constraints = false;
             self.deferred_foreign_keys_dirty = false;
-            abort_database_transaction(&mut state, transaction.xid);
+            state.abort_transaction(transaction.xid);
             self.db.condvar.notify_all();
             return Err(error);
         }
@@ -331,7 +331,7 @@ impl Session {
                 state.mark_table_reclaimable(table_id);
             }
         }
-        prune_database_versions(&mut state);
+        state.prune_versions();
         state.row_locks.release_transaction_locks(transaction.xid);
         state
             .advisory_locks
@@ -391,7 +391,7 @@ impl Session {
         self.deferred_constraints.clear();
         self.defer_all_constraints = false;
         self.deferred_foreign_keys_dirty = false;
-        abort_database_transaction(&mut state, xid);
+        state.abort_transaction(xid);
         self.db.condvar.notify_all();
         Ok(())
     }
@@ -540,65 +540,4 @@ fn parse_isolation_level(modes: &[ast::TransactionMode]) -> Result<Option<Isolat
         }
     }
     Ok(isolation)
-}
-
-#[cfg_attr(feature = "execution-log", tracing::instrument(skip_all))]
-fn abort_database_transaction(state: &mut DatabaseState, xid: Xid) {
-    state.abort_sequence_resets(xid);
-    let reclaimed = state.catalog_history.discard_transaction(xid);
-    for table_id in reclaimed.tables {
-        state.tables.remove(&table_id);
-    }
-    let mut sequence_values = state
-        .sequence_values
-        .lock()
-        .expect("sequence storage is poisoned");
-    for sequence_id in reclaimed.sequences {
-        sequence_values.remove(&sequence_id);
-    }
-    drop(sequence_values);
-    state.transactions.abort(xid);
-    for table_id in state.take_touched_tables(xid) {
-        if let Some(table) = state.tables.get_mut(&table_id) {
-            table.discard_transaction_versions(xid);
-        }
-    }
-    prune_database_versions(state);
-    state.row_locks.release_transaction_locks(xid);
-    state
-        .advisory_locks
-        .lock()
-        .expect("advisory lock mutex is poisoned")
-        .release_transaction_locks(xid);
-    state.relation_locks.release_transaction_locks(xid);
-    state.wait_for.remove_transaction(xid);
-}
-
-#[cfg_attr(feature = "execution-log", tracing::instrument(skip_all))]
-fn prune_database_versions(state: &mut DatabaseState) {
-    let horizon = state.transactions.find_reclamation_horizon();
-    for table_id in state.collect_reclaimable_table_ids() {
-        let Some(table) = state.tables.get_mut(&table_id) else {
-            state.clear_table_reclaimable(table_id);
-            continue;
-        };
-        table.prune_versions(horizon, &state.transactions);
-        if !table.has_reclaimable_versions() {
-            state.clear_table_reclaimable(table_id);
-        }
-    }
-    let protected_tables = state.collect_touched_tables();
-    let reclaimed = state
-        .catalog_history
-        .prune(horizon, &state.transactions, &protected_tables);
-    for table_id in reclaimed.tables {
-        state.tables.remove(&table_id);
-    }
-    let mut sequence_values = state
-        .sequence_values
-        .lock()
-        .expect("sequence storage is poisoned");
-    for sequence_id in reclaimed.sequences {
-        sequence_values.remove(&sequence_id);
-    }
 }

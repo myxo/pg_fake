@@ -51,6 +51,57 @@ impl Db {
         }
     }
 
+    pub fn snapshot(&self) -> Self {
+        let source = self.state.lock().expect("database mutex is poisoned");
+        let mut state = source.clone();
+        state.sequence_values = Arc::new(Mutex::new(
+            source
+                .sequence_values
+                .lock()
+                .expect("sequence storage is poisoned")
+                .clone(),
+        ));
+        state.row_locks = Default::default();
+        state.relation_locks = Default::default();
+        state.wait_for = Default::default();
+        state.advisory_locks = Default::default();
+        for xid in state.transactions.collect_active_transactions() {
+            state.abort_transaction(xid);
+        }
+        for schema in state.catalog_history.collect_temporary_schema_ids() {
+            let reclaimed = state.catalog_history.drop_temporary_schema(schema);
+            for table in reclaimed.tables {
+                state.tables.remove(&table);
+            }
+            let mut sequences = state
+                .sequence_values
+                .lock()
+                .expect("sequence storage is poisoned");
+            for sequence in reclaimed.sequences {
+                sequences.remove(&sequence);
+            }
+        }
+        state.prune_versions();
+        state.load_catalog(
+            None,
+            crate::txn::Snapshot::create(&state.transactions),
+            None,
+        );
+        state.catalog.set_search_path(&["public".into()]);
+        Self {
+            state: Arc::new(Mutex::new(state)),
+            condvar: Arc::new(Condvar::new()),
+            default_lock_timeout: self.default_lock_timeout,
+            clock: Arc::new(Mutex::new(
+                *self.clock.lock().expect("clock mutex is poisoned"),
+            )),
+            rng: Arc::new(Mutex::new(
+                self.rng.lock().expect("RNG mutex is poisoned").clone(),
+            )),
+            strict: self.strict,
+        }
+    }
+
     #[cfg_attr(feature = "execution-log", tracing::instrument(skip_all))]
     pub fn create_session(&self) -> Session {
         Session::create(self.clone(), self.default_lock_timeout)
@@ -150,3 +201,6 @@ impl Default for Db {
         Self::create()
     }
 }
+
+#[cfg(test)]
+mod tests;

@@ -48,7 +48,7 @@ and scope boundaries. The completed Phase 2 plan is archived in
   `spec.md` §10. Optimization-only clauses may be tolerated only when ignoring
   them cannot change Tier-A behavior, and strict mode must still reject them.
 - Tasks 8 through 30 are the priority track and must finish before Tasks 31
-  onward. Task 32 is the first unfinished task. Task 24 retains its
+  onward. Task 33 is the first unfinished task. Task 24 retains its
   completed status from an earlier approved exception. Tasks 25, 26, 27, and
   29 have no dependency on later milestones and are placed immediately after
   it for expedited delivery; Task 28 depends on Task 27, and Task 30 gates the
@@ -1639,7 +1639,63 @@ the run does not replace the committed benchmark baseline.
   transactions.
 - The benchmark suite includes nested savepoint create/release and rollback.
 
-### Task 32 — Typed GUC registry and general `SET`/`SHOW`/`RESET`
+### Task 32 — Typed GUC registry and general `SET`/`SHOW`/`RESET` [COMPLETE]
+
+**Progress:** Complete; user approved committing the changes. Scope confirmed by the user: semantic `TimeZone`,
+`lock_timeout`, `statement_timeout`, `search_path`, and
+`default_transaction_isolation`; explicitly registered existing planner
+settings; `application_name` and UTF-8 `client_encoding` compatibility.
+GUC functions and expanded transaction-local behavior remain Task 33.
+The user also approved implementing the missing `Db::snapshot()` prerequisite
+here: committed data/catalog only, clean sessions, independent sequence/clock/RNG
+state, and no copied transaction or session locks.
+
+- [x] Implement the typed registry and shared SET/SHOW/RESET dispatch.
+- [x] Cover settings isolation, snapshots, prepared execution, and strict mode.
+- [x] Add differential/property coverage and representative settings/snapshot benchmarks.
+- [x] Run required checks and resolve independent review findings.
+- [x] Obtain user approval before marking Task 32 complete.
+
+The registry replaces prefix-based planner tolerance with named, typed entries;
+SHOW metadata and execution share canonical names. Prepared statements retain
+search-path reanalysis and capture explicit timestamptz literals at preparation,
+while session-dependent casts and formatting consult current settings.
+Independent review identified and verified fixes for aborted-state error
+precedence and stale prepared reanalysis. Subsequent review found no production
+issues and strengthened the committed-temporary-object snapshot fixture.
+
+`Db::snapshot()` clones committed data and catalog state, aborts copied in-flight
+work (including transactional sequence resets), removes temporary objects and
+locks, and detaches sequence storage, mock clock, and RNG. A native generated
+model checks source/fork independence; focused cases cover truncation, catalog
+rollback, locks, settings, mock time, and seeded UUID generation.
+
+The sqlparser grammar fixes for `SET SCHEMA` and `RESET TIME ZONE` are committed
+in the `myxo/datafusion-sqlparser-rs` fork. The workspace pins revision
+`a5131269ef597512d2afee9cc8799474426c9923`; the vendored copy was removed. Grammar tests
+live in the parser's PostgreSQL suite, with focused integration coverage in the
+core suite. Standalone parser tests and Clippy could not fetch uncached development
+dependencies (network proxy HTTP 403); the prescribed fuzz tool is not installed.
+An existing timestamptz-input limitation (omitted seconds before an explicit
+offset) is recorded in `known_bugs.md`; GUC fixtures use full timestamp inputs.
+
+**Benchmarks:** A short Criterion run (10 samples, one-second warmup and
+measurement, concurrent with validation) measured the five-command settings
+roundtrip at approximately 185 microseconds for `pg_fake` versus 2.06 milliseconds
+for PostgreSQL 18, and a 100-row database snapshot at approximately 36 microseconds.
+The approximately 11x settings speedup falls short of orders-of-magnitude gains.
+These noisy local measurements do not replace the committed benchmark baseline.
+
+**Validation:** Formatting and strict all-target/all-feature Clippy pass. The
+final all-feature workspace regression passed 528 checks, including settings,
+the PostgreSQL regression manifest, and the Task 30 application workload.
+All 24 SQL property suites passed with `CHAOS_THEORY_CHECK_ITERS=10000` and
+`CHAOS_THEORY_CHECK_TIME=600s` (1186.17 seconds); the three native snapshot tests
+also passed at that gate. A final timezone-infinity regression fix passed the
+workspace suite and a rerun of the generated runtime-expression gate. Independent
+review found no remaining issues. The corpus skip baseline now reaches the
+unsupported LATIN1 setting after successfully accepting UTF8. The temporary
+verification database was removed.
 
 **Goal:** Replace scattered session-variable handling with a typed registry for
 settings that affect supported behavior or driver compatibility.

@@ -481,6 +481,15 @@ impl WaitForGraph {
 }
 
 impl TransactionRegistry {
+    pub(crate) fn collect_active_transactions(&self) -> Vec<Xid> {
+        self.statuses
+            .iter()
+            .filter_map(|(xid, status)| {
+                matches!(status, TransactionStatus::InFlight).then_some(*xid)
+            })
+            .collect()
+    }
+
     #[cfg_attr(feature = "execution-log", tracing::instrument(skip_all))]
     pub(crate) fn create() -> Self {
         TransactionRegistry {

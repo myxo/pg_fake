@@ -29,7 +29,7 @@ impl Session {
             .strip_suffix(if deferred { " DEFERRED" } else { " IMMEDIATE" })
             .expect("suffix was checked");
         if self.transaction.is_none() {
-            self.start_transaction(self.default_isolation, true);
+            self.start_transaction(self.settings.default_isolation, true);
         }
         if matches!(
             self.transaction,

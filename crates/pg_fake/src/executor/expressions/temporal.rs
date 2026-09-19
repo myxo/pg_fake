@@ -1,4 +1,4 @@
-use crate::coercion::time_zones::{convert_local, convert_utc, parse_zone};
+use crate::coercion::time_zones::{Zone, convert_local, convert_utc, parse_session_zone};
 use crate::{
     error::{PgError, Result, SqlState, reject_unsupported},
     value::{PgTimestamp, PgTimestampTz, Value},
@@ -31,7 +31,7 @@ pub(super) fn convert_epoch(seconds: f64) -> Result<Value> {
     Ok(Value::TimestampTz(PgTimestampTz::Finite(value.and_utc())))
 }
 
-pub(super) fn truncate_timestamp(unit: &str, value: Value, zone: &str) -> Result<Value> {
+pub(super) fn truncate_timestamp(unit: &str, value: Value, zone: Zone) -> Result<Value> {
     let unit = unit.to_ascii_lowercase();
     let unit = match unit.as_str() {
         "microsecond" | "microseconds" => 0,
@@ -57,12 +57,10 @@ pub(super) fn truncate_timestamp(unit: &str, value: Value, zone: &str) -> Result
     let (timestamp, zone, original_offset) = match value {
         Value::Timestamp(PgTimestamp::Finite(timestamp)) => (timestamp, None, 0),
         Value::TimestampTz(PgTimestampTz::Finite(timestamp)) => {
-            let zone = parse_zone(zone)?;
             let (local, offset) = convert_utc(zone, timestamp)?;
             (local, Some(zone), offset)
         }
         Value::TimestampTz(_) => {
-            parse_zone(zone)?;
             return Ok(value);
         }
         _ => return Ok(value),
@@ -114,7 +112,9 @@ pub(super) fn truncate_timestamp(unit: &str, value: Value, zone: &str) -> Result
 pub(super) fn format_timestamp(value: &Value, format: &str, zone: &str) -> Result<Value> {
     let (timestamp, offset) = match value {
         Value::Timestamp(PgTimestamp::Finite(value)) => (*value, 0),
-        Value::TimestampTz(PgTimestampTz::Finite(value)) => convert_utc(parse_zone(zone)?, *value)?,
+        Value::TimestampTz(PgTimestampTz::Finite(value)) => {
+            convert_utc(parse_session_zone(zone)?, *value)?
+        }
         _ => return Ok(Value::Null),
     };
     if format.is_empty() {

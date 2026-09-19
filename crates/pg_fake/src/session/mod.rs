@@ -39,11 +39,8 @@ pub struct Session {
     temporary_schema_id: SchemaId,
     transaction: Option<SessionTransactionState>,
     savepoints: Vec<savepoints::Savepoint>,
-    default_isolation: IsolationLevel,
-    lock_timeout: Duration,
-    statement_timeout: Duration,
-    timezone: String,
-    search_path: Vec<String>,
+    settings: SessionSettings,
+    default_lock_timeout: Duration,
     settings_undo: Option<SessionSettings>,
     settings_on_commit: Option<SessionSettings>,
     deferred_constraints: BTreeSet<ConstraintId>,
@@ -65,11 +62,8 @@ impl Session {
             temporary_schema_id,
             transaction: None,
             savepoints: Vec::new(),
-            default_isolation: IsolationLevel::ReadCommitted,
-            lock_timeout,
-            statement_timeout: Duration::ZERO,
-            timezone: "UTC".into(),
-            search_path: vec!["public".into()],
+            settings: SessionSettings::create(lock_timeout),
+            default_lock_timeout: lock_timeout,
             settings_undo: None,
             settings_on_commit: None,
             deferred_constraints: BTreeSet::new(),
@@ -91,7 +85,7 @@ impl Session {
         let mut results = Vec::with_capacity(statements.len());
         for statement in statements {
             if self.transaction.is_none() {
-                self.start_transaction(self.default_isolation, true);
+                self.start_transaction(self.settings.default_isolation, true);
             }
             match self.execute_statement(&statement, None, None, None) {
                 Ok(result) => results.push(result),
@@ -154,8 +148,8 @@ impl Session {
         }
         if let ast::Statement::Do(statement) = statement {
             let procedural = procedural.unwrap_or_else(|| DoBlockContext {
-                deadline: (self.statement_timeout != Duration::ZERO)
-                    .then(|| Instant::now() + self.statement_timeout),
+                deadline: (self.settings.statement_timeout != Duration::ZERO)
+                    .then(|| Instant::now() + self.settings.statement_timeout),
                 statement_timestamp: self.db.read_clock(),
             });
             return match self.execute_do_block(statement, procedural) {
@@ -171,8 +165,8 @@ impl Session {
         };
         let statement_deadline = procedural.map_or_else(
             || {
-                (self.statement_timeout != Duration::ZERO)
-                    .then(|| Instant::now() + self.statement_timeout)
+                (self.settings.statement_timeout != Duration::ZERO)
+                    .then(|| Instant::now() + self.settings.statement_timeout)
             },
             |procedural| procedural.deadline,
         );
@@ -207,10 +201,10 @@ impl Session {
             snapshot,
             Some(self.temporary_schema_id),
         );
-        state.catalog.set_search_path(&self.search_path);
+        state.catalog.set_search_path(&self.settings.search_path);
         let acquired = match acquire_relation_locks(
             &condvar,
-            self.lock_timeout,
+            self.settings.lock_timeout,
             statement_deadline,
             state,
             statement,
@@ -305,7 +299,7 @@ impl Session {
             transaction_timestamp: transaction.transaction_timestamp,
             statement_timestamp: statement_timestamp.expect("fallback captures statement time"),
             clock_timestamp: self.db.read_clock(),
-            timezone: self.timezone.clone(),
+            timezone: self.settings.timezone.clone(),
             deadline: statement_deadline,
             rng: self.db.rng.clone(),
             sequences,
@@ -365,7 +359,7 @@ impl Session {
         let cte_statement = if contains_cte {
             let (acquired_state, acquired_snapshot, locked_rows) = match acquire_row_locks(
                 &condvar,
-                self.lock_timeout,
+                self.settings.lock_timeout,
                 statement_deadline,
                 state,
                 RowLockTarget::Ctes(statement),
@@ -422,7 +416,7 @@ impl Session {
             .then(|| state.catalog.clone());
         let (mut state, snapshot, locked_rows) = match acquire_row_locks(
             &condvar,
-            self.lock_timeout,
+            self.settings.lock_timeout,
             statement_deadline,
             state,
             RowLockTarget::Statement(statement),
@@ -467,7 +461,7 @@ impl Session {
                 if let crate::advisory::PendingAdvisory::Waiting(request) = pending {
                     state = match locking::acquire_advisory_lock(
                         &condvar,
-                        self.lock_timeout,
+                        self.settings.lock_timeout,
                         statement_deadline,
                         state,
                         request,

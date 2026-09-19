@@ -18,6 +18,9 @@ use super::{
 #[derive(Debug, Clone)]
 pub struct PreparedStatement {
     pub(super) statement: ast::Statement,
+    search_path: Vec<String>,
+    source_sql: String,
+    replanned: std::sync::Arc<std::sync::Mutex<Option<std::sync::Arc<PreparedStatement>>>>,
     pub(super) parameter_types: Vec<crate::value::BaseType>,
     pub(super) columns: Vec<ColumnMeta>,
     pub(super) query_plan: Option<executor::PreparedQueryPlan>,
@@ -99,6 +102,52 @@ impl Session {
                 "current transaction is aborted",
             ));
         }
+        let frozen = ast::visit_expressions_mut(&mut statement, |expression| {
+            let literal = match &*expression {
+                ast::Expr::TypedString(typed) if !typed.uses_odbc_syntax => {
+                    Some((&typed.data_type, &typed.value.value))
+                }
+                ast::Expr::Cast {
+                    expr, data_type, ..
+                } => match expr.as_ref() {
+                    ast::Expr::Value(value) => Some((data_type, &value.value)),
+                    _ => None,
+                },
+                _ => None,
+            };
+            if let Some((
+                ast::DataType::Timestamp(
+                    precision,
+                    ast::TimezoneInfo::WithTimeZone | ast::TimezoneInfo::Tz,
+                ),
+                ast::Value::SingleQuotedString(text),
+            )) = literal
+            {
+                let data_type =
+                    ast::DataType::Timestamp(*precision, ast::TimezoneInfo::WithTimeZone);
+                let value = crate::coercion::convert_ast_data_type(&data_type).and_then(|target| {
+                    crate::coercion::coerce_unknown(
+                        text,
+                        target,
+                        crate::coercion::CastContext::Explicit,
+                        &self.settings.timezone,
+                    )
+                    .map(|value| analyzer::create_typed_literal(value, target))
+                });
+                match value {
+                    Ok(value) => *expression = value,
+                    Err(error) => return std::ops::ControlFlow::Break(error),
+                }
+            }
+            std::ops::ControlFlow::Continue(())
+        });
+        if let std::ops::ControlFlow::Break(error) = frozen {
+            return self.abort_with_error(error);
+        }
+        let setting_columns = match self.describe_setting_statement(&statement) {
+            Ok(columns) => columns,
+            Err(error) => return self.abort_with_error(error),
+        };
         let prepared = {
             let mut state = self.db.state.lock().expect("database mutex is poisoned");
             let (xid, snapshot) = match self.transaction {
@@ -117,7 +166,7 @@ impl Session {
                 None => (None, Snapshot::create(&state.transactions)),
             };
             state.load_catalog(xid, snapshot, Some(self.temporary_schema_id));
-            state.catalog.set_search_path(&self.search_path);
+            state.catalog.set_search_path(&self.settings.search_path);
             analyzer::count_parameters(&statement)
                 .and_then(|parameter_count| {
                     let parameter_count = parameter_count.max(parameter_types.len());
@@ -156,8 +205,12 @@ impl Session {
                             parameter_types,
                         )
                         .and_then(|(parameter_types, described)| {
-                            let columns =
-                                executor::describe_query_result_columns(&state, &described)?;
+                            let columns = match &setting_columns {
+                                Some(columns) => columns.clone(),
+                                None => {
+                                    executor::describe_query_result_columns(&state, &described)?
+                                }
+                            };
                             let query_plan = executor::build_prepared_query_plan(
                                 &state,
                                 &statement,
@@ -205,6 +258,9 @@ impl Session {
                 relation_locks,
                 catalog_identity,
             )) => Ok(PreparedStatement {
+                search_path: self.settings.search_path.clone(),
+                source_sql: sql.into(),
+                replanned: Default::default(),
                 statement,
                 parameter_types,
                 columns,
@@ -251,6 +307,32 @@ impl Session {
         statement: &PreparedStatement,
         params: &[Value],
     ) -> Result<StatementResult> {
+        let replan_cache = &statement.replanned;
+        let cached = replan_cache
+            .lock()
+            .expect("prepared statement mutex is poisoned")
+            .clone();
+        let statement = cached.as_deref().unwrap_or(statement);
+        if statement.search_path != self.settings.search_path {
+            let types = statement
+                .parameter_types
+                .iter()
+                .copied()
+                .map(Some)
+                .collect::<Vec<_>>();
+            let refreshed = self.prepare_with_parameter_types(&statement.source_sql, &types)?;
+            if refreshed.columns != statement.columns {
+                return self.abort_with_error(PgError::create(
+                    SqlState::FeatureNotSupported,
+                    "cached plan must not change result type",
+                ));
+            }
+            let refreshed = std::sync::Arc::new(refreshed);
+            *replan_cache
+                .lock()
+                .expect("prepared statement mutex is poisoned") = Some(refreshed.clone());
+            return self.execute_prepared_statement(&refreshed, params);
+        }
         let parameters;
         let (bound_statement, prepared_query) = if let Some(query_plan) = &statement.query_plan {
             parameters = match analyzer::coerce_parameters(&statement.parameter_types, params) {
@@ -298,7 +380,7 @@ impl Session {
         let execution_statement = bound_statement.as_deref().unwrap_or(&statement.statement);
         let started_implicit_transaction = self.transaction.is_none();
         if started_implicit_transaction {
-            self.start_transaction(self.default_isolation, true);
+            self.start_transaction(self.settings.default_isolation, true);
         }
         match self.execute_statement(execution_statement, prepared_query, Some(statement), None) {
             Ok(result) => {

@@ -28,6 +28,7 @@ pub enum SqlState {
     InvalidRowCountInResultOffsetClause, // 2201X
     InvalidTextRepresentation,           // 22P02
     UntranslatableCharacter,             // 22P05
+    CantChangeRuntimeParam,              // 55P02
     InvalidParameterValue,               // 22023
     StringDataRightTruncation,           // 22001
     SequenceGeneratorLimitExceeded,      // 2200H
@@ -123,6 +124,7 @@ impl SqlState {
             SqlState::InvalidRowCountInResultOffsetClause => "2201X",
             SqlState::InvalidTextRepresentation => "22P02",
             SqlState::UntranslatableCharacter => "22P05",
+            SqlState::CantChangeRuntimeParam => "55P02",
             SqlState::InvalidParameterValue => "22023",
             SqlState::StringDataRightTruncation => "22001",
             SqlState::SequenceGeneratorLimitExceeded => "2200H",

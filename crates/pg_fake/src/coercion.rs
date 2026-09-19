@@ -323,11 +323,11 @@ pub(crate) fn coerce(
         } else {
             value
         };
-        time_zones::convert_time_zone(timestamp, timezone)?
+        time_zones::convert_session_time_zone(timestamp, timezone)?
     } else if source == BaseType::TimestampTz
         && matches!(target.base, BaseType::Timestamp | BaseType::Date)
     {
-        let timestamp = time_zones::convert_time_zone(value, timezone)?;
+        let timestamp = time_zones::convert_session_time_zone(value, timezone)?;
         if target.base == BaseType::Date {
             convert_non_string_value(timestamp, BaseType::Date)?
         } else {
@@ -439,7 +439,7 @@ pub(crate) fn coerce_unknown(
     };
     let value = if target.base == BaseType::TimestampTz {
         if let Some(local) = crate::value::parse_local_timestamp(text) {
-            time_zones::convert_time_zone(
+            time_zones::convert_session_time_zone(
                 Value::Timestamp(crate::value::PgTimestamp::Finite(local)),
                 timezone,
             )?

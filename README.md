@@ -56,6 +56,39 @@ COMMIT;
 SELECT * FROM items; -- returns 1
 ```
 
+## Fixture snapshots
+
+`db.snapshot()` returns an independent database containing committed rows and
+catalog objects. New sessions start with database defaults. In-flight writes,
+temporary objects, session settings, and locks are excluded. Sequence allocation,
+mock time, and seeded random state are copied and evolve independently in each
+fork. Taking a snapshot briefly locks the source database while copying it.
+
+## Session settings
+
+`SET`, `SET SESSION`, `SHOW`, `RESET`, `SET ... TO DEFAULT`, and `RESET ALL`
+share a typed registry. Semantic settings are `TimeZone`, `lock_timeout`,
+`statement_timeout`, `search_path`, and `default_transaction_isolation`.
+`application_name` and UTF-8 `client_encoding` are supported, including
+`SET NAMES`, `SET SCHEMA`, and `TIME ZONE` aliases. Fresh sessions use the
+configured database lock timeout, UTC, and `"$user", public` as their search path.
+
+```sql
+SET SESSION lock_timeout = '1.5s';
+SHOW lock_timeout;
+SET TIME ZONE 'Europe/Paris';
+SET application_name = 'test-worker';
+RESET ALL;
+```
+
+Known planner settings are validated and tracked without changing execution;
+strict mode rejects them. Unknown names are rejected rather than accepted by
+prefix. READ COMMITTED and REPEATABLE READ defaults are implemented; other
+isolation levels and non-UTF-8 encodings remain explicit unsupported features.
+Time zones support named IANA zones and numeric offsets; arbitrary POSIX zone
+rules and interval-valued settings remain outside this registry's current surface.
+GUC functions remain later work.
+
 ## Command-line interface
 
 Run a SQL file against a fresh in-memory database:

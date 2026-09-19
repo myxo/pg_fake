@@ -25,3 +25,10 @@ INSERT INTO omitted_columns VALUES (1, 0);
 Using `INSERT INTO omitted_columns (id, value) VALUES (1, 0)` works. This existing
 limitation was exposed by the Task 31 savepoint generator after adding a column;
 that generator now names its input columns explicitly.
+
+## Timestamptz input with omitted seconds and an explicit offset
+
+`SELECT TIMESTAMPTZ '2024-07-01 12:00+00'` succeeds in PostgreSQL but currently
+returns `22007` in `pg_fake`. Including seconds (`'2024-07-01 12:00:00+00'`)
+works. This existing timestamp-input limitation was exposed by Task 32's
+session-time-zone tests; those tests use the supported full timestamp form.

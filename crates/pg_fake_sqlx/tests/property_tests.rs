@@ -3336,3 +3336,102 @@ fn generated_savepoint_histories_match_postgres() {
         }
     });
 }
+
+#[test]
+fn compare_generated_setting_histories() {
+    let server = start_isolated_postgres_server();
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap();
+    let options: sqlx_postgres::PgConnectOptions = server.url.parse().unwrap();
+    let options = options
+        .application_name("")
+        .options([("lock_timeout", "1000"), ("timezone", "UTC")]);
+    let postgres = RefCell::new(
+        runtime
+            .block_on(PgConnection::connect_with(&options))
+            .unwrap(),
+    );
+    check(|src| {
+        let mut postgres = postgres.borrow_mut();
+        runtime
+            .block_on(sqlx::raw_sql("ROLLBACK; RESET ALL").execute(&mut *postgres))
+            .unwrap();
+        let mut fake = PgFakeConnection::new(Db::create());
+        let parameters = [
+            "lock_timeout",
+            "work_mem",
+            "enable_hashjoin",
+            "application_name",
+            "default_transaction_isolation",
+            "TimeZone",
+            "search_path",
+            "client_encoding",
+        ];
+        let count = src.any_of("steps", int_in(1..=12));
+        for _ in 0..count {
+            let parameter = parameters[src.any_of("parameter", int_in(0..parameters.len()))];
+            let value = match parameter {
+                "lock_timeout" => format!(
+                    "'{}{}'",
+                    src.any_of("timeout", int_in(0..=100)),
+                    ["ms", "s", "min", "us"][src.any_of("unit", int_in(0..4))]
+                ),
+                "work_mem" => format!("'{}kB'", src.any_of("kilobytes", int_in(64..=2048))),
+                "enable_hashjoin" => ["on", "off", "'t'", "'of'", "'o'", "1", "'bad'"]
+                    [src.any_of("boolean", int_in(0..7))]
+                .into(),
+                "application_name" => {
+                    format!("'case{}'", src.any_of("application", int_in(0..=100)))
+                }
+                "default_transaction_isolation" => {
+                    ["'read committed'", "'repeatable read'", "'invalid'"]
+                        [src.any_of("isolation", int_in(0..3))]
+                    .into()
+                }
+                "TimeZone" => ["'UTC'", "'Europe/Paris'", "'America/New_York'", "3.5", "-7"]
+                    [src.any_of("zone", int_in(0..5))]
+                .into(),
+                "search_path" => [
+                    "public",
+                    "pg_temp, public",
+                    "'Missing', public",
+                    "'a,b'",
+                    "'$user', public",
+                ][src.any_of("path", int_in(0..5))]
+                .into(),
+                "client_encoding" => ["'UTF8'", "'utf-8'", "unicode", "'invalid'"]
+                    [src.any_of("encoding", int_in(0..4))]
+                .into(),
+                _ => unreachable!(),
+            };
+            let sql = match src.any_of("operation", int_in(0..=7)) {
+                0 => format!("RESET \"{parameter}\""),
+                1 => format!("SET \"{parameter}\" TO DEFAULT"),
+                2 => "RESET ALL".into(),
+                3 => "BEGIN".into(),
+                4 => "ROLLBACK".into(),
+                5 => "COMMIT".into(),
+                _ => format!("SET SESSION \"{parameter}\" = {value}"),
+            };
+            for sql in [sql, format!("SHOW \"{parameter}\"")] {
+                src.log_value("sql", &sql);
+                assert_statement_allow_error(
+                    &runtime,
+                    &mut postgres,
+                    &mut fake,
+                    &sql,
+                    RowOrder::Ordered,
+                );
+            }
+        }
+        assert_statement_allow_error(
+            &runtime,
+            &mut postgres,
+            &mut fake,
+            "ROLLBACK",
+            RowOrder::Ordered,
+        );
+    });
+}

@@ -2,18 +2,18 @@ use crate::{
     error::{PgError, Result, SqlState},
     value::{PgTimestamp, PgTimestampTz, Value},
 };
-use chrono::{DateTime, Duration, FixedOffset, LocalResult, NaiveDateTime, Offset, TimeZone, Utc};
+use chrono::{DateTime, Duration, LocalResult, NaiveDateTime, Offset, TimeZone, Utc};
 
 #[derive(Clone, Copy)]
 pub(crate) enum Zone {
-    Fixed(FixedOffset),
+    Fixed(i32),
     Named(chrono_tz::Tz),
 }
 
 pub(crate) fn parse_zone(zone: &str) -> Result<Zone> {
     let upper = zone.to_ascii_uppercase();
     if matches!(upper.as_str(), "UTC" | "GMT" | "Z") {
-        return Ok(Zone::Fixed(FixedOffset::east_opt(0).unwrap()));
+        return Ok(Zone::Fixed(0));
     }
     let abbreviation = match upper.as_str() {
         "CET" | "MET" => Some(3600),
@@ -33,12 +33,16 @@ pub(crate) fn parse_zone(zone: &str) -> Result<Zone> {
         _ => None,
     };
     if let Some(seconds) = abbreviation {
-        return Ok(Zone::Fixed(FixedOffset::east_opt(seconds).unwrap()));
+        return Ok(Zone::Fixed(seconds));
     }
-    let offset = upper
+    let upper_offset = upper
+        .strip_prefix('<')
+        .and_then(|value| value.split_once('>'))
+        .map_or(upper.as_str(), |(_, offset)| offset);
+    let offset = upper_offset
         .strip_prefix("UTC")
         .or_else(|| upper.strip_prefix("GMT"))
-        .unwrap_or(&upper);
+        .unwrap_or(upper_offset);
     if offset.starts_with(['+', '-']) {
         let invalid = || {
             PgError::create(
@@ -62,15 +66,13 @@ pub(crate) fn parse_zone(zone: &str) -> Result<Zone> {
         let hour = numbers[0];
         let minute = numbers.get(1).copied().unwrap_or(0);
         let second = numbers.get(2).copied().unwrap_or(0);
-        if hour > 15 || minute > 59 || second > 59 {
+        if hour > 167 || minute > 59 || second > 59 {
             return Err(invalid());
         }
         // PostgreSQL's text zone offsets use POSIX's west-positive sign.
         let seconds =
             (hour * 3600 + minute * 60 + second) * if offset.starts_with('-') { 1 } else { -1 };
-        return Ok(Zone::Fixed(
-            FixedOffset::east_opt(seconds).expect("validated zone offset"),
-        ));
+        return Ok(Zone::Fixed(seconds));
     }
     if let Some(zone) = chrono_tz::TZ_VARIANTS
         .iter()
@@ -86,9 +88,12 @@ pub(crate) fn parse_zone(zone: &str) -> Result<Zone> {
 
 pub(crate) fn convert_local(zone: Zone, value: NaiveDateTime) -> Result<DateTime<Utc>> {
     let result = match zone {
-        Zone::Fixed(zone) => zone
-            .from_local_datetime(&value)
-            .map(|date| date.with_timezone(&Utc)),
+        Zone::Fixed(seconds) => {
+            return value
+                .checked_sub_signed(Duration::seconds(i64::from(seconds)))
+                .map(|value| value.and_utc())
+                .ok_or_else(create_overflow);
+        }
         Zone::Named(zone) => zone
             .from_local_datetime(&value)
             .map(|date| date.with_timezone(&Utc)),
@@ -122,23 +127,42 @@ pub(crate) fn convert_local(zone: Zone, value: NaiveDateTime) -> Result<DateTime
 pub(crate) fn convert_utc(zone: Zone, value: DateTime<Utc>) -> Result<(NaiveDateTime, i32)> {
     let offset = match zone {
         Zone::Fixed(zone) => zone,
-        Zone::Named(zone) => zone.offset_from_utc_datetime(&value.naive_utc()).fix(),
+        Zone::Named(zone) => zone
+            .offset_from_utc_datetime(&value.naive_utc())
+            .fix()
+            .local_minus_utc(),
     };
     let local = value
         .naive_utc()
-        .checked_add_signed(Duration::seconds(i64::from(offset.local_minus_utc())))
+        .checked_add_signed(Duration::seconds(i64::from(offset)))
         .ok_or_else(create_overflow)?;
-    Ok((local, offset.local_minus_utc()))
+    Ok((local, offset))
 }
 
 pub(crate) fn convert_time_zone(value: Value, zone: &str) -> Result<Value> {
+    convert_zone(value, || parse_zone(zone))
+}
+
+pub(crate) fn parse_session_zone(zone: &str) -> Result<Zone> {
+    chrono_tz::TZ_VARIANTS
+        .iter()
+        .find(|candidate| candidate.name().eq_ignore_ascii_case(zone))
+        .map(|zone| Ok(Zone::Named(*zone)))
+        .unwrap_or_else(|| parse_zone(zone))
+}
+
+pub(crate) fn convert_session_time_zone(value: Value, zone: &str) -> Result<Value> {
+    convert_zone(value, || parse_session_zone(zone))
+}
+
+fn convert_zone(value: Value, parse: impl FnOnce() -> Result<Zone>) -> Result<Value> {
     match value {
         Value::Null => Ok(Value::Null),
         Value::Timestamp(PgTimestamp::Finite(value)) => Ok(Value::TimestampTz(
-            PgTimestampTz::Finite(convert_local(parse_zone(zone)?, value)?),
+            PgTimestampTz::Finite(convert_local(parse()?, value)?),
         )),
         Value::TimestampTz(PgTimestampTz::Finite(value)) => Ok(Value::Timestamp(
-            PgTimestamp::Finite(convert_utc(parse_zone(zone)?, value)?.0),
+            PgTimestamp::Finite(convert_utc(parse()?, value)?.0),
         )),
         Value::Timestamp(PgTimestamp::Infinity) => Ok(Value::TimestampTz(PgTimestampTz::Infinity)),
         Value::Timestamp(PgTimestamp::NegInfinity) => {

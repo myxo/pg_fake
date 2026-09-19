@@ -334,6 +334,31 @@ fn transactional_ddl_benchmark(
     group.finish();
 }
 
+fn benchmark_settings(
+    criterion: &mut Criterion,
+    runtime: &Runtime,
+    connections: &mut [NamedBenchmarkConnection<'_>],
+) {
+    let mut group =
+        criterion.benchmark_group(benchmarks::find_benchmark("session_settings_roundtrip").name);
+    for (backend, connection) in connections.iter_mut() {
+        group.bench_function(*backend, |benchmark| {
+            benchmark.iter(|| {
+                for sql in [
+                    "SET application_name = 'benchmark'",
+                    "SET lock_timeout = '2s'",
+                    "SHOW lock_timeout",
+                    "RESET application_name",
+                    "RESET lock_timeout",
+                ] {
+                    connection.execute(runtime, sql);
+                }
+            });
+        });
+    }
+    group.finish();
+}
+
 fn benchmark_savepoints(
     criterion: &mut Criterion,
     runtime: &Runtime,
@@ -1495,6 +1520,22 @@ fn core_vs_sqlx_benchmark(criterion: &mut Criterion, runtime: &Runtime) {
     fake_execute(runtime, &mut sqlx, "ROLLBACK");
 }
 
+fn benchmark_snapshots(criterion: &mut Criterion) {
+    let db = Db::create();
+    let mut session = db.create_session();
+    core_execute(
+        &mut session,
+        "CREATE TABLE snapshot_fixture(id INT PRIMARY KEY, name TEXT)",
+    );
+    core_execute(&mut session, &insert_values_sql("snapshot_fixture", 100));
+    let mut group =
+        criterion.benchmark_group(benchmarks::find_benchmark("core_snapshot_100_rows").name);
+    group.bench_function("pg_fake", |benchmark| {
+        benchmark.iter(|| black_box(db.snapshot()))
+    });
+    group.finish();
+}
+
 fn parsed_vs_prepared_benchmark(criterion: &mut Criterion) {
     let mut session = Db::create().create_session();
     core_execute(
@@ -1844,6 +1885,7 @@ fn benchmarks(criterion: &mut Criterion) {
 
         create_table_benchmark(criterion, &runtime, &mut connections);
         transactional_ddl_benchmark(criterion, &runtime, &mut connections);
+        benchmark_settings(criterion, &runtime, &mut connections);
         benchmark_savepoints(criterion, &runtime, &mut connections);
         migration_table_lock_benchmark(criterion, &runtime, &mut connections);
         benchmark_sqlx_migration_chain(criterion, &runtime, &mut connections);
@@ -1872,6 +1914,7 @@ fn benchmarks(criterion: &mut Criterion) {
         nested_filtered_view_benchmark(criterion, &runtime, &mut connections);
         order_by_benchmark(criterion, &runtime, &mut connections);
         core_vs_sqlx_benchmark(criterion, &runtime);
+        benchmark_snapshots(criterion);
         parsed_vs_prepared_benchmark(criterion);
         transaction_history_benchmark(criterion);
         mvcc_version_chain_benchmark(criterion);

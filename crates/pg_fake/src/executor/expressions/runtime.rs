@@ -159,11 +159,17 @@ pub(super) fn evaluate_runtime_function(
         ("to_char", [value, Value::Text(format)]) => {
             super::temporal::format_timestamp(value, format, &context.timezone)
         }
-        ("date_trunc", [Value::Text(unit), value]) => {
-            super::temporal::truncate_timestamp(unit, value.clone(), &context.timezone)
-        }
+        ("date_trunc", [Value::Text(unit), value]) => super::temporal::truncate_timestamp(
+            unit,
+            value.clone(),
+            crate::coercion::time_zones::parse_session_zone(&context.timezone)?,
+        ),
         ("date_trunc", [Value::Text(unit), value, Value::Text(zone)]) => {
-            super::temporal::truncate_timestamp(unit, value.clone(), zone)
+            super::temporal::truncate_timestamp(
+                unit,
+                value.clone(),
+                crate::coercion::time_zones::parse_zone(zone)?,
+            )
         }
         ("regexp_like", [Value::Text(value), Value::Text(pattern)]) => {
             super::patterns::evaluate_regex(value, pattern, "")

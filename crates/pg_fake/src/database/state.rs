@@ -230,3 +230,65 @@ impl DatabaseState {
             .retain(|candidate| *candidate != table_id);
     }
 }
+
+impl DatabaseState {
+    #[cfg_attr(feature = "execution-log", tracing::instrument(skip_all))]
+    pub(crate) fn abort_transaction(&mut self, xid: Xid) {
+        self.abort_sequence_resets(xid);
+        let reclaimed = self.catalog_history.discard_transaction(xid);
+        for table_id in reclaimed.tables {
+            self.tables.remove(&table_id);
+        }
+        let mut sequence_values = self
+            .sequence_values
+            .lock()
+            .expect("sequence storage is poisoned");
+        for sequence_id in reclaimed.sequences {
+            sequence_values.remove(&sequence_id);
+        }
+        drop(sequence_values);
+        self.transactions.abort(xid);
+        for table_id in self.take_touched_tables(xid) {
+            if let Some(table) = self.tables.get_mut(&table_id) {
+                table.discard_transaction_versions(xid);
+            }
+        }
+        self.prune_versions();
+        self.row_locks.release_transaction_locks(xid);
+        self.advisory_locks
+            .lock()
+            .expect("advisory lock mutex is poisoned")
+            .release_transaction_locks(xid);
+        self.relation_locks.release_transaction_locks(xid);
+        self.wait_for.remove_transaction(xid);
+    }
+
+    #[cfg_attr(feature = "execution-log", tracing::instrument(skip_all))]
+    pub(crate) fn prune_versions(&mut self) {
+        let horizon = self.transactions.find_reclamation_horizon();
+        for table_id in self.collect_reclaimable_table_ids() {
+            let Some(table) = self.tables.get_mut(&table_id) else {
+                self.clear_table_reclaimable(table_id);
+                continue;
+            };
+            table.prune_versions(horizon, &self.transactions);
+            if !table.has_reclaimable_versions() {
+                self.clear_table_reclaimable(table_id);
+            }
+        }
+        let protected_tables = self.collect_touched_tables();
+        let reclaimed = self
+            .catalog_history
+            .prune(horizon, &self.transactions, &protected_tables);
+        for table_id in reclaimed.tables {
+            self.tables.remove(&table_id);
+        }
+        let mut sequence_values = self
+            .sequence_values
+            .lock()
+            .expect("sequence storage is poisoned");
+        for sequence_id in reclaimed.sequences {
+            sequence_values.remove(&sequence_id);
+        }
+    }
+}

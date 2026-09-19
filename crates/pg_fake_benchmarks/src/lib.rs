@@ -27,6 +27,16 @@ pub fn find_benchmark(name: &str) -> Benchmark {
 pub fn list_benchmarks() -> Vec<Benchmark> {
     vec![
         build_benchmark(
+            "core_snapshot_100_rows",
+            vec![value("pg_fake", &["pg_fake"])],
+            vec![],
+        ),
+        build_benchmark(
+            "session_settings_roundtrip",
+            postgres_values(),
+            postgres_comparisons(),
+        ),
+        build_benchmark(
             "nested_savepoint_release",
             postgres_values(),
             postgres_comparisons(),
