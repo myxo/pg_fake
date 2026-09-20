@@ -359,6 +359,31 @@ fn benchmark_settings(
     group.finish();
 }
 
+fn benchmark_transaction_local_gucs(
+    criterion: &mut Criterion,
+    runtime: &Runtime,
+    connections: &mut [NamedBenchmarkConnection<'_>],
+) {
+    let mut group = criterion
+        .benchmark_group(benchmarks::find_benchmark("transaction_local_guc_roundtrip").name);
+    for (backend, connection) in connections.iter_mut() {
+        group.bench_function(*backend, |benchmark| {
+            benchmark.iter(|| {
+                for sql in [
+                    "BEGIN",
+                    "SELECT set_config('application_name', 'benchmark-local', true)",
+                    "SELECT current_setting('application_name')",
+                    "SHOW transaction_isolation",
+                    "ROLLBACK",
+                ] {
+                    connection.execute(runtime, sql);
+                }
+            });
+        });
+    }
+    group.finish();
+}
+
 fn benchmark_savepoints(
     criterion: &mut Criterion,
     runtime: &Runtime,
@@ -1886,6 +1911,7 @@ fn benchmarks(criterion: &mut Criterion) {
         create_table_benchmark(criterion, &runtime, &mut connections);
         transactional_ddl_benchmark(criterion, &runtime, &mut connections);
         benchmark_settings(criterion, &runtime, &mut connections);
+        benchmark_transaction_local_gucs(criterion, &runtime, &mut connections);
         benchmark_savepoints(criterion, &runtime, &mut connections);
         migration_table_lock_benchmark(criterion, &runtime, &mut connections);
         benchmark_sqlx_migration_chain(criterion, &runtime, &mut connections);

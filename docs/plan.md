@@ -1719,7 +1719,66 @@ settings that affect supported behavior or driver compatibility.
 - Differential/property cases cover aliases, units, invalid values, reset,
   session isolation, strict mode, and prepared statements.
 
-### Task 33 — Transaction-local settings and GUC functions
+### Task 33 — Transaction-local settings and GUC functions [COMPLETE]
+
+**Progress:** Implementation, validation, and independent iterative review are
+complete; the user approved committing the task.
+
+- [x] Generalize `SET LOCAL` across the typed registry and preserve session/local
+  assignment state through commit, rollback, and nested savepoints.
+- [x] Add typed `current_setting(name [, missing_ok])` and
+  `set_config(name, value, is_local)`, including prepared parameter inference,
+  custom dotted names, strict-mode behavior, and statement-visible semantic
+  changes.
+- [x] Report the active `transaction_isolation` dynamically and apply the
+  existing isolation-precedence and legal-timing rules to direct assignment.
+- [x] Add focused differential, generated, manifest, savepoint, startup, and
+  benchmark coverage, and document the supported surface.
+- [x] Pass formatting, strict all-target/all-feature workspace Clippy, the full
+  non-generated workspace regression, and the required 10,000-iteration
+  property gate.
+- [x] Complete independent iterative review with no remaining findings.
+- [x] Obtain user approval before marking Task 33 complete.
+
+`GucExecutionContext` gives all expressions in one statement a shared mutable
+GUC view. This lets a `set_config` call affect a later expression in the same
+statement while statement deadlines, snapshots, and transaction timestamps
+remain captured at statement start. Timezone formatting and advisory-lock
+timeouts consult the current GUC value at execution time. PostgreSQL custom GUC
+names containing a dot are stored with the same session/local and savepoint
+lifetime rules as registered settings. Their session-level placeholder identity
+survives local assignments, statement errors, transaction rollback, and
+savepoint rollback while their values restore transactionally.
+
+`transaction_isolation` is a dynamic registered setting: outside a transaction
+it reports the session default, and inside a transaction it reports the active
+isolation. Direct changes reuse the transaction characteristic timing checks.
+Transaction read-only/deferrable modes and SERIALIZABLE behavior remain owned
+by Tasks 38–39 rather than introducing partial semantics here.
+
+**Validation:** The focused generated settings history and all six settings
+differential tests pass against PostgreSQL 18.6. The complete non-generated
+all-feature workspace regression passes against a temporary `C`-collation
+database, including 247 core tests and the existing application, manifest,
+savepoint, and startup coverage. Formatting and strict workspace Clippy pass.
+The full
+`CHAOS_THEORY_CHECK_ITERS=10000 CHAOS_THEORY_CHECK_TIME=600s cargo test
+-p pg_fake_sqlx --features time --test property_tests` gate passes all 24
+suites in 827.00 seconds. After review fixes, the affected generated settings
+history passes another 10,000 cases, the complete non-generated workspace
+regression passes again, and strict workspace Clippy remains clean.
+
+Six independent review passes resolved PostgreSQL compatibility gaps in NULL
+`set_config` arguments, idempotent isolation assignments, functional
+`search_path` parsing, custom-name validation and reset behavior, custom
+placeholder lifetime, and savepoint error-path lock ordering. The sixth review
+found no remaining issue.
+
+**Benchmark:** A short Criterion run (10 samples, one-second warmup and
+measurement) measures the five-command transaction-local GUC roundtrip at
+approximately 80.1 microseconds for `pg_fake` versus 138.8 microseconds for
+PostgreSQL 18.6, about 1.7x faster. This local measurement does not replace the
+committed benchmark baseline.
 
 **Goal:** Complete transactional GUC behavior and the common functional access
 surface.

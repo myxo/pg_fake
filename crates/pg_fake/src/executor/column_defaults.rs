@@ -26,7 +26,7 @@ pub(super) fn evaluate_column_default(
                 BaseType::Int8,
                 column.data_type,
                 CastContext::Assignment,
-                &context.timezone,
+                &context.get_timezone(),
             );
         }
         let Some(expr) = &column.default else {

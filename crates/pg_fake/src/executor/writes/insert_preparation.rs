@@ -677,7 +677,7 @@ pub(super) fn evaluate_insert_rows(
                                     &text,
                                     schema.columns[*index].data_type,
                                     CastContext::Assignment,
-                                    &context.timezone,
+                                    &context.get_timezone(),
                                 )?,
                                 Value::Null => Value::Null,
                                 _ => unreachable!("unknown literals evaluate to text or null"),
@@ -690,7 +690,7 @@ pub(super) fn evaluate_insert_rows(
                                 source_type,
                                 schema.columns[*index].data_type,
                                 CastContext::Assignment,
-                                &context.timezone,
+                                &context.get_timezone(),
                             )?
                         };
                     }
@@ -855,7 +855,7 @@ pub(super) fn evaluate_insert_rows(
                                 &text,
                                 schema.columns[*index].data_type,
                                 CastContext::Assignment,
-                                &context.timezone,
+                                &context.get_timezone(),
                             )?,
                             Value::Null => Value::Null,
                             _ => unreachable!("unknown literals evaluate to text or null"),
@@ -868,7 +868,7 @@ pub(super) fn evaluate_insert_rows(
                             source_type,
                             schema.columns[*index].data_type,
                             CastContext::Assignment,
-                            &context.timezone,
+                            &context.get_timezone(),
                         )?
                     };
                     row[*index] = value;

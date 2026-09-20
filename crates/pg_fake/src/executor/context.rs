@@ -25,7 +25,7 @@ pub(crate) struct StatementContext {
     pub(crate) transaction_timestamp: chrono::DateTime<chrono::Utc>,
     pub(crate) statement_timestamp: chrono::DateTime<chrono::Utc>,
     pub(crate) clock_timestamp: chrono::DateTime<chrono::Utc>,
-    pub(crate) timezone: String,
+    pub(crate) guc: Arc<Mutex<crate::session::settings::GucExecutionContext>>,
     pub(crate) deadline: Option<Instant>,
     pub(crate) rng: Arc<Mutex<ChaCha12Rng>>,
     pub(crate) sequences: SequenceExecutionContext,
@@ -142,6 +142,20 @@ pub(crate) struct PreparedUpdateRow {
 }
 
 impl StatementContext {
+    pub(crate) fn get_timezone(&self) -> String {
+        self.guc
+            .lock()
+            .expect("GUC context mutex is poisoned")
+            .get_timezone()
+    }
+
+    pub(crate) fn get_lock_timeout(&self) -> std::time::Duration {
+        self.guc
+            .lock()
+            .expect("GUC context mutex is poisoned")
+            .get_lock_timeout()
+    }
+
     pub(crate) fn check_timeout(&self) -> Result<()> {
         if self
             .deadline

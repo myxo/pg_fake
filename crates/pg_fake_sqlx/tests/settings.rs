@@ -289,6 +289,219 @@ fn compare_transactional_settings_and_prepared_metadata() {
 }
 
 #[test]
+fn compare_guc_functions_and_transaction_isolation() {
+    let server = differential::start_isolated_postgres_server();
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap();
+    let mut postgres = runtime
+        .block_on(PgConnection::connect(&server.url))
+        .unwrap();
+    let mut fake = PgFakeConnection::new(Db::create());
+    for sql in [
+        "SET application_name = 'base'",
+        "SELECT current_setting('application_name')",
+        "BEGIN",
+        "SELECT set_config('application_name', 'local', true)",
+        "SAVEPOINT guc",
+        "SELECT set_config('application_name', 'discarded', false)",
+        "SELECT current_setting('application_name')",
+        "ROLLBACK TO guc",
+        "SELECT current_setting('application_name')",
+        "COMMIT",
+        "SELECT current_setting('application_name')",
+        "BEGIN",
+        "SELECT set_config('application_name', 'committed', false)",
+        "SELECT set_config('application_name', 'temporary', true)",
+        "SELECT current_setting('application_name')",
+        "COMMIT",
+        "SELECT current_setting('application_name')",
+        "SELECT current_setting('missing.parameter', true)",
+        "SELECT set_config('custom.setting', 'value', false)",
+        "SELECT current_setting('custom.setting')",
+        "SELECT set_config('custom.a$b', 'dollar', false)",
+        "SELECT current_setting('custom.a$b')",
+        "SELECT set_config('custom.😀', 'unicode', false)",
+        "SELECT current_setting('custom.😀')",
+        "BEGIN",
+        "SELECT set_config('custom.first_local', 'local', true)",
+        "COMMIT",
+        "SELECT current_setting('custom.first_local', true)",
+        "BEGIN",
+        "SELECT set_config('custom.first_rollback', 'rollback', false)",
+        "ROLLBACK",
+        "SELECT current_setting('custom.first_rollback', true)",
+        "BEGIN",
+        "SAVEPOINT custom_first",
+        "SELECT set_config('custom.first_savepoint', 'savepoint', false)",
+        "ROLLBACK TO custom_first",
+        "SELECT current_setting('custom.first_savepoint', true)",
+        "ROLLBACK",
+        "SELECT current_setting('custom.first_savepoint', true)",
+        "SELECT set_config('application_name', 'reset-me', false)",
+        "SELECT set_config('application_name', NULL, false)",
+        "SELECT current_setting('application_name')",
+        "SELECT set_config('application_name', 'null-local-flag', NULL)",
+        "SELECT current_setting('application_name')",
+        "SELECT set_config('custom.reset_value', 'reset-me', false)",
+        "SELECT set_config('custom.reset_value', NULL, false)",
+        "SELECT current_setting('custom.reset_value')",
+        "SELECT set_config('custom.reset_direct', 'reset-me', false)",
+        "RESET custom.reset_direct",
+        "SELECT current_setting('custom.reset_direct')",
+        "SELECT set_config('custom.reset_all', 'reset-me', false)",
+        "RESET ALL",
+        "SELECT current_setting('custom.reset_all')",
+        "SELECT set_config('search_path', '', false)",
+        "SELECT current_setting('search_path')",
+        "SELECT set_config('search_path', '   ', false)",
+        "SELECT current_setting('search_path')",
+        "SELECT set_config('search_path', '\" a \"', false)",
+        "SELECT current_setting('search_path')",
+        "SELECT set_config('search_path', 'ABC, $user, a$b, é, 😀', false)",
+        "SELECT current_setting('search_path')",
+        "RESET search_path",
+        "BEGIN",
+        "SELECT set_config('TimeZone', 'Europe/Paris', true), current_setting('TimeZone'), to_char(TIMESTAMPTZ '2024-07-01 12:00:00+00', 'HH24:MI')",
+        "SELECT set_config('search_path', '\"Mixed\", public', true)",
+        "SELECT current_setting('search_path')",
+        "ROLLBACK",
+        "SET default_transaction_isolation = 'repeatable read'",
+        "SHOW transaction_isolation",
+        "BEGIN ISOLATION LEVEL READ COMMITTED",
+        "SHOW transaction_isolation",
+        "SELECT current_setting('transaction_isolation')",
+        "COMMIT",
+        "SHOW transaction_isolation",
+        "BEGIN",
+        "SET transaction_isolation = 'read committed'",
+        "SHOW transaction_isolation",
+        "ROLLBACK",
+        "BEGIN ISOLATION LEVEL READ COMMITTED",
+        "SELECT 1",
+        "SELECT set_config('transaction_isolation', 'read committed', false)",
+        "ROLLBACK",
+    ] {
+        assert_statement(&runtime, &mut postgres, &mut fake, sql, RowOrder::Ordered);
+    }
+    for sql in [
+        "SELECT current_setting('missing_parameter')",
+        "SELECT set_config('missing_parameter', 'value', false)",
+        "SELECT set_config(NULL, 'value', false)",
+        "SELECT set_config('1.bad', 'value', false)",
+        "SELECT set_config('search_path', '\"a\"junk', false)",
+        "SELECT set_config('search_path', 'a b', false)",
+        "SELECT set_config('transaction_isolation', 'read committed', false)",
+        "SELECT set_config('transaction_isolation', NULL, false)",
+    ] {
+        assert_statement_allow_error(&runtime, &mut postgres, &mut fake, sql, RowOrder::Ordered);
+    }
+    assert_statement_allow_error(
+        &runtime,
+        &mut postgres,
+        &mut fake,
+        "SELECT set_config('custom.failed_statement', 'value', false)::int",
+        RowOrder::Ordered,
+    );
+    assert_statement(
+        &runtime,
+        &mut postgres,
+        &mut fake,
+        "SELECT current_setting('custom.failed_statement', true)",
+        RowOrder::Ordered,
+    );
+    assert_statement_allow_error(
+        &runtime,
+        &mut postgres,
+        &mut fake,
+        "SELECT (SELECT set_config('custom.failed_subquery', 'value', false)::int)",
+        RowOrder::Ordered,
+    );
+    assert_statement(
+        &runtime,
+        &mut postgres,
+        &mut fake,
+        "SELECT current_setting('custom.failed_subquery', true)",
+        RowOrder::Ordered,
+    );
+    for sql in ["BEGIN", "SAVEPOINT failed_subquery"] {
+        assert_statement(&runtime, &mut postgres, &mut fake, sql, RowOrder::Ordered);
+    }
+    assert_statement_allow_error(
+        &runtime,
+        &mut postgres,
+        &mut fake,
+        "SELECT (SELECT set_config('custom.failed_savepoint', 'value', false)::int)",
+        RowOrder::Ordered,
+    );
+    for sql in [
+        "ROLLBACK TO failed_subquery",
+        "SELECT current_setting('custom.failed_savepoint', true)",
+        "ROLLBACK",
+    ] {
+        assert_statement(&runtime, &mut postgres, &mut fake, sql, RowOrder::Ordered);
+    }
+    for sql in ["BEGIN", "SELECT 1"] {
+        assert_statement(&runtime, &mut postgres, &mut fake, sql, RowOrder::Ordered);
+    }
+    assert_statement_allow_error(
+        &runtime,
+        &mut postgres,
+        &mut fake,
+        "SET transaction_isolation = 'read committed'",
+        RowOrder::Ordered,
+    );
+    assert_statement(
+        &runtime,
+        &mut postgres,
+        &mut fake,
+        "ROLLBACK",
+        RowOrder::Ordered,
+    );
+    for sql in [
+        "BEGIN",
+        "RESET transaction_isolation",
+        "ROLLBACK",
+        "BEGIN",
+        "SET transaction_isolation TO DEFAULT",
+        "ROLLBACK",
+    ] {
+        assert_statement_allow_error(&runtime, &mut postgres, &mut fake, sql, RowOrder::Ordered);
+    }
+    runtime.block_on(async {
+        let expected: String = sqlx::query_scalar("SELECT set_config($1, $2, $3)")
+            .bind("application_name")
+            .bind("prepared")
+            .bind(false)
+            .fetch_one(&mut postgres)
+            .await
+            .unwrap();
+        let actual: String = sqlx::query_scalar("SELECT set_config($1, $2, $3)")
+            .bind("application_name")
+            .bind("prepared")
+            .bind(false)
+            .fetch_one(&mut fake)
+            .await
+            .unwrap();
+        assert_eq!(actual, expected);
+        let expected: Option<String> = sqlx::query_scalar("SELECT current_setting($1, $2)")
+            .bind("missing.parameter")
+            .bind(true)
+            .fetch_one(&mut postgres)
+            .await
+            .unwrap();
+        let actual: Option<String> = sqlx::query_scalar("SELECT current_setting($1, $2)")
+            .bind("missing.parameter")
+            .bind(true)
+            .fetch_one(&mut fake)
+            .await
+            .unwrap();
+        assert_eq!(actual, expected);
+    });
+}
+
+#[test]
 fn preserve_session_isolation_snapshot_defaults_and_strict_policy() {
     let db = Db::create_builder()
         .set_lock_timeout(Duration::from_millis(42))
@@ -349,6 +562,23 @@ fn preserve_session_isolation_snapshot_defaults_and_strict_policy() {
     strict
         .execute("SET application_name = 'strict'; SET client_encoding = 'UTF8'; RESET ALL")
         .unwrap();
+    assert_eq!(
+        strict
+            .execute("SELECT current_setting('enable_seqscan')")
+            .unwrap_err()
+            .sqlstate,
+        SqlState::FeatureNotSupported
+    );
+    assert_eq!(
+        strict
+            .query(
+                "SELECT set_config('custom.audit_setting', 'enabled', false)",
+                &[],
+            )
+            .unwrap()
+            .rows,
+        vec![vec![Value::Text("enabled".into())]]
+    );
     assert_eq!(
         strict
             .execute("SET client_encoding = 'LATIN1'")

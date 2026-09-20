@@ -157,12 +157,12 @@ pub(super) fn evaluate_runtime_function(
         )),
         ("to_timestamp", [Value::Float8(seconds)]) => super::temporal::convert_epoch(*seconds),
         ("to_char", [value, Value::Text(format)]) => {
-            super::temporal::format_timestamp(value, format, &context.timezone)
+            super::temporal::format_timestamp(value, format, &context.get_timezone())
         }
         ("date_trunc", [Value::Text(unit), value]) => super::temporal::truncate_timestamp(
             unit,
             value.clone(),
-            crate::coercion::time_zones::parse_session_zone(&context.timezone)?,
+            crate::coercion::time_zones::parse_session_zone(&context.get_timezone())?,
         ),
         ("date_trunc", [Value::Text(unit), value, Value::Text(zone)]) => {
             super::temporal::truncate_timestamp(

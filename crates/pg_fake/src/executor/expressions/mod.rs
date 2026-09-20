@@ -88,14 +88,19 @@ pub(super) fn evaluate_assignment_expression(
     context: &StatementContext,
 ) -> Result<Value> {
     if let Some(text) = extract_unknown_string_literal(expr) {
-        coercion::coerce_unknown(text, target, CastContext::Assignment, &context.timezone)
+        coercion::coerce_unknown(
+            text,
+            target,
+            CastContext::Assignment,
+            &context.get_timezone(),
+        )
     } else {
         coercion::coerce(
             evaluate(expr, RowScope::Table(schema), row, context)?,
             infer_expression_type(expr, RowScope::Table(schema))?,
             target,
             CastContext::Assignment,
-            &context.timezone,
+            &context.get_timezone(),
         )
     }
 }
@@ -180,7 +185,7 @@ fn evaluate_inner(
                 text,
                 PgType::create(base),
                 CastContext::Explicit,
-                &context.timezone,
+                &context.get_timezone(),
             )
         }
         ast::Expr::Value(_) | ast::Expr::TypedString(_) => evaluate_literal(expr),
@@ -634,14 +639,19 @@ fn evaluate_inner(
                 );
             }
             if let Some(text) = extract_unknown_string_literal(expr) {
-                coercion::coerce_unknown(text, target, CastContext::Explicit, &context.timezone)
+                coercion::coerce_unknown(
+                    text,
+                    target,
+                    CastContext::Explicit,
+                    &context.get_timezone(),
+                )
             } else {
                 coercion::coerce(
                     evaluate(expr, schema, row, context)?,
                     infer_expression_type(expr, schema)?,
                     target,
                     CastContext::Explicit,
-                    &context.timezone,
+                    &context.get_timezone(),
                 )
             }
         }
@@ -684,7 +694,12 @@ pub(super) fn evaluate_and_coerce(
         return evaluate_array(array, elem_type, context, schema, row, execution);
     }
     if let Some(text) = extract_unknown_string_literal(expression) {
-        coercion::coerce_unknown(text, PgType::create(target), context, &execution.timezone)
+        coercion::coerce_unknown(
+            text,
+            PgType::create(target),
+            context,
+            &execution.get_timezone(),
+        )
     } else {
         let source = infer_expression_type(expression, schema)?;
         coercion::coerce(
@@ -692,7 +707,7 @@ pub(super) fn evaluate_and_coerce(
             source,
             PgType::create(target),
             context,
-            &execution.timezone,
+            &execution.get_timezone(),
         )
     }
 }

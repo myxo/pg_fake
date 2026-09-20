@@ -189,6 +189,7 @@ pub(in crate::executor) fn contains_volatile_expression(expression: &ast::Expr) 
                     | "currval"
                     | "lastval"
                     | "setval"
+                    | "set_config"
             )
         }) {
             found = true;

@@ -1,8 +1,14 @@
-use std::{collections::BTreeMap, time::Duration};
+use std::{
+    collections::{BTreeMap, BTreeSet},
+    sync::{Arc, Mutex},
+    time::Duration,
+};
 
 use sqlparser::ast;
 
-use super::{ColumnMeta, IsolationLevel, QueryResult, Session, StatementResult};
+use super::{
+    ColumnMeta, IsolationLevel, QueryResult, Session, SessionTransactionState, StatementResult,
+};
 use crate::{
     error::{PgError, Result, SqlState},
     value::Value,
@@ -21,7 +27,9 @@ pub(super) struct SessionSettings {
     pub(super) statement_timeout: Duration,
     pub(super) timezone: String,
     pub(super) search_path: Vec<String>,
+    search_path_text: String,
     values: BTreeMap<&'static str, SettingValue>,
+    custom: BTreeMap<String, String>,
 }
 
 #[derive(Clone)]
@@ -30,7 +38,7 @@ enum SettingValue {
     Integer(i64),
     Real(f64),
     Text(String),
-    SearchPath(Vec<String>),
+    SearchPath { names: Vec<String>, text: String },
     Isolation(IsolationLevel),
 }
 
@@ -42,12 +50,21 @@ impl SessionSettings {
             statement_timeout: Duration::ZERO,
             timezone: String::new(),
             search_path: Vec::new(),
+            search_path_text: String::new(),
             values: BTreeMap::new(),
+            custom: BTreeMap::new(),
         };
         for spec in list_settings() {
             let value = match spec.default {
                 SettingDefault::SearchPath(values) => {
-                    SettingValue::SearchPath(values.iter().map(|value| (*value).into()).collect())
+                    let names = values
+                        .iter()
+                        .map(|value| (*value).into())
+                        .collect::<Vec<_>>();
+                    SettingValue::SearchPath {
+                        text: format_search_path(&names),
+                        names,
+                    }
                 }
                 SettingDefault::LockTimeout => SettingValue::Integer(
                     lock_timeout
@@ -58,6 +75,7 @@ impl SessionSettings {
                 SettingDefault::Text(value) => {
                     parse_setting_value(spec, value).expect("registry defaults must be valid")
                 }
+                SettingDefault::Transaction => continue,
             };
             settings.assign_value(spec, value);
         }
@@ -76,8 +94,9 @@ impl SessionSettings {
             (SettingEffect::Isolation, SettingValue::Isolation(value)) => {
                 self.default_isolation = *value
             }
-            (SettingEffect::SearchPath, SettingValue::SearchPath(value)) => {
-                self.search_path = value.clone()
+            (SettingEffect::SearchPath, SettingValue::SearchPath { names, text }) => {
+                self.search_path = names.clone();
+                self.search_path_text = text.clone();
             }
             (SettingEffect::Compatibility | SettingEffect::Planner, _) => {
                 self.values.insert(spec.name, value);
@@ -120,27 +139,10 @@ impl SessionSettings {
                 }
                 .into();
             }
-            SettingEffect::SearchPath => {
-                return self
-                    .search_path
-                    .iter()
-                    .map(|name| {
-                        if !name.is_empty()
-                            && !is_quoted_keyword(name)
-                            && name.bytes().enumerate().all(|(index, byte)| {
-                                byte.is_ascii_lowercase()
-                                    || byte == b'_'
-                                    || (index > 0 && (byte.is_ascii_digit() || byte == b'$'))
-                            })
-                        {
-                            name.clone()
-                        } else {
-                            format!("\"{}\"", name.replace('"', "\"\""))
-                        }
-                    })
-                    .collect::<Vec<_>>()
-                    .join(", ");
+            SettingEffect::TransactionIsolation => {
+                unreachable!("transaction isolation is formatted by the session")
             }
+            SettingEffect::SearchPath => return self.search_path_text.clone(),
             SettingEffect::Compatibility | SettingEffect::Planner => self
                 .values
                 .get(spec.name)
@@ -178,6 +180,103 @@ impl SessionSettings {
     }
 }
 
+#[derive(Clone)]
+pub(crate) struct GucExecutionContext {
+    current: SessionSettings,
+    on_commit: SessionSettings,
+    defaults: SessionSettings,
+    custom_settings: BTreeSet<String>,
+    isolation: IsolationLevel,
+    strict: bool,
+}
+
+impl GucExecutionContext {
+    pub(crate) fn get_timezone(&self) -> String {
+        self.current.timezone.clone()
+    }
+
+    pub(crate) fn get_lock_timeout(&self) -> Duration {
+        self.current.lock_timeout
+    }
+
+    pub(crate) fn get_setting(&self, name: &str, missing_ok: bool) -> Result<Option<String>> {
+        let spec = match resolve_setting(name) {
+            Ok(spec) => spec,
+            Err(error) => {
+                let name = name.to_ascii_lowercase();
+                if let Some(value) = self.current.custom.get(&name) {
+                    return Ok(Some(value.clone()));
+                }
+                if self.custom_settings.contains(&name) {
+                    return Ok(Some(String::new()));
+                }
+                if missing_ok {
+                    return Ok(None);
+                }
+                return Err(error);
+            }
+        };
+        spec.validate_access(self.strict, false)?;
+        Ok(Some(match spec.effect {
+            SettingEffect::TransactionIsolation => format_isolation(self.isolation),
+            _ => self.current.format_value(spec),
+        }))
+    }
+
+    pub(crate) fn set_setting(
+        &mut self,
+        name: &str,
+        text: Option<&str>,
+        local: bool,
+    ) -> Result<String> {
+        let spec = match resolve_setting(name) {
+            Ok(spec) => spec,
+            Err(error) => {
+                if !is_custom_setting_name(name) {
+                    if name.contains('.') {
+                        return Err(create_invalid_custom_setting_name_error(name));
+                    }
+                    return Err(error);
+                }
+                let name = name.to_ascii_lowercase();
+                self.custom_settings.insert(name.clone());
+                let text = text.unwrap_or_default();
+                self.current.custom.insert(name.clone(), text.into());
+                if !local {
+                    self.on_commit.custom.insert(name, text.into());
+                }
+                return Ok(text.into());
+            }
+        };
+        if matches!(spec.effect, SettingEffect::TransactionIsolation) {
+            let Some(text) = text else {
+                return Err(create_cannot_reset_setting_error(spec.name));
+            };
+            let SettingValue::Isolation(isolation) = parse_function_setting_value(spec, text)?
+            else {
+                unreachable!("transaction isolation uses the isolation setting type")
+            };
+            if isolation != self.isolation {
+                return Err(PgError::create(
+                    SqlState::ActiveSqlTransaction,
+                    "transaction isolation level must be set before any query",
+                ));
+            }
+            return Ok(format_isolation(isolation));
+        }
+        spec.validate_access(self.strict, true)?;
+        let value = match text {
+            Some(text) => parse_function_setting_value(spec, text)?,
+            None => self.defaults.read_value(spec),
+        };
+        self.current.assign_value(spec, value.clone());
+        if !local {
+            self.on_commit.assign_value(spec, value);
+        }
+        Ok(self.current.format_value(spec))
+    }
+}
+
 impl Session {
     pub(super) fn describe_setting_statement(
         &self,
@@ -207,7 +306,7 @@ impl Session {
                     .expect("SHOW has columns");
                 return Ok(Some(StatementResult::Query(QueryResult {
                     columns,
-                    rows: vec![vec![Value::Text(self.settings.format_value(spec))]],
+                    rows: vec![vec![Value::Text(self.format_setting(spec))]],
                 })));
             }
             ast::Statement::Reset(reset) => {
@@ -224,10 +323,35 @@ impl Session {
                             }
                             self.reset_setting(spec, &defaults);
                         }
+                        self.settings.custom.values_mut().for_each(String::clear);
+                        self.settings_on_commit
+                            .as_mut()
+                            .expect("RESET runs in a transaction")
+                            .custom
+                            .values_mut()
+                            .for_each(String::clear);
                     }
                     ast::Reset::ConfigurationParameter(name) => {
                         let name = normalize_setting_name(name)?;
-                        let spec = resolve_setting(&name)?;
+                        let spec = match resolve_setting(&name) {
+                            Ok(spec) => spec,
+                            Err(_) if is_custom_setting_name(&name) => {
+                                let name = name.to_ascii_lowercase();
+                                self.custom_settings.insert(name.clone());
+                                self.settings.custom.insert(name.clone(), String::new());
+                                self.settings_on_commit
+                                    .as_mut()
+                                    .expect("RESET runs in a transaction")
+                                    .custom
+                                    .insert(name, String::new());
+                                return Ok(Some(StatementResult::Affected(0)));
+                            }
+                            Err(error) => return Err(error),
+                        };
+                        if matches!(spec.effect, SettingEffect::TransactionIsolation) {
+                            return self
+                                .abort_with_error(create_cannot_reset_setting_error(spec.name));
+                        }
                         spec.validate_access(self.db.strict, true)?;
                         self.reset_setting(
                             spec,
@@ -277,6 +401,26 @@ impl Session {
             _ => return Ok(None),
         };
         let spec = resolve_setting(&name)?;
+        if matches!(spec.effect, SettingEffect::TransactionIsolation) {
+            spec.validate_access(self.db.strict, false)?;
+            if values.len() != 1 {
+                return self.abort_with_error(PgError::create(
+                    SqlState::InvalidParameterValue,
+                    "SET requires a single value",
+                ));
+            }
+            if matches!(values.as_slice(), [ast::Expr::Identifier(ident)] if ident.quote_style.is_none() && ident.value.eq_ignore_ascii_case("default"))
+            {
+                return self.abort_with_error(create_cannot_reset_setting_error(spec.name));
+            }
+            let SettingValue::Isolation(isolation) =
+                parse_setting_value(spec, &parse_setting_text(&values[0], false)?)?
+            else {
+                unreachable!("transaction isolation uses the isolation setting type")
+            };
+            self.set_transaction_isolation(isolation)?;
+            return Ok(Some(StatementResult::Affected(0)));
+        }
         spec.validate_access(self.db.strict, true)?;
         let reset = matches!(values.as_slice(), [ast::Expr::Identifier(ident)] if ident.quote_style.is_none() && (ident.value.eq_ignore_ascii_case("default") || (matches!(spec.kind, SettingType::TimeZone) && ident.value.eq_ignore_ascii_case("local"))));
         if reset {
@@ -294,12 +438,14 @@ impl Session {
                 if values.is_empty() {
                     return Err(create_invalid_setting_error(spec.name));
                 }
-                SettingValue::SearchPath(
-                    values
-                        .iter()
-                        .map(|expr| parse_setting_text(expr, true))
-                        .collect::<Result<Vec<_>>>()?,
-                )
+                let names = values
+                    .iter()
+                    .map(|expr| parse_setting_text(expr, true))
+                    .collect::<Result<Vec<_>>>()?;
+                SettingValue::SearchPath {
+                    text: format_search_path(&names),
+                    names,
+                }
             } else {
                 if values.len() != 1 {
                     return Err(PgError::create(
@@ -335,6 +481,62 @@ impl Session {
     pub(super) fn restore_settings(&mut self, settings: SessionSettings) {
         self.settings = settings;
     }
+
+    fn format_setting(&self, spec: &SettingSpec) -> String {
+        if matches!(spec.effect, SettingEffect::TransactionIsolation) {
+            let isolation = match self.transaction {
+                Some(SessionTransactionState::Active(transaction))
+                | Some(SessionTransactionState::Aborted { transaction }) => transaction.isolation,
+                None => self.settings.default_isolation,
+            };
+            format_isolation(isolation)
+        } else {
+            self.settings.format_value(spec)
+        }
+    }
+
+    pub(super) fn create_guc_execution_context(&self) -> Arc<Mutex<GucExecutionContext>> {
+        Arc::new(Mutex::new(GucExecutionContext {
+            current: self.settings.clone(),
+            on_commit: self
+                .settings_on_commit
+                .clone()
+                .expect("statement has transaction settings"),
+            defaults: SessionSettings::create(self.default_lock_timeout),
+            custom_settings: self.custom_settings.clone(),
+            isolation: match self.transaction.expect("statement has a transaction") {
+                SessionTransactionState::Active(transaction)
+                | SessionTransactionState::Aborted { transaction } => transaction.isolation,
+            },
+            strict: self.db.strict,
+        }))
+    }
+
+    pub(super) fn apply_guc_execution_context(
+        &mut self,
+        context: &Arc<Mutex<GucExecutionContext>>,
+    ) {
+        let context = context.lock().expect("GUC context mutex is poisoned");
+        self.settings = context.current.clone();
+        self.settings_on_commit = Some(context.on_commit.clone());
+        self.custom_settings
+            .extend(context.custom_settings.iter().cloned());
+    }
+
+    pub(super) fn apply_guc_custom_settings(&mut self, context: &Arc<Mutex<GucExecutionContext>>) {
+        let context = context.lock().expect("GUC context mutex is poisoned");
+        self.custom_settings
+            .extend(context.custom_settings.iter().cloned());
+    }
+
+    pub(super) fn abort_with_guc_error<T>(
+        &mut self,
+        context: &Arc<Mutex<GucExecutionContext>>,
+        error: PgError,
+    ) -> Result<T> {
+        self.apply_guc_custom_settings(context);
+        self.abort_with_error(error)
+    }
 }
 
 impl SessionSettings {
@@ -348,7 +550,13 @@ impl SessionSettings {
                 SettingValue::Integer(self.statement_timeout.as_millis() as i64)
             }
             SettingEffect::Isolation => SettingValue::Isolation(self.default_isolation),
-            SettingEffect::SearchPath => SettingValue::SearchPath(self.search_path.clone()),
+            SettingEffect::TransactionIsolation => {
+                unreachable!("transaction isolation has no session value")
+            }
+            SettingEffect::SearchPath => SettingValue::SearchPath {
+                names: self.search_path.clone(),
+                text: self.search_path_text.clone(),
+            },
             SettingEffect::Compatibility | SettingEffect::Planner => self
                 .values
                 .get(spec.name)
@@ -407,6 +615,20 @@ fn create_invalid_setting_error(name: &str) -> PgError {
     PgError::create(
         SqlState::InvalidParameterValue,
         format!("invalid value for parameter {name}"),
+    )
+}
+
+fn create_cannot_reset_setting_error(name: &str) -> PgError {
+    PgError::create(
+        SqlState::FeatureNotSupported,
+        format!("parameter {name:?} cannot be reset"),
+    )
+}
+
+fn create_invalid_custom_setting_name_error(name: &str) -> PgError {
+    PgError::create(
+        SqlState::InvalidName,
+        format!("invalid configuration parameter name {name:?}"),
     )
 }
 
@@ -595,6 +817,113 @@ fn parse_setting_value(spec: &SettingSpec, text: &str) -> Result<SettingValue> {
             unreachable!("search path is parsed from its SQL identifier list")
         }
     }
+}
+
+fn parse_function_setting_value(spec: &SettingSpec, text: &str) -> Result<SettingValue> {
+    if !matches!(spec.kind, SettingType::SearchPath) {
+        return parse_setting_value(spec, text);
+    }
+    let names = parse_search_path(text).ok_or_else(|| create_invalid_setting_error(spec.name))?;
+    Ok(SettingValue::SearchPath {
+        names,
+        text: text.into(),
+    })
+}
+
+fn parse_search_path(text: &str) -> Option<Vec<String>> {
+    let mut values = Vec::new();
+    let mut chars = text.chars().peekable();
+    loop {
+        while chars.next_if(|ch| ch.is_whitespace()).is_some() {}
+        let Some(first) = chars.peek().copied() else {
+            return Some(values);
+        };
+        let value = if first == '"' {
+            chars.next();
+            let mut value = String::new();
+            loop {
+                match chars.next()? {
+                    '"' if chars.peek() == Some(&'"') => {
+                        chars.next();
+                        value.push('"');
+                    }
+                    '"' => break,
+                    ch => value.push(ch),
+                }
+            }
+            value
+        } else {
+            let mut value = String::new();
+            while let Some(ch) = chars.peek().copied() {
+                if ch == ',' || ch.is_whitespace() {
+                    break;
+                }
+                if ch == '"' {
+                    return None;
+                }
+                chars.next();
+                value.push(ch);
+            }
+            if value.is_empty() {
+                return None;
+            }
+            value.to_ascii_lowercase()
+        };
+        values.push(value);
+        while chars.next_if(|ch| ch.is_whitespace()).is_some() {}
+        match chars.next() {
+            None => return Some(values),
+            Some(',') => {
+                let mut remaining = chars.clone();
+                while remaining.next_if(|ch| ch.is_whitespace()).is_some() {}
+                remaining.peek()?;
+            }
+            Some(_) => return None,
+        }
+    }
+}
+
+fn format_isolation(isolation: IsolationLevel) -> String {
+    match isolation {
+        IsolationLevel::ReadCommitted => "read committed",
+        IsolationLevel::RepeatableRead => "repeatable read",
+    }
+    .into()
+}
+
+fn is_custom_setting_name(name: &str) -> bool {
+    let mut parts = name.split('.');
+    let valid = |part: &str| {
+        let mut bytes = part.bytes();
+        bytes
+            .next()
+            .is_some_and(|byte| byte.is_ascii_alphabetic() || byte == b'_' || !byte.is_ascii())
+            && bytes.all(|byte| {
+                byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'$') || !byte.is_ascii()
+            })
+    };
+    parts.clone().count() >= 2 && parts.all(valid)
+}
+
+fn format_search_path(names: &[String]) -> String {
+    names
+        .iter()
+        .map(|name| {
+            if !name.is_empty()
+                && !is_quoted_keyword(name)
+                && name.bytes().enumerate().all(|(index, byte)| {
+                    byte.is_ascii_lowercase()
+                        || byte == b'_'
+                        || (index > 0 && (byte.is_ascii_digit() || byte == b'$'))
+                })
+            {
+                name.clone()
+            } else {
+                format!("\"{}\"", name.replace('"', "\"\""))
+            }
+        })
+        .collect::<Vec<_>>()
+        .join(", ")
 }
 
 fn format_units(value: i64, units: &[(i64, &str)]) -> String {

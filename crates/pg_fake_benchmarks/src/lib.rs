@@ -37,6 +37,11 @@ pub fn list_benchmarks() -> Vec<Benchmark> {
             postgres_comparisons(),
         ),
         build_benchmark(
+            "transaction_local_guc_roundtrip",
+            postgres_values(),
+            postgres_comparisons(),
+        ),
+        build_benchmark(
             "nested_savepoint_release",
             postgres_values(),
             postgres_comparisons(),

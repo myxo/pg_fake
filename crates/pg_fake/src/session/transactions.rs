@@ -135,20 +135,7 @@ impl Session {
                         .default_isolation = isolation;
                     return Ok(Some(StatementResult::Affected(0)));
                 }
-                let Some(SessionTransactionState::Active(mut transaction)) = self.transaction
-                else {
-                    return Ok(Some(StatementResult::Affected(0)));
-                };
-                if (transaction.statement_started || !self.savepoints.is_empty())
-                    && isolation != transaction.isolation
-                {
-                    return self.abort_with_error(PgError::create(
-                        SqlState::ActiveSqlTransaction,
-                        "transaction isolation level must be set before any query",
-                    ));
-                }
-                transaction.isolation = isolation;
-                self.transaction = Some(SessionTransactionState::Active(transaction));
+                self.set_transaction_isolation(isolation)?;
                 return Ok(Some(StatementResult::Affected(0)));
             }
             ast::Statement::Commit { chain, .. } => {
@@ -419,6 +406,23 @@ impl Session {
     pub(super) fn abort_with_error<T>(&mut self, error: PgError) -> Result<T> {
         self.mark_transaction_aborted();
         Err(error)
+    }
+
+    pub(super) fn set_transaction_isolation(&mut self, isolation: IsolationLevel) -> Result<()> {
+        let Some(SessionTransactionState::Active(mut transaction)) = self.transaction else {
+            return Ok(());
+        };
+        if (transaction.statement_started || !self.savepoints.is_empty())
+            && isolation != transaction.isolation
+        {
+            return self.abort_with_error(PgError::create(
+                SqlState::ActiveSqlTransaction,
+                "transaction isolation level must be set before any query",
+            ));
+        }
+        transaction.isolation = isolation;
+        self.transaction = Some(SessionTransactionState::Active(transaction));
+        Ok(())
     }
 }
 

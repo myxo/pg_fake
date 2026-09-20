@@ -34,6 +34,7 @@ pub(super) enum SettingEffect {
     LockTimeout,
     StatementTimeout,
     Isolation,
+    TransactionIsolation,
     SearchPath,
     Compatibility,
     Planner,
@@ -42,6 +43,7 @@ pub(super) enum SettingEffect {
 #[derive(Clone, Copy)]
 pub(super) enum SettingContext {
     Session,
+    Transaction,
     Backend,
     Server,
 }
@@ -50,6 +52,7 @@ pub(super) enum SettingDefault {
     Text(&'static str),
     SearchPath(&'static [&'static str]),
     LockTimeout,
+    Transaction,
 }
 
 pub(super) struct SettingSpec {
@@ -119,6 +122,14 @@ pub(super) fn list_settings() -> &'static [SettingSpec] {
             "read committed",
             Isolation
         ),
+        SettingSpec {
+            name: "transaction_isolation",
+            aliases: &[],
+            kind: Isolation,
+            default: SettingDefault::Transaction,
+            effect: SettingEffect::TransactionIsolation,
+            context: SettingContext::Transaction,
+        },
         SettingSpec {
             name: "search_path",
             aliases: &[],

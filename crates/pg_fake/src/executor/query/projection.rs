@@ -198,7 +198,7 @@ pub(super) fn evaluate_projection_value(
                         .expect("non-null value has a base type"),
                     *data_type,
                     CastContext::Implicit,
-                    &context.timezone,
+                    &context.get_timezone(),
                 )
             }
         }

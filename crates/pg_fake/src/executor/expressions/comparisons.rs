@@ -269,7 +269,7 @@ pub(super) fn evaluate_quantified(
                 element_type,
                 crate::value::PgType::create(comparison_type),
                 CastContext::Implicit,
-                &context.timezone,
+                &context.get_timezone(),
             )?;
             let comparison = if left.is_null() || candidate.is_null() {
                 Value::Null

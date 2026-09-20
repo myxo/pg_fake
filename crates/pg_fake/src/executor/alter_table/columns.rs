@@ -250,7 +250,7 @@ pub(super) fn alter_column(
                         source,
                         target,
                         CastContext::Assignment,
-                        &context.timezone,
+                        &context.get_timezone(),
                     ),
                 })
                 .collect::<Result<Vec<_>>>()?;

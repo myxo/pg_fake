@@ -60,7 +60,12 @@ fn evaluate_mutation_assignment(
     context: &StatementContext,
 ) -> Result<Value> {
     if let Some(text) = extract_unknown_string_literal(expression) {
-        coercion::coerce_unknown(text, target, CastContext::Assignment, &context.timezone)
+        coercion::coerce_unknown(
+            text,
+            target,
+            CastContext::Assignment,
+            &context.get_timezone(),
+        )
     } else {
         coercion::coerce(
             subqueries::evaluate_query_expression(
@@ -69,7 +74,7 @@ fn evaluate_mutation_assignment(
             query::infer_query_expression_type(state, expression, scope)?.base,
             target,
             CastContext::Assignment,
-            &context.timezone,
+            &context.get_timezone(),
         )
     }
 }

@@ -3406,14 +3406,21 @@ fn compare_generated_setting_histories() {
                 .into(),
                 _ => unreachable!(),
             };
-            let sql = match src.any_of("operation", int_in(0..=7)) {
+            let sql = match src.any_of("operation", int_in(0..=10)) {
                 0 => format!("RESET \"{parameter}\""),
                 1 => format!("SET \"{parameter}\" TO DEFAULT"),
                 2 => "RESET ALL".into(),
                 3 => "BEGIN".into(),
                 4 => "ROLLBACK".into(),
                 5 => "COMMIT".into(),
-                _ => format!("SET SESSION \"{parameter}\" = {value}"),
+                6 | 7 => format!("SET SESSION \"{parameter}\" = {value}"),
+                8 => format!("SELECT current_setting('{parameter}')"),
+                9 => format!(
+                    "SELECT set_config('application_name', 'generated{}', {})",
+                    src.any_of("application", int_in(0..=100)),
+                    if src.any("local") { "true" } else { "false" }
+                ),
+                _ => format!("SET LOCAL \"{parameter}\" = {value}"),
             };
             for sql in [sql, format!("SHOW \"{parameter}\"")] {
                 src.log_value("sql", &sql);

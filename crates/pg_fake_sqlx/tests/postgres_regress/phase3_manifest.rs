@@ -737,13 +737,36 @@ pub const FEATURES: &[Feature] = &[
     Feature {
         task: 33,
         name: "transaction-local GUCs",
-        cases: &[Case {
-            id: "set_local_timezone",
-            source: "json.sql:154",
-            setup: &["BEGIN"],
-            sql: "SET LOCAL TIME ZONE 'UTC'",
-            blocker: BlockerKind::Implementation,
-        }],
+        cases: &[
+            Case {
+                id: "set_local_timezone",
+                source: "json.sql:154",
+                setup: &["BEGIN"],
+                sql: "SET LOCAL TIME ZONE 'UTC'",
+                blocker: BlockerKind::Implementation,
+            },
+            Case {
+                id: "current_setting",
+                source: "focused local GUC scenario",
+                setup: &["SET application_name = 'phase3'"],
+                sql: "SELECT current_setting('application_name')",
+                blocker: BlockerKind::Implementation,
+            },
+            Case {
+                id: "set_config_local",
+                source: "focused local GUC scenario",
+                setup: &["BEGIN"],
+                sql: "SELECT set_config('application_name', 'phase3-local', true)",
+                blocker: BlockerKind::Implementation,
+            },
+            Case {
+                id: "show_transaction_isolation",
+                source: "transactions.sql:450",
+                setup: &["BEGIN ISOLATION LEVEL REPEATABLE READ"],
+                sql: "SHOW transaction_isolation",
+                blocker: BlockerKind::Implementation,
+            },
+        ],
     },
     Feature {
         task: 14,

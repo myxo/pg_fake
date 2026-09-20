@@ -198,6 +198,19 @@ pub(super) fn infer_function_return_type(
         }
         "gen_random_uuid" | "uuidv4" | "uuidv7" if arguments.is_empty() => Ok(BaseType::Uuid),
         "pg_is_in_recovery" if arguments.is_empty() => Ok(BaseType::Bool),
+        "current_setting" if matches!(arguments.len(), 1 | 2) => {
+            validate_function_argument(arguments[0], BaseType::Text, schema, &signature_error)?;
+            if let Some(missing_ok) = arguments.get(1) {
+                validate_function_argument(missing_ok, BaseType::Bool, schema, &signature_error)?;
+            }
+            Ok(BaseType::Text)
+        }
+        "set_config" if arguments.len() == 3 => {
+            validate_function_argument(arguments[0], BaseType::Text, schema, &signature_error)?;
+            validate_function_argument(arguments[1], BaseType::Text, schema, &signature_error)?;
+            validate_function_argument(arguments[2], BaseType::Bool, schema, &signature_error)?;
+            Ok(BaseType::Text)
+        }
         "now"
         | "current_timestamp"
         | "transaction_timestamp"
@@ -256,6 +269,8 @@ pub(super) fn infer_function_return_type(
         | "setval"
         | "pg_get_serial_sequence"
         | "pg_is_in_recovery"
+        | "current_setting"
+        | "set_config"
         | "to_regclass"
         | "format_type" => Err(signature_error()),
         _ => Err(PgError::create(
@@ -331,6 +346,90 @@ pub(super) fn evaluate_function(
     }
     match function_name.as_str() {
         "pg_is_in_recovery" => Ok(Value::Bool(false)),
+        "current_setting" => {
+            let name = evaluate_and_coerce(
+                arguments[0],
+                BaseType::Text,
+                CastContext::Implicit,
+                schema,
+                row,
+                context,
+            )?;
+            let missing_ok = if let Some(argument) = arguments.get(1) {
+                evaluate_and_coerce(
+                    argument,
+                    BaseType::Bool,
+                    CastContext::Implicit,
+                    schema,
+                    row,
+                    context,
+                )?
+            } else {
+                Value::Bool(false)
+            };
+            let (Value::Text(name), Value::Bool(missing_ok)) = (name, missing_ok) else {
+                return Ok(Value::Null);
+            };
+            Ok(context
+                .guc
+                .lock()
+                .expect("GUC context mutex is poisoned")
+                .get_setting(&name, missing_ok)?
+                .map(Value::Text)
+                .unwrap_or(Value::Null))
+        }
+        "set_config" => {
+            let name = evaluate_and_coerce(
+                arguments[0],
+                BaseType::Text,
+                CastContext::Implicit,
+                schema,
+                row,
+                context,
+            )?;
+            let value = evaluate_and_coerce(
+                arguments[1],
+                BaseType::Text,
+                CastContext::Implicit,
+                schema,
+                row,
+                context,
+            )?;
+            let local = evaluate_and_coerce(
+                arguments[2],
+                BaseType::Bool,
+                CastContext::Implicit,
+                schema,
+                row,
+                context,
+            )?;
+            let name = match name {
+                Value::Text(name) => name,
+                Value::Null => {
+                    return Err(PgError::create(
+                        SqlState::NullValueNotAllowed,
+                        "SET requires parameter name",
+                    ));
+                }
+                _ => unreachable!("set_config name is coerced to text"),
+            };
+            let value = match value {
+                Value::Text(value) => Some(value),
+                Value::Null => None,
+                _ => unreachable!("set_config value is coerced to text"),
+            };
+            let local = match local {
+                Value::Bool(local) => local,
+                Value::Null => false,
+                _ => unreachable!("set_config local flag is coerced to boolean"),
+            };
+            let value = context
+                .guc
+                .lock()
+                .expect("GUC context mutex is poisoned")
+                .set_setting(&name, value.as_deref(), local)?;
+            Ok(Value::Text(value))
+        }
         "to_regclass" => {
             let name = evaluate_and_coerce(
                 arguments[0],

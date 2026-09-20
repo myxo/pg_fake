@@ -219,7 +219,7 @@ fn materialize_table_factor_rows(
                 text,
                 PgType::create(base),
                 CastContext::Implicit,
-                &context.timezone,
+                &context.get_timezone(),
             )?
         } else {
             let source =
@@ -238,7 +238,7 @@ fn materialize_table_factor_rows(
                 source,
                 PgType::create(base),
                 CastContext::Implicit,
-                &context.timezone,
+                &context.get_timezone(),
             )?
         };
         return Ok(json::evaluate_json_expansion(&name, value, ordinality)?

@@ -72,12 +72,19 @@ share a typed registry. Semantic settings are `TimeZone`, `lock_timeout`,
 `application_name` and UTF-8 `client_encoding` are supported, including
 `SET NAMES`, `SET SCHEMA`, and `TIME ZONE` aliases. Fresh sessions use the
 configured database lock timeout, UTC, and `"$user", public` as their search path.
+`SET LOCAL` applies to every registered setting and restores values across
+commit, rollback, and savepoints. `current_setting` and `set_config` use the
+same validation and support PostgreSQL custom names containing a namespace dot.
+`transaction_isolation` reports the active transaction level.
 
 ```sql
 SET SESSION lock_timeout = '1.5s';
 SHOW lock_timeout;
 SET TIME ZONE 'Europe/Paris';
 SET application_name = 'test-worker';
+SELECT set_config('application_name', 'local-worker', true);
+SELECT current_setting('application_name');
+SHOW transaction_isolation;
 RESET ALL;
 ```
 
@@ -87,7 +94,6 @@ prefix. READ COMMITTED and REPEATABLE READ defaults are implemented; other
 isolation levels and non-UTF-8 encodings remain explicit unsupported features.
 Time zones support named IANA zones and numeric offsets; arbitrary POSIX zone
 rules and interval-valued settings remain outside this registry's current surface.
-GUC functions remain later work.
 
 ## Command-line interface
 

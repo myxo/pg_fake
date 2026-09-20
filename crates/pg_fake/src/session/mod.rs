@@ -22,7 +22,7 @@ mod do_block;
 mod locking;
 mod prepared;
 mod savepoints;
-mod settings;
+pub(crate) mod settings;
 mod transactions;
 
 pub use prepared::PreparedStatement;
@@ -40,6 +40,7 @@ pub struct Session {
     transaction: Option<SessionTransactionState>,
     savepoints: Vec<savepoints::Savepoint>,
     settings: SessionSettings,
+    custom_settings: BTreeSet<String>,
     default_lock_timeout: Duration,
     settings_undo: Option<SessionSettings>,
     settings_on_commit: Option<SessionSettings>,
@@ -63,6 +64,7 @@ impl Session {
             transaction: None,
             savepoints: Vec::new(),
             settings: SessionSettings::create(lock_timeout),
+            custom_settings: BTreeSet::new(),
             default_lock_timeout: lock_timeout,
             settings_undo: None,
             settings_on_commit: None,
@@ -294,12 +296,13 @@ impl Session {
             state.sequence_values.clone(),
             self.sequence_session.clone(),
         );
+        let guc = self.create_guc_execution_context();
         let context = executor::StatementContext {
             command_id,
             transaction_timestamp: transaction.transaction_timestamp,
             statement_timestamp: statement_timestamp.expect("fallback captures statement time"),
             clock_timestamp: self.db.read_clock(),
-            timezone: self.settings.timezone.clone(),
+            guc: guc.clone(),
             deadline: statement_deadline,
             rng: self.db.rng.clone(),
             sequences,
@@ -372,7 +375,7 @@ impl Session {
                 self.defer_all_constraints,
             ) {
                 Ok(acquired) => acquired,
-                Err(error) => return self.abort_with_error(error),
+                Err(error) => return self.abort_with_guc_error(&guc, error),
             };
             acquired_row_locks = !locked_rows.is_empty();
             state = acquired_state;
@@ -388,7 +391,10 @@ impl Session {
                     &context,
                 ) {
                     Ok(statement) => statement,
-                    Err(error) => return self.abort_with_error(error),
+                    Err(error) => {
+                        drop(state);
+                        return self.abort_with_guc_error(&guc, error);
+                    }
                 },
             )
         } else {
@@ -405,7 +411,10 @@ impl Session {
                     &context,
                 ) {
                     Ok(statement) => statement,
-                    Err(error) => return self.abort_with_error(error),
+                    Err(error) => {
+                        drop(state);
+                        return self.abort_with_guc_error(&guc, error);
+                    }
                 },
             )
         } else {
@@ -429,7 +438,7 @@ impl Session {
             self.defer_all_constraints,
         ) {
             Ok(acquired) => acquired,
-            Err(error) => return self.abort_with_error(error),
+            Err(error) => return self.abort_with_guc_error(&guc, error),
         };
         acquired_row_locks |= !locked_rows.is_empty();
         let mutation_targets =
@@ -461,14 +470,14 @@ impl Session {
                 if let crate::advisory::PendingAdvisory::Waiting(request) = pending {
                     state = match locking::acquire_advisory_lock(
                         &condvar,
-                        self.settings.lock_timeout,
+                        context.get_lock_timeout(),
                         statement_deadline,
                         state,
                         request,
                         &context,
                     ) {
                         Ok(state) => state,
-                        Err(error) => return self.abort_with_error(error),
+                        Err(error) => return self.abort_with_guc_error(&guc, error),
                     };
                     state.load_catalog(
                         Some(transaction.xid),
@@ -482,6 +491,7 @@ impl Session {
         };
         match result {
             Ok(result) => {
+                self.apply_guc_execution_context(&guc);
                 if let Some(catalog_before) = catalog_before {
                     state.record_catalog_changes(
                         &catalog_before,
@@ -511,7 +521,7 @@ impl Session {
             }
             Err(error) => {
                 drop(state);
-                self.abort_with_error(error)
+                self.abort_with_guc_error(&guc, error)
             }
         }
     }

@@ -340,6 +340,22 @@ fn infer_function_parameters(
         }
         return Ok(());
     }
+    if name == "current_setting" {
+        for (argument, expected) in arguments.iter().zip([BaseType::Text, BaseType::Bool]) {
+            constrain_parameter_type(argument, Some(expected), types)?;
+        }
+        return Ok(());
+    }
+    if name == "set_config" {
+        for (argument, expected) in
+            arguments
+                .iter()
+                .zip([BaseType::Text, BaseType::Text, BaseType::Bool])
+        {
+            constrain_parameter_type(argument, Some(expected), types)?;
+        }
+        return Ok(());
+    }
     let expected = match name.as_str() {
         "length" | "lower" | "upper" | "btrim" | "string_agg" => Some(BaseType::Text),
         _ => arguments
