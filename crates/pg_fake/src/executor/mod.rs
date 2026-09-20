@@ -47,8 +47,8 @@ pub(crate) use context::{
 };
 pub(crate) use ctes::{expand_ctes_for_analysis, materialize_statement_ctes};
 pub(crate) use expressions::{
-    create_constant_expression_schema, extract_unknown_string_literal, infer_expression_type,
-    is_null_literal, is_parameter_placeholder, resolve_runtime_function,
+    create_constant_expression_schema, expand_between_expression, extract_unknown_string_literal,
+    infer_expression_type, is_null_literal, is_parameter_placeholder, resolve_runtime_function,
 };
 pub(crate) use foreign_keys::{contains_deferred_foreign_keys, validate_deferred_foreign_keys};
 pub(crate) use indexes::evaluate_index_predicate;
@@ -63,7 +63,10 @@ pub(crate) use locks::{
     mutation_locks_cover_targets,
 };
 pub(crate) use prepared::{PreparedQueryPlan, build_prepared_query_plan, execute_prepared_query};
-pub(crate) use procedural::{coerce_procedural_value, substitute_procedural_references};
+pub(crate) use procedural::{
+    coerce_procedural_value, format_procedural_exception, substitute_procedural_references,
+    validate_procedural_raise_arity,
+};
 pub(crate) use query::LOCK_PENDING;
 pub(crate) use query::{describe_query_result_columns, detect_statement_features};
 pub(crate) use scope::{

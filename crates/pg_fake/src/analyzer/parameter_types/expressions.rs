@@ -173,6 +173,17 @@ pub(super) fn infer_expression_parameters(
                 }
                 Ok(())
             })(),
+            ast::Expr::Between {
+                expr,
+                negated,
+                low,
+                high,
+            } => infer_expression_parameters(
+                &executor::expand_between_expression(expr, low, high, *negated),
+                schema,
+                expected,
+                types,
+            ),
             ast::Expr::InList { expr, list, .. } => (|| {
                 let left = match expr.as_ref() {
                     ast::Expr::Tuple(fields) => fields.as_slice(),

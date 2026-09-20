@@ -985,3 +985,55 @@ fn procedural_evaluation_order_matches_postgres() {
         );
     });
 }
+
+#[test]
+fn matches_postgres_for_trigger_exceptions_and_between_checks() {
+    let server = common::start_postgres_server();
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap();
+    runtime.block_on(async {
+        let mut postgres = PgConnection::connect(&server.url).await.unwrap();
+        let mut fake = PgFakeConnection::new(Db::create());
+        for sql in [
+            "CREATE TEMP TABLE attempts_between (failed_attempts SMALLINT NOT NULL DEFAULT 0 CHECK (failed_attempts BETWEEN 0 AND 5))",
+            "INSERT INTO attempts_between DEFAULT VALUES",
+            "INSERT INTO attempts_between VALUES (5)",
+            "INSERT INTO attempts_between VALUES (-1)",
+            "INSERT INTO attempts_between VALUES (6)",
+            "UPDATE attempts_between SET failed_attempts = 6",
+            "CREATE TEMP TABLE currencies_raise (currency TEXT)",
+            "CREATE FUNCTION pg_temp.validate_currency_raise() RETURNS TRIGGER AS $$ BEGIN IF NEW.currency NOT IN ('RUB', 'USD') THEN RAISE EXCEPTION 'unsupported currency: % (%%)', NEW.currency USING HINT = 'Use RUB or USD'; END IF; RETURN NEW; END; $$ LANGUAGE plpgsql",
+            "CREATE TRIGGER validate_currency_raise BEFORE INSERT OR UPDATE ON currencies_raise FOR EACH ROW EXECUTE FUNCTION pg_temp.validate_currency_raise()",
+            "INSERT INTO currencies_raise VALUES ('RUB'), ('USD'), (NULL)",
+        ] { execute_both(&mut postgres, &mut fake, sql).await; }
+        for sql in [
+            "INSERT INTO currencies_raise VALUES ('USD'), ('EUR')",
+            "UPDATE currencies_raise SET currency = 'EUR'",
+        ] { compare_raise_error(&mut postgres, &mut fake, sql).await; }
+        let expected: Vec<Option<String>> = sqlx::query_scalar("SELECT currency FROM currencies_raise ORDER BY currency").fetch_all(&mut postgres).await.unwrap();
+        let actual: Vec<Option<String>> = sqlx::query_scalar("SELECT currency FROM currencies_raise ORDER BY currency").fetch_all(&mut fake).await.unwrap();
+        assert_eq!(actual, expected);
+        for value in ["NULL", "-1", "0", "3", "5", "6"] {
+            for low in ["NULL", "0", "5"] {
+                for high in ["NULL", "0", "5"] {
+                    for operator in ["BETWEEN", "NOT BETWEEN"] {
+                        let sql = format!("SELECT {value}::smallint {operator} {low}::integer AND {high}::bigint");
+                        let expected: Option<bool> = sqlx::query_scalar(&sql).fetch_one(&mut postgres).await.unwrap();
+                        let actual: Option<bool> = sqlx::query_scalar(&sql).fetch_one(&mut fake).await.unwrap();
+                        assert_eq!(actual, expected, "{sql}");
+                    }
+                }
+            }
+        }
+        for sql in [
+            "CREATE FUNCTION pg_temp.invalid_raise() RETURNS TRIGGER AS $$ BEGIN IF false THEN RAISE EXCEPTION '%'; END IF; RETURN NEW; END; $$ LANGUAGE plpgsql",
+            "CREATE FUNCTION pg_temp.invalid_raise() RETURNS TRIGGER AS $$ BEGIN RAISE EXCEPTION '%%', 1; RETURN NEW; END; $$ LANGUAGE plpgsql",
+            "CREATE OR REPLACE FUNCTION pg_temp.validate_currency_raise() RETURNS TRIGGER AS $$ BEGIN RAISE EXCEPTION 'value: %, percent: %%', NEW.currency; END; $$ LANGUAGE plpgsql",
+        ] { execute_both(&mut postgres, &mut fake, sql).await; }
+        compare_raise_error(&mut postgres, &mut fake, "INSERT INTO currencies_raise VALUES (NULL)").await;
+        execute_both(&mut postgres, &mut fake, "CREATE OR REPLACE FUNCTION pg_temp.validate_currency_raise() RETURNS TRIGGER AS $$ BEGIN RAISE EXCEPTION 'value' USING HINT = NEW.currency; END; $$ LANGUAGE plpgsql").await;
+        compare_raise_error(&mut postgres, &mut fake, "INSERT INTO currencies_raise VALUES (NULL)").await;
+    });
+}

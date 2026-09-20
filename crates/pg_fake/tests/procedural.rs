@@ -1180,3 +1180,115 @@ fn fires_before_update_triggers_for_foreign_key_actions() {
         ]
     );
 }
+
+#[test]
+fn rejects_trigger_rows_with_formatted_exceptions() {
+    let db = Db::create();
+    let mut session = db.create_session();
+    session
+        .execute(
+            r#"
+        CREATE TABLE currencies (currency TEXT);
+        CREATE FUNCTION validate_currency() RETURNS TRIGGER AS $$
+        BEGIN
+            IF NEW.currency NOT IN ('RUB', 'USD') THEN
+                RAISE EXCEPTION 'unsupported currency: % (%%)', NEW.currency
+                    USING HINT = 'Use RUB or USD';
+            END IF;
+            RETURN NEW;
+        END;
+        $$ LANGUAGE plpgsql;
+        CREATE TRIGGER validate_currency BEFORE INSERT OR UPDATE ON currencies
+            FOR EACH ROW EXECUTE FUNCTION validate_currency();
+        INSERT INTO currencies VALUES ('RUB'), ('USD'), (NULL);
+    "#,
+        )
+        .unwrap();
+    for sql in [
+        "INSERT INTO currencies VALUES ('RUB'), ('EUR')",
+        "UPDATE currencies SET currency = 'EUR'",
+    ] {
+        let error = session.execute(sql).unwrap_err();
+        assert_eq!(error.sqlstate, SqlState::RaiseException);
+        assert_eq!(error.message, "unsupported currency: EUR (%)");
+        assert_eq!(error.hint.as_deref(), Some("Use RUB or USD"));
+        assert_eq!(
+            query_rows(&mut session, "SELECT currency FROM currencies"),
+            vec![
+                vec![Value::Text("RUB".into())],
+                vec![Value::Text("USD".into())],
+                vec![Value::Null],
+            ]
+        );
+    }
+    session.execute("BEGIN; SAVEPOINT retry").unwrap();
+    assert_eq!(
+        session
+            .execute("INSERT INTO currencies VALUES ('EUR')")
+            .unwrap_err()
+            .sqlstate,
+        SqlState::RaiseException
+    );
+    assert_eq!(
+        session.execute("SELECT 1").unwrap_err().sqlstate.get_code(),
+        "25P02"
+    );
+    session
+        .execute("ROLLBACK TO retry; INSERT INTO currencies VALUES ('USD'); COMMIT")
+        .unwrap();
+    for raise in ["RAISE EXCEPTION '%'", "RAISE EXCEPTION '%%', 1"] {
+        let sql = format!(
+            "CREATE FUNCTION invalid_raise() RETURNS TRIGGER AS $$ BEGIN IF false THEN {raise}; END IF; RETURN NEW; END; $$ LANGUAGE plpgsql"
+        );
+        assert_eq!(
+            session.execute(&sql).unwrap_err().sqlstate,
+            SqlState::SyntaxError
+        );
+    }
+}
+
+#[test]
+fn enforces_between_checks_and_infers_parameters() {
+    let db = Db::create();
+    let mut session = db.create_session();
+    session.execute("CREATE TABLE attempts (failed_attempts SMALLINT NOT NULL DEFAULT 0 CHECK (failed_attempts BETWEEN 0 AND 5)); INSERT INTO attempts DEFAULT VALUES; INSERT INTO attempts VALUES (5)").unwrap();
+    for sql in [
+        "INSERT INTO attempts VALUES (-1)",
+        "INSERT INTO attempts VALUES (6)",
+        "UPDATE attempts SET failed_attempts = 6",
+    ] {
+        assert_eq!(
+            session.execute(sql).unwrap_err().sqlstate,
+            SqlState::CheckViolation
+        );
+    }
+    assert_eq!(
+        query_rows(
+            &mut session,
+            "SELECT failed_attempts FROM attempts ORDER BY failed_attempts"
+        ),
+        vec![vec![Value::Int2(0)], vec![Value::Int2(5)]]
+    );
+    assert_eq!(
+        query_rows(
+            &mut session,
+            "SELECT 0 BETWEEN 0 AND 5, 5 BETWEEN 0 AND 5, 6 NOT BETWEEN 0 AND 5, 1 BETWEEN NULL AND 0, 1 NOT BETWEEN NULL AND 0, NULL BETWEEN 0 AND 5"
+        ),
+        vec![vec![
+            Value::Bool(true),
+            Value::Bool(true),
+            Value::Bool(true),
+            Value::Bool(false),
+            Value::Bool(true),
+            Value::Null
+        ]]
+    );
+    let prepared = session.prepare("SELECT $1 BETWEEN 0 AND 5").unwrap();
+    assert_eq!(
+        session
+            .query_prepared(&prepared, &[Value::Int4(3)])
+            .unwrap()
+            .rows,
+        vec![vec![Value::Bool(true)]]
+    );
+}

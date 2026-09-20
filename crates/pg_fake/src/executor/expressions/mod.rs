@@ -46,6 +46,39 @@ use functions::{evaluate_function, extract_datetime_field};
 use literals::parse_integer_literal;
 use types::{infer_array_type, resolve_expression_list_type};
 
+pub(crate) fn expand_between_expression(
+    expr: &ast::Expr,
+    low: &ast::Expr,
+    high: &ast::Expr,
+    negated: bool,
+) -> ast::Expr {
+    ast::Expr::BinaryOp {
+        left: Box::new(ast::Expr::BinaryOp {
+            left: Box::new(expr.clone()),
+            op: if negated {
+                ast::BinaryOperator::Lt
+            } else {
+                ast::BinaryOperator::GtEq
+            },
+            right: Box::new(low.clone()),
+        }),
+        op: if negated {
+            ast::BinaryOperator::Or
+        } else {
+            ast::BinaryOperator::And
+        },
+        right: Box::new(ast::Expr::BinaryOp {
+            left: Box::new(expr.clone()),
+            op: if negated {
+                ast::BinaryOperator::Gt
+            } else {
+                ast::BinaryOperator::LtEq
+            },
+            right: Box::new(high.clone()),
+        }),
+    }
+}
+
 #[cfg_attr(feature = "execution-log", tracing::instrument(skip_all))]
 pub(super) fn evaluate_assignment_expression(
     expr: &ast::Expr,
@@ -397,6 +430,17 @@ fn evaluate_inner(
         ast::Expr::IsNotNull(expr) => Ok(Value::Bool(
             !evaluate(expr, schema, row, context)?.is_null(),
         )),
+        ast::Expr::Between {
+            expr,
+            negated,
+            low,
+            high,
+        } => evaluate(
+            &expand_between_expression(expr, low, high, *negated),
+            schema,
+            row,
+            context,
+        ),
         ast::Expr::InList {
             expr,
             list,

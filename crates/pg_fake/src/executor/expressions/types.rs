@@ -256,6 +256,15 @@ pub(crate) fn infer_expression_type(expr: &ast::Expr, schema: RowScope<'_>) -> R
             infer_expression_type(expression, schema)?;
             Ok(BaseType::Bool)
         }
+        ast::Expr::Between {
+            expr,
+            negated,
+            low,
+            high,
+        } => infer_expression_type(
+            &super::expand_between_expression(expr, low, high, *negated),
+            schema,
+        ),
         ast::Expr::InList { expr, list, .. } => {
             validate_membership_types(expr, list, schema)?;
             Ok(BaseType::Bool)

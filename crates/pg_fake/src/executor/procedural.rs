@@ -38,6 +38,69 @@ fn extract_function_body(create: &ast::CreateFunction) -> Result<String> {
     })
 }
 
+pub(crate) fn format_procedural_exception(format: &str, arguments: &[Value]) -> Result<String> {
+    let mut result = String::new();
+    let mut arguments = arguments.iter();
+    let mut characters = format.chars();
+    while let Some(character) = characters.next() {
+        if character != '%' {
+            result.push(character);
+            continue;
+        }
+        if characters.clone().next() == Some('%') {
+            characters.next();
+            result.push('%');
+            continue;
+        }
+        let argument = arguments.next().ok_or_else(|| {
+            PgError::create(
+                SqlState::SyntaxError,
+                "too few parameters specified for RAISE",
+            )
+        })?;
+        if argument.is_null() {
+            result.push_str("<NULL>");
+        } else {
+            result.push_str(&argument.format_postgres_text());
+        }
+    }
+    if arguments.next().is_some() {
+        return Err(PgError::create(
+            SqlState::SyntaxError,
+            "too many parameters specified for RAISE",
+        ));
+    }
+    Ok(result)
+}
+
+pub(crate) fn validate_procedural_raise_arity(statements: &[ast::PlPgSqlStatement]) -> Result<()> {
+    for statement in statements {
+        match statement {
+            ast::PlPgSqlStatement::If {
+                branches,
+                else_statements,
+            } => {
+                for branch in branches {
+                    validate_procedural_raise_arity(&branch.statements)?;
+                }
+                if let Some(statements) = else_statements {
+                    validate_procedural_raise_arity(statements)?;
+                }
+            }
+            ast::PlPgSqlStatement::RaiseException {
+                format, arguments, ..
+            } => {
+                let format = format.clone().into_string().ok_or_else(|| {
+                    PgError::create(SqlState::SyntaxError, "RAISE format must be a string")
+                })?;
+                format_procedural_exception(&format, &vec![Value::Null; arguments.len()])?;
+            }
+            _ => {}
+        }
+    }
+    Ok(())
+}
+
 fn validate_trigger_statements(statements: &[ast::PlPgSqlStatement]) -> Result<()> {
     for statement in statements {
         match statement {
@@ -61,6 +124,7 @@ fn validate_trigger_statements(statements: &[ast::PlPgSqlStatement]) -> Result<(
                 if normalize_identifier(identifier) == "new" => {}
             ast::PlPgSqlStatement::Return(ast::Expr::Value(value))
                 if matches!(value.value, ast::Value::Null) => {}
+            ast::PlPgSqlStatement::RaiseException { .. } => {}
             _ => return reject_unsupported("trigger function statement is not implemented"),
         }
     }
@@ -106,6 +170,7 @@ pub(super) fn execute_create_function(
         return reject_unsupported("trigger function declarations are not implemented");
     }
     validate_trigger_statements(&body.statements)?;
+    validate_procedural_raise_arity(&body.statements)?;
     let name = normalize_relation_name(&create.name)?;
     let name = state.catalog.resolve_function_name(&name)?;
     state
@@ -436,6 +501,35 @@ fn execute_trigger_statements(
                 if matches!(value.value, ast::Value::Null) =>
             {
                 return Ok(Some(TriggerReturn::Skip));
+            }
+            ast::PlPgSqlStatement::RaiseException {
+                format,
+                arguments,
+                hint,
+            } => {
+                let format = format
+                    .clone()
+                    .into_string()
+                    .expect("RAISE format was validated");
+                let arguments = arguments
+                    .iter()
+                    .map(|argument| evaluate_trigger_expression(argument, scope, row, context))
+                    .collect::<Result<Vec<_>>>()?;
+                let mut error = PgError::create(
+                    SqlState::RaiseException,
+                    format_procedural_exception(&format, &arguments)?,
+                );
+                if let Some(hint) = hint {
+                    let hint = evaluate_trigger_expression(hint, scope, row, context)?;
+                    if hint.is_null() {
+                        return Err(PgError::create(
+                            SqlState::NullValueNotAllowed,
+                            "RAISE statement option cannot be null",
+                        ));
+                    }
+                    error.hint = Some(hint.format_postgres_text());
+                }
+                return Err(error);
             }
             _ => return reject_unsupported("trigger function statement is not implemented"),
         }

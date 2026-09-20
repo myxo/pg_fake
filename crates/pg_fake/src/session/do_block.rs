@@ -150,69 +150,6 @@ fn substitute_procedural_statement_locals(
     let _ = statement.visit(&mut substituter);
 }
 
-fn format_procedural_exception(format: &str, arguments: &[Value]) -> Result<String> {
-    let mut result = String::new();
-    let mut arguments = arguments.iter();
-    let mut characters = format.chars();
-    while let Some(character) = characters.next() {
-        if character != '%' {
-            result.push(character);
-            continue;
-        }
-        if characters.clone().next() == Some('%') {
-            characters.next();
-            result.push('%');
-            continue;
-        }
-        let argument = arguments.next().ok_or_else(|| {
-            PgError::create(
-                SqlState::SyntaxError,
-                "too few parameters specified for RAISE",
-            )
-        })?;
-        if argument.is_null() {
-            result.push_str("<NULL>");
-        } else {
-            result.push_str(&argument.format_postgres_text());
-        }
-    }
-    if arguments.next().is_some() {
-        return Err(PgError::create(
-            SqlState::SyntaxError,
-            "too many parameters specified for RAISE",
-        ));
-    }
-    Ok(result)
-}
-
-fn validate_procedural_raise_arity(statements: &[ast::PlPgSqlStatement]) -> Result<()> {
-    for statement in statements {
-        match statement {
-            ast::PlPgSqlStatement::If {
-                branches,
-                else_statements,
-            } => {
-                for branch in branches {
-                    validate_procedural_raise_arity(&branch.statements)?;
-                }
-                if let Some(statements) = else_statements {
-                    validate_procedural_raise_arity(statements)?;
-                }
-            }
-            ast::PlPgSqlStatement::RaiseException {
-                format, arguments, ..
-            } => {
-                let format = format.clone().into_string().ok_or_else(|| {
-                    PgError::create(SqlState::SyntaxError, "RAISE format must be a string")
-                })?;
-                format_procedural_exception(&format, &vec![Value::Null; arguments.len()])?;
-            }
-            _ => {}
-        }
-    }
-    Ok(())
-}
-
 fn validate_procedural_targets(
     statements: &[ast::PlPgSqlStatement],
     locals: &BTreeSet<String>,
@@ -597,7 +534,7 @@ impl Session {
                             self.evaluate_procedural_expression(argument, locals, procedural)
                         })
                         .collect::<Result<Vec<_>>>()?;
-                    let message = format_procedural_exception(&format, &arguments)?;
+                    let message = executor::format_procedural_exception(&format, &arguments)?;
                     let mut error = PgError::create(SqlState::RaiseException, message);
                     if let Some(hint) = hint {
                         let hint = self.evaluate_procedural_expression(hint, locals, procedural)?;
@@ -666,7 +603,7 @@ impl Session {
         let block = parser
             .parse_plpgsql()
             .map_err(|error| PgError::create(SqlState::SyntaxError, error.to_string()))?;
-        validate_procedural_raise_arity(&block.statements)?;
+        executor::validate_procedural_raise_arity(&block.statements)?;
         let local_names = block
             .declarations
             .iter()
