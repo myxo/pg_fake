@@ -1,5 +1,5 @@
 use pg_fake_sqlx::{Db, PgFakeConnection};
-use sqlx::{Column, Connection, Row, TypeInfo};
+use sqlx::{Column, Connection, Executor, Row, Statement, TypeInfo};
 use sqlx_postgres::PgConnection;
 
 mod common;
@@ -74,6 +74,16 @@ fn matches_migration_data_transform_queries() {
         "SELECT 1 ~ '1'",
         "SELECT count()",
         "SELECT count() OVER (PARTITION BY id) FROM transform_source",
+        "SELECT lag(id) IGNORE NULLS OVER () FROM transform_window_edges",
+        "SELECT lag(id) RESPECT NULLS OVER () FROM transform_window_edges",
+        "SELECT lag(id, 1, 1, 1) OVER () FROM transform_window_edges",
+        "SELECT nth_value(id, 0) OVER () FROM transform_window_edges",
+        "SELECT lag(id, NULL, 'x') OVER () FROM transform_window_edges",
+        "SELECT lag(id, 0, 'x') OVER () FROM transform_window_edges",
+        "SELECT lag(id, 1, 'x') OVER () FROM transform_window_edges WHERE false",
+        "SELECT nth_value(id, '2147483648') OVER () FROM transform_window_edges WHERE false",
+        "SELECT lag(id, 1, 'x'::integer) OVER () FROM transform_window_edges WHERE false",
+        "SELECT nth_value(id, '2147483648'::integer) OVER () FROM transform_window_edges WHERE false",
         "SELECT 9223372036854775807::bigint * 2::bigint",
         "SELECT 'not-a-uuid'::uuid",
         "SELECT 'not-a-number'::numeric",
@@ -82,6 +92,166 @@ fn matches_migration_data_transform_queries() {
     ] {
         assert_statement_allow_error(&runtime, &mut postgres, &mut fake, sql, RowOrder::Ordered);
     }
+
+    let parameter_sql = "SELECT lag(id, $1, $2) OVER (ORDER BY id), \
+                                lead(id, $1, $2) OVER (ORDER BY id), \
+                                nth_value(id, $3) OVER (ORDER BY id) \
+                         FROM transform_window_edges ORDER BY id";
+    let postgres_rows = runtime
+        .block_on(
+            sqlx::query(parameter_sql)
+                .bind(2_i32)
+                .bind(-1_i32)
+                .bind(2_i32)
+                .fetch_all(&mut postgres),
+        )
+        .unwrap();
+    let fake_rows = runtime
+        .block_on(
+            sqlx::query(parameter_sql)
+                .bind(2_i32)
+                .bind(-1_i32)
+                .bind(2_i32)
+                .fetch_all(&mut fake),
+        )
+        .unwrap();
+    let postgres_values = postgres_rows
+        .iter()
+        .map(|row| {
+            (0..3)
+                .map(|index| row.get::<Option<i32>, _>(index))
+                .collect::<Vec<_>>()
+        })
+        .collect::<Vec<_>>();
+    let fake_values = fake_rows
+        .iter()
+        .map(|row| {
+            (0..3)
+                .map(|index| row.get::<Option<i32>, _>(index))
+                .collect::<Vec<_>>()
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(fake_values, postgres_values);
+    let postgres_window_metadata = postgres_rows[0]
+        .columns()
+        .iter()
+        .map(|column| {
+            (
+                column.name().to_owned(),
+                column.type_info().name().to_owned(),
+            )
+        })
+        .collect::<Vec<_>>();
+    let fake_window_metadata = fake_rows[0]
+        .columns()
+        .iter()
+        .map(|column| {
+            (
+                column.name().to_owned(),
+                column.type_info().name().to_owned(),
+            )
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(fake_window_metadata, postgres_window_metadata);
+
+    for sql in [
+        "CREATE TABLE transform_window_times (id INTEGER, value TIMESTAMPTZ)",
+        "INSERT INTO transform_window_times VALUES (1, '2024-01-01 00:00:00+00')",
+        "SET TIME ZONE 'UTC'",
+    ] {
+        assert_statement(&runtime, &mut postgres, &mut fake, sql, RowOrder::Ordered);
+    }
+    let prepared_time_sql = "SELECT lag(value, 1, '2020-01-01 00:00') OVER (ORDER BY id) \
+         FROM transform_window_times";
+    let postgres_time_statement = runtime
+        .block_on(postgres.prepare(prepared_time_sql))
+        .unwrap();
+    let fake_time_statement = runtime.block_on(fake.prepare(prepared_time_sql)).unwrap();
+    assert_statement(
+        &runtime,
+        &mut postgres,
+        &mut fake,
+        "SET TIME ZONE '+03:00'",
+        RowOrder::Ordered,
+    );
+    let postgres_time = runtime
+        .block_on(postgres_time_statement.query().fetch_one(&mut postgres))
+        .unwrap()
+        .get::<chrono::DateTime<chrono::Utc>, _>(0);
+    let fake_time = runtime
+        .block_on(fake_time_statement.query().fetch_one(&mut fake))
+        .unwrap()
+        .get::<chrono::DateTime<chrono::Utc>, _>(0);
+    assert_eq!(fake_time, postgres_time);
+
+    assert_statement(
+        &runtime,
+        &mut postgres,
+        &mut fake,
+        "SET TIME ZONE 'UTC'",
+        RowOrder::Ordered,
+    );
+    let explicit_prepared_time_sql = "SELECT lag(value, 1, ('2020-01-01 00:00')::timestamptz) OVER (ORDER BY id) \
+         FROM transform_window_times";
+    let postgres_explicit_time_statement = runtime
+        .block_on(postgres.prepare(explicit_prepared_time_sql))
+        .unwrap();
+    let fake_explicit_time_statement = runtime
+        .block_on(fake.prepare(explicit_prepared_time_sql))
+        .unwrap();
+    assert_statement(
+        &runtime,
+        &mut postgres,
+        &mut fake,
+        "SET TIME ZONE '+03:00'",
+        RowOrder::Ordered,
+    );
+    let postgres_explicit_time = runtime
+        .block_on(
+            postgres_explicit_time_statement
+                .query()
+                .fetch_one(&mut postgres),
+        )
+        .unwrap()
+        .get::<chrono::DateTime<chrono::Utc>, _>(0);
+    let fake_explicit_time = runtime
+        .block_on(fake_explicit_time_statement.query().fetch_one(&mut fake))
+        .unwrap()
+        .get::<chrono::DateTime<chrono::Utc>, _>(0);
+    assert_eq!(fake_explicit_time, postgres_explicit_time);
+
+    assert_statement(
+        &runtime,
+        &mut postgres,
+        &mut fake,
+        "SET search_path = pg_catalog, public",
+        RowOrder::Ordered,
+    );
+    let postgres_replanned_explicit_time = runtime
+        .block_on(
+            postgres_explicit_time_statement
+                .query()
+                .fetch_one(&mut postgres),
+        )
+        .unwrap()
+        .get::<chrono::DateTime<chrono::Utc>, _>(0);
+    let fake_replanned_explicit_time = runtime
+        .block_on(fake_explicit_time_statement.query().fetch_one(&mut fake))
+        .unwrap()
+        .get::<chrono::DateTime<chrono::Utc>, _>(0);
+    assert_eq!(
+        fake_replanned_explicit_time,
+        postgres_replanned_explicit_time
+    );
+    let postgres_replanned_time = runtime
+        .block_on(postgres_time_statement.query().fetch_one(&mut postgres))
+        .unwrap()
+        .get::<chrono::DateTime<chrono::Utc>, _>(0);
+    let fake_replanned_time = runtime
+        .block_on(fake_time_statement.query().fetch_one(&mut fake))
+        .unwrap()
+        .get::<chrono::DateTime<chrono::Utc>, _>(0);
+    assert_eq!(fake_replanned_time, postgres_replanned_time);
 
     for sql in [
         "BEGIN",

@@ -26,6 +26,7 @@ pub(crate) struct StatementContext {
     pub(crate) statement_timestamp: chrono::DateTime<chrono::Utc>,
     pub(crate) clock_timestamp: chrono::DateTime<chrono::Utc>,
     pub(crate) guc: Arc<Mutex<crate::session::settings::GucExecutionContext>>,
+    pub(crate) prepared_literal_timezone: Option<String>,
     pub(crate) deadline: Option<Instant>,
     pub(crate) rng: Arc<Mutex<ChaCha12Rng>>,
     pub(crate) sequences: SequenceExecutionContext,
@@ -147,6 +148,12 @@ impl StatementContext {
             .lock()
             .expect("GUC context mutex is poisoned")
             .get_timezone()
+    }
+
+    pub(crate) fn get_literal_timezone(&self) -> String {
+        self.prepared_literal_timezone
+            .clone()
+            .unwrap_or_else(|| self.get_timezone())
     }
 
     pub(crate) fn get_lock_timeout(&self) -> std::time::Duration {

@@ -303,6 +303,8 @@ impl Session {
             statement_timestamp: statement_timestamp.expect("fallback captures statement time"),
             clock_timestamp: self.db.read_clock(),
             guc: guc.clone(),
+            prepared_literal_timezone: prepared_statement
+                .map(|statement| statement.literal_timezone.clone()),
             deadline: statement_deadline,
             rng: self.db.rng.clone(),
             sequences,

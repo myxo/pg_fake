@@ -401,7 +401,67 @@ fn executes_offset_and_value_windows() {
             .query("SELECT nth_value(value, 0) OVER () FROM offset_values", &[])
             .unwrap_err()
             .sqlstate,
-        SqlState::ArraySubscriptError,
+        SqlState::InvalidArgumentForNthValue,
+    );
+    for sql in [
+        "SELECT lag(value) IGNORE NULLS OVER () FROM offset_values",
+        "SELECT lag(value) RESPECT NULLS OVER () FROM offset_values",
+        "SELECT nth_value(value, 1) FROM FIRST OVER () FROM offset_values",
+        "SELECT nth_value(value, 1) FROM LAST OVER () FROM offset_values",
+    ] {
+        assert_eq!(
+            session.query(sql, &[]).unwrap_err().sqlstate,
+            SqlState::SyntaxError,
+        );
+    }
+    for (sql, sqlstate) in [
+        (
+            "SELECT lag(value, NULL, 'x') OVER () FROM offset_values",
+            SqlState::InvalidTextRepresentation,
+        ),
+        (
+            "SELECT lag(value, 0, 'x') OVER () FROM offset_values",
+            SqlState::InvalidTextRepresentation,
+        ),
+        (
+            "SELECT lag(value, 1, 'x') OVER () FROM offset_values WHERE false",
+            SqlState::InvalidTextRepresentation,
+        ),
+        (
+            "SELECT nth_value(value, '2147483648') OVER () FROM offset_values WHERE false",
+            SqlState::NumericValueOutOfRange,
+        ),
+        (
+            "SELECT lag(value, 1, 'x'::integer) OVER () FROM offset_values WHERE false",
+            SqlState::InvalidTextRepresentation,
+        ),
+        (
+            "SELECT nth_value(value, '2147483648'::integer) OVER () FROM offset_values WHERE false",
+            SqlState::NumericValueOutOfRange,
+        ),
+    ] {
+        assert_eq!(session.query(sql, &[]).unwrap_err().sqlstate, sqlstate);
+    }
+
+    session
+        .execute(
+            "CREATE TABLE offset_times (id INTEGER, value TIMESTAMPTZ); \
+             INSERT INTO offset_times VALUES (1, '2024-01-01 00:00:00+00'); \
+             SET TIME ZONE 'UTC'",
+        )
+        .unwrap();
+    let prepared = session
+        .prepare(
+            "SELECT lag(value, 1, '2020-01-01 00:00') OVER (ORDER BY id) \
+             FROM offset_times",
+        )
+        .unwrap();
+    let expected =
+        query_rows(&mut session, "SELECT '2020-01-01 00:00:00+00'::timestamptz")[0][0].clone();
+    session.execute("SET TIME ZONE '+03:00'").unwrap();
+    assert_eq!(
+        session.query_prepared(&prepared, &[]).unwrap().rows,
+        vec![vec![expected]],
     );
 }
 

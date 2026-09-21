@@ -1840,16 +1840,39 @@ binding, partitioning, ordering, and ranking surface.
 - Differential/property cases cover partitions, peers, NULLs, named windows,
   clause ordering, metadata, placement, nesting, and errors.
 
-### Task 35 — Offset and value window functions
+### Task 35 — Offset and value window functions [COMPLETE]
 
 **Progress:**
 
 - [x] Implement `lag`, `lead`, `first_value`, `last_value`, and `nth_value` with
   partition/default-frame semantics, coercion, parameter inference, metadata, and errors.
 - [x] Add native, PostgreSQL differential, generated-property, manifest, and benchmark coverage.
-- [ ] Complete final validation.
+- [x] Complete final validation.
 - [x] Complete independent review with no findings.
-- [ ] Obtain user approval before marking this task complete.
+- [x] Obtain user approval before marking this task complete.
+
+**Validation:** Formatting, strict all-target/all-feature workspace Clippy, the
+focused native and PostgreSQL differential window suites, and the complete
+non-generated workspace regression pass. The core differential suite was run
+against a temporary PostgreSQL 18 `C`-collation database; the remaining SQLx
+suites used their existing isolated-database harness. The required
+`CHAOS_THEORY_CHECK_ITERS=10000 CHAOS_THEORY_CHECK_TIME=600s cargo test
+-p pg_fake_sqlx --features time --test property_tests` gate passes all 24
+suites after the final review fixes in 820.11 seconds.
+
+Review follow-up added native rejection coverage for `IGNORE NULLS`, `RESPECT
+NULLS`, `FROM FIRST`, and `FROM LAST`, plus PostgreSQL differential and
+generated error cases, prepared parameters, and result metadata. It also fixed
+`nth_value(..., 0)` to return PostgreSQL's dedicated `22016` SQLSTATE and made
+parsed NULL-treatment clauses return PostgreSQL's `42601` syntax error.
+Invalid unknown-string defaults and offsets are validated during analysis, so
+unreached defaults and empty inputs still return PostgreSQL's `22P02` or
+`22003` errors. Explicitly cast invalid literals are likewise validated before
+execution without treating catalog-resolved `regclass` names as numeric input.
+Prepared window defaults, including parenthesized explicit casts, capture the
+literal timezone at initial preparation. Search-path replanning reanalyzes them
+under the current timezone as PostgreSQL does; differential coverage compares
+decoded UTC instants before and after replanning.
 
 **Goal:** Add position-sensitive access to rows within a partition or frame.
 

@@ -2567,7 +2567,7 @@ fn matches_generated_migration_data_transform_queries() {
         let first = src.any_of("first", int_in(-20_i32..=20));
         let second = src.any_of("second", int_in(-20_i32..=20));
         let third = src.any_of("third", int_in(-20_i32..=20));
-        let transform = src.any_of("transform", int_in(0..=11));
+        let transform = src.any_of("transform", int_in(0..=21));
         let sql = match transform {
             0 => format!(
                 "SELECT ({first}::integer * {second}::numeric)::bigint, \
@@ -2629,9 +2629,49 @@ fn matches_generated_migration_data_transform_queries() {
                  WINDOW ordered AS (ORDER BY value NULLS FIRST) ORDER BY value NULLS FIRST"
             ),
             10 => format!("SELECT 'x' ~ 'x{{{}}}'", 256 + first.unsigned_abs()),
-            _ => format!(
+            11 => format!(
                 "SELECT count() OVER (PARTITION BY value) \
                  FROM (VALUES ({first}), ({second}), ({third})) AS generated(value)"
+            ),
+            12 => format!(
+                "SELECT lag(value) IGNORE NULLS OVER () \
+                 FROM (VALUES ({first}), ({second}), ({third})) AS generated(value)"
+            ),
+            13 => format!(
+                "SELECT first_value(value) RESPECT NULLS OVER () \
+                 FROM (VALUES ({first}), ({second}), ({third})) AS generated(value)"
+            ),
+            14 => format!(
+                "SELECT lead(value, 1, {first}, {second}) OVER () \
+                 FROM (VALUES ({third})) AS generated(value)"
+            ),
+            15 => format!(
+                "SELECT nth_value(value, 0) OVER () \
+                 FROM (VALUES ({first}), ({second}), ({third})) AS generated(value)"
+            ),
+            16 => format!(
+                "SELECT lag(value, NULL, 'x') OVER () \
+                 FROM (VALUES ({first})) AS generated(value)"
+            ),
+            17 => format!(
+                "SELECT lag(value, 0, 'x') OVER () \
+                 FROM (VALUES ({first})) AS generated(value)"
+            ),
+            18 => format!(
+                "SELECT lag(value, 1, 'x') OVER () \
+                 FROM (VALUES ({first}), ({second})) AS generated(value) WHERE false"
+            ),
+            19 => format!(
+                "SELECT nth_value(value, '2147483648') OVER () \
+                 FROM (VALUES ({first}), ({second}), ({third})) AS generated(value) WHERE false"
+            ),
+            20 => format!(
+                "SELECT lag(value, 1, 'x'::integer) OVER () \
+                 FROM (VALUES ({first}), ({second})) AS generated(value) WHERE false"
+            ),
+            _ => format!(
+                "SELECT nth_value(value, '2147483648'::integer) OVER () \
+                 FROM (VALUES ({first}), ({second}), ({third})) AS generated(value) WHERE false"
             ),
         };
         src.log_value("sql", &sql);

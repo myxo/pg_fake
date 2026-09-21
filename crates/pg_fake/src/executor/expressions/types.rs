@@ -408,7 +408,7 @@ pub(crate) fn infer_expression_type(expr: &ast::Expr, schema: RowScope<'_>) -> R
                 }
                 return Ok(target.base);
             }
-            if matches!(target.base, BaseType::Json | BaseType::Jsonb)
+            if target.base != BaseType::Regclass
                 && let Some(text) = extract_unknown_string_literal(expr)
             {
                 coercion::coerce_unknown(text, target, CastContext::Explicit, "UTC")?;

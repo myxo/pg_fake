@@ -65,10 +65,15 @@ pub(in crate::executor) fn infer_window_return_type(
         return Ok(None);
     };
     let name = normalize_function_name(&function.name)?;
+    if function.null_treatment.is_some() {
+        return Err(PgError::create(
+            SqlState::SyntaxError,
+            "syntax error at or near NULLS",
+        ));
+    }
     if function.uses_odbc_syntax
         || !matches!(function.parameters, ast::FunctionArguments::None)
         || function.filter.is_some()
-        || function.null_treatment.is_some()
         || !function.within_group.is_empty()
         || window.window_frame.is_some()
     {
@@ -188,13 +193,25 @@ pub(in crate::executor) fn infer_window_return_type(
                 })?;
             }
             validate_window_partition_and_order(window, schema)?;
-            Ok(Some(resolve_expression_list_type(
+            let data_type = resolve_expression_list_type(
                 &[
                     expressions[0],
                     expressions.get(2).copied().unwrap_or(expressions[0]),
                 ],
                 schema,
-            )?))
+            )?;
+            if let Some(text) = expressions
+                .get(2)
+                .and_then(|default| extract_unknown_string_literal(default))
+            {
+                coercion::coerce_unknown(
+                    text,
+                    crate::value::PgType::create(data_type),
+                    CastContext::Implicit,
+                    "UTC",
+                )?;
+            }
+            Ok(Some(data_type))
         }
         "first_value" | "last_value" => {
             let ast::FunctionArguments::List(arguments) = &function.args else {
@@ -456,7 +473,16 @@ pub(in crate::executor) fn validate_function_argument(
     schema: RowScope<'_>,
     create_error: &impl Fn() -> PgError,
 ) -> Result<()> {
-    if is_null_literal(argument) || extract_unknown_string_literal(argument).is_some() {
+    if is_null_literal(argument) {
+        return Ok(());
+    }
+    if let Some(text) = extract_unknown_string_literal(argument) {
+        coercion::coerce_unknown(
+            text,
+            crate::value::PgType::create(target),
+            CastContext::Implicit,
+            "UTC",
+        )?;
         return Ok(());
     }
     let source = infer_expression_type(argument, schema)?;

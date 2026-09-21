@@ -365,7 +365,7 @@ fn evaluate_window_value_expression(
             text,
             PgType::create(function.data_type),
             CastContext::Implicit,
-            &context.get_timezone(),
+            &context.get_literal_timezone(),
         );
     }
     coercion::coerce(
@@ -782,7 +782,7 @@ pub(super) fn calculate_window_values(
                                         Some(offset) => {
                                             if offset <= 0 {
                                                 return Err(crate::error::PgError::create(
-                                                    crate::error::SqlState::ArraySubscriptError,
+                                                    crate::error::SqlState::InvalidArgumentForNthValue,
                                                     "argument of nth_value must be greater than zero",
                                                 ));
                                             }

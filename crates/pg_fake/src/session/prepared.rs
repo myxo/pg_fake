@@ -20,6 +20,7 @@ pub struct PreparedStatement {
     pub(super) statement: ast::Statement,
     search_path: Vec<String>,
     source_sql: String,
+    pub(super) literal_timezone: String,
     replanned: std::sync::Arc<std::sync::Mutex<Option<std::sync::Arc<PreparedStatement>>>>,
     pub(super) parameter_types: Vec<crate::value::BaseType>,
     pub(super) columns: Vec<ColumnMeta>,
@@ -108,14 +109,16 @@ impl Session {
         let frozen = ast::visit_expressions_mut(&mut statement, |expression| {
             let literal = match &*expression {
                 ast::Expr::TypedString(typed) if !typed.uses_odbc_syntax => {
-                    Some((&typed.data_type, &typed.value.value))
+                    Some((typed.data_type.clone(), typed.value.value.clone()))
                 }
                 ast::Expr::Cast {
                     expr, data_type, ..
-                } => match expr.as_ref() {
-                    ast::Expr::Value(value) => Some((data_type, &value.value)),
-                    _ => None,
-                },
+                } => crate::executor::extract_unknown_string_literal(expr).map(|text| {
+                    (
+                        data_type.clone(),
+                        ast::Value::SingleQuotedString(text.to_owned()),
+                    )
+                }),
                 _ => None,
             };
             if let Some((
@@ -127,10 +130,10 @@ impl Session {
             )) = literal
             {
                 let data_type =
-                    ast::DataType::Timestamp(*precision, ast::TimezoneInfo::WithTimeZone);
+                    ast::DataType::Timestamp(precision, ast::TimezoneInfo::WithTimeZone);
                 let value = crate::coercion::convert_ast_data_type(&data_type).and_then(|target| {
                     crate::coercion::coerce_unknown(
-                        text,
+                        &text,
                         target,
                         crate::coercion::CastContext::Explicit,
                         &self.settings.timezone,
@@ -263,6 +266,7 @@ impl Session {
             )) => Ok(PreparedStatement {
                 search_path: self.settings.search_path.clone(),
                 source_sql: sql.into(),
+                literal_timezone: self.settings.timezone.clone(),
                 replanned: Default::default(),
                 statement,
                 parameter_types,
