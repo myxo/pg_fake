@@ -4,8 +4,7 @@ use crate::{
     executor::{
         DatabaseState, StatementContext,
         ctes::{contains_query_ctes, materialize_query_ctes},
-        expressions::infer_window_return_type,
-        scope::{RowScope, bind_select_scope},
+        scope::bind_select_scope,
         views::expand_query_views,
     },
     txn::{Snapshot, Xid},
@@ -53,7 +52,11 @@ pub(super) use select::validate_select_predicates;
 pub(super) use streaming::{QueryStreamState, stream_query_rows};
 pub(crate) use values::PreparedValues;
 use values::execute_values_query;
-use windows::{collect_window_functions, execute_windowed_select_rows};
+pub(crate) use windows::resolve_statement_windows;
+use windows::{
+    collect_window_functions, execute_windowed_select_rows, resolve_select_windows,
+    resolve_window_functions,
+};
 
 struct StatementFeatureDetector {
     cte: bool,
@@ -313,6 +316,9 @@ pub(super) fn execute_query(
             maximum_rows,
         );
     };
+    let mut select = select.as_ref().clone();
+    resolve_select_windows(&mut select)?;
+    let select = &select;
     let ast::GroupByExpr::Expressions(group_by, modifiers) = &select.group_by else {
         return reject_unsupported("GROUP BY is not implemented");
     };
@@ -377,13 +383,10 @@ pub(super) fn execute_query(
         &distinct,
         &scope,
     )?;
-    let window_functions = collect_window_functions(&projections, &order_specs, &distinct);
-    for function in &window_functions {
-        infer_window_return_type(function, RowScope::Bound(&scope))?;
-    }
-    if !window_functions.is_empty() && grouping.enabled {
-        return reject_unsupported("aggregate and window composition is not implemented");
-    }
+    let window_functions = resolve_window_functions(
+        collect_window_functions(&projections, &order_specs, &distinct),
+        &scope,
+    )?;
     if grouping.enabled && lock_mode.is_some() {
         return reject_unsupported("FOR UPDATE is not allowed with aggregate functions");
     }
@@ -406,6 +409,20 @@ pub(super) fn execute_query(
         std::mem::take(&mut prepared.rows)
     } else if limit == Some(0) {
         Vec::new()
+    } else if grouping.enabled {
+        execute_grouped_select_rows(
+            state,
+            select,
+            &scope,
+            &projections,
+            &order_specs,
+            &distinct,
+            &grouping.expressions,
+            &window_functions,
+            xid,
+            snapshot,
+            context,
+        )?
     } else if !window_functions.is_empty() {
         if lock_mode.is_some() {
             return reject_unsupported("FOR UPDATE is not allowed with window functions");
@@ -418,19 +435,6 @@ pub(super) fn execute_query(
             &order_specs,
             &distinct,
             &window_functions,
-            xid,
-            snapshot,
-            context,
-        )?
-    } else if grouping.enabled {
-        execute_grouped_select_rows(
-            state,
-            select,
-            &scope,
-            &projections,
-            &order_specs,
-            &distinct,
-            &grouping.expressions,
             xid,
             snapshot,
             context,
@@ -672,7 +676,7 @@ pub(super) fn execute_query(
             let mut origins = row.origins;
             if let Some(source) = row.deferred_source {
                 let projection = std::sync::Arc::new(DerivedProjection {
-                    select: select.as_ref().clone(),
+                    select: select.clone(),
                     source: super::from::SourceRow {
                         values: source,
                         origins: origins.clone(),

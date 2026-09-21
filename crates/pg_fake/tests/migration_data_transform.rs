@@ -35,6 +35,30 @@ fn executes_required_window_expressions() {
     assert_eq!(
         query_rows(
             &mut session,
+            "SELECT id, ntile(value) OVER (ORDER BY id) \
+             FROM (VALUES (1, 1), (2, 2), (3, 3)) AS tiles(id, value) ORDER BY id",
+        ),
+        vec![
+            vec![Value::Int4(1), Value::Int4(1)],
+            vec![Value::Int4(2), Value::Int4(1)],
+            vec![Value::Int4(3), Value::Int4(1)],
+        ],
+    );
+    assert_eq!(
+        query_rows(
+            &mut session,
+            "SELECT ntile('2') OVER (ORDER BY id) FROM window_values ORDER BY id",
+        ),
+        vec![
+            vec![Value::Int4(1)],
+            vec![Value::Int4(1)],
+            vec![Value::Int4(2)],
+            vec![Value::Int4(2)],
+        ],
+    );
+    assert_eq!(
+        query_rows(
+            &mut session,
             "SELECT id, count(*) OVER (PARTITION BY payload) FROM window_values ORDER BY id",
         ),
         vec![
@@ -78,6 +102,174 @@ fn executes_required_window_expressions() {
         )
         .is_empty()
     );
+}
+
+#[test]
+fn executes_named_and_ranking_windows() {
+    let db = Db::create();
+    let mut session = db.create_session();
+    session
+        .execute(
+            "CREATE TABLE ranking_values (id INTEGER, category TEXT, value INTEGER); \
+             INSERT INTO ranking_values VALUES \
+               (1, 'a', 10), (2, 'a', 10), (3, 'a', 20), \
+               (4, 'b', NULL), (5, 'b', 5)",
+        )
+        .unwrap();
+
+    assert_eq!(
+        query_rows(
+            &mut session,
+            "SELECT id, row_number() OVER ordered, rank() OVER ordered, \
+                    dense_rank() OVER ordered, percent_rank() OVER ordered, \
+                    cume_dist() OVER ordered, ntile(2) OVER ordered \
+             FROM ranking_values \
+             WINDOW base AS (PARTITION BY category), \
+                    ordered AS (base ORDER BY value NULLS FIRST) \
+             ORDER BY id",
+        ),
+        vec![
+            vec![
+                Value::Int4(1),
+                Value::Int8(1),
+                Value::Int8(1),
+                Value::Int8(1),
+                Value::Float8(0.0),
+                Value::Float8(2.0 / 3.0),
+                Value::Int4(1),
+            ],
+            vec![
+                Value::Int4(2),
+                Value::Int8(2),
+                Value::Int8(1),
+                Value::Int8(1),
+                Value::Float8(0.0),
+                Value::Float8(2.0 / 3.0),
+                Value::Int4(1),
+            ],
+            vec![
+                Value::Int4(3),
+                Value::Int8(3),
+                Value::Int8(3),
+                Value::Int8(2),
+                Value::Float8(1.0),
+                Value::Float8(1.0),
+                Value::Int4(2),
+            ],
+            vec![
+                Value::Int4(4),
+                Value::Int8(1),
+                Value::Int8(1),
+                Value::Int8(1),
+                Value::Float8(0.0),
+                Value::Float8(0.5),
+                Value::Int4(1),
+            ],
+            vec![
+                Value::Int4(5),
+                Value::Int8(2),
+                Value::Int8(2),
+                Value::Int8(2),
+                Value::Float8(1.0),
+                Value::Float8(1.0),
+                Value::Int4(2),
+            ],
+        ],
+    );
+    let metadata = session
+        .query(
+            "SELECT ntile(2) OVER (), cume_dist() OVER () FROM ranking_values LIMIT 1",
+            &[],
+        )
+        .unwrap();
+    assert_eq!(metadata.columns[0].type_oid, 23);
+    assert_eq!(metadata.columns[1].type_oid, 701);
+    assert_eq!(
+        query_rows(
+            &mut session,
+            "SELECT rank() OVER () + rank() OVER () FROM ranking_values",
+        ),
+        vec![vec![Value::Int8(2)]; 5],
+    );
+    assert_eq!(
+        query_rows(
+            &mut session,
+            "SELECT category, rank() OVER (ORDER BY category) \
+             FROM ranking_values GROUP BY category HAVING count(*) > 0 ORDER BY category",
+        ),
+        vec![
+            vec![Value::Text("a".into()), Value::Int8(1)],
+            vec![Value::Text("b".into()), Value::Int8(2)],
+        ],
+    );
+    assert_eq!(
+        query_rows(
+            &mut session,
+            "SELECT category, rank() OVER (ORDER BY count(*)) \
+             FROM ranking_values GROUP BY category ORDER BY category",
+        ),
+        vec![
+            vec![Value::Text("a".into()), Value::Int8(2)],
+            vec![Value::Text("b".into()), Value::Int8(1)],
+        ],
+    );
+    assert_eq!(
+        query_rows(
+            &mut session,
+            "SELECT category, count(*) OVER (PARTITION BY count(*)) \
+             FROM ranking_values GROUP BY category ORDER BY category",
+        ),
+        vec![
+            vec![Value::Text("a".into()), Value::Int8(1)],
+            vec![Value::Text("b".into()), Value::Int8(1)],
+        ],
+    );
+    session.execute("CREATE SEQUENCE ranking_tiles").unwrap();
+    assert_eq!(
+        query_rows(
+            &mut session,
+            "SELECT ntile(nextval('ranking_tiles')::integer) OVER (), \
+                    ntile(nextval('ranking_tiles')::integer) OVER () \
+             FROM (VALUES (1), (2), (3)) AS tiles(value)",
+        ),
+        vec![
+            vec![Value::Int4(1), Value::Int4(1)],
+            vec![Value::Int4(1), Value::Int4(1)],
+            vec![Value::Int4(1), Value::Int4(2)],
+        ],
+    );
+    for sql in [
+        "SELECT rank() OVER missing FROM ranking_values",
+        "SELECT rank() OVER child FROM ranking_values WINDOW base AS (PARTITION BY category), child AS (base PARTITION BY value)",
+        "SELECT rank() OVER a FROM ranking_values WINDOW a AS (b), b AS (a)",
+    ] {
+        assert_eq!(
+            session.query(sql, &[]).unwrap_err().sqlstate,
+            SqlState::WindowingError
+        );
+    }
+    for sql in [
+        "SELECT ntile(0) OVER () FROM ranking_values",
+        "SELECT ntile(NULL) OVER () FROM ranking_values",
+    ] {
+        assert_eq!(
+            session.query(sql, &[]).unwrap_err().sqlstate,
+            if sql.contains("NULL") {
+                SqlState::NullValueNotAllowed
+            } else {
+                SqlState::InvalidParameterValue
+            }
+        );
+    }
+    for sql in [
+        "SELECT id FROM ranking_values WHERE rank() OVER () > 0",
+        "SELECT rank() OVER (ORDER BY row_number() OVER ()) FROM ranking_values",
+    ] {
+        assert_eq!(
+            session.query(sql, &[]).unwrap_err().sqlstate,
+            SqlState::WindowingError
+        );
+    }
 }
 
 #[test]

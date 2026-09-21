@@ -304,6 +304,20 @@ pub const FEATURES: &[Feature] = &[
         }],
     },
     Feature {
+        task: 34,
+        name: "named windows and ranking functions",
+        cases: &[Case {
+            id: "named_window_ranks",
+            source: "window.sql:26-59",
+            setup: &[
+                "CREATE TABLE phase3_window_ranks (category TEXT, value INTEGER)",
+                "INSERT INTO phase3_window_ranks VALUES ('a', 1), ('a', 1), ('a', 2), ('b', NULL), ('b', 3)",
+            ],
+            sql: "SELECT category, value, rank() OVER ordered, dense_rank() OVER ordered, percent_rank() OVER ordered, cume_dist() OVER ordered, ntile(2) OVER ordered FROM phase3_window_ranks WINDOW base AS (PARTITION BY category), ordered AS (base ORDER BY value NULLS FIRST) ORDER BY category, value NULLS FIRST",
+            blocker: BlockerKind::Implementation,
+        }],
+    },
+    Feature {
         task: 19,
         name: "migration data transforms",
         cases: &[

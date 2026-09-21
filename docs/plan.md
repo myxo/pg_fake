@@ -1810,7 +1810,20 @@ Phase 3 functional/session behavior.
 
 ## Milestone I — Complete window functions
 
-### Task 34 — Named windows and remaining ranking functions
+### Task 34 — Named windows and remaining ranking functions [COMPLETE]
+
+**Progress:**
+
+- [x] Resolve named window declarations, inheritance, forward references,
+  duplicate definitions, and prohibited overrides before prepared analysis.
+- [x] Execute partitioned `row_number`, `rank`, `dense_rank`, `percent_rank`,
+  `cume_dist`, and `ntile` with peer and NULL-ordering semantics.
+- [x] Run grouped/HAVING window evaluation before final ordering, limiting, and
+  distinct processing.
+- [x] Add native, SQLx differential, generated-property, manifest, and ranking
+  benchmark coverage.
+- [x] Run final validation and independent review.
+- [x] Obtain user approval before marking Task 34 complete.
 
 **Goal:** Extend Task 19's migration window substrate to the full planned
 binding, partitioning, ordering, and ranking surface.

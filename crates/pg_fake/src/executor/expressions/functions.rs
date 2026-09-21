@@ -70,26 +70,29 @@ pub(in crate::executor) fn infer_window_return_type(
         || function.filter.is_some()
         || function.null_treatment.is_some()
         || !function.within_group.is_empty()
-        || window.window_name.is_some()
         || window.window_frame.is_some()
     {
         return reject_unsupported("window function feature is not implemented");
     }
     match name.as_str() {
-        "row_number" => {
+        "row_number" | "rank" | "dense_rank" | "percent_rank" | "cume_dist" => {
             let ast::FunctionArguments::List(arguments) = &function.args else {
                 return Err(PgError::create(
                     SqlState::UndefinedFunction,
-                    "function row_number does not exist",
+                    format!("function {name} does not exist"),
                 ));
             };
             if !arguments.args.is_empty()
                 || !arguments.clauses.is_empty()
                 || arguments.duplicate_treatment.is_some()
-                || !window.partition_by.is_empty()
-                || window.order_by.is_empty()
             {
-                return reject_unsupported("row_number window shape is not implemented");
+                return Err(PgError::create(
+                    SqlState::UndefinedFunction,
+                    format!("function {name} does not exist"),
+                ));
+            }
+            for partition in &window.partition_by {
+                validate_equality_type(infer_expression_type(partition, schema)?)?;
             }
             for order in &window.order_by {
                 if order.with_fill.is_some()
@@ -99,7 +102,53 @@ pub(in crate::executor) fn infer_window_return_type(
                 }
                 validate_ordering_type(infer_expression_type(&order.expr, schema)?)?;
             }
-            Ok(Some(BaseType::Int8))
+            Ok(Some(
+                if matches!(name.as_str(), "percent_rank" | "cume_dist") {
+                    BaseType::Float8
+                } else {
+                    BaseType::Int8
+                },
+            ))
+        }
+        "ntile" => {
+            let ast::FunctionArguments::List(arguments) = &function.args else {
+                return Err(PgError::create(
+                    SqlState::UndefinedFunction,
+                    "function ntile does not exist",
+                ));
+            };
+            if !matches!(
+                arguments.args.as_slice(),
+                [ast::FunctionArg::Unnamed(ast::FunctionArgExpr::Expr(_))]
+            ) || !arguments.clauses.is_empty()
+                || arguments.duplicate_treatment.is_some()
+            {
+                return Err(PgError::create(
+                    SqlState::UndefinedFunction,
+                    "function ntile does not exist",
+                ));
+            }
+            validate_function_argument(
+                match &arguments.args[0] {
+                    ast::FunctionArg::Unnamed(ast::FunctionArgExpr::Expr(expression)) => expression,
+                    _ => unreachable!("ntile argument was validated"),
+                },
+                BaseType::Int4,
+                schema,
+                &|| PgError::create(SqlState::UndefinedFunction, "function ntile does not exist"),
+            )?;
+            for partition in &window.partition_by {
+                validate_equality_type(infer_expression_type(partition, schema)?)?;
+            }
+            for order in &window.order_by {
+                if order.with_fill.is_some()
+                    || matches!(order.options.sort, Some(ast::OrderBySort::Using(_)))
+                {
+                    return reject_unsupported("window order feature is not implemented");
+                }
+                validate_ordering_type(infer_expression_type(&order.expr, schema)?)?;
+            }
+            Ok(Some(BaseType::Int4))
         }
         "count" => {
             let ast::FunctionArguments::List(arguments) = &function.args else {
@@ -307,7 +356,7 @@ pub(super) fn evaluate_function(
 ) -> Result<Value> {
     if infer_window_return_type(function, schema)?.is_some() {
         return Err(PgError::create(
-            SqlState::GroupingError,
+            SqlState::WindowingError,
             "window function is not allowed in this context",
         ));
     }

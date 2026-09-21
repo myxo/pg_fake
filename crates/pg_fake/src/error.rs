@@ -88,6 +88,7 @@ pub enum SqlState {
     GeneratedAlways,           // 428C9
     InvalidTableDefinition,    // 42P16
     InvalidObjectDefinition,   // 42P17
+    WindowingError,            // 42P20
     InvalidFunctionDefinition, // 42P13
 
     // 2F — SQL Routine Exception
@@ -168,6 +169,7 @@ impl SqlState {
             SqlState::GeneratedAlways => "428C9",
             SqlState::InvalidTableDefinition => "42P16",
             SqlState::InvalidObjectDefinition => "42P17",
+            SqlState::WindowingError => "42P20",
             SqlState::InvalidFunctionDefinition => "42P13",
             SqlState::FunctionExecutedNoReturnStatement => "2F005",
             SqlState::RaiseException => "P0001",

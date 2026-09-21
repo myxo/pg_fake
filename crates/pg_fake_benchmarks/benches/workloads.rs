@@ -1062,6 +1062,10 @@ fn migration_data_transform_benchmark(
             "SELECT id, row_number() OVER (ORDER BY id DESC) FROM migration_data_transform_100_rows ORDER BY id",
         ),
         (
+            "window_rank_100_rows",
+            "SELECT id, rank() OVER ranked, dense_rank() OVER ranked, ntile(10) OVER ranked FROM migration_data_transform_100_rows WINDOW ranked AS (PARTITION BY bucket ORDER BY id DESC) ORDER BY id",
+        ),
+        (
             "ordered_string_agg_100_rows",
             "SELECT bucket, string_agg(btrim(label), ',' ORDER BY id) FROM migration_data_transform_100_rows GROUP BY bucket ORDER BY bucket",
         ),

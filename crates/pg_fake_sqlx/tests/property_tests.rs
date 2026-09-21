@@ -2567,7 +2567,7 @@ fn matches_generated_migration_data_transform_queries() {
         let first = src.any_of("first", int_in(-20_i32..=20));
         let second = src.any_of("second", int_in(-20_i32..=20));
         let third = src.any_of("third", int_in(-20_i32..=20));
-        let transform = src.any_of("transform", int_in(0..=8));
+        let transform = src.any_of("transform", int_in(0..=9));
         let sql = match transform {
             0 => format!(
                 "SELECT ({first}::integer * {second}::numeric)::bigint, \
@@ -2610,14 +2610,20 @@ fn matches_generated_migration_data_transform_queries() {
                 second.unsigned_abs(),
                 third.unsigned_abs() % 9 + 1,
             ),
-            7 => format!("SELECT 'x' ~ 'x{{{}}}'", 256 + first.unsigned_abs()),
+            7 => format!(
+                "SELECT value, rank() OVER ordered, dense_rank() OVER ordered, \
+                        percent_rank() OVER ordered, cume_dist() OVER ordered, ntile(3) OVER ordered \
+                 FROM (VALUES ({first}), (NULL), ({second}), ({third})) AS generated(value) \
+                 WINDOW base AS (), ordered AS (base ORDER BY value NULLS FIRST) ORDER BY value NULLS FIRST"
+            ),
+            8 => format!("SELECT 'x' ~ 'x{{{}}}'", 256 + first.unsigned_abs()),
             _ => format!(
                 "SELECT count() OVER (PARTITION BY value) \
                  FROM (VALUES ({first}), ({second}), ({third})) AS generated(value)"
             ),
         };
         src.log_value("sql", &sql);
-        if transform >= 7 {
+        if transform >= 8 {
             assert_statement_allow_error(
                 &runtime,
                 &mut postgres.borrow_mut(),

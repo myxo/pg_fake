@@ -35,9 +35,14 @@ pub(crate) fn describe_query_result_columns(
 ) -> Result<Vec<ColumnMeta>> {
     match statement {
         ast::Statement::Query(query) => match query.body.as_ref() {
-            ast::SetExpr::Select(select) => bind_select_scope(state, select).and_then(|scope| {
-                build_projection_plan(state, &select.projection, &scope).map(|(_, columns)| columns)
-            }),
+            ast::SetExpr::Select(select) => {
+                let mut select = select.as_ref().clone();
+                super::windows::resolve_select_windows(&mut select)?;
+                bind_select_scope(state, &select).and_then(|scope| {
+                    build_projection_plan(state, &select.projection, &scope)
+                        .map(|(_, columns)| columns)
+                })
+            }
             ast::SetExpr::Values(values) => bind_values_scope(values).map(|scope| {
                 scope
                     .columns

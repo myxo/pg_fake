@@ -22,11 +22,13 @@ use crate::{
 
 use super::{
     SelectRow,
-    distinct::{DistinctKey, DistinctPlan, evaluate_distinct_keys},
+    distinct::{DistinctKey, DistinctPlan},
+    expressions::evaluate_select_expression,
     expressions::{contains_volatile_expression, prune_constant_cases},
-    ordering::{OrderKey, RowOrderSpec, evaluate_order_keys},
-    projection::{ProjectionSource, evaluate_projection_values},
+    ordering::{OrderKey, RowOrderSpec},
+    projection::ProjectionSource,
     select::evaluate_where_clause,
+    windows::{WindowFunction, calculate_window_values, materialize_window_expression},
 };
 
 mod validation;
@@ -557,6 +559,7 @@ pub(super) fn execute_grouped_select_rows(
     order_specs: &[RowOrderSpec<'_>],
     distinct: &DistinctPlan<'_>,
     grouped_expressions: &[(ast::Expr, PgType)],
+    window_functions: &[WindowFunction],
     xid: Xid,
     snapshot: &Snapshot,
     context: &StatementContext,
@@ -596,54 +599,136 @@ pub(super) fn execute_grouped_select_rows(
             cursor: Default::default(),
         });
     drop(cached);
+    let groups = groups
+        .into_iter()
+        .map(|(row, aggregate_values)| {
+            evaluate_group_having(
+                state,
+                select,
+                scope,
+                &row,
+                &aggregate_values,
+                xid,
+                snapshot,
+                context,
+            )
+            .map(|keep| keep.then_some((row, aggregate_values)))
+        })
+        .collect::<Result<Vec<_>>>()?
+        .into_iter()
+        .flatten()
+        .collect::<Vec<_>>();
+    let window_aggregate_values = groups
+        .iter()
+        .map(|(_, values)| values.clone())
+        .collect::<Vec<_>>();
+    let window_values = calculate_window_values(
+        state,
+        window_functions,
+        scope,
+        &groups
+            .iter()
+            .map(|(row, _)| row.clone())
+            .collect::<Vec<_>>(),
+        Some(&window_aggregate_values),
+        xid,
+        snapshot,
+        context,
+    )?;
     let evaluated = (|| {
-        for (row, aggregate_values) in groups.into_iter().skip(prepared.next) {
+        for ((row, aggregate_values), window_values) in
+            groups.into_iter().zip(window_values).skip(prepared.next)
+        {
             let output = resume_evaluation(&mut prepared.cursor, context, |context| {
-                if !evaluate_group_having(
-                    state,
-                    select,
-                    scope,
-                    &row,
-                    &aggregate_values,
-                    xid,
-                    snapshot,
-                    context,
-                )? {
-                    return Ok(None);
-                }
-                let values = evaluate_projection_values(
-                    state,
-                    projections,
-                    scope,
-                    &row,
-                    Some(&aggregate_values),
-                    xid,
-                    snapshot,
-                    context,
-                )?;
-                let keys = evaluate_order_keys(
-                    state,
-                    order_specs,
-                    &values,
-                    scope,
-                    &row,
-                    Some(&aggregate_values),
-                    xid,
-                    snapshot,
-                    context,
-                )?;
-                let distinct_keys = evaluate_distinct_keys(
-                    state,
-                    distinct,
-                    &values,
-                    &keys,
-                    scope,
-                    &row,
-                    Some(&aggregate_values),
-                    xid,
-                    snapshot,
-                    context,
-                )?;
+                let values = projections
+                    .iter()
+                    .enumerate()
+                    .map(|(index, projection)| match projection {
+                        ProjectionSource::Expression(expression) => {
+                            let expression = materialize_window_expression(
+                                expression,
+                                window_functions,
+                                &window_values,
+                                AggregateOwner::Projection(index),
+                            );
+                            evaluate_select_expression(
+                                state,
+                                &expression,
+                                scope,
+                                &row,
+                                Some((&aggregate_values, AggregateOwner::Projection(index))),
+                                xid,
+                                snapshot,
+                                context,
+                            )
+                        }
+                        _ => super::projection::evaluate_projection_value(
+                            state,
+                            projection,
+                            scope,
+                            &row,
+                            Some((&aggregate_values, AggregateOwner::Projection(index))),
+                            xid,
+                            snapshot,
+                            context,
+                        ),
+                    })
+                    .collect::<Result<Vec<_>>>()?;
+                let keys = order_specs
+                    .iter()
+                    .enumerate()
+                    .map(|(index, order)| match order.key {
+                        OrderKey::Output(index) => Ok(values[index].clone()),
+                        OrderKey::Input(slot, _) => Ok(row[slot].clone()),
+                        OrderKey::Expression(expression) => {
+                            let expression = materialize_window_expression(
+                                expression,
+                                window_functions,
+                                &window_values,
+                                AggregateOwner::Order(index),
+                            );
+                            evaluate_select_expression(
+                                state,
+                                &expression,
+                                scope,
+                                &row,
+                                Some((&aggregate_values, AggregateOwner::Order(index))),
+                                xid,
+                                snapshot,
+                                context,
+                            )
+                        }
+                    })
+                    .collect::<Result<Vec<_>>>()?;
+                let distinct_keys = match distinct {
+                    DistinctPlan::On { keys: distinct, .. } => distinct
+                        .iter()
+                        .enumerate()
+                        .map(|(index, key)| match key {
+                            DistinctKey::Output(index) => Ok(values[*index].clone()),
+                            DistinctKey::Order(index) => Ok(keys[*index].clone()),
+                            DistinctKey::Expression(expression) => {
+                                let expression = materialize_window_expression(
+                                    expression,
+                                    window_functions,
+                                    &window_values,
+                                    AggregateOwner::Distinct(index),
+                                );
+                                evaluate_select_expression(
+                                    state,
+                                    &expression,
+                                    scope,
+                                    &row,
+                                    Some((&aggregate_values, AggregateOwner::Distinct(index))),
+                                    xid,
+                                    snapshot,
+                                    context,
+                                )
+                            }
+                        })
+                        .collect::<Result<Vec<_>>>()?,
+                    DistinctPlan::None | DistinctPlan::Rows => Vec::new(),
+                };
                 Ok(Some(SelectRow {
                     origins: Vec::new(),
                     values,

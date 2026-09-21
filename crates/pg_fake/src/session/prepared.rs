@@ -65,6 +65,9 @@ impl Session {
             ));
         }
         let mut statement = statements.pop().expect("statement count was checked");
+        if let Err(error) = executor::resolve_statement_windows(&mut statement) {
+            return self.abort_with_error(error);
+        }
         let parameter_count = match analyzer::count_parameters(&statement) {
             Ok(count) => count,
             Err(error) => return self.abort_with_error(error),

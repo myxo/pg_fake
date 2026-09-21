@@ -40,6 +40,8 @@ fn matches_migration_data_transform_queries() {
         "SELECT id, row_number() OVER (ORDER BY id DESC NULLS FIRST) FROM transform_source ORDER BY id",
         "SELECT id, count(*) OVER (PARTITION BY payload) FROM transform_source ORDER BY id",
         "SELECT id, row_number() OVER (ORDER BY sort_key NULLS FIRST), count(*) OVER (PARTITION BY payload) FROM transform_window_edges ORDER BY id",
+        "SELECT id, rank() OVER ordered, dense_rank() OVER ordered, percent_rank() OVER ordered, cume_dist() OVER ordered, ntile(3) OVER ordered FROM transform_window_edges WINDOW base AS (PARTITION BY payload), ordered AS (base ORDER BY sort_key NULLS FIRST) ORDER BY id",
+        "SELECT payload, rank() OVER (ORDER BY payload) FROM transform_window_edges GROUP BY payload HAVING count(*) > 0 ORDER BY payload NULLS FIRST",
         "SELECT id, row_number() OVER (ORDER BY sort_key), count(*) OVER (PARTITION BY payload) FROM transform_window_edges WHERE false",
         "SELECT count(*), max(id), string_agg(btrim(label), ':' ORDER BY id DESC) FROM transform_source",
         "SELECT count(*), max(id), string_agg(label, ',' ORDER BY id) FROM transform_source WHERE false",

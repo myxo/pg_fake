@@ -68,6 +68,7 @@ pub(crate) use procedural::{
     validate_procedural_raise_arity,
 };
 pub(crate) use query::LOCK_PENDING;
+pub(crate) use query::resolve_statement_windows;
 pub(crate) use query::{describe_query_result_columns, detect_statement_features};
 pub(crate) use scope::{
     BoundScope, RowScope, bind_from_scope, bind_join, bind_query_scope, bind_table_factor,
