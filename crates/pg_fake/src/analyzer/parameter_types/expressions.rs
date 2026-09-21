@@ -356,6 +356,24 @@ fn infer_function_parameters(
         }
         return Ok(());
     }
+    if matches!(name.as_str(), "lag" | "lead") && function.over.is_some() {
+        if let Some(offset) = arguments.get(1) {
+            constrain_parameter_type(offset, Some(BaseType::Int4), types)?;
+        }
+        if let Some(default) = arguments.get(2) {
+            let value_type = infer_parameter_expression_type(arguments[0], schema, types)
+                .or_else(|| infer_parameter_expression_type(default, schema, types));
+            constrain_parameter_type(arguments[0], value_type, types)?;
+            constrain_parameter_type(default, value_type, types)?;
+        }
+        return Ok(());
+    }
+    if name == "nth_value" && function.over.is_some() {
+        if let Some(offset) = arguments.get(1) {
+            constrain_parameter_type(offset, Some(BaseType::Int4), types)?;
+        }
+        return Ok(());
+    }
     let expected = match name.as_str() {
         "length" | "lower" | "upper" | "btrim" | "string_agg" => Some(BaseType::Text),
         _ => arguments

@@ -273,6 +273,139 @@ fn executes_named_and_ranking_windows() {
 }
 
 #[test]
+fn executes_offset_and_value_windows() {
+    let db = Db::create();
+    let mut session = db.create_session();
+    session
+        .execute(
+            "CREATE TABLE offset_values (id INTEGER, category TEXT, value INTEGER); \
+             INSERT INTO offset_values VALUES \
+               (1, 'a', 10), (2, 'a', 10), (3, 'a', 30), \
+               (4, 'b', NULL), (5, 'b', 5)",
+        )
+        .unwrap();
+
+    assert_eq!(
+        query_rows(
+            &mut session,
+            "SELECT id, lag(value, 1, -1) OVER ordered, lead(value, -1, -2) OVER ordered, \
+                    first_value(value) OVER ordered, last_value(value) OVER ordered, \
+                    nth_value(value, 2) OVER ordered \
+             FROM offset_values \
+             WINDOW ordered AS (PARTITION BY category ORDER BY value NULLS FIRST) \
+             ORDER BY id",
+        ),
+        vec![
+            vec![
+                Value::Int4(1),
+                Value::Int4(-1),
+                Value::Int4(-2),
+                Value::Int4(10),
+                Value::Int4(10),
+                Value::Int4(10)
+            ],
+            vec![
+                Value::Int4(2),
+                Value::Int4(10),
+                Value::Int4(10),
+                Value::Int4(10),
+                Value::Int4(10),
+                Value::Int4(10)
+            ],
+            vec![
+                Value::Int4(3),
+                Value::Int4(10),
+                Value::Int4(10),
+                Value::Int4(10),
+                Value::Int4(30),
+                Value::Int4(10)
+            ],
+            vec![
+                Value::Int4(4),
+                Value::Int4(-1),
+                Value::Int4(-2),
+                Value::Null,
+                Value::Null,
+                Value::Null
+            ],
+            vec![
+                Value::Int4(5),
+                Value::Null,
+                Value::Null,
+                Value::Null,
+                Value::Int4(5),
+                Value::Int4(5)
+            ],
+        ],
+    );
+    assert_eq!(
+        query_rows(
+            &mut session,
+            "SELECT first_value(value) OVER (PARTITION BY category), \
+                    last_value(value) OVER (PARTITION BY category), \
+                    nth_value(value, NULL) OVER (PARTITION BY category) \
+             FROM offset_values ORDER BY id",
+        ),
+        vec![
+            vec![Value::Int4(10), Value::Int4(30), Value::Null],
+            vec![Value::Int4(10), Value::Int4(30), Value::Null],
+            vec![Value::Int4(10), Value::Int4(30), Value::Null],
+            vec![Value::Null, Value::Int4(5), Value::Null],
+            vec![Value::Null, Value::Int4(5), Value::Null],
+        ],
+    );
+    let prepared = session
+        .prepare("SELECT lag(value, $1, $2) OVER (ORDER BY id) FROM offset_values ORDER BY id")
+        .unwrap();
+    assert_eq!(
+        session
+            .query_prepared(&prepared, &[Value::Int4(2), Value::Int4(-1)])
+            .unwrap()
+            .rows,
+        vec![
+            vec![Value::Int4(-1)],
+            vec![Value::Int4(-1)],
+            vec![Value::Int4(10)],
+            vec![Value::Int4(10)],
+            vec![Value::Int4(30)],
+        ],
+    );
+    let metadata = session
+        .query(
+            "SELECT lead(value, 1, 1::bigint) OVER (ORDER BY id), \
+                    nth_value(value, 1) OVER (ORDER BY id) \
+             FROM offset_values LIMIT 1",
+            &[],
+        )
+        .unwrap();
+    assert_eq!(
+        metadata
+            .columns
+            .iter()
+            .map(|column| column.type_oid)
+            .collect::<Vec<_>>(),
+        vec![20, 23],
+    );
+    for sql in [
+        "SELECT lag(value, 1, 1, 1) OVER () FROM offset_values",
+        "SELECT first_value(value, 1) OVER () FROM offset_values",
+        "SELECT nth_value(value) OVER () FROM offset_values",
+    ] {
+        assert_eq!(
+            session.query(sql, &[]).unwrap_err().sqlstate,
+            SqlState::UndefinedFunction,
+        );
+    }
+    assert_eq!(
+        session
+            .query("SELECT nth_value(value, 0) OVER () FROM offset_values", &[])
+            .unwrap_err()
+            .sqlstate,
+        SqlState::ArraySubscriptError,
+    );
+}
+
+#[test]
 fn executes_required_aggregates_and_predicates() {
     let db = Db::create();
     let mut session = db.create_session();

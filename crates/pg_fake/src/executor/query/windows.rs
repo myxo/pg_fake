@@ -341,6 +341,88 @@ fn evaluate_window_expression(
     evaluate_query_expression(state, &expression, scope, row, xid, snapshot, context)
 }
 
+fn evaluate_window_value_expression(
+    state: &DatabaseState,
+    function: &WindowFunction,
+    expression: &ast::Expr,
+    scope: &BoundScope,
+    row: &[Value],
+    aggregate_values: Option<&GroupedAggregateValues>,
+    xid: Xid,
+    snapshot: &Snapshot,
+    context: &StatementContext,
+) -> Result<Value> {
+    let expression = aggregate_values.map_or_else(
+        || Ok(expression.clone()),
+        |values| materialize_aggregate_expression(state, expression, scope, values, function.owner),
+    )?;
+    let value = evaluate_query_expression(state, &expression, scope, row, xid, snapshot, context)?;
+    if value.is_null() {
+        return Ok(value);
+    }
+    if let Some(text) = crate::executor::extract_unknown_string_literal(&expression) {
+        return coercion::coerce_unknown(
+            text,
+            PgType::create(function.data_type),
+            CastContext::Implicit,
+            &context.get_timezone(),
+        );
+    }
+    coercion::coerce(
+        value,
+        crate::executor::infer_expression_type(&expression, RowScope::Bound(scope))?,
+        PgType::create(function.data_type),
+        CastContext::Implicit,
+        &context.get_timezone(),
+    )
+}
+
+fn evaluate_window_offset(
+    state: &DatabaseState,
+    function: &WindowFunction,
+    expression: &ast::Expr,
+    scope: &BoundScope,
+    row: &[Value],
+    aggregate_values: Option<&GroupedAggregateValues>,
+    xid: Xid,
+    snapshot: &Snapshot,
+    context: &StatementContext,
+) -> Result<Option<i64>> {
+    let value = evaluate_window_expression(
+        state,
+        function,
+        expression,
+        scope,
+        row,
+        aggregate_values,
+        xid,
+        snapshot,
+        context,
+    )?;
+    let value = match value {
+        Value::Null => return Ok(None),
+        Value::Text(value) => coercion::coerce_unknown(
+            &value,
+            PgType::create(BaseType::Int4),
+            CastContext::Implicit,
+            &context.get_timezone(),
+        )?,
+        value => coercion::coerce(
+            value.clone(),
+            value
+                .get_base_type()
+                .expect("non-null offset has a base type"),
+            PgType::create(BaseType::Int4),
+            CastContext::Implicit,
+            &context.get_timezone(),
+        )?,
+    };
+    let Value::Int4(value) = value else {
+        unreachable!("window offset was coerced to int4")
+    };
+    Ok(Some(i64::from(value)))
+}
+
 pub(super) fn calculate_window_values(
     state: &DatabaseState,
     functions: &[WindowFunction],
@@ -352,8 +434,8 @@ pub(super) fn calculate_window_values(
     context: &StatementContext,
 ) -> Result<Vec<Vec<Value>>> {
     let mut values = vec![vec![Value::Null; functions.len()]; rows.len()];
-    for (function_index, function) in functions.iter().enumerate() {
-        let function = &function.function;
+    for (function_index, window_function) in functions.iter().enumerate() {
+        let function = &window_function.function;
         let name = normalize_function_name(&function.name)?;
         let ast::WindowType::WindowSpec(window) = function
             .over
@@ -363,7 +445,8 @@ pub(super) fn calculate_window_values(
             unreachable!("named windows were rejected")
         };
         match name.as_str() {
-            "row_number" | "rank" | "dense_rank" | "percent_rank" | "cume_dist" | "ntile" => {
+            "row_number" | "rank" | "dense_rank" | "percent_rank" | "cume_dist" | "ntile"
+            | "lag" | "lead" | "first_value" | "last_value" | "nth_value" => {
                 let partitions = rows
                     .iter()
                     .enumerate()
@@ -526,6 +609,208 @@ pub(super) fn calculate_window_values(
                                         i32::try_from(bucket)
                                             .expect("ntile result must fit in int4"),
                                     )
+                                }
+                                "lag" | "lead" => {
+                                    let ast::FunctionArguments::List(arguments) = &function.args
+                                    else {
+                                        unreachable!("lag and lead arguments were validated")
+                                    };
+                                    let ast::FunctionArg::Unnamed(ast::FunctionArgExpr::Expr(
+                                        value,
+                                    )) = &arguments.args[0]
+                                    else {
+                                        unreachable!("lag and lead value argument was validated")
+                                    };
+                                    let offset = if let Some(argument) = arguments.args.get(1) {
+                                        let ast::FunctionArg::Unnamed(ast::FunctionArgExpr::Expr(
+                                            argument,
+                                        )) = argument
+                                        else {
+                                            unreachable!(
+                                                "lag and lead offset argument was validated"
+                                            )
+                                        };
+                                        evaluate_window_offset(
+                                            state,
+                                            window_function,
+                                            argument,
+                                            scope,
+                                            &rows[row_index],
+                                            aggregate_values.map(|values| &values[row_index]),
+                                            xid,
+                                            snapshot,
+                                            context,
+                                        )?
+                                    } else {
+                                        Some(1)
+                                    };
+                                    match offset {
+                                        None => Value::Null,
+                                        Some(offset) => {
+                                            let target = if name == "lag" {
+                                                i64::try_from(position)
+                                                    .expect("window position must fit in int8")
+                                                    - offset
+                                            } else {
+                                                i64::try_from(position)
+                                                    .expect("window position must fit in int8")
+                                                    + offset
+                                            };
+                                            if let Ok(target) = usize::try_from(target)
+                                                && let Some(&target) = indexes.get(target)
+                                            {
+                                                evaluate_window_value_expression(
+                                                    state,
+                                                    window_function,
+                                                    value,
+                                                    scope,
+                                                    &rows[target],
+                                                    aggregate_values.map(|values| &values[target]),
+                                                    xid,
+                                                    snapshot,
+                                                    context,
+                                                )?
+                                            } else if let Some(argument) = arguments.args.get(2) {
+                                                let ast::FunctionArg::Unnamed(
+                                                    ast::FunctionArgExpr::Expr(default),
+                                                ) = argument
+                                                else {
+                                                    unreachable!(
+                                                        "lag and lead default argument was validated"
+                                                    )
+                                                };
+                                                evaluate_window_value_expression(
+                                                    state,
+                                                    window_function,
+                                                    default,
+                                                    scope,
+                                                    &rows[row_index],
+                                                    aggregate_values
+                                                        .map(|values| &values[row_index]),
+                                                    xid,
+                                                    snapshot,
+                                                    context,
+                                                )?
+                                            } else {
+                                                Value::Null
+                                            }
+                                        }
+                                    }
+                                }
+                                "first_value" => {
+                                    let ast::FunctionArguments::List(arguments) = &function.args
+                                    else {
+                                        unreachable!("first_value arguments were validated")
+                                    };
+                                    let ast::FunctionArg::Unnamed(ast::FunctionArgExpr::Expr(
+                                        value,
+                                    )) = &arguments.args[0]
+                                    else {
+                                        unreachable!("first_value argument was validated")
+                                    };
+                                    let target = indexes[0];
+                                    evaluate_window_value_expression(
+                                        state,
+                                        window_function,
+                                        value,
+                                        scope,
+                                        &rows[target],
+                                        aggregate_values.map(|values| &values[target]),
+                                        xid,
+                                        snapshot,
+                                        context,
+                                    )?
+                                }
+                                "last_value" => {
+                                    let ast::FunctionArguments::List(arguments) = &function.args
+                                    else {
+                                        unreachable!("last_value arguments were validated")
+                                    };
+                                    let ast::FunctionArg::Unnamed(ast::FunctionArgExpr::Expr(
+                                        value,
+                                    )) = &arguments.args[0]
+                                    else {
+                                        unreachable!("last_value argument was validated")
+                                    };
+                                    let target = indexes[if window.order_by.is_empty() {
+                                        indexes.len() - 1
+                                    } else {
+                                        peer_end - 1
+                                    }];
+                                    evaluate_window_value_expression(
+                                        state,
+                                        window_function,
+                                        value,
+                                        scope,
+                                        &rows[target],
+                                        aggregate_values.map(|values| &values[target]),
+                                        xid,
+                                        snapshot,
+                                        context,
+                                    )?
+                                }
+                                "nth_value" => {
+                                    let ast::FunctionArguments::List(arguments) = &function.args
+                                    else {
+                                        unreachable!("nth_value arguments were validated")
+                                    };
+                                    let ast::FunctionArg::Unnamed(ast::FunctionArgExpr::Expr(
+                                        value,
+                                    )) = &arguments.args[0]
+                                    else {
+                                        unreachable!("nth_value value argument was validated")
+                                    };
+                                    let ast::FunctionArg::Unnamed(ast::FunctionArgExpr::Expr(
+                                        offset,
+                                    )) = &arguments.args[1]
+                                    else {
+                                        unreachable!("nth_value offset argument was validated")
+                                    };
+                                    let offset = evaluate_window_offset(
+                                        state,
+                                        window_function,
+                                        offset,
+                                        scope,
+                                        &rows[row_index],
+                                        aggregate_values.map(|values| &values[row_index]),
+                                        xid,
+                                        snapshot,
+                                        context,
+                                    )?;
+                                    match offset {
+                                        None => Value::Null,
+                                        Some(offset) => {
+                                            if offset <= 0 {
+                                                return Err(crate::error::PgError::create(
+                                                    crate::error::SqlState::ArraySubscriptError,
+                                                    "argument of nth_value must be greater than zero",
+                                                ));
+                                            }
+                                            let frame_end = if window.order_by.is_empty() {
+                                                indexes.len()
+                                            } else {
+                                                peer_end
+                                            };
+                                            if let Ok(target) = usize::try_from(offset - 1)
+                                                && target < frame_end
+                                            {
+                                                let target = indexes[target];
+                                                evaluate_window_value_expression(
+                                                    state,
+                                                    window_function,
+                                                    value,
+                                                    scope,
+                                                    &rows[target],
+                                                    aggregate_values.map(|values| &values[target]),
+                                                    xid,
+                                                    snapshot,
+                                                    context,
+                                                )?
+                                            } else {
+                                                Value::Null
+                                            }
+                                        }
+                                    }
                                 }
                                 _ => unreachable!("ranking function name was validated"),
                             };

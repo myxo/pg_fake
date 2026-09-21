@@ -150,6 +150,108 @@ pub(in crate::executor) fn infer_window_return_type(
             }
             Ok(Some(BaseType::Int4))
         }
+        "lag" | "lead" => {
+            let ast::FunctionArguments::List(arguments) = &function.args else {
+                return Err(PgError::create(
+                    SqlState::UndefinedFunction,
+                    format!("function {name} does not exist"),
+                ));
+            };
+            let expressions = arguments
+                .args
+                .iter()
+                .map(|argument| match argument {
+                    ast::FunctionArg::Unnamed(ast::FunctionArgExpr::Expr(expression)) => {
+                        Ok(expression)
+                    }
+                    _ => Err(PgError::create(
+                        SqlState::UndefinedFunction,
+                        format!("function {name} does not exist"),
+                    )),
+                })
+                .collect::<Result<Vec<_>>>()?;
+            if !(1..=3).contains(&expressions.len())
+                || !arguments.clauses.is_empty()
+                || arguments.duplicate_treatment.is_some()
+            {
+                return Err(PgError::create(
+                    SqlState::UndefinedFunction,
+                    format!("function {name} does not exist"),
+                ));
+            }
+            if let Some(offset) = expressions.get(1) {
+                validate_function_argument(offset, BaseType::Int4, schema, &|| {
+                    PgError::create(
+                        SqlState::UndefinedFunction,
+                        format!("function {name} does not exist"),
+                    )
+                })?;
+            }
+            validate_window_partition_and_order(window, schema)?;
+            Ok(Some(resolve_expression_list_type(
+                &[
+                    expressions[0],
+                    expressions.get(2).copied().unwrap_or(expressions[0]),
+                ],
+                schema,
+            )?))
+        }
+        "first_value" | "last_value" => {
+            let ast::FunctionArguments::List(arguments) = &function.args else {
+                return Err(PgError::create(
+                    SqlState::UndefinedFunction,
+                    format!("function {name} does not exist"),
+                ));
+            };
+            let [ast::FunctionArg::Unnamed(ast::FunctionArgExpr::Expr(expression))] =
+                arguments.args.as_slice()
+            else {
+                return Err(PgError::create(
+                    SqlState::UndefinedFunction,
+                    format!("function {name} does not exist"),
+                ));
+            };
+            if !arguments.clauses.is_empty() || arguments.duplicate_treatment.is_some() {
+                return Err(PgError::create(
+                    SqlState::UndefinedFunction,
+                    format!("function {name} does not exist"),
+                ));
+            }
+            validate_window_partition_and_order(window, schema)?;
+            Ok(Some(infer_expression_type(expression, schema)?))
+        }
+        "nth_value" => {
+            let ast::FunctionArguments::List(arguments) = &function.args else {
+                return Err(PgError::create(
+                    SqlState::UndefinedFunction,
+                    "function nth_value does not exist",
+                ));
+            };
+            let [
+                ast::FunctionArg::Unnamed(ast::FunctionArgExpr::Expr(expression)),
+                ast::FunctionArg::Unnamed(ast::FunctionArgExpr::Expr(offset)),
+            ] = arguments.args.as_slice()
+            else {
+                return Err(PgError::create(
+                    SqlState::UndefinedFunction,
+                    "function nth_value does not exist",
+                ));
+            };
+            if !arguments.clauses.is_empty() || arguments.duplicate_treatment.is_some() {
+                return Err(PgError::create(
+                    SqlState::UndefinedFunction,
+                    "function nth_value does not exist",
+                ));
+            }
+            validate_function_argument(offset, BaseType::Int4, schema, &|| {
+                PgError::create(
+                    SqlState::UndefinedFunction,
+                    "function nth_value does not exist",
+                )
+            })?;
+            validate_window_partition_and_order(window, schema)?;
+            Ok(Some(infer_expression_type(expression, schema)?))
+        }
         "count" => {
             let ast::FunctionArguments::List(arguments) = &function.args else {
                 return Err(PgError::create(
@@ -181,6 +283,24 @@ pub(in crate::executor) fn infer_window_return_type(
             format!("function {name} does not exist"),
         )),
     }
+}
+
+fn validate_window_partition_and_order(
+    window: &ast::WindowSpec,
+    schema: RowScope<'_>,
+) -> Result<()> {
+    for partition in &window.partition_by {
+        validate_equality_type(infer_expression_type(partition, schema)?)?;
+    }
+    for order in &window.order_by {
+        if order.with_fill.is_some()
+            || matches!(order.options.sort, Some(ast::OrderBySort::Using(_)))
+        {
+            return reject_unsupported("window order feature is not implemented");
+        }
+        validate_ordering_type(infer_expression_type(&order.expr, schema)?)?;
+    }
+    Ok(())
 }
 
 #[cfg_attr(feature = "execution-log", tracing::instrument(skip_all))]

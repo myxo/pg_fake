@@ -2567,7 +2567,7 @@ fn matches_generated_migration_data_transform_queries() {
         let first = src.any_of("first", int_in(-20_i32..=20));
         let second = src.any_of("second", int_in(-20_i32..=20));
         let third = src.any_of("third", int_in(-20_i32..=20));
-        let transform = src.any_of("transform", int_in(0..=9));
+        let transform = src.any_of("transform", int_in(0..=11));
         let sql = match transform {
             0 => format!(
                 "SELECT ({first}::integer * {second}::numeric)::bigint, \
@@ -2616,14 +2616,26 @@ fn matches_generated_migration_data_transform_queries() {
                  FROM (VALUES ({first}), (NULL), ({second}), ({third})) AS generated(value) \
                  WINDOW base AS (), ordered AS (base ORDER BY value NULLS FIRST) ORDER BY value NULLS FIRST"
             ),
-            8 => format!("SELECT 'x' ~ 'x{{{}}}'", 256 + first.unsigned_abs()),
+            8 => format!(
+                "SELECT value, lag(value, {third}, {first}) OVER ordered, \
+                        lead(value, {second}, {third}) OVER ordered \
+                 FROM (VALUES ({first}), (NULL), ({second}), ({third})) AS generated(value) \
+                 WINDOW ordered AS (ORDER BY value NULLS FIRST) ORDER BY value NULLS FIRST"
+            ),
+            9 => format!(
+                "SELECT value, first_value(value) OVER ordered, last_value(value) OVER ordered, \
+                        nth_value(value, 2) OVER ordered \
+                 FROM (VALUES ({first}), (NULL), ({second}), ({third})) AS generated(value) \
+                 WINDOW ordered AS (ORDER BY value NULLS FIRST) ORDER BY value NULLS FIRST"
+            ),
+            10 => format!("SELECT 'x' ~ 'x{{{}}}'", 256 + first.unsigned_abs()),
             _ => format!(
                 "SELECT count() OVER (PARTITION BY value) \
                  FROM (VALUES ({first}), ({second}), ({third})) AS generated(value)"
             ),
         };
         src.log_value("sql", &sql);
-        if transform >= 8 {
+        if transform >= 10 {
             assert_statement_allow_error(
                 &runtime,
                 &mut postgres.borrow_mut(),

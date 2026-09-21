@@ -212,6 +212,11 @@ pub fn list_benchmarks() -> Vec<Benchmark> {
             postgres_comparisons(),
         ),
         build_benchmark(
+            "window_offset_100_rows",
+            postgres_values(),
+            postgres_comparisons(),
+        ),
+        build_benchmark(
             "ordered_string_agg_100_rows",
             postgres_values(),
             postgres_comparisons(),

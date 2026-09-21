@@ -365,16 +365,28 @@ pub const FEATURES: &[Feature] = &[
     Feature {
         task: 35,
         name: "window offset and value functions",
-        cases: &[Case {
-            id: "lag",
-            source: "window.sql:61",
-            setup: &[
-                "CREATE TABLE phase3_window_offset (value INTEGER)",
-                "INSERT INTO phase3_window_offset VALUES (1), (2)",
-            ],
-            sql: "SELECT value, lag(value) OVER (ORDER BY value) FROM phase3_window_offset ORDER BY value",
-            blocker: BlockerKind::Implementation,
-        }],
+        cases: &[
+            Case {
+                id: "lag_and_lead",
+                source: "window.sql:61-72",
+                setup: &[
+                    "CREATE TABLE phase3_window_offset (value INTEGER)",
+                    "INSERT INTO phase3_window_offset VALUES (1), (1), (2), (NULL)",
+                ],
+                sql: "SELECT value, lag(value, 1, -1) OVER ordered, lead(value, 2, -2) OVER ordered FROM phase3_window_offset WINDOW ordered AS (ORDER BY value NULLS FIRST) ORDER BY value NULLS FIRST",
+                blocker: BlockerKind::Implementation,
+            },
+            Case {
+                id: "frame_value_functions",
+                source: "window.sql:76-84",
+                setup: &[
+                    "CREATE TABLE phase3_window_values (value INTEGER)",
+                    "INSERT INTO phase3_window_values VALUES (1), (1), (2), (NULL)",
+                ],
+                sql: "SELECT value, first_value(value) OVER ordered, last_value(value) OVER ordered, nth_value(value, 2) OVER ordered FROM phase3_window_values WINDOW ordered AS (ORDER BY value NULLS FIRST) ORDER BY value NULLS FIRST",
+                blocker: BlockerKind::Implementation,
+            },
+        ],
     },
     Feature {
         task: 36,

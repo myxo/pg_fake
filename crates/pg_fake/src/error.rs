@@ -30,6 +30,7 @@ pub enum SqlState {
     UntranslatableCharacter,             // 22P05
     CantChangeRuntimeParam,              // 55P02
     InvalidParameterValue,               // 22023
+    ArraySubscriptError,                 // 2202E
     StringDataRightTruncation,           // 22001
     SequenceGeneratorLimitExceeded,      // 2200H
 
@@ -127,6 +128,7 @@ impl SqlState {
             SqlState::UntranslatableCharacter => "22P05",
             SqlState::CantChangeRuntimeParam => "55P02",
             SqlState::InvalidParameterValue => "22023",
+            SqlState::ArraySubscriptError => "2202E",
             SqlState::StringDataRightTruncation => "22001",
             SqlState::SequenceGeneratorLimitExceeded => "2200H",
             SqlState::CardinalityViolation => "21000",

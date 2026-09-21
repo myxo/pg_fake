@@ -1842,6 +1842,15 @@ binding, partitioning, ordering, and ranking surface.
 
 ### Task 35 — Offset and value window functions
 
+**Progress:**
+
+- [x] Implement `lag`, `lead`, `first_value`, `last_value`, and `nth_value` with
+  partition/default-frame semantics, coercion, parameter inference, metadata, and errors.
+- [x] Add native, PostgreSQL differential, generated-property, manifest, and benchmark coverage.
+- [ ] Complete final validation.
+- [x] Complete independent review with no findings.
+- [ ] Obtain user approval before marking this task complete.
+
 **Goal:** Add position-sensitive access to rows within a partition or frame.
 
 **DoD:**
