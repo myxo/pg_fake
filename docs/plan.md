@@ -1954,7 +1954,7 @@ grammar as pending, so no represented exclusion form exists to execute.
 
 ## Milestone J — General array completion
 
-### Task 37 — Remaining one-dimensional array operations
+### Task 37 — Remaining one-dimensional array operations [COMPLETE]
 
 **Goal:** Complete the broader one-dimensional array commitment after the
 priority BIGINT/UUID application paths are available.
@@ -2013,8 +2013,8 @@ none of its remaining forms is required by the expedited application workload.
   NULL edge cases, equality validation, and `bpchar` comparison semantics.
 - [x] Obtain user approval and commit the reviewed parser-fork change locally
   as `dfbc7476`.
-- [ ] Publish the parser-fork revision, replace the temporary path dependency,
-  and mark the task complete.
+- [x] Publish the parser-fork revision, replace the temporary path dependency
+  with `dfbc74760f1f453cfd207226fdf986285e1f8485`, and mark Task 37 complete.
 
 ---
 
