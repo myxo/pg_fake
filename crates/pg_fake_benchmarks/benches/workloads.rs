@@ -1070,6 +1070,10 @@ fn migration_data_transform_benchmark(
             "SELECT id, lag(id, 1, -1) OVER ordered, lead(id, 1, -1) OVER ordered, first_value(id) OVER ordered, last_value(id) OVER ordered, nth_value(id, 2) OVER ordered FROM migration_data_transform_100_rows WINDOW ordered AS (PARTITION BY bucket ORDER BY id) ORDER BY id",
         ),
         (
+            "window_moving_aggregate_100_rows",
+            "SELECT id, sum(id) OVER (PARTITION BY bucket ORDER BY id ROWS BETWEEN 2 PRECEDING AND 2 FOLLOWING), avg(id) OVER (PARTITION BY bucket ORDER BY id GROUPS BETWEEN 1 PRECEDING AND CURRENT ROW) FROM migration_data_transform_100_rows ORDER BY id",
+        ),
+        (
             "ordered_string_agg_100_rows",
             "SELECT bucket, string_agg(btrim(label), ',' ORDER BY id) FROM migration_data_transform_100_rows GROUP BY bucket ORDER BY bucket",
         ),

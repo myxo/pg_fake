@@ -1885,7 +1885,56 @@ decoded UTC instants before and after replanning.
 - Differential/property cases cover edges, offsets, defaults, NULLs, peers,
   parameters, metadata, and errors.
 
-### Task 36 — Aggregate windows and frame semantics
+### Task 36 — Aggregate windows and frame semantics [COMPLETE]
+
+**Progress:**
+
+- [x] Execute core aggregates as windows with PostgreSQL result types, NULL
+  behavior, filters, default peer frames, and grouped aggregate inputs.
+- [x] Implement legal `ROWS`, `RANGE`, and `GROUPS` bounds, including numeric
+  and temporal offsets, prepared parameters, value-function frames, and
+  PostgreSQL-compatible validation and error timing.
+- [x] Add native, PostgreSQL differential, generated-property, manifest, and
+  ranking/moving-aggregate benchmark coverage.
+- [x] Complete final formatting, strict Clippy, focused tests, the full
+  non-generated workspace regression, and the required property gate.
+- [x] Complete repeated independent review with no remaining findings.
+- [x] Commit the reviewed sqlparser-fork change locally as
+  `26eeb2114037b79220f1eaa8a82171271b7aee77`.
+- [x] Publish the reviewed sqlparser-fork change and update the workspace Git
+  revision.
+- [x] Obtain user approval before marking Task 36 complete.
+
+**Validation:** Formatting and strict all-target/all-feature workspace Clippy
+pass. The focused native and PostgreSQL differential migration window suites
+pass, including aggregate frames, peers, empty inputs, prepared offsets,
+numeric/temporal infinities, quoted offsets, and compatible errors. The full
+non-generated workspace regression passes against a uniquely named temporary
+PostgreSQL 18 database with `C` collation; the database was removed afterward.
+The exact `CHAOS_THEORY_CHECK_ITERS=10000 CHAOS_THEORY_CHECK_TIME=600s cargo
+test -p pg_fake_sqlx --features time --test property_tests` gate passes all 24
+suites on the final reviewed source in 920.78 seconds. The Phase 3 manifest
+reports no Task 36 blocker; 88 of 92 total Phase 3 cases pass, with the four
+remaining blockers assigned to later tasks.
+
+The sqlparser fork now preserves quoted window-frame bounds as unknown string
+expressions so PostgreSQL coercion can select `int8`, numeric, or interval
+offsets. The change is committed locally as
+`26eeb2114037b79220f1eaa8a82171271b7aee77`. Repeated independent review found
+no remaining issues after moving its positive and negative coverage into the
+common-dialect suite. The standalone fork test could not resolve uncached
+crates because the network proxy returned HTTP 403, and its offline cache lacks
+`matches`. The fork's focused grammar behavior, pg_fake integration tests,
+differential suite, full regression, and strict Clippy all pass through Cargo's
+local path override. The fork revision is now published, the workspace and
+lockfile pin it, and a locked all-target/all-feature workspace check plus the
+focused native aggregate-window test pass against the published source.
+
+The short moving-window benchmark measured approximately 591 microseconds for
+pg_fake and 151 microseconds for PostgreSQL 18, about 3.9 times slower, so the
+performance target was not met. The pinned sqlparser AST does not yet represent
+window-frame `EXCLUDE` clauses; its `WindowFrame` definition still records that
+grammar as pending, so no represented exclusion form exists to execute.
 
 **Goal:** Complete existing aggregates over PostgreSQL window frames.
 

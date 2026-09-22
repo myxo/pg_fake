@@ -2567,7 +2567,7 @@ fn matches_generated_migration_data_transform_queries() {
         let first = src.any_of("first", int_in(-20_i32..=20));
         let second = src.any_of("second", int_in(-20_i32..=20));
         let third = src.any_of("third", int_in(-20_i32..=20));
-        let transform = src.any_of("transform", int_in(0..=21));
+        let transform = src.any_of("transform", int_in(0..=27));
         let sql = match transform {
             0 => format!(
                 "SELECT ({first}::integer * {second}::numeric)::bigint, \
@@ -2669,9 +2669,41 @@ fn matches_generated_migration_data_transform_queries() {
                 "SELECT lag(value, 1, 'x'::integer) OVER () \
                  FROM (VALUES ({first}), ({second})) AS generated(value) WHERE false"
             ),
-            _ => format!(
+            21 => format!(
                 "SELECT nth_value(value, '2147483648'::integer) OVER () \
                  FROM (VALUES ({first}), ({second}), ({third})) AS generated(value) WHERE false"
+            ),
+            22 => format!(
+                "SELECT value, sum(value) OVER (ORDER BY value ROWS BETWEEN 1 PRECEDING AND 1 FOLLOWING), \
+                        count(value) OVER (ORDER BY value RANGE BETWEEN {0} PRECEDING AND {0} FOLLOWING) \
+                 FROM (VALUES ({first}), (NULL), ({second}), ({third})) AS generated(value) \
+                 ORDER BY value NULLS FIRST",
+                first.unsigned_abs() % 4,
+            ),
+            23 => format!(
+                "SELECT value, min(value) OVER framed, max(value) OVER framed, avg(value) OVER framed \
+                 FROM (VALUES ({first}), (NULL), ({second}), ({third})) AS generated(value) \
+                 WINDOW framed AS (ORDER BY value NULLS FIRST GROUPS BETWEEN 1 PRECEDING AND CURRENT ROW) \
+                 ORDER BY value NULLS FIRST"
+            ),
+            24 => format!(
+                "SELECT value, first_value(value) OVER framed, last_value(value) OVER framed, \
+                        nth_value(value, 2) OVER framed, sum(value) FILTER (WHERE value >= 0) OVER framed \
+                 FROM (VALUES ({first}), (NULL), ({second}), ({third})) AS generated(value) \
+                 WINDOW framed AS (ORDER BY value NULLS FIRST ROWS BETWEEN CURRENT ROW AND 1 FOLLOWING) \
+                 ORDER BY value NULLS FIRST"
+            ),
+            25 => format!(
+                "SELECT sum(value) OVER (ROWS UNBOUNDED FOLLOWING) \
+                 FROM (VALUES ({first}), ({second})) AS generated(value)"
+            ),
+            26 => format!(
+                "SELECT sum(value) OVER (ORDER BY value ROWS -1 PRECEDING) \
+                 FROM (VALUES ({first}), ({second})) AS generated(value)"
+            ),
+            _ => format!(
+                "SELECT sum(value) OVER (RANGE BETWEEN 1 PRECEDING AND CURRENT ROW) \
+                 FROM (VALUES ({first}), ({second})) AS generated(value)"
             ),
         };
         src.log_value("sql", &sql);

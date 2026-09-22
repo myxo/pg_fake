@@ -10,4 +10,4 @@ license = "MIT"
 too_many_arguments = "allow"
 
 [patch.crates-io]
-sqlparser = { git = "https://github.com/myxo/datafusion-sqlparser-rs", rev = "a5131269ef597512d2afee9cc8799474426c9923" }
+sqlparser = { git = "https://github.com/myxo/datafusion-sqlparser-rs", rev = "26eeb2114037b79220f1eaa8a82171271b7aee77" }

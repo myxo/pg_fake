@@ -39,6 +39,12 @@ pub(super) struct AggregateDescriptor {
     order: Vec<(bool, bool)>,
 }
 
+impl AggregateDescriptor {
+    pub(super) fn get_result_type(&self) -> BaseType {
+        self.result_type
+    }
+}
+
 pub(super) struct AggregateCall<'a> {
     pub(super) descriptor: AggregateDescriptor,
     argument: Option<&'a ast::Expr>,

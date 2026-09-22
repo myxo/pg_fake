@@ -466,6 +466,514 @@ fn executes_offset_and_value_windows() {
 }
 
 #[test]
+fn executes_aggregate_window_frames() {
+    let db = Db::create();
+    let mut session = db.create_session();
+    session
+        .execute(
+            "CREATE TABLE frame_values (id INTEGER, category TEXT, value INTEGER, flag BOOLEAN, label TEXT); \
+             INSERT INTO frame_values VALUES \
+               (1, 'a', 10, true, 'x'), (2, 'a', 10, false, 'y'), \
+               (3, 'a', 30, true, 'z'), (4, 'a', NULL, NULL, NULL), \
+               (5, 'b', 5, true, 'q')",
+        )
+        .unwrap();
+
+    assert_eq!(
+        query_rows(
+            &mut session,
+            "SELECT id, count(*) OVER (ORDER BY id RANGE BETWEEN 2147483647 FOLLOWING AND UNBOUNDED FOLLOWING) \
+             FROM frame_values ORDER BY id",
+        ),
+        vec![
+            vec![Value::Int4(1), Value::Int8(0)],
+            vec![Value::Int4(2), Value::Int8(0)],
+            vec![Value::Int4(3), Value::Int8(0)],
+            vec![Value::Int4(4), Value::Int8(0)],
+            vec![Value::Int4(5), Value::Int8(0)],
+        ],
+    );
+    session
+        .execute("CREATE SEQUENCE frame_offset_sequence")
+        .unwrap();
+    let _ = query_rows(
+        &mut session,
+        "SELECT count(*) OVER (ORDER BY id ROWS nextval('frame_offset_sequence') PRECEDING) \
+         FROM frame_values",
+    );
+    assert_eq!(
+        query_rows(&mut session, "SELECT currval('frame_offset_sequence')"),
+        vec![vec![Value::Int8(1)]],
+    );
+
+    assert_eq!(
+        query_rows(
+            &mut session,
+            "SELECT id, sum(value) OVER ordered, \
+                    sum(value) OVER (PARTITION BY category ORDER BY value NULLS LAST \
+                      ROWS BETWEEN 1 PRECEDING AND 1 FOLLOWING), \
+                    sum(value) OVER (PARTITION BY category ORDER BY value NULLS LAST \
+                      RANGE BETWEEN 5 PRECEDING AND 5 FOLLOWING), \
+                    sum(value) OVER (PARTITION BY category ORDER BY value NULLS LAST \
+                      GROUPS BETWEEN 1 PRECEDING AND CURRENT ROW) \
+             FROM frame_values \
+             WINDOW ordered AS (PARTITION BY category ORDER BY value NULLS LAST) \
+             ORDER BY id",
+        ),
+        vec![
+            vec![
+                Value::Int4(1),
+                Value::Int8(20),
+                Value::Int8(20),
+                Value::Int8(20),
+                Value::Int8(20)
+            ],
+            vec![
+                Value::Int4(2),
+                Value::Int8(20),
+                Value::Int8(50),
+                Value::Int8(20),
+                Value::Int8(20)
+            ],
+            vec![
+                Value::Int4(3),
+                Value::Int8(50),
+                Value::Int8(40),
+                Value::Int8(30),
+                Value::Int8(50)
+            ],
+            vec![
+                Value::Int4(4),
+                Value::Int8(50),
+                Value::Int8(30),
+                Value::Null,
+                Value::Int8(30)
+            ],
+            vec![
+                Value::Int4(5),
+                Value::Int8(5),
+                Value::Int8(5),
+                Value::Int8(5),
+                Value::Int8(5)
+            ],
+        ],
+    );
+    assert_eq!(
+        query_rows(
+            &mut session,
+            "SELECT id, count(*) OVER whole, count(value) OVER whole, \
+                    min(value) OVER whole, max(value) OVER whole, \
+                    bool_and(flag) OVER whole, bool_or(flag) OVER whole, \
+                    string_agg(label, ',') OVER whole, \
+                    sum(value) FILTER (WHERE flag) OVER whole \
+             FROM frame_values \
+             WINDOW whole AS (PARTITION BY category) ORDER BY id",
+        ),
+        vec![
+            vec![
+                Value::Int4(1),
+                Value::Int8(4),
+                Value::Int8(3),
+                Value::Int4(10),
+                Value::Int4(30),
+                Value::Bool(false),
+                Value::Bool(true),
+                Value::Text("x,y,z".into()),
+                Value::Int8(40)
+            ],
+            vec![
+                Value::Int4(2),
+                Value::Int8(4),
+                Value::Int8(3),
+                Value::Int4(10),
+                Value::Int4(30),
+                Value::Bool(false),
+                Value::Bool(true),
+                Value::Text("x,y,z".into()),
+                Value::Int8(40)
+            ],
+            vec![
+                Value::Int4(3),
+                Value::Int8(4),
+                Value::Int8(3),
+                Value::Int4(10),
+                Value::Int4(30),
+                Value::Bool(false),
+                Value::Bool(true),
+                Value::Text("x,y,z".into()),
+                Value::Int8(40)
+            ],
+            vec![
+                Value::Int4(4),
+                Value::Int8(4),
+                Value::Int8(3),
+                Value::Int4(10),
+                Value::Int4(30),
+                Value::Bool(false),
+                Value::Bool(true),
+                Value::Text("x,y,z".into()),
+                Value::Int8(40)
+            ],
+            vec![
+                Value::Int4(5),
+                Value::Int8(1),
+                Value::Int8(1),
+                Value::Int4(5),
+                Value::Int4(5),
+                Value::Bool(true),
+                Value::Bool(true),
+                Value::Text("q".into()),
+                Value::Int8(5)
+            ],
+        ],
+    );
+    assert_eq!(
+        query_rows(
+            &mut session,
+            "SELECT id, first_value(value) OVER (ORDER BY id ROWS BETWEEN CURRENT ROW AND 1 FOLLOWING), \
+                    last_value(value) OVER (ORDER BY id ROWS BETWEEN CURRENT ROW AND 1 FOLLOWING), \
+                    nth_value(value, 2) OVER (ORDER BY id ROWS BETWEEN CURRENT ROW AND 1 FOLLOWING) \
+             FROM frame_values ORDER BY id",
+        ),
+        vec![
+            vec![
+                Value::Int4(1),
+                Value::Int4(10),
+                Value::Int4(10),
+                Value::Int4(10)
+            ],
+            vec![
+                Value::Int4(2),
+                Value::Int4(10),
+                Value::Int4(30),
+                Value::Int4(30)
+            ],
+            vec![Value::Int4(3), Value::Int4(30), Value::Null, Value::Null],
+            vec![Value::Int4(4), Value::Null, Value::Int4(5), Value::Int4(5)],
+            vec![Value::Int4(5), Value::Int4(5), Value::Int4(5), Value::Null],
+        ],
+    );
+    let prepared = session
+        .prepare(
+            "SELECT sum(value) OVER (ORDER BY id ROWS BETWEEN $1 PRECEDING AND $2 FOLLOWING) \
+             FROM frame_values ORDER BY id",
+        )
+        .unwrap();
+    assert_eq!(
+        session
+            .query_prepared(&prepared, &[Value::Int8(1), Value::Int8(0)])
+            .unwrap()
+            .rows,
+        vec![
+            vec![Value::Int8(10)],
+            vec![Value::Int8(20)],
+            vec![Value::Int8(40)],
+            vec![Value::Int8(30)],
+            vec![Value::Int8(5)],
+        ],
+    );
+    assert_eq!(
+        query_rows(
+            &mut session,
+            "SELECT category, sum(count(*)) OVER (ORDER BY category) \
+             FROM frame_values GROUP BY category HAVING count(*) > 0 ORDER BY category",
+        ),
+        vec![
+            vec![Value::Text("a".into()), Value::Numeric(4.into())],
+            vec![Value::Text("b".into()), Value::Numeric(5.into())],
+        ],
+    );
+
+    for sql in [
+        "SELECT sum(value) OVER (ROWS UNBOUNDED FOLLOWING) FROM frame_values",
+        "SELECT row_number() OVER (ROWS UNBOUNDED FOLLOWING) FROM frame_values",
+        "SELECT lag(value) OVER (ROWS UNBOUNDED FOLLOWING) FROM frame_values",
+        "SELECT first_value(value) OVER (ROWS UNBOUNDED FOLLOWING) FROM frame_values",
+        "SELECT sum(value) OVER (ROWS BETWEEN CURRENT ROW AND 1 PRECEDING) FROM frame_values",
+        "SELECT sum(value) OVER (RANGE BETWEEN 1 PRECEDING AND CURRENT ROW) FROM frame_values",
+    ] {
+        assert_eq!(
+            session.query(sql, &[]).unwrap_err().sqlstate,
+            SqlState::WindowingError,
+        );
+    }
+    assert_eq!(
+        session
+            .query(
+                "SELECT sum(value) OVER (ORDER BY id ROWS -1 PRECEDING) FROM frame_values",
+                &[],
+            )
+            .unwrap_err()
+            .sqlstate,
+        SqlState::InvalidPrecedingOrFollowingSize,
+    );
+    assert_eq!(
+        session
+            .query(
+                "SELECT sum(value) OVER (ORDER BY id ROWS id PRECEDING) FROM frame_values",
+                &[],
+            )
+            .unwrap_err()
+            .sqlstate,
+        SqlState::InvalidColumnReference,
+    );
+    assert_eq!(
+        session
+            .query(
+                "SELECT sum(value) OVER (ORDER BY id ROWS count(*) PRECEDING) FROM frame_values",
+                &[],
+            )
+            .unwrap_err()
+            .sqlstate,
+        SqlState::GroupingError,
+    );
+    assert_eq!(
+        session
+            .query(
+                "SELECT sum(value) OVER (ORDER BY id ROWS row_number() OVER () PRECEDING) FROM frame_values",
+                &[],
+            )
+            .unwrap_err()
+            .sqlstate,
+        SqlState::WindowingError,
+    );
+    assert_eq!(
+        session
+            .query(
+                "SELECT sum(value) OVER (ORDER BY id::double precision RANGE CAST('NaN' AS double precision) PRECEDING) FROM frame_values",
+                &[],
+            )
+            .unwrap_err()
+            .sqlstate,
+        SqlState::InvalidPrecedingOrFollowingSize,
+    );
+    assert_eq!(
+        query_rows(
+            &mut session,
+            "SELECT count(*) OVER (ORDER BY x RANGE CAST('Infinity' AS float8) PRECEDING) \
+             FROM (VALUES (1::float8), (2), ('Infinity')) AS values(x)",
+        ),
+        vec![
+            vec![Value::Int8(1)],
+            vec![Value::Int8(2)],
+            vec![Value::Int8(3)],
+        ],
+    );
+    assert_eq!(
+        session
+            .query(
+                "SELECT count(*) OVER (ORDER BY id::float8 RANGE CAST('-Infinity' AS float8) PRECEDING) FROM frame_values",
+                &[],
+            )
+            .unwrap_err()
+            .sqlstate,
+        SqlState::InvalidPrecedingOrFollowingSize,
+    );
+    assert_eq!(
+        session
+            .query(
+                "SELECT sum(value) OVER (ROWS -1 PRECEDING) FROM frame_values WHERE false",
+                &[],
+            )
+            .unwrap_err()
+            .sqlstate,
+        SqlState::InvalidPrecedingOrFollowingSize,
+    );
+    assert_eq!(
+        session
+            .query(
+                "SELECT sum(value) OVER (ORDER BY id GROUPS NULL PRECEDING) FROM frame_values WHERE false",
+                &[],
+            )
+            .unwrap_err()
+            .sqlstate,
+        SqlState::NullValueNotAllowed,
+    );
+    assert_eq!(
+        session
+            .query(
+                "SELECT sum(value) OVER (ROWS ('-1') PRECEDING) FROM frame_values WHERE false",
+                &[],
+            )
+            .unwrap_err()
+            .sqlstate,
+        SqlState::InvalidPrecedingOrFollowingSize,
+    );
+    assert!(
+        query_rows(
+            &mut session,
+            "SELECT count(*) OVER (ORDER BY id RANGE -1 PRECEDING) FROM frame_values WHERE false",
+        )
+        .is_empty()
+    );
+    assert_eq!(
+        query_rows(
+            &mut session,
+            "SELECT count(*) OVER (ORDER BY value RANGE -1 PRECEDING) \
+             FROM (VALUES (NULL::integer)) AS values(value)",
+        ),
+        vec![vec![Value::Int8(1)]],
+    );
+    assert_eq!(
+        query_rows(
+            &mut session,
+            "SELECT count(*) OVER (ORDER BY id ROWS '1' PRECEDING), \
+                    count(*) OVER (ORDER BY id RANGE '1' PRECEDING) \
+             FROM frame_values ORDER BY id",
+        ),
+        vec![
+            vec![Value::Int8(1), Value::Int8(1)],
+            vec![Value::Int8(2), Value::Int8(2)],
+            vec![Value::Int8(2), Value::Int8(2)],
+            vec![Value::Int8(2), Value::Int8(2)],
+            vec![Value::Int8(2), Value::Int8(2)],
+        ],
+    );
+}
+
+#[test]
+fn executes_temporal_range_frames() {
+    let db = Db::create();
+    let mut session = db.create_session();
+    session
+        .execute(
+            "CREATE TABLE temporal_frames (id INTEGER, d DATE, tm TIME, ts TIMESTAMP, tz TIMESTAMPTZ, iv INTERVAL); \
+             INSERT INTO temporal_frames VALUES \
+               (1, '2024-01-01', '00:00', '2024-01-01 00:00', '2024-01-01 00:00:00+00', INTERVAL '1 hour'), \
+               (2, '2024-01-02', '00:10', '2024-01-01 00:30', '2024-01-01 00:30:00+00', INTERVAL '90 minutes'), \
+               (3, '2024-02-01', '23:50', '2024-02-01 00:00', '2024-02-01 00:00:00+00', INTERVAL '3 hours')",
+        )
+        .unwrap();
+
+    for sql in [
+        "SELECT sum(id) OVER (ORDER BY d RANGE INTERVAL '1 day' PRECEDING) FROM temporal_frames ORDER BY id",
+        "SELECT count(*) OVER (ORDER BY tm RANGE INTERVAL '30 minutes' PRECEDING) FROM temporal_frames ORDER BY id",
+        "SELECT sum(id) OVER (ORDER BY ts RANGE INTERVAL '1 hour' PRECEDING) FROM temporal_frames ORDER BY id",
+        "SELECT sum(id) OVER (ORDER BY tz RANGE INTERVAL '1 hour' PRECEDING) FROM temporal_frames ORDER BY id",
+        "SELECT sum(id) OVER (ORDER BY iv RANGE INTERVAL '1 hour' PRECEDING) FROM temporal_frames ORDER BY id",
+        "SELECT sum(id) OVER (ORDER BY ts RANGE INTERVAL '1 month -1 day' PRECEDING) FROM temporal_frames ORDER BY id",
+        "SELECT sum(id) OVER (ORDER BY ts RANGE INTERVAL '-1 month 40 days' PRECEDING) FROM temporal_frames ORDER BY id",
+    ] {
+        let _ = query_rows(&mut session, sql);
+    }
+    assert_eq!(
+        query_rows(
+            &mut session,
+            "SELECT count(*) OVER (ORDER BY tm RANGE INTERVAL '30 minutes' PRECEDING) \
+             FROM temporal_frames ORDER BY tm",
+        ),
+        vec![
+            vec![Value::Int8(1)],
+            vec![Value::Int8(2)],
+            vec![Value::Int8(1)],
+        ],
+    );
+    assert_eq!(
+        query_rows(
+            &mut session,
+            "SELECT count(*) OVER (ORDER BY tm RANGE INTERVAL '1 day' PRECEDING) \
+             FROM (VALUES ('01:00'::time), ('02:00')) AS values(tm)",
+        ),
+        vec![vec![Value::Int8(1)], vec![Value::Int8(1)]],
+    );
+    assert_eq!(
+        query_rows(
+            &mut session,
+            "SELECT count(*) OVER (ORDER BY tm RANGE INTERVAL '-1 day 1 hour' PRECEDING) \
+             FROM (VALUES ('01:00'::time), ('02:00')) AS values(tm)",
+        ),
+        vec![vec![Value::Int8(1)], vec![Value::Int8(2)]],
+    );
+    assert_eq!(
+        session
+            .query(
+                "SELECT count(*) OVER (ORDER BY tm RANGE INTERVAL '1 day -1 hour' PRECEDING) \
+                 FROM (VALUES ('01:00'::time), ('02:00')) AS values(tm)",
+                &[],
+            )
+            .unwrap_err()
+            .sqlstate,
+        SqlState::InvalidPrecedingOrFollowingSize,
+    );
+    assert_eq!(
+        session
+            .query(
+                "SELECT count(*) OVER (ORDER BY ts RANGE INTERVAL '-1 day' PRECEDING) \
+                 FROM (VALUES ('infinity'::timestamp)) AS values(ts)",
+                &[],
+            )
+            .unwrap_err()
+            .sqlstate,
+        SqlState::InvalidPrecedingOrFollowingSize,
+    );
+    assert_eq!(
+        query_rows(
+            &mut session,
+            "SELECT count(*) OVER (ORDER BY d RANGE BETWEEN CURRENT ROW AND INTERVAL '1 day' FOLLOWING) \
+             FROM (VALUES ('2024-01-01'::date), ('infinity'::date)) AS values(d)",
+        ),
+        vec![vec![Value::Int8(1)], vec![Value::Int8(1)]],
+    );
+    assert_eq!(
+        query_rows(
+            &mut session,
+            "SELECT count(*) OVER (ORDER BY ts RANGE '1 day' PRECEDING) \
+             FROM (VALUES ('2024-01-01'::timestamp), ('2024-01-02'::timestamp)) AS values(ts)",
+        ),
+        vec![vec![Value::Int8(1)], vec![Value::Int8(2)]],
+    );
+    assert_eq!(
+        session
+            .query(
+                "SELECT count(*) OVER (ORDER BY ts RANGE '-1 day' PRECEDING) \
+                 FROM (VALUES ('infinity'::timestamp)) AS values(ts)",
+                &[],
+            )
+            .unwrap_err()
+            .sqlstate,
+        SqlState::InvalidPrecedingOrFollowingSize,
+    );
+    let prepared = session
+        .prepare(
+            "SELECT sum(id) OVER (ORDER BY d RANGE $1 PRECEDING) \
+             FROM temporal_frames ORDER BY id",
+        )
+        .unwrap();
+    assert_eq!(
+        session
+            .query_prepared(
+                &prepared,
+                &[Value::Interval(pg_fake::value::PgInterval {
+                    months: 0,
+                    days: 1,
+                    micros: 0,
+                })],
+            )
+            .unwrap()
+            .rows,
+        vec![
+            vec![Value::Int8(1)],
+            vec![Value::Int8(3)],
+            vec![Value::Int8(3)],
+        ],
+    );
+    assert_eq!(
+        session
+            .query(
+                "SELECT sum(id) OVER (ORDER BY id ROWS (SELECT id) PRECEDING) FROM temporal_frames",
+                &[],
+            )
+            .unwrap_err()
+            .sqlstate,
+        SqlState::InvalidColumnReference,
+    );
+    let _ = query_rows(
+        &mut session,
+        "SELECT sum(id) OVER (ORDER BY id ROWS (SELECT 1) PRECEDING) FROM temporal_frames",
+    );
+}
+
+#[test]
 fn executes_required_aggregates_and_predicates() {
     let db = Db::create();
     let mut session = db.create_session();

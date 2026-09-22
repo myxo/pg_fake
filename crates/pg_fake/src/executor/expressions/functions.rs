@@ -73,11 +73,42 @@ pub(in crate::executor) fn infer_window_return_type(
     }
     if function.uses_odbc_syntax
         || !matches!(function.parameters, ast::FunctionArguments::None)
-        || function.filter.is_some()
         || !function.within_group.is_empty()
-        || window.window_frame.is_some()
     {
         return reject_unsupported("window function feature is not implemented");
+    }
+    validate_window_frame(window, schema)?;
+    if matches!(
+        name.as_str(),
+        "count"
+            | "sum"
+            | "avg"
+            | "min"
+            | "max"
+            | "bool_and"
+            | "bool_or"
+            | "string_agg"
+            | "array_agg"
+    ) {
+        let ast::FunctionArguments::List(arguments) = &function.args else {
+            return Err(PgError::create(
+                SqlState::UndefinedFunction,
+                format!("function {name} does not exist"),
+            ));
+        };
+        if arguments.duplicate_treatment == Some(ast::DuplicateTreatment::Distinct) {
+            return reject_unsupported("DISTINCT is not implemented for window functions");
+        }
+        if !arguments.clauses.is_empty() {
+            return reject_unsupported(
+                "aggregate ORDER BY is not implemented for window functions",
+            );
+        }
+        validate_window_partition_and_order(window, schema)?;
+        let mut aggregate = function.clone();
+        aggregate.over = None;
+        let call = crate::executor::aggregates::parse_aggregate_call(&aggregate, schema)?;
+        return Ok(Some(call.descriptor.get_result_type()));
     }
     match name.as_str() {
         "row_number" | "rank" | "dense_rank" | "percent_rank" | "cume_dist" => {
@@ -269,37 +300,181 @@ pub(in crate::executor) fn infer_window_return_type(
             validate_window_partition_and_order(window, schema)?;
             Ok(Some(infer_expression_type(expression, schema)?))
         }
-        "count" => {
-            let ast::FunctionArguments::List(arguments) = &function.args else {
-                return Err(PgError::create(
-                    SqlState::UndefinedFunction,
-                    "function count does not exist",
-                ));
-            };
-            if arguments.args.is_empty() {
-                return Err(PgError::create(
-                    SqlState::WrongObjectType,
-                    "count requires an argument or wildcard",
-                ));
-            }
-            if !matches!(
-                arguments.args.as_slice(),
-                [ast::FunctionArg::Unnamed(ast::FunctionArgExpr::Wildcard)]
-            ) || !arguments.clauses.is_empty()
-                || arguments.duplicate_treatment.is_some()
-                || window.partition_by.len() != 1
-                || !window.order_by.is_empty()
-            {
-                return reject_unsupported("count window shape is not implemented");
-            }
-            validate_equality_type(infer_expression_type(&window.partition_by[0], schema)?)?;
-            Ok(Some(BaseType::Int8))
-        }
         _ => Err(PgError::create(
             SqlState::UndefinedFunction,
             format!("function {name} does not exist"),
         )),
     }
+}
+
+fn validate_window_frame(window: &ast::WindowSpec, schema: RowScope<'_>) -> Result<()> {
+    let Some(frame) = &window.window_frame else {
+        return Ok(());
+    };
+    let end = frame
+        .end_bound
+        .as_ref()
+        .unwrap_or(&ast::WindowFrameBound::CurrentRow);
+    if matches!(frame.start_bound, ast::WindowFrameBound::Following(None)) {
+        return Err(PgError::create(
+            SqlState::WindowingError,
+            "frame start cannot be UNBOUNDED FOLLOWING",
+        ));
+    }
+    if matches!(end, ast::WindowFrameBound::Preceding(None)) {
+        return Err(PgError::create(
+            SqlState::WindowingError,
+            "frame end cannot be UNBOUNDED PRECEDING",
+        ));
+    }
+    if matches!(frame.start_bound, ast::WindowFrameBound::CurrentRow)
+        && matches!(end, ast::WindowFrameBound::Preceding(Some(_)))
+        || matches!(frame.start_bound, ast::WindowFrameBound::Following(Some(_)))
+            && matches!(
+                end,
+                ast::WindowFrameBound::CurrentRow | ast::WindowFrameBound::Preceding(Some(_))
+            )
+    {
+        return Err(PgError::create(
+            SqlState::WindowingError,
+            "frame starting bound must not follow frame ending bound",
+        ));
+    }
+    let offsets = [&frame.start_bound, end]
+        .into_iter()
+        .filter_map(|bound| match bound {
+            ast::WindowFrameBound::Preceding(Some(offset))
+            | ast::WindowFrameBound::Following(Some(offset)) => Some(offset.as_ref()),
+            _ => None,
+        })
+        .collect::<Vec<_>>();
+    struct OffsetInspector<'a> {
+        query_depth: usize,
+        error: Option<PgError>,
+        schema: RowScope<'a>,
+    }
+    impl ast::Visitor for OffsetInspector<'_> {
+        type Break = ();
+
+        fn pre_visit_query(&mut self, _query: &ast::Query) -> std::ops::ControlFlow<Self::Break> {
+            self.query_depth += 1;
+            std::ops::ControlFlow::Continue(())
+        }
+
+        fn post_visit_query(&mut self, _query: &ast::Query) -> std::ops::ControlFlow<Self::Break> {
+            self.query_depth -= 1;
+            std::ops::ControlFlow::Continue(())
+        }
+
+        fn pre_visit_expr(&mut self, expression: &ast::Expr) -> std::ops::ControlFlow<Self::Break> {
+            self.error = match expression {
+                ast::Expr::Identifier(identifier)
+                    if self.query_depth == 0
+                        || self
+                            .schema
+                            .resolve_column(std::slice::from_ref(identifier))
+                            .is_ok() =>
+                {
+                    Some(PgError::create(
+                        SqlState::InvalidColumnReference,
+                        "argument of window frame must not contain variables",
+                    ))
+                }
+                ast::Expr::CompoundIdentifier(identifiers)
+                    if self.query_depth == 0 || self.schema.resolve_column(identifiers).is_ok() =>
+                {
+                    Some(PgError::create(
+                        SqlState::InvalidColumnReference,
+                        "argument of window frame must not contain variables",
+                    ))
+                }
+                ast::Expr::Function(function) if function.over.is_some() => Some(PgError::create(
+                    SqlState::WindowingError,
+                    "window functions are not allowed in window definitions",
+                )),
+                ast::Expr::Function(function)
+                    if crate::executor::aggregates::is_aggregate_function(function) =>
+                {
+                    Some(PgError::create(
+                        SqlState::GroupingError,
+                        "aggregate functions are not allowed in window definitions",
+                    ))
+                }
+                _ => None,
+            };
+            if self.error.is_some() {
+                std::ops::ControlFlow::Break(())
+            } else {
+                std::ops::ControlFlow::Continue(())
+            }
+        }
+    }
+    for offset in &offsets {
+        let mut inspector = OffsetInspector {
+            query_depth: 0,
+            error: None,
+            schema,
+        };
+        let _ = ast::Visit::visit(*offset, &mut inspector);
+        if let Some(error) = inspector.error {
+            return Err(error);
+        }
+    }
+    if !offsets.is_empty()
+        && matches!(
+            frame.units,
+            ast::WindowFrameUnits::Range | ast::WindowFrameUnits::Groups
+        )
+        && window.order_by.len() != 1
+    {
+        return Err(PgError::create(
+            SqlState::WindowingError,
+            format!(
+                "{} with offset PRECEDING/FOLLOWING requires exactly one ORDER BY column",
+                frame.units
+            ),
+        ));
+    }
+    if matches!(
+        frame.units,
+        ast::WindowFrameUnits::Rows | ast::WindowFrameUnits::Groups
+    ) {
+        for offset in offsets {
+            validate_function_argument(offset, BaseType::Int8, schema, &|| {
+                PgError::create(
+                    SqlState::DatatypeMismatch,
+                    "frame offset has incompatible type",
+                )
+            })?;
+        }
+    } else {
+        let order_type = infer_expression_type(&window.order_by[0].expr, schema)?;
+        let offset_type = if is_numeric_type(order_type) {
+            order_type
+        } else if matches!(
+            order_type,
+            BaseType::Date
+                | BaseType::Time
+                | BaseType::Timestamp
+                | BaseType::TimestampTz
+                | BaseType::Interval
+        ) {
+            BaseType::Interval
+        } else {
+            return reject_unsupported(format!(
+                "RANGE with offset PRECEDING/FOLLOWING is not supported for type {order_type:?}",
+            ));
+        };
+        for offset in offsets {
+            validate_function_argument(offset, offset_type, schema, &|| {
+                PgError::create(
+                    SqlState::DatatypeMismatch,
+                    "RANGE offset has incompatible type",
+                )
+            })?;
+        }
+    }
+    Ok(())
 }
 
 fn validate_window_partition_and_order(

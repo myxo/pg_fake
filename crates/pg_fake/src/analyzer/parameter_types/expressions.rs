@@ -297,6 +297,36 @@ fn infer_function_parameters(
             }
         })
         .collect::<Vec<_>>();
+    if let Some(ast::WindowType::WindowSpec(window)) = &function.over
+        && let Some(frame) = &window.window_frame
+    {
+        let expected = match frame.units {
+            ast::WindowFrameUnits::Rows | ast::WindowFrameUnits::Groups => Some(BaseType::Int8),
+            ast::WindowFrameUnits::Range => window.order_by.first().and_then(|order| {
+                match executor::infer_expression_type(&order.expr, schema).ok()? {
+                    BaseType::Date
+                    | BaseType::Time
+                    | BaseType::Timestamp
+                    | BaseType::TimestampTz
+                    | BaseType::Interval => Some(BaseType::Interval),
+                    data_type => Some(data_type),
+                }
+            }),
+        };
+        for bound in [
+            &frame.start_bound,
+            frame
+                .end_bound
+                .as_ref()
+                .unwrap_or(&ast::WindowFrameBound::CurrentRow),
+        ] {
+            if let ast::WindowFrameBound::Preceding(Some(offset))
+            | ast::WindowFrameBound::Following(Some(offset)) = bound
+            {
+                constrain_parameter_type(offset, expected, types)?;
+            }
+        }
+    }
     if let Some(signature) = executor::resolve_runtime_function(&name, &argument_types) {
         let (targets, _) = signature?;
         for ((argument, argument_type), target) in arguments.iter().zip(argument_types).zip(targets)
