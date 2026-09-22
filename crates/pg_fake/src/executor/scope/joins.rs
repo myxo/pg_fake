@@ -215,6 +215,19 @@ fn validate_lateral_join_references(
             ));
         }
     }
+    if let Some(crate::executor::expressions::UnnestTableFunction { argument, .. }) =
+        crate::executor::expressions::extract_unnest_table_function(factor)?
+    {
+        let referenced = outer_references::collect_outer_reference_slots(catalog, argument, scope)?
+            .iter()
+            .any(|slot| forbidden.contains(slot));
+        if referenced {
+            return Err(PgError::create(
+                SqlState::InvalidColumnReference,
+                "invalid lateral reference in RIGHT or FULL JOIN",
+            ));
+        }
+    }
     if let ast::TableFactor::NestedJoin {
         table_with_joins, ..
     } = factor

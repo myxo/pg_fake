@@ -3329,6 +3329,108 @@ fn matches_generated_required_array_queries() {
 }
 
 #[test]
+fn matches_generated_general_array_operations() {
+    let server = start_isolated_postgres_server();
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap();
+    let postgres = RefCell::new(
+        runtime
+            .block_on(PgConnection::connect(&server.url))
+            .unwrap(),
+    );
+    let fake = RefCell::new(PgFakeConnection::new(Db::create()));
+    check(|src| {
+        let family = src.any_of("family", int_in(0..=5));
+        let sql_type = match family {
+            0 => "integer",
+            1 => "numeric",
+            2 => "text",
+            3 => "boolean",
+            4 => "date",
+            5 => "uuid",
+            _ => unreachable!(),
+        };
+        let first_count = src.any_of("first_count", int_in(0..=5));
+        let second_count = src.any_of("second_count", int_in(0..=5));
+        let mut scalar = |label: &str| {
+            if src.any(&format!("{label}_null")) {
+                return format!("NULL::{sql_type}");
+            }
+            match family {
+                0 => format!("{}::integer", src.any_of(label, int_in(-5..=5))),
+                1 => {
+                    let tenths = src.any_of(label, int_in(-50_i32..=50));
+                    format!("{}.{:01}::numeric", tenths / 10, tenths.unsigned_abs() % 10)
+                }
+                2 => {
+                    let values = ["''::text", "'a'::text", "'b'::text", "'z'::text"];
+                    values[src.any_of(label, int_in(0..=values.len() - 1))].to_owned()
+                }
+                3 => format!("{}::boolean", src.any::<bool>(label)),
+                4 => format!(
+                    "'2024-01-{:02}'::date",
+                    src.any_of(label, int_in(1_u8..=28))
+                ),
+                5 => format!(
+                    "'00000000-0000-4000-8000-{:012x}'::uuid",
+                    src.any_of(label, int_in(0_u64..=15))
+                ),
+                _ => unreachable!(),
+            }
+        };
+        let target = scalar("target");
+        let replacement = scalar("replacement");
+        let first = (0..first_count)
+            .map(|index| scalar(&format!("first_{index}")))
+            .collect::<Vec<_>>();
+        let second = (0..second_count)
+            .map(|index| scalar(&format!("second_{index}")))
+            .collect::<Vec<_>>();
+        let array = |values: &[String]| {
+            if values.is_empty() {
+                format!("ARRAY[]::{sql_type}[]")
+            } else {
+                format!("ARRAY[{}]::{sql_type}[]", values.join(","))
+            }
+        };
+        let first = array(&first);
+        let second = array(&second);
+        let sql = format!(
+            "WITH source(id, values) AS (VALUES (1, {first}), (2, {second})) \
+             SELECT id, values::text, element::text, ordinality, \
+                    values = {second}, values < {second}, \
+                    (values || {second})::text, values @> {second}, \
+                    values <@ {second}, values && {second}, \
+                    array_length(values, 1), cardinality(values), \
+                    array_lower(values, 1), array_upper(values, 1), \
+                    array_append(values, {target})::text, \
+                    array_prepend({target}, values)::text, \
+                    array_cat(values, {second})::text, \
+                    array_position(values, {target}), \
+                    array_positions(values, {target})::text, \
+                    array_remove(values, {target})::text, \
+                    array_replace(values, {target}, {replacement})::text, \
+                    {target} = ANY(values), {target} <> ALL(values), \
+                    ARRAY[1::smallint, 2::integer, 3::bigint]::text \
+             FROM source \
+             LEFT JOIN LATERAL unnest(values) WITH ORDINALITY \
+                 AS expanded(element, ordinality) ON TRUE \
+             ORDER BY id, ordinality"
+        );
+        src.log_value("sql", &sql);
+        assert_statement(
+            &runtime,
+            &mut postgres.borrow_mut(),
+            &mut fake.borrow_mut(),
+            &sql,
+            RowOrder::Ordered,
+        );
+    });
+}
+
+#[test]
 fn matches_generated_pg_lsn_values_and_arithmetic() {
     let server = start_isolated_postgres_server();
     let runtime = tokio::runtime::Builder::new_current_thread()

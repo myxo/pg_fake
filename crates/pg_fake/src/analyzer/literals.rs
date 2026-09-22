@@ -122,16 +122,11 @@ fn convert_to_ast_data_type(data_type: PgType) -> ast::DataType {
         BaseType::Jsonb => ast::DataType::JSONB,
         BaseType::PgLsn => ast::DataType::Custom(ast::Ident::new("pg_lsn").into(), Vec::new()),
         BaseType::Regclass => ast::DataType::Regclass,
-        BaseType::TextArray => ast::DataType::Array(ast::ArrayElemTypeDef::SquareBracket(
-            Box::new(ast::DataType::Text),
-            None,
-        )),
-        BaseType::Int8Array => ast::DataType::Array(ast::ArrayElemTypeDef::SquareBracket(
-            Box::new(ast::DataType::BigInt(None)),
-            None,
-        )),
-        BaseType::UuidArray => ast::DataType::Array(ast::ArrayElemTypeDef::SquareBracket(
-            Box::new(ast::DataType::Uuid),
+        BaseType::Array(element) => ast::DataType::Array(ast::ArrayElemTypeDef::SquareBracket(
+            Box::new(convert_to_ast_data_type(PgType::create_with_typmod(
+                element.get_base_type(),
+                data_type.typmod,
+            ))),
             None,
         )),
     }

@@ -57,16 +57,12 @@ fn matches_lateral_fixtures_and_errors() {
 fn rejects_unsupported_lateral_table_functions() {
     let db = Db::create();
     let mut session = db.create_session();
-    for sql in [
-        "SELECT * FROM (VALUES (2)) p(id), LATERAL generate_series(1, p.id) x",
-        "SELECT * FROM LATERAL unnest(ARRAY[1, 2]) x",
-    ] {
-        assert_eq!(
-            session.query(sql, &[]).unwrap_err().sqlstate,
-            pg_fake::error::SqlState::FeatureNotSupported,
-            "{sql}"
-        );
-    }
+    let sql = "SELECT * FROM (VALUES (2)) p(id), LATERAL generate_series(1, p.id) x";
+    assert_eq!(
+        session.query(sql, &[]).unwrap_err().sqlstate,
+        pg_fake::error::SqlState::FeatureNotSupported,
+        "{sql}"
+    );
 }
 
 #[test]

@@ -221,16 +221,16 @@ pub(super) fn parse_aggregate_call<'a>(
             return Err(signature_error());
         };
         let argument_type = infer_expression_type(argument, schema)?;
-        if argument_type != BaseType::Int8 {
+        let Some(result_type) = argument_type.get_array_type() else {
             return Err(signature_error());
-        }
+        };
         let (order, order_by) = parse_aggregate_order(&arguments.clauses, schema)?;
         return Ok(AggregateCall {
             descriptor: AggregateDescriptor {
-                kind: AggregateKind::ArrayAgg(BaseType::Int8),
+                kind: AggregateKind::ArrayAgg(argument_type),
                 distinct,
-                argument_type: Some(BaseType::Int8),
-                result_type: BaseType::Int8Array,
+                argument_type: Some(argument_type),
+                result_type,
                 order,
             },
             argument: Some(argument),

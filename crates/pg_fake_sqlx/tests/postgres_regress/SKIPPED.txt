@@ -9,7 +9,7 @@ bit:1
 boolean:18
 box:1
 case:18
-char:14
+char:21
 circle:1
 collate.icu.utf8:2
 collate.linux.utf8:2
@@ -23,7 +23,7 @@ copy2:3
 copy:2
 copydml:7
 copyencoding:6
-copyselect:13
+copyselect:14
 create_aggregate:1
 create_cast:1
 create_function_sql:1
@@ -107,8 +107,8 @@ rules:5
 select:8
 select_distinct:5
 select_distinct_on:5
-select_having:13
-select_implicit:12
+select_having:22
+select_implicit:28
 select_into:5
 select_views:4
 sequence:7
@@ -133,7 +133,7 @@ union:26
 updatable_views:1
 update:12
 uuid:10
-varchar:13
+varchar:20
 window:3
 with:2
 without_overlaps:1

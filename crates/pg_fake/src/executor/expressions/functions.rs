@@ -522,6 +522,9 @@ pub(super) fn infer_function_return_type(
     {
         return Ok(result);
     }
+    if let Some(result) = super::arrays::infer_array_function(&function_name, &arguments, schema)? {
+        return Ok(result);
+    }
     match function_name.as_str() {
         "coalesce" if !arguments.is_empty() => resolve_expression_list_type(&arguments, schema),
         "greatest" | "least" if !arguments.is_empty() => {
@@ -709,6 +712,16 @@ pub(super) fn evaluate_function(
             &function_name,
             &arguments,
             &targets,
+            schema,
+            row,
+            context,
+        );
+    }
+    if super::arrays::infer_array_function(&function_name, &arguments, schema)?.is_some() {
+        return super::arrays::evaluate_array_function(
+            &function_name,
+            &arguments,
+            result_type,
             schema,
             row,
             context,

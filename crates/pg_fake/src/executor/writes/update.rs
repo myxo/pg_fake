@@ -221,6 +221,7 @@ pub(in crate::executor) fn execute_update(
                 let assignment_row = bound_row.as_deref().unwrap_or(&updated).to_vec();
                 for assignment in &assignments {
                     let target = schema.columns[assignment.index].data_type;
+                    let current = updated[assignment.index].clone();
                     updated[assignment.index] = if is_default_expression(assignment.expression) {
                         evaluate_column_default(&schema.columns[assignment.index], context)?
                     } else if let Some(prepared) = &assignment.prepared {
@@ -233,8 +234,9 @@ pub(in crate::executor) fn execute_update(
                     } else {
                         evaluate_mutation_assignment(
                             state,
-                            assignment.expression,
+                            assignment,
                             target,
+                            &current,
                             &scope,
                             &assignment_row,
                             xid,
@@ -476,6 +478,7 @@ pub(in crate::executor) fn prepare_update_rows(
                     let mut updated = current.clone();
                     let assignment_row = bound_row.as_deref().unwrap_or(&current);
                     for assignment in &assignments {
+                        let current_value = updated[assignment.index].clone();
                         updated[assignment.index] = if is_default_expression(assignment.expression)
                         {
                             evaluate_column_default(&schema.columns[assignment.index], context)?
@@ -489,8 +492,9 @@ pub(in crate::executor) fn prepare_update_rows(
                         } else {
                             evaluate_mutation_assignment(
                                 state,
-                                assignment.expression,
+                                assignment,
                                 schema.columns[assignment.index].data_type,
+                                &current_value,
                                 &scope,
                                 assignment_row,
                                 xid,

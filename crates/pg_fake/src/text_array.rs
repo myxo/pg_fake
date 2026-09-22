@@ -4,6 +4,13 @@ use crate::{
 };
 
 pub(crate) fn parse_array(input: &str, elem_type: BaseType) -> Result<Vec<Value>> {
+    parse_array_with(input, |value| Value::parse(elem_type, value))
+}
+
+pub(crate) fn parse_array_with(
+    input: &str,
+    mut parse_element: impl FnMut(&str) -> Result<Value>,
+) -> Result<Vec<Value>> {
     let invalid = || {
         PgError::create(
             SqlState::InvalidTextRepresentation,
@@ -77,7 +84,7 @@ pub(crate) fn parse_array(input: &str, elem_type: BaseType) -> Result<Vec<Value>
             if !quoted && !escaped && value.eq_ignore_ascii_case("null") {
                 Value::Null
             } else {
-                Value::parse(elem_type, &value)?
+                parse_element(&value)?
             },
         );
         match chars.next() {
@@ -90,6 +97,13 @@ pub(crate) fn parse_array(input: &str, elem_type: BaseType) -> Result<Vec<Value>
 }
 
 pub(crate) fn format_array(values: &[Value]) -> String {
+    format_array_with(values, Value::format_postgres_text)
+}
+
+pub(crate) fn format_array_with(
+    values: &[Value],
+    mut format_element: impl FnMut(&Value) -> String,
+) -> String {
     format!(
         "{{{}}}",
         values
@@ -97,7 +111,7 @@ pub(crate) fn format_array(values: &[Value]) -> String {
             .map(|value| match value {
                 Value::Null => "NULL".to_owned(),
                 value => {
-                    let value = value.format_postgres_text();
+                    let value = format_element(value);
                     if !value.is_empty()
                         && !value.eq_ignore_ascii_case("null")
                         && !value

@@ -45,7 +45,7 @@ pub(crate) fn resolve_json_operator_types(
         ),
         HashArrow | HashLongArrow => (
             input,
-            BaseType::TextArray,
+            BaseType::Array(crate::value::ArrayElementType::Text),
             if *op == HashLongArrow {
                 BaseType::Text
             } else {
@@ -54,8 +54,16 @@ pub(crate) fn resolve_json_operator_types(
         ),
         AtArrow | ArrowAt => (BaseType::Jsonb, BaseType::Jsonb, BaseType::Bool),
         Question => (BaseType::Jsonb, BaseType::Text, BaseType::Bool),
-        QuestionAnd | QuestionPipe => (BaseType::Jsonb, BaseType::TextArray, BaseType::Bool),
-        HashMinus => (BaseType::Jsonb, BaseType::TextArray, BaseType::Jsonb),
+        QuestionAnd | QuestionPipe => (
+            BaseType::Jsonb,
+            BaseType::Array(crate::value::ArrayElementType::Text),
+            BaseType::Bool,
+        ),
+        HashMinus => (
+            BaseType::Jsonb,
+            BaseType::Array(crate::value::ArrayElementType::Text),
+            BaseType::Jsonb,
+        ),
         StringConcat if left == Some(BaseType::Jsonb) || right == Some(BaseType::Jsonb) => {
             (BaseType::Jsonb, BaseType::Jsonb, BaseType::Jsonb)
         }

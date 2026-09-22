@@ -322,6 +322,7 @@ pub(super) fn prepare_conflict_update(
             }
             let mut updated = current.clone();
             for assignment in &update.assignments {
+                let current_value = updated[assignment.index].clone();
                 updated[assignment.index] = if is_default_expression(assignment.expression) {
                     evaluate_column_default(&schema.columns[assignment.index], context)?
                 } else if let Some(prepared) = &assignment.prepared {
@@ -334,8 +335,9 @@ pub(super) fn prepare_conflict_update(
                 } else {
                     evaluate_mutation_assignment(
                         state,
-                        assignment.expression,
+                        assignment,
                         schema.columns[assignment.index].data_type,
+                        &current_value,
                         &update.scope,
                         &bound_row,
                         xid,
@@ -517,6 +519,7 @@ pub(super) fn execute_insert_conflict(
     }
     let mut updated = current.clone();
     for assignment in &update.assignments {
+        let current_value = updated[assignment.index].clone();
         updated[assignment.index] = if is_default_expression(assignment.expression) {
             evaluate_column_default(&schema.columns[assignment.index], context)?
         } else if let Some(prepared) = &assignment.prepared {
@@ -524,8 +527,9 @@ pub(super) fn execute_insert_conflict(
         } else {
             evaluate_mutation_assignment(
                 state,
-                assignment.expression,
+                assignment,
                 schema.columns[assignment.index].data_type,
+                &current_value,
                 &update.scope,
                 &bound_row,
                 xid,

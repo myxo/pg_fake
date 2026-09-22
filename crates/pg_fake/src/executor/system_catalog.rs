@@ -1,7 +1,7 @@
 use crate::{
     catalog::{Catalog, IdentityKind, RelationName, SchemaId},
     error::{Result, SqlState},
-    value::{BaseType, Oid, PgType, Value},
+    value::{ArrayElementType, BaseType, Oid, PgType, Value},
 };
 
 pub(crate) const PG_CATALOG_SCHEMA_OID: Oid = 11;
@@ -313,31 +313,7 @@ fn materialize_pg_type() -> Vec<Vec<Value>> {
 }
 
 fn type_array_oid(base: BaseType) -> Oid {
-    match base {
-        BaseType::Bool => 1000,
-        BaseType::Bytea => 1001,
-        BaseType::Int2 => 1005,
-        BaseType::Int4 => 1007,
-        BaseType::Text => 1009,
-        BaseType::Bpchar => 1014,
-        BaseType::Varchar => 1015,
-        BaseType::Int8 => 1016,
-        BaseType::Float4 => 1021,
-        BaseType::Float8 => 1022,
-        BaseType::Oid => 1028,
-        BaseType::Timestamp => 1115,
-        BaseType::Date => 1182,
-        BaseType::Time => 1183,
-        BaseType::TimestampTz => 1185,
-        BaseType::Interval => 1187,
-        BaseType::Numeric => 1231,
-        BaseType::Json => 199,
-        BaseType::Regclass => 2210,
-        BaseType::Uuid => 2951,
-        BaseType::PgLsn => 3221,
-        BaseType::Jsonb => 3807,
-        BaseType::Void | BaseType::TextArray | BaseType::Int8Array | BaseType::UuidArray => 0,
-    }
+    base.get_array_type().map_or(0, BaseType::map_to_oid)
 }
 
 fn supported_types() -> &'static [BaseType] {
@@ -364,9 +340,28 @@ fn supported_types() -> &'static [BaseType] {
         BaseType::Jsonb,
         BaseType::PgLsn,
         BaseType::Regclass,
-        BaseType::TextArray,
-        BaseType::Int8Array,
-        BaseType::UuidArray,
+        BaseType::Array(ArrayElementType::Bool),
+        BaseType::Array(ArrayElementType::Int2),
+        BaseType::Array(ArrayElementType::Int4),
+        BaseType::Array(ArrayElementType::Int8),
+        BaseType::Array(ArrayElementType::Oid),
+        BaseType::Array(ArrayElementType::Float4),
+        BaseType::Array(ArrayElementType::Float8),
+        BaseType::Array(ArrayElementType::Numeric),
+        BaseType::Array(ArrayElementType::Text),
+        BaseType::Array(ArrayElementType::Varchar),
+        BaseType::Array(ArrayElementType::Bpchar),
+        BaseType::Array(ArrayElementType::Bytea),
+        BaseType::Array(ArrayElementType::Uuid),
+        BaseType::Array(ArrayElementType::Date),
+        BaseType::Array(ArrayElementType::Time),
+        BaseType::Array(ArrayElementType::Timestamp),
+        BaseType::Array(ArrayElementType::TimestampTz),
+        BaseType::Array(ArrayElementType::Interval),
+        BaseType::Array(ArrayElementType::Json),
+        BaseType::Array(ArrayElementType::Jsonb),
+        BaseType::Array(ArrayElementType::PgLsn),
+        BaseType::Array(ArrayElementType::Regclass),
     ]
 }
 
@@ -384,7 +379,7 @@ fn type_category(base: BaseType) -> &'static str {
         BaseType::Text | BaseType::Varchar | BaseType::Bpchar => "S",
         BaseType::Date | BaseType::Time | BaseType::Timestamp | BaseType::TimestampTz => "D",
         BaseType::Interval => "T",
-        BaseType::TextArray | BaseType::Int8Array | BaseType::UuidArray => "A",
+        BaseType::Array(_) => "A",
         _ => "U",
     }
 }
@@ -538,9 +533,12 @@ pub(crate) fn format_type(oid: Oid, typmod: i32) -> Result<String> {
         BaseType::Varchar => "character varying",
         BaseType::Timestamp => "timestamp without time zone",
         BaseType::TimestampTz => "timestamp with time zone",
-        BaseType::TextArray => "text[]",
-        BaseType::Int8Array => "bigint[]",
-        BaseType::UuidArray => "uuid[]",
+        BaseType::Array(element) => {
+            return Ok(format!(
+                "{}[]",
+                format_type(element.get_base_type().map_to_oid(), typmod)?
+            ));
+        }
         _ => base.get_postgres_name(),
     };
     if typmod == PgType::NO_TYPEMOD {

@@ -59,6 +59,9 @@ pub(crate) fn extract_json_table_function(
     };
     let name = normalize_function_name(name)?;
     if !is_json_expansion(&name) {
+        if name == "unnest" {
+            return Ok(None);
+        }
         return reject_unsupported("table function is not implemented");
     }
     let [ast::FunctionArg::Unnamed(ast::FunctionArgExpr::Expr(argument))] = args.as_slice() else {

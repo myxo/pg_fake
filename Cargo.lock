@@ -2780,7 +2780,6 @@ dependencies = [
 [[package]]
 name = "sqlparser"
 version = "0.62.0"
-source = "git+https://github.com/myxo/datafusion-sqlparser-rs?rev=26eeb2114037b79220f1eaa8a82171271b7aee77#26eeb2114037b79220f1eaa8a82171271b7aee77"
 dependencies = [
  "log",
  "recursive",
@@ -2790,7 +2789,6 @@ dependencies = [
 [[package]]
 name = "sqlparser_derive"
 version = "0.5.0"
-source = "git+https://github.com/myxo/datafusion-sqlparser-rs?rev=26eeb2114037b79220f1eaa8a82171271b7aee77#26eeb2114037b79220f1eaa8a82171271b7aee77"
 dependencies = [
  "proc-macro2",
  "quote",

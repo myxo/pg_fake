@@ -53,6 +53,61 @@ pub struct PgLsn(pub u64);
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct PgRegclass(pub Oid);
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum ArrayElementType {
+    Bool,
+    Int2,
+    Int4,
+    Int8,
+    Oid,
+    Float4,
+    Float8,
+    Numeric,
+    Text,
+    Varchar,
+    Bpchar,
+    Bytea,
+    Uuid,
+    Date,
+    Time,
+    Timestamp,
+    TimestampTz,
+    Interval,
+    Json,
+    Jsonb,
+    PgLsn,
+    Regclass,
+}
+
+impl ArrayElementType {
+    pub fn get_base_type(self) -> BaseType {
+        match self {
+            Self::Bool => BaseType::Bool,
+            Self::Int2 => BaseType::Int2,
+            Self::Int4 => BaseType::Int4,
+            Self::Int8 => BaseType::Int8,
+            Self::Oid => BaseType::Oid,
+            Self::Float4 => BaseType::Float4,
+            Self::Float8 => BaseType::Float8,
+            Self::Numeric => BaseType::Numeric,
+            Self::Text => BaseType::Text,
+            Self::Varchar => BaseType::Varchar,
+            Self::Bpchar => BaseType::Bpchar,
+            Self::Bytea => BaseType::Bytea,
+            Self::Uuid => BaseType::Uuid,
+            Self::Date => BaseType::Date,
+            Self::Time => BaseType::Time,
+            Self::Timestamp => BaseType::Timestamp,
+            Self::TimestampTz => BaseType::TimestampTz,
+            Self::Interval => BaseType::Interval,
+            Self::Json => BaseType::Json,
+            Self::Jsonb => BaseType::Jsonb,
+            Self::PgLsn => BaseType::PgLsn,
+            Self::Regclass => BaseType::Regclass,
+        }
+    }
+}
+
 /// Phase-1 PostgreSQL base types (§3.1).
 ///
 /// Each variant maps to a distinct `pg_type` OID. The character types
@@ -83,9 +138,7 @@ pub enum BaseType {
     Jsonb,
     PgLsn,
     Regclass,
-    TextArray,
-    Int8Array,
-    UuidArray,
+    Array(ArrayElementType),
 }
 
 impl BaseType {
@@ -116,9 +169,30 @@ impl BaseType {
             BaseType::Jsonb => 3802,
             BaseType::PgLsn => 3220,
             BaseType::Regclass => 2205,
-            BaseType::TextArray => 1009,
-            BaseType::Int8Array => 1016,
-            BaseType::UuidArray => 2951,
+            BaseType::Array(element) => match element {
+                ArrayElementType::Bool => 1000,
+                ArrayElementType::Bytea => 1001,
+                ArrayElementType::Int2 => 1005,
+                ArrayElementType::Int4 => 1007,
+                ArrayElementType::Text => 1009,
+                ArrayElementType::Bpchar => 1014,
+                ArrayElementType::Varchar => 1015,
+                ArrayElementType::Int8 => 1016,
+                ArrayElementType::Float4 => 1021,
+                ArrayElementType::Float8 => 1022,
+                ArrayElementType::Oid => 1028,
+                ArrayElementType::Timestamp => 1115,
+                ArrayElementType::Date => 1182,
+                ArrayElementType::Time => 1183,
+                ArrayElementType::TimestampTz => 1185,
+                ArrayElementType::Interval => 1187,
+                ArrayElementType::Numeric => 1231,
+                ArrayElementType::Json => 199,
+                ArrayElementType::Regclass => 2210,
+                ArrayElementType::Uuid => 2951,
+                ArrayElementType::PgLsn => 3221,
+                ArrayElementType::Jsonb => 3807,
+            },
         }
     }
 
@@ -149,9 +223,30 @@ impl BaseType {
             BaseType::Jsonb => "jsonb",
             BaseType::PgLsn => "pg_lsn",
             BaseType::Regclass => "regclass",
-            BaseType::TextArray => "_text",
-            BaseType::Int8Array => "_int8",
-            BaseType::UuidArray => "_uuid",
+            BaseType::Array(element) => match element {
+                ArrayElementType::Bool => "_bool",
+                ArrayElementType::Int2 => "_int2",
+                ArrayElementType::Int4 => "_int4",
+                ArrayElementType::Int8 => "_int8",
+                ArrayElementType::Oid => "_oid",
+                ArrayElementType::Float4 => "_float4",
+                ArrayElementType::Float8 => "_float8",
+                ArrayElementType::Numeric => "_numeric",
+                ArrayElementType::Text => "_text",
+                ArrayElementType::Varchar => "_varchar",
+                ArrayElementType::Bpchar => "_bpchar",
+                ArrayElementType::Bytea => "_bytea",
+                ArrayElementType::Uuid => "_uuid",
+                ArrayElementType::Date => "_date",
+                ArrayElementType::Time => "_time",
+                ArrayElementType::Timestamp => "_timestamp",
+                ArrayElementType::TimestampTz => "_timestamptz",
+                ArrayElementType::Interval => "_interval",
+                ArrayElementType::Json => "_json",
+                ArrayElementType::Jsonb => "_jsonb",
+                ArrayElementType::PgLsn => "_pg_lsn",
+                ArrayElementType::Regclass => "_regclass",
+            },
         }
     }
 
@@ -182,9 +277,28 @@ impl BaseType {
             3802 => Some(BaseType::Jsonb),
             3220 => Some(BaseType::PgLsn),
             2205 => Some(BaseType::Regclass),
-            1009 => Some(BaseType::TextArray),
-            1016 => Some(BaseType::Int8Array),
-            2951 => Some(BaseType::UuidArray),
+            1000 => Some(BaseType::Bool.get_array_type().unwrap()),
+            1001 => Some(BaseType::Bytea.get_array_type().unwrap()),
+            1005 => Some(BaseType::Int2.get_array_type().unwrap()),
+            1007 => Some(BaseType::Int4.get_array_type().unwrap()),
+            1009 => Some(BaseType::Text.get_array_type().unwrap()),
+            1014 => Some(BaseType::Bpchar.get_array_type().unwrap()),
+            1015 => Some(BaseType::Varchar.get_array_type().unwrap()),
+            1016 => Some(BaseType::Int8.get_array_type().unwrap()),
+            1021 => Some(BaseType::Float4.get_array_type().unwrap()),
+            1022 => Some(BaseType::Float8.get_array_type().unwrap()),
+            1028 => Some(BaseType::Oid.get_array_type().unwrap()),
+            1115 => Some(BaseType::Timestamp.get_array_type().unwrap()),
+            1182 => Some(BaseType::Date.get_array_type().unwrap()),
+            1183 => Some(BaseType::Time.get_array_type().unwrap()),
+            1185 => Some(BaseType::TimestampTz.get_array_type().unwrap()),
+            1187 => Some(BaseType::Interval.get_array_type().unwrap()),
+            1231 => Some(BaseType::Numeric.get_array_type().unwrap()),
+            199 => Some(BaseType::Json.get_array_type().unwrap()),
+            2210 => Some(BaseType::Regclass.get_array_type().unwrap()),
+            2951 => Some(BaseType::Uuid.get_array_type().unwrap()),
+            3221 => Some(BaseType::PgLsn.get_array_type().unwrap()),
+            3807 => Some(BaseType::Jsonb.get_array_type().unwrap()),
             _ => None,
         }
     }
@@ -217,29 +331,49 @@ impl BaseType {
             "jsonb" => Some(BaseType::Jsonb),
             "pg_lsn" => Some(BaseType::PgLsn),
             "regclass" => Some(BaseType::Regclass),
-            "text[]" | "_text" => Some(BaseType::TextArray),
-            "bigint[]" | "int8[]" | "_int8" => Some(BaseType::Int8Array),
-            "uuid[]" | "_uuid" => Some(BaseType::UuidArray),
+            name if let Some(element) = name.strip_suffix("[]") => {
+                BaseType::parse_sql_name(element).and_then(BaseType::get_array_type)
+            }
+            name if name.starts_with('_') => {
+                BaseType::parse_sql_name(&name[1..]).and_then(BaseType::get_array_type)
+            }
             _ => None,
         }
     }
 
     #[cfg_attr(feature = "execution-log", tracing::instrument(skip_all))]
-    pub(crate) fn get_array_element_type(self) -> Option<BaseType> {
+    pub fn get_array_element_type(self) -> Option<BaseType> {
         match self {
-            BaseType::TextArray => Some(BaseType::Text),
-            BaseType::Int8Array => Some(BaseType::Int8),
-            BaseType::UuidArray => Some(BaseType::Uuid),
+            BaseType::Array(element) => Some(element.get_base_type()),
             _ => None,
         }
     }
 
     #[cfg_attr(feature = "execution-log", tracing::instrument(skip_all))]
-    pub(crate) fn get_array_type(self) -> Option<BaseType> {
+    pub fn get_array_type(self) -> Option<BaseType> {
         match self {
-            BaseType::Text => Some(BaseType::TextArray),
-            BaseType::Int8 => Some(BaseType::Int8Array),
-            BaseType::Uuid => Some(BaseType::UuidArray),
+            BaseType::Bool => Some(BaseType::Array(ArrayElementType::Bool)),
+            BaseType::Int2 => Some(BaseType::Array(ArrayElementType::Int2)),
+            BaseType::Int4 => Some(BaseType::Array(ArrayElementType::Int4)),
+            BaseType::Int8 => Some(BaseType::Array(ArrayElementType::Int8)),
+            BaseType::Oid => Some(BaseType::Array(ArrayElementType::Oid)),
+            BaseType::Float4 => Some(BaseType::Array(ArrayElementType::Float4)),
+            BaseType::Float8 => Some(BaseType::Array(ArrayElementType::Float8)),
+            BaseType::Numeric => Some(BaseType::Array(ArrayElementType::Numeric)),
+            BaseType::Text => Some(BaseType::Array(ArrayElementType::Text)),
+            BaseType::Varchar => Some(BaseType::Array(ArrayElementType::Varchar)),
+            BaseType::Bpchar => Some(BaseType::Array(ArrayElementType::Bpchar)),
+            BaseType::Bytea => Some(BaseType::Array(ArrayElementType::Bytea)),
+            BaseType::Uuid => Some(BaseType::Array(ArrayElementType::Uuid)),
+            BaseType::Date => Some(BaseType::Array(ArrayElementType::Date)),
+            BaseType::Time => Some(BaseType::Array(ArrayElementType::Time)),
+            BaseType::Timestamp => Some(BaseType::Array(ArrayElementType::Timestamp)),
+            BaseType::TimestampTz => Some(BaseType::Array(ArrayElementType::TimestampTz)),
+            BaseType::Interval => Some(BaseType::Array(ArrayElementType::Interval)),
+            BaseType::Json => Some(BaseType::Array(ArrayElementType::Json)),
+            BaseType::Jsonb => Some(BaseType::Array(ArrayElementType::Jsonb)),
+            BaseType::PgLsn => Some(BaseType::Array(ArrayElementType::PgLsn)),
+            BaseType::Regclass => Some(BaseType::Array(ArrayElementType::Regclass)),
             _ => None,
         }
     }
@@ -468,7 +602,7 @@ impl Value {
             BaseType::Regclass => {
                 parse_int::<u32>(input).map(|oid| Value::Regclass(PgRegclass(oid)))
             }
-            BaseType::TextArray | BaseType::Int8Array | BaseType::UuidArray => {
+            BaseType::Array(_) => {
                 let elem_type = base
                     .get_array_element_type()
                     .expect("array base type has an element type");

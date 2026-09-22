@@ -4,7 +4,10 @@ use super::{
 };
 use crate::executor::{
     DatabaseState,
-    expressions::{extract_unknown_string_literal, is_null_literal},
+    expressions::{
+        UnnestTableFunction, extract_unknown_string_literal, extract_unnest_table_function,
+        is_null_literal,
+    },
     json, normalize_identifier, normalize_relation_name,
 };
 use crate::{
@@ -69,6 +72,58 @@ pub(crate) fn bind_table_factor(
     factor: &ast::TableFactor,
     scope: &mut BoundScope,
 ) -> Result<()> {
+    if let Some(UnnestTableFunction {
+        argument,
+        alias,
+        ordinality,
+    }) = extract_unnest_table_function(factor)?
+    {
+        let array_type = infer_expression_data_type(catalog, argument, scope)?.base;
+        let element_type = array_type.get_array_element_type().ok_or_else(|| {
+            PgError::create(
+                SqlState::UndefinedFunction,
+                "function unnest does not exist",
+            )
+        })?;
+        let column_count = if ordinality { 2 } else { 1 };
+        if alias.is_some_and(|alias| alias.columns.len() > column_count) {
+            return Err(PgError::create(
+                SqlState::InvalidColumnReference,
+                "function has fewer columns than its alias list",
+            ));
+        }
+        let qualifier = alias
+            .map(|alias| normalize_identifier(&alias.name))
+            .unwrap_or_else(|| "unnest".into());
+        let start = scope.columns.len();
+        for (index, (default_name, base)) in [("unnest", element_type)]
+            .into_iter()
+            .chain(ordinality.then_some(("ordinality", crate::value::BaseType::Int8)))
+            .enumerate()
+        {
+            let source_name = default_name.to_owned();
+            let name = alias
+                .and_then(|alias| alias.columns.get(index))
+                .map(|alias| normalize_identifier(&alias.name))
+                .unwrap_or_else(|| source_name.clone());
+            scope.columns.push(BoundColumn {
+                name,
+                data_type: PgType::create(base),
+                qualifier: qualifier.clone(),
+                slot: start + index,
+                output_order: start + index,
+                qualified_order: start + index,
+                qualified_merged: None,
+                merged: None,
+                unqualified: true,
+                wildcard: true,
+                depth: 0,
+                table_id: None,
+                source_name,
+            });
+        }
+        return Ok(());
+    }
     if let Some(json::JsonTableFunction {
         name,
         argument,

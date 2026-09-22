@@ -87,8 +87,15 @@ pub(super) fn constrain_statement_parameters(
             let bound = bind_update_scope(update, catalog)?;
             let scope = executor::RowScope::Bound(&bound);
             for assignment in &update.assignments {
-                let ast::AssignmentTarget::ColumnName(name) = &assignment.target else {
-                    continue;
+                let (name, subscript) = match &assignment.target {
+                    ast::AssignmentTarget::ColumnName(name) => (name, None),
+                    ast::AssignmentTarget::Subscript { column, subscripts } => {
+                        let [ast::Subscript::Index { index }] = subscripts.as_slice() else {
+                            continue;
+                        };
+                        (column, Some(index))
+                    }
+                    ast::AssignmentTarget::Tuple(_) => continue,
                 };
                 let name = executor::normalize_unqualified_object_name(name)?;
                 let column = schema
@@ -104,9 +111,16 @@ pub(super) fn constrain_statement_parameters(
                 infer_expression_parameters(
                     &assignment.value,
                     scope,
-                    Some(column.data_type.base),
+                    Some(
+                        subscript
+                            .and_then(|_| column.data_type.base.get_array_element_type())
+                            .unwrap_or(column.data_type.base),
+                    ),
                     types,
                 )?;
+                if let Some(subscript) = subscript {
+                    infer_expression_parameters(subscript, scope, Some(BaseType::Int4), types)?;
+                }
             }
             if let Some(selection) = &update.selection {
                 infer_expression_parameters(selection, scope, Some(BaseType::Bool), types)?;

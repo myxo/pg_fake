@@ -34,7 +34,7 @@ pub(crate) fn resolve_json_function_arguments(name: &str) -> Option<Vec<BaseType
     } else if name == "jsonb_set" {
         Some(vec![
             BaseType::Jsonb,
-            BaseType::TextArray,
+            BaseType::Array(crate::value::ArrayElementType::Text),
             BaseType::Jsonb,
             BaseType::Bool,
         ])

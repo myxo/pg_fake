@@ -1,7 +1,7 @@
 use super::super::parse_placeholder_index;
 use crate::{
     coercion,
-    error::{PgError, Result, SqlState, reject_unsupported},
+    error::{PgError, Result, SqlState},
     executor,
     value::BaseType,
 };
@@ -223,7 +223,10 @@ pub(super) fn infer_expression_parameters(
                 } else if let Some(array_type) = left_type.and_then(BaseType::get_array_type) {
                     constrain_parameter_type(right, Some(array_type), types)
                 } else if executor::is_parameter_placeholder(right) {
-                    reject_unsupported("quantified array parameter type is not implemented")
+                    let element_type = left_type.unwrap_or(BaseType::Text);
+                    constrain_parameter_type(left, Some(element_type), types).and_then(|()| {
+                        constrain_parameter_type(right, element_type.get_array_type(), types)
+                    })
                 } else {
                     constrain_parameter_type(left, right_type, types)
                         .and_then(|()| constrain_parameter_type(right, left_type, types))
@@ -383,6 +386,75 @@ fn infer_function_parameters(
                 .zip([BaseType::Text, BaseType::Text, BaseType::Bool])
         {
             constrain_parameter_type(argument, Some(expected), types)?;
+        }
+        return Ok(());
+    }
+    if matches!(
+        name.as_str(),
+        "cardinality"
+            | "array_length"
+            | "array_lower"
+            | "array_upper"
+            | "array_append"
+            | "array_prepend"
+            | "array_cat"
+            | "array_position"
+            | "array_positions"
+            | "array_remove"
+            | "array_replace"
+    ) {
+        let array_index = usize::from(name == "array_prepend");
+        let Some(array_argument) = arguments.get(array_index) else {
+            return Ok(());
+        };
+        let array_type = argument_types
+            .get(array_index)
+            .copied()
+            .flatten()
+            .or_else(|| {
+                if name == "array_cat" {
+                    argument_types
+                        .iter()
+                        .copied()
+                        .flatten()
+                        .find(|base| base.get_array_element_type().is_some())
+                } else {
+                    let element_index = 1 - array_index;
+                    argument_types
+                        .get(element_index)
+                        .copied()
+                        .flatten()
+                        .and_then(BaseType::get_array_type)
+                }
+            });
+        if let Some(array_type) = array_type {
+            constrain_parameter_type(array_argument, Some(array_type), types)?;
+            if name == "array_cat" {
+                if let Some(right) = arguments.get(1) {
+                    constrain_parameter_type(right, Some(array_type), types)?;
+                }
+            } else if let Some(element_type) = array_type.get_array_element_type() {
+                for index in match name.as_str() {
+                    "array_append" | "array_prepend" | "array_position" | "array_positions"
+                    | "array_remove" => vec![1 - array_index],
+                    "array_replace" => vec![1, 2],
+                    _ => Vec::new(),
+                } {
+                    if let Some(argument) = arguments.get(index) {
+                        constrain_parameter_type(argument, Some(element_type), types)?;
+                    }
+                }
+            }
+        }
+        if matches!(
+            name.as_str(),
+            "array_length" | "array_lower" | "array_upper"
+        ) && let Some(dimension) = arguments.get(1)
+        {
+            constrain_parameter_type(dimension, Some(BaseType::Int4), types)?;
+        }
+        if name == "array_position" && arguments.len() == 3 {
+            constrain_parameter_type(arguments[2], Some(BaseType::Int4), types)?;
         }
         return Ok(());
     }

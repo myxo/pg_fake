@@ -15,6 +15,7 @@ use crate::{
 };
 use sqlparser::ast;
 
+mod arrays;
 mod comparisons;
 mod functions;
 mod hashing;
@@ -25,8 +26,10 @@ mod runtime;
 mod temporal;
 mod types;
 
+pub(crate) use arrays::{UnnestTableFunction, extract_unnest_table_function};
 pub(super) use comparisons::{
-    compare_values, evaluate_comparison, validate_equality_type, validate_ordering_type,
+    compare_values, compare_values_as_type, evaluate_comparison, validate_equality_type,
+    validate_ordering_type,
 };
 pub(super) use functions::{infer_window_return_type, validate_function_argument};
 pub(super) use literals::{evaluate_literal, extract_number_literal};
@@ -45,6 +48,81 @@ use comparisons::{evaluate_membership, evaluate_quantified};
 use functions::{evaluate_function, extract_datetime_field};
 use literals::parse_integer_literal;
 use types::{infer_array_type, resolve_expression_list_type};
+
+pub(crate) fn coerce_unknown_with_context(
+    text: &str,
+    target: PgType,
+    cast_context: CastContext,
+    context: &StatementContext,
+) -> Result<Value> {
+    let resolve_regclass = |name: &str| {
+        context
+            .sequences
+            .resolve_regclass(name)?
+            .map(Value::Regclass)
+            .ok_or_else(|| {
+                PgError::create(
+                    SqlState::UndefinedTable,
+                    format!("relation {name:?} does not exist"),
+                )
+            })
+    };
+    if target.base == BaseType::Regclass {
+        return resolve_regclass(text);
+    }
+    if target.base.get_array_element_type() == Some(BaseType::Regclass) {
+        return Ok(Value::Array {
+            elem_type: BaseType::Regclass,
+            values: crate::text_array::parse_array_with(text, resolve_regclass)?,
+        });
+    }
+    coercion::coerce_unknown(text, target, cast_context, &context.get_timezone())
+}
+
+fn format_array_with_context(
+    values: &[Value],
+    element_type: BaseType,
+    context: &StatementContext,
+) -> Result<String> {
+    let timezone = context.get_timezone();
+    let mut formatted = Vec::with_capacity(values.len());
+    for value in values {
+        let text = match (element_type, value) {
+            (_, Value::Null) => {
+                formatted.push(Value::Null);
+                continue;
+            }
+            (BaseType::Regclass, Value::Regclass(crate::value::PgRegclass(oid))) => {
+                context.sequences.format_regclass(*oid)?
+            }
+            (
+                BaseType::TimestampTz,
+                Value::TimestampTz(crate::value::PgTimestampTz::Finite(timestamp)),
+            ) => {
+                let zone = coercion::time_zones::parse_session_zone(&timezone)?;
+                let (local, offset) = coercion::time_zones::convert_utc(zone, *timestamp)?;
+                let mut text = Value::Timestamp(crate::value::PgTimestamp::Finite(local))
+                    .format_postgres_text();
+                let sign = if offset < 0 { '-' } else { '+' };
+                let seconds = offset.unsigned_abs();
+                let hours = seconds / 3600;
+                let minutes = seconds / 60 % 60;
+                let seconds = seconds % 60;
+                if seconds != 0 {
+                    text.push_str(&format!("{sign}{hours:02}:{minutes:02}:{seconds:02}"));
+                } else if minutes != 0 {
+                    text.push_str(&format!("{sign}{hours:02}:{minutes:02}"));
+                } else {
+                    text.push_str(&format!("{sign}{hours:02}"));
+                }
+                text
+            }
+            (_, value) => value.format_postgres_text(),
+        };
+        formatted.push(Value::Text(text));
+    }
+    Ok(crate::text_array::format_array(&formatted))
+}
 
 pub(crate) fn expand_between_expression(
     expr: &ast::Expr,
@@ -88,12 +166,7 @@ pub(super) fn evaluate_assignment_expression(
     context: &StatementContext,
 ) -> Result<Value> {
     if let Some(text) = extract_unknown_string_literal(expr) {
-        coercion::coerce_unknown(
-            text,
-            target,
-            CastContext::Assignment,
-            &context.get_timezone(),
-        )
+        coerce_unknown_with_context(text, target, CastContext::Assignment, context)
     } else {
         coercion::coerce(
             evaluate(expr, RowScope::Table(schema), row, context)?,
@@ -148,14 +221,7 @@ fn evaluate_inner(
                 row,
                 context,
             )?;
-            let (
-                Value::Array {
-                    elem_type: BaseType::Int8,
-                    values,
-                },
-                Value::Int4(index),
-            ) = (array, index)
-            else {
+            let (Value::Array { values, .. }, Value::Int4(index)) = (array, index) else {
                 return Ok(Value::Null);
             };
             Ok(index
@@ -206,7 +272,7 @@ fn evaluate_inner(
                 .expect("array type has an element type");
             evaluate_array(
                 array,
-                elem_type,
+                PgType::create(elem_type),
                 CastContext::Implicit,
                 schema,
                 row,
@@ -346,6 +412,58 @@ fn evaluate_inner(
             ))
         }
         ast::Expr::BinaryOp { left, op, right } => {
+            let is_string = |data_type| {
+                matches!(
+                    data_type,
+                    BaseType::Text | BaseType::Varchar | BaseType::Bpchar
+                )
+            };
+            if *op == ast::BinaryOperator::StringConcat
+                && is_string(infer_expression_type(left, schema)?)
+                && is_string(infer_expression_type(right, schema)?)
+            {
+                let left = evaluate_and_coerce(
+                    left,
+                    BaseType::Text,
+                    CastContext::Implicit,
+                    schema,
+                    row,
+                    context,
+                )?;
+                let right = evaluate_and_coerce(
+                    right,
+                    BaseType::Text,
+                    CastContext::Implicit,
+                    schema,
+                    row,
+                    context,
+                )?;
+                return match (left, right) {
+                    (Value::Null, _) | (_, Value::Null) => Ok(Value::Null),
+                    (Value::Text(mut left), Value::Text(right)) => {
+                        left.push_str(&right);
+                        Ok(Value::Text(left))
+                    }
+                    _ => unreachable!("text concatenation operands were coerced"),
+                };
+            }
+            if matches!(
+                op,
+                ast::BinaryOperator::StringConcat
+                    | ast::BinaryOperator::AtArrow
+                    | ast::BinaryOperator::ArrowAt
+                    | ast::BinaryOperator::PGOverlap
+            ) && (infer_expression_type(left, schema)?
+                .get_array_element_type()
+                .is_some()
+                || infer_expression_type(right, schema)?
+                    .get_array_element_type()
+                    .is_some())
+            {
+                return arrays::evaluate_array_operator(
+                    expr, left, op, right, schema, row, context,
+                );
+            }
             if let Some((l, r, result)) = json::infer_json_operator(op, left, right, schema)? {
                 return json::evaluate_json_operator(
                     op,
@@ -626,12 +744,33 @@ fn evaluate_inner(
                     _ => unreachable!("regclass expression has regclass value"),
                 };
             }
+            if matches!(
+                target.base,
+                BaseType::Text | BaseType::Varchar | BaseType::Bpchar
+            ) && let Some(element_type) =
+                infer_expression_type(expr, schema)?.get_array_element_type()
+            {
+                return match evaluate(expr, schema, row, context)? {
+                    Value::Array { values, .. } => {
+                        let text = format_array_with_context(&values, element_type, context)?;
+                        coercion::coerce(
+                            Value::Text(text),
+                            BaseType::Text,
+                            target,
+                            CastContext::Explicit,
+                            &context.get_timezone(),
+                        )
+                    }
+                    Value::Null => Ok(Value::Null),
+                    _ => unreachable!("array expression has array value"),
+                };
+            }
             if let ast::Expr::Array(array) = expr.as_ref()
                 && let Some(elem_type) = target.base.get_array_element_type()
             {
                 return evaluate_array(
                     array,
-                    elem_type,
+                    PgType::create_with_typmod(elem_type, target.typmod),
                     CastContext::Explicit,
                     schema,
                     row,
@@ -639,12 +778,7 @@ fn evaluate_inner(
                 );
             }
             if let Some(text) = extract_unknown_string_literal(expr) {
-                coercion::coerce_unknown(
-                    text,
-                    target,
-                    CastContext::Explicit,
-                    &context.get_timezone(),
-                )
+                coerce_unknown_with_context(text, target, CastContext::Explicit, context)
             } else {
                 coercion::coerce(
                     evaluate(expr, schema, row, context)?,
@@ -665,7 +799,7 @@ fn evaluate_inner(
 #[cfg_attr(feature = "execution-log", tracing::instrument(skip_all))]
 fn evaluate_array(
     array: &ast::Array,
-    elem_type: BaseType,
+    element_type: PgType,
     cast_context: CastContext,
     schema: RowScope<'_>,
     row: &[Value],
@@ -674,9 +808,24 @@ fn evaluate_array(
     let values = array
         .elem
         .iter()
-        .map(|element| evaluate_and_coerce(element, elem_type, cast_context, schema, row, context))
+        .map(|expression| {
+            if let Some(text) = extract_unknown_string_literal(expression) {
+                coerce_unknown_with_context(text, element_type, cast_context, context)
+            } else {
+                coercion::coerce(
+                    evaluate(expression, schema, row, context)?,
+                    infer_expression_type(expression, schema)?,
+                    element_type,
+                    cast_context,
+                    &context.get_timezone(),
+                )
+            }
+        })
         .collect::<Result<Vec<_>>>()?;
-    Ok(Value::Array { elem_type, values })
+    Ok(Value::Array {
+        elem_type: element_type.base,
+        values,
+    })
 }
 
 #[cfg_attr(feature = "execution-log", tracing::instrument(skip_all))]
@@ -691,15 +840,17 @@ pub(super) fn evaluate_and_coerce(
     if let ast::Expr::Array(array) = expression
         && let Some(elem_type) = target.get_array_element_type()
     {
-        return evaluate_array(array, elem_type, context, schema, row, execution);
+        return evaluate_array(
+            array,
+            PgType::create(elem_type),
+            context,
+            schema,
+            row,
+            execution,
+        );
     }
     if let Some(text) = extract_unknown_string_literal(expression) {
-        coercion::coerce_unknown(
-            text,
-            PgType::create(target),
-            context,
-            &execution.get_timezone(),
-        )
+        coerce_unknown_with_context(text, PgType::create(target), context, execution)
     } else {
         let source = infer_expression_type(expression, schema)?;
         coercion::coerce(

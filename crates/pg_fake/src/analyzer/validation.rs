@@ -102,8 +102,15 @@ pub(super) fn validate_statement(statement: &ast::Statement, catalog: &Catalog) 
                 validate_boolean(selection, scope, "WHERE requires a boolean expression")?;
             }
             for assignment in &update.assignments {
-                let ast::AssignmentTarget::ColumnName(name) = &assignment.target else {
-                    continue;
+                let (name, subscript) = match &assignment.target {
+                    ast::AssignmentTarget::ColumnName(name) => (name, None),
+                    ast::AssignmentTarget::Subscript { column, subscripts } => {
+                        let [ast::Subscript::Index { index }] = subscripts.as_slice() else {
+                            continue;
+                        };
+                        (column, Some(index))
+                    }
+                    ast::AssignmentTarget::Tuple(_) => continue,
                 };
                 let name = executor::normalize_unqualified_object_name(name)?;
                 let column = schema
@@ -116,7 +123,14 @@ pub(super) fn validate_statement(statement: &ast::Statement, catalog: &Catalog) 
                             format!("column {name:?} does not exist"),
                         )
                     })?;
-                validate_assignment(&assignment.value, column.data_type, scope)?;
+                let target = subscript
+                    .and_then(|_| column.data_type.base.get_array_element_type())
+                    .map(PgType::create)
+                    .unwrap_or(column.data_type);
+                validate_assignment(&assignment.value, target, scope)?;
+                if let Some(subscript) = subscript {
+                    validate_assignment(subscript, PgType::create(BaseType::Int4), scope)?;
+                }
             }
             validate_returning_items(update.returning.as_deref(), scope)?;
         }

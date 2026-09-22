@@ -1,7 +1,7 @@
 use std::fmt::{self, Write};
 
 use bigdecimal::BigDecimal;
-use pg_fake::value::{BaseType, Value};
+use pg_fake::value::{ArrayElementType, BaseType, Value};
 use sqlx::{
     Arguments, Decode, Encode, Type, TypeInfo,
     encode::IsNull,
@@ -68,9 +68,30 @@ impl TypeInfo for PgFakeTypeInfo {
             Some(BaseType::Jsonb) => "JSONB",
             Some(BaseType::PgLsn) => "PG_LSN",
             Some(BaseType::Regclass) => "REGCLASS",
-            Some(BaseType::TextArray) => "TEXT[]",
-            Some(BaseType::Int8Array) => "INT8[]",
-            Some(BaseType::UuidArray) => "UUID[]",
+            Some(BaseType::Array(element)) => match element {
+                ArrayElementType::Bool => "BOOL[]",
+                ArrayElementType::Int2 => "INT2[]",
+                ArrayElementType::Int4 => "INT4[]",
+                ArrayElementType::Int8 => "INT8[]",
+                ArrayElementType::Oid => "OID[]",
+                ArrayElementType::Float4 => "FLOAT4[]",
+                ArrayElementType::Float8 => "FLOAT8[]",
+                ArrayElementType::Numeric => "NUMERIC[]",
+                ArrayElementType::Text => "TEXT[]",
+                ArrayElementType::Varchar => "VARCHAR[]",
+                ArrayElementType::Bpchar => "CHAR[]",
+                ArrayElementType::Bytea => "BYTEA[]",
+                ArrayElementType::Uuid => "UUID[]",
+                ArrayElementType::Date => "DATE[]",
+                ArrayElementType::Time => "TIME[]",
+                ArrayElementType::Timestamp => "TIMESTAMP[]",
+                ArrayElementType::TimestampTz => "TIMESTAMPTZ[]",
+                ArrayElementType::Interval => "INTERVAL[]",
+                ArrayElementType::Json => "JSON[]",
+                ArrayElementType::Jsonb => "JSONB[]",
+                ArrayElementType::PgLsn => "PG_LSN[]",
+                ArrayElementType::Regclass => "REGCLASS[]",
+            },
             None => "NULL",
         }
     }
@@ -85,6 +106,16 @@ impl TypeInfo for PgFakeTypeInfo {
                         (
                             BaseType::Text | BaseType::Varchar | BaseType::Bpchar,
                             BaseType::Text | BaseType::Varchar | BaseType::Bpchar
+                        )
+                    )
+                    || matches!(
+                        (
+                            left.get_array_element_type(),
+                            right.get_array_element_type()
+                        ),
+                        (
+                            Some(BaseType::Text | BaseType::Varchar | BaseType::Bpchar),
+                            Some(BaseType::Text | BaseType::Varchar | BaseType::Bpchar)
                         )
                     )
             }
@@ -502,179 +533,352 @@ impl<'r> Decode<'r, PgFake> for Vec<u8> {
     }
 }
 
-impl Type<PgFake> for Vec<Option<String>> {
-    fn type_info() -> PgFakeTypeInfo {
-        PgFakeTypeInfo::new(BaseType::TextArray)
-    }
-}
-impl<'q> Encode<'q, PgFake> for Vec<Option<String>> {
-    fn encode_by_ref(&self, buf: &mut Vec<Value>) -> Result<IsNull, BoxDynError> {
-        buf.push(Value::Array {
-            elem_type: BaseType::Text,
-            values: self
-                .iter()
-                .map(|value| value.clone().map(Value::Text).unwrap_or(Value::Null))
-                .collect(),
-        });
-        Ok(IsNull::No)
-    }
-}
-impl<'r> Decode<'r, PgFake> for Vec<Option<String>> {
-    fn decode(value: PgFakeValueRef<'r>) -> Result<Self, BoxDynError> {
-        match value.value {
-            Value::Array {
-                elem_type: BaseType::Text,
-                values,
-            } => values
-                .iter()
-                .map(|value| match value {
-                    Value::Null => Ok(None),
-                    Value::Text(value) => Ok(Some(value.clone())),
-                    _ => Err("expected text array".into()),
-                })
-                .collect(),
-            Value::Null => Err(Box::new(UnexpectedNullError)),
-            _ => Err("expected text array".into()),
+macro_rules! scalar_array_type {
+    ($rust:ty, $base:expr, $variant:path) => {
+        impl Type<PgFake> for Vec<Option<$rust>> {
+            fn type_info() -> PgFakeTypeInfo {
+                PgFakeTypeInfo::new($base.get_array_type().expect("scalar has an array type"))
+            }
         }
-    }
+
+        impl<'q> Encode<'q, PgFake> for Vec<Option<$rust>> {
+            fn encode_by_ref(&self, buffer: &mut Vec<Value>) -> Result<IsNull, BoxDynError> {
+                buffer.push(Value::Array {
+                    elem_type: $base,
+                    values: self
+                        .iter()
+                        .map(|value| {
+                            value
+                                .as_ref()
+                                .map(|value| $variant(value.clone()))
+                                .unwrap_or(Value::Null)
+                        })
+                        .collect(),
+                });
+                Ok(IsNull::No)
+            }
+        }
+
+        impl<'r> Decode<'r, PgFake> for Vec<Option<$rust>> {
+            fn decode(value: PgFakeValueRef<'r>) -> Result<Self, BoxDynError> {
+                match value.value {
+                    Value::Array { elem_type, values }
+                        if *elem_type == $base
+                            || $base == BaseType::Text
+                                && matches!(elem_type, BaseType::Varchar | BaseType::Bpchar) =>
+                    {
+                        values
+                            .iter()
+                            .map(|value| match value {
+                                Value::Null => Ok(None),
+                                $variant(value) => Ok(Some(value.clone())),
+                                _ => Err("array element has an incompatible type".into()),
+                            })
+                            .collect()
+                    }
+                    Value::Null => Err(Box::new(UnexpectedNullError)),
+                    _ => Err("expected an array".into()),
+                }
+            }
+        }
+
+        impl Type<PgFake> for Vec<$rust> {
+            fn type_info() -> PgFakeTypeInfo {
+                <Vec<Option<$rust>> as Type<PgFake>>::type_info()
+            }
+        }
+
+        impl<'q> Encode<'q, PgFake> for Vec<$rust> {
+            fn encode_by_ref(&self, buffer: &mut Vec<Value>) -> Result<IsNull, BoxDynError> {
+                buffer.push(Value::Array {
+                    elem_type: $base,
+                    values: self.iter().map(|value| $variant(value.clone())).collect(),
+                });
+                Ok(IsNull::No)
+            }
+        }
+
+        impl<'r> Decode<'r, PgFake> for Vec<$rust> {
+            fn decode(value: PgFakeValueRef<'r>) -> Result<Self, BoxDynError> {
+                <Vec<Option<$rust>> as Decode<PgFake>>::decode(value)?
+                    .into_iter()
+                    .map(|value| value.ok_or_else(|| "unexpected null array element".into()))
+                    .collect()
+            }
+        }
+    };
 }
-impl Type<PgFake> for Vec<String> {
+
+scalar_array_type!(bool, BaseType::Bool, Value::Bool);
+scalar_array_type!(i16, BaseType::Int2, Value::Int2);
+scalar_array_type!(i32, BaseType::Int4, Value::Int4);
+scalar_array_type!(u32, BaseType::Oid, Value::Oid);
+scalar_array_type!(i64, BaseType::Int8, Value::Int8);
+scalar_array_type!(f32, BaseType::Float4, Value::Float4);
+scalar_array_type!(f64, BaseType::Float8, Value::Float8);
+scalar_array_type!(BigDecimal, BaseType::Numeric, Value::Numeric);
+scalar_array_type!(String, BaseType::Text, Value::Text);
+scalar_array_type!(Vec<u8>, BaseType::Bytea, Value::Bytea);
+scalar_array_type!(uuid::Uuid, BaseType::Uuid, Value::Uuid);
+scalar_array_type!(pg_fake::jsonb::Jsonb, BaseType::Jsonb, Value::Jsonb);
+scalar_array_type!(pg_fake::value::PgLsn, BaseType::PgLsn, Value::PgLsn);
+scalar_array_type!(
+    pg_fake::value::PgRegclass,
+    BaseType::Regclass,
+    Value::Regclass
+);
+scalar_array_type!(
+    pg_fake::value::PgInterval,
+    BaseType::Interval,
+    Value::Interval
+);
+
+macro_rules! temporal_array_type {
+    ($rust:ty, $base:expr, $encode:expr, $decode:expr) => {
+        impl Type<PgFake> for Vec<Option<$rust>> {
+            fn type_info() -> PgFakeTypeInfo {
+                PgFakeTypeInfo::new($base.get_array_type().expect("scalar has an array type"))
+            }
+        }
+
+        impl<'q> Encode<'q, PgFake> for Vec<Option<$rust>> {
+            fn encode_by_ref(&self, buffer: &mut Vec<Value>) -> Result<IsNull, BoxDynError> {
+                let encode: fn(&$rust) -> Result<Value, BoxDynError> = $encode;
+                let values = self
+                    .iter()
+                    .map(|value| match value {
+                        Some(value) => encode(value),
+                        None => Ok(Value::Null),
+                    })
+                    .collect::<Result<Vec<_>, _>>()?;
+                buffer.push(Value::Array {
+                    elem_type: $base,
+                    values,
+                });
+                Ok(IsNull::No)
+            }
+        }
+
+        impl<'r> Decode<'r, PgFake> for Vec<Option<$rust>> {
+            fn decode(value: PgFakeValueRef<'r>) -> Result<Self, BoxDynError> {
+                let decode: fn(&Value) -> Result<$rust, BoxDynError> = $decode;
+                match value.value {
+                    Value::Array { elem_type, values } if *elem_type == $base => values
+                        .iter()
+                        .map(|value| {
+                            if value.is_null() {
+                                Ok(None)
+                            } else {
+                                decode(value).map(Some)
+                            }
+                        })
+                        .collect(),
+                    Value::Null => Err(Box::new(UnexpectedNullError)),
+                    _ => Err("expected an array".into()),
+                }
+            }
+        }
+
+        impl Type<PgFake> for Vec<$rust> {
+            fn type_info() -> PgFakeTypeInfo {
+                <Vec<Option<$rust>> as Type<PgFake>>::type_info()
+            }
+        }
+
+        impl<'q> Encode<'q, PgFake> for Vec<$rust> {
+            fn encode_by_ref(&self, buffer: &mut Vec<Value>) -> Result<IsNull, BoxDynError> {
+                let encode: fn(&$rust) -> Result<Value, BoxDynError> = $encode;
+                buffer.push(Value::Array {
+                    elem_type: $base,
+                    values: self.iter().map(encode).collect::<Result<Vec<_>, _>>()?,
+                });
+                Ok(IsNull::No)
+            }
+        }
+
+        impl<'r> Decode<'r, PgFake> for Vec<$rust> {
+            fn decode(value: PgFakeValueRef<'r>) -> Result<Self, BoxDynError> {
+                <Vec<Option<$rust>> as Decode<PgFake>>::decode(value)?
+                    .into_iter()
+                    .map(|value| value.ok_or_else(|| "unexpected null array element".into()))
+                    .collect()
+            }
+        }
+    };
+}
+
+temporal_array_type!(
+    chrono::NaiveDate,
+    BaseType::Date,
+    |value| Ok(Value::Date(pg_fake::value::PgDate::Finite(*value))),
+    |value| match value {
+        Value::Date(pg_fake::value::PgDate::Finite(value)) => Ok(*value),
+        _ => Err("expected finite date array element".into()),
+    }
+);
+
+#[cfg(feature = "time")]
+temporal_array_type!(
+    time::OffsetDateTime,
+    BaseType::TimestampTz,
+    |value| {
+        const POSTGRES_EPOCH_NANOS: i128 = 946_684_800_000_000_000;
+
+        let postgres_micros = (value.unix_timestamp_nanos() - POSTGRES_EPOCH_NANOS) / 1_000;
+        let unix_nanos = POSTGRES_EPOCH_NANOS + postgres_micros * 1_000;
+        let seconds = i64::try_from(unix_nanos.div_euclid(1_000_000_000))?;
+        let nanoseconds = u32::try_from(unix_nanos.rem_euclid(1_000_000_000))?;
+        let value = chrono::DateTime::from_timestamp(seconds, nanoseconds)
+            .ok_or("OffsetDateTime array element is outside pg_fake's timestamptz range")?;
+        Ok(Value::TimestampTz(pg_fake::value::PgTimestampTz::Finite(
+            value,
+        )))
+    },
+    |value| match value {
+        Value::TimestampTz(pg_fake::value::PgTimestampTz::Finite(value)) => {
+            let unix_nanos = i128::from(value.timestamp()) * 1_000_000_000
+                + i128::from(value.timestamp_subsec_nanos());
+            Ok(time::OffsetDateTime::from_unix_timestamp_nanos(unix_nanos)?)
+        }
+        _ => Err("expected finite timestamptz array element".into()),
+    }
+);
+
+impl<T> Type<PgFake> for Vec<Option<sqlx::types::Json<T>>> {
     fn type_info() -> PgFakeTypeInfo {
-        PgFakeTypeInfo::new(BaseType::TextArray)
+        PgFakeTypeInfo::new(BaseType::Jsonb.get_array_type().unwrap())
     }
-}
-impl<'q> Encode<'q, PgFake> for Vec<String> {
-    fn encode_by_ref(&self, buf: &mut Vec<Value>) -> Result<IsNull, BoxDynError> {
-        buf.push(Value::Array {
-            elem_type: BaseType::Text,
-            values: self.iter().cloned().map(Value::Text).collect(),
-        });
-        Ok(IsNull::No)
-    }
-}
-impl<'r> Decode<'r, PgFake> for Vec<String> {
-    fn decode(value: PgFakeValueRef<'r>) -> Result<Self, BoxDynError> {
-        <Vec<Option<String>> as Decode<PgFake>>::decode(value)?
-            .into_iter()
-            .map(|v| v.ok_or_else(|| "unexpected null array element".into()))
-            .collect()
+
+    fn compatible(type_info: &PgFakeTypeInfo) -> bool {
+        matches!(
+            type_info.base.and_then(BaseType::get_array_element_type),
+            Some(BaseType::Json | BaseType::Jsonb)
+        )
     }
 }
 
-impl Type<PgFake> for Vec<Option<i64>> {
-    fn type_info() -> PgFakeTypeInfo {
-        PgFakeTypeInfo::new(BaseType::Int8Array)
-    }
-}
-impl<'q> Encode<'q, PgFake> for Vec<Option<i64>> {
-    fn encode_by_ref(&self, buf: &mut Vec<Value>) -> Result<IsNull, BoxDynError> {
-        buf.push(Value::Array {
-            elem_type: BaseType::Int8,
-            values: self
-                .iter()
-                .map(|value| value.map(Value::Int8).unwrap_or(Value::Null))
-                .collect(),
+impl<'q, T: serde::Serialize> Encode<'q, PgFake> for Vec<Option<sqlx::types::Json<T>>> {
+    fn encode_by_ref(&self, buffer: &mut Vec<Value>) -> Result<IsNull, BoxDynError> {
+        let values = self
+            .iter()
+            .map(|value| match value {
+                Some(value) => pg_fake::jsonb::Jsonb::parse(&serde_json::to_string(&value.0)?)
+                    .map(Value::Jsonb)
+                    .map_err(|error| -> BoxDynError { Box::new(error) }),
+                None => Ok(Value::Null),
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+        buffer.push(Value::Array {
+            elem_type: BaseType::Jsonb,
+            values,
         });
         Ok(IsNull::No)
     }
 }
-impl<'r> Decode<'r, PgFake> for Vec<Option<i64>> {
+
+impl<'r, T: serde::Deserialize<'r>> Decode<'r, PgFake> for Vec<Option<sqlx::types::Json<T>>> {
     fn decode(value: PgFakeValueRef<'r>) -> Result<Self, BoxDynError> {
         match value.value {
             Value::Array {
-                elem_type: BaseType::Int8,
+                elem_type: BaseType::Json | BaseType::Jsonb,
                 values,
             } => values
                 .iter()
                 .map(|value| match value {
                     Value::Null => Ok(None),
-                    Value::Int8(value) => Ok(Some(*value)),
-                    _ => Err("expected bigint array".into()),
+                    Value::Json(text) => serde_json::from_str(text)
+                        .map(sqlx::types::Json)
+                        .map(Some)
+                        .map_err(Into::into),
+                    Value::Jsonb(value) => serde_json::from_str(value.get_postgres_text())
+                        .map(sqlx::types::Json)
+                        .map(Some)
+                        .map_err(Into::into),
+                    _ => Err("expected JSON array element".into()),
                 })
                 .collect(),
             Value::Null => Err(Box::new(UnexpectedNullError)),
-            _ => Err("expected bigint array".into()),
+            _ => Err("expected JSON array".into()),
         }
     }
 }
-impl Type<PgFake> for Vec<i64> {
+
+impl<T> Type<PgFake> for Vec<sqlx::types::Json<T>> {
     fn type_info() -> PgFakeTypeInfo {
-        <Vec<Option<i64>> as Type<PgFake>>::type_info()
+        <Vec<Option<sqlx::types::Json<T>>> as Type<PgFake>>::type_info()
+    }
+
+    fn compatible(type_info: &PgFakeTypeInfo) -> bool {
+        <Vec<Option<sqlx::types::Json<T>>> as Type<PgFake>>::compatible(type_info)
     }
 }
-impl<'q> Encode<'q, PgFake> for Vec<i64> {
-    fn encode_by_ref(&self, buf: &mut Vec<Value>) -> Result<IsNull, BoxDynError> {
-        buf.push(Value::Array {
-            elem_type: BaseType::Int8,
-            values: self.iter().copied().map(Value::Int8).collect(),
+
+impl<'q, T: serde::Serialize> Encode<'q, PgFake> for Vec<sqlx::types::Json<T>> {
+    fn encode_by_ref(&self, buffer: &mut Vec<Value>) -> Result<IsNull, BoxDynError> {
+        let values = self
+            .iter()
+            .map(|value| {
+                pg_fake::jsonb::Jsonb::parse(&serde_json::to_string(&value.0)?)
+                    .map(Value::Jsonb)
+                    .map_err(|error| -> BoxDynError { Box::new(error) })
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+        buffer.push(Value::Array {
+            elem_type: BaseType::Jsonb,
+            values,
         });
         Ok(IsNull::No)
     }
 }
-impl<'r> Decode<'r, PgFake> for Vec<i64> {
+
+impl<'r, T: serde::Deserialize<'r>> Decode<'r, PgFake> for Vec<sqlx::types::Json<T>> {
     fn decode(value: PgFakeValueRef<'r>) -> Result<Self, BoxDynError> {
-        <Vec<Option<i64>> as Decode<PgFake>>::decode(value)?
+        <Vec<Option<sqlx::types::Json<T>>> as Decode<PgFake>>::decode(value)?
             .into_iter()
             .map(|value| value.ok_or_else(|| "unexpected null array element".into()))
             .collect()
     }
 }
-
-impl Type<PgFake> for Vec<Option<uuid::Uuid>> {
-    fn type_info() -> PgFakeTypeInfo {
-        PgFakeTypeInfo::new(BaseType::UuidArray)
-    }
-}
-impl<'q> Encode<'q, PgFake> for Vec<Option<uuid::Uuid>> {
-    fn encode_by_ref(&self, buf: &mut Vec<Value>) -> Result<IsNull, BoxDynError> {
-        buf.push(Value::Array {
-            elem_type: BaseType::Uuid,
-            values: self
-                .iter()
-                .map(|value| value.map(Value::Uuid).unwrap_or(Value::Null))
-                .collect(),
-        });
-        Ok(IsNull::No)
-    }
-}
-impl<'r> Decode<'r, PgFake> for Vec<Option<uuid::Uuid>> {
-    fn decode(value: PgFakeValueRef<'r>) -> Result<Self, BoxDynError> {
-        match value.value {
-            Value::Array {
-                elem_type: BaseType::Uuid,
-                values,
-            } => values
-                .iter()
-                .map(|value| match value {
-                    Value::Null => Ok(None),
-                    Value::Uuid(value) => Ok(Some(*value)),
-                    _ => Err("expected UUID array".into()),
-                })
-                .collect(),
-            Value::Null => Err(Box::new(UnexpectedNullError)),
-            _ => Err("expected UUID array".into()),
+temporal_array_type!(
+    chrono::NaiveTime,
+    BaseType::Time,
+    |value| {
+        use chrono::Timelike;
+        Ok(Value::Time(pg_fake::value::PgTime(
+            i64::from(value.num_seconds_from_midnight()) * 1_000_000
+                + i64::from(value.nanosecond() / 1_000),
+        )))
+    },
+    |value| match value {
+        Value::Time(pg_fake::value::PgTime(value)) if *value < 86_400_000_000 => {
+            chrono::NaiveTime::from_num_seconds_from_midnight_opt(
+                (*value / 1_000_000) as u32,
+                ((*value % 1_000_000) * 1_000) as u32,
+            )
+            .ok_or_else(|| "invalid time array element".into())
         }
+        _ => Err("expected time array element".into()),
     }
-}
-impl Type<PgFake> for Vec<uuid::Uuid> {
-    fn type_info() -> PgFakeTypeInfo {
-        <Vec<Option<uuid::Uuid>> as Type<PgFake>>::type_info()
+);
+temporal_array_type!(
+    chrono::NaiveDateTime,
+    BaseType::Timestamp,
+    |value| Ok(Value::Timestamp(pg_fake::value::PgTimestamp::Finite(
+        *value
+    ))),
+    |value| match value {
+        Value::Timestamp(pg_fake::value::PgTimestamp::Finite(value)) => Ok(*value),
+        _ => Err("expected finite timestamp array element".into()),
     }
-}
-impl<'q> Encode<'q, PgFake> for Vec<uuid::Uuid> {
-    fn encode_by_ref(&self, buf: &mut Vec<Value>) -> Result<IsNull, BoxDynError> {
-        buf.push(Value::Array {
-            elem_type: BaseType::Uuid,
-            values: self.iter().copied().map(Value::Uuid).collect(),
-        });
-        Ok(IsNull::No)
+);
+temporal_array_type!(
+    chrono::DateTime<chrono::Utc>,
+    BaseType::TimestampTz,
+    |value| Ok(Value::TimestampTz(pg_fake::value::PgTimestampTz::Finite(
+        *value,
+    ))),
+    |value| match value {
+        Value::TimestampTz(pg_fake::value::PgTimestampTz::Finite(value)) => Ok(*value),
+        _ => Err("expected finite timestamptz array element".into()),
     }
-}
-impl<'r> Decode<'r, PgFake> for Vec<uuid::Uuid> {
-    fn decode(value: PgFakeValueRef<'r>) -> Result<Self, BoxDynError> {
-        <Vec<Option<uuid::Uuid>> as Decode<PgFake>>::decode(value)?
-            .into_iter()
-            .map(|value| value.ok_or_else(|| "unexpected null array element".into()))
-            .collect()
-    }
-}
+);

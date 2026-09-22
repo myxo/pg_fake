@@ -21,8 +21,12 @@ enum ForeignKeyMutation {
 fn collect_assignment_columns(assignments: &[ast::Assignment]) -> Result<Vec<String>> {
     let mut columns = BTreeSet::new();
     for assignment in assignments {
-        let ast::AssignmentTarget::ColumnName(column) = &assignment.target else {
-            return reject_unsupported("UPDATE tuple assignment is not implemented");
+        let column = match &assignment.target {
+            ast::AssignmentTarget::ColumnName(column)
+            | ast::AssignmentTarget::Subscript { column, .. } => column,
+            ast::AssignmentTarget::Tuple(_) => {
+                return reject_unsupported("UPDATE tuple assignment is not implemented");
+            }
         };
         columns.insert(executor::normalize_unqualified_object_name(column)?);
     }

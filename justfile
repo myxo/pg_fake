@@ -6,6 +6,10 @@ default: check
 build:
     cargo build
 
+# Start the pg_fake SQL REPL
+repl:
+    cargo run -p pg_fake_cli
+
 # Run all tests
 test:
     cargo test

@@ -41,6 +41,46 @@ pub struct Scenario {
 
 pub const FEATURES: &[Feature] = &[
     Feature {
+        task: 37,
+        name: "one-dimensional array operations",
+        cases: &[
+            Case {
+                id: "array_comparison_and_operators",
+                source: "tests/array_differential.rs",
+                setup: &[],
+                sql: "SELECT ARRAY[1,2] < ARRAY[1,3], (ARRAY[1,2] || ARRAY[3])::text, ARRAY[1,1] @> ARRAY[1], ARRAY[1,2] && ARRAY[2,3]",
+                blocker: BlockerKind::Implementation,
+            },
+            Case {
+                id: "array_inspection_and_mutation_functions",
+                source: "tests/array_differential.rs",
+                setup: &[],
+                sql: "SELECT array_length(ARRAY[1,2],1), cardinality(ARRAY[]::int[]), array_lower(ARRAY[1],1), array_upper(ARRAY[1],1), array_append(ARRAY[1],2)::text, array_prepend(0,ARRAY[1])::text, array_cat(ARRAY[1],ARRAY[2])::text, array_position(ARRAY[1,NULL],NULL), array_positions(ARRAY[1,2,1],1)::text, array_remove(ARRAY[1,2,1],1)::text, array_replace(ARRAY[1,2,1],1,9)::text",
+                blocker: BlockerKind::Implementation,
+            },
+            Case {
+                id: "array_subscript_assignment",
+                source: "tests/array_differential.rs",
+                setup: &[
+                    "CREATE TABLE phase3_array_assignment (id INTEGER PRIMARY KEY, values TEXT[])",
+                    "INSERT INTO phase3_array_assignment VALUES (1, ARRAY['a','b','c'])",
+                ],
+                sql: "UPDATE phase3_array_assignment SET values[2] = 'changed' WHERE id = 1 RETURNING values::text",
+                blocker: BlockerKind::Implementation,
+            },
+            Case {
+                id: "correlated_unnest_with_ordinality",
+                source: "tests/array_differential.rs",
+                setup: &[
+                    "CREATE TABLE phase3_array_expansion (id INTEGER PRIMARY KEY, values INTEGER[])",
+                    "INSERT INTO phase3_array_expansion VALUES (1, ARRAY[10,20]), (2, ARRAY[]::INTEGER[]), (3, NULL)",
+                ],
+                sql: "SELECT source.id, expanded.value, expanded.position FROM phase3_array_expansion AS source LEFT JOIN LATERAL unnest(source.values) WITH ORDINALITY AS expanded(value,position) ON TRUE ORDER BY source.id, expanded.position",
+                blocker: BlockerKind::Implementation,
+            },
+        ],
+    },
+    Feature {
         task: 22,
         name: "bounded LATERAL joins",
         cases: &[

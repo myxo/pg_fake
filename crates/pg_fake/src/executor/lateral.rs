@@ -35,6 +35,7 @@ pub(super) use initplans::{InitplanKey, RecursiveRows};
 pub(super) fn contains_lateral_source(factor: &ast::TableFactor) -> bool {
     match factor {
         ast::TableFactor::Derived { lateral: true, .. } => true,
+        ast::TableFactor::UNNEST { .. } => true,
         ast::TableFactor::NestedJoin {
             table_with_joins, ..
         } => {

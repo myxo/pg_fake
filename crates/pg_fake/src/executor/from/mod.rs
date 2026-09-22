@@ -3,7 +3,10 @@ use crate::{
     error::{Result, reject_unsupported},
     executor::{
         DatabaseState, StatementContext,
-        expressions::{evaluate, extract_unknown_string_literal},
+        expressions::{
+            UnnestTableFunction, evaluate, extract_unknown_string_literal,
+            extract_unnest_table_function,
+        },
         json,
         lateral::{InitplanKey, bind_lateral_query, contains_lateral_source},
         normalize_relation_name,
@@ -201,6 +204,42 @@ fn materialize_table_factor_rows(
     next_slot: &mut usize,
     prefix: &SourceRow,
 ) -> Result<Vec<SourceRow>> {
+    if let Some(UnnestTableFunction {
+        argument,
+        ordinality,
+        ..
+    }) = extract_unnest_table_function(factor)?
+    {
+        let start = *next_slot;
+        *next_slot += if ordinality { 2 } else { 1 };
+        let argument_scope = BoundScope {
+            columns: scope.columns[..start].to_vec(),
+        };
+        let value = evaluate_query_expression(
+            state,
+            argument,
+            &argument_scope,
+            &prefix.values,
+            xid,
+            snapshot,
+            context,
+        )?;
+        let Value::Array { values, .. } = value else {
+            return Ok(Vec::new());
+        };
+        return Ok(values
+            .into_iter()
+            .enumerate()
+            .map(|(index, value)| {
+                let mut row = prefix.clone();
+                row.values[start] = value;
+                if ordinality {
+                    row.values[start + 1] = Value::Int8(index as i64 + 1);
+                }
+                row
+            })
+            .collect());
+    }
     if let Some(json::JsonTableFunction {
         name,
         argument,

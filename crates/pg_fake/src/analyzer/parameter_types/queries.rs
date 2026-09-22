@@ -218,6 +218,11 @@ fn infer_join_expression_parameters(
                 types,
             )?;
         }
+        if let Some(executor::UnnestTableFunction { argument, .. }) =
+            executor::extract_unnest_table_function(factor)?
+        {
+            infer_expression_parameters(argument, executor::RowScope::Bound(visible), None, types)?;
+        }
         if index == 0 {
             executor::bind_table_factor(catalog, factor, visible)?;
         } else {
@@ -255,6 +260,16 @@ fn infer_table_factor_parameters(
     {
         let base = executor::resolve_json_function_arguments(&name).expect("JSON expansion")[0];
         constrain_parameter_type(argument, Some(base), types)?;
+    }
+    if let Some(executor::UnnestTableFunction { argument, .. }) =
+        executor::extract_unnest_table_function(factor)?
+    {
+        infer_expression_parameters(
+            argument,
+            executor::RowScope::Table(&executor::create_constant_expression_schema()),
+            None,
+            types,
+        )?;
     }
     match factor {
         ast::TableFactor::Derived {

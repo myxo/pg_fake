@@ -913,6 +913,51 @@ fn required_array_query_benchmarks(
     }
 }
 
+fn general_array_operation_benchmarks(
+    criterion: &mut Criterion,
+    runtime: &Runtime,
+    connections: &mut [NamedBenchmarkConnection<'_>],
+) {
+    let values = (1..=100)
+        .map(|id| format!("({id}, ARRAY[{},{},NULL]::INTEGER[])", id % 10, id % 7))
+        .collect::<Vec<_>>()
+        .join(",");
+    for (_, connection) in connections.iter_mut() {
+        connection.execute(
+            runtime,
+            "CREATE TABLE general_array_benchmark (id INTEGER PRIMARY KEY, values INTEGER[])",
+        );
+        connection.execute(
+            runtime,
+            &format!("INSERT INTO general_array_benchmark VALUES {values}"),
+        );
+    }
+    for (name, query, expected) in [
+        (
+            "array_containment_100_rows",
+            "SELECT id FROM general_array_benchmark WHERE values @> ARRAY[3,4] ORDER BY id",
+            100,
+        ),
+        (
+            "correlated_unnest_100_rows",
+            "SELECT source.id, expanded.value FROM general_array_benchmark AS source CROSS JOIN LATERAL unnest(source.values) AS expanded(value) ORDER BY source.id",
+            300,
+        ),
+    ] {
+        let mut group = criterion.benchmark_group(benchmarks::find_benchmark(name).name);
+        group.throughput(Throughput::Elements(expected));
+        for (connection_name, connection) in connections.iter_mut() {
+            group.bench_function(*connection_name, |benchmark| {
+                benchmark.iter(|| connection.fetch(runtime, query));
+            });
+        }
+        group.finish();
+    }
+    for (_, connection) in connections.iter_mut() {
+        connection.execute(runtime, "DROP TABLE general_array_benchmark");
+    }
+}
+
 fn hashed_advisory_lock_benchmark(
     criterion: &mut Criterion,
     runtime: &Runtime,
@@ -1938,6 +1983,7 @@ fn benchmarks(criterion: &mut Criterion) {
         offset_datetime_benchmark(criterion, &runtime, &mut connections);
         bigint_uuid_array_benchmark(criterion, &runtime, &mut connections);
         required_array_query_benchmarks(criterion, &runtime, &mut connections);
+        general_array_operation_benchmarks(criterion, &runtime, &mut connections);
         hashed_advisory_lock_benchmark(criterion, &runtime, &mut connections);
         benchmark_json(criterion, &runtime, &mut connections);
         benchmark_jsonb(criterion, &runtime, &mut connections);

@@ -53,9 +53,10 @@ pub(crate) fn infer_expression_type(expr: &ast::Expr, schema: RowScope<'_>) -> R
             else {
                 return reject_unsupported("array access shape is not implemented");
             };
-            if infer_expression_type(root, schema)? != BaseType::Int8Array {
+            let Some(element_type) = infer_expression_type(root, schema)?.get_array_element_type()
+            else {
                 return reject_unsupported("array subscript element type is not implemented");
-            }
+            };
             let index_type = infer_expression_type(index, schema)?;
             if !is_null_literal(index)
                 && extract_unknown_string_literal(index).is_none()
@@ -67,7 +68,7 @@ pub(crate) fn infer_expression_type(expr: &ast::Expr, schema: RowScope<'_>) -> R
                     "array subscript must have type integer",
                 ));
             }
-            Ok(BaseType::Int8)
+            Ok(element_type)
         }
         ast::Expr::Nested(expr) => infer_expression_type(expr, schema),
         ast::Expr::UnaryOp {
@@ -97,7 +98,19 @@ pub(crate) fn infer_expression_type(expr: &ast::Expr, schema: RowScope<'_>) -> R
             }
         }
         ast::Expr::BinaryOp { left, op, right }
-            if json::infer_json_operator(op, left, right, schema)?.is_some() =>
+            if !(matches!(
+                op,
+                ast::BinaryOperator::StringConcat
+                    | ast::BinaryOperator::AtArrow
+                    | ast::BinaryOperator::ArrowAt
+                    | ast::BinaryOperator::PGOverlap
+            ) && (infer_expression_type(left, schema)?
+                .get_array_element_type()
+                .is_some()
+                || infer_expression_type(right, schema)?
+                    .get_array_element_type()
+                    .is_some()))
+                && json::infer_json_operator(op, left, right, schema)?.is_some() =>
         {
             Ok(json::infer_json_operator(op, left, right, schema)?
                 .expect("resolved JSON operator")
@@ -176,6 +189,76 @@ pub(crate) fn infer_expression_type(expr: &ast::Expr, schema: RowScope<'_>) -> R
             Ok(BaseType::Interval)
         }
         ast::Expr::BinaryOp { left, op, right } => match op {
+            ast::BinaryOperator::StringConcat => {
+                let left_type = infer_expression_type(left, schema)?;
+                let right_type = infer_expression_type(right, schema)?;
+                let left_unknown =
+                    is_null_literal(left) || extract_unknown_string_literal(left).is_some();
+                let right_unknown =
+                    is_null_literal(right) || extract_unknown_string_literal(right).is_some();
+                match (
+                    left_type.get_array_element_type(),
+                    right_type.get_array_element_type(),
+                ) {
+                    (Some(left), Some(right)) => coercion::resolve_common_type(left, right)
+                        .and_then(BaseType::get_array_type)
+                        .ok_or_else(|| {
+                            PgError::create(
+                                SqlState::UndefinedFunction,
+                                "array concatenation types are incompatible",
+                            )
+                        }),
+                    (Some(element), None) if right_unknown => Ok(element
+                        .get_array_type()
+                        .expect("array element has an array type")),
+                    (None, Some(element)) if left_unknown => Ok(element
+                        .get_array_type()
+                        .expect("array element has an array type")),
+                    (Some(element), None) | (None, Some(element)) => {
+                        let scalar = if left_type.get_array_element_type().is_none() {
+                            left_type
+                        } else {
+                            right_type
+                        };
+                        coercion::resolve_common_type(element, scalar)
+                            .and_then(BaseType::get_array_type)
+                            .ok_or_else(|| {
+                                PgError::create(
+                                    SqlState::UndefinedFunction,
+                                    "array concatenation types are incompatible",
+                                )
+                            })
+                    }
+                    (None, None)
+                        if matches!(
+                            left_type,
+                            BaseType::Text | BaseType::Varchar | BaseType::Bpchar
+                        ) && matches!(
+                            right_type,
+                            BaseType::Text | BaseType::Varchar | BaseType::Bpchar
+                        ) =>
+                    {
+                        Ok(BaseType::Text)
+                    }
+                    (None, None) => Err(PgError::create(
+                        SqlState::UndefinedFunction,
+                        "operator does not exist for argument types",
+                    )),
+                }
+            }
+            ast::BinaryOperator::AtArrow
+            | ast::BinaryOperator::ArrowAt
+            | ast::BinaryOperator::PGOverlap => {
+                let data_type = resolve_operator_type(left, right, schema)?;
+                let Some(element_type) = data_type.get_array_element_type() else {
+                    return Err(PgError::create(
+                        SqlState::UndefinedFunction,
+                        "operator does not exist for argument types",
+                    ));
+                };
+                validate_equality_type(element_type)?;
+                Ok(BaseType::Bool)
+            }
             ast::BinaryOperator::Plus
             | ast::BinaryOperator::Minus
             | ast::BinaryOperator::Multiply
@@ -284,15 +367,6 @@ pub(crate) fn infer_expression_type(expr: &ast::Expr, schema: RowScope<'_>) -> R
             if let Ok(Some(element_type)) =
                 infer_expression_type(right, schema).map(BaseType::get_array_element_type)
             {
-                if element_type != BaseType::Uuid
-                    || !matches!(
-                        (expr, compare_op),
-                        (ast::Expr::AnyOp { .. }, ast::BinaryOperator::Eq)
-                            | (ast::Expr::AllOp { .. }, ast::BinaryOperator::NotEq)
-                    )
-                {
-                    return reject_unsupported("quantified array comparison is not implemented");
-                }
                 let left_type = infer_expression_type(left, schema)?;
                 let Some(comparison_type) = coercion::resolve_common_type(left_type, element_type)
                 else {
@@ -409,6 +483,7 @@ pub(crate) fn infer_expression_type(expr: &ast::Expr, schema: RowScope<'_>) -> R
                 return Ok(target.base);
             }
             if target.base != BaseType::Regclass
+                && target.base.get_array_element_type() != Some(BaseType::Regclass)
                 && let Some(text) = extract_unknown_string_literal(expr)
             {
                 coercion::coerce_unknown(text, target, CastContext::Explicit, "UTC")?;

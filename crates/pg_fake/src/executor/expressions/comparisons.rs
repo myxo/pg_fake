@@ -22,7 +22,21 @@ pub(in crate::executor) fn evaluate_comparison(
     right: &Value,
 ) -> Result<Value> {
     let ordering = compare_values(left, right)?;
-    Ok(Value::Bool(match operator {
+    Ok(evaluate_ordering(operator, ordering))
+}
+
+fn evaluate_comparison_as_type(
+    operator: &ast::BinaryOperator,
+    left: &Value,
+    right: &Value,
+    data_type: BaseType,
+) -> Result<Value> {
+    let ordering = compare_values_as_type(left, right, data_type)?;
+    Ok(evaluate_ordering(operator, ordering))
+}
+
+fn evaluate_ordering(operator: &ast::BinaryOperator, ordering: Ordering) -> Value {
+    Value::Bool(match operator {
         ast::BinaryOperator::Eq => ordering == Ordering::Equal,
         ast::BinaryOperator::NotEq => ordering != Ordering::Equal,
         ast::BinaryOperator::Gt => ordering == Ordering::Greater,
@@ -30,7 +44,7 @@ pub(in crate::executor) fn evaluate_comparison(
         ast::BinaryOperator::GtEq => ordering != Ordering::Less,
         ast::BinaryOperator::LtEq => ordering != Ordering::Greater,
         _ => unreachable!("evaluate_comparison operator was checked by caller"),
-    }))
+    })
 }
 
 #[cfg_attr(feature = "execution-log", tracing::instrument(skip_all))]
@@ -70,6 +84,34 @@ pub(in crate::executor) fn compare_values(left: &Value, right: &Value) -> Result
         (Value::Jsonb(left), Value::Jsonb(right)) => left.compare(right),
         (Value::PgLsn(left), Value::PgLsn(right)) => left.cmp(right),
         (Value::Regclass(left), Value::Regclass(right)) => left.cmp(right),
+        (
+            Value::Array {
+                elem_type: left_type,
+                values: left,
+            },
+            Value::Array {
+                elem_type: right_type,
+                values: right,
+            },
+        ) if left_type == right_type => {
+            let mut ordering = Ordering::Equal;
+            for (left, right) in left.iter().zip(right) {
+                ordering = match (left, right) {
+                    (Value::Null, Value::Null) => Ordering::Equal,
+                    (Value::Null, _) => Ordering::Greater,
+                    (_, Value::Null) => Ordering::Less,
+                    _ => compare_values_as_type(left, right, *left_type)?,
+                };
+                if ordering != Ordering::Equal {
+                    break;
+                }
+            }
+            if ordering == Ordering::Equal {
+                left.len().cmp(&right.len())
+            } else {
+                ordering
+            }
+        }
         _ => {
             return Err(PgError::create(
                 SqlState::DatatypeMismatch,
@@ -79,8 +121,26 @@ pub(in crate::executor) fn compare_values(left: &Value, right: &Value) -> Result
     })
 }
 
+pub(in crate::executor) fn compare_values_as_type(
+    left: &Value,
+    right: &Value,
+    data_type: BaseType,
+) -> Result<Ordering> {
+    if data_type == BaseType::Bpchar {
+        let (Value::Text(left), Value::Text(right)) = (left, right) else {
+            return Err(PgError::create(
+                SqlState::DatatypeMismatch,
+                "operator has incompatible types",
+            ));
+        };
+        return Ok(left.trim_end_matches(' ').cmp(right.trim_end_matches(' ')));
+    }
+    compare_values(left, right)
+}
+
 pub(in crate::executor) fn validate_equality_type(data_type: BaseType) -> Result<()> {
-    if matches!(data_type, BaseType::Json | BaseType::Void) {
+    let compared_type = data_type.get_array_element_type().unwrap_or(data_type);
+    if matches!(compared_type, BaseType::Json | BaseType::Void) {
         Err(create_missing_operator_error(data_type))
     } else {
         Ok(())
@@ -231,16 +291,6 @@ pub(super) fn evaluate_quantified(
     if let Ok(Some(element_type)) =
         infer_expression_type(right, schema).map(BaseType::get_array_element_type)
     {
-        if element_type != BaseType::Uuid
-            || !matches!(
-                (all, compare_op),
-                (false, ast::BinaryOperator::Eq) | (true, ast::BinaryOperator::NotEq)
-            )
-        {
-            return crate::error::reject_unsupported(
-                "quantified array comparison is not implemented",
-            );
-        }
         let left_type = infer_expression_type(left, schema)?;
         let comparison_type =
             coercion::resolve_common_type(left_type, element_type).ok_or_else(|| {
@@ -274,7 +324,7 @@ pub(super) fn evaluate_quantified(
             let comparison = if left.is_null() || candidate.is_null() {
                 Value::Null
             } else {
-                evaluate_comparison(compare_op, &left, &candidate)?
+                evaluate_comparison_as_type(compare_op, &left, &candidate, comparison_type)?
             };
             result = evaluate_boolean_operator(
                 if all {

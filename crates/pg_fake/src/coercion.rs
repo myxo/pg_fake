@@ -68,11 +68,11 @@ pub(crate) fn convert_ast_data_type(data_type: &ast::DataType) -> Result<PgType>
         ast::DataType::JSON => (BaseType::Json, PgType::NO_TYPEMOD),
         ast::DataType::JSONB => (BaseType::Jsonb, PgType::NO_TYPEMOD),
         ast::DataType::Array(ast::ArrayElemTypeDef::SquareBracket(element, None)) => {
-            let element = convert_ast_data_type(element)?.base;
-            let Some(base) = element.get_array_type() else {
+            let element = convert_ast_data_type(element)?;
+            let Some(base) = element.base.get_array_type() else {
                 return reject_unsupported("array element type is not implemented");
             };
-            (base, PgType::NO_TYPEMOD)
+            (base, element.typmod)
         }
         ast::DataType::Array(_) => {
             return reject_unsupported("array dimensions are not implemented");
@@ -173,6 +173,12 @@ pub(crate) fn resolve_common_type(left: BaseType, right: BaseType) -> Option<Bas
     if is_string_type(left) && is_string_type(right) {
         return Some(BaseType::Text);
     }
+    if let (Some(left), Some(right)) = (
+        left.get_array_element_type(),
+        right.get_array_element_type(),
+    ) {
+        return resolve_common_type(left, right).and_then(BaseType::get_array_type);
+    }
     if matches!(
         (left, right),
         (BaseType::Oid, BaseType::Regclass) | (BaseType::Regclass, BaseType::Oid)
@@ -184,6 +190,21 @@ pub(crate) fn resolve_common_type(left: BaseType, right: BaseType) -> Option<Bas
         (BaseType::Oid, BaseType::Int4) | (BaseType::Int4, BaseType::Oid)
     ) {
         return Some(BaseType::Oid);
+    }
+    if matches!(
+        left,
+        BaseType::Date | BaseType::Timestamp | BaseType::TimestampTz
+    ) && matches!(
+        right,
+        BaseType::Date | BaseType::Timestamp | BaseType::TimestampTz
+    ) {
+        return Some(
+            if left == BaseType::TimestampTz || right == BaseType::TimestampTz {
+                BaseType::TimestampTz
+            } else {
+                BaseType::Timestamp
+            },
+        );
     }
     let left_rank = get_numeric_rank(left)?;
     let right_rank = get_numeric_rank(right)?;
@@ -394,7 +415,7 @@ pub(crate) fn coerce(
                     coerce(
                         value,
                         source_element,
-                        PgType::create(target_element),
+                        PgType::create_with_typmod(target_element, target.typmod),
                         context,
                         timezone,
                     )
@@ -432,7 +453,15 @@ pub(crate) fn coerce_unknown(
     context: CastContext,
     timezone: &str,
 ) -> Result<Value> {
-    let value = if is_string_type(target.base) {
+    let value = if let Some(element_type) = target.base.get_array_element_type() {
+        let element_target = PgType::create_with_typmod(element_type, target.typmod);
+        Value::Array {
+            elem_type: element_type,
+            values: crate::text_array::parse_array_with(text, |value| {
+                coerce_unknown(value, element_target, context, timezone)
+            })?,
+        }
+    } else if is_string_type(target.base) {
         Value::Text(text.into())
     } else {
         Value::parse(target.base, text)?
@@ -733,11 +762,19 @@ fn round_timestamp(
         u32::try_from(typmod).map_err(|_| create_out_of_range_error(BaseType::Timestamp))?;
     let unit = 10_u32.pow(6 - precision);
     Ok(match value {
-        crate::value::PgTimestamp::Finite(value) => crate::value::PgTimestamp::Finite(
-            value
-                .with_nanosecond((value.nanosecond() / (unit * 1_000)) * unit * 1_000)
-                .expect("rounded timestamp remains valid"),
-        ),
+        crate::value::PgTimestamp::Finite(value) => {
+            let unit = unit * 1_000;
+            let nanos = ((value.nanosecond() + unit / 2) / unit) * unit;
+            let value = if nanos == 1_000_000_000 {
+                value
+                    .with_nanosecond(0)
+                    .and_then(|value| value.checked_add_signed(chrono::Duration::seconds(1)))
+            } else {
+                value.with_nanosecond(nanos)
+            }
+            .ok_or_else(|| create_out_of_range_error(BaseType::Timestamp))?;
+            crate::value::PgTimestamp::Finite(value)
+        }
         value => value,
     })
 }
@@ -751,11 +788,19 @@ fn round_timestamptz(
         u32::try_from(typmod).map_err(|_| create_out_of_range_error(BaseType::TimestampTz))?;
     let unit = 10_u32.pow(6 - precision);
     Ok(match value {
-        crate::value::PgTimestampTz::Finite(value) => crate::value::PgTimestampTz::Finite(
-            value
-                .with_nanosecond((value.nanosecond() / (unit * 1_000)) * unit * 1_000)
-                .expect("rounded timestamp remains valid"),
-        ),
+        crate::value::PgTimestampTz::Finite(value) => {
+            let unit = unit * 1_000;
+            let nanos = ((value.nanosecond() + unit / 2) / unit) * unit;
+            let value = if nanos == 1_000_000_000 {
+                value
+                    .with_nanosecond(0)
+                    .and_then(|value| value.checked_add_signed(chrono::Duration::seconds(1)))
+            } else {
+                value.with_nanosecond(nanos)
+            }
+            .ok_or_else(|| create_out_of_range_error(BaseType::TimestampTz))?;
+            crate::value::PgTimestampTz::Finite(value)
+        }
         value => value,
     })
 }

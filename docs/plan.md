@@ -1991,6 +1991,31 @@ priority BIGINT/UUID application paths are available.
 **Notes:** This task builds on Tasks 27–28. It is deliberately later because
 none of its remaining forms is required by the expedited application workload.
 
+**Progress:**
+
+- [x] Generalize one-dimensional arrays to every supported scalar type, with
+  PostgreSQL element/array OIDs, typmods, storage, text I/O, casts, prepared
+  metadata, and SQLx codecs.
+- [x] Implement common-element resolution, equality and ordering, generalized
+  `array_agg`/`ANY`/`ALL`, concatenation, containment, overlap, indexed
+  assignment, the bounded inspection/mutation functions, and correlated
+  `unnest` with aliases, ordinality, and supported lateral joins.
+- [x] Extend the sqlparser fork so `UPDATE` assignment targets retain array
+  subscripts instead of reparsing SQL text in pg_fake.
+- [x] Add focused native and PostgreSQL differential tests, prepared metadata
+  checks, generated differential coverage, Phase 3 manifest cases, and
+  containment/correlated-`unnest` benchmarks.
+- [x] Pass formatting, strict workspace Clippy, the complete workspace suite,
+  benchmark smoke execution, the Phase 3 audit, and the exact 10,000-iteration
+  property gate. The property gate passed all 25 generators in 983.06 seconds.
+- [x] Complete repeated subagent review, including fixes for contextual array
+  text I/O, element typmods, unknown polymorphic arguments, temporal promotion,
+  NULL edge cases, equality validation, and `bpchar` comparison semantics.
+- [x] Obtain user approval and commit the reviewed parser-fork change locally
+  as `dfbc7476`.
+- [ ] Publish the parser-fork revision, replace the temporary path dependency,
+  and mark the task complete.
+
 ---
 
 ## Milestone K — SERIALIZABLE isolation
