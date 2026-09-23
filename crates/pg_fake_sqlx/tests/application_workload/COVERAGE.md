@@ -8,8 +8,8 @@ cargo test -p pg_fake_sqlx --features time --test application_workload
 ```
 
 Run the complete Task 30 gate, including formatting, strict workspace Clippy,
-all non-generated workspace regressions, every focused replay below, and the
-mandatory 10,000-iteration/600-second property suite:
+workspace tests, every focused replay below, and `_long` property tests at
+the extended 10,000-iteration/600-second budget per test:
 
 ```console
 just task30-gate

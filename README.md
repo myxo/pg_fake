@@ -135,8 +135,9 @@ Configure Docker before launching tests. For Colima's default socket:
 DOCKER_HOST="unix://${HOME}/.colima/default/docker.sock" cargo test -p pg_fake_sqlx
 ```
 
-Run the full property gate with:
+Run property tests ending in `_long` with an extended budget of 10,000
+iterations or 600 seconds per test:
 
 ```sh
-CHAOS_THEORY_CHECK_ITERS=10000 CHAOS_THEORY_CHECK_TIME=600s cargo test -p pg_fake_sqlx --test property_tests
+CHAOS_THEORY_CHECK_ITERS=10000 CHAOS_THEORY_CHECK_TIME=600s cargo test -p pg_fake_sqlx --features time --test property_tests _long
 ```

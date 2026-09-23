@@ -24,5 +24,5 @@ To reproduce and minimize a property failure, copy the reported
 ```sh
 PG_FAKE_DATABASE_URL=postgresql://user@127.0.0.1:5432/postgres \
 CHAOS_THEORY_REPLAY=... \
-  cargo test -p pg_fake_sqlx --test property_tests generated_sql_matches_postgres
+  cargo test -p pg_fake_sqlx --test property_tests generated_sql_matches_postgres_long
 ```

@@ -1835,7 +1835,7 @@ pub fn fuzz_generated_sql_matches_postgres(src: &mut Source) {
 }
 
 #[test]
-fn generated_sql_matches_postgres() {
+fn generated_sql_matches_postgres_long() {
     let server = start_isolated_postgres_server();
     let runtime = tokio::runtime::Builder::new_current_thread()
         .enable_all()
@@ -1883,7 +1883,7 @@ fn generated_set_operations_match_postgres() {
 }
 
 #[test]
-fn matches_generated_jsonb_normalization_and_comparison() {
+fn matches_generated_jsonb_normalization_and_comparison_long() {
     let server = start_isolated_postgres_server();
     let runtime = tokio::runtime::Builder::new_current_thread()
         .enable_all()
@@ -1913,7 +1913,7 @@ fn matches_generated_jsonb_normalization_and_comparison() {
 }
 
 #[test]
-fn matches_generated_json_text_and_errors() {
+fn matches_generated_json_text_and_errors_long() {
     let server = start_isolated_postgres_server();
     let runtime = tokio::runtime::Builder::new_current_thread()
         .enable_all()
@@ -1967,7 +1967,7 @@ fn matches_generated_json_text_and_errors() {
 }
 
 #[test]
-fn generated_procedural_trees_match_postgres() {
+fn generated_procedural_trees_match_postgres_long() {
     let server = start_isolated_postgres_server();
     let runtime = tokio::runtime::Builder::new_current_thread()
         .enable_all()
@@ -2270,7 +2270,7 @@ fn generated_partial_unique_indexes_match_postgres() {
 }
 
 #[test]
-fn generated_interleaved_transaction_snapshots_match_postgres() {
+fn generated_interleaved_transaction_snapshots_match_postgres_long() {
     let server = start_isolated_postgres_server();
     let runtime = tokio::runtime::Builder::new_current_thread()
         .enable_all()
@@ -2502,7 +2502,7 @@ fn generated_temporary_relation_lifetimes_are_session_local() {
 }
 
 #[test]
-fn matches_generated_json_operations() {
+fn matches_generated_json_operations_long() {
     let server = start_isolated_postgres_server();
     let runtime = tokio::runtime::Builder::new_current_thread()
         .enable_all()
@@ -2769,7 +2769,7 @@ fn matches_generated_offset_datetime_parameters() {
 }
 
 #[test]
-fn matches_generated_runtime_expressions() {
+fn matches_generated_runtime_expressions_long() {
     let server = start_isolated_postgres_server();
     let runtime = tokio::runtime::Builder::new_current_thread()
         .enable_all()
@@ -2936,7 +2936,7 @@ fn matches_generated_lateral_joins() {
 }
 
 #[test]
-fn matches_generated_skip_locked_queues() {
+fn matches_generated_skip_locked_queues_long() {
     let server = start_isolated_postgres_server();
     let runtime = tokio::runtime::Builder::new_current_thread()
         .enable_all()
@@ -3063,7 +3063,7 @@ fn matches_generated_skip_locked_queues() {
 }
 
 #[test]
-fn matches_generated_advisory_transactions() {
+fn matches_generated_advisory_transactions_long() {
     let server = start_isolated_postgres_server();
     let runtime = tokio::runtime::Builder::new_current_thread()
         .enable_all()
@@ -3471,7 +3471,7 @@ fn matches_generated_pg_lsn_values_and_arithmetic() {
 }
 
 #[test]
-fn generated_savepoint_histories_match_postgres() {
+fn generated_savepoint_histories_match_postgres_long() {
     let server = start_isolated_postgres_server();
     let runtime = tokio::runtime::Builder::new_current_thread()
         .enable_all()
@@ -3530,7 +3530,7 @@ fn generated_savepoint_histories_match_postgres() {
 }
 
 #[test]
-fn compare_generated_setting_histories() {
+fn compare_generated_setting_histories_long() {
     let server = start_isolated_postgres_server();
     let runtime = tokio::runtime::Builder::new_current_thread()
         .enable_all()

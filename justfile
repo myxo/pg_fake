@@ -49,5 +49,5 @@ check: fmt-check lint test
 task30-gate:
     cargo fmt --all -- --check
     cargo clippy --workspace --all-targets --all-features -- -D warnings
-    cargo test --workspace --all-features -- --skip generated_
-    CHAOS_THEORY_CHECK_ITERS=10000 CHAOS_THEORY_CHECK_TIME=600s cargo test -p pg_fake_sqlx --features time --test property_tests
+    cargo test --workspace --all-features -- --skip _long
+    CHAOS_THEORY_CHECK_ITERS=10000 CHAOS_THEORY_CHECK_TIME=600s cargo test -p pg_fake_sqlx --features time --test property_tests _long

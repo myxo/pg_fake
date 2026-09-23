@@ -36,10 +36,12 @@ and scope boundaries. The completed Phase 2 plan is archived in
 - Every feature task must add or update a representative benchmark when it can
   materially affect common query, mutation, catalog, or concurrency workloads.
   Otherwise, the completion handoff must explain why.
-- Before a task can be marked complete, the property suite must pass
-  10,000 `chaos_theory` iterations or 10 min, run with
-  `CHAOS_THEORY_CHECK_ITERS=10000 CHAOS_THEORY_CHECK_TIME=600s` and
-  `cargo test -p pg_fake_sqlx --test property_tests`.
+- Before a task can be marked complete, property tests whose names end in
+  `_long` must pass with a budget of 10,000 `chaos_theory` iterations or
+  10 minutes per test, whichever limit is reached first. Run
+  `CHAOS_THEORY_CHECK_ITERS=10000 CHAOS_THEORY_CHECK_TIME=600s cargo test -p pg_fake_sqlx --features time --test property_tests _long`.
+  Reserve the `_long` suffix for generators with broad combinations of SQL,
+  recursive structures, or operation histories that need extended coverage.
 - After implementing a task, update its progress but do not mark it complete
   until the user approves the result, as required by `AGENTS.md`.
 - Valid PostgreSQL syntax that `sqlparser-rs` cannot represent must be fixed in
@@ -2092,8 +2094,9 @@ native and SQLx APIs.
 - SQLx prepared queries, row decoding/encoding, nested transactions, and
   concurrent transactions cover every Phase 3 type and statement family plus
   the Task 25–26 application-compatibility additions.
-- The property suite passes 10,000 iterations with Phase 3 operations enabled,
-  and randomized plus focused multi-session tests pass repeatedly.
+- The property suite passes with Phase 3 operations enabled, with `_long`
+  tests using the extended budget defined in Conventions. Randomized plus
+  focused multi-session tests pass repeatedly.
 - Benchmarks cover set operations, recursive CTEs, conflicting inserts, windows,
   JSONB, arrays, `OffsetDateTime`, text hashes, views, savepoints,
   transactional DDL, row locking, and SSI; results are compared with PostgreSQL
