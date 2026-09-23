@@ -5,11 +5,13 @@ Benchmarks are prioritized by their impact on everyday application tests using
 
 | Prefix | Priority | Workloads |
 | --- | --- | --- |
-| `tier1_` | Essential | Basic inserts (including defaults, identity, `RETURNING`, and foreign keys), updates, basic transactions, full and filtered selects with and without indexes, ordering/paging, and simple inner joins. |
-| `tier2_` | Important | Deletes, upserts, schema setup and migrations, snapshots, prepared reads, adapter overhead, aggregates, subqueries, non-recursive read CTEs, views, JSON/array operations, temporal values, savepoints, and row locks. |
-| `tier3_` | Rare | Recursive and data-modifying CTEs, advanced window operations, triggers, temporary-table lifecycles, catalog lookups, specialized locking/settings, JSON joins, correlated unnesting, and transaction-history/MVCC/concurrency diagnostics. |
+| `tier1_` | Essential | Plain inserts, updates, basic transactions, full and filtered selects with and without indexes, ordering/paging, and simple inner joins. |
+| `tier2_` | Important | Insert variants (`RETURNING`, defaults, identity, foreign keys, upserts), deletes, schema setup/migrations, snapshots, read diagnostics, aggregates, subqueries, read CTEs, JSON/array/temporal operations, savepoints, row locks, and uncontended concurrent reads. |
+| `tier3_` | Rare | Recursive/data-modifying CTEs, advanced windows, lateral queries, nested views, compound index/array aggregation workloads, triggers, temporary tables, catalog lookups, specialized locking/settings, JSON joins, and transaction-history/MVCC/contention diagnostics. |
 
 The shared catalog in [`src/lib.rs`](src/lib.rs) assigns every workload a tier.
+The [complete tier assessment](tiers.md) explains the assignment of all 76
+benchmark groups based on their actual timed operations.
 Console and saved reports group measurements and comparisons by tier, with
 Tier 1 first. These priorities are independent of the SQL fidelity tiers in the
 project specification.

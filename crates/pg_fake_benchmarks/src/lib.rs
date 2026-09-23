@@ -93,13 +93,13 @@ pub fn list_benchmarks() -> Vec<Benchmark> {
             build_postgres_comparisons(),
         ),
         build_benchmark(
-            BenchmarkTier::Important,
+            BenchmarkTier::Rare,
             "skip_locked_queue_100_rows",
             build_postgres_values(),
             build_postgres_comparisons(),
         ),
         build_benchmark(
-            BenchmarkTier::Important,
+            BenchmarkTier::Rare,
             "lateral_latest_per_parent_100_rows",
             build_postgres_values(),
             build_postgres_comparisons(),
@@ -153,7 +153,7 @@ pub fn list_benchmarks() -> Vec<Benchmark> {
             build_postgres_comparisons(),
         ),
         build_benchmark(
-            BenchmarkTier::Important,
+            BenchmarkTier::Rare,
             "partial_unique_index_100_rows",
             build_postgres_values(),
             build_postgres_comparisons(),
@@ -171,13 +171,13 @@ pub fn list_benchmarks() -> Vec<Benchmark> {
             build_postgres_comparisons(),
         ),
         build_benchmark(
-            BenchmarkTier::Essential,
+            BenchmarkTier::Important,
             "insert_row_returning",
             build_postgres_values(),
             build_postgres_comparisons(),
         ),
         build_benchmark(
-            BenchmarkTier::Essential,
+            BenchmarkTier::Important,
             "insert_row_with_defaults",
             build_postgres_values(),
             build_postgres_comparisons(),
@@ -231,7 +231,7 @@ pub fn list_benchmarks() -> Vec<Benchmark> {
             build_postgres_comparisons(),
         ),
         build_benchmark(
-            BenchmarkTier::Essential,
+            BenchmarkTier::Important,
             "serial_identity_insert",
             build_postgres_values(),
             build_postgres_comparisons(),
@@ -261,7 +261,7 @@ pub fn list_benchmarks() -> Vec<Benchmark> {
             build_postgres_comparisons(),
         ),
         build_benchmark(
-            BenchmarkTier::Important,
+            BenchmarkTier::Rare,
             "ordered_filtered_array_agg_100_rows",
             build_postgres_values(),
             build_postgres_comparisons(),
@@ -381,7 +381,7 @@ pub fn list_benchmarks() -> Vec<Benchmark> {
             build_postgres_comparisons(),
         ),
         build_benchmark(
-            BenchmarkTier::Important,
+            BenchmarkTier::Rare,
             "nested_filtered_view_100_rows",
             build_postgres_values(),
             build_postgres_comparisons(),
@@ -439,7 +439,7 @@ pub fn list_benchmarks() -> Vec<Benchmark> {
             ],
         ),
         build_benchmark(
-            BenchmarkTier::Essential,
+            BenchmarkTier::Important,
             "point_lookup_index_vs_scan",
             vec![
                 build_value("heap_scan/100", &["heap_scan", "100"]),
@@ -453,7 +453,7 @@ pub fn list_benchmarks() -> Vec<Benchmark> {
             ],
         ),
         build_benchmark(
-            BenchmarkTier::Rare,
+            BenchmarkTier::Important,
             "concurrent_uncontended_reads",
             vec![
                 build_value("sequential", &["sequential"]),
@@ -468,7 +468,7 @@ pub fn list_benchmarks() -> Vec<Benchmark> {
             vec![],
         ),
         build_benchmark(
-            BenchmarkTier::Essential,
+            BenchmarkTier::Important,
             "foreign_key_insert",
             build_postgres_values(),
             build_postgres_comparisons(),

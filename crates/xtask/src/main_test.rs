@@ -107,7 +107,7 @@ fn excludes_comparisons_when_only_one_backend_is_selected() {
 
 #[test]
 fn filters_parameterized_benchmarks_using_their_criterion_names() {
-    let benchmarks = select_benchmarks(Some("tier1_point_lookup_index_vs_scan/heap_scan/10000"));
+    let benchmarks = select_benchmarks(Some("tier2_point_lookup_index_vs_scan/heap_scan/10000"));
     let report = collect_report(
         &find_results_root().join("criterion"),
         BASELINE,
@@ -116,7 +116,7 @@ fn filters_parameterized_benchmarks_using_their_criterion_names() {
     assert_eq!(report.tiers[0].measurements.len(), 1);
     assert_eq!(
         report.tiers[0].measurements[0].0,
-        "tier1_point_lookup_index_vs_scan/heap_scan/10,000"
+        "tier2_point_lookup_index_vs_scan/heap_scan/10,000"
     );
     assert!(report.tiers[0].speedups.is_empty());
 }
