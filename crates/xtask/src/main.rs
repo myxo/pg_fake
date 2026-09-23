@@ -7,7 +7,7 @@ use std::{
     process::Command,
 };
 
-use pg_fake_benchmarks::{Benchmark, BenchmarkValue, list_benchmarks};
+use pg_fake_benchmarks::{Benchmark, BenchmarkTier, BenchmarkValue, list_benchmarks};
 
 const BASELINE: &str = "repo-baseline";
 const BASELINE_FILES: [&str; 4] = [
@@ -18,24 +18,31 @@ const BASELINE_FILES: [&str; 4] = [
 ];
 
 struct Report {
+    tiers: Vec<TierReport>,
+}
+
+struct TierReport {
+    tier: BenchmarkTier,
     measurements: Vec<(String, String, String)>,
     speedups: Vec<(String, String, String, String)>,
 }
 
 fn main() {
     let commands = env::args().skip(1).collect::<Vec<_>>();
-    let record = match commands.as_slice() {
-        [command] if command == "bench" => false,
-        [command, action] if command == "bench" && action == "record" => true,
-        _ => panic!("usage: cargo x bench [record]"),
+    let (record, filter) = match commands.as_slice() {
+        [command] if command == "bench" => (false, None),
+        [command, action] if command == "bench" && action == "record" => (true, None),
+        [command, filter] if command == "bench" => (false, Some(filter.as_str())),
+        _ => panic!("usage: cargo x bench [FILTER] | cargo x bench record"),
     };
+    let benchmarks = select_benchmarks(filter);
 
     let environment = collect_environment();
     print_environment(&environment);
-    restore_baseline(record);
-    run_benchmarks(record);
+    restore_baseline(record, &benchmarks);
+    run_benchmarks(record, filter);
 
-    let report = collect_report(&find_criterion_root(), "new");
+    let report = collect_report(&find_criterion_root(), "new", &benchmarks);
     print_report(&report);
     if record {
         save_results(&environment, &report);
@@ -44,6 +51,34 @@ fn main() {
             find_results_root().display()
         );
     }
+}
+
+fn select_benchmarks(filter: Option<&str>) -> Vec<Benchmark> {
+    if let Some(filter) = filter {
+        assert!(
+            filter
+                .bytes()
+                .all(|byte| byte.is_ascii_alphanumeric() || b"_/".contains(&byte)),
+            "filter must be a literal benchmark name fragment (letters, digits, underscores, or slashes)"
+        );
+    }
+    let benchmarks = list_benchmarks()
+        .into_iter()
+        .filter_map(|mut benchmark| {
+            let name = benchmark.format_name();
+            benchmark.values.retain(|value| {
+                filter.is_none_or(|filter| {
+                    format!("{name}/{}", value.path.join("/")).contains(filter)
+                })
+            });
+            (!benchmark.values.is_empty()).then_some(benchmark)
+        })
+        .collect::<Vec<_>>();
+    assert!(
+        !benchmarks.is_empty(),
+        "benchmark filter matched no benchmarks"
+    );
+    benchmarks
 }
 
 fn collect_environment() -> Vec<(String, String)> {
@@ -158,12 +193,10 @@ fn run_command(program: &str, arguments: &[&str]) -> Option<String> {
         .filter(|output| !output.is_empty())
 }
 
-fn restore_baseline(record: bool) {
+fn restore_baseline(record: bool, benchmarks: &[Benchmark]) {
     let criterion_root = find_criterion_root();
     let results_root = find_results_root().join("criterion");
-    let benchmarks = list_benchmarks();
-
-    for benchmark in &benchmarks {
+    for benchmark in benchmarks {
         for value in &benchmark.values {
             let target = find_baseline_path(&criterion_root, benchmark, value);
             if target.exists() {
@@ -180,7 +213,7 @@ fn restore_baseline(record: bool) {
         return;
     }
 
-    for benchmark in &benchmarks {
+    for benchmark in benchmarks {
         for value in &benchmark.values {
             let source = find_baseline_path(&results_root, benchmark, value);
             let target = find_baseline_path(&criterion_root, benchmark, value);
@@ -192,82 +225,91 @@ fn restore_baseline(record: bool) {
     }
 }
 
-fn run_benchmarks(record: bool) {
+fn run_benchmarks(record: bool, filter: Option<&str>) {
     let argument = if record {
         "--save-baseline"
     } else {
         "--baseline"
     };
-    let status = Command::new("cargo")
-        .args([
-            "bench",
-            "-p",
-            "pg_fake_benchmarks",
-            "--bench",
-            "workloads",
-            "--",
-            argument,
-            BASELINE,
-            "--noplot",
-        ])
-        .status()
-        .expect("benchmark command must start");
+    let mut command = Command::new("cargo");
+    command.args([
+        "bench",
+        "-p",
+        "pg_fake_benchmarks",
+        "--bench",
+        "workloads",
+        "--",
+        argument,
+        BASELINE,
+        "--noplot",
+    ]);
+    if let Some(filter) = filter {
+        command.arg(filter);
+    }
+    let status = command.status().expect("benchmark command must start");
     assert!(status.success(), "benchmark command must succeed");
 }
 
-fn collect_report(root: &Path, result: &str) -> Report {
-    let benchmarks = list_benchmarks();
+fn collect_report(root: &Path, result: &str, benchmarks: &[Benchmark]) -> Report {
     let previous_root = find_results_root().join("criterion");
-    let (postgres_benchmarks, other_benchmarks): (Vec<_>, Vec<_>) =
-        benchmarks.iter().partition(|benchmark| {
-            benchmark
-                .values
-                .iter()
-                .any(|value| value.name == "postgres_18")
-        });
-    let mut measurements = Vec::new();
-    let mut speedups = Vec::new();
+    let mut tiers = Vec::new();
+    for tier in BenchmarkTier::list() {
+        let mut measurements = Vec::new();
+        let mut speedups = Vec::new();
 
-    for benchmark in postgres_benchmarks.into_iter().chain(other_benchmarks) {
-        for value in &benchmark.values {
-            if let Some(average) = read_estimate(root, benchmark, value, result) {
-                let change = read_estimate(&previous_root, benchmark, value, BASELINE).map_or_else(
-                    || "N/A".to_owned(),
-                    |previous| format_change(previous, average),
-                );
-                measurements.push((
-                    format!("{}/{}", benchmark.name, value.name),
-                    format_time(average),
-                    change,
+        for benchmark in benchmarks.iter().filter(|benchmark| benchmark.tier == tier) {
+            for value in &benchmark.values {
+                if let Some(average) = read_estimate(root, benchmark, value, result) {
+                    let change = read_estimate(&previous_root, benchmark, value, BASELINE)
+                        .map_or_else(
+                            || "N/A".to_owned(),
+                            |previous| format_change(previous, average),
+                        );
+                    measurements.push((
+                        format!("{}/{}", benchmark.format_name(), value.name),
+                        format_time(average),
+                        change,
+                    ));
+                }
+            }
+            for comparison in &benchmark.comparisons {
+                let (Some(baseline), Some(candidate)) = (
+                    benchmark
+                        .values
+                        .iter()
+                        .find(|value| value.name == comparison.baseline),
+                    benchmark
+                        .values
+                        .iter()
+                        .find(|value| value.name == comparison.candidate),
+                ) else {
+                    continue;
+                };
+                let (Some(baseline), Some(candidate)) = (
+                    read_estimate(root, benchmark, baseline, result),
+                    read_estimate(root, benchmark, candidate, result),
+                ) else {
+                    continue;
+                };
+                speedups.push((
+                    benchmark.format_name(),
+                    comparison.baseline.to_owned(),
+                    comparison.candidate.to_owned(),
+                    format_relative(baseline, candidate),
                 ));
             }
         }
-        for comparison in &benchmark.comparisons {
-            let baseline = find_value(benchmark, comparison.baseline);
-            let candidate = find_value(benchmark, comparison.candidate);
-            let (Some(baseline), Some(candidate)) = (
-                read_estimate(root, benchmark, baseline, result),
-                read_estimate(root, benchmark, candidate, result),
-            ) else {
-                continue;
-            };
-            speedups.push((
-                benchmark.name.to_owned(),
-                comparison.baseline.to_owned(),
-                comparison.candidate.to_owned(),
-                format_relative(baseline, candidate),
-            ));
+
+        if !measurements.is_empty() {
+            tiers.push(TierReport {
+                tier,
+                measurements,
+                speedups,
+            });
         }
     }
-
-    assert!(
-        !measurements.is_empty(),
-        "no Criterion estimates were found"
-    );
-    Report {
-        measurements,
-        speedups,
-    }
+    assert!(!tiers.is_empty(), "no Criterion estimates were found");
+    Report { tiers }
 }
 
 fn print_environment(environment: &[(String, String)]) {
@@ -283,32 +325,35 @@ fn print_environment(environment: &[(String, String)]) {
 }
 
 fn print_report(report: &Report) {
-    println!("\nBenchmarks\n");
-    print_table(
-        &["benchmark", "average", "change vs previous"],
-        &report
-            .measurements
-            .iter()
-            .map(|(name, average, change)| vec![name.clone(), average.clone(), change.clone()])
-            .collect::<Vec<_>>(),
-    );
-    if !report.speedups.is_empty() {
-        println!("\nSpeedups\n");
+    for report in &report.tiers {
+        println!("\n{}", report.tier.get_title());
+        println!("\nBenchmarks\n");
         print_table(
-            &["benchmark", "baseline", "candidate", "relative"],
+            &["benchmark", "average", "change vs previous"],
             &report
-                .speedups
+                .measurements
                 .iter()
-                .map(|(name, baseline, candidate, relative)| {
-                    vec![
-                        name.clone(),
-                        baseline.clone(),
-                        candidate.clone(),
-                        relative.clone(),
-                    ]
-                })
+                .map(|(name, average, change)| vec![name.clone(), average.clone(), change.clone()])
                 .collect::<Vec<_>>(),
         );
+        if !report.speedups.is_empty() {
+            println!("\nSpeedups\n");
+            print_table(
+                &["benchmark", "baseline", "candidate", "relative"],
+                &report
+                    .speedups
+                    .iter()
+                    .map(|(name, baseline, candidate, relative)| {
+                        vec![
+                            name.clone(),
+                            baseline.clone(),
+                            candidate.clone(),
+                            relative.clone(),
+                        ]
+                    })
+                    .collect::<Vec<_>>(),
+            );
+        }
     }
 }
 
@@ -364,22 +409,25 @@ fn format_markdown(
         )
         .unwrap();
     }
-    markdown.push_str(
-        "\n## Benchmarks\n\n| Benchmark | Average | Change vs previous |\n| --- | ---: | ---: |\n",
-    );
-    for (name, average, change) in &report.measurements {
-        writeln!(markdown, "| {name} | {average} | {change} |").unwrap();
-    }
-    if !report.speedups.is_empty() {
+    for report in &report.tiers {
+        writeln!(markdown, "\n## {}", report.tier.get_title()).unwrap();
         markdown.push_str(
-            "\n## Comparisons\n\n| Benchmark | Baseline | Candidate | Relative |\n| --- | --- | --- | ---: |\n",
+        "\n### Benchmarks\n\n| Benchmark | Average | Change vs previous |\n| --- | ---: | ---: |\n",
+    );
+        for (name, average, change) in &report.measurements {
+            writeln!(markdown, "| {name} | {average} | {change} |").unwrap();
+        }
+        if !report.speedups.is_empty() {
+            markdown.push_str(
+            "\n### Comparisons\n\n| Benchmark | Baseline | Candidate | Relative |\n| --- | --- | --- | ---: |\n",
         );
-        for (name, baseline, candidate, relative) in &report.speedups {
-            writeln!(
-                markdown,
-                "| {name} | {baseline} | {candidate} | {relative} |"
-            )
-            .unwrap();
+            for (name, baseline, candidate, relative) in &report.speedups {
+                writeln!(
+                    markdown,
+                    "| {name} | {baseline} | {candidate} | {relative} |"
+                )
+                .unwrap();
+            }
         }
     }
     markdown
@@ -423,7 +471,7 @@ fn find_criterion_root() -> PathBuf {
 }
 
 fn find_baseline_path(root: &Path, benchmark: &Benchmark, value: &BenchmarkValue) -> PathBuf {
-    root.join(benchmark.name)
+    root.join(benchmark.format_name())
         .join(value.path.iter().collect::<PathBuf>())
         .join(BASELINE)
 }
@@ -435,7 +483,7 @@ fn read_estimate(
     result: &str,
 ) -> Option<f64> {
     let path = root
-        .join(benchmark.name)
+        .join(benchmark.format_name())
         .join(value.path.iter().collect::<PathBuf>())
         .join(result)
         .join("estimates.json");
@@ -446,14 +494,6 @@ fn read_estimate(
             .as_f64()
             .expect("Criterion estimate must contain a mean point estimate"),
     )
-}
-
-fn find_value<'a>(benchmark: &'a Benchmark, name: &str) -> &'a BenchmarkValue {
-    benchmark
-        .values
-        .iter()
-        .find(|value| value.name == name)
-        .expect("comparison value must be registered")
 }
 
 fn format_time(nanoseconds: f64) -> String {

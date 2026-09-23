@@ -115,6 +115,9 @@ cargo run -p pg_fake_cli
 The Criterion suite compares `pg_fake` with PostgreSQL 18. See
 [`crates/pg_fake_benchmarks/results/report.md`](crates/pg_fake_benchmarks/results/report.md)
 for current numbers.
+Run `cargo x bench tier1_` for essential operations, `tier2_` for important
+application features, or `tier3_` for rare workloads and diagnostics. See the
+[benchmark guide](crates/pg_fake_benchmarks/README.md) for filtering and recording.
 
 ## Testing
 

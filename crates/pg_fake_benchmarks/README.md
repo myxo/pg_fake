@@ -1,5 +1,36 @@
 # Benchmarks
 
+Benchmarks are prioritized by their impact on everyday application tests using
+`pg_fake` as a PostgreSQL test double. Each benchmark name starts with its tier:
+
+| Prefix | Priority | Workloads |
+| --- | --- | --- |
+| `tier1_` | Essential | Basic inserts (including defaults, identity, `RETURNING`, and foreign keys), updates, basic transactions, full and filtered selects with and without indexes, ordering/paging, and simple inner joins. |
+| `tier2_` | Important | Deletes, upserts, schema setup and migrations, snapshots, prepared reads, adapter overhead, aggregates, subqueries, non-recursive read CTEs, views, JSON/array operations, temporal values, savepoints, and row locks. |
+| `tier3_` | Rare | Recursive and data-modifying CTEs, advanced window operations, triggers, temporary-table lifecycles, catalog lookups, specialized locking/settings, JSON joins, correlated unnesting, and transaction-history/MVCC/concurrency diagnostics. |
+
+The shared catalog in [`src/lib.rs`](src/lib.rs) assigns every workload a tier.
+Console and saved reports group measurements and comparisons by tier, with
+Tier 1 first. These priorities are independent of the SQL fidelity tiers in the
+project specification.
+
+Run a tier or any literal fragment of a benchmark name:
+
+```sh
+cargo x bench tier1_
+cargo x bench tier2_
+cargo x bench tier3_
+cargo x bench select_where
+cargo x bench tier1_insert_row/pg_fake
+```
+
+The filter is a plain substring: letters, digits, underscores, and slashes are
+accepted, with no regex syntax. It matches the full Criterion name, such as
+`tier1_insert_row/pg_fake`. Filtered reports contain only selected measurements;
+comparisons appear only when both values were selected. For parameterized
+benchmarks use Criterion's unformatted number (for example `heap_scan/10000`).
+Criterion still performs fixture setup for workloads outside the filter.
+
 The Criterion suite compares `pg_fake` with PostgreSQL 18 through SQLx. It
 covers a create/drop table lifecycle, individual constrained
 explicit/defaulted inserts, updates, deletes, explicit transactions at READ
@@ -88,6 +119,10 @@ cargo x bench record
 This stores Criterion's compact raw JSON baseline, `environment.json`, and a
 readable `report.md` under `results/`. Transient comparison data remains under
 `target/criterion`; the wrapper disables HTML and plot generation.
+Recording always runs the full suite; `record` does not accept a filter, so the
+saved report and environment describe one complete baseline run.
 
 Direct `cargo bench -p pg_fake_benchmarks --bench workloads` remains an ordinary
 Criterion run and does not read or write the committed results.
+For example, `cargo bench -p pg_fake_benchmarks --bench workloads -- tier1_`
+runs only Tier 1 measurements using Criterion's built-in name filter.
