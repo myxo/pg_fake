@@ -83,7 +83,9 @@ fn finds_visible_rows_through_a_unique_index() {
         Some(row_id)
     );
     assert_eq!(
-        table.find_unique_visible_row(&[0], &[Value::Int4(1)], &snapshot, xid, &transactions,),
+        table
+            .find_unique_visible_version(&[0], &[Value::Int4(1)], &snapshot, xid, &transactions,)
+            .map(|(_, version)| &version.row),
         Some(&vec![Value::Int4(1)])
     );
 }

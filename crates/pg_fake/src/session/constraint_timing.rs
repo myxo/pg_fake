@@ -132,7 +132,9 @@ impl Session {
                 snapshot,
                 Some(self.temporary_schema_id),
             );
-            if let Err(error) = executor::validate_deferred_foreign_keys(&state, transaction.xid) {
+            if let Err(error) =
+                executor::validate_deferred_foreign_keys(&state, transaction.xid, snapshot)
+            {
                 drop(state);
                 return Some(self.abort_with_error(error));
             }

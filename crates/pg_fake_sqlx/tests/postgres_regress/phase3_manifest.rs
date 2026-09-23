@@ -1137,7 +1137,7 @@ pub const SCENARIOS: &[Scenario] = &[
         task: 38,
         feature: "serializable dependency tracking",
         name: "write_skew_dependency_graph",
-        source: "focused two-session scenario",
+        source: "crates/pg_fake/src/session/tests.rs",
         blocker: BlockerKind::Implementation,
     },
     Scenario {

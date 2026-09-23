@@ -681,24 +681,35 @@ pub(crate) fn execute_prepared_query(
     };
     match &plan.access {
         PreparedAccess::Scan => {
-            for (_, chain) in table.iterate_version_chains() {
+            state.record_read(xid, crate::serializable::Access::Relation(plan.table_id));
+            for (row_id, chain) in table.iterate_version_chains() {
                 if let Some(version) =
                     find_visible_version(chain, snapshot, xid, &state.transactions)
                 {
+                    state.record_read(xid, crate::serializable::Access::Row(plan.table_id, row_id));
                     visit(&version.row)?;
                 }
             }
         }
         PreparedAccess::Unique { column, value } => {
             let value = evaluate_prepared_expression(value, &[], parameters, deadline)?;
-            if let Some(row) = table.find_unique_visible_row(
+            if let Some(key) =
+                table.create_unique_read_key(&[*column], std::slice::from_ref(&value))
+            {
+                state.record_read(
+                    xid,
+                    crate::serializable::Access::Unique(plan.table_id, vec![*column], key),
+                );
+            }
+            if let Some((row_id, version)) = table.find_unique_visible_version(
                 &[*column],
                 &[value],
                 snapshot,
                 xid,
                 &state.transactions,
             ) {
-                visit(row)?;
+                state.record_read(xid, crate::serializable::Access::Row(plan.table_id, row_id));
+                visit(&version.row)?;
             }
         }
     }

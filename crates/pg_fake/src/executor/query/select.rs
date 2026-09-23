@@ -426,16 +426,18 @@ fn execute_correlated_exists_rows(
         Err(error) => return Some(Err(error)),
     };
     let mut matches = std::collections::HashSet::new();
-    for (_, chain) in state
+    state.record_read(xid, crate::serializable::Access::Relation(schema.id));
+    for (row_id, chain) in state
         .tables
         .get(&schema.id)
         .expect("catalog table must have storage")
         .iterate_version_chains()
     {
-        if let Some(version) = find_visible_version(chain, snapshot, xid, &state.transactions)
-            && let Some(key) = create_equality_key(&version.row[inner_slot])
-        {
-            matches.insert(key);
+        if let Some(version) = find_visible_version(chain, snapshot, xid, &state.transactions) {
+            state.record_read(xid, crate::serializable::Access::Row(schema.id, row_id));
+            if let Some(key) = create_equality_key(&version.row[inner_slot]) {
+                matches.insert(key);
+            }
         }
     }
     let mut rows = Vec::new();

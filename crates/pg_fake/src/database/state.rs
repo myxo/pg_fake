@@ -20,6 +20,7 @@ pub(crate) struct DatabaseState {
     pub(crate) catalog_history: CatalogHistory,
     pub(crate) tables: BTreeMap<TableId, Table>,
     pub(crate) transactions: TransactionRegistry,
+    pub(crate) serializable: Arc<Mutex<crate::serializable::DependencyGraph>>,
     pub(crate) row_locks: RowLockManager,
     pub(crate) advisory_locks: Arc<Mutex<crate::advisory::AdvisoryLockManager>>,
     pub(crate) relation_locks: RelationLockManager,
@@ -45,6 +46,7 @@ impl DatabaseState {
             catalog_history,
             tables: BTreeMap::new(),
             transactions,
+            serializable: Default::default(),
             row_locks: RowLockManager::create(),
             advisory_locks: Default::default(),
             relation_locks: RelationLockManager::create(),
@@ -142,6 +144,70 @@ impl DatabaseState {
         if !tables.contains(&table_id) {
             tables.push(table_id);
         }
+        if !self
+            .serializable
+            .lock()
+            .expect("dependency graph is poisoned")
+            .needs_write_tracking()
+        {
+            return;
+        }
+        let accesses = self
+            .tables
+            .get(&table_id)
+            .map_or_else(Default::default, |table| {
+                table.collect_transaction_accesses(xid)
+            });
+        self.serializable
+            .lock()
+            .expect("dependency graph is poisoned")
+            .replace_table_writes(xid, table_id, accesses);
+    }
+
+    pub(crate) fn begin_statement_tracking(
+        &mut self,
+        xid: Xid,
+        snapshot: Snapshot,
+        serializable: bool,
+    ) {
+        let first_serializable_statement = self
+            .serializable
+            .lock()
+            .expect("dependency graph is poisoned")
+            .set_snapshot(xid, snapshot.commit_seq, serializable);
+        if first_serializable_statement {
+            let touched = self
+                .touched_tables
+                .iter()
+                .flat_map(|(&writer, tables)| tables.iter().map(move |&table| (writer, table)))
+                .collect::<Vec<_>>();
+            for (writer, table_id) in touched {
+                let accesses = self
+                    .tables
+                    .get(&table_id)
+                    .map_or_else(Default::default, |table| {
+                        table.collect_transaction_accesses(writer)
+                    });
+                self.serializable
+                    .lock()
+                    .expect("dependency graph is poisoned")
+                    .replace_table_writes(writer, table_id, accesses);
+            }
+        }
+    }
+
+    pub(crate) fn record_read(&self, xid: Xid, access: crate::serializable::Access) {
+        self.serializable
+            .lock()
+            .expect("dependency graph is poisoned")
+            .read(xid, access);
+    }
+
+    pub(crate) fn uses_serializable_snapshot(&self, xid: Xid) -> bool {
+        self.serializable
+            .lock()
+            .expect("dependency graph is poisoned")
+            .is_serializable(xid)
     }
 
     #[cfg_attr(feature = "execution-log", tracing::instrument(skip_all))]
@@ -234,6 +300,10 @@ impl DatabaseState {
 impl DatabaseState {
     #[cfg_attr(feature = "execution-log", tracing::instrument(skip_all))]
     pub(crate) fn abort_transaction(&mut self, xid: Xid) {
+        self.serializable
+            .lock()
+            .expect("dependency graph is poisoned")
+            .abort(xid);
         self.abort_sequence_resets(xid);
         let reclaimed = self.catalog_history.discard_transaction(xid);
         for table_id in reclaimed.tables {

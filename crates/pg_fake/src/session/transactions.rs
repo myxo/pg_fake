@@ -14,6 +14,7 @@ use super::{PreparedStatement, QueryResult, Session, StatementResult};
 pub enum IsolationLevel {
     ReadCommitted,
     RepeatableRead,
+    Serializable,
 }
 
 #[derive(Clone, Copy)]
@@ -197,6 +198,11 @@ impl Session {
         let mut state = self.db.state.lock().expect("database mutex is poisoned");
         let xid = state.transactions.begin();
         state
+            .serializable
+            .lock()
+            .expect("dependency graph is poisoned")
+            .begin(xid);
+        state
             .advisory_locks
             .lock()
             .expect("advisory lock mutex is poisoned")
@@ -263,6 +269,12 @@ impl Session {
         if transaction.read_only {
             assert!(!self.deferred_foreign_keys_dirty);
             assert!(!state.has_touched_tables(transaction.xid));
+            let end = Snapshot::create(&state.transactions).commit_seq;
+            state
+                .serializable
+                .lock()
+                .expect("dependency graph is poisoned")
+                .commit(transaction.xid, end);
             state.transactions.finish_read_only(transaction.xid);
             state.row_locks.release_transaction_locks(transaction.xid);
             state
@@ -287,7 +299,8 @@ impl Session {
             return Ok(());
         }
         if self.deferred_foreign_keys_dirty
-            && let Err(error) = executor::validate_deferred_foreign_keys(&state, transaction.xid)
+            && let Err(error) =
+                executor::validate_deferred_foreign_keys(&state, transaction.xid, snapshot)
         {
             let settings = self
                 .settings_undo
@@ -307,6 +320,11 @@ impl Session {
             snapshot,
             Some(self.temporary_schema_id),
         );
+        state
+            .serializable
+            .lock()
+            .expect("dependency graph is poisoned")
+            .commit(transaction.xid, commit_seq);
         state.commit_sequence_resets(transaction.xid);
         for table_id in state.take_touched_tables(transaction.xid) {
             let has_reclamation = state
@@ -527,7 +545,7 @@ fn parse_isolation_level(modes: &[ast::TransactionMode]) -> Result<Option<Isolat
                 ast::TransactionIsolationLevel::RepeatableRead,
             ) => IsolationLevel::RepeatableRead,
             ast::TransactionMode::IsolationLevel(ast::TransactionIsolationLevel::Serializable) => {
-                return reject_unsupported("SERIALIZABLE isolation is not implemented");
+                IsolationLevel::Serializable
             }
             ast::TransactionMode::IsolationLevel(ast::TransactionIsolationLevel::Snapshot) => {
                 return reject_unsupported("SNAPSHOT isolation is not implemented");

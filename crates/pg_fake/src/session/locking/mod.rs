@@ -350,7 +350,7 @@ pub(super) fn acquire_row_locks<'a>(
                 },
             );
         }
-        if isolation == IsolationLevel::RepeatableRead
+        if isolation != IsolationLevel::ReadCommitted
             && state.tables.get(&key.table_id).is_some_and(|table| {
                 table.iterate_version_chains().find(|(row_id, _)| *row_id == key.row_id)
                     .and_then(|(_, chain)| crate::txn::find_visible_version(chain, &snapshot, xid, &state.transactions))

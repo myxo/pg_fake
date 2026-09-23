@@ -109,7 +109,7 @@ enum NormalizedIndexValue {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
-struct UniqueIndexKey(Vec<NormalizedIndexValue>);
+pub(crate) struct UniqueIndexKey(Vec<NormalizedIndexValue>);
 
 #[derive(Debug, Clone, PartialEq)]
 struct UniqueIndex {
@@ -235,6 +235,54 @@ impl Table {
                     .map(|version| (*row_id, version))
             })
             .collect()
+    }
+
+    pub(crate) fn create_unique_read_key(
+        &self,
+        columns: &[usize],
+        values: &[Value],
+    ) -> Option<UniqueIndexKey> {
+        self.has_unique_index(columns)
+            .then(|| build_index_key(&self.schema, columns, values))
+            .flatten()
+    }
+
+    pub(crate) fn collect_transaction_accesses(
+        &self,
+        xid: Xid,
+    ) -> BTreeSet<(CommandId, crate::serializable::Access)> {
+        use crate::serializable::Access;
+
+        let mut accesses = BTreeSet::new();
+        for (row_id, chain) in &self.version_chains.chains {
+            for version in &chain.versions {
+                let command = if version.xmin == xid {
+                    Some(version.xmin_command_id)
+                } else if version.xmax == Some(xid) {
+                    version.xmax_command_id
+                } else {
+                    None
+                };
+                let Some(command) = command else { continue };
+                accesses.insert((command, Access::Row(self.schema.id, *row_id)));
+                for index in &self.indexes {
+                    if let Some(key) = build_row_index_key(&self.schema, index, &version.row) {
+                        accesses.insert((
+                            command,
+                            Access::Unique(self.schema.id, index.columns.clone(), key),
+                        ));
+                    }
+                }
+            }
+        }
+        for (transaction, truncated) in &self.truncated {
+            if *transaction == xid {
+                for storage in truncated {
+                    accesses.insert((storage.command_id, Access::Relation(self.schema.id)));
+                }
+            }
+        }
+        accesses
     }
 
     pub(crate) fn truncate_all(&mut self, xid: Xid, command_id: CommandId) {
@@ -727,19 +775,6 @@ impl Table {
         self.indexes
             .iter()
             .any(|index| index.columns == columns && index.predicate.is_none())
-    }
-
-    #[cfg_attr(feature = "execution-log", tracing::instrument(skip_all))]
-    pub(crate) fn find_unique_visible_row(
-        &self,
-        columns: &[usize],
-        values: &[Value],
-        snapshot: &Snapshot,
-        current_xid: Xid,
-        transactions: &TransactionRegistry,
-    ) -> Option<&Row> {
-        self.find_unique_visible_version(columns, values, snapshot, current_xid, transactions)
-            .map(|(_, version)| &version.row)
     }
 
     #[cfg_attr(feature = "execution-log", tracing::instrument(skip_all))]

@@ -10004,3 +10004,303 @@ fn restores_timeout_settings_and_prepared_recovery_at_savepoints() {
     session.execute("COMMIT").unwrap();
     assert_eq!(session.settings.lock_timeout, Duration::from_secs(1));
 }
+
+#[test]
+fn tracks_serializable_unique_key_gaps_and_snapshot_visibility() {
+    let db = Db::create();
+    let mut reader = db.create_session();
+    let mut writer = db.create_session();
+    writer
+        .execute("CREATE TABLE serializable_keys (id INT PRIMARY KEY)")
+        .unwrap();
+    reader
+        .execute("BEGIN ISOLATION LEVEL SERIALIZABLE")
+        .unwrap();
+    writer.execute("BEGIN").unwrap();
+    let Some(SessionTransactionState::Active(reader_transaction)) = reader.transaction else {
+        panic!("reader transaction is active")
+    };
+    let Some(SessionTransactionState::Active(writer_transaction)) = writer.transaction else {
+        panic!("writer transaction is active")
+    };
+    assert!(
+        reader
+            .query("SELECT id FROM serializable_keys WHERE id = 5", &[])
+            .unwrap()
+            .rows
+            .is_empty()
+    );
+    writer
+        .execute("INSERT INTO serializable_keys VALUES (6)")
+        .unwrap();
+    assert!(
+        !db.state
+            .lock()
+            .unwrap()
+            .serializable
+            .lock()
+            .unwrap()
+            .has_edge(reader_transaction.xid, writer_transaction.xid)
+    );
+    writer
+        .execute("INSERT INTO serializable_keys VALUES (5)")
+        .unwrap();
+    assert!(
+        db.state
+            .lock()
+            .unwrap()
+            .serializable
+            .lock()
+            .unwrap()
+            .has_edge(reader_transaction.xid, writer_transaction.xid)
+    );
+    writer.execute("COMMIT").unwrap();
+    assert!(
+        reader
+            .query("SELECT id FROM serializable_keys WHERE id = 5", &[])
+            .unwrap()
+            .rows
+            .is_empty()
+    );
+    reader.execute("COMMIT").unwrap();
+    assert!(
+        !db.state
+            .lock()
+            .unwrap()
+            .serializable
+            .lock()
+            .unwrap()
+            .has_edge(reader_transaction.xid, writer_transaction.xid)
+    );
+}
+
+#[test]
+fn removes_rolled_back_serializable_writes_but_keeps_reads() {
+    let db = Db::create();
+    let mut reader = db.create_session();
+    let mut writer = db.create_session();
+    writer
+        .execute("CREATE TABLE serializable_savepoints (id INT PRIMARY KEY)")
+        .unwrap();
+    reader
+        .execute("BEGIN ISOLATION LEVEL SERIALIZABLE")
+        .unwrap();
+    writer.execute("BEGIN; SAVEPOINT before_insert").unwrap();
+    let Some(SessionTransactionState::Active(reader_transaction)) = reader.transaction else {
+        panic!("reader transaction is active")
+    };
+    let Some(SessionTransactionState::Active(writer_transaction)) = writer.transaction else {
+        panic!("writer transaction is active")
+    };
+    reader
+        .query("SELECT id FROM serializable_savepoints WHERE id = 7", &[])
+        .unwrap();
+    writer
+        .execute("INSERT INTO serializable_savepoints VALUES (7)")
+        .unwrap();
+    assert!(
+        db.state
+            .lock()
+            .unwrap()
+            .serializable
+            .lock()
+            .unwrap()
+            .has_edge(reader_transaction.xid, writer_transaction.xid)
+    );
+    writer.execute("ROLLBACK TO before_insert").unwrap();
+    assert!(
+        !db.state
+            .lock()
+            .unwrap()
+            .serializable
+            .lock()
+            .unwrap()
+            .has_edge(reader_transaction.xid, writer_transaction.xid)
+    );
+    writer
+        .execute("INSERT INTO serializable_savepoints VALUES (7)")
+        .unwrap();
+    assert!(
+        db.state
+            .lock()
+            .unwrap()
+            .serializable
+            .lock()
+            .unwrap()
+            .has_edge(reader_transaction.xid, writer_transaction.xid)
+    );
+    writer.execute("ROLLBACK").unwrap();
+    reader.execute("COMMIT").unwrap();
+}
+
+#[test]
+fn keeps_serializable_read_write_transactions_on_their_first_snapshot() {
+    let db = Db::create();
+    let mut first = db.create_session();
+    let mut second = db.create_session();
+    first
+        .execute("CREATE TABLE serializable_snapshot (id INT PRIMARY KEY, value INT); INSERT INTO serializable_snapshot VALUES (1, 10)")
+        .unwrap();
+    first.execute("BEGIN ISOLATION LEVEL SERIALIZABLE").unwrap();
+    assert_eq!(
+        first
+            .query("SELECT value FROM serializable_snapshot WHERE id = 1", &[])
+            .unwrap()
+            .rows,
+        vec![vec![Value::Int4(10)]]
+    );
+    second
+        .execute("INSERT INTO serializable_snapshot VALUES (2, 20)")
+        .unwrap();
+    first
+        .execute("UPDATE serializable_snapshot SET value = 11 WHERE id = 1")
+        .unwrap();
+    assert!(
+        first
+            .query("SELECT id FROM serializable_snapshot WHERE id = 2", &[])
+            .unwrap()
+            .rows
+            .is_empty()
+    );
+    first.execute("COMMIT").unwrap();
+}
+
+#[test]
+fn discovers_writes_started_before_a_serializable_snapshot() {
+    let db = Db::create();
+    let mut writer = db.create_session();
+    let mut reader = db.create_session();
+    writer
+        .execute("CREATE TABLE serializable_prior_write (id INT PRIMARY KEY)")
+        .unwrap();
+    writer
+        .execute("BEGIN; INSERT INTO serializable_prior_write VALUES (5)")
+        .unwrap();
+    reader
+        .execute("BEGIN ISOLATION LEVEL SERIALIZABLE")
+        .unwrap();
+    let Some(SessionTransactionState::Active(reader_transaction)) = reader.transaction else {
+        panic!("reader transaction is active")
+    };
+    let Some(SessionTransactionState::Active(writer_transaction)) = writer.transaction else {
+        panic!("writer transaction is active")
+    };
+    assert!(
+        reader
+            .query("SELECT id FROM serializable_prior_write WHERE id = 5", &[])
+            .unwrap()
+            .rows
+            .is_empty()
+    );
+    assert!(
+        db.state
+            .lock()
+            .unwrap()
+            .serializable
+            .lock()
+            .unwrap()
+            .has_edge(reader_transaction.xid, writer_transaction.xid)
+    );
+    writer.execute("COMMIT").unwrap();
+    assert!(
+        reader
+            .query("SELECT id FROM serializable_prior_write WHERE id = 5", &[])
+            .unwrap()
+            .rows
+            .is_empty()
+    );
+    reader.execute("COMMIT").unwrap();
+}
+
+#[test]
+fn records_both_edges_of_a_write_skew_schedule() {
+    let db = Db::create();
+    let mut first = db.create_session();
+    let mut second = db.create_session();
+    first.execute("CREATE TABLE serializable_skew (id INT PRIMARY KEY, value INT); INSERT INTO serializable_skew VALUES (1, 0), (2, 0)").unwrap();
+    first.execute("BEGIN ISOLATION LEVEL SERIALIZABLE").unwrap();
+    second
+        .execute("BEGIN ISOLATION LEVEL SERIALIZABLE")
+        .unwrap();
+    let Some(SessionTransactionState::Active(first_transaction)) = first.transaction else {
+        panic!("first transaction is active")
+    };
+    let Some(SessionTransactionState::Active(second_transaction)) = second.transaction else {
+        panic!("second transaction is active")
+    };
+    first
+        .query("SELECT value FROM serializable_skew WHERE id = 2", &[])
+        .unwrap();
+    second
+        .query("SELECT value FROM serializable_skew WHERE id = 1", &[])
+        .unwrap();
+    first
+        .execute("UPDATE serializable_skew SET value = 1 WHERE id = 1")
+        .unwrap();
+    second
+        .execute("UPDATE serializable_skew SET value = 1 WHERE id = 2")
+        .unwrap();
+    let state = db.state.lock().unwrap();
+    let graph = state.serializable.lock().unwrap();
+    assert!(graph.has_edge(first_transaction.xid, second_transaction.xid));
+    assert!(graph.has_edge(second_transaction.xid, first_transaction.xid));
+    drop(graph);
+    drop(state);
+    first.execute("ROLLBACK").unwrap();
+    second.execute("ROLLBACK").unwrap();
+}
+
+#[test]
+fn checks_deferred_foreign_keys_against_the_serializable_snapshot() {
+    let db = Db::create();
+    let mut first = db.create_session();
+    let mut second = db.create_session();
+    first.execute("CREATE TABLE serializable_parent (id INT PRIMARY KEY); CREATE TABLE serializable_child (id INT PRIMARY KEY, parent_id INT REFERENCES serializable_parent DEFERRABLE INITIALLY DEFERRED)").unwrap();
+    first.execute("BEGIN ISOLATION LEVEL SERIALIZABLE").unwrap();
+    first
+        .query("SELECT id FROM serializable_parent", &[])
+        .unwrap();
+    first
+        .execute("INSERT INTO serializable_child VALUES (1, 7)")
+        .unwrap();
+    second
+        .execute("INSERT INTO serializable_parent VALUES (7)")
+        .unwrap();
+    assert_eq!(
+        first.execute("COMMIT").unwrap_err().sqlstate,
+        SqlState::ForeignKeyViolation
+    );
+}
+
+#[test]
+fn tracks_on_conflict_do_nothing_as_a_unique_key_read() {
+    let db = Db::create();
+    let mut first = db.create_session();
+    let mut second = db.create_session();
+    first.execute("CREATE TABLE serializable_conflict (id INT PRIMARY KEY, value INT); INSERT INTO serializable_conflict VALUES (1, 0)").unwrap();
+    first.execute("BEGIN ISOLATION LEVEL SERIALIZABLE").unwrap();
+    second.execute("BEGIN").unwrap();
+    let Some(SessionTransactionState::Active(first_transaction)) = first.transaction else {
+        panic!("first transaction is active")
+    };
+    let Some(SessionTransactionState::Active(second_transaction)) = second.transaction else {
+        panic!("second transaction is active")
+    };
+    first
+        .execute("INSERT INTO serializable_conflict VALUES (1, 9) ON CONFLICT (id) DO NOTHING")
+        .unwrap();
+    first.execute("COMMIT").unwrap();
+    second
+        .execute("UPDATE serializable_conflict SET value = 2 WHERE id = 1")
+        .unwrap();
+    assert!(
+        db.state
+            .lock()
+            .unwrap()
+            .serializable
+            .lock()
+            .unwrap()
+            .has_edge(first_transaction.xid, second_transaction.xid)
+    );
+    second.execute("ROLLBACK").unwrap();
+}

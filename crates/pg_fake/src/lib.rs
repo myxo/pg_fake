@@ -9,6 +9,7 @@ mod executor;
 pub mod jsonb;
 pub mod parser;
 mod results;
+mod serializable;
 mod session;
 mod storage;
 mod text_array;

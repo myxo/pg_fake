@@ -223,7 +223,7 @@ pub(in crate::executor) fn evaluate_json_function(
             ));
         }
         let mut entries = Vec::new();
-        for pair in values.chunks_exact(2) {
+        for pair in values.as_chunks::<2>().0 {
             if pair[0].is_null() {
                 return Err(PgError::create(
                     if base == BaseType::Json {

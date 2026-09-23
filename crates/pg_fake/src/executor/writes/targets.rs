@@ -135,6 +135,12 @@ pub(super) fn collect_mutation_targets(
             context,
         )?
     {
+        if let Some(key) = table.create_unique_read_key(&[column], std::slice::from_ref(&value)) {
+            state.record_read(
+                xid,
+                crate::serializable::Access::Unique(schema.id, vec![column], key),
+            );
+        }
         let Some((row_id, version)) = table.find_unique_visible_version(
             &[column],
             &[value],
@@ -144,6 +150,7 @@ pub(super) fn collect_mutation_targets(
         ) else {
             return Ok(Vec::new());
         };
+        state.record_read(xid, crate::serializable::Access::Row(schema.id, row_id));
         if version.xmax == Some(xid) && version.xmax_command_id == Some(context.command_id) {
             return Ok(Vec::new());
         }
@@ -159,6 +166,7 @@ pub(super) fn collect_mutation_targets(
         }
         return Ok(Vec::new());
     }
+    state.record_read(xid, crate::serializable::Access::Relation(schema.id));
     table
         .iterate_version_chains()
         .try_fold(Vec::new(), |mut targets, (row_id, chain)| {
@@ -166,6 +174,7 @@ pub(super) fn collect_mutation_targets(
             else {
                 return Ok(targets);
             };
+            state.record_read(xid, crate::serializable::Access::Row(schema.id, row_id));
             if version.xmax == Some(xid) && version.xmax_command_id == Some(context.command_id) {
                 return Ok(targets);
             }

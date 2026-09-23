@@ -136,6 +136,7 @@ impl SessionSettings {
                 return match self.default_isolation {
                     IsolationLevel::ReadCommitted => "read committed",
                     IsolationLevel::RepeatableRead => "repeatable read",
+                    IsolationLevel::Serializable => "serializable",
                 }
                 .into();
             }
@@ -675,10 +676,8 @@ fn parse_setting_value(spec: &SettingSpec, text: &str) -> Result<SettingValue> {
         SettingType::Isolation => match text.to_ascii_lowercase().as_str() {
             "read committed" => Ok(SettingValue::Isolation(IsolationLevel::ReadCommitted)),
             "repeatable read" => Ok(SettingValue::Isolation(IsolationLevel::RepeatableRead)),
-            "read uncommitted" | "serializable" => Err(PgError::create(
-                SqlState::FeatureNotSupported,
-                "isolation level is not implemented",
-            )),
+            "serializable" => Ok(SettingValue::Isolation(IsolationLevel::Serializable)),
+            "read uncommitted" => Ok(SettingValue::Isolation(IsolationLevel::ReadCommitted)),
             _ => Err(invalid()),
         },
         SettingType::Encoding => {
@@ -887,6 +886,7 @@ fn format_isolation(isolation: IsolationLevel) -> String {
     match isolation {
         IsolationLevel::ReadCommitted => "read committed",
         IsolationLevel::RepeatableRead => "repeatable read",
+        IsolationLevel::Serializable => "serializable",
     }
     .into()
 }

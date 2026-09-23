@@ -245,12 +245,23 @@ pub(super) fn validate_row_foreign_keys(
             .tables
             .get(&foreign_schema.id)
             .expect("catalog table must have storage");
+        if let Some(index_key) = table.create_unique_read_key(&referred_indexes, &key) {
+            state.record_read(
+                xid,
+                crate::serializable::Access::Unique(
+                    foreign_schema.id,
+                    referred_indexes.clone(),
+                    index_key,
+                ),
+            );
+        }
         let found = table
             .find_unique_row(&referred_indexes, &key, &snapshot, xid, &state.transactions)
             .is_some()
-            || table
-                .find_unique_candidate_row(&referred_indexes, &key, xid, &state.transactions)
-                .is_some()
+            || !state.uses_serializable_snapshot(xid)
+                && table
+                    .find_unique_candidate_row(&referred_indexes, &key, xid, &state.transactions)
+                    .is_some()
             || foreign_schema.id == schema.id
                 && pending_rows.iter().any(|pending| {
                     referred_indexes
@@ -272,9 +283,19 @@ pub(super) fn validate_row_foreign_keys(
 }
 
 #[cfg_attr(feature = "execution-log", tracing::instrument(skip_all))]
-pub(crate) fn validate_deferred_foreign_keys(state: &DatabaseState, xid: Xid) -> Result<()> {
-    let snapshot = Snapshot::create(&state.transactions);
+pub(crate) fn validate_deferred_foreign_keys(
+    state: &DatabaseState,
+    xid: Xid,
+    snapshot: Snapshot,
+) -> Result<()> {
     for schema in state.catalog.iterate_tables() {
+        if !schema
+            .constraints
+            .iter()
+            .any(|constraint| matches!(constraint, crate::catalog::Constraint::ForeignKey(_)))
+        {
+            continue;
+        }
         let mut schema = schema.clone();
         for constraint in &mut schema.constraints {
             if let crate::catalog::Constraint::ForeignKey(foreign_key) = constraint {
@@ -285,9 +306,11 @@ pub(crate) fn validate_deferred_foreign_keys(state: &DatabaseState, xid: Xid) ->
             .tables
             .get(&schema.id)
             .expect("catalog table must have storage");
-        for (_, chain) in table.iterate_version_chains() {
+        state.record_read(xid, crate::serializable::Access::Relation(schema.id));
+        for (row_id, chain) in table.iterate_version_chains() {
             if let Some(version) = find_visible_version(chain, &snapshot, xid, &state.transactions)
             {
+                state.record_read(xid, crate::serializable::Access::Row(schema.id, row_id));
                 validate_row_foreign_keys(
                     state,
                     &schema,
@@ -353,6 +376,7 @@ pub(super) fn apply_referencing_foreign_key_actions(
         }
         let child_indexes =
             resolve_foreign_key_column_indexes(&child_schema, &foreign_key.columns)?;
+        state.record_read(xid, crate::serializable::Access::Relation(child_schema.id));
         let children = state
             .tables
             .get(&child_schema.id)
@@ -364,6 +388,10 @@ pub(super) fn apply_referencing_foreign_key_actions(
                 else {
                     return Ok(children);
                 };
+                state.record_read(
+                    xid,
+                    crate::serializable::Access::Row(child_schema.id, row_id),
+                );
                 if version.xmax == Some(xid) && version.xmax_command_id == Some(context.command_id)
                 {
                     return Ok(children);

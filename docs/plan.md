@@ -50,7 +50,7 @@ and scope boundaries. The completed Phase 2 plan is archived in
   `spec.md` §10. Optimization-only clauses may be tolerated only when ignoring
   them cannot change Tier-A behavior, and strict mode must still reject them.
 - Tasks 8 through 30 are the priority track and must finish before Tasks 31
-  onward. Task 33 is the first unfinished task. Task 24 retains its
+  onward. Task 39 is the first unfinished task. Task 24 retains its
   completed status from an earlier approved exception. Tasks 25, 26, 27, and
   29 have no dependency on later milestones and are placed immediately after
   it for expedited delivery; Task 28 depends on Task 27, and Task 30 gates the
@@ -2022,7 +2022,7 @@ none of its remaining forms is required by the expedited application workload.
 
 ## Milestone K — SERIALIZABLE isolation
 
-### Task 38 — SERIALIZABLE dependency tracking
+### Task 38 — SERIALIZABLE dependency tracking [COMPLETE]
 
 **Goal:** Track the read/write dependencies needed to detect SSI dangerous
 structures without changing READ COMMITTED or REPEATABLE READ behavior.
@@ -2043,6 +2043,33 @@ structures without changing READ COMMITTED or REPEATABLE READ behavior.
 - Internal unit/property tests cover dependency graph construction, aborted
   transactions, overlapping snapshots, savepoint rollback, cleanup horizons,
   and unique-key gaps.
+
+**Progress:**
+
+- [x] Accept SERIALIZABLE through SQL, native transactions, and session settings;
+  retain its first-statement snapshot and apply repeatable-read write-conflict
+  behavior.
+- [x] Track relation scans, row reads, unique-key gaps, conflict probes,
+  foreign-key checks, and row/key/relation writes by transaction identity.
+- [x] Preserve reads and edges across statements and savepoints, remove rolled
+  back writes, retain committed dependencies while overlapping transactions
+  remain active, and detach graph state on database snapshots.
+- [x] Add native dependency-graph, controlled multi-session, snapshot,
+  savepoint, unique-gap, write-skew, and deferred-foreign-key tests.
+- [x] Pass core unit tests, settings tests, strict workspace Clippy, and repeated
+  independent review with no remaining findings.
+- [x] Pass the required 10,000-iteration `_long` property gate.
+- [x] Obtain user approval before marking Task 38 complete.
+
+**Validation:** All 261 core unit tests, all six SQLx settings tests, formatting,
+and strict all-target/all-feature workspace Clippy pass. The exact
+`CHAOS_THEORY_CHECK_ITERS=10000 CHAOS_THEORY_CHECK_TIME=600s cargo test
+-p pg_fake_sqlx --features time --test property_tests _long` gate passes all
+11 suites in 645.69 seconds. The broader workspace regression command reached
+an existing PostgreSQL text-collation mismatch in `e2e_unit_tests`
+(`min`/`max` over `MiXeD` and `a`) because the configured database does not use
+`C` collation; later tests in that binary then failed on its poisoned test
+mutex. Task 39 owns SSI validation and its uncontended/contended benchmarks.
 
 ### Task 39 — SSI validation and predicate conflicts
 

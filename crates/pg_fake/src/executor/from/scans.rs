@@ -8,6 +8,7 @@ use crate::{
         normalize_relation_name,
         scope::{BoundScope, RowScope},
     },
+    serializable::Access,
     storage::Table,
     txn::{Snapshot, Xid, find_visible_version},
     value::Value,
@@ -100,11 +101,20 @@ pub(super) fn visit_table_factor_rows(
             &row,
             context,
         )?;
-        let Some(indexed_row) =
-            table.find_unique_visible_row(&[column], &[value], snapshot, xid, &state.transactions)
-        else {
+        if let Some(key) = table.create_unique_read_key(&[column], std::slice::from_ref(&value)) {
+            state.record_read(xid, Access::Unique(schema.id, vec![column], key));
+        }
+        let Some((row_id, indexed_version)) = table.find_unique_visible_version(
+            &[column],
+            &[value],
+            snapshot,
+            xid,
+            &state.transactions,
+        ) else {
             return Ok(());
         };
+        state.record_read(xid, Access::Row(schema.id, row_id));
+        let indexed_row = &indexed_version.row;
         row[start..start + indexed_row.len()].clone_from_slice(indexed_row);
         let passes = filters.iter().try_fold(true, |passes, filter| {
             if !passes {
@@ -120,10 +130,12 @@ pub(super) fn visit_table_factor_rows(
         }
         return Ok(());
     }
-    for (_, chain) in table.iterate_version_chains() {
+    state.record_read(xid, Access::Relation(schema.id));
+    for (row_id, chain) in table.iterate_version_chains() {
         let Some(version) = find_visible_version(chain, snapshot, xid, &state.transactions) else {
             continue;
         };
+        state.record_read(xid, Access::Row(schema.id, row_id));
         row[start..start + version.row.len()].clone_from_slice(&version.row);
         let passes = filters.iter().try_fold(true, |passes, filter| {
             if !passes {

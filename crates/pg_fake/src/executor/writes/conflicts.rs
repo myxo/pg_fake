@@ -60,6 +60,30 @@ impl ConflictArbiter {
     }
 }
 
+fn record_conflict_read(
+    state: &DatabaseState,
+    schema: &TableSchema,
+    table: &Table,
+    row: &[Value],
+    arbiter: &ConflictArbiter,
+    xid: Xid,
+) {
+    if let Some(columns) = arbiter.get_columns() {
+        let values = columns
+            .iter()
+            .map(|column| row[*column].clone())
+            .collect::<Vec<_>>();
+        if let Some(key) = table.create_unique_read_key(columns, &values) {
+            state.record_read(
+                xid,
+                crate::serializable::Access::Unique(schema.id, columns.to_vec(), key),
+            );
+            return;
+        }
+    }
+    state.record_read(xid, crate::serializable::Access::Relation(schema.id));
+}
+
 #[cfg_attr(feature = "execution-log", tracing::instrument(skip_all))]
 pub(in crate::executor) fn resolve_conflict_arbiter(
     schema: &TableSchema,
@@ -277,6 +301,7 @@ pub(super) fn prepare_conflict_update(
     let columns = arbiter
         .get_columns()
         .expect("DO UPDATE requires a unique arbiter");
+    record_conflict_read(state, schema, table, row, arbiter, xid);
     let Some((row_id, version)) = table.find_visible_unique_conflict(
         row,
         snapshot,
@@ -288,6 +313,7 @@ pub(super) fn prepare_conflict_update(
     ) else {
         return Ok(None);
     };
+    state.record_read(xid, crate::serializable::Access::Row(schema.id, row_id));
     if affected_rows.is_some_and(|affected| affected.contains(&row_id)) {
         return Err(PgError::create(
             SqlState::CardinalityViolation,
@@ -386,6 +412,7 @@ pub(super) fn execute_insert_conflict(
         .tables
         .get(&schema.id)
         .expect("catalog table must have storage");
+    record_conflict_read(state, schema, table, row, arbiter, xid);
     let Some(update) = update else {
         return Ok(
             if table.has_visible_unique_conflict(

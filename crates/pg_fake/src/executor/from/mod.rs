@@ -487,14 +487,20 @@ fn materialize_table_factor_rows(
     } else {
         snapshot
     };
+    source_state.record_read(xid, crate::serializable::Access::Relation(schema.id));
     source_state
         .tables
         .get(&schema.id)
         .expect("catalog table must have storage")
         .iterate_version_chains()
         .filter_map(|(row_id, chain)| {
-            find_visible_version(chain, source_snapshot, xid, &source_state.transactions)
-                .map(|version| (row_id, version))
+            find_visible_version(chain, source_snapshot, xid, &source_state.transactions).map(
+                |version| {
+                    source_state
+                        .record_read(xid, crate::serializable::Access::Row(schema.id, row_id));
+                    (row_id, version)
+                },
+            )
         })
         .map(|(row_id, version)| {
             let mut row = vec![Value::Null; scope.columns.len()];

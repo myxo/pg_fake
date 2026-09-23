@@ -54,6 +54,13 @@ impl Db {
     pub fn snapshot(&self) -> Self {
         let source = self.state.lock().expect("database mutex is poisoned");
         let mut state = source.clone();
+        state.serializable = Arc::new(Mutex::new(
+            source
+                .serializable
+                .lock()
+                .expect("dependency graph is poisoned")
+                .clone(),
+        ));
         state.sequence_values = Arc::new(Mutex::new(
             source
                 .sequence_values

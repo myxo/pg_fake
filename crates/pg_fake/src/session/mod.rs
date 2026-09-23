@@ -188,16 +188,21 @@ impl Session {
         transaction.next_command_id += 1;
         let mut snapshot = match transaction.isolation {
             IsolationLevel::ReadCommitted => Snapshot::create(&state.transactions),
-            IsolationLevel::RepeatableRead => *transaction
+            IsolationLevel::RepeatableRead | IsolationLevel::Serializable => *transaction
                 .snapshot
                 .get_or_insert_with(|| Snapshot::create(&state.transactions)),
         }
         .use_command(command_id);
-        if transaction.isolation == IsolationLevel::RepeatableRead {
+        if transaction.isolation != IsolationLevel::ReadCommitted {
             state
                 .transactions
                 .retain_snapshot(transaction.xid, snapshot);
         }
+        state.begin_statement_tracking(
+            transaction.xid,
+            snapshot,
+            transaction.isolation == IsolationLevel::Serializable,
+        );
         state.load_catalog(
             Some(transaction.xid),
             snapshot,

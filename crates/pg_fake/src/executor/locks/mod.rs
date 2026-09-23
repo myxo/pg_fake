@@ -211,6 +211,12 @@ pub(crate) fn collect_required_row_locks(
     } else if let Some((column, value)) =
         resolve_unique_point_lookup(table, schema, selection, RowScope::Table(schema), context)?
     {
+        if let Some(key) = table.create_unique_read_key(&[column], std::slice::from_ref(&value)) {
+            state.record_read(
+                xid,
+                crate::serializable::Access::Unique(schema.id, vec![column], key),
+            );
+        }
         match table.find_unique_visible_version(
             &[column],
             &[value],
@@ -219,6 +225,7 @@ pub(crate) fn collect_required_row_locks(
             &state.transactions,
         ) {
             Some((row_id, version)) => {
+                state.record_read(xid, crate::serializable::Access::Row(schema.id, row_id));
                 check_concurrent_update(state, version, xid, snapshot)?;
                 vec![RequiredRowLock {
                     key: RowLockKey {
@@ -235,6 +242,7 @@ pub(crate) fn collect_required_row_locks(
             None => Vec::new(),
         }
     } else {
+        state.record_read(xid, crate::serializable::Access::Relation(schema.id));
         let bound_scope = bind_target_scope(schema, alias);
         let prepared_selection = match selection {
             Some(selection) => prepared::bind_prepared_expression(selection, &bound_scope, &[])?
@@ -248,6 +256,7 @@ pub(crate) fn collect_required_row_locks(
                 else {
                     return Ok(locks);
                 };
+                state.record_read(xid, crate::serializable::Access::Row(schema.id, row_id));
                 if let Some(selection) = selection {
                     let value = if let Some(prepared_selection) = &prepared_selection {
                         prepared::evaluate_prepared_expression(

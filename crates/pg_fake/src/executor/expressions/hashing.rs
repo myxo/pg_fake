@@ -17,14 +17,13 @@ fn calculate_hash_state(bytes: &[u8], seed: Option<u64>) -> (u32, u32) {
         mix_state(&mut a, &mut b, &mut c);
     }
 
-    let mut chunks = bytes.chunks_exact(12);
-    for chunk in &mut chunks {
+    let (chunks, remainder) = bytes.as_chunks::<12>();
+    for chunk in chunks {
         a = a.wrapping_add(u32::from_le_bytes(chunk[0..4].try_into().unwrap()));
         b = b.wrapping_add(u32::from_le_bytes(chunk[4..8].try_into().unwrap()));
         c = c.wrapping_add(u32::from_le_bytes(chunk[8..12].try_into().unwrap()));
         mix_state(&mut a, &mut b, &mut c);
     }
-    let remainder = chunks.remainder();
     for (index, byte) in remainder.iter().copied().enumerate() {
         match index {
             0..=3 => a = a.wrapping_add(u32::from(byte) << (index * 8)),

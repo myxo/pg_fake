@@ -586,12 +586,15 @@ fn preserve_session_isolation_snapshot_defaults_and_strict_policy() {
             .sqlstate,
         SqlState::FeatureNotSupported
     );
+    strict
+        .execute("SET default_transaction_isolation = 'serializable'")
+        .unwrap();
     assert_eq!(
         strict
-            .execute("SET default_transaction_isolation = 'serializable'")
-            .unwrap_err()
-            .sqlstate,
-        SqlState::FeatureNotSupported
+            .query("SHOW default_transaction_isolation", &[])
+            .unwrap()
+            .rows,
+        vec![vec![Value::Text("serializable".into())]]
     );
 }
 
