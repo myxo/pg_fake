@@ -85,12 +85,14 @@ in [`src/lib.rs`](src/lib.rs); update this assessment when adding or moving one.
 | `tier2_union_all_100_rows` | Combines two result sets while retaining duplicates. |
 | `tier2_union_100_rows` | Combines two result sets while removing duplicates. |
 
-## Tier 3: rare operations and diagnostics (22 groups)
+## Tier 3: rare operations and diagnostics (24 groups)
 
 | Benchmark | Reason |
 | --- | --- |
 | `tier3_transaction_local_guc_roundtrip` | Exercises transaction-local configuration through set_config/current_setting and rollback. |
 | `tier3_skip_locked_queue_100_rows` | Combines priority ordering, a limit, and FOR UPDATE SKIP LOCKED for a database-backed work queue. |
+| `tier3_serializable_uncontended_read` | Measures an uncontended read transaction at SERIALIZABLE isolation, a diagnostic for SSI tracking overhead. |
+| `tier3_serializable_write_skew` | Runs two overlapping SERIALIZABLE transactions whose disjoint writes produce a serialization failure. |
 | `tier3_lateral_latest_per_parent_100_rows` | Runs a correlated LEFT JOIN LATERAL with per-parent ordering and a limit. |
 | `tier3_migration_table_lock_two_relations` | Acquires an explicit exclusive table lock across two relations during a transaction. |
 | `tier3_procedural_trigger_insert_update` | Runs a procedural trigger function on inserts and updates; the trigger is the feature being exercised. |

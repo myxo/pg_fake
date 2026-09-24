@@ -50,7 +50,7 @@ and scope boundaries. The completed Phase 2 plan is archived in
   `spec.md` §10. Optimization-only clauses may be tolerated only when ignoring
   them cannot change Tier-A behavior, and strict mode must still reject them.
 - Tasks 8 through 30 are the priority track and must finish before Tasks 31
-  onward. Task 39 is the first unfinished task. Task 24 retains its
+  onward. Task 40 is the first unfinished task. Task 24 retains its
   completed status from an earlier approved exception. Tasks 25, 26, 27, and
   29 have no dependency on later milestones and are placed immediately after
   it for expedited delivery; Task 28 depends on Task 27, and Task 30 gates the
@@ -2071,7 +2071,7 @@ an existing PostgreSQL text-collation mismatch in `e2e_unit_tests`
 `C` collation; later tests in that binary then failed on its poisoned test
 mutex. Task 39 owns SSI validation and its uncontended/contended benchmarks.
 
-### Task 39 — SSI validation and predicate conflicts
+### Task 39 — SSI validation and predicate conflicts [COMPLETE]
 
 **Goal:** Reject executions that are not serializable while allowing valid
 concurrent histories.
@@ -2111,10 +2111,10 @@ concurrent histories.
 - [x] Add uncontended SERIALIZABLE read and contended write-skew benchmarks;
   compile them and complete repeated independent review with no findings.
 - [x] Run the required long property gate and record its result.
-- [ ] Record benchmark measurements. Automatic approval review rejected the
-  configured benchmark run because its harness drops the existing
-  `pgfake_benchmark` schema with `CASCADE`; user approval is required to run it.
-- [ ] Obtain user approval before marking Task 39 complete.
+- [x] Record benchmark measurements in a disposable PostgreSQL 18 container;
+  the configured database's existing `pgfake_benchmark` schema was verified
+  present afterward.
+- [x] Obtain user approval before marking Task 39 complete.
 
 **Validation:** All 272 core library tests and strict all-target/all-feature
 workspace Clippy pass. The focused PostgreSQL 18 differential cases pass,
@@ -2123,6 +2123,14 @@ and savepoint retry. The exact `CHAOS_THEORY_CHECK_ITERS=10000
 CHAOS_THEORY_CHECK_TIME=600s cargo test -p pg_fake_sqlx --features time --test
 property_tests _long` gate passes all 11 suites in 646.22 seconds. Repeated
 independent review found no remaining issue after the savepoint retry fix.
+
+A short isolated PostgreSQL 18 Criterion run with 20 samples measured the
+uncontended SERIALIZABLE read at 28.495 µs for pg_fake versus 906.02 µs for
+PostgreSQL (31.8 times faster), and contended write skew at 202.60 µs versus
+2.3853 ms (11.8 times faster). The run used a disposable PostgreSQL 18.1
+container and did not replace the committed benchmark baseline. Read-only
+checks confirmed that the configured database's existing benchmark schema
+remained present and the disposable container's benchmark schema was removed.
 
 ---
 
