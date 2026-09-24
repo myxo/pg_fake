@@ -100,6 +100,18 @@ pub fn list_benchmarks() -> Vec<Benchmark> {
         ),
         build_benchmark(
             BenchmarkTier::Rare,
+            "serializable_uncontended_read",
+            build_postgres_values(),
+            build_postgres_comparisons(),
+        ),
+        build_benchmark(
+            BenchmarkTier::Rare,
+            "serializable_write_skew",
+            build_postgres_values(),
+            build_postgres_comparisons(),
+        ),
+        build_benchmark(
+            BenchmarkTier::Rare,
             "lateral_latest_per_parent_100_rows",
             build_postgres_values(),
             build_postgres_comparisons(),

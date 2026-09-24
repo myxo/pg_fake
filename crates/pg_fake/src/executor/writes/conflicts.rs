@@ -412,7 +412,6 @@ pub(super) fn execute_insert_conflict(
         .tables
         .get(&schema.id)
         .expect("catalog table must have storage");
-    record_conflict_read(state, schema, table, row, arbiter, xid);
     let Some(update) = update else {
         return Ok(
             if table.has_visible_unique_conflict(
@@ -432,6 +431,7 @@ pub(super) fn execute_insert_conflict(
             },
         );
     };
+    record_conflict_read(state, schema, table, row, arbiter, xid);
     if let Some(prepared) = prepared {
         if affected_rows.contains(&prepared.row_id) {
             return Err(PgError::create(

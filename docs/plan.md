@@ -2096,6 +2096,34 @@ concurrent histories.
 - The benchmark suite records uncontended SERIALIZABLE overhead and a contended
   write-skew workload.
 
+**Progress:**
+
+- [x] Validate SSI dangerous structures at statements and commit with PostgreSQL
+  commit ordering, read-only snapshot optimization, and serializable participant
+  rules.
+- [x] Preserve overlapping dependency chains and savepoint recovery without
+  admitting a retried write-skew schedule; avoid a predicate conflict for
+  `ON CONFLICT DO NOTHING` when PostgreSQL does not take one.
+- [x] Add controlled native and PostgreSQL 18 differential cases for write skew,
+  unique gaps, phantoms, read-only anomalies, `ON CONFLICT`, deferred foreign
+  keys, sequence allocation, cleanup, and savepoint recovery. Add randomized
+  schedules checked against a serial result.
+- [x] Add uncontended SERIALIZABLE read and contended write-skew benchmarks;
+  compile them and complete repeated independent review with no findings.
+- [x] Run the required long property gate and record its result.
+- [ ] Record benchmark measurements. Automatic approval review rejected the
+  configured benchmark run because its harness drops the existing
+  `pgfake_benchmark` schema with `CASCADE`; user approval is required to run it.
+- [ ] Obtain user approval before marking Task 39 complete.
+
+**Validation:** All 272 core library tests and strict all-target/all-feature
+workspace Clippy pass. The focused PostgreSQL 18 differential cases pass,
+including write skew, read-only anomalies, `ON CONFLICT`, deferred foreign keys,
+and savepoint retry. The exact `CHAOS_THEORY_CHECK_ITERS=10000
+CHAOS_THEORY_CHECK_TIME=600s cargo test -p pg_fake_sqlx --features time --test
+property_tests _long` gate passes all 11 suites in 646.22 seconds. Repeated
+independent review found no remaining issue after the savepoint retry fix.
+
 ---
 
 ## Milestone L — Phase 3 conformance and release gate

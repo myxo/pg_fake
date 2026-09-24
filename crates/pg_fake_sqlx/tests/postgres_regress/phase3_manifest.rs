@@ -1144,7 +1144,7 @@ pub const SCENARIOS: &[Scenario] = &[
         task: 39,
         feature: "serializable validation",
         name: "phantom_insert_serialization_failure",
-        source: "focused two-session scenario",
+        source: "tests/serializable_differential.rs",
         blocker: BlockerKind::Implementation,
     },
 ];

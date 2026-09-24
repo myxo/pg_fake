@@ -203,6 +203,8 @@ impl Session {
             snapshot,
             transaction.isolation == IsolationLevel::Serializable,
         );
+        let had_serialization_failure = state.has_serialization_failure(transaction.xid);
+        let preexisting_serialization_edges = state.collect_serialization_edges(transaction.xid);
         state.load_catalog(
             Some(transaction.xid),
             snapshot,
@@ -247,10 +249,22 @@ impl Session {
                 statement_deadline,
             ) {
                 Ok(rows) => match check_statement_timeout(statement_deadline) {
-                    Ok(()) => Ok(StatementResult::Query(QueryResult {
-                        columns: columns.to_vec(),
-                        rows,
-                    })),
+                    Ok(()) => {
+                        if !had_serialization_failure
+                            && state.has_serialization_failure(transaction.xid)
+                        {
+                            self.abort_serialization_failure(
+                                state,
+                                transaction.xid,
+                                &preexisting_serialization_edges,
+                            )
+                        } else {
+                            Ok(StatementResult::Query(QueryResult {
+                                columns: columns.to_vec(),
+                                rows,
+                            }))
+                        }
+                    }
                     Err(error) => {
                         drop(state);
                         self.abort_with_error(error)
@@ -280,10 +294,22 @@ impl Session {
                 statement_deadline,
             ) {
                 Ok(rows) => match check_statement_timeout(statement_deadline) {
-                    Ok(()) => Ok(StatementResult::Query(QueryResult {
-                        columns: plan.columns().to_vec(),
-                        rows,
-                    })),
+                    Ok(()) => {
+                        if !had_serialization_failure
+                            && state.has_serialization_failure(transaction.xid)
+                        {
+                            self.abort_serialization_failure(
+                                state,
+                                transaction.xid,
+                                &preexisting_serialization_edges,
+                            )
+                        } else {
+                            Ok(StatementResult::Query(QueryResult {
+                                columns: plan.columns().to_vec(),
+                                rows,
+                            }))
+                        }
+                    }
                     Err(error) => {
                         drop(state);
                         self.abort_with_error(error)
@@ -523,6 +549,13 @@ impl Session {
                         unreachable!("statement transaction remains active")
                     };
                     transaction.read_only = true;
+                }
+                if !had_serialization_failure && state.has_serialization_failure(transaction.xid) {
+                    return self.abort_serialization_failure(
+                        state,
+                        transaction.xid,
+                        &preexisting_serialization_edges,
+                    );
                 }
                 Ok(result)
             }

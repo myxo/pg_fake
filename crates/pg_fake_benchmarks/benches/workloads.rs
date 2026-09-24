@@ -41,6 +41,25 @@ impl BenchmarkConnection<'_> {
         }
     }
 
+    fn execute_expect_serialization_failure(&mut self, runtime: &Runtime) {
+        let result = match self {
+            Self::PgFake(connection) => runtime
+                .block_on(sqlx::query("COMMIT").execute(&mut **connection))
+                .map(|_| ()),
+            Self::Postgres(connection) => runtime
+                .block_on(sqlx::query("COMMIT").execute(&mut **connection))
+                .map(|_| ()),
+        };
+        assert_eq!(
+            result
+                .unwrap_err()
+                .as_database_error()
+                .and_then(|error| error.code())
+                .as_deref(),
+            Some("40001")
+        );
+    }
+
     fn run_migration_cycle(&mut self, runtime: &Runtime, migrator: &Migrator) {
         match self {
             Self::PgFake(connection) => {
@@ -242,6 +261,7 @@ fn insert_values_sql(table: &str, rows: usize) -> String {
 
 struct PostgresBenchmark {
     connection: PgConnection,
+    url: String,
     _container: Option<Container<Postgres>>,
 }
 
@@ -288,6 +308,7 @@ fn postgres_benchmark(runtime: &Runtime) -> PostgresBenchmark {
     }
     PostgresBenchmark {
         connection,
+        url,
         _container: container,
     }
 }
@@ -1403,6 +1424,83 @@ fn repeatable_read_benchmark(
     }
 }
 
+fn run_write_skew(
+    runtime: &Runtime,
+    first: &mut BenchmarkConnection<'_>,
+    second: &mut BenchmarkConnection<'_>,
+) {
+    first.execute(runtime, "UPDATE ssi_benchmark SET value = 0");
+    first.execute(runtime, "BEGIN ISOLATION LEVEL SERIALIZABLE");
+    second.execute(runtime, "BEGIN ISOLATION LEVEL SERIALIZABLE");
+    first.fetch(runtime, "SELECT value FROM ssi_benchmark WHERE id = 2");
+    second.fetch(runtime, "SELECT value FROM ssi_benchmark WHERE id = 1");
+    first.execute(runtime, "UPDATE ssi_benchmark SET value = 1 WHERE id = 1");
+    second.execute(runtime, "UPDATE ssi_benchmark SET value = 1 WHERE id = 2");
+    first.execute(runtime, "COMMIT");
+    second.execute_expect_serialization_failure(runtime);
+}
+
+fn benchmark_serializable(criterion: &mut Criterion, runtime: &Runtime, postgres_url: &str) {
+    let db = Db::create();
+    let mut fake_first = PgFakeConnection::new(db.clone());
+    let mut fake_second = PgFakeConnection::new(db);
+    let mut postgres_first = runtime
+        .block_on(PgConnection::connect(postgres_url))
+        .unwrap();
+    let mut postgres_second = runtime
+        .block_on(PgConnection::connect(postgres_url))
+        .unwrap();
+    for connection in [&mut postgres_first, &mut postgres_second] {
+        runtime
+            .block_on(sqlx::query("SET search_path TO pgfake_benchmark").execute(connection))
+            .unwrap();
+    }
+    let mut connections = [
+        (
+            "pg_fake",
+            BenchmarkConnection::PgFake(&mut fake_first),
+            BenchmarkConnection::PgFake(&mut fake_second),
+        ),
+        (
+            "postgres_18",
+            BenchmarkConnection::Postgres(&mut postgres_first),
+            BenchmarkConnection::Postgres(&mut postgres_second),
+        ),
+    ];
+    for (_, first, _) in &mut connections {
+        first.execute(
+            runtime,
+            "CREATE TABLE ssi_benchmark(id INT PRIMARY KEY, value INT)",
+        );
+        first.execute(runtime, "INSERT INTO ssi_benchmark VALUES (1, 0), (2, 0)");
+    }
+    let mut group = criterion
+        .benchmark_group(benchmarks::find_benchmark("serializable_uncontended_read").format_name());
+    for (name, first, _) in &mut connections {
+        group.bench_function(*name, |benchmark| {
+            benchmark.iter(|| {
+                first.execute(runtime, "BEGIN ISOLATION LEVEL SERIALIZABLE");
+                first.fetch(runtime, "SELECT value FROM ssi_benchmark WHERE id = 1");
+                first.execute(runtime, "COMMIT");
+            });
+        });
+    }
+    group.finish();
+    let mut group = criterion
+        .benchmark_group(benchmarks::find_benchmark("serializable_write_skew").format_name());
+    group.sample_size(20);
+    group.measurement_time(Duration::from_secs(2));
+    for (name, first, second) in &mut connections {
+        group.bench_function(*name, |benchmark| {
+            benchmark.iter(|| run_write_skew(runtime, first, second));
+        });
+    }
+    group.finish();
+    for (_, first, _) in &mut connections {
+        first.execute(runtime, "DROP TABLE ssi_benchmark");
+    }
+}
+
 fn select_benchmark(
     criterion: &mut Criterion,
     runtime: &Runtime,
@@ -1977,6 +2075,7 @@ fn benchmarks(criterion: &mut Criterion) {
         .build()
         .unwrap();
     let mut postgres = postgres_benchmark(&runtime);
+    let postgres_url = postgres.url.clone();
     {
         let mut fake = PgFakeConnection::new(Db::create());
         let mut connections = [
@@ -2026,6 +2125,7 @@ fn benchmarks(criterion: &mut Criterion) {
         mvcc_version_chain_benchmark(criterion);
         indexed_vs_scan_benchmark(criterion);
         concurrency_benchmark(criterion, &runtime);
+        benchmark_serializable(criterion, &runtime, &postgres_url);
         foreign_key_insert_benchmark(criterion, &runtime, &mut connections);
         inner_join_benchmark(criterion, &runtime, &mut connections);
         benchmark_lateral(criterion, &runtime, &mut connections);

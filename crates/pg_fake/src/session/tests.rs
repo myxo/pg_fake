@@ -10251,6 +10251,377 @@ fn records_both_edges_of_a_write_skew_schedule() {
 }
 
 #[test]
+fn rejects_write_skew_and_preserves_the_winning_commit() {
+    let db = Db::create();
+    let mut first = db.create_session();
+    let mut second = db.create_session();
+    first.execute("CREATE TABLE skew_commit (id INT PRIMARY KEY, value INT); INSERT INTO skew_commit VALUES (1, 0), (2, 0)").unwrap();
+    first.execute("BEGIN ISOLATION LEVEL SERIALIZABLE").unwrap();
+    second
+        .execute("BEGIN ISOLATION LEVEL SERIALIZABLE")
+        .unwrap();
+    first
+        .query("SELECT value FROM skew_commit WHERE id = 2", &[])
+        .unwrap();
+    second
+        .query("SELECT value FROM skew_commit WHERE id = 1", &[])
+        .unwrap();
+    first
+        .execute("UPDATE skew_commit SET value = 1 WHERE id = 1")
+        .unwrap();
+    second
+        .execute("UPDATE skew_commit SET value = 1 WHERE id = 2")
+        .unwrap();
+    first.execute("COMMIT").unwrap();
+    assert_eq!(
+        second.execute("COMMIT").unwrap_err().sqlstate,
+        SqlState::SerializationFailure
+    );
+    assert_eq!(
+        first
+            .query("SELECT value FROM skew_commit ORDER BY id", &[])
+            .unwrap()
+            .rows,
+        vec![vec![Value::Int4(1)], vec![Value::Int4(0)]]
+    );
+}
+
+#[test]
+fn rejects_phantom_key_insert_and_allows_independent_writes() {
+    let db = Db::create();
+    let mut first = db.create_session();
+    let mut second = db.create_session();
+    first
+        .execute("CREATE TABLE phantom_keys (id INT PRIMARY KEY)")
+        .unwrap();
+    first.execute("BEGIN ISOLATION LEVEL SERIALIZABLE").unwrap();
+    second
+        .execute("BEGIN ISOLATION LEVEL SERIALIZABLE")
+        .unwrap();
+    assert!(
+        first
+            .query("SELECT id FROM phantom_keys WHERE id = 2", &[])
+            .unwrap()
+            .rows
+            .is_empty()
+    );
+    assert!(
+        second
+            .query("SELECT id FROM phantom_keys WHERE id = 1", &[])
+            .unwrap()
+            .rows
+            .is_empty()
+    );
+    first
+        .execute("INSERT INTO phantom_keys VALUES (1)")
+        .unwrap();
+    second
+        .execute("INSERT INTO phantom_keys VALUES (2)")
+        .unwrap();
+    second.execute("COMMIT").unwrap();
+    assert_eq!(
+        first.execute("COMMIT").unwrap_err().sqlstate,
+        SqlState::SerializationFailure
+    );
+    first.execute("BEGIN ISOLATION LEVEL SERIALIZABLE").unwrap();
+    second
+        .execute("BEGIN ISOLATION LEVEL SERIALIZABLE")
+        .unwrap();
+    first
+        .query("SELECT id FROM phantom_keys WHERE id = 9", &[])
+        .unwrap();
+    second
+        .query("SELECT id FROM phantom_keys WHERE id = 8", &[])
+        .unwrap();
+    first
+        .execute("INSERT INTO phantom_keys VALUES (8)")
+        .unwrap();
+    second
+        .execute("INSERT INTO phantom_keys VALUES (9)")
+        .unwrap();
+    first.execute("COMMIT").unwrap();
+    assert_eq!(
+        second.execute("COMMIT").unwrap_err().sqlstate,
+        SqlState::SerializationFailure
+    );
+    first.execute("BEGIN ISOLATION LEVEL SERIALIZABLE").unwrap();
+    second
+        .execute("BEGIN ISOLATION LEVEL SERIALIZABLE")
+        .unwrap();
+    first
+        .query("SELECT id FROM phantom_keys WHERE id = 100", &[])
+        .unwrap();
+    second
+        .query("SELECT id FROM phantom_keys WHERE id = 200", &[])
+        .unwrap();
+    first
+        .execute("INSERT INTO phantom_keys VALUES (101)")
+        .unwrap();
+    second
+        .execute("INSERT INTO phantom_keys VALUES (201)")
+        .unwrap();
+    first.execute("COMMIT").unwrap();
+    second.execute("COMMIT").unwrap();
+}
+
+#[test]
+fn randomized_write_skew_schedules_have_serializable_commits() {
+    let mut seed = 0x5eed_u64;
+    for _ in 0..64 {
+        seed = seed.wrapping_mul(6364136223846793005).wrapping_add(1);
+        let first_reads_first = seed & 1 == 0;
+        let first_writes_first = seed & 2 == 0;
+        let first_commits_first = seed & 4 == 0;
+        let db = Db::create();
+        let mut first = db.create_session();
+        let mut second = db.create_session();
+        first.execute("CREATE TABLE schedule_rows(id INT PRIMARY KEY, value INT); INSERT INTO schedule_rows VALUES (1, 0), (2, 0)").unwrap();
+        first.execute("BEGIN ISOLATION LEVEL SERIALIZABLE").unwrap();
+        second
+            .execute("BEGIN ISOLATION LEVEL SERIALIZABLE")
+            .unwrap();
+        let read_first = "SELECT value FROM schedule_rows WHERE id = 2";
+        let read_second = "SELECT value FROM schedule_rows WHERE id = 1";
+        if first_reads_first {
+            first.query(read_first, &[]).unwrap();
+            second.query(read_second, &[]).unwrap();
+        } else {
+            second.query(read_second, &[]).unwrap();
+            first.query(read_first, &[]).unwrap();
+        }
+        let write_first = "UPDATE schedule_rows SET value = 1 WHERE id = 1";
+        let write_second = "UPDATE schedule_rows SET value = 1 WHERE id = 2";
+        if first_writes_first {
+            first.execute(write_first).unwrap();
+            second.execute(write_second).unwrap();
+        } else {
+            second.execute(write_second).unwrap();
+            first.execute(write_first).unwrap();
+        }
+        let outcomes = if first_commits_first {
+            [first.execute("COMMIT"), second.execute("COMMIT")]
+        } else {
+            [second.execute("COMMIT"), first.execute("COMMIT")]
+        };
+        assert!(outcomes[0].is_ok());
+        assert_eq!(
+            outcomes[1].as_ref().unwrap_err().sqlstate,
+            SqlState::SerializationFailure
+        );
+        let values = first
+            .query("SELECT value FROM schedule_rows ORDER BY id", &[])
+            .unwrap()
+            .rows;
+        let serial_result = if first_commits_first {
+            vec![vec![Value::Int4(1)], vec![Value::Int4(0)]]
+        } else {
+            vec![vec![Value::Int4(0)], vec![Value::Int4(1)]]
+        };
+        assert_eq!(values, serial_result);
+    }
+}
+
+#[test]
+fn detects_insert_phantoms_through_supported_query_shapes() {
+    for query in [
+        "SELECT id FROM watched WHERE id > 0",
+        "SELECT count(*) FROM watched WHERE id > 0",
+        "WITH matching AS (SELECT id FROM watched WHERE id > 0) SELECT count(*) FROM matching",
+        "SELECT count(*) FROM watched w JOIN guard_rows g ON w.id = g.id",
+        "SELECT count(*) FROM watched_view",
+    ] {
+        let db = Db::create();
+        let mut first = db.create_session();
+        let mut second = db.create_session();
+        first.execute("CREATE TABLE watched(id INT PRIMARY KEY); CREATE TABLE guard_rows(id INT PRIMARY KEY, value INT); INSERT INTO guard_rows VALUES (1, 0); CREATE VIEW watched_view AS SELECT id FROM watched").unwrap();
+        first.execute("BEGIN ISOLATION LEVEL SERIALIZABLE").unwrap();
+        second
+            .execute("BEGIN ISOLATION LEVEL SERIALIZABLE")
+            .unwrap();
+        first.query(query, &[]).unwrap();
+        second
+            .query("SELECT value FROM guard_rows WHERE id = 1", &[])
+            .unwrap();
+        second.execute("INSERT INTO watched VALUES (1)").unwrap();
+        first
+            .execute("UPDATE guard_rows SET value = 1 WHERE id = 1")
+            .unwrap();
+        second.execute("COMMIT").unwrap();
+        assert_eq!(
+            first.execute("COMMIT").unwrap_err().sqlstate,
+            SqlState::SerializationFailure,
+            "query: {query}"
+        );
+    }
+}
+
+#[test]
+fn rejects_read_only_anomaly_only_when_the_outgoing_writer_precedes_its_snapshot() {
+    let db = Db::create();
+    let mut reader = db.create_session();
+    let mut pivot = db.create_session();
+    let mut outgoing = db.create_session();
+    reader.execute("CREATE TABLE anomaly_rows(id INT PRIMARY KEY, value INT); INSERT INTO anomaly_rows VALUES (1, 0), (2, 0)").unwrap();
+    pivot.execute("BEGIN ISOLATION LEVEL SERIALIZABLE").unwrap();
+    pivot
+        .query("SELECT value FROM anomaly_rows WHERE id = 2", &[])
+        .unwrap();
+    outgoing
+        .execute("BEGIN ISOLATION LEVEL SERIALIZABLE")
+        .unwrap();
+    outgoing
+        .execute("UPDATE anomaly_rows SET value = 1 WHERE id = 2")
+        .unwrap();
+    outgoing.execute("COMMIT").unwrap();
+    reader
+        .execute("BEGIN ISOLATION LEVEL SERIALIZABLE")
+        .unwrap();
+    reader
+        .query("SELECT value FROM anomaly_rows WHERE id = 2", &[])
+        .unwrap();
+    pivot
+        .execute("UPDATE anomaly_rows SET value = 1 WHERE id = 1")
+        .unwrap();
+    pivot.execute("COMMIT").unwrap();
+    assert_eq!(
+        reader
+            .query("SELECT value FROM anomaly_rows WHERE id = 1", &[])
+            .unwrap_err()
+            .sqlstate,
+        SqlState::SerializationFailure
+    );
+    assert_eq!(
+        reader.query("SELECT 1", &[]).unwrap_err().sqlstate,
+        SqlState::InFailedSqlTransaction
+    );
+    reader.execute("ROLLBACK").unwrap();
+}
+
+#[test]
+fn allows_read_only_snapshot_taken_before_the_outgoing_writer_commits() {
+    let db = Db::create();
+    let mut reader = db.create_session();
+    let mut pivot = db.create_session();
+    let mut outgoing = db.create_session();
+    reader.execute("CREATE TABLE safe_reader_rows(id INT PRIMARY KEY, value INT); INSERT INTO safe_reader_rows VALUES (1, 0), (2, 0)").unwrap();
+    pivot.execute("BEGIN ISOLATION LEVEL SERIALIZABLE").unwrap();
+    reader
+        .execute("BEGIN ISOLATION LEVEL SERIALIZABLE")
+        .unwrap();
+    pivot
+        .query("SELECT value FROM safe_reader_rows WHERE id = 2", &[])
+        .unwrap();
+    reader
+        .query("SELECT value FROM safe_reader_rows WHERE id = 1", &[])
+        .unwrap();
+    outgoing
+        .execute("BEGIN ISOLATION LEVEL SERIALIZABLE")
+        .unwrap();
+    outgoing
+        .execute("UPDATE safe_reader_rows SET value = 1 WHERE id = 2")
+        .unwrap();
+    outgoing.execute("COMMIT").unwrap();
+    pivot
+        .execute("UPDATE safe_reader_rows SET value = 1 WHERE id = 1")
+        .unwrap();
+    pivot.execute("COMMIT").unwrap();
+    reader
+        .query("SELECT value FROM safe_reader_rows WHERE id = 1", &[])
+        .unwrap();
+    reader.execute("COMMIT").unwrap();
+}
+
+#[test]
+fn detects_delete_phantoms_and_allows_do_nothing() {
+    for use_conflict in [false, true] {
+        let db = Db::create();
+        let mut first = db.create_session();
+        let mut second = db.create_session();
+        first.execute("CREATE TABLE conflict_rows(id INT PRIMARY KEY, value INT); INSERT INTO conflict_rows VALUES (1, 0); CREATE TABLE conflict_guard(id INT PRIMARY KEY, value INT); INSERT INTO conflict_guard VALUES (1, 0)").unwrap();
+        first.execute("BEGIN ISOLATION LEVEL SERIALIZABLE").unwrap();
+        second
+            .execute("BEGIN ISOLATION LEVEL SERIALIZABLE")
+            .unwrap();
+        if use_conflict {
+            first
+                .execute("INSERT INTO conflict_rows VALUES (1, 9) ON CONFLICT (id) DO NOTHING")
+                .unwrap();
+        } else {
+            first
+                .query("SELECT count(*) FROM conflict_rows WHERE id > 0", &[])
+                .unwrap();
+        }
+        second
+            .query("SELECT value FROM conflict_guard WHERE id = 1", &[])
+            .unwrap();
+        if use_conflict {
+            first
+                .execute("UPDATE conflict_guard SET value = 1 WHERE id = 1")
+                .unwrap();
+            first.execute("COMMIT").unwrap();
+            second
+                .execute("UPDATE conflict_rows SET value = 2 WHERE id = 1")
+                .unwrap();
+            second.execute("COMMIT").unwrap();
+        } else {
+            second
+                .execute("DELETE FROM conflict_rows WHERE id = 1")
+                .unwrap();
+            first
+                .execute("UPDATE conflict_guard SET value = 1 WHERE id = 1")
+                .unwrap();
+            second.execute("COMMIT").unwrap();
+            assert_eq!(
+                first.execute("COMMIT").unwrap_err().sqlstate,
+                SqlState::SerializationFailure
+            );
+        }
+    }
+}
+
+#[test]
+fn serialization_failure_releases_locks_and_keeps_sequence_allocation() {
+    let db = Db::create();
+    let mut first = db.create_session();
+    let mut second = db.create_session();
+    first.execute("CREATE TABLE failure_cleanup(id INT PRIMARY KEY, value INT); INSERT INTO failure_cleanup VALUES (1, 0), (2, 0); CREATE SEQUENCE failure_sequence").unwrap();
+    first.execute("BEGIN ISOLATION LEVEL SERIALIZABLE").unwrap();
+    second
+        .execute("BEGIN ISOLATION LEVEL SERIALIZABLE")
+        .unwrap();
+    first
+        .query("SELECT value FROM failure_cleanup WHERE id = 2", &[])
+        .unwrap();
+    second
+        .query("SELECT value FROM failure_cleanup WHERE id = 1", &[])
+        .unwrap();
+    second
+        .query("SELECT nextval('failure_sequence')", &[])
+        .unwrap();
+    first
+        .execute("UPDATE failure_cleanup SET value = 1 WHERE id = 1")
+        .unwrap();
+    second
+        .execute("UPDATE failure_cleanup SET value = 1 WHERE id = 2")
+        .unwrap();
+    first.execute("COMMIT").unwrap();
+    assert_eq!(
+        second.execute("COMMIT").unwrap_err().sqlstate,
+        SqlState::SerializationFailure
+    );
+    assert_eq!(
+        second
+            .query("SELECT nextval('failure_sequence')", &[])
+            .unwrap()
+            .rows,
+        vec![vec![Value::Int8(2)]]
+    );
+    second
+        .execute("UPDATE failure_cleanup SET value = 2 WHERE id = 2")
+        .unwrap();
+}
+
+#[test]
 fn checks_deferred_foreign_keys_against_the_serializable_snapshot() {
     let db = Db::create();
     let mut first = db.create_session();
@@ -10273,7 +10644,7 @@ fn checks_deferred_foreign_keys_against_the_serializable_snapshot() {
 }
 
 #[test]
-fn tracks_on_conflict_do_nothing_as_a_unique_key_read() {
+fn does_not_add_predicate_read_for_do_nothing() {
     let db = Db::create();
     let mut first = db.create_session();
     let mut second = db.create_session();
@@ -10294,7 +10665,7 @@ fn tracks_on_conflict_do_nothing_as_a_unique_key_read() {
         .execute("UPDATE serializable_conflict SET value = 2 WHERE id = 1")
         .unwrap();
     assert!(
-        db.state
+        !db.state
             .lock()
             .unwrap()
             .serializable

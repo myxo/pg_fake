@@ -210,6 +210,20 @@ impl DatabaseState {
             .is_serializable(xid)
     }
 
+    pub(crate) fn has_serialization_failure(&self, xid: Xid) -> bool {
+        self.serializable
+            .lock()
+            .expect("dependency graph is poisoned")
+            .would_fail_on_commit(xid)
+    }
+
+    pub(crate) fn collect_serialization_edges(&self, xid: Xid) -> BTreeSet<(Xid, Xid)> {
+        self.serializable
+            .lock()
+            .expect("dependency graph is poisoned")
+            .collect_transaction_edges(xid)
+    }
+
     #[cfg_attr(feature = "execution-log", tracing::instrument(skip_all))]
     pub(crate) fn has_touched_tables(&self, xid: Xid) -> bool {
         self.touched_tables

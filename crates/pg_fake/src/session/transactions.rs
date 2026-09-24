@@ -266,6 +266,33 @@ impl Session {
             );
             transaction.read_only = false;
         }
+        let validation_error = if self.deferred_foreign_keys_dirty {
+            executor::validate_deferred_foreign_keys(&state, transaction.xid, snapshot).err()
+        } else {
+            None
+        };
+        let validation_error = validation_error.or_else(|| {
+            state.has_serialization_failure(transaction.xid).then(|| {
+                PgError::create(
+                    SqlState::SerializationFailure,
+                    "could not serialize access due to read/write dependencies among transactions",
+                )
+            })
+        });
+        if let Some(error) = validation_error {
+            let settings = self
+                .settings_undo
+                .take()
+                .expect("active transaction has rollback settings");
+            self.settings_on_commit = None;
+            self.restore_settings(settings);
+            self.deferred_constraints.clear();
+            self.defer_all_constraints = false;
+            self.deferred_foreign_keys_dirty = false;
+            state.abort_transaction(transaction.xid);
+            self.db.condvar.notify_all();
+            return Err(error);
+        }
         if transaction.read_only {
             assert!(!self.deferred_foreign_keys_dirty);
             assert!(!state.has_touched_tables(transaction.xid));
@@ -297,23 +324,6 @@ impl Session {
             self.defer_all_constraints = false;
             self.db.condvar.notify_all();
             return Ok(());
-        }
-        if self.deferred_foreign_keys_dirty
-            && let Err(error) =
-                executor::validate_deferred_foreign_keys(&state, transaction.xid, snapshot)
-        {
-            let settings = self
-                .settings_undo
-                .take()
-                .expect("active transaction has rollback settings");
-            self.settings_on_commit = None;
-            self.restore_settings(settings);
-            self.deferred_constraints.clear();
-            self.defer_all_constraints = false;
-            self.deferred_foreign_keys_dirty = false;
-            state.abort_transaction(transaction.xid);
-            self.db.condvar.notify_all();
-            return Err(error);
         }
         let commit_seq = state.commit_loaded_catalog_transaction(
             transaction.xid,
@@ -386,7 +396,13 @@ impl Session {
                 Snapshot::create(&state.transactions).use_command(crate::txn::CommandId(u64::MAX))
             }
         };
-        state.load_catalog(Some(xid), snapshot, Some(self.temporary_schema_id));
+        let already_aborted = matches!(
+            state.transactions.get_status(xid),
+            Some(crate::txn::TransactionStatus::Aborted)
+        );
+        if !already_aborted {
+            state.load_catalog(Some(xid), snapshot, Some(self.temporary_schema_id));
+        }
         let settings = self
             .settings_undo
             .take()
@@ -396,9 +412,41 @@ impl Session {
         self.deferred_constraints.clear();
         self.defer_all_constraints = false;
         self.deferred_foreign_keys_dirty = false;
-        state.abort_transaction(xid);
+        if !already_aborted {
+            state.abort_transaction(xid);
+        }
         self.db.condvar.notify_all();
         Ok(())
+    }
+
+    pub(super) fn abort_serialization_failure<T>(
+        &mut self,
+        mut state: std::sync::MutexGuard<'_, executor::DatabaseState>,
+        xid: Xid,
+        preexisting_edges: &std::collections::BTreeSet<(Xid, Xid)>,
+    ) -> Result<T> {
+        let error = PgError::create(
+            SqlState::SerializationFailure,
+            "could not serialize access due to read/write dependencies among transactions",
+        );
+        if !self.savepoints.is_empty() {
+            state
+                .serializable
+                .lock()
+                .expect("dependency graph is poisoned")
+                .dismiss_transaction_conflicts(xid, preexisting_edges);
+            drop(state);
+            return self.abort_with_error(error);
+        }
+        let Some(SessionTransactionState::Active(transaction)) = self.transaction else {
+            unreachable!("serialization failure belongs to an active transaction")
+        };
+        assert_eq!(transaction.xid, xid);
+        self.savepoints.clear();
+        self.transaction = Some(SessionTransactionState::Aborted { transaction });
+        state.abort_transaction(xid);
+        self.db.condvar.notify_all();
+        Err(error)
     }
 
     #[cfg_attr(feature = "execution-log", tracing::instrument(skip_all))]
