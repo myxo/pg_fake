@@ -1948,6 +1948,7 @@ dependencies = [
  "pg_fake",
  "serde",
  "serde_json",
+ "sqlparser",
  "sqlx",
  "sqlx-core",
  "sqlx-postgres",

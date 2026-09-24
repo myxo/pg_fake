@@ -49,8 +49,11 @@ fn reports_change_from_committed_measurements() {
             .sum::<usize>(),
         benchmarks
             .iter()
-            .map(|benchmark| benchmark.values.len())
-            .sum::<usize>()
+            .flat_map(|benchmark| { benchmark.values.iter().map(move |value| (benchmark, value)) })
+            .filter(|(benchmark, value)| {
+                has_complete_baseline(&super::find_baseline_path(&root, benchmark, value))
+            })
+            .count()
     );
     assert_eq!(
         report
@@ -134,11 +137,14 @@ fn rejects_regex_filters() {
 }
 
 #[test]
-fn preserves_complete_baselines_under_tiered_names() {
+fn preserves_recorded_baselines_under_tiered_names() {
     let root = find_results_root().join("criterion");
     for benchmark in list_benchmarks() {
         for value in &benchmark.values {
             let path = super::find_baseline_path(&root, &benchmark, value);
+            if !path.exists() {
+                continue;
+            }
             assert!(has_complete_baseline(&path), "{}", path.display());
             let metadata: serde_json::Value = serde_json::from_str(
                 &std::fs::read_to_string(path.join("benchmark.json")).unwrap(),

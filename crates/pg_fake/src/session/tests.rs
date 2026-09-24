@@ -8176,16 +8176,14 @@ fn materializes_non_recursive_ctes_once_with_aliases_and_empty_results() {
             .unwrap();
     assert_eq!(result.rows, vec![vec![Value::Bool(true)]]);
 
-    assert_eq!(
-            session
-                .query(
-                    "WITH values_cte(value) AS (SELECT 1) SELECT (WITH values_cte(value) AS (SELECT 2) SELECT value FROM values_cte) FROM values_cte",
-                    &[],
-                )
-                .unwrap()
-                .rows,
-            vec![vec![Value::Int4(2)]]
-        );
+    let result = session
+        .query(
+            "WITH values_cte(value) AS (SELECT 1) SELECT (WITH values_cte(value) AS (SELECT 2) SELECT value FROM values_cte) FROM values_cte",
+            &[],
+        )
+        .unwrap();
+    assert_eq!(result.rows, vec![vec![Value::Int4(2)]]);
+    assert_eq!(result.columns[0].name, "value");
     assert_eq!(
             session
                 .query(
@@ -8767,6 +8765,7 @@ fn executes_data_modifying_ctes_once_with_statement_snapshot_visibility() {
         result.rows,
         vec![vec![Value::Int4(2), Value::Int4(20), Value::Int8(1)]]
     );
+    assert_eq!(result.columns[2].name, "count");
     assert_eq!(
         session
             .query("SELECT id, value FROM items ORDER BY id", &[])

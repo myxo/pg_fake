@@ -1002,7 +1002,7 @@ pub const FEATURES: &[Feature] = &[
                 setup: &[
                     "CREATE TABLE phase3_catalog_item (id SERIAL PRIMARY KEY, label VARCHAR(9) NOT NULL)",
                 ],
-                sql: "SELECT a.attname, format_type(a.atttypid, a.atttypmod), a.attnotnull FROM pg_catalog.pg_attribute AS a WHERE a.attrelid = 'phase3_catalog_item'::regclass AND a.attnum > 0 ORDER BY a.attnum",
+                sql: "SELECT a.attname::text, format_type(a.atttypid, a.atttypmod), a.attnotnull FROM pg_catalog.pg_attribute AS a WHERE a.attrelid = 'phase3_catalog_item'::regclass AND a.attnum > 0 ORDER BY a.attnum",
                 blocker: BlockerKind::Implementation,
             },
             Case {

@@ -1,5 +1,5 @@
 use bigdecimal::BigDecimal;
-use chrono::{DateTime, NaiveDateTime, Timelike, Utc};
+use chrono::{DateTime, Datelike, NaiveDateTime, Timelike, Utc};
 use std::str::FromStr;
 
 use crate::error::{PgError, Result, SqlState};
@@ -532,7 +532,7 @@ impl Value {
             Value::Uuid(value) => value.to_string(),
             Value::Date(PgDate::NegInfinity) => "-infinity".into(),
             Value::Date(PgDate::Infinity) => "infinity".into(),
-            Value::Date(PgDate::Finite(value)) => value.format("%Y-%m-%d").to_string(),
+            Value::Date(PgDate::Finite(value)) => format_pg_date(*value),
             Value::Time(PgTime(value)) if *value == MICROSECONDS_PER_DAY => "24:00:00".into(),
             Value::Time(PgTime(value)) => {
                 let hours = value / 3_600_000_000;
@@ -859,11 +859,32 @@ fn parse_interval(input: &str) -> Result<PgInterval> {
 
 #[cfg_attr(feature = "execution-log", tracing::instrument(skip_all))]
 fn format_timestamp(value: NaiveDateTime) -> String {
-    let output = value.format("%Y-%m-%d %H:%M:%S%.6f").to_string();
-    output
-        .trim_end_matches('0')
-        .trim_end_matches('.')
-        .to_string()
+    let time = value.format("%H:%M:%S%.6f").to_string();
+    let time = time.trim_end_matches('0').trim_end_matches('.').to_string();
+    let date = value.date();
+    if date.year() <= 0 {
+        format!(
+            "{:04}-{:02}-{:02} {time} BC",
+            1 - date.year(),
+            date.month(),
+            date.day()
+        )
+    } else {
+        format!("{} {time}", format_pg_date(date))
+    }
+}
+
+fn format_pg_date(value: chrono::NaiveDate) -> String {
+    if value.year() <= 0 {
+        format!(
+            "{:04}-{:02}-{:02} BC",
+            1 - value.year(),
+            value.month(),
+            value.day()
+        )
+    } else {
+        value.format("%Y-%m-%d").to_string()
+    }
 }
 
 #[cfg_attr(feature = "execution-log", tracing::instrument(skip_all))]
@@ -883,12 +904,47 @@ fn format_float8(f: f64) -> String {
 
 #[cfg_attr(feature = "execution-log", tracing::instrument(skip_all))]
 fn parse_date(input: &str) -> Result<PgDate> {
-    match input.trim().to_ascii_lowercase().as_str() {
+    let trimmed = input.trim();
+    match trimmed.to_ascii_lowercase().as_str() {
         "infinity" => Ok(PgDate::Infinity),
         "-infinity" => Ok(PgDate::NegInfinity),
-        _ => chrono::NaiveDate::parse_from_str(input.trim(), "%Y-%m-%d")
+        _ if trimmed.to_ascii_lowercase().ends_with(" bc") => {
+            let date_text = &trimmed[..trimmed.len() - 3];
+            let mut parts = date_text.split('-');
+            let (Some(year), Some(month), Some(day), None) =
+                (parts.next(), parts.next(), parts.next(), parts.next())
+            else {
+                return Err(create_invalid_text_error(input, "date"));
+            };
+            let (Ok(year), Ok(month), Ok(day)) = (
+                year.parse::<i32>(),
+                month.parse::<u32>(),
+                day.parse::<u32>(),
+            ) else {
+                return Err(create_invalid_text_error(input, "date"));
+            };
+            if year <= 0 {
+                return Err(create_invalid_text_error(input, "date"));
+            }
+            chrono::NaiveDate::from_ymd_opt(1 - year, month, day)
+                .map(PgDate::Finite)
+                .ok_or_else(|| {
+                    PgError::create(
+                        SqlState::DatetimeFieldOverflow,
+                        format!("date/time field value out of range: {input}"),
+                    )
+                })
+        }
+        _ => chrono::NaiveDate::parse_from_str(trimmed, "%Y-%m-%d")
             .map(PgDate::Finite)
-            .map_err(|_| create_invalid_text_error(input, "date")),
+            .map_err(|error| match error.kind() {
+                chrono::format::ParseErrorKind::OutOfRange
+                | chrono::format::ParseErrorKind::Impossible => PgError::create(
+                    SqlState::DatetimeFieldOverflow,
+                    format!("date/time field value out of range: {input}"),
+                ),
+                _ => create_invalid_text_error(input, "date"),
+            }),
     }
 }
 
@@ -989,8 +1045,8 @@ fn normalize_rfc3339_input(input: &str) -> String {
 #[cfg_attr(feature = "execution-log", tracing::instrument(skip_all))]
 fn parse_bool(input: &str) -> Result<bool> {
     match input.trim().to_ascii_lowercase().as_str() {
-        "t" | "true" | "y" | "yes" | "on" | "1" => Ok(true),
-        "f" | "false" | "n" | "no" | "off" | "0" => Ok(false),
+        "t" | "tr" | "tru" | "true" | "y" | "ye" | "yes" | "on" | "1" => Ok(true),
+        "f" | "fa" | "fal" | "fals" | "false" | "n" | "no" | "of" | "off" | "0" => Ok(false),
         _ => Err(create_invalid_text_error(input, "boolean")),
     }
 }
@@ -1027,22 +1083,41 @@ fn parse_float<T: FloatExt>(input: &str) -> Result<T> {
             format!("value out of range for type: {input}"),
         ));
     }
+    if v.is_zero()
+        && s.split(['e', 'E']).next().is_some_and(|significand| {
+            significand
+                .bytes()
+                .any(|digit| matches!(digit, b'1'..=b'9'))
+        })
+    {
+        return Err(PgError::create(
+            SqlState::NumericValueOutOfRange,
+            format!("value out of range for type: {input}"),
+        ));
+    }
     Ok(v)
 }
 
 trait FloatExt: Copy + std::str::FromStr<Err = std::num::ParseFloatError> {
     fn is_infinite(self) -> bool;
+    fn is_zero(self) -> bool;
 }
 impl FloatExt for f32 {
     #[cfg_attr(feature = "execution-log", tracing::instrument(skip_all))]
     fn is_infinite(self) -> bool {
         f32::is_infinite(self)
     }
+    fn is_zero(self) -> bool {
+        self == 0.0
+    }
 }
 impl FloatExt for f64 {
     #[cfg_attr(feature = "execution-log", tracing::instrument(skip_all))]
     fn is_infinite(self) -> bool {
         f64::is_infinite(self)
+    }
+    fn is_zero(self) -> bool {
+        self == 0.0
     }
 }
 

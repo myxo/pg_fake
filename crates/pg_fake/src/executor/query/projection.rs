@@ -348,13 +348,7 @@ pub(in crate::executor) fn build_projection_plan<'a>(
                 let data_type = infer_query_expression_type(state, expr, scope)?;
                 projections.push(ProjectionSource::Expression(expr));
                 columns.push(ColumnMeta {
-                    name: match expr {
-                        ast::Expr::Function(function) => normalize_function_name(&function.name)?,
-                        ast::Expr::Extract { .. } => "extract".into(),
-                        ast::Expr::Floor { .. } => "floor".into(),
-                        ast::Expr::AtTimeZone { .. } => "timezone".into(),
-                        _ => "?column?".into(),
-                    },
+                    name: get_projection_name(expr, data_type)?,
                     type_oid: data_type.map_to_oid(),
                     typmod: data_type.typmod,
                 });
@@ -397,6 +391,69 @@ pub(in crate::executor) fn build_projection_plan<'a>(
         }
     }
     Ok((projections, columns))
+}
+
+pub(super) fn get_projection_name(expr: &ast::Expr, data_type: PgType) -> Result<String> {
+    match expr {
+        ast::Expr::Identifier(identifier) => Ok(normalize_identifier(identifier)),
+        ast::Expr::CompoundIdentifier(identifiers) => Ok(identifiers
+            .last()
+            .map(normalize_identifier)
+            .unwrap_or_else(|| "?column?".into())),
+        ast::Expr::Function(function) => normalize_function_name(&function.name),
+        ast::Expr::Extract { .. } => Ok("extract".into()),
+        ast::Expr::Floor { .. } => Ok("floor".into()),
+        ast::Expr::AtTimeZone { .. } => Ok("timezone".into()),
+        ast::Expr::Array(_) => Ok("array".into()),
+        ast::Expr::Exists { negated, .. } => {
+            Ok(if *negated { "?column?" } else { "exists" }.into())
+        }
+        ast::Expr::TypedString { .. } => Ok(data_type.base.get_postgres_name().into()),
+        ast::Expr::Cast { expr, .. } => {
+            let inner = get_projection_name(expr, data_type)?;
+            if inner == "?column?" {
+                Ok(data_type.base.get_postgres_name().into())
+            } else {
+                Ok(inner)
+            }
+        }
+        ast::Expr::Nested(expr) => get_projection_name(expr, data_type),
+        ast::Expr::Subquery(query) => match query.body.as_ref() {
+            ast::SetExpr::Select(select) => match select.projection.first() {
+                Some(ast::SelectItem::ExprWithAlias { alias, .. }) => {
+                    Ok(normalize_identifier(alias))
+                }
+                Some(ast::SelectItem::UnnamedExpr(expr)) => get_projection_name(expr, data_type),
+                _ => Ok("?column?".into()),
+            },
+            ast::SetExpr::Values(_) => Ok("column1".into()),
+            _ => Ok("?column?".into()),
+        },
+        _ => Ok("?column?".into()),
+    }
+}
+
+pub(crate) fn restore_query_projection_names(
+    statement: &ast::Statement,
+    columns: &mut [ColumnMeta],
+) {
+    let ast::Statement::Query(query) = statement else {
+        return;
+    };
+    let ast::SetExpr::Select(select) = query.body.as_ref() else {
+        return;
+    };
+    if select.projection.len() != columns.len() {
+        return;
+    }
+    for (item, column) in select.projection.iter().zip(columns) {
+        if let ast::SelectItem::UnnamedExpr(expr) = item
+            && let Some(base) = crate::value::BaseType::resolve_oid(column.type_oid)
+        {
+            column.name = get_projection_name(expr, PgType::create(base))
+                .expect("executed projection has a valid name");
+        }
+    }
 }
 
 #[cfg_attr(feature = "execution-log", tracing::instrument(skip_all))]

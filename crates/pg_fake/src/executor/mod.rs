@@ -70,7 +70,9 @@ pub(crate) use procedural::{
 };
 pub(crate) use query::LOCK_PENDING;
 pub(crate) use query::resolve_statement_windows;
-pub(crate) use query::{describe_query_result_columns, detect_statement_features};
+pub(crate) use query::{
+    describe_query_result_columns, detect_statement_features, restore_query_projection_names,
+};
 pub(crate) use scope::{
     BoundScope, RowScope, bind_from_scope, bind_join, bind_query_scope, bind_table_factor,
     bind_target_scope, combine_bound_scopes, create_value_scope, identify_unknown_query_columns,

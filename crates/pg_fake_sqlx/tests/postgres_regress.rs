@@ -2,8 +2,10 @@ use std::{fs, path::PathBuf, sync::Mutex};
 
 use pg_fake::parser::{self, Statement};
 use pg_fake_sqlx::{Db, PgFake, PgFakeConnection};
+use sqlparser::ast;
 use sqlx::{
-    ColumnIndex, Connection, Database, Decode, Executor, IntoArguments, Row, Type, ValueRef,
+    Column, ColumnIndex, Connection, Database, Decode, Executor, IntoArguments, Row, Type,
+    TypeInfo, ValueRef,
 };
 use sqlx_postgres::{PgConnection, Postgres};
 use tokio::runtime::Runtime;
@@ -21,15 +23,19 @@ use common::start_postgres_server;
 #[derive(Debug, PartialEq, Eq)]
 enum Outcome {
     Affected(u64),
-    Rows(Vec<Vec<Option<String>>>),
+    Rows {
+        columns: Vec<(String, String)>,
+        rows: Vec<Vec<Option<String>>>,
+    },
     Error(String),
 }
 
 static TEST_LOCK: Mutex<()> = Mutex::new(());
 
-const MINIMUM_PASSED_STATEMENTS: usize = 460;
+const MINIMUM_PASSED_STATEMENTS: usize = 850;
 const REVIEWED_SKIPPED_SCRIPTS: usize = 141;
 const PHASE2_CONFORMANCE_CASES: usize = 32;
+const PHASE3_CONFORMANCE_CASES: usize = 96;
 
 enum TestConnection<'connection> {
     Fake(&'connection mut PgFakeConnection),
@@ -77,13 +83,35 @@ where
     for<'query> DB::Arguments<'query>: IntoArguments<'query, DB>,
     usize: ColumnIndex<DB::Row>,
 {
-    match statement {
-        Statement::Query(_) | Statement::ShowVariable { .. } => match match mode {
+    let returns_rows = match statement {
+        Statement::Query(_) | Statement::ShowVariable { .. } => true,
+        Statement::Insert(insert) => insert.returning.is_some(),
+        Statement::Update(update) => update.returning.is_some(),
+        Statement::Delete(delete) => delete.returning.is_some(),
+        _ => false,
+    };
+    if returns_rows {
+        match match mode {
             ExecutionMode::Prepared => sqlx::query(sql).fetch_all(&mut *connection).await,
             ExecutionMode::Raw => sqlx::raw_sql(sql).fetch_all(&mut *connection).await,
         } {
-            Ok(rows) => Outcome::Rows(
-                rows.iter()
+            Ok(rows) => Outcome::Rows {
+                columns: rows
+                    .first()
+                    .map(|row| {
+                        row.columns()
+                            .iter()
+                            .map(|column| {
+                                (
+                                    column.name().to_owned(),
+                                    column.type_info().name().to_owned(),
+                                )
+                            })
+                            .collect()
+                    })
+                    .unwrap_or_default(),
+                rows: rows
+                    .iter()
                     .map(|row| {
                         (0..row.len())
                             .map(|index| {
@@ -97,16 +125,17 @@ where
                             .collect()
                     })
                     .collect(),
-            ),
+            },
             Err(error) => make_error_outcome(error),
-        },
-        _ => match match mode {
+        }
+    } else {
+        match match mode {
             ExecutionMode::Prepared => sqlx::query(sql).execute(&mut *connection).await,
             ExecutionMode::Raw => sqlx::raw_sql(sql).execute(&mut *connection).await,
         } {
             Ok(result) => Outcome::Affected(rows_affected(result)),
             Err(error) => make_error_outcome(error),
-        },
+        }
     }
 }
 
@@ -308,15 +337,88 @@ fn compare_source_statement(
         },
     };
     let statement = parsed.pop().unwrap();
-    let [expected, actual] = [
+    let [mut expected, mut actual] = [
         TestConnection::Postgres(postgres),
         TestConnection::Fake(fake),
     ]
     .map(|mut connection| connection.execute(runtime, &statement, sql));
+    let order_by = match &statement {
+        Statement::Query(query) => query.order_by.as_ref(),
+        _ => None,
+    };
+    if let (
+        Outcome::Rows {
+            columns,
+            rows: expected_rows,
+        },
+        Outcome::Rows {
+            rows: actual_rows, ..
+        },
+    ) = (&mut expected, &mut actual)
+    {
+        match order_by {
+            None => {
+                expected_rows.sort();
+                actual_rows.sort();
+            }
+            Some(ast::OrderBy {
+                kind: ast::OrderByKind::Expressions(orders),
+                ..
+            }) => {
+                let indices = orders
+                    .iter()
+                    .map(|order| {
+                        let name = match &order.expr {
+                            ast::Expr::Identifier(identifier) => Some(identifier.value.as_str()),
+                            ast::Expr::CompoundIdentifier(identifiers) => identifiers
+                                .last()
+                                .map(|identifier| identifier.value.as_str()),
+                            _ => None,
+                        };
+                        name.and_then(|name| {
+                            columns
+                                .iter()
+                                .position(|(column, _)| column.eq_ignore_ascii_case(name))
+                        })
+                        .or_else(|| {
+                            order
+                                .expr
+                                .to_string()
+                                .parse::<usize>()
+                                .ok()
+                                .and_then(|position| position.checked_sub(1))
+                                .filter(|position| *position < columns.len())
+                        })
+                    })
+                    .collect::<Option<Vec<_>>>();
+                if let Some(indices) = indices {
+                    normalize_peer_order(expected_rows, &indices);
+                    normalize_peer_order(actual_rows, &indices);
+                }
+            }
+            Some(_) => {}
+        }
+    }
     if actual == expected {
         Ok(())
     } else {
         Err(format!("PostgreSQL: {expected:?}; pg_fake: {actual:?}"))
+    }
+}
+
+fn normalize_peer_order(rows: &mut [Vec<Option<String>>], indices: &[usize]) {
+    let mut start = 0;
+    while start < rows.len() {
+        let mut end = start + 1;
+        while end < rows.len()
+            && indices
+                .iter()
+                .all(|index| rows[start][*index] == rows[end][*index])
+        {
+            end += 1;
+        }
+        rows[start..end].sort();
+        start = end;
     }
 }
 
@@ -325,23 +427,25 @@ fn collect_phase2_report(
     admin: &mut PgConnection,
     server_url: &str,
 ) -> (usize, Vec<String>, Vec<String>) {
-    let database = format!("pg_fake_regress_phase2_{}", std::process::id());
-    let sql = format!("CREATE DATABASE {database}");
-    runtime
-        .block_on(sqlx::raw_sql(sql.as_str()).execute(&mut *admin))
-        .expect("must create PostgreSQL Phase 2 regression database");
-    let database_url = database_url(server_url, &database);
-    let mut postgres = runtime
-        .block_on(PgConnection::connect(&database_url))
-        .expect("must connect to PostgreSQL Phase 2 regression database");
     let mut passed = 0;
     let mut blockers = Vec::new();
     let mut regressions = Vec::new();
+    let mut total = 0;
 
     for feature in phase2_manifest::FEATURES {
-        let mut fake = PgFakeConnection::new(Db::create());
         let mut first_blocker = None;
         for case in feature.cases {
+            total += 1;
+            let database = format!("pg_fake_regress_phase2_{}_{}", std::process::id(), total);
+            let sql = format!("CREATE DATABASE {database}");
+            runtime
+                .block_on(sqlx::raw_sql(sql.as_str()).execute(&mut *admin))
+                .expect("must create PostgreSQL Phase 2 regression database");
+            let database_url = database_url(server_url, &database);
+            let mut postgres = runtime
+                .block_on(PgConnection::connect(&database_url))
+                .expect("must connect to PostgreSQL Phase 2 regression database");
+            let mut fake = PgFakeConnection::new(Db::create());
             let mut result = Ok(());
             for setup in case.setup {
                 result = compare_source_statement(runtime, &mut postgres, &mut fake, setup);
@@ -366,15 +470,15 @@ fn collect_phase2_report(
                     }
                 }
             }
+            drop(postgres);
+            let sql = format!("DROP DATABASE {database} WITH (FORCE)");
+            runtime
+                .block_on(sqlx::raw_sql(sql.as_str()).execute(&mut *admin))
+                .expect("must drop PostgreSQL Phase 2 regression database");
         }
         blockers.push(first_blocker.unwrap_or_else(|| format!("{}: none", feature.name)));
     }
 
-    drop(postgres);
-    let sql = format!("DROP DATABASE {database} WITH (FORCE)");
-    runtime
-        .block_on(sqlx::raw_sql(sql.as_str()).execute(&mut *admin))
-        .expect("must drop PostgreSQL Phase 2 regression database");
     (passed, blockers, regressions)
 }
 
@@ -383,24 +487,24 @@ fn collect_phase3_report(
     admin: &mut PgConnection,
     server_url: &str,
 ) -> (usize, usize, Vec<String>) {
-    let database = format!("pg_fake_regress_phase3_{}", std::process::id());
-    let sql = format!("CREATE DATABASE {database}");
-    runtime
-        .block_on(sqlx::raw_sql(sql.as_str()).execute(&mut *admin))
-        .expect("must create PostgreSQL Phase 3 regression database");
-    let database_url = database_url(server_url, &database);
-    let mut postgres = runtime
-        .block_on(PgConnection::connect(&database_url))
-        .expect("must connect to PostgreSQL Phase 3 regression database");
     let mut passed = 0;
     let mut total = 0;
     let mut blockers = Vec::new();
 
     for feature in phase3_manifest::FEATURES {
-        let mut fake = PgFakeConnection::new(Db::create());
         let mut first_blocker = None;
         for case in feature.cases {
             total += 1;
+            let database = format!("pg_fake_regress_phase3_{}_{}", std::process::id(), total);
+            let sql = format!("CREATE DATABASE {database}");
+            runtime
+                .block_on(sqlx::raw_sql(sql.as_str()).execute(&mut *admin))
+                .expect("must create PostgreSQL Phase 3 regression database");
+            let database_url = database_url(server_url, &database);
+            let mut postgres = runtime
+                .block_on(PgConnection::connect(&database_url))
+                .expect("must connect to PostgreSQL Phase 3 regression database");
+            let mut fake = PgFakeConnection::new(Db::create());
             let mut result = Ok(());
             for setup in case.setup {
                 result = compare_source_statement(runtime, &mut postgres, &mut fake, setup);
@@ -425,21 +529,17 @@ fn collect_phase3_report(
                 }
                 Err(_) => {}
             }
+            drop(postgres);
+            let sql = format!("DROP DATABASE {database} WITH (FORCE)");
+            runtime
+                .block_on(sqlx::raw_sql(sql.as_str()).execute(&mut *admin))
+                .expect("must drop PostgreSQL Phase 3 regression database");
         }
         blockers.push(
             first_blocker
                 .unwrap_or_else(|| format!("Task {}: {}: none", feature.task, feature.name)),
         );
-        runtime
-            .block_on(sqlx::raw_sql("ROLLBACK").execute(&mut postgres))
-            .expect("must clean up Phase 3 transaction state");
     }
-
-    drop(postgres);
-    let sql = format!("DROP DATABASE {database} WITH (FORCE)");
-    runtime
-        .block_on(sqlx::raw_sql(sql.as_str()).execute(&mut *admin))
-        .expect("must drop PostgreSQL Phase 3 regression database");
     (passed, total, blockers)
 }
 
@@ -582,6 +682,14 @@ fn reports_phase2_regression_progress() {
         phase2_passed, PHASE2_CONFORMANCE_CASES,
         "reviewed Phase 2 conformance cases regressed",
     );
+    assert_eq!(
+        phase3_total, PHASE3_CONFORMANCE_CASES,
+        "reviewed Phase 3 conformance manifest changed",
+    );
+    assert_eq!(
+        phase3_passed, phase3_total,
+        "Phase 3 conformance cases failed"
+    );
     assert!(
         phase2_regressions.is_empty(),
         "reviewed Phase 2 cases regressed:\n{}",
@@ -602,4 +710,16 @@ fn reports_phase2_regression_progress() {
     expected_skipped.sort();
     actual_skipped.sort();
     assert_eq!(actual_skipped, expected_skipped);
+    let mut classified_skipped = include_str!("postgres_regress/SKIPPED_CATEGORIES.tsv")
+        .lines()
+        .map(|line| {
+            let (name, category) = line
+                .split_once('\t')
+                .expect("every skipped script must have a classification");
+            assert!(matches!(category, "fixture" | "parser" | "later"));
+            name
+        })
+        .collect::<Vec<_>>();
+    classified_skipped.sort();
+    assert_eq!(classified_skipped, actual_skipped);
 }

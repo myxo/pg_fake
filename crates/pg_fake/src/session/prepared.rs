@@ -211,12 +211,13 @@ impl Session {
                             parameter_types,
                         )
                         .and_then(|(parameter_types, described)| {
-                            let columns = match &setting_columns {
+                            let mut columns = match &setting_columns {
                                 Some(columns) => columns.clone(),
                                 None => {
                                     executor::describe_query_result_columns(&state, &described)?
                                 }
                             };
+                            executor::restore_query_projection_names(&statement, &mut columns);
                             let query_plan = executor::build_prepared_query_plan(
                                 &state,
                                 &statement,
@@ -390,7 +391,11 @@ impl Session {
             self.start_transaction(self.settings.default_isolation, true);
         }
         match self.execute_statement(execution_statement, prepared_query, Some(statement), None) {
-            Ok(result) => {
+            Ok(mut result) => {
+                if let StatementResult::Query(query) = &mut result {
+                    assert_eq!(query.columns.len(), statement.columns.len());
+                    query.columns.clone_from(&statement.columns);
+                }
                 if started_implicit_transaction && self.is_transaction_implicit_batch() {
                     self.commit_transaction()?;
                 }

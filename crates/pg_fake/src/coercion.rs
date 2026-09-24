@@ -580,7 +580,8 @@ fn convert_non_string_value(value: Value, target: BaseType) -> Result<Value> {
         (Value::Float8(value), BaseType::Int8) => convert_float_to_int(value, BaseType::Int8),
         (Value::Float8(value), BaseType::Float4) => {
             let converted = value as f32;
-            if converted.is_infinite() && value.is_finite() {
+            if (converted.is_infinite() && value.is_finite()) || (converted == 0.0 && value != 0.0)
+            {
                 Err(create_out_of_range_error(BaseType::Float4))
             } else {
                 Ok(Value::Float4(converted))

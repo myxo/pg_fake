@@ -426,7 +426,15 @@ fn resolve_set_columns_with_unknown(
             Ok(ColumnMeta {
                 name: left.name.clone(),
                 type_oid: data_type.map_to_oid(),
-                typmod: PgType::NO_TYPEMOD,
+                typmod: if !left_unknown
+                    && !right_unknown
+                    && left.type_oid == right.type_oid
+                    && left.typmod == right.typmod
+                {
+                    left.typmod
+                } else {
+                    PgType::NO_TYPEMOD
+                },
             })
         })
         .collect()

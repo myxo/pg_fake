@@ -353,7 +353,18 @@ pub(super) fn describe_bound_query_columns(
                             )
                         })?,
                     };
-                    left.data_type = PgType::create(base);
+                    left.data_type = PgType::create_with_typmod(
+                        base,
+                        if !left_unknown
+                            && !right_unknown
+                            && left.data_type.base == right.data_type.base
+                            && left.data_type.typmod == right.data_type.typmod
+                        {
+                            left.data_type.typmod
+                        } else {
+                            PgType::NO_TYPEMOD
+                        },
+                    );
                     Ok(left)
                 })
                 .collect()

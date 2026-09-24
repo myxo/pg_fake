@@ -86,3 +86,16 @@ fn provides_assignment_conversion_for_every_numeric_pair() {
         }
     }
 }
+
+#[test]
+fn rejects_float_narrowing_that_underflows_to_zero() {
+    let error = coerce(
+        Value::Float8(1e-69),
+        BaseType::Float8,
+        PgType::create(BaseType::Float4),
+        CastContext::Assignment,
+        "UTC",
+    )
+    .unwrap_err();
+    assert_eq!(error.sqlstate, SqlState::NumericValueOutOfRange);
+}

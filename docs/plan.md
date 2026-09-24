@@ -2136,10 +2136,41 @@ remained present and the disposable container's benchmark schema was removed.
 
 ## Milestone L — Phase 3 conformance and release gate
 
-### Task 40 — Phase 3 integration, regression audit, and benchmarks
+### Task 40 — Phase 3 integration, regression audit, and benchmarks [COMPLETE]
 
 **Goal:** Prove that the complete Phase 3 surface works coherently through the
 native and SQLx APIs.
+
+**Progress:**
+
+- [x] Isolate conformance cases, compare result multiplicity, ordered peers,
+  metadata, affected rows, and SQLSTATE, and pass all 32 Phase 2 and 96 Phase 3
+  manifest cases against PostgreSQL 18.
+- [x] Audit the embedded upstream corpus at 850 matching statements and 141
+  skipped scripts, up from the 463/141 Phase 2 baseline; pin and classify every
+  first blocker in the skip registry.
+- [x] Add a shared native/SQLx end-to-end scenario with typed prepared metadata,
+  decoding, nested transactions, row locking, and SERIALIZABLE sessions; keep
+  the Task 30 application-workload gate green.
+- [x] Refresh the user-facing Phase 3 feature registry and record the benchmark
+  catalog's PostgreSQL 18 comparisons and speed misses.
+- [x] Pass the final long property gate, full workspace regression, formatting,
+  strict Clippy, repeated multi-session tests, and benchmark smoke execution.
+- [x] Complete repeated independent review with no remaining findings.
+- [x] Obtain user approval before marking Task 40 complete.
+
+**Validation:** The final 10,000-iteration long property gate passed all 11
+suites in 748.64 seconds. The all-feature workspace regression passed 593 tests;
+the two `CET`-dependent cases excluded on the disposable PostgreSQL 18 server
+passed with the rest of the settings suite on the configured server. Two
+repeated focused multi-session runs, formatting, and strict all-target,
+all-feature Clippy passed. The strengthened audit passed 850 matching upstream
+statements with 141 classified skips, 32/32 Phase 2 cases, and 96/96 Phase 3
+cases. The Task 30 application-workload gate passed its three tests separately.
+A short paired `UNION ALL` smoke run measured pg_fake at 436.66 µs and
+PostgreSQL 18 at 550.33 µs; the recorded benchmark baseline and its documented
+speed misses were retained. Independent review found no remaining issue after
+the audit-gate fixes.
 
 **DoD:**
 

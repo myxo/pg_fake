@@ -42,6 +42,7 @@ pub(super) use locking::{
 };
 use ordering::{RowOrderSpec, compare_ordered_rows, resolve_order_specs, sort_ordered_rows};
 pub(crate) use projection::describe_query_result_columns;
+pub(crate) use projection::restore_query_projection_names;
 pub(super) use projection::{
     ProjectionSource, build_mutation_projection_plan, build_projection_plan,
     evaluate_projection_values,
@@ -190,6 +191,21 @@ fn finalize_select_rows(
 
 #[cfg_attr(feature = "execution-log", tracing::instrument(skip_all))]
 pub(super) fn execute_query(
+    state: &DatabaseState,
+    query: &ast::Query,
+    xid: Xid,
+    snapshot: &Snapshot,
+    context: &StatementContext,
+) -> Result<QueryOutput> {
+    let mut output = execute_query_inner(state, query, xid, snapshot, context)?;
+    restore_query_projection_names(
+        &ast::Statement::Query(Box::new(query.clone())),
+        &mut output.result.columns,
+    );
+    Ok(output)
+}
+
+fn execute_query_inner(
     state: &DatabaseState,
     query: &ast::Query,
     xid: Xid,

@@ -45,13 +45,17 @@ fn reports_22p02_for_invalid_integer_syntax() {
 #[test]
 #[cfg_attr(feature = "execution-log", tracing::instrument(skip_all))]
 fn accepts_postgres_boolean_forms() {
-    for t in ["t", "TRUE", "y", "yes", "on", "1"] {
+    for t in ["t", "tr", "tru", "TRUE", "y", "ye", "yes", "on", "1"] {
         assert_eq!(Value::parse(BaseType::Bool, t).unwrap(), Value::Bool(true));
     }
-    for f in ["f", "FALSE", "n", "no", "off", "0"] {
+    for f in [
+        "f", "fa", "fal", "fals", "FALSE", "n", "no", "of", "off", "0",
+    ] {
         assert_eq!(Value::parse(BaseType::Bool, f).unwrap(), Value::Bool(false));
     }
     let err = Value::parse(BaseType::Bool, "maybe").unwrap_err();
+    assert_eq!(err.sqlstate, SqlState::InvalidTextRepresentation);
+    let err = Value::parse(BaseType::Bool, "o").unwrap_err();
     assert_eq!(err.sqlstate, SqlState::InvalidTextRepresentation);
 }
 
@@ -73,6 +77,36 @@ fn roundtrips_floats_and_special_values() {
 fn reports_22003_for_float_overflow() {
     let err = Value::parse(BaseType::Float4, "1e999").unwrap_err();
     assert_eq!(err.sqlstate, SqlState::NumericValueOutOfRange);
+    for (base, input) in [(BaseType::Float4, "10e-70"), (BaseType::Float8, "10e-400")] {
+        let err = Value::parse(base, input).unwrap_err();
+        assert_eq!(err.sqlstate, SqlState::NumericValueOutOfRange);
+    }
+    assert_eq!(
+        Value::parse(BaseType::Float4, "0e-70").unwrap(),
+        Value::Float4(0.0)
+    );
+}
+
+#[test]
+fn distinguishes_invalid_date_fields_from_invalid_text() {
+    assert_eq!(
+        Value::parse(BaseType::Date, "2040-04-10 BC")
+            .unwrap()
+            .format_postgres_text(),
+        "2040-04-10 BC"
+    );
+    assert_eq!(
+        Value::parse(BaseType::Date, "1997-02-29")
+            .unwrap_err()
+            .sqlstate,
+        SqlState::DatetimeFieldOverflow
+    );
+    assert_eq!(
+        Value::parse(BaseType::Date, "not-a-date")
+            .unwrap_err()
+            .sqlstate,
+        SqlState::InvalidTextRepresentation
+    );
 }
 
 #[test]

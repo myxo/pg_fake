@@ -6,7 +6,7 @@ alter_table:1
 arrays:1
 async:1
 bit:1
-boolean:18
+boolean:27
 box:1
 case:18
 char:21
@@ -35,7 +35,7 @@ create_table:1
 create_table_like:3
 create_type:5
 create_view:2
-date:9
+date:22
 delete:3
 domain:1
 drop_if_exists:19
@@ -44,8 +44,8 @@ encoding:11
 enum:1
 errors:2
 expressions:1
-float4:9
-float8:9
+float4:27
+float8:11
 foreign_key:3
 generated_stored:1
 generated_virtual:1
@@ -59,7 +59,7 @@ int2:10
 int4:10
 int8:9
 interval:1
-join:30
+join:43
 join_hash:5
 json:8
 json_encoding:27
@@ -120,7 +120,7 @@ time:4
 timestamp:3
 timestamptz:3
 timetz:1
-transactions:14
+transactions:18
 triggers:3
 truncate:49
 tsdicts:1
@@ -134,7 +134,7 @@ updatable_views:1
 update:12
 uuid:10
 varchar:20
-window:3
+window:7
 with:2
 without_overlaps:1
 xml:1

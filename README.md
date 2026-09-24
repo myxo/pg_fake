@@ -90,10 +90,19 @@ RESET ALL;
 
 Known planner settings are validated and tracked without changing execution;
 strict mode rejects them. Unknown names are rejected rather than accepted by
-prefix. READ COMMITTED and REPEATABLE READ defaults are implemented; other
-isolation levels and non-UTF-8 encodings remain explicit unsupported features.
+prefix. READ COMMITTED, REPEATABLE READ, and SERIALIZABLE isolation are
+implemented; non-UTF-8 encodings remain unsupported.
 Time zones support named IANA zones and numeric offsets; arbitrary POSIX zone
 rules and interval-valued settings remain outside this registry's current surface.
+
+## SQL coverage
+
+Phase 3 supports CTEs, set operations, `ON CONFLICT`, window functions,
+ordinary read-only views, JSON and JSONB, one-dimensional arrays of supported
+scalar types, savepoints, session settings, row locks, transactional DDL, and
+SERIALIZABLE transactions. The supported forms are bounded; see the
+[Phase 3 feature registry](docs/phase3_coverage.md) for examples, explicit
+gaps, and handling in strict mode.
 
 ## Command-line interface
 
