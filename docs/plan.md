@@ -2249,6 +2249,26 @@ the project's own generators do not explore.
 property generator rather than replacing it. Tool selection and the fixed versus
 stateful workload model are intentionally research outcomes of this task.
 
+**Progress:**
+
+- [ ] Select and implement a replacement for the discarded SQLancer
+  log-and-replay approach. The SQLancer harness and campaign artifacts were
+  removed at the user's request; Task 41 remains open.
+- [x] Differential harness `fuzz/fuzz_targets/squirrel_matches_postgres.rs`:
+  splits a script into statements, executes each against PostgreSQL 18 (rolled
+  back transaction, 2s statement timeout) and pg_fake, and aborts on Tier-A
+  divergence (rows, column metadata, affected-row counts, SQLSTATE).
+- [x] Squirrel + AFL++ end-to-end scheme in `fuzz/squirrel/` (Docker image
+  with pinned Squirrel 96810fd / AFL++ 8cdc48f and PostgreSQL 18; target
+  instrumented via sancov + `afl-compiler-rt.o`). Smoke campaign: ~150
+  execs/s at ~99% reported stability (deferred forkserver, pre-fork HashMap
+  seeding, persistent PostgreSQL connection, instrumentation limited to
+  pg_fake/pg_fake_sqlx/sqlparser via `rustc_wrapper.sh`), corpus growth,
+  first real mismatches found and reproducible via `just fuzz-squirrel-repro`.
+  Seeds are limited to Squirrel's grammar subset (no RETURNING/DELETE/
+  aggregates); widening the SQL surface, mismatch classification/dedup and
+  the regression corpus remain open.
+
 ---
 
 ## Phase 3 exit criteria

@@ -22,6 +22,26 @@ bench:
 fuzz-generated-sql:
     cargo +nightly fuzz run generated_sql_matches_postgres
 
+# Build the squirrel + AFL++ differential fuzzing image
+fuzz-squirrel-build:
+    docker build -f fuzz/squirrel/Dockerfile -t pg-fake-squirrel .
+
+# Run a bounded squirrel + AFL++ campaign against PostgreSQL 18
+fuzz-squirrel seconds='300':
+    mkdir -p fuzz/artifacts/squirrel
+    docker run --rm -e AFL_RUN_SECONDS={{seconds}} \
+      -v {{justfile_directory()}}/fuzz/artifacts/squirrel:/out \
+      -v {{justfile_directory()}}/fuzz/squirrel/seeds:/opt/seeds:ro pg-fake-squirrel
+
+# Replay a squirrel crash against PostgreSQL and pg_fake and print the diff
+fuzz-squirrel-repro crash:
+    docker run --rm --entrypoint bash \
+      -v {{justfile_directory()}}:/repo pg-fake-squirrel -c '\
+      su postgres -s /bin/bash -c "/usr/lib/postgresql/18/bin/pg_ctl \
+        -D /var/lib/postgresql/data -l /tmp/pg.log -w -t 60 start" >/dev/null && \
+      PG_FAKE_SQUIRREL_POSTGRES_URL="postgresql://postgres@localhost/postgres?host=/var/run/postgresql" \
+      /opt/fuzz-bin/squirrel_matches_postgres "$(cat /repo/{{crash}})"'
+
 # Record benchmark results as the committed baseline
 bench-record:
     cargo x bench record

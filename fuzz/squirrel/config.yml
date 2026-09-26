@@ -1,0 +1,5 @@
+required: [init_lib, data_lib, db]
+should_exist: [init_lib, data_lib]
+init_lib: /opt/squirrel-src/data/fuzz_root/pqsql_init_lib
+data_lib: /opt/squirrel-src/data/fuzz_root/global_data_lib_pqsql
+db: postgresql

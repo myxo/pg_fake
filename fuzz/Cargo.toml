@@ -7,6 +7,9 @@ edition = "2024"
 [lints.clippy]
 too_many_arguments = "allow"
 
+[lints.rust]
+unexpected_cfgs = { level = "allow", check-cfg = ["cfg(fuzzing)"] }
+
 [package.metadata]
 cargo-fuzz = true
 
@@ -28,8 +31,15 @@ test = false
 doc = false
 bench = false
 
+[[bin]]
+name = "squirrel_matches_postgres"
+path = "fuzz_targets/squirrel_matches_postgres.rs"
+test = true
+doc = false
+bench = false
+
 [workspace]
 members = ["."]
 
 [patch.crates-io]
-sqlparser = { git = "https://github.com/myxo/datafusion-sqlparser-rs", rev = "1bcc091c6b9a49df73e2ed9348f85471a33a985e" }
+sqlparser = { git = "https://github.com/myxo/datafusion-sqlparser-rs", rev = "dfbc74760f1f453cfd207226fdf986285e1f8485" }

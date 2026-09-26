@@ -1,0 +1,7 @@
+.git
+target
+vendor
+fuzz/target
+fuzz/artifacts
+logs
+agent_sessions
