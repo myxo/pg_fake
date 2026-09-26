@@ -230,13 +230,24 @@ pub(crate) fn infer_expression_type(expr: &ast::Expr, schema: RowScope<'_>) -> R
                             })
                     }
                     (None, None)
-                        if matches!(
+                        if ((matches!(
                             left_type,
                             BaseType::Text | BaseType::Varchar | BaseType::Bpchar
-                        ) && matches!(
-                            right_type,
-                            BaseType::Text | BaseType::Varchar | BaseType::Bpchar
-                        ) =>
+                        ) && !matches!(right_type, BaseType::Json | BaseType::Jsonb)
+                            && coercion::can_cast(
+                                right_type,
+                                BaseType::Text,
+                                CastContext::Explicit,
+                            ))
+                            || (matches!(
+                                right_type,
+                                BaseType::Text | BaseType::Varchar | BaseType::Bpchar
+                            ) && !matches!(left_type, BaseType::Json | BaseType::Jsonb)
+                                && coercion::can_cast(
+                                    left_type,
+                                    BaseType::Text,
+                                    CastContext::Explicit,
+                                ))) =>
                     {
                         Ok(BaseType::Text)
                     }
@@ -394,7 +405,12 @@ pub(crate) fn infer_expression_type(expr: &ast::Expr, schema: RowScope<'_>) -> R
             }
             Ok(BaseType::Bool)
         }
-        ast::Expr::IsTrue(expr) | ast::Expr::IsFalse(expr) | ast::Expr::IsUnknown(expr) => {
+        ast::Expr::IsTrue(expr)
+        | ast::Expr::IsFalse(expr)
+        | ast::Expr::IsUnknown(expr)
+        | ast::Expr::IsNotTrue(expr)
+        | ast::Expr::IsNotFalse(expr)
+        | ast::Expr::IsNotUnknown(expr) => {
             let base = infer_expression_type(expr, schema)?;
             if base == BaseType::Bool
                 || is_null_literal(expr)

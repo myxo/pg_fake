@@ -526,6 +526,12 @@ pub(super) fn infer_function_return_type(
         return Ok(result);
     }
     match function_name.as_str() {
+        "num_nulls" | "num_nonnulls" if !arguments.is_empty() => {
+            for argument in &arguments {
+                infer_expression_type(argument, schema)?;
+            }
+            Ok(BaseType::Int4)
+        }
         "coalesce" if !arguments.is_empty() => resolve_expression_list_type(&arguments, schema),
         "greatest" | "least" if !arguments.is_empty() => {
             let data_type = resolve_expression_list_type(&arguments, schema)?;
@@ -618,7 +624,9 @@ pub(super) fn infer_function_return_type(
             }
             Ok(BaseType::Int8)
         }
-        "coalesce"
+        "num_nulls"
+        | "num_nonnulls"
+        | "coalesce"
         | "nullif"
         | "greatest"
         | "least"
@@ -728,6 +736,16 @@ pub(super) fn evaluate_function(
         );
     }
     match function_name.as_str() {
+        "num_nulls" | "num_nonnulls" => {
+            let mut count = 0;
+            for argument in arguments {
+                let is_null = evaluate(argument, schema, row, context)?.is_null();
+                if is_null == (function_name == "num_nulls") {
+                    count += 1;
+                }
+            }
+            Ok(Value::Int4(count))
+        }
         "pg_is_in_recovery" => Ok(Value::Bool(false)),
         "current_setting" => {
             let name = evaluate_and_coerce(
@@ -1090,7 +1108,7 @@ pub(super) fn evaluate_function(
                 } else {
                     &value
                 };
-                Ok(Value::Text(value.to_lowercase()))
+                Ok(Value::Text(value.to_ascii_lowercase()))
             }
             _ => unreachable!("lower argument was type-checked"),
         },
@@ -1102,7 +1120,7 @@ pub(super) fn evaluate_function(
                 } else {
                     &value
                 };
-                Ok(Value::Text(value.to_uppercase()))
+                Ok(Value::Text(value.to_ascii_uppercase()))
             }
             _ => unreachable!("upper argument was type-checked"),
         },

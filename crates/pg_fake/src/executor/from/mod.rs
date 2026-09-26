@@ -5,7 +5,7 @@ use crate::{
         DatabaseState, StatementContext,
         expressions::{
             UnnestTableFunction, evaluate, extract_unknown_string_literal,
-            extract_unnest_table_function,
+            extract_unnest_table_function, validate_constant_boolean_operands,
         },
         json,
         lateral::{InitplanKey, bind_lateral_query, contains_lateral_source},
@@ -88,6 +88,20 @@ pub(super) fn materialize_from_rows(
     if from.is_empty() {
         return Ok(vec![SourceRow::create(Vec::new())]);
     }
+    let selection = selection.filter(|_| {
+        !from.iter().any(|table| {
+            table.joins.iter().any(|join| {
+                matches!(
+                    join.join_operator,
+                    ast::JoinOperator::Left(_)
+                        | ast::JoinOperator::LeftOuter(_)
+                        | ast::JoinOperator::Right(_)
+                        | ast::JoinOperator::RightOuter(_)
+                        | ast::JoinOperator::FullOuter(_)
+                )
+            })
+        })
+    });
     let mut next_slot = start_slot;
     let mut rows = vec![SourceRow::create(vec![Value::Null; scope.columns.len()])];
     for table in from {
@@ -144,9 +158,39 @@ pub(super) fn visit_query_source_rows(
     selection: Option<&ast::Expr>,
     visit: &mut RowConsumer<'_>,
 ) -> Result<()> {
+    if let Some(selection) = selection {
+        validate_constant_boolean_operands(selection, RowScope::Bound(scope), context)?;
+    }
+    if let Some(having) = &select.having {
+        validate_constant_boolean_operands(having, RowScope::Bound(scope), context)?;
+    }
+    for item in &select.projection {
+        let expression = match item {
+            ast::SelectItem::UnnamedExpr(expression)
+            | ast::SelectItem::ExprWithAlias {
+                expr: expression, ..
+            } => expression,
+            _ => continue,
+        };
+        validate_constant_boolean_operands(expression, RowScope::Bound(scope), context)?;
+    }
     if crate::executor::lateral::skips_lateral_rows(selection, context) {
         return Ok(());
     }
+    let selection = selection.filter(|_| {
+        !select.from.iter().any(|table| {
+            table.joins.iter().any(|join| {
+                matches!(
+                    join.join_operator,
+                    ast::JoinOperator::Left(_)
+                        | ast::JoinOperator::LeftOuter(_)
+                        | ast::JoinOperator::Right(_)
+                        | ast::JoinOperator::RightOuter(_)
+                        | ast::JoinOperator::FullOuter(_)
+                )
+            })
+        })
+    });
     if context.capture_lock_queries {
         return streaming::visit_demand_source_rows(
             state, select, scope, xid, snapshot, context, selection, visit,
@@ -352,14 +396,7 @@ fn materialize_table_factor_rows(
         let filtered = if is_cte {
             None
         } else {
-            subqueries::push_derived_filters(
-                state,
-                query,
-                scope,
-                *next_slot,
-                selection,
-                inherited.is_some(),
-            )?
+            subqueries::push_derived_filters(state, query, scope, *next_slot, selection)?
         };
         let query = filtered.as_ref().unwrap_or(query);
         let InitplanKey::Scalar(projection) = InitplanKey::create_scalar(query) else {

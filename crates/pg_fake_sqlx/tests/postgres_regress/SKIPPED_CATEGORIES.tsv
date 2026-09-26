@@ -115,7 +115,7 @@ sequence:7	later
 strings:1	parser
 subselect:9	parser
 temp:21	later
-text:5	later
+text:8	later
 time:4	later
 timestamp:3	later
 timestamptz:3	later

@@ -10,6 +10,117 @@ use differential::{
 };
 
 #[test]
+fn matches_outer_join_null_filter_and_boolean_short_circuit() {
+    let server = start_isolated_postgres_server();
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap();
+    let mut postgres = runtime
+        .block_on(PgConnection::connect(&server.url))
+        .unwrap();
+    let mut fake = PgFakeConnection::new(Db::create());
+    for sql in [
+        "CREATE TABLE filter_left (id integer)",
+        "CREATE TABLE filter_right (id integer, value integer)",
+        "INSERT INTO filter_left VALUES (1), (2)",
+        "INSERT INTO filter_right VALUES (1, 9)",
+        "SELECT l.id FROM filter_left l LEFT JOIN filter_right r ON r.id = l.id WHERE r.value IS NULL ORDER BY l.id",
+        "SELECT l.id FROM filter_left l LEFT JOIN filter_right r ON r.id = l.id WHERE r.value IS NOT NULL ORDER BY l.id",
+        "SELECT upper('Ꭻ'::text)",
+        "SELECT FALSE AND (1 / 0 = 0)",
+        "SELECT TRUE OR (1 / 0 = 0)",
+    ] {
+        assert_statement(&runtime, &mut postgres, &mut fake, sql, RowOrder::Ordered);
+    }
+    for sql in ["SELECT (1 / 0 = 0) AND FALSE", "SELECT (1 / 0 = 0) OR TRUE"] {
+        assert_statement_allow_error(&runtime, &mut postgres, &mut fake, sql, RowOrder::Ordered);
+    }
+    assert_statement_allow_error(
+        &runtime,
+        &mut postgres,
+        &mut fake,
+        "SELECT 1 FROM (SELECT 1 AS x WHERE FALSE) t WHERE (x = 1) AND CAST(('bad')::VARCHAR AS BOOLEAN)",
+        RowOrder::Ordered,
+    );
+    assert_statement_allow_error(
+        &runtime,
+        &mut postgres,
+        &mut fake,
+        "SELECT 1 FROM (SELECT 1 AS x WHERE FALSE) t WHERE ((x = 1) AND CAST(('bad')::VARCHAR AS BOOLEAN)) IS FALSE",
+        RowOrder::Ordered,
+    );
+    assert_statement_allow_error(
+        &runtime,
+        &mut postgres,
+        &mut fake,
+        "SELECT 1 FROM (SELECT 1 AS x WHERE FALSE) t WHERE ((x = 1) AND CAST(('bad')::VARCHAR AS BOOLEAN)) = TRUE",
+        RowOrder::Ordered,
+    );
+    assert_statement_allow_error(
+        &runtime,
+        &mut postgres,
+        &mut fake,
+        "SELECT (x = 1) AND CAST(('bad')::VARCHAR AS BOOLEAN) FROM (SELECT 1 AS x WHERE FALSE) t",
+        RowOrder::Ordered,
+    );
+    assert_statement_allow_error(
+        &runtime,
+        &mut postgres,
+        &mut fake,
+        "SELECT CAST((x = 1) AND CAST('bad' AS BOOLEAN) AS TEXT) FROM (SELECT 1 AS x WHERE FALSE) t",
+        RowOrder::Ordered,
+    );
+    assert_statement_allow_error(
+        &runtime,
+        &mut postgres,
+        &mut fake,
+        "SELECT COALESCE((x = 1) AND CAST('bad' AS BOOLEAN), FALSE) FROM (SELECT 1 AS x WHERE FALSE) t",
+        RowOrder::Ordered,
+    );
+}
+
+#[test]
+fn matches_replayed_expression_and_derived_filter_regressions() {
+    let server = start_isolated_postgres_server();
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap();
+    let mut postgres = runtime
+        .block_on(PgConnection::connect(&server.url))
+        .unwrap();
+    let mut fake = PgFakeConnection::new(Db::create());
+    for sql in [
+        "CREATE TABLE derived_boolean (id bigint, flag boolean, value text)",
+        "INSERT INTO derived_boolean VALUES (-694373444, TRUE, 'f5ag'), (1171521147, FALSE, 'f5ag')",
+        "SELECT * FROM (SELECT id, flag, value FROM derived_boolean WHERE flag OR value::boolean) AS result WHERE id = -694373444 AND flag = TRUE AND value = 'f5ag'",
+        "SELECT * FROM (SELECT DISTINCT id, flag, value FROM derived_boolean WHERE flag OR value::boolean GROUP BY id, flag, value) AS result WHERE id = -694373444 AND flag = TRUE AND value = 'f5ag'",
+        "CREATE TABLE derived_integer (id bigint, flag boolean, value text)",
+        "INSERT INTO derived_integer VALUES (-439725413, TRUE, '-439725413'), (1174940318, FALSE, 'FkWxH/')",
+        "SELECT * FROM (SELECT DISTINCT id, flag, value FROM derived_integer WHERE (value::integer NOT IN (id::integer)) IS FALSE ORDER BY id, flag) AS result WHERE id = -439725413 AND flag = TRUE AND value = '-439725413'",
+        "CREATE TABLE derived_null (id bigint, flag boolean, value text)",
+        "INSERT INTO derived_null VALUES (-296315549, FALSE, NULL), (1193343114, FALSE, 'HZ')",
+        "SELECT * FROM (SELECT DISTINCT id, flag, value FROM derived_null WHERE CAST(value::varchar AS boolean) IS NULL GROUP BY id, flag, value) AS result WHERE id = -296315549 AND flag = FALSE AND value IS NULL",
+        "CREATE TABLE derived_group (id bigint, flag boolean, value text)",
+        "INSERT INTO derived_group VALUES (1627862158, FALSE, 'safe'), (0, TRUE, '')",
+        "SELECT * FROM (SELECT DISTINCT id, flag, value FROM derived_group WHERE id::integer > ((id - id) % id) GROUP BY id, flag, value) AS result WHERE id = 1627862158 AND flag = FALSE",
+        "SELECT num_nulls(NULL::integer, 1, NULL::boolean), num_nonnulls(NULL::integer, 1, NULL::boolean)",
+        "SELECT 'x=' || 42::integer, 42::integer || '=x', 'x' || TRUE",
+        "SELECT NULL::boolean IS NOT TRUE, TRUE IS NOT FALSE, NULL::boolean IS NOT UNKNOWN",
+    ] {
+        assert_statement(&runtime, &mut postgres, &mut fake, sql, RowOrder::Ordered);
+    }
+    assert_statement_allow_error(
+        &runtime,
+        &mut postgres,
+        &mut fake,
+        "SELECT ('233768573' || TRUE || '233768573')::boolean",
+        RowOrder::Ordered,
+    );
+}
+
+#[test]
 fn matches_runtime_expression_fixtures() {
     let server = start_isolated_postgres_server();
     let runtime = tokio::runtime::Builder::new_current_thread()

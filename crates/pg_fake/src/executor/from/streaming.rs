@@ -306,7 +306,7 @@ fn visit_source_plan(
             let filtered = if is_cte {
                 None
             } else {
-                push_derived_filters(state, query, scope, *start, selection, inherited.is_some())?
+                push_derived_filters(state, query, scope, *start, selection)?
             };
             let query = filtered.as_ref().unwrap_or(query);
             let mut invocation = context.clone();

@@ -178,6 +178,18 @@ pub(super) fn collect_pushdown_filters<'a>(
 
 #[cfg_attr(feature = "execution-log", tracing::instrument(skip_all))]
 fn resolve_pushdown_column(expr: &ast::Expr, scope: &BoundScope) -> Option<usize> {
+    if let ast::Expr::IsNull(inner) | ast::Expr::IsNotNull(inner) = expr {
+        return match inner.as_ref() {
+            ast::Expr::Identifier(column) => scope
+                .resolve_column(std::slice::from_ref(column))
+                .ok()
+                .map(|(slot, _)| slot),
+            ast::Expr::CompoundIdentifier(columns) => {
+                scope.resolve_column(columns).ok().map(|(slot, _)| slot)
+            }
+            _ => None,
+        };
+    }
     let ast::Expr::BinaryOp { left, right, .. } = expr else {
         return None;
     };

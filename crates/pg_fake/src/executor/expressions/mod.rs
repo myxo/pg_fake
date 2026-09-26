@@ -192,6 +192,113 @@ pub(crate) fn create_constant_expression_schema() -> TableSchema {
     }
 }
 
+fn is_constant_expression(expr: &ast::Expr) -> bool {
+    match expr {
+        ast::Expr::Value(_) => true,
+        ast::Expr::Nested(inner)
+        | ast::Expr::Cast { expr: inner, .. }
+        | ast::Expr::UnaryOp { expr: inner, .. }
+        | ast::Expr::IsNull(inner)
+        | ast::Expr::IsNotNull(inner)
+        | ast::Expr::IsTrue(inner)
+        | ast::Expr::IsFalse(inner)
+        | ast::Expr::IsUnknown(inner)
+        | ast::Expr::IsNotTrue(inner)
+        | ast::Expr::IsNotFalse(inner)
+        | ast::Expr::IsNotUnknown(inner) => is_constant_expression(inner),
+        ast::Expr::BinaryOp { left, right, .. }
+        | ast::Expr::IsDistinctFrom(left, right)
+        | ast::Expr::IsNotDistinctFrom(left, right) => {
+            is_constant_expression(left) && is_constant_expression(right)
+        }
+        _ => false,
+    }
+}
+
+pub(in crate::executor) fn validate_constant_boolean_operands(
+    expr: &ast::Expr,
+    schema: RowScope<'_>,
+    context: &StatementContext,
+) -> Result<()> {
+    match expr {
+        ast::Expr::Nested(inner)
+        | ast::Expr::Cast { expr: inner, .. }
+        | ast::Expr::UnaryOp { expr: inner, .. }
+        | ast::Expr::IsNull(inner)
+        | ast::Expr::IsNotNull(inner)
+        | ast::Expr::IsTrue(inner)
+        | ast::Expr::IsFalse(inner)
+        | ast::Expr::IsUnknown(inner)
+        | ast::Expr::IsNotTrue(inner)
+        | ast::Expr::IsNotFalse(inner)
+        | ast::Expr::IsNotUnknown(inner) => {
+            validate_constant_boolean_operands(inner, schema, context)
+        }
+        ast::Expr::BinaryOp { left, op, right }
+            if matches!(op, ast::BinaryOperator::And | ast::BinaryOperator::Or) =>
+        {
+            if is_constant_expression(left) {
+                let value = evaluate_and_coerce(
+                    left,
+                    BaseType::Bool,
+                    CastContext::Implicit,
+                    schema,
+                    &[],
+                    context,
+                )?;
+                if matches!(
+                    (op, value),
+                    (ast::BinaryOperator::And, Value::Bool(false))
+                        | (ast::BinaryOperator::Or, Value::Bool(true))
+                ) {
+                    return Ok(());
+                }
+            } else {
+                validate_constant_boolean_operands(left, schema, context)?;
+            }
+            if is_constant_expression(right) {
+                evaluate_and_coerce(
+                    right,
+                    BaseType::Bool,
+                    CastContext::Implicit,
+                    schema,
+                    &[],
+                    context,
+                )?;
+            } else {
+                validate_constant_boolean_operands(right, schema, context)?;
+            }
+            Ok(())
+        }
+        ast::Expr::BinaryOp { left, right, .. }
+        | ast::Expr::IsDistinctFrom(left, right)
+        | ast::Expr::IsNotDistinctFrom(left, right) => {
+            validate_constant_boolean_operands(left, schema, context)?;
+            validate_constant_boolean_operands(right, schema, context)
+        }
+        ast::Expr::Function(function) => {
+            let ast::FunctionArguments::List(arguments) = &function.args else {
+                return Ok(());
+            };
+            for argument in &arguments.args {
+                let ast::FunctionArg::Unnamed(ast::FunctionArgExpr::Expr(expression)) = argument
+                else {
+                    continue;
+                };
+                validate_constant_boolean_operands(expression, schema, context)?;
+                if function.name.to_string().eq_ignore_ascii_case("coalesce")
+                    && is_constant_expression(expression)
+                    && !evaluate(expression, schema, &[], context)?.is_null()
+                {
+                    break;
+                }
+            }
+            Ok(())
+        }
+        _ => Ok(()),
+    }
+}
+
 #[cfg_attr(feature = "execution-log", tracing::instrument(skip_all))]
 fn evaluate_inner(
     expr: &ast::Expr,
@@ -418,14 +525,19 @@ fn evaluate_inner(
                     BaseType::Text | BaseType::Varchar | BaseType::Bpchar
                 )
             };
+            let left_type = infer_expression_type(left, schema)?;
+            let right_type = infer_expression_type(right, schema)?;
             if *op == ast::BinaryOperator::StringConcat
-                && is_string(infer_expression_type(left, schema)?)
-                && is_string(infer_expression_type(right, schema)?)
+                && (is_string(left_type) || is_string(right_type))
+                && left_type.get_array_element_type().is_none()
+                && right_type.get_array_element_type().is_none()
+                && !matches!(left_type, BaseType::Json | BaseType::Jsonb)
+                && !matches!(right_type, BaseType::Json | BaseType::Jsonb)
             {
                 let left = evaluate_and_coerce(
                     left,
                     BaseType::Text,
-                    CastContext::Implicit,
+                    CastContext::Explicit,
                     schema,
                     row,
                     context,
@@ -433,7 +545,7 @@ fn evaluate_inner(
                 let right = evaluate_and_coerce(
                     right,
                     BaseType::Text,
-                    CastContext::Implicit,
+                    CastContext::Explicit,
                     schema,
                     row,
                     context,
@@ -508,8 +620,51 @@ fn evaluate_inner(
                 | ast::BinaryOperator::Modulo => resolve_operator_type(left, right, schema)?,
                 _ => resolve_operator_type(left, right, schema)?,
             };
-            let left =
-                evaluate_and_coerce(left, target, CastContext::Implicit, schema, row, context)?;
+            let boolean = matches!(op, ast::BinaryOperator::And | ast::BinaryOperator::Or);
+            let constant_left = if boolean && is_constant_expression(left) {
+                Some(evaluate_and_coerce(
+                    left,
+                    target,
+                    CastContext::Implicit,
+                    schema,
+                    row,
+                    context,
+                )?)
+            } else {
+                None
+            };
+            if matches!(
+                (op, constant_left.as_ref()),
+                (ast::BinaryOperator::And, Some(Value::Bool(false)))
+                    | (ast::BinaryOperator::Or, Some(Value::Bool(true)))
+            ) {
+                return Ok(constant_left.expect("decisive constant was evaluated"));
+            }
+            let constant_right = if boolean && is_constant_expression(right) {
+                Some(evaluate_and_coerce(
+                    right,
+                    target,
+                    CastContext::Implicit,
+                    schema,
+                    row,
+                    context,
+                )?)
+            } else {
+                None
+            };
+            if matches!(
+                (op, constant_right.as_ref()),
+                (ast::BinaryOperator::And, Some(Value::Bool(false)))
+                    | (ast::BinaryOperator::Or, Some(Value::Bool(true)))
+            ) {
+                return Ok(constant_right.expect("decisive constant was evaluated"));
+            }
+            let left = match constant_left {
+                Some(value) => value,
+                None => {
+                    evaluate_and_coerce(left, target, CastContext::Implicit, schema, row, context)?
+                }
+            };
             if matches!(
                 (op, &left),
                 (ast::BinaryOperator::And, Value::Bool(false))
@@ -517,8 +672,12 @@ fn evaluate_inner(
             ) {
                 return Ok(left);
             }
-            let right =
-                evaluate_and_coerce(right, target, CastContext::Implicit, schema, row, context)?;
+            let right = match constant_right {
+                Some(value) => value,
+                None => {
+                    evaluate_and_coerce(right, target, CastContext::Implicit, schema, row, context)?
+                }
+            };
             match op {
                 ast::BinaryOperator::Plus
                 | ast::BinaryOperator::Minus
@@ -604,6 +763,39 @@ fn evaluate_inner(
         ))),
         ast::Expr::IsUnknown(expr) => Ok(Value::Bool(
             evaluate_and_coerce(
+                expr,
+                BaseType::Bool,
+                CastContext::Implicit,
+                schema,
+                row,
+                context,
+            )?
+            .is_null(),
+        )),
+        ast::Expr::IsNotTrue(expr) => Ok(Value::Bool(!matches!(
+            evaluate_and_coerce(
+                expr,
+                BaseType::Bool,
+                CastContext::Implicit,
+                schema,
+                row,
+                context
+            )?,
+            Value::Bool(true)
+        ))),
+        ast::Expr::IsNotFalse(expr) => Ok(Value::Bool(!matches!(
+            evaluate_and_coerce(
+                expr,
+                BaseType::Bool,
+                CastContext::Implicit,
+                schema,
+                row,
+                context
+            )?,
+            Value::Bool(false)
+        ))),
+        ast::Expr::IsNotUnknown(expr) => Ok(Value::Bool(
+            !evaluate_and_coerce(
                 expr,
                 BaseType::Bool,
                 CastContext::Implicit,
