@@ -136,7 +136,7 @@ fn normalize_bound_expression(expression: &ast::Expr, scope: &BoundScope) -> Res
         query_depth: 0,
         error: None,
     };
-    let _ = expression.visit(&mut normalizer);
+    let _ = expression.visit(&mut crate::ast_visit::WriteVisitor(&mut normalizer));
     normalizer.error.map_or(Ok(expression), Err)
 }
 
@@ -217,6 +217,6 @@ pub(super) fn prune_constant_cases(
         type_context,
         error: None,
     };
-    let _ = expression.visit(&mut pruner);
+    let _ = expression.visit(&mut crate::ast_visit::WriteVisitor(&mut pruner));
     pruner.error.map_or(Ok(()), Err)
 }

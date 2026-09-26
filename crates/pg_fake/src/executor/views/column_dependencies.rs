@@ -372,7 +372,7 @@ pub(super) fn collect_view_column_dependencies(
                         cte_scopes: Vec::new(),
                         found: false,
                     };
-                    let _ = query.visit(&mut detector);
+                    let _ = query.visit(&mut crate::ast_visit::WriteVisitor(&mut detector));
                     detector.found.then_some(column.name.clone())
                 })
                 .collect();

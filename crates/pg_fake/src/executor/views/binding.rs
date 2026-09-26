@@ -199,7 +199,7 @@ pub(super) fn bind_view_dependencies(
         cte_scopes: Vec::new(),
         error: None,
     };
-    let _ = query.visit(&mut collector);
+    let _ = query.visit(&mut crate::ast_visit::WriteVisitor(&mut collector));
     match collector.error {
         Some(error) => Err(error),
         None => {

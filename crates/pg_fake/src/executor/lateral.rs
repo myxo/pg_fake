@@ -105,7 +105,10 @@ pub(crate) fn bind_lateral_query(
         }
     }
     let mut query = query.clone();
-    let _ = ast::VisitMut::visit(&mut query, &mut ProjectionNamer);
+    let _ = ast::VisitMut::visit(
+        &mut query,
+        &mut crate::ast_visit::WriteVisitor(&mut ProjectionNamer),
+    );
     let slots = substitute_outer_references(
         catalog,
         &mut query,

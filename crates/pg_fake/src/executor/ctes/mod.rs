@@ -163,7 +163,7 @@ pub(super) fn materialize_query_ctes(
             context,
             error: None,
         };
-        let _ = query.visit(&mut materializer);
+        let _ = query.visit(&mut crate::ast_visit::WriteVisitor(&mut materializer));
         if let Some(error) = materializer.error {
             return Err(error);
         }

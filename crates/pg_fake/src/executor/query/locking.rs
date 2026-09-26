@@ -115,7 +115,7 @@ pub(in crate::executor) fn resolve_query_lock_targets(
         depth: 0,
         found: false,
     };
-    let _ = ast::Visit::visit(query, &mut detector);
+    let _ = ast::Visit::visit(query, &mut crate::ast_visit::ReadVisitor(&mut detector));
     if locking && detector.found {
         return reject_unsupported("row locking is not allowed with window functions");
     }
@@ -302,7 +302,7 @@ pub(in crate::executor) fn contains_locking_operations(value: &impl ast::Visit) 
         }
     }
     let mut detector = LockDetector(false);
-    let _ = value.visit(&mut detector);
+    let _ = value.visit(&mut crate::ast_visit::ReadVisitor(&mut detector));
     detector.0
 }
 
@@ -317,7 +317,7 @@ pub(in crate::executor) fn requires_nested_locking(query: &ast::Query) -> bool {
         }
     }
     let mut detector = BarrierDetector(false);
-    let _ = ast::Visit::visit(query, &mut detector);
+    let _ = ast::Visit::visit(query, &mut crate::ast_visit::ReadVisitor(&mut detector));
     detector.0
 }
 

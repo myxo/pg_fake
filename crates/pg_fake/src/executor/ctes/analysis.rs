@@ -43,7 +43,7 @@ pub(in crate::executor) fn inline_query_with_cte_scope(
         validate_recursive_types: true,
         lateral_depth: 0,
     };
-    let _ = query.visit(&mut replacer);
+    let _ = query.visit(&mut crate::ast_visit::WriteVisitor(&mut replacer));
     replacer.error.map_or(Ok(query), Err)
 }
 
@@ -120,7 +120,9 @@ impl ast::VisitorMut for InlineCteReferenceReplacer<'_> {
                         && self.lateral_depth == 0,
                     lateral_depth: 0,
                 };
-                let _ = cte.query.visit(&mut replacer);
+                let _ = cte
+                    .query
+                    .visit(&mut crate::ast_visit::WriteVisitor(&mut replacer));
                 if let Some(error) = replacer.error {
                     self.error = Some(error);
                     return std::ops::ControlFlow::Break(());
@@ -220,7 +222,7 @@ pub(in crate::executor) fn inline_query_ctes(
             validate_recursive_types,
             lateral_depth: 0,
         };
-        let _ = query.visit(&mut replacer);
+        let _ = query.visit(&mut crate::ast_visit::WriteVisitor(&mut replacer));
         if let Some(error) = replacer.error {
             return Err(error);
         }
@@ -259,7 +261,7 @@ pub(in crate::executor) fn inline_query_ctes(
             validate_recursive_types,
             lateral_depth: 0,
         };
-        let _ = cte_query.visit(&mut replacer);
+        let _ = cte_query.visit(&mut crate::ast_visit::WriteVisitor(&mut replacer));
         if let Some(error) = replacer.error {
             return Err(error);
         }
@@ -306,7 +308,7 @@ pub(in crate::executor) fn inline_query_ctes(
         validate_recursive_types,
         lateral_depth: 0,
     };
-    let _ = query.visit(&mut replacer);
+    let _ = query.visit(&mut crate::ast_visit::WriteVisitor(&mut replacer));
     if let Some(error) = replacer.error {
         return Err(error);
     }
@@ -365,7 +367,7 @@ fn inline_recursive_query_ctes(
                 validate_recursive_types,
                 lateral_depth: 0,
             };
-            let _ = cte_query.visit(&mut replacer);
+            let _ = cte_query.visit(&mut crate::ast_visit::WriteVisitor(&mut replacer));
             if let Some(error) = replacer.error {
                 return Err(error);
             }
@@ -389,7 +391,7 @@ fn inline_recursive_query_ctes(
                     validate_recursive_types,
                     lateral_depth: 0,
                 };
-                let _ = cte_query.visit(&mut replacer);
+                let _ = cte_query.visit(&mut crate::ast_visit::WriteVisitor(&mut replacer));
                 if let Some(error) = replacer.error {
                     return Err(error);
                 }
@@ -419,7 +421,7 @@ fn inline_recursive_query_ctes(
         validate_recursive_types,
         lateral_depth: 0,
     };
-    let _ = query.visit(&mut replacer);
+    let _ = query.visit(&mut crate::ast_visit::WriteVisitor(&mut replacer));
     if let Some(error) = replacer.error {
         return Err(error);
     }
@@ -508,7 +510,7 @@ pub(crate) fn expand_ctes_for_analysis<'a>(
                     validate_recursive_types: true,
                     lateral_depth: 0,
                 };
-                let _ = cte_query.visit(&mut replacer);
+                let _ = cte_query.visit(&mut crate::ast_visit::WriteVisitor(&mut replacer));
                 if let Some(error) = replacer.error {
                     return Err(error);
                 }
@@ -550,7 +552,7 @@ pub(crate) fn expand_ctes_for_analysis<'a>(
                         validate_recursive_types: true,
                         lateral_depth: 0,
                     };
-                    let _ = cte_query.visit(&mut replacer);
+                    let _ = cte_query.visit(&mut crate::ast_visit::WriteVisitor(&mut replacer));
                     if let Some(error) = replacer.error {
                         return Err(error);
                     }
@@ -580,7 +582,7 @@ pub(crate) fn expand_ctes_for_analysis<'a>(
             validate_recursive_types: true,
             lateral_depth: 0,
         };
-        let _ = query.visit(&mut replacer);
+        let _ = query.visit(&mut crate::ast_visit::WriteVisitor(&mut replacer));
         if let Some(error) = replacer.error {
             return Err(error);
         }
@@ -613,7 +615,7 @@ pub(crate) fn expand_ctes_for_analysis<'a>(
                 validate_recursive_types: true,
                 lateral_depth: 0,
             };
-            let _ = cte_query.visit(&mut replacer);
+            let _ = cte_query.visit(&mut crate::ast_visit::WriteVisitor(&mut replacer));
             if let Some(error) = replacer.error {
                 return Err(error);
             }

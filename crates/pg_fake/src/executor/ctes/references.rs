@@ -63,7 +63,7 @@ pub(super) fn reject_cte_forward_references(
         names,
         error: None,
     };
-    let _ = query.visit(&mut detector);
+    let _ = query.visit(&mut crate::ast_visit::WriteVisitor(&mut detector));
     detector.error.map_or(Ok(()), Err)
 }
 
@@ -125,7 +125,7 @@ pub(in crate::executor) fn collect_cte_references(
         masked: Vec::new(),
         found: BTreeSet::new(),
     };
-    let _ = query.visit(&mut collector);
+    let _ = query.visit(&mut crate::ast_visit::WriteVisitor(&mut collector));
     collector.found
 }
 
@@ -176,11 +176,13 @@ pub(super) fn replace_cte_references(
             }
         }
     }
-    let _ = query.visit(&mut CteReferenceReplacer {
-        ctes,
-        masked: Vec::new(),
-        replacement_depth: None,
-    });
+    let _ = query.visit(&mut crate::ast_visit::WriteVisitor(
+        &mut CteReferenceReplacer {
+            ctes,
+            masked: Vec::new(),
+            replacement_depth: None,
+        },
+    ));
 }
 
 struct CteReferenceReplacer<'a> {
@@ -359,5 +361,5 @@ pub(in crate::executor) fn contains_query_ctes(query: &ast::Query) -> bool {
         }
     }
 
-    ast::Visit::visit(query, &mut CteDetector).is_break()
+    ast::Visit::visit(query, &mut crate::ast_visit::ReadVisitor(&mut CteDetector)).is_break()
 }

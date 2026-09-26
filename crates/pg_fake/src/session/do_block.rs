@@ -147,7 +147,7 @@ fn substitute_procedural_statement_locals(
         group_by_depth: 0,
         group_expression_depth: 0,
     };
-    let _ = statement.visit(&mut substituter);
+    let _ = statement.visit(&mut crate::ast_visit::WriteVisitor(&mut substituter));
 }
 
 fn validate_procedural_targets(

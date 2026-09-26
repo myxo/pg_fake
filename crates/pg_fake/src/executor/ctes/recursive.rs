@@ -96,7 +96,7 @@ fn count_recursive_references(expression: &ast::SetExpr, name: &str) -> usize {
         masked: Vec::new(),
         count: 0,
     };
-    let _ = query.visit(&mut counter);
+    let _ = query.visit(&mut crate::ast_visit::WriteVisitor(&mut counter));
     counter.count
 }
 
@@ -108,7 +108,7 @@ fn count_query_recursive_references(query: &ast::Query, name: &str) -> usize {
         masked: Vec::new(),
         count: 0,
     };
-    let _ = query.visit(&mut counter);
+    let _ = query.visit(&mut crate::ast_visit::WriteVisitor(&mut counter));
     counter.count
 }
 
@@ -120,7 +120,7 @@ fn count_factor_recursive_references(factor: &ast::TableFactor, name: &str) -> u
         masked: Vec::new(),
         count: 0,
     };
-    let _ = factor.visit(&mut counter);
+    let _ = factor.visit(&mut crate::ast_visit::WriteVisitor(&mut counter));
     counter.count
 }
 
@@ -194,7 +194,7 @@ fn validate_recursive_placements(expression: &ast::SetExpr, name: &str) -> Resul
         name,
         invalid: false,
     };
-    let _ = query.visit(&mut validator);
+    let _ = query.visit(&mut crate::ast_visit::WriteVisitor(&mut validator));
     if validator.invalid {
         Err(PgError::create(
             SqlState::InvalidRecursion,

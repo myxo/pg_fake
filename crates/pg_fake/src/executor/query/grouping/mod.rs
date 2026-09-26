@@ -215,7 +215,7 @@ pub(super) fn materialize_aggregate_expression(
         query_depth: 0,
         error: None,
     };
-    let _ = expression.visit(&mut materializer);
+    let _ = expression.visit(&mut crate::ast_visit::WriteVisitor(&mut materializer));
     materializer.error.map_or(Ok(expression), Err)
 }
 
@@ -236,7 +236,7 @@ pub(super) fn collect_group_aggregate_functions(
         collector.owner = owner;
         let mut expression = expression.clone();
         prune_constant_cases(&mut expression, Some((state, scope)))?;
-        let _ = expression.visit(&mut collector);
+        let _ = expression.visit(&mut crate::ast_visit::WriteVisitor(&mut collector));
         Ok(())
     };
     for (index, projection) in projections.iter().enumerate() {

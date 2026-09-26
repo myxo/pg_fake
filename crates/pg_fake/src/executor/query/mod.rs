@@ -93,7 +93,7 @@ pub(crate) fn detect_statement_features(statement: &ast::Statement) -> (bool, bo
         cte: false,
         subquery: false,
     };
-    let _ = ast::Visit::visit(statement, &mut detector);
+    let _ = ast::Visit::visit(statement, &mut crate::ast_visit::ReadVisitor(&mut detector));
     (detector.cte, detector.subquery)
 }
 
@@ -360,7 +360,10 @@ fn execute_query_inner(
             std::ops::ControlFlow::Continue(())
         }
     }
-    let _ = ast::Visit::visit(&select.from, &mut DerivedSources(&mut derived));
+    let _ = ast::Visit::visit(
+        &select.from,
+        &mut crate::ast_visit::ReadVisitor(&mut DerivedSources(&mut derived)),
+    );
     let lock_targets = context
         .source_row_locks
         .iter()

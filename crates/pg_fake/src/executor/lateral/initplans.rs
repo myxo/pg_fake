@@ -50,7 +50,10 @@ impl InitplanKey {
                                 std::ops::ControlFlow::Continue(())
                             }
                         }
-                        let _ = ast::VisitMut::visit(&mut expression, &mut AliasRemover);
+                        let _ = ast::VisitMut::visit(
+                            &mut expression,
+                            &mut crate::ast_visit::WriteVisitor(&mut AliasRemover),
+                        );
                         keys.push((span, expression.to_string()));
                     }
                 }
@@ -254,7 +257,12 @@ pub(crate) fn collect_lateral_initplans(
             }
         }
     }
-    if ast::Visit::visit(statement, &mut LateralDetector).is_continue() {
+    if ast::Visit::visit(
+        statement,
+        &mut crate::ast_visit::ReadVisitor(&mut LateralDetector),
+    )
+    .is_continue()
+    {
         return InitplanCache::default();
     }
     let mut collector = InitplanCollector {
@@ -262,6 +270,9 @@ pub(crate) fn collect_lateral_initplans(
         scopes: Vec::new(),
         cache: InitplanCache::default(),
     };
-    let _ = ast::Visit::visit(statement, &mut collector);
+    let _ = ast::Visit::visit(
+        statement,
+        &mut crate::ast_visit::ReadVisitor(&mut collector),
+    );
     collector.cache
 }

@@ -65,7 +65,7 @@ pub(in crate::executor) fn contains_query_aggregate(query: &ast::Query) -> bool 
         query_depth: 0,
         found: false,
     };
-    let _ = query.visit(&mut detector);
+    let _ = query.visit(&mut crate::ast_visit::WriteVisitor(&mut detector));
     detector.found
 }
 
@@ -158,7 +158,7 @@ pub(in crate::executor::query) fn inspect_aggregate_usage(
         usage: AggregateUsage::default(),
         error: None,
     };
-    let _ = expression.visit(&mut validator);
+    let _ = expression.visit(&mut crate::ast_visit::WriteVisitor(&mut validator));
     validator.error.map_or(Ok(validator.usage), Err)
 }
 
@@ -327,7 +327,7 @@ fn validate_grouped_expression(
         aggregate_depth: 0,
         error: None,
     };
-    let _ = expression.visit(&mut substituter);
+    let _ = expression.visit(&mut crate::ast_visit::WriteVisitor(&mut substituter));
     if let Some(error) = substituter.error {
         return Err(error);
     }
@@ -702,6 +702,6 @@ pub(crate) fn collect_query_primary_key_dependencies(
         state,
         dependencies: BTreeSet::new(),
     };
-    let _ = query.visit(&mut collector);
+    let _ = query.visit(&mut crate::ast_visit::WriteVisitor(&mut collector));
     collector.dependencies
 }

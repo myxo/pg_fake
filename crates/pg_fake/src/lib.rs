@@ -1,5 +1,6 @@
 mod advisory;
 mod analyzer;
+mod ast_visit;
 mod catalog;
 mod catalog_inspection;
 mod coercion;

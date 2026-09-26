@@ -41,7 +41,7 @@ pub(crate) fn contains_advisory_function(value: &impl sqlparser::ast::Visit) -> 
         }
     }
     let mut detector = Detector(false);
-    let _ = value.visit(&mut detector);
+    let _ = value.visit(&mut crate::ast_visit::ReadVisitor(&mut detector));
     detector.0
 }
 

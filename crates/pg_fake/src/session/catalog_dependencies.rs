@@ -287,7 +287,7 @@ pub(super) fn collect_catalog_dependencies<'a>(
             | ast::Statement::Insert(_)
             | ast::Statement::Update(_)
             | ast::Statement::Delete(_) => {
-                let _ = statement.visit(&mut collector);
+                let _ = statement.visit(&mut crate::ast_visit::ReadVisitor(&mut collector));
             }
             ast::Statement::Drop {
                 object_type: ast::ObjectType::Table,

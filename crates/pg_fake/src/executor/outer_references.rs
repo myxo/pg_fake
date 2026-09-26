@@ -390,7 +390,7 @@ pub(super) fn substitute_outer_references<V: ast::VisitMut>(
         reference_context,
         cte_scopes: Vec::new(),
     };
-    let _ = value.visit(&mut substituter);
+    let _ = value.visit(&mut crate::ast_visit::WriteVisitor(&mut substituter));
     substituter
         .error
         .map_or(Ok(substituter.referenced_slots), Err)

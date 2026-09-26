@@ -415,7 +415,7 @@ fn validate_window_frame(window: &ast::WindowSpec, schema: RowScope<'_>) -> Resu
             error: None,
             schema,
         };
-        let _ = ast::Visit::visit(*offset, &mut inspector);
+        let _ = ast::Visit::visit(*offset, &mut crate::ast_visit::ReadVisitor(&mut inspector));
         if let Some(error) = inspector.error {
             return Err(error);
         }

@@ -129,7 +129,7 @@ impl ast::VisitorMut for ViewExpander<'_> {
             masked: Vec::new(),
             error: None,
         };
-        let _ = query.visit(&mut expander);
+        let _ = query.visit(&mut crate::ast_visit::WriteVisitor(&mut expander));
         if let Some(error) = expander.error {
             self.error = Some(error);
             return std::ops::ControlFlow::Break(());
@@ -206,7 +206,12 @@ pub(crate) fn expand_query_views(
         }
     }
 
-    if ast::Visit::visit(query, &mut ViewProbe { catalog }).is_continue() {
+    if ast::Visit::visit(
+        query,
+        &mut crate::ast_visit::ReadVisitor(&mut ViewProbe { catalog }),
+    )
+    .is_continue()
+    {
         return Ok(None);
     }
     let mut expanded = query.clone();
@@ -216,7 +221,7 @@ pub(crate) fn expand_query_views(
         masked: Vec::new(),
         error: None,
     };
-    let _ = expanded.visit(&mut expander);
+    let _ = expanded.visit(&mut crate::ast_visit::WriteVisitor(&mut expander));
     match expander.error {
         Some(error) => Err(error),
         None => Ok((expanded != *query).then_some(expanded)),

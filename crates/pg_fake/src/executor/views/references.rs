@@ -218,7 +218,7 @@ pub(crate) fn rename_table_references(catalog: &mut Catalog, table_id: TableId, 
             new_name,
             cte_scopes: Vec::new(),
         };
-        let _ = query.visit(&mut renamer);
+        let _ = query.visit(&mut crate::ast_visit::WriteVisitor(&mut renamer));
         *view.query = query;
     }
 }
@@ -253,7 +253,7 @@ pub(crate) fn rename_column_references(
             cte_scopes: Vec::new(),
             nested_join_depth: 0,
         };
-        let _ = query.visit(&mut wrapper);
+        let _ = query.visit(&mut crate::ast_visit::WriteVisitor(&mut wrapper));
         assert!(columns.remove(old_name));
         columns.insert(new_name.to_owned());
         *view.query = query;
@@ -288,7 +288,7 @@ pub(crate) fn preserve_column_drop_references(
             cte_scopes: Vec::new(),
             nested_join_depth: 0,
         };
-        let _ = query.visit(&mut wrapper);
+        let _ = query.visit(&mut crate::ast_visit::WriteVisitor(&mut wrapper));
         *view.query = query;
     }
 }

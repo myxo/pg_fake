@@ -130,7 +130,7 @@ fn substitute_scoped_subqueries<V: ast::VisitMut>(
         outer,
         error: None,
     };
-    let _ = value.visit(&mut describer);
+    let _ = value.visit(&mut crate::ast_visit::WriteVisitor(&mut describer));
     describer.error.map_or(Ok(()), Err)
 }
 

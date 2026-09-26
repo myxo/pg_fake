@@ -34,7 +34,7 @@ pub(in crate::executor) fn infer_expression_data_type(
         outer: scope,
         error: None,
     };
-    let _ = expression.visit(&mut describer);
+    let _ = expression.visit(&mut crate::ast_visit::WriteVisitor(&mut describer));
     if let Some(error) = describer.error {
         return Err(error);
     }
@@ -53,7 +53,7 @@ pub(crate) fn substitute_typed_subqueries(
         outer,
         error: None,
     };
-    let _ = expression.visit(&mut describer);
+    let _ = expression.visit(&mut crate::ast_visit::WriteVisitor(&mut describer));
     describer.error.map_or(Ok(expression), Err)
 }
 

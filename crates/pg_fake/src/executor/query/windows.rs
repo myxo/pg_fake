@@ -63,7 +63,7 @@ pub(super) fn collect_window_functions(
     let mut visit = |owner, expression: &ast::Expr| {
         collector.owner = owner;
         let mut expression = expression.clone();
-        let _ = expression.visit(&mut collector);
+        let _ = expression.visit(&mut crate::ast_visit::WriteVisitor(&mut collector));
     };
     for (index, projection) in projections.iter().enumerate() {
         if let ProjectionSource::Expression(expression) = projection {
@@ -176,7 +176,7 @@ pub(super) fn resolve_select_windows(select: &mut ast::Select) -> Result<()> {
         error: None,
         query_depth: 0,
     };
-    let _ = select.visit(&mut resolver);
+    let _ = select.visit(&mut crate::ast_visit::WriteVisitor(&mut resolver));
     resolver.error.map_or(Ok(()), Err)
 }
 
@@ -199,7 +199,7 @@ pub(crate) fn resolve_statement_windows(statement: &mut ast::Statement) -> Resul
         }
     }
     let mut resolver = Resolver { error: None };
-    let _ = statement.visit(&mut resolver);
+    let _ = statement.visit(&mut crate::ast_visit::WriteVisitor(&mut resolver));
     resolver.error.map_or(Ok(()), Err)
 }
 
@@ -272,13 +272,15 @@ pub(super) fn materialize_window_expression(
 ) -> ast::Expr {
     assert_eq!(functions.len(), values.len());
     let mut expression = expression.clone();
-    let _ = expression.visit(&mut WindowMaterializer {
-        functions,
-        values,
-        owner,
-        seen: BTreeMap::new(),
-        query_depth: 0,
-    });
+    let _ = expression.visit(&mut crate::ast_visit::WriteVisitor(
+        &mut WindowMaterializer {
+            functions,
+            values,
+            owner,
+            seen: BTreeMap::new(),
+            query_depth: 0,
+        },
+    ));
     expression
 }
 

@@ -50,7 +50,10 @@ impl ast::Visitor for SubqueryDetector {
 #[cfg_attr(feature = "execution-log", tracing::instrument(skip_all))]
 fn contains_subquery(expression: &ast::Expr) -> bool {
     let mut detector = SubqueryDetector { found: false };
-    let _ = ast::Visit::visit(expression, &mut detector);
+    let _ = ast::Visit::visit(
+        expression,
+        &mut crate::ast_visit::ReadVisitor(&mut detector),
+    );
     detector.found
 }
 
@@ -479,7 +482,7 @@ fn materialize_subqueries<V: ast::VisitMut>(
         defer_unresolved,
         scopes,
     };
-    let _ = value.visit(&mut materializer);
+    let _ = value.visit(&mut crate::ast_visit::WriteVisitor(&mut materializer));
     if let Some(error) = materializer.error {
         return Err(error);
     }
