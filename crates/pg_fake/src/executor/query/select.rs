@@ -515,14 +515,6 @@ fn execute_any_membership_rows(
     else {
         return None;
     };
-    let ast::Expr::Tuple(candidates) = right.as_ref() else {
-        return None;
-    };
-    if !candidates.iter().all(|candidate| {
-        matches!(candidate, ast::Expr::Cast { expr, .. } if matches!(expr.as_ref(), ast::Expr::Value(_)))
-    }) {
-        return None;
-    }
     let left_type = match infer_query_expression_type(state, left, scope) {
         Ok(data_type) => data_type,
         Err(error) => return Some(Err(error)),
@@ -543,21 +535,67 @@ fn execute_any_membership_rows(
     }
     let empty_row = vec![Value::Null; scope.columns.len()];
     let mut matches = std::collections::HashSet::new();
-    for candidate in candidates {
-        let value = match evaluate_and_coerce(
-            candidate,
-            left_type.base,
-            CastContext::Implicit,
-            RowScope::Bound(scope),
-            &empty_row,
-            context,
-        ) {
-            Ok(value) => value,
-            Err(error) => return Some(Err(error)),
-        };
-        if let Some(key) = create_equality_key(&value) {
-            matches.insert(key);
+    match right.as_ref() {
+        ast::Expr::Tuple(candidates)
+            if candidates.iter().all(|candidate| {
+                matches!(candidate, ast::Expr::Cast { expr, .. } if matches!(expr.as_ref(), ast::Expr::Value(_)))
+            }) =>
+        {
+            for candidate in candidates {
+                let value = match evaluate_and_coerce(
+                    candidate,
+                    left_type.base,
+                    CastContext::Implicit,
+                    RowScope::Bound(scope),
+                    &empty_row,
+                    context,
+                ) {
+                    Ok(value) => value,
+                    Err(error) => return Some(Err(error)),
+                };
+                if let Some(key) = create_equality_key(&value) {
+                    matches.insert(key);
+                }
+            }
         }
+        ast::Expr::Cast { expr, .. } if left_type.base == BaseType::Uuid => {
+            let mut parameter = expr.as_ref();
+            while let ast::Expr::Cast { expr, .. } = parameter {
+                parameter = expr;
+            }
+            let ast::Expr::Value(value) = parameter else {
+                return None;
+            };
+            let ast::Value::Placeholder(placeholder) = &value.value else {
+                return None;
+            };
+            let index = match crate::analyzer::parse_placeholder_index(placeholder) {
+                Ok(index) => index,
+                Err(error) => return Some(Err(error)),
+            };
+            let Some(parameter) = context
+                .parameters
+                .as_ref()
+                .and_then(|parameters| parameters.get(index))
+            else {
+                return None;
+            };
+            match parameter {
+                Some(Value::Array {
+                    elem_type: BaseType::Uuid,
+                    values,
+                }) => {
+                    for value in values {
+                        if let Some(key) = create_equality_key(value) {
+                            matches.insert(key);
+                        }
+                    }
+                }
+                None => {}
+                Some(_) => return None,
+            }
+        }
+        _ => return None,
     }
     let mut rows = Vec::new();
     let result = visit_query_source_rows(
