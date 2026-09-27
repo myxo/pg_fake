@@ -381,6 +381,8 @@ impl Session {
             inherited_row_lock: None,
             source_row_locks: Vec::new(),
             cte_query_barriers: Default::default(),
+            cte_row_sources: Default::default(),
+            next_cte_row_source_id: Default::default(),
             prepared_plain_rows: Default::default(),
             prepared_groups: Default::default(),
             prepared_group_outputs: Default::default(),

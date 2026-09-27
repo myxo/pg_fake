@@ -63,7 +63,7 @@ pub(crate) fn create_typed_cast(expression: ast::Expr, data_type: PgType) -> ast
 }
 
 #[cfg_attr(feature = "execution-log", tracing::instrument(skip_all))]
-fn convert_to_ast_data_type(data_type: PgType) -> ast::DataType {
+pub(crate) fn convert_to_ast_data_type(data_type: PgType) -> ast::DataType {
     match data_type.base {
         BaseType::Void => ast::DataType::Custom(ast::Ident::new("void").into(), Vec::new()),
         BaseType::Bool => ast::DataType::Boolean,

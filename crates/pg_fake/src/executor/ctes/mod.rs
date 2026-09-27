@@ -1,4 +1,4 @@
-use std::collections::BTreeSet;
+use std::{collections::BTreeSet, sync::Arc};
 
 use sqlparser::{
     ast::{self, VisitMut as _},
@@ -27,7 +27,7 @@ pub(super) use analysis::{InlineCte, collect_query_cte_scope, inline_query_with_
 pub(crate) use mutations::materialize_statement_ctes;
 pub(super) use mutations::prepare_cte_mutation_for_locking;
 pub(super) use references::{
-    collect_cte_references, collect_reachable_cte_names, contains_query_ctes,
+    collect_cte_references, collect_reachable_cte_names, contains_query_ctes, cte_row_source_id,
 };
 
 use recursive::materialize_recursive_query_ctes;
@@ -40,11 +40,30 @@ struct MaterializedCte {
 }
 
 enum CteSource {
-    Rows(QueryResult),
+    Rows {
+        id: usize,
+        result: Arc<QueryResult>,
+    },
     Query {
         query: Box<ast::Query>,
         columns: Vec<crate::ColumnMeta>,
     },
+}
+
+fn create_materialized_cte(
+    context: &StatementContext,
+    name: String,
+    alias: ast::TableAlias,
+    result: QueryResult,
+) -> MaterializedCte {
+    let id = context.allocate_cte_row_source_id();
+    let result = Arc::new(result);
+    context.set_cte_row_source(id, result.clone());
+    MaterializedCte {
+        name,
+        alias,
+        source: CteSource::Rows { id, result },
+    }
 }
 
 #[cfg_attr(feature = "execution-log", tracing::instrument(skip_all))]
@@ -264,11 +283,7 @@ pub(super) fn materialize_query_ctes(
         for (column, alias) in result.columns.iter_mut().zip(&cte.alias.columns) {
             column.name = normalize_identifier(&alias.name);
         }
-        ctes.push(MaterializedCte {
-            name,
-            alias: cte.alias,
-            source: CteSource::Rows(result),
-        });
+        ctes.push(create_materialized_cte(context, name, cte.alias, result));
     }
     replace_cte_references(&mut query, &ctes, Some(context));
     Ok(query)

@@ -15,8 +15,8 @@ use crate::{
 };
 
 use super::{
-    MaterializedCte, convert_query_to_statement, execute_prepared_cte_query,
-    is_data_modifying_query, materialize_query_ctes,
+    MaterializedCte, convert_query_to_statement, create_materialized_cte,
+    execute_prepared_cte_query, is_data_modifying_query, materialize_query_ctes,
     recursive::{
         describe_recursive_cte_columns, execute_recursive_cte, materialize_recursive_query_ctes,
         resolve_direct_cte_demand, validate_recursive_cte,
@@ -144,11 +144,12 @@ pub(in crate::executor) fn prepare_cte_mutation_for_locking(
             for (column, alias) in result.columns.iter_mut().zip(&cte.alias.columns) {
                 column.name = normalize_identifier(&alias.name);
             }
-            materialized.push(MaterializedCte {
-                name: names[index].clone(),
-                alias: cte.alias.clone(),
-                source: super::CteSource::Rows(result),
-            });
+            materialized.push(create_materialized_cte(
+                context,
+                names[index].clone(),
+                cte.alias.clone(),
+                result,
+            ));
             progressed = true;
         }
         if !progressed {
@@ -329,11 +330,7 @@ pub(crate) fn materialize_statement_ctes(
         for (column, alias) in result.columns.iter_mut().zip(&cte.alias.columns) {
             column.name = normalize_identifier(&alias.name);
         }
-        ctes.push(MaterializedCte {
-            name,
-            alias: cte.alias,
-            source: super::CteSource::Rows(result),
-        });
+        ctes.push(create_materialized_cte(context, name, cte.alias, result));
     }
     replace_cte_references(&mut query, &ctes, Some(context));
     Ok(convert_query_to_statement(materialize_query_ctes(
@@ -523,11 +520,12 @@ fn materialize_recursive_data_modifying_ctes(
             for (column, alias) in result.columns.iter_mut().zip(&cte.alias.columns) {
                 column.name = normalize_identifier(&alias.name);
             }
-            ctes.push(MaterializedCte {
-                name: name.clone(),
-                alias: cte.alias,
-                source: super::CteSource::Rows(result),
-            });
+            ctes.push(create_materialized_cte(
+                context,
+                name.clone(),
+                cte.alias,
+                result,
+            ));
             progressed = true;
         }
         if !progressed {

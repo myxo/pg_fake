@@ -12,6 +12,7 @@ use crate::{
 };
 
 mod literals;
+pub(crate) use literals::convert_to_ast_data_type;
 mod parameter_types;
 mod scopes;
 mod subqueries;

@@ -16,7 +16,7 @@ use sqlparser::{
 use std::{
     sync::{
         Arc, Mutex,
-        atomic::{AtomicBool, Ordering as AtomicOrdering},
+        atomic::{AtomicBool, AtomicUsize, Ordering as AtomicOrdering},
     },
     time::Instant,
 };
@@ -61,6 +61,8 @@ pub(crate) struct StatementContext {
     pub(crate) inherited_row_lock: Option<super::query::SelectLock>,
     pub(crate) source_row_locks: Vec<(Span, super::query::SelectLock)>,
     pub(crate) cte_query_barriers: Arc<Mutex<Vec<ast::Query>>>,
+    pub(crate) cte_row_sources: Arc<Mutex<std::collections::HashMap<usize, Arc<QueryResult>>>>,
+    pub(crate) next_cte_row_source_id: Arc<AtomicUsize>,
     pub(crate) prepared_plain_rows: Arc<Mutex<Vec<super::query::PreparedPlainRows>>>,
     pub(crate) prepared_groups: Arc<Mutex<Vec<super::query::PreparedGrouping>>>,
     pub(crate) prepared_group_outputs: Arc<Mutex<Vec<super::query::PreparedGroupOutput>>>,
@@ -148,6 +150,26 @@ pub(crate) struct PreparedUpdateRow {
 }
 
 impl StatementContext {
+    pub(crate) fn allocate_cte_row_source_id(&self) -> usize {
+        self.next_cte_row_source_id
+            .fetch_add(1, AtomicOrdering::Relaxed)
+    }
+
+    pub(crate) fn set_cte_row_source(&self, id: usize, rows: Arc<QueryResult>) {
+        self.cte_row_sources
+            .lock()
+            .expect("CTE row source mutex is poisoned")
+            .insert(id, rows);
+    }
+
+    pub(crate) fn get_cte_row_source(&self, id: usize) -> Option<Arc<QueryResult>> {
+        self.cte_row_sources
+            .lock()
+            .expect("CTE row source mutex is poisoned")
+            .get(&id)
+            .cloned()
+    }
+
     pub(crate) fn get_timezone(&self) -> String {
         self.guc
             .lock()

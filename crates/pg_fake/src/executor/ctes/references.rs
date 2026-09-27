@@ -12,6 +12,19 @@ use crate::{
 
 use super::{MaterializedCte, is_data_modifying_query};
 
+const CTE_ROW_SOURCE_PREFIX: &str = "\0pg_fake_cte_rows_";
+
+pub(crate) fn cte_row_source_id(name: &ast::ObjectName) -> Option<usize> {
+    let [ast::ObjectNamePart::Identifier(identifier)] = name.0.as_slice() else {
+        return None;
+    };
+    identifier
+        .value
+        .strip_prefix(CTE_ROW_SOURCE_PREFIX)?
+        .parse()
+        .ok()
+}
+
 struct CteForwardReferenceDetector<'a> {
     catalog: &'a Catalog,
     names: &'a [String],
@@ -168,7 +181,10 @@ pub(super) fn replace_cte_references(
             .expect("CTE query mutex is poisoned");
         for cte in ctes {
             let query = match &cte.source {
-                super::CteSource::Rows(rows) => create_cte_values_query(rows),
+                super::CteSource::Rows { id, result } => {
+                    context.set_cte_row_source(*id, result.clone());
+                    continue;
+                }
                 super::CteSource::Query { query, .. } => query.as_ref().clone(),
             };
             if !queries.contains(&query) {
@@ -238,9 +254,52 @@ impl ast::VisitorMut for CteReferenceReplacer<'_> {
         }) else {
             return std::ops::ControlFlow::Continue(());
         };
+        if let super::CteSource::Rows { id, result } = &cte.source {
+            let mut row_alias = alias.as_ref().cloned().unwrap_or_else(|| cte.alias.clone());
+            let previous_columns = row_alias.columns.clone();
+            row_alias.columns = (0..result.columns.len().max(previous_columns.len()))
+                .map(|index| {
+                    let column = result.columns.get(index);
+                    ast::TableAliasColumnDef {
+                        name: previous_columns.get(index).map_or_else(
+                            || {
+                                ast::Ident::with_quote(
+                                    '"',
+                                    column.map_or_else(
+                                        || format!("column{}", index + 1),
+                                        |column| column.name.clone(),
+                                    ),
+                                )
+                            },
+                            |column| column.name.clone(),
+                        ),
+                        data_type: column.map(|column| {
+                            crate::analyzer::convert_to_ast_data_type(PgType::create_with_typmod(
+                                BaseType::resolve_oid(column.type_oid)
+                                    .expect("CTE result type OID is supported"),
+                                column.typmod,
+                            ))
+                        }),
+                    }
+                })
+                .collect();
+            let ast::TableFactor::Table {
+                name,
+                alias: target_alias,
+                ..
+            } = factor
+            else {
+                unreachable!("CTE references are table factors")
+            };
+            *name = ast::ObjectName(vec![ast::ObjectNamePart::Identifier(
+                ast::Ident::with_quote('"', format!("{CTE_ROW_SOURCE_PREFIX}{id}")),
+            )]);
+            *target_alias = Some(row_alias);
+            return std::ops::ControlFlow::Continue(());
+        }
         let (columns, query) = match &cte.source {
-            super::CteSource::Rows(result) => (&result.columns, create_cte_values_query(result)),
             super::CteSource::Query { query, columns } => (columns, query.as_ref().clone()),
+            super::CteSource::Rows { .. } => unreachable!(),
         };
         let columns = if cte.alias.columns.is_empty() {
             columns

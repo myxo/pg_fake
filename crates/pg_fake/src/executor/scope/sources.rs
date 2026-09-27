@@ -72,6 +72,52 @@ pub(crate) fn bind_table_factor(
     factor: &ast::TableFactor,
     scope: &mut BoundScope,
 ) -> Result<()> {
+    if let ast::TableFactor::Table {
+        name,
+        alias: Some(alias),
+        ..
+    } = factor
+        && crate::executor::ctes::cte_row_source_id(name).is_some()
+    {
+        if alias
+            .columns
+            .iter()
+            .any(|column| column.data_type.is_none())
+        {
+            return Err(PgError::create(
+                SqlState::InvalidColumnReference,
+                "table has fewer columns than specified in column alias list",
+            ));
+        }
+        let qualifier = normalize_identifier(&alias.name);
+        let start = scope.columns.len();
+        scope
+            .columns
+            .extend(alias.columns.iter().enumerate().map(|(index, column)| {
+                BoundColumn {
+                    name: normalize_identifier(&column.name),
+                    data_type: crate::coercion::convert_ast_data_type(
+                        column
+                            .data_type
+                            .as_ref()
+                            .expect("CTE column type was checked"),
+                    )
+                    .expect("CTE row source type came from a supported result column"),
+                    qualifier: qualifier.clone(),
+                    slot: start + index,
+                    output_order: start + index,
+                    qualified_order: start + index,
+                    qualified_merged: None,
+                    merged: None,
+                    unqualified: true,
+                    wildcard: true,
+                    depth: 0,
+                    table_id: None,
+                    source_name: normalize_identifier(&column.name),
+                }
+            }));
+        return Ok(());
+    }
     if let Some(UnnestTableFunction {
         argument,
         alias,

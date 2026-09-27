@@ -38,6 +38,38 @@ pub(super) fn visit_table_factor_rows(
     if args.is_some() {
         return reject_unsupported("table functions are not implemented");
     }
+    if let Some(id) = crate::executor::ctes::cte_row_source_id(table_name) {
+        let source = context
+            .get_cte_row_source(id)
+            .expect("materialized CTE row source was registered");
+        let mut filters = Vec::new();
+        if let Some(selection) = selection {
+            collect_pushdown_filters(
+                selection,
+                scope,
+                start,
+                start + source.columns.len(),
+                &mut filters,
+            );
+        }
+        let mut row = vec![Value::Null; scope.columns.len()];
+        for values in &source.rows {
+            row[start..start + values.len()].clone_from_slice(values);
+            let passes = filters.iter().try_fold(true, |passes, filter| {
+                if !passes {
+                    return Ok(false);
+                }
+                Ok(matches!(
+                    evaluate(filter, RowScope::Bound(scope), &row, context)?,
+                    Value::Bool(true)
+                ))
+            })?;
+            if passes {
+                visit(&row)?;
+            }
+        }
+        return Ok(());
+    }
     let schema = state
         .catalog
         .require_named_table(&normalize_relation_name(table_name)?)?;

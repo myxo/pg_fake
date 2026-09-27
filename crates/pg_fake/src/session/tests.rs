@@ -8323,6 +8323,17 @@ fn materializes_non_recursive_ctes_once_with_aliases_and_empty_results() {
             .unwrap();
     assert!(result.rows.is_empty());
 
+    assert_eq!(
+        session
+            .query(
+                "WITH source(value) AS (SELECT 1) SELECT * FROM source AS aliased(value, extra)",
+                &[],
+            )
+            .unwrap_err()
+            .sqlstate,
+        SqlState::InvalidColumnReference
+    );
+
     let statement = session
         .prepare("WITH parameterized(value) AS (SELECT $1) SELECT value FROM parameterized")
         .unwrap();

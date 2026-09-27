@@ -248,6 +248,44 @@ fn materialize_table_factor_rows(
     next_slot: &mut usize,
     prefix: &SourceRow,
 ) -> Result<Vec<SourceRow>> {
+    if let ast::TableFactor::Table { name, .. } = factor
+        && let Some(id) = crate::executor::ctes::cte_row_source_id(name)
+    {
+        let source = context
+            .get_cte_row_source(id)
+            .expect("materialized CTE row source was registered");
+        let start = *next_slot;
+        *next_slot += source.columns.len();
+        let mut filters = Vec::new();
+        if let Some(selection) = selection {
+            collect_pushdown_filters(
+                selection,
+                scope,
+                start,
+                start + source.columns.len(),
+                &mut filters,
+            );
+        }
+        return source
+            .rows
+            .iter()
+            .map(|values| {
+                let mut row = prefix.clone();
+                row.values[start..start + values.len()].clone_from_slice(values);
+                let passes = filters.iter().try_fold(true, |passes, filter| {
+                    if !passes {
+                        return Ok(false);
+                    }
+                    Ok(matches!(
+                        evaluate(filter, RowScope::Bound(scope), &row.values, context)?,
+                        Value::Bool(true)
+                    ))
+                })?;
+                Ok(passes.then_some(row))
+            })
+            .collect::<Result<Vec<_>>>()
+            .map(|rows| rows.into_iter().flatten().collect());
+    }
     if let Some(UnnestTableFunction {
         argument,
         ordinality,

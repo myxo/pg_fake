@@ -48,18 +48,23 @@ pub(super) fn visit_streamed_join_rows(
     for factor in
         std::iter::once(&table.relation).chain(table.joins.iter().map(|join| &join.relation))
     {
-        let ast::TableFactor::Table {
-            name: table_name, ..
-        } = factor
-        else {
+        let ast::TableFactor::Table { name, .. } = factor else {
             unreachable!("streamable sources are tables");
         };
         starts.push(next_slot);
-        next_slot += state
-            .catalog
-            .require_named_table(&normalize_relation_name(table_name)?)?
-            .columns
-            .len();
+        next_slot += if let Some(id) = crate::executor::ctes::cte_row_source_id(name) {
+            context
+                .get_cte_row_source(id)
+                .expect("materialized CTE row source was registered")
+                .columns
+                .len()
+        } else {
+            state
+                .catalog
+                .require_named_table(&normalize_relation_name(name)?)?
+                .columns
+                .len()
+        };
     }
     let hash_slots = table
         .joins

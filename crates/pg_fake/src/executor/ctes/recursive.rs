@@ -412,11 +412,12 @@ pub(super) fn materialize_recursive_query_ctes(
             for (column, alias) in result.columns.iter_mut().zip(&cte.alias.columns) {
                 column.name = normalize_identifier(&alias.name);
             }
-            ctes.push(MaterializedCte {
-                name: name.clone(),
-                alias: cte.alias,
-                source: super::CteSource::Rows(result),
-            });
+            ctes.push(super::create_materialized_cte(
+                context,
+                name.clone(),
+                cte.alias,
+                result,
+            ));
             progressed = true;
         }
         if !progressed {
@@ -538,10 +539,13 @@ pub(super) fn describe_recursive_cte_columns(
         &[MaterializedCte {
             name: name.to_owned(),
             alias: alias.clone(),
-            source: super::CteSource::Rows(QueryResult {
-                columns: seed_columns.clone(),
-                rows: Vec::new(),
-            }),
+            source: super::CteSource::Rows {
+                id: 0,
+                result: std::sync::Arc::new(QueryResult {
+                    columns: seed_columns.clone(),
+                    rows: Vec::new(),
+                }),
+            },
         }],
         None,
     );
@@ -628,23 +632,38 @@ pub(super) fn execute_recursive_cte(
         }
         (rows.clone(), rows)
     };
+    let row_source_id = context.allocate_cte_row_source_id();
+    let mut recursive_query = create_set_expression_query((**right).clone());
+    replace_cte_references(
+        &mut recursive_query,
+        &[MaterializedCte {
+            name: name.to_owned(),
+            alias: alias.clone(),
+            source: super::CteSource::Rows {
+                id: row_source_id,
+                result: std::sync::Arc::new(QueryResult {
+                    columns: columns.clone(),
+                    rows: Vec::new(),
+                }),
+            },
+        }],
+        Some(context),
+    );
     while !working.is_empty()
         && generation_demand.is_none_or(|generation_demand| rows.len() < generation_demand)
     {
-        let mut recursive_query = create_set_expression_query((**right).clone());
-        replace_cte_references(
-            &mut recursive_query,
-            &[MaterializedCte {
-                name: name.to_owned(),
-                alias: alias.clone(),
-                source: super::CteSource::Rows(QueryResult {
-                    columns: columns.clone(),
-                    rows: working,
-                }),
-            }],
-            Some(context),
+        context.set_cte_row_source(
+            row_source_id,
+            std::sync::Arc::new(QueryResult {
+                columns: columns.clone(),
+                rows: std::mem::take(&mut working),
+            }),
         );
-        let result = execute_query(state, &recursive_query, xid, snapshot, context)?.result;
+        let iteration = rows.len();
+        let mut invocation = context.clone();
+        invocation.query_invocation.push(iteration);
+        let result = execute_query(state, &recursive_query, xid, snapshot, &invocation);
+        let result = result?.result;
         working = coerce_set_rows(result.rows, &result.columns, &columns)?;
         if distinct {
             working = remove_set_duplicates(working)?;
@@ -666,6 +685,13 @@ pub(super) fn execute_recursive_cte(
         }
         rows.extend(working.iter().cloned());
     }
+    context.set_cte_row_source(
+        row_source_id,
+        std::sync::Arc::new(QueryResult {
+            columns: columns.clone(),
+            rows: Vec::new(),
+        }),
+    );
     context
         .lateral_initplans
         .lock()
