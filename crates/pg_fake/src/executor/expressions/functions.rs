@@ -699,10 +699,9 @@ pub(super) fn evaluate_function(
             "aggregate function is not allowed in this context",
         ));
     }
-    infer_function_return_type(function, schema)?;
+    let result_type = infer_function_return_type(function, schema)?;
     let function_name = normalize_function_name(&function.name)?;
     let arguments = extract_function_arguments(function)?;
-    let result_type = infer_function_return_type(function, schema)?;
     if json::infer_json_function(&function_name, &arguments, schema)?.is_some() {
         return json::evaluate_json_function(
             &function_name,
