@@ -347,8 +347,9 @@ impl Session {
                 condvar: condvar.clone(),
                 pending: Default::default(),
             },
-            source_state: contains_triggered_insert(&state, statement)
-                .then(|| Arc::new(state.clone())),
+            source_state: (contains_triggered_insert(&state, statement)
+                && contains_insert_query_source(statement))
+            .then(|| Arc::new(state.clone())),
             source_snapshot: snapshot,
             pending_insert_sources: Default::default(),
             prepared_inserts: Arc::new(Mutex::new(Default::default())),
@@ -616,6 +617,32 @@ fn contains_triggered_insert(state: &executor::DatabaseState, statement: &ast::S
         }
         _ => false,
     }
+}
+
+fn contains_insert_query_source(statement: &ast::Statement) -> bool {
+    match statement {
+        ast::Statement::Insert(insert) => insert_has_query_source(insert),
+        ast::Statement::Query(query) => {
+            matches!(
+                query.body.as_ref(),
+                ast::SetExpr::Insert(statement)
+                    if matches!(statement, ast::Statement::Insert(insert) if insert_has_query_source(insert))
+            ) || query.with.as_ref().is_some_and(|with| {
+                with.cte_tables.iter().any(|cte| {
+                    contains_insert_query_source(&ast::Statement::Query(Box::new(
+                        (*cte.query).clone(),
+                    )))
+                })
+            })
+        }
+        _ => false,
+    }
+}
+
+fn insert_has_query_source(insert: &ast::Insert) -> bool {
+    insert.source.as_ref().is_some_and(|source| {
+        source.with.is_some() || !matches!(source.body.as_ref(), ast::SetExpr::Values(_))
+    })
 }
 
 #[cfg_attr(feature = "execution-log", tracing::instrument(skip_all))]
