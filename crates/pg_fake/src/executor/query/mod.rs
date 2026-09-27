@@ -37,8 +37,8 @@ pub(crate) use limits::PreparedLimit;
 pub(super) use limits::{has_zero_limit, resolve_select_limit};
 pub(crate) use locking::SelectLock;
 pub(super) use locking::{
-    contains_locking_operations, requires_nested_locking, resolve_query_lock_targets,
-    resolve_select_lock_mode,
+    contains_locking_operations, contains_read_source, requires_nested_locking,
+    resolve_query_lock_targets, resolve_select_lock_mode,
 };
 use ordering::{RowOrderSpec, compare_ordered_rows, resolve_order_specs, sort_ordered_rows};
 pub(crate) use projection::describe_query_result_columns;
@@ -228,7 +228,7 @@ fn execute_query_inner(
             .iter()
             .any(|cached| cached.occurrence == query.span() && cached.sql == query.to_string());
     context.retain_row_origins |= context.capture_lock_queries;
-    if context.capture_lock_queries {
+    if context.capture_lock_queries && contains_read_source(query) {
         context
             .query_source_state
             .lock()
