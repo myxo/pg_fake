@@ -13,6 +13,7 @@ use crate::{
     value::Value,
 };
 use sqlparser::ast::{self, Spanned as _};
+use std::collections::HashMap;
 
 pub(super) type MutationTarget = (RowId, Xid, Vec<Value>, Option<Vec<Value>>);
 
@@ -343,8 +344,12 @@ pub(in crate::executor) fn collect_update_cte_locks(
         return Ok(locks);
     }
     let prepared = prepare_update_rows(state, update, schema, xid, snapshot, context)?;
+    let prepared_by_id = prepared
+        .iter()
+        .map(|row| (row.row_id, row))
+        .collect::<HashMap<_, _>>();
     for lock in &mut locks {
-        if let Some(row) = prepared.iter().find(|row| row.row_id == lock.key.row_id)
+        if let Some(row) = prepared_by_id.get(&lock.key.row_id)
             && let Some(updated) = &row.updated
         {
             lock.mode = locks::resolve_update_lock_mode(schema, &row.current, updated);

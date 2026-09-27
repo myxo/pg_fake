@@ -124,7 +124,7 @@ pub(in crate::executor) enum EvaluationOperation {
     InsertRow(Box<ast::Insert>, usize),
     Returning(Vec<ast::SelectItem>, Vec<Value>),
     ConflictUpdate(Box<ast::DoUpdate>, Vec<Value>),
-    UpdateRow(Box<ast::Update>, crate::storage::RowId),
+    UpdateRow(sqlparser::tokenizer::Span, crate::storage::RowId),
 }
 
 #[derive(Clone)]

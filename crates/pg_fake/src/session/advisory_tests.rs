@@ -156,6 +156,32 @@ fn resumes_advisory_expressions_after_controlled_waits() {
 }
 
 #[test]
+fn resumes_update_rows_with_nan_without_repeating_sequence_effects() {
+    let db = Db::create_builder()
+        .set_lock_timeout(Duration::from_secs(3))
+        .build();
+    let mut holder = db.create_session();
+    let mut worker = db.create_session();
+    holder
+        .execute("CREATE SEQUENCE advisory_sequence; CREATE TABLE retry_rows(id INT PRIMARY KEY,n BIGINT,f DOUBLE PRECISION); INSERT INTO retry_rows VALUES (1,0,'NaN'),(2,0,'NaN')")
+        .unwrap();
+    holder
+        .execute("BEGIN; SELECT pg_advisory_xact_lock(1)")
+        .unwrap();
+    let waiting = thread::spawn(move || {
+        worker
+            .execute("UPDATE retry_rows SET n=nextval('advisory_sequence')+(pg_advisory_xact_lock(id-1) IS NULL)::INT")
+            .unwrap();
+        worker
+            .query("SELECT currval('advisory_sequence')", &[])
+            .unwrap()
+    });
+    wait_until_advisory_blocked(&db);
+    holder.execute("COMMIT").unwrap();
+    assert_eq!(waiting.join().unwrap().rows, vec![vec![Value::Int8(2)]]);
+}
+
+#[test]
 fn detects_mixed_advisory_deadlocks() {
     for second_resource in [
         "SELECT pg_advisory_xact_lock(2)",

@@ -38,7 +38,7 @@ pub(crate) struct StatementContext {
     pub(crate) source_snapshot: Snapshot,
     pub(crate) pending_insert_sources: Arc<Mutex<Vec<(ast::Insert, QueryResult)>>>,
     pub(crate) prepared_inserts: Arc<Mutex<PreparedInsertCache>>,
-    pub(crate) prepared_update_inputs: Arc<Mutex<Vec<(ast::Update, PreparedUpdateRow)>>>,
+    pub(crate) prepared_update_inputs: Arc<Mutex<PreparedUpdateInputs>>,
     pub(crate) prepared_writes: Arc<Mutex<Vec<super::writes::PreparedWrite>>>,
     pub(crate) prepared_updates: Arc<Mutex<PreparedUpdateCache>>,
     pub(crate) prepared_mutation_targets: Arc<Mutex<MutationTargetCache>>,
@@ -140,6 +140,19 @@ pub(crate) struct PreparedUpdateCache {
     entries: Vec<(PreparedAstKey, ast::Update, Vec<PreparedUpdateRow>)>,
 }
 
+#[derive(Clone, Default)]
+pub(crate) struct PreparedUpdateInputs {
+    entries: Vec<PreparedUpdateInputStatement>,
+}
+
+#[derive(Clone)]
+struct PreparedUpdateInputStatement {
+    occurrence: Span,
+    update: ast::Update,
+    invocation: Vec<usize>,
+    rows: std::collections::HashMap<RowId, PreparedUpdateRow>,
+}
+
 #[derive(Clone)]
 pub(crate) struct PreparedUpdateRow {
     pub(crate) row_id: RowId,
@@ -150,6 +163,61 @@ pub(crate) struct PreparedUpdateRow {
 }
 
 impl StatementContext {
+    pub(crate) fn prepare_update_inputs(&self, update: &ast::Update, occurrence: Span) -> usize {
+        let mut prepared = self
+            .prepared_update_inputs
+            .lock()
+            .expect("prepared update input mutex is poisoned");
+        if let Some(index) = prepared.entries.iter().position(|entry| {
+            entry.occurrence == occurrence
+                && entry.update == *update
+                && entry.invocation == self.query_invocation
+        }) {
+            return index;
+        }
+        let index = prepared.entries.len();
+        prepared.entries.push(PreparedUpdateInputStatement {
+            occurrence,
+            update: update.clone(),
+            invocation: self.query_invocation.clone(),
+            rows: Default::default(),
+        });
+        index
+    }
+
+    pub(crate) fn get_prepared_update_input(
+        &self,
+        index: usize,
+        row_id: RowId,
+        version_xmin: Xid,
+        current: &[Value],
+        bound_row: Option<&[Value]>,
+    ) -> Option<Option<Vec<Value>>> {
+        let prepared = self
+            .prepared_update_inputs
+            .lock()
+            .expect("prepared update input mutex is poisoned");
+        let row = prepared.entries[index].rows.get(&row_id)?;
+        let bound_row_matches = match (row.bound_row.as_deref(), bound_row) {
+            (None, None) => true,
+            (Some(cached), Some(current)) => match_values(cached, current),
+            _ => false,
+        };
+        (row.version_xmin == version_xmin
+            && match_values(&row.current, current)
+            && bound_row_matches)
+            .then(|| row.updated.clone())
+    }
+
+    pub(crate) fn set_prepared_update_input(&self, index: usize, row: PreparedUpdateRow) {
+        self.prepared_update_inputs
+            .lock()
+            .expect("prepared update input mutex is poisoned")
+            .entries[index]
+            .rows
+            .insert(row.row_id, row);
+    }
+
     pub(crate) fn allocate_cte_row_source_id(&self) -> usize {
         self.next_cte_row_source_id
             .fetch_add(1, AtomicOrdering::Relaxed)
@@ -565,5 +633,47 @@ impl StatementContext {
             .iter()
             .position(|(cached, _, _)| cached.occurrence == update.span())?;
         Some(prepared.entries.remove(position).2)
+    }
+}
+
+fn match_values(cached: &[Value], current: &[Value]) -> bool {
+    cached.len() == current.len()
+        && cached
+            .iter()
+            .zip(current)
+            .all(|(cached, current)| match_value(cached, current))
+}
+
+fn match_value(cached: &Value, current: &Value) -> bool {
+    match (cached, current) {
+        (Value::Float4(cached), Value::Float4(current)) => cached.to_bits() == current.to_bits(),
+        (Value::Float8(cached), Value::Float8(current)) => cached.to_bits() == current.to_bits(),
+        (
+            Value::Array {
+                elem_type: cached_type,
+                values: cached,
+            },
+            Value::Array {
+                elem_type: current_type,
+                values: current,
+            },
+        ) => cached_type == current_type && match_values(cached, current),
+        (cached, current) => cached == current,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::match_values;
+    use crate::value::{BaseType, Value};
+
+    #[test]
+    fn matches_float_arrays_with_nan() {
+        let cached = vec![Value::Array {
+            elem_type: BaseType::Float8,
+            values: vec![Value::Float8(f64::NAN)],
+        }];
+        let current = cached.clone();
+        assert!(match_values(&cached, &current));
     }
 }

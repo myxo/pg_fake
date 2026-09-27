@@ -12,6 +12,7 @@ use crate::{
     value::{BaseType, Value},
 };
 use sqlparser::ast::{self, Spanned as _};
+use std::collections::HashMap;
 
 mod ctes;
 mod foreign_keys;
@@ -337,8 +338,12 @@ pub(crate) fn collect_required_row_locks(
             return Ok(locks);
         }
         let rows = writes::prepare_update_rows(state, update, schema, xid, snapshot, context)?;
+        let rows_by_id = rows
+            .iter()
+            .map(|row| (row.row_id, row))
+            .collect::<HashMap<_, _>>();
         for lock in &mut locks {
-            if let Some(row) = rows.iter().find(|row| row.row_id == lock.key.row_id)
+            if let Some(row) = rows_by_id.get(&lock.key.row_id)
                 && let Some(updated) = &row.updated
             {
                 lock.mode = resolve_update_lock_mode(schema, &row.current, updated);

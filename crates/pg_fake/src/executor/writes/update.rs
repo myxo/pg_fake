@@ -444,6 +444,8 @@ pub(in crate::executor) fn prepare_update_rows(
             )?
         }
     };
+    let update_span = update.span();
+    let prepared_inputs = context.prepare_update_inputs(update, update_span);
     let mut rows = Vec::new();
     let mut validation_table = state
         .tables
@@ -451,28 +453,18 @@ pub(in crate::executor) fn prepare_update_rows(
         .expect("catalog table must have storage")
         .clone();
     for (row_id, version_xmin, current, bound_row) in targets {
-        let cached = context
-            .prepared_update_inputs
-            .lock()
-            .expect("prepared update input mutex is poisoned")
-            .iter()
-            .find(|(statement, row)| {
-                statement.span() == update.span()
-                    && statement == update
-                    && row.row_id == row_id
-                    && row.version_xmin == version_xmin
-                    && row.current == current
-                    && row.bound_row == bound_row
-            })
-            .map(|(_, row)| row.updated.clone());
+        let cached = context.get_prepared_update_input(
+            prepared_inputs,
+            row_id,
+            version_xmin,
+            &current,
+            bound_row.as_deref(),
+        );
         let updated = if let Some(updated) = cached {
             updated
         } else {
             let updated = crate::executor::expressions::resume_operation(
-                crate::executor::expressions::EvaluationOperation::UpdateRow(
-                    Box::new(update.clone()),
-                    row_id,
-                ),
+                crate::executor::expressions::EvaluationOperation::UpdateRow(update_span, row_id),
                 context,
                 |context| {
                     let mut updated = current.clone();
@@ -513,20 +505,16 @@ pub(in crate::executor) fn prepare_update_rows(
                     Ok(updated)
                 },
             )?;
-            context
-                .prepared_update_inputs
-                .lock()
-                .expect("prepared update input mutex is poisoned")
-                .push((
-                    update.clone(),
-                    PreparedUpdateRow {
-                        row_id,
-                        version_xmin,
-                        current: current.clone(),
-                        bound_row: bound_row.clone(),
-                        updated: updated.clone(),
-                    },
-                ));
+            context.set_prepared_update_input(
+                prepared_inputs,
+                PreparedUpdateRow {
+                    row_id,
+                    version_xmin,
+                    current: current.clone(),
+                    bound_row: bound_row.clone(),
+                    updated: updated.clone(),
+                },
+            );
             updated
         };
         if let Some(updated) = &updated {
