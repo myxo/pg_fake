@@ -1,16 +1,19 @@
 use crate::{
     QueryResult,
+    catalog::TableId,
     error::{PgError, Result, SqlState, reject_unsupported},
     executor::{
         DatabaseState, StatementContext,
         ctes::{contains_query_ctes, materialize_query_ctes},
+        normalize_relation_name,
         scope::bind_select_scope,
         views::expand_query_views,
     },
     txn::{Snapshot, Xid},
     value::Value,
 };
-use sqlparser::ast::{self, Spanned as _};
+use sqlparser::ast::{self, Spanned as _, Visit as _};
+use std::collections::BTreeSet;
 
 mod distinct;
 mod expressions;
@@ -37,8 +40,8 @@ pub(crate) use limits::PreparedLimit;
 pub(super) use limits::{has_zero_limit, resolve_select_limit};
 pub(crate) use locking::SelectLock;
 pub(super) use locking::{
-    contains_locking_operations, contains_read_source, requires_nested_locking,
-    resolve_query_lock_targets, resolve_select_lock_mode,
+    contains_locking_operations, requires_nested_locking, resolve_query_lock_targets,
+    resolve_select_lock_mode,
 };
 use ordering::{RowOrderSpec, compare_ordered_rows, resolve_order_specs, sort_ordered_rows};
 pub(crate) use projection::describe_query_result_columns;
@@ -228,13 +231,6 @@ fn execute_query_inner(
             .iter()
             .any(|cached| cached.occurrence == query.span() && cached.sql == query.to_string());
     context.retain_row_origins |= context.capture_lock_queries;
-    if context.capture_lock_queries && contains_read_source(query) {
-        context
-            .query_source_state
-            .lock()
-            .expect("query source mutex is poisoned")
-            .get_or_insert_with(|| std::sync::Arc::new(state.clone()));
-    }
     let query_sql = format!("{:?} {inherited:?} {query}", context.query_invocation);
     let context = &context;
     let cache_key = context
@@ -290,6 +286,20 @@ fn execute_query_inner(
         expanded_context.query_row_demand = maximum_rows;
         expanded_context.inherited_row_lock = inherited;
         return execute_query(state, &expanded, xid, snapshot, &expanded_context);
+    }
+    if context.capture_lock_queries {
+        let table_ids = collect_query_source_table_ids(query, state);
+        let mut sources = context
+            .query_source_state
+            .lock()
+            .expect("query source mutex is poisoned");
+        for table_id in table_ids {
+            sources.entry(table_id).or_insert_with(|| {
+                state
+                    .capture_query_source(table_id)
+                    .expect("catalog table has storage")
+            });
+        }
     }
     if contains_query_ctes(query) {
         let materialized = materialize_query_ctes(state, query, xid, snapshot, context)?;
@@ -736,6 +746,36 @@ fn execute_query_inner(
         });
     }
     Ok(output)
+}
+
+fn collect_query_source_table_ids(query: &ast::Query, state: &DatabaseState) -> BTreeSet<TableId> {
+    struct TableCollector<'a> {
+        state: &'a DatabaseState,
+        tables: BTreeSet<TableId>,
+    }
+    impl ast::Visitor for TableCollector<'_> {
+        type Break = ();
+        fn pre_visit_table_factor(
+            &mut self,
+            factor: &ast::TableFactor,
+        ) -> std::ops::ControlFlow<()> {
+            if let ast::TableFactor::Table {
+                name, args: None, ..
+            } = factor
+                && let Ok(name) = normalize_relation_name(name)
+                && let Ok(schema) = self.state.catalog.require_named_table(&name)
+            {
+                self.tables.insert(schema.id);
+            }
+            std::ops::ControlFlow::Continue(())
+        }
+    }
+    let mut collector = TableCollector {
+        state,
+        tables: BTreeSet::new(),
+    };
+    let _ = query.visit(&mut crate::ast_visit::ReadVisitor(&mut collector));
+    collector.tables
 }
 
 pub(in crate::executor) fn simplify_exists_query(

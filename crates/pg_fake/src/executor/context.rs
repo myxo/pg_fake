@@ -1,6 +1,8 @@
 use super::{DatabaseState, RequiredRowLock, query, sequences::SequenceExecutionContext};
 use crate::{
     QueryResult,
+    catalog::TableId,
+    database::QuerySourceTable,
     error::{PgError, Result, SqlState},
     storage::RowId,
     txn::{CommandId, CommitSeq, Snapshot, Xid},
@@ -53,7 +55,8 @@ pub(crate) struct StatementContext {
     pub(crate) retain_row_origins: bool,
     pub(crate) query_row_demand: Option<usize>,
     pub(crate) query_invocation: Vec<usize>,
-    pub(crate) query_source_state: Arc<Mutex<Option<Arc<DatabaseState>>>>,
+    pub(crate) query_source_state:
+        Arc<Mutex<std::collections::BTreeMap<TableId, QuerySourceTable>>>,
     pub(crate) inherited_row_lock: Option<super::query::SelectLock>,
     pub(crate) source_row_locks: Vec<(Span, super::query::SelectLock)>,
     pub(crate) cte_query_barriers: Arc<Mutex<Vec<ast::Query>>>,

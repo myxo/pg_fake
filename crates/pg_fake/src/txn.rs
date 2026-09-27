@@ -481,6 +481,18 @@ impl WaitForGraph {
 }
 
 impl TransactionRegistry {
+    pub(crate) fn snapshot_statuses(&self, xids: &BTreeSet<Xid>) -> Self {
+        TransactionRegistry {
+            next_xid: self.next_xid,
+            commit_seq: self.commit_seq,
+            statuses: xids
+                .iter()
+                .filter_map(|xid| self.statuses.get(xid).map(|status| (*xid, *status)))
+                .collect(),
+            retained_snapshots: BTreeMap::new(),
+        }
+    }
+
     pub(crate) fn collect_active_transactions(&self) -> Vec<Xid> {
         self.statuses
             .iter()

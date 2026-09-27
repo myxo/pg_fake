@@ -32,6 +32,12 @@ pub(crate) struct DatabaseState {
     reclaimable_tables: Vec<TableId>,
 }
 
+#[derive(Clone)]
+pub(crate) struct QuerySourceTable {
+    pub(crate) table: Arc<Table>,
+    pub(crate) transactions: Arc<TransactionRegistry>,
+}
+
 impl DatabaseState {
     #[cfg_attr(feature = "execution-log", tracing::instrument(skip_all))]
     pub(crate) fn create() -> Self {
@@ -56,6 +62,23 @@ impl DatabaseState {
             touched_tables: BTreeMap::new(),
             reclaimable_tables: Vec::new(),
         }
+    }
+
+    pub(crate) fn capture_query_source(&self, table_id: TableId) -> Option<QuerySourceTable> {
+        let table = self.tables.get(&table_id)?;
+        let xids = table
+            .iterate_version_chains()
+            .flat_map(|(_, chain)| {
+                chain
+                    .versions
+                    .iter()
+                    .flat_map(|version| std::iter::once(version.xmin).chain(version.xmax))
+            })
+            .collect();
+        Some(QuerySourceTable {
+            table: Arc::new(table.clone()),
+            transactions: Arc::new(self.transactions.snapshot_statuses(&xids)),
+        })
     }
 
     #[cfg_attr(feature = "execution-log", tracing::instrument(skip_all))]

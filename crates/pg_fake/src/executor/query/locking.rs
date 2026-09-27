@@ -306,21 +306,6 @@ pub(in crate::executor) fn contains_locking_operations(value: &impl ast::Visit) 
     detector.0
 }
 
-pub(in crate::executor) fn contains_read_source(value: &impl ast::Visit) -> bool {
-    struct SourceDetector;
-    impl ast::Visitor for SourceDetector {
-        type Break = ();
-        fn pre_visit_table_factor(&mut self, _: &ast::TableFactor) -> std::ops::ControlFlow<()> {
-            std::ops::ControlFlow::Break(())
-        }
-    }
-    let mut detector = SourceDetector;
-    matches!(
-        value.visit(&mut crate::ast_visit::ReadVisitor(&mut detector)),
-        std::ops::ControlFlow::Break(())
-    )
-}
-
 pub(in crate::executor) fn requires_nested_locking(query: &ast::Query) -> bool {
     struct BarrierDetector(bool);
     impl ast::Visitor for BarrierDetector {

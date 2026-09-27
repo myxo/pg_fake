@@ -517,29 +517,36 @@ fn materialize_table_factor_rows(
         .query_source_state
         .lock()
         .expect("query source mutex is poisoned")
-        .clone();
-    let source_state = frozen.as_deref().unwrap_or(state);
-    let source_snapshot = if frozen.is_some() {
-        &context.source_snapshot
-    } else {
-        snapshot
-    };
-    source_state.record_read(xid, crate::serializable::Access::Relation(schema.id));
-    source_state
-        .tables
         .get(&schema.id)
-        .expect("catalog table must have storage")
+        .cloned();
+    let (table, transactions, source_snapshot) = frozen.as_ref().map_or_else(
+        || {
+            (
+                state
+                    .tables
+                    .get(&schema.id)
+                    .expect("catalog table must have storage"),
+                &state.transactions,
+                snapshot,
+            )
+        },
+        |source| {
+            (
+                source.table.as_ref(),
+                source.transactions.as_ref(),
+                &context.source_snapshot,
+            )
+        },
+    );
+    state.record_read(xid, crate::serializable::Access::Relation(schema.id));
+    table
         .iterate_version_chains()
         .filter_map(|(row_id, chain)| {
-            find_visible_version(chain, source_snapshot, xid, &source_state.transactions).map(
-                |version| {
-                    source_state
-                        .record_read(xid, crate::serializable::Access::Row(schema.id, row_id));
-                    (row_id, version)
-                },
-            )
+            find_visible_version(chain, source_snapshot, xid, transactions)
+                .map(|version| (row_id, version))
         })
         .map(|(row_id, version)| {
+            state.record_read(xid, crate::serializable::Access::Row(schema.id, row_id));
             let mut row = vec![Value::Null; scope.columns.len()];
             row[start..start + version.row.len()].clone_from_slice(&version.row);
             let passes = filters.iter().try_fold(true, |passes, filter| {

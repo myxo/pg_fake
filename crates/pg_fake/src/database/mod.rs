@@ -10,7 +10,7 @@ use crate::error::{PgError, Result, SqlState};
 use super::Session;
 
 mod state;
-pub(crate) use state::DatabaseState;
+pub(crate) use state::{DatabaseState, QuerySourceTable};
 
 #[derive(Clone)]
 pub struct Db {
