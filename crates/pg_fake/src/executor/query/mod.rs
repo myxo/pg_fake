@@ -140,7 +140,7 @@ impl QueryOutput {
 
 #[derive(Clone)]
 pub(crate) struct DerivedProjection {
-    select: ast::Select,
+    select: std::sync::Arc<ast::Select>,
     source: super::from::SourceRow,
 }
 
@@ -699,13 +699,19 @@ fn execute_query_inner(
         }
     }
     let rows = finalize_select_rows(rows, &order_specs, &distinct, limit, offset)?;
+    let mut shared_select = None;
     let (values, origins): (Vec<_>, Vec<_>) = rows
         .into_iter()
         .map(|row| {
             let mut origins = row.origins;
-            if let Some(source) = row.deferred_source {
+            if let Some(source) = row.deferred_source
+                && !origins.is_empty()
+            {
+                let select = shared_select
+                    .get_or_insert_with(|| std::sync::Arc::new(select.clone()))
+                    .clone();
                 let projection = std::sync::Arc::new(DerivedProjection {
-                    select: select.clone(),
+                    select,
                     source: super::from::SourceRow {
                         values: source,
                         origins: origins.clone(),
