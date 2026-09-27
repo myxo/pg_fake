@@ -52,10 +52,31 @@ pub(super) fn visit_table_factor_rows(
         );
     }
     let mut row = vec![Value::Null; scope.columns.len()];
-    let table = state
-        .tables
+    let frozen = context
+        .query_source_state
+        .lock()
+        .expect("query source mutex is poisoned")
         .get(&schema.id)
-        .expect("catalog table must have storage");
+        .cloned();
+    let (table, transactions, source_snapshot) = frozen.as_ref().map_or_else(
+        || {
+            (
+                state
+                    .tables
+                    .get(&schema.id)
+                    .expect("catalog table must have storage"),
+                &state.transactions,
+                snapshot,
+            )
+        },
+        |source| {
+            (
+                source.table.as_ref(),
+                source.transactions.as_ref(),
+                &context.source_snapshot,
+            )
+        },
+    );
     for filter in &filters {
         let ast::Expr::BinaryOp {
             left,
@@ -107,9 +128,9 @@ pub(super) fn visit_table_factor_rows(
         let Some((row_id, indexed_version)) = table.find_unique_visible_version(
             &[column],
             &[value],
-            snapshot,
+            source_snapshot,
             xid,
-            &state.transactions,
+            transactions,
         ) else {
             return Ok(());
         };
@@ -132,7 +153,7 @@ pub(super) fn visit_table_factor_rows(
     }
     state.record_read(xid, Access::Relation(schema.id));
     for (row_id, chain) in table.iterate_version_chains() {
-        let Some(version) = find_visible_version(chain, snapshot, xid, &state.transactions) else {
+        let Some(version) = find_visible_version(chain, source_snapshot, xid, transactions) else {
             continue;
         };
         state.record_read(xid, Access::Row(schema.id, row_id));

@@ -748,7 +748,10 @@ fn execute_query_inner(
     Ok(output)
 }
 
-fn collect_query_source_table_ids(query: &ast::Query, state: &DatabaseState) -> BTreeSet<TableId> {
+pub(super) fn collect_query_source_table_ids(
+    query: &ast::Query,
+    state: &DatabaseState,
+) -> BTreeSet<TableId> {
     struct TableCollector<'a> {
         state: &'a DatabaseState,
         tables: BTreeSet<TableId>,

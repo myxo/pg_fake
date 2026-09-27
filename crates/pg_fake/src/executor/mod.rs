@@ -1,15 +1,73 @@
+use crate::database::QuerySourceTable;
 use crate::{
     StatementResult,
-    catalog::{ConstraintId, RelationName},
+    catalog::{ConstraintId, RelationName, TableId},
     error::{PgError, Result, SqlState, reject_unsupported},
     txn::{Snapshot, Xid},
     value::BaseType,
 };
 use indexes::{execute_alter_index, execute_create_index, execute_drop_indexes};
 use sqlparser::ast;
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 use views::{execute_comment_on_view, execute_create_view, execute_drop_views};
 use writes::{execute_delete, execute_insert, execute_update};
+
+pub(crate) fn capture_insert_query_sources(
+    state: &DatabaseState,
+    statement: &ast::Statement,
+) -> BTreeMap<TableId, QuerySourceTable> {
+    fn collect(statement: &ast::Statement, state: &DatabaseState, ids: &mut BTreeSet<TableId>) {
+        match statement {
+            ast::Statement::Insert(insert) => {
+                if let Some(source) = &insert.source {
+                    let expanded = views::expand_query_views(&state.catalog, source)
+                        .ok()
+                        .flatten();
+                    ids.extend(query::collect_query_source_table_ids(
+                        expanded.as_ref().unwrap_or(source),
+                        state,
+                    ));
+                }
+            }
+            ast::Statement::Query(query) => {
+                if contains_insert_query_source(statement) {
+                    let expanded = views::expand_query_views(&state.catalog, query)
+                        .ok()
+                        .flatten();
+                    ids.extend(query::collect_query_source_table_ids(
+                        expanded.as_ref().unwrap_or(query),
+                        state,
+                    ));
+                }
+            }
+            _ => {}
+        }
+    }
+    let mut ids = BTreeSet::new();
+    collect(statement, state, &mut ids);
+    ids.into_iter()
+        .filter_map(|id| state.capture_query_source(id).map(|source| (id, source)))
+        .collect()
+}
+
+fn contains_insert_query_source(statement: &ast::Statement) -> bool {
+    match statement {
+        ast::Statement::Insert(insert) => insert.source.as_ref().is_some_and(|source| {
+            source.with.is_some() || !matches!(source.body.as_ref(), ast::SetExpr::Values(_))
+        }),
+        ast::Statement::Query(query) => {
+            matches!(
+                query.body.as_ref(),
+                ast::SetExpr::Insert(statement) if contains_insert_query_source(statement)
+            ) || query.with.as_ref().is_some_and(|with| {
+                with.cte_tables.iter().any(|cte| {
+                    contains_insert_query_source(&ast::Statement::Query(cte.query.clone()))
+                })
+            })
+        }
+        _ => false,
+    }
+}
 
 mod aggregates;
 mod alter_table;

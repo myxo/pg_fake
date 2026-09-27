@@ -4119,6 +4119,8 @@ fn preserves_statement_source_snapshot_across_insert_ctes() {
                 CREATE TABLE cte_snapshot_source (id BIGINT PRIMARY KEY);
                 CREATE TABLE cte_snapshot_rows (id BIGINT PRIMARY KEY, value BIGINT);
                 INSERT INTO cte_snapshot_source VALUES (1), (2), (3);
+                CREATE VIEW cte_snapshot_source_view AS
+                    SELECT id FROM cte_snapshot_source;
                 INSERT INTO cte_snapshot_rows VALUES (1, 0);
                 CREATE FUNCTION preserve_cte_snapshot_row() RETURNS TRIGGER AS $$
                 BEGIN RETURN NEW; END;
@@ -4142,9 +4144,11 @@ fn preserves_statement_source_snapshot_across_insert_ctes() {
                          INSERT INTO cte_snapshot_rows VALUES (1, 0) \
                          ON CONFLICT (id) DO UPDATE SET value = excluded.value \
                          RETURNING id\
+                     ), source_rows AS (\
+                         SELECT id FROM cte_snapshot_source_view\
                      ), later_insert AS (\
                          INSERT INTO cte_snapshot_rows \
-                         SELECT id + 10, 0 FROM cte_snapshot_source \
+                         SELECT id + 10, 0 FROM source_rows \
                          RETURNING id\
                      ) \
                      SELECT first_insert.id, later_insert.id \

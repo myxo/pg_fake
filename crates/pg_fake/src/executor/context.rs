@@ -1,4 +1,4 @@
-use super::{DatabaseState, RequiredRowLock, query, sequences::SequenceExecutionContext};
+use super::{RequiredRowLock, query, sequences::SequenceExecutionContext};
 use crate::{
     QueryResult,
     catalog::TableId,
@@ -33,7 +33,6 @@ pub(crate) struct StatementContext {
     pub(crate) rng: Arc<Mutex<ChaCha12Rng>>,
     pub(crate) sequences: SequenceExecutionContext,
     pub(crate) advisory: crate::advisory::AdvisoryExecutionContext,
-    pub(crate) source_state: Option<Arc<DatabaseState>>,
     pub(crate) source_snapshot: Snapshot,
     pub(crate) pending_insert_sources: Arc<Mutex<Vec<(ast::Insert, QueryResult)>>>,
     pub(crate) prepared_inserts: Arc<Mutex<PreparedInsertCache>>,
@@ -81,7 +80,6 @@ pub(crate) struct PreparedInsertCache {
 
 #[derive(Clone)]
 pub(crate) struct PreparedInsert {
-    pub(crate) source_state: Option<Arc<DatabaseState>>,
     pub(crate) source_snapshot: Option<Snapshot>,
     pub(super) source_query: Option<query::QueryStreamState>,
     pub(crate) source_rows: Vec<Option<Vec<Value>>>,

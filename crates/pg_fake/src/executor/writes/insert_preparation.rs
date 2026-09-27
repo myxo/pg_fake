@@ -22,7 +22,7 @@ use crate::{
     value::{BaseType, Value},
 };
 use sqlparser::ast::{self, Spanned as _};
-use std::{collections::BTreeSet, sync::Arc};
+use std::collections::BTreeSet;
 
 #[cfg_attr(feature = "execution-log", tracing::instrument(skip_all))]
 pub(super) fn evaluate_insert_rows(
@@ -503,7 +503,6 @@ pub(super) fn evaluate_insert_rows(
             Err(error) => Some(error.clone()),
         };
         return Ok(PreparedInsert {
-            source_state: None,
             source_snapshot: None,
             source_query: None,
             source_rows: evaluated.ok().into_iter().collect(),
@@ -536,7 +535,6 @@ pub(super) fn evaluate_insert_rows(
                     ) {
                         source_rows.push(evaluated.expect("evaluated row is successful"));
                         return Ok(PreparedInsert {
-                            source_state: None,
                             source_snapshot: None,
                             source_query: None,
                             source_rows,
@@ -555,7 +553,6 @@ pub(super) fn evaluate_insert_rows(
                 Ok(None) => source_rows.push(None),
                 Err(error) => {
                     return Ok(PreparedInsert {
-                        source_state: None,
                         source_snapshot: None,
                         source_query: None,
                         source_rows,
@@ -569,7 +566,6 @@ pub(super) fn evaluate_insert_rows(
             }
         }
         return Ok(PreparedInsert {
-            source_state: None,
             source_snapshot: None,
             source_query: None,
             source_rows,
@@ -599,10 +595,6 @@ pub(super) fn evaluate_insert_rows(
     let source_snapshot = resume
         .and_then(|cached| cached.source_snapshot.as_ref())
         .unwrap_or(&context.source_snapshot);
-    let source_state = resume
-        .and_then(|cached| cached.source_state.clone())
-        .or_else(|| context.source_state.clone())
-        .unwrap_or_else(|| Arc::new(state.clone()));
     if let Some(resume) = resume {
         for cached in &resume.source_rows {
             if let Some(row) = cached {
@@ -616,7 +608,6 @@ pub(super) fn evaluate_insert_rows(
                 ) {
                     streamed_source_rows.push(cached.clone());
                     return Ok(PreparedInsert {
-                        source_state: Some(source_state.clone()),
                         source_snapshot: Some(*source_snapshot),
                         source_query,
                         source_rows: streamed_source_rows,
@@ -631,7 +622,6 @@ pub(super) fn evaluate_insert_rows(
             streamed_source_rows.push(cached.clone());
             if stopped.get() {
                 return Ok(PreparedInsert {
-                    source_state: Some(source_state.clone()),
                     source_snapshot: Some(*source_snapshot),
                     source_query,
                     source_rows: streamed_source_rows,
@@ -760,7 +750,7 @@ pub(super) fn evaluate_insert_rows(
     });
     let streamed = resumed.and_then(|()| {
         query::stream_query_rows(
-            &source_state,
+            state,
             source,
             xid,
             source_snapshot,
@@ -773,7 +763,6 @@ pub(super) fn evaluate_insert_rows(
     match streamed {
         Err(_) if stopped.get() => {
             return Ok(PreparedInsert {
-                source_state: Some(source_state.clone()),
                 source_snapshot: Some(*source_snapshot),
                 source_query,
                 source_rows: streamed_source_rows,
@@ -787,7 +776,6 @@ pub(super) fn evaluate_insert_rows(
         Err(error) => {
             return match streamed_error {
                 Some(error) => Ok(PreparedInsert {
-                    source_state: Some(source_state.clone()),
                     source_snapshot: Some(*source_snapshot),
                     source_query,
                     source_rows: streamed_source_rows,
@@ -808,7 +796,6 @@ pub(super) fn evaluate_insert_rows(
                 ));
             }
             return Ok(PreparedInsert {
-                source_state: Some(source_state.clone()),
                 source_snapshot: Some(*source_snapshot),
                 source_query,
                 source_rows: streamed_source_rows,
@@ -888,7 +875,6 @@ pub(super) fn evaluate_insert_rows(
                 ) {
                     streamed_source_rows.push(Some(row));
                     return Ok(PreparedInsert {
-                        source_state: Some(source_state.clone()),
                         source_snapshot: Some(*source_snapshot),
                         source_query,
                         source_rows: streamed_source_rows,
@@ -907,7 +893,6 @@ pub(super) fn evaluate_insert_rows(
             Ok(None) => streamed_source_rows.push(None),
             Err(error) => {
                 return Ok(PreparedInsert {
-                    source_state: Some(source_state.clone()),
                     source_snapshot: Some(*source_snapshot),
                     source_query,
                     source_rows: streamed_source_rows,
@@ -921,7 +906,6 @@ pub(super) fn evaluate_insert_rows(
         }
     }
     Ok(PreparedInsert {
-        source_state: Some(source_state),
         source_snapshot: Some(*source_snapshot),
         source_query,
         source_rows: streamed_source_rows,
