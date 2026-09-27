@@ -1,4 +1,3 @@
-use super::quote_identifier;
 use crate::executor::{normalize_identifier, normalize_relation_name};
 use crate::{
     catalog::{Catalog, ViewColumn, ViewId},
@@ -6,27 +5,75 @@ use crate::{
 };
 use sqlparser::ast::{self, VisitMut as _};
 
-fn freeze_view_output(query: &ast::Query, columns: &[ViewColumn]) -> Result<Box<ast::Query>> {
-    let alias = quote_identifier("__pg_fake_view_input");
-    let names = columns
+fn freeze_view_output(query: &ast::Query, columns: &[ViewColumn]) -> Box<ast::Query> {
+    let alias_name = "__pg_fake_view_input";
+    let alias = ast::Ident::with_quote('"', alias_name);
+    let columns = columns
         .iter()
-        .map(|column| quote_identifier(&column.name))
+        .map(|column| ast::TableAliasColumnDef {
+            name: ast::Ident::with_quote('"', column.name.clone()),
+            data_type: None,
+        })
         .collect::<Vec<_>>();
-    let projection = names
+    let projection = columns
         .iter()
-        .map(|name| format!("{alias}.{name}"))
-        .collect::<Vec<_>>()
-        .join(", ");
-    let aliases = names.join(", ");
-    let sql = format!("SELECT {projection} FROM ({query}) AS {alias} ({aliases})");
-    let mut statements = crate::parser::parse(&sql)?;
-    let ast::Statement::Query(query) = statements
-        .pop()
-        .expect("generated view projection contains one statement")
-    else {
-        unreachable!("generated view projection is a query")
-    };
-    Ok(query)
+        .map(|column| {
+            ast::SelectItem::UnnamedExpr(ast::Expr::CompoundIdentifier(vec![
+                ast::Ident::with_quote('"', alias_name),
+                column.name.clone(),
+            ]))
+        })
+        .collect();
+    Box::new(ast::Query {
+        with: None,
+        body: Box::new(ast::SetExpr::Select(Box::new(ast::Select {
+            select_token: ast::helpers::attached_token::AttachedToken::empty(),
+            optimizer_hints: Vec::new(),
+            distinct: None,
+            select_modifiers: None,
+            top: None,
+            top_before_distinct: false,
+            projection,
+            exclude: None,
+            into: None,
+            from: vec![ast::TableWithJoins {
+                relation: ast::TableFactor::Derived {
+                    lateral: false,
+                    subquery: Box::new(query.clone()),
+                    alias: Some(ast::TableAlias {
+                        name: alias,
+                        columns,
+                        explicit: true,
+                        at: None,
+                    }),
+                    sample: None,
+                },
+                joins: Vec::new(),
+            }],
+            lateral_views: Vec::new(),
+            prewhere: None,
+            selection: None,
+            connect_by: Vec::new(),
+            group_by: ast::GroupByExpr::Expressions(Vec::new(), Vec::new()),
+            cluster_by: Vec::new(),
+            distribute_by: Vec::new(),
+            sort_by: Vec::new(),
+            having: None,
+            named_window: Vec::new(),
+            qualify: None,
+            window_before_qualify: false,
+            value_table_mode: None,
+            flavor: ast::SelectFlavor::Standard,
+        }))),
+        order_by: None,
+        limit_clause: None,
+        fetch: None,
+        locks: Vec::new(),
+        for_clause: None,
+        settings: None,
+        format_clause: None,
+        pipe_operators: Vec::new(),
+    })
 }
 
 struct ViewExpander<'a> {
@@ -134,13 +181,7 @@ impl ast::VisitorMut for ViewExpander<'_> {
             self.error = Some(error);
             return std::ops::ControlFlow::Break(());
         }
-        let query = match freeze_view_output(&query, &view.columns) {
-            Ok(query) => query,
-            Err(error) => {
-                self.error = Some(error);
-                return std::ops::ControlFlow::Break(());
-            }
-        };
+        let query = freeze_view_output(&query, &view.columns);
         let columns = view
             .columns
             .iter()
