@@ -33,6 +33,7 @@ pub(crate) struct StatementContext {
     pub(crate) rng: Arc<Mutex<ChaCha12Rng>>,
     pub(crate) sequences: SequenceExecutionContext,
     pub(crate) advisory: crate::advisory::AdvisoryExecutionContext,
+    pub(crate) regex_cache: Arc<Mutex<RegexCache>>,
     pub(crate) source_snapshot: Snapshot,
     pub(crate) pending_insert_sources: Arc<Mutex<Vec<(ast::Insert, QueryResult)>>>,
     pub(crate) prepared_inserts: Arc<Mutex<PreparedInsertCache>>,
@@ -72,6 +73,8 @@ pub(crate) struct StatementContext {
     pub(crate) row_lock_recheck: Arc<AtomicBool>,
     pub(crate) row_lock_recheck_locks: Arc<Mutex<Vec<RequiredRowLock>>>,
 }
+
+pub(crate) type RegexCache = Vec<((String, String), Result<Arc<regex::Regex>>)>;
 
 #[derive(Clone, Default)]
 pub(crate) struct PreparedInsertCache {

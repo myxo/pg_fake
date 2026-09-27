@@ -1661,6 +1661,64 @@ fn binds_typed_parameters_and_prepared_statements() {
 
 #[test]
 #[cfg_attr(feature = "execution-log", tracing::instrument(skip_all))]
+fn evaluates_constant_and_row_dependent_regex_patterns_per_statement() {
+    let db = Db::create();
+    let mut session = db.create_session();
+    session
+        .execute(
+            "CREATE TABLE regex_pattern_rows (id INT, value TEXT, pattern TEXT); \
+             INSERT INTO regex_pattern_rows VALUES \
+                 (1, 'alpha', '^a'), (2, 'alpha', '^z')",
+        )
+        .unwrap();
+
+    assert_eq!(
+        session
+            .query(
+                "SELECT regexp_like(value, pattern) FROM regex_pattern_rows ORDER BY id",
+                &[],
+            )
+            .unwrap()
+            .rows,
+        vec![vec![Value::Bool(true)], vec![Value::Bool(false)]]
+    );
+
+    let prepared = session.prepare("SELECT regexp_like($1, $2)").unwrap();
+    assert_eq!(
+        session
+            .query_prepared(
+                &prepared,
+                &[Value::Text("alpha".into()), Value::Text("^a".into())],
+            )
+            .unwrap()
+            .rows,
+        vec![vec![Value::Bool(true)]]
+    );
+    assert_eq!(
+        session
+            .query_prepared(
+                &prepared,
+                &[Value::Text("alpha".into()), Value::Text("^z".into())],
+            )
+            .unwrap()
+            .rows,
+        vec![vec![Value::Bool(false)]]
+    );
+
+    assert_eq!(
+        session
+            .query(
+                "SELECT CASE WHEN false THEN regexp_like('alpha', '[') ELSE true END",
+                &[],
+            )
+            .unwrap()
+            .rows,
+        vec![vec![Value::Bool(true)]]
+    );
+}
+
+#[test]
+#[cfg_attr(feature = "execution-log", tracing::instrument(skip_all))]
 fn preserves_comparison_coercion_for_point_lookup_candidates() {
     let db = Db::create();
     let mut session = db.create_session();

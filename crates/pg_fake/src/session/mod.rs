@@ -350,6 +350,7 @@ impl Session {
                 condvar: condvar.clone(),
                 pending: Default::default(),
             },
+            regex_cache: Arc::new(Mutex::new(Default::default())),
             source_snapshot: snapshot,
             pending_insert_sources: Default::default(),
             prepared_inserts: Arc::new(Mutex::new(Default::default())),

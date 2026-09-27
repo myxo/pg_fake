@@ -487,6 +487,7 @@ fn evaluate_inner(
         {
             infer_expression_type(expr, schema)?;
             let left = evaluate(left, schema, row, context)?;
+            let cacheable = patterns::is_execution_constant(right);
             let right = evaluate_and_coerce(
                 right,
                 BaseType::Text,
@@ -506,7 +507,9 @@ fn evaluate_inner(
             } else {
                 ""
             };
-            let Value::Bool(matched) = patterns::evaluate_regex(&value, &pattern, flags)? else {
+            let Value::Bool(matched) =
+                patterns::evaluate_regex(&value, &pattern, flags, context, cacheable)?
+            else {
                 unreachable!()
             };
             Ok(Value::Bool(

@@ -172,10 +172,23 @@ pub(super) fn evaluate_runtime_function(
             )
         }
         ("regexp_like", [Value::Text(value), Value::Text(pattern)]) => {
-            super::patterns::evaluate_regex(value, pattern, "")
+            super::patterns::evaluate_regex(
+                value,
+                pattern,
+                "",
+                context,
+                super::patterns::is_execution_constant(arguments[1]),
+            )
         }
         ("regexp_like", [Value::Text(value), Value::Text(pattern), Value::Text(flags)]) => {
-            super::patterns::evaluate_regex(value, pattern, flags)
+            super::patterns::evaluate_regex(
+                value,
+                pattern,
+                flags,
+                context,
+                super::patterns::is_execution_constant(arguments[1])
+                    && super::patterns::is_execution_constant(arguments[2]),
+            )
         }
         ("hashtext", [Value::Text(value)]) => {
             Ok(Value::Int4(super::hashing::calculate_text_hash(value)))

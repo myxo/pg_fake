@@ -3,8 +3,49 @@ use crate::{
     executor::StatementContext,
     value::Value,
 };
+use sqlparser::ast;
+use std::sync::Arc;
 
-pub(super) fn evaluate_regex(value: &str, pattern: &str, flags: &str) -> Result<Value> {
+pub(super) fn evaluate_regex(
+    value: &str,
+    pattern: &str,
+    flags: &str,
+    context: &StatementContext,
+    cacheable: bool,
+) -> Result<Value> {
+    let insensitive = regex_insensitive(flags)?;
+    if !pattern.is_ascii() || (insensitive && !value.is_ascii()) {
+        return reject_unsupported("non-ASCII regular expression matching is not implemented");
+    }
+    let regex = if cacheable {
+        let mut cache = context
+            .regex_cache
+            .lock()
+            .expect("regex cache mutex is poisoned");
+        if let Some((_, regex)) = cache.iter().find(|((cached_pattern, cached_flags), _)| {
+            cached_pattern == pattern && cached_flags == flags
+        }) {
+            regex.clone()?
+        } else {
+            let regex = compile_regex(pattern, insensitive).map(Arc::new);
+            cache.push(((pattern.to_owned(), flags.to_owned()), regex.clone()));
+            regex?
+        }
+    } else {
+        Arc::new(compile_regex(pattern, insensitive)?)
+    };
+    Ok(Value::Bool(regex.is_match(value)))
+}
+
+pub(super) fn is_execution_constant(expression: &ast::Expr) -> bool {
+    match expression {
+        ast::Expr::Value(_) | ast::Expr::TypedString { .. } => true,
+        ast::Expr::Cast { expr, .. } | ast::Expr::Nested(expr) => is_execution_constant(expr),
+        _ => false,
+    }
+}
+
+fn regex_insensitive(flags: &str) -> Result<bool> {
     let mut insensitive = false;
     for flag in flags.chars() {
         match flag {
@@ -22,9 +63,10 @@ pub(super) fn evaluate_regex(value: &str, pattern: &str, flags: &str) -> Result<
             }
         }
     }
-    if !pattern.is_ascii() || (insensitive && !value.is_ascii()) {
-        return reject_unsupported("non-ASCII regular expression matching is not implemented");
-    }
+    Ok(insensitive)
+}
+
+fn compile_regex(pattern: &str, insensitive: bool) -> Result<regex::Regex> {
     let mut escaped = false;
     let mut in_class = false;
     let mut previous = None;
@@ -158,12 +200,11 @@ pub(super) fn evaluate_regex(value: &str, pattern: &str, flags: &str) -> Result<
         normalized.push(character);
         previous = Some(character);
     }
-    let regex = regex::RegexBuilder::new(&normalized)
+    regex::RegexBuilder::new(&normalized)
         .case_insensitive(insensitive)
         .dot_matches_new_line(true)
         .build()
-        .map_err(|error| PgError::create(SqlState::InvalidRegularExpression, error.to_string()))?;
-    Ok(Value::Bool(regex.is_match(value)))
+        .map_err(|error| PgError::create(SqlState::InvalidRegularExpression, error.to_string()))
 }
 
 #[derive(Clone, Copy)]
