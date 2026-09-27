@@ -28,8 +28,8 @@ pub(super) struct SessionSettings {
     pub(super) timezone: String,
     pub(super) search_path: Vec<String>,
     search_path_text: String,
-    values: BTreeMap<&'static str, SettingValue>,
-    custom: BTreeMap<String, String>,
+    values: Arc<BTreeMap<&'static str, SettingValue>>,
+    custom: Arc<BTreeMap<String, String>>,
 }
 
 #[derive(Clone)]
@@ -51,8 +51,8 @@ impl SessionSettings {
             timezone: String::new(),
             search_path: Vec::new(),
             search_path_text: String::new(),
-            values: BTreeMap::new(),
-            custom: BTreeMap::new(),
+            values: Arc::new(BTreeMap::new()),
+            custom: Arc::new(BTreeMap::new()),
         };
         for spec in list_settings() {
             let value = match spec.default {
@@ -99,7 +99,7 @@ impl SessionSettings {
                 self.search_path_text = text.clone();
             }
             (SettingEffect::Compatibility | SettingEffect::Planner, _) => {
-                self.values.insert(spec.name, value);
+                Arc::make_mut(&mut self.values).insert(spec.name, value);
             }
             _ => unreachable!("registry type must agree with its execution effect"),
         }
@@ -186,7 +186,7 @@ pub(crate) struct GucExecutionContext {
     current: SessionSettings,
     on_commit: SessionSettings,
     defaults: SessionSettings,
-    custom_settings: BTreeSet<String>,
+    custom_settings: Arc<BTreeSet<String>>,
     isolation: IsolationLevel,
     strict: bool,
 }
@@ -240,11 +240,11 @@ impl GucExecutionContext {
                     return Err(error);
                 }
                 let name = name.to_ascii_lowercase();
-                self.custom_settings.insert(name.clone());
+                Arc::make_mut(&mut self.custom_settings).insert(name.clone());
                 let text = text.unwrap_or_default();
-                self.current.custom.insert(name.clone(), text.into());
+                Arc::make_mut(&mut self.current.custom).insert(name.clone(), text.into());
                 if !local {
-                    self.on_commit.custom.insert(name, text.into());
+                    Arc::make_mut(&mut self.on_commit.custom).insert(name, text.into());
                 }
                 return Ok(text.into());
             }
@@ -324,13 +324,18 @@ impl Session {
                             }
                             self.reset_setting(spec, &defaults);
                         }
-                        self.settings.custom.values_mut().for_each(String::clear);
-                        self.settings_on_commit
-                            .as_mut()
-                            .expect("RESET runs in a transaction")
-                            .custom
+                        Arc::make_mut(&mut self.settings.custom)
                             .values_mut()
                             .for_each(String::clear);
+                        Arc::make_mut(
+                            &mut self
+                                .settings_on_commit
+                                .as_mut()
+                                .expect("RESET runs in a transaction")
+                                .custom,
+                        )
+                        .values_mut()
+                        .for_each(String::clear);
                     }
                     ast::Reset::ConfigurationParameter(name) => {
                         let name = normalize_setting_name(name)?;
@@ -338,13 +343,17 @@ impl Session {
                             Ok(spec) => spec,
                             Err(_) if is_custom_setting_name(&name) => {
                                 let name = name.to_ascii_lowercase();
-                                self.custom_settings.insert(name.clone());
-                                self.settings.custom.insert(name.clone(), String::new());
-                                self.settings_on_commit
-                                    .as_mut()
-                                    .expect("RESET runs in a transaction")
-                                    .custom
-                                    .insert(name, String::new());
+                                Arc::make_mut(&mut self.custom_settings).insert(name.clone());
+                                Arc::make_mut(&mut self.settings.custom)
+                                    .insert(name.clone(), String::new());
+                                Arc::make_mut(
+                                    &mut self
+                                        .settings_on_commit
+                                        .as_mut()
+                                        .expect("RESET runs in a transaction")
+                                        .custom,
+                                )
+                                .insert(name, String::new());
                                 return Ok(Some(StatementResult::Affected(0)));
                             }
                             Err(error) => return Err(error),
@@ -520,14 +529,12 @@ impl Session {
         let context = context.lock().expect("GUC context mutex is poisoned");
         self.settings = context.current.clone();
         self.settings_on_commit = Some(context.on_commit.clone());
-        self.custom_settings
-            .extend(context.custom_settings.iter().cloned());
+        self.custom_settings = context.custom_settings.clone();
     }
 
     pub(super) fn apply_guc_custom_settings(&mut self, context: &Arc<Mutex<GucExecutionContext>>) {
         let context = context.lock().expect("GUC context mutex is poisoned");
-        self.custom_settings
-            .extend(context.custom_settings.iter().cloned());
+        self.custom_settings = context.custom_settings.clone();
     }
 
     pub(super) fn abort_with_guc_error<T>(
