@@ -29,6 +29,7 @@ pub(crate) struct StatementContext {
     pub(crate) clock_timestamp: chrono::DateTime<chrono::Utc>,
     pub(crate) guc: Arc<Mutex<crate::session::settings::GucExecutionContext>>,
     pub(crate) prepared_literal_timezone: Option<String>,
+    pub(crate) parameters: Option<Arc<Vec<Option<Value>>>>,
     pub(crate) deadline: Option<Instant>,
     pub(crate) rng: Arc<Mutex<ChaCha12Rng>>,
     pub(crate) sequences: SequenceExecutionContext,

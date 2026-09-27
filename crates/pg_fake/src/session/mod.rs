@@ -89,7 +89,7 @@ impl Session {
             if self.transaction.is_none() {
                 self.start_transaction(self.settings.default_isolation, true);
             }
-            match self.execute_statement(&statement, None, None, None) {
+            match self.execute_statement(&statement, None, None, None, None) {
                 Ok(result) => results.push(result),
                 Err(error) => {
                     if self.is_transaction_implicit_batch() {
@@ -111,6 +111,7 @@ impl Session {
         statement: &ast::Statement,
         prepared_query: Option<(&executor::PreparedQueryPlan, &[Value], &[ColumnMeta])>,
         prepared_statement: Option<&PreparedStatement>,
+        prepared_parameters: Option<Vec<Option<Value>>>,
         procedural: Option<DoBlockContext>,
     ) -> Result<StatementResult> {
         if matches!(
@@ -339,6 +340,7 @@ impl Session {
             guc: guc.clone(),
             prepared_literal_timezone: prepared_statement
                 .map(|statement| statement.literal_timezone.clone()),
+            parameters: prepared_parameters.map(Arc::new),
             deadline: statement_deadline,
             rng: self.db.rng.clone(),
             sequences,

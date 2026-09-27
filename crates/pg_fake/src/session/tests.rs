@@ -1719,6 +1719,64 @@ fn evaluates_constant_and_row_dependent_regex_patterns_per_statement() {
 
 #[test]
 #[cfg_attr(feature = "execution-log", tracing::instrument(skip_all))]
+fn binds_uuid_array_parameters_as_typed_values_across_executions() {
+    let db = Db::create();
+    let mut session = db.create_session();
+    session
+        .execute(
+            "CREATE TABLE uuid_array_parameters (id UUID PRIMARY KEY); \
+             INSERT INTO uuid_array_parameters VALUES \
+                 ('00000000-0000-4000-8000-000000000001'), \
+                 ('00000000-0000-4000-8000-000000000002')",
+        )
+        .unwrap();
+    let first: uuid::Uuid = "00000000-0000-4000-8000-000000000001".parse().unwrap();
+    let second: uuid::Uuid = "00000000-0000-4000-8000-000000000002".parse().unwrap();
+    let prepared = session
+        .prepare("SELECT id FROM uuid_array_parameters WHERE id = ANY($1) ORDER BY id")
+        .unwrap();
+
+    for (values, expected) in [
+        (vec![Value::Uuid(first)], vec![Value::Uuid(first)]),
+        (vec![Value::Uuid(second)], vec![Value::Uuid(second)]),
+        (
+            vec![Value::Uuid(second), Value::Uuid(first), Value::Uuid(second)],
+            vec![Value::Uuid(first), Value::Uuid(second)],
+        ),
+        (
+            vec![Value::Null, Value::Uuid(second)],
+            vec![Value::Uuid(second)],
+        ),
+        (Vec::new(), Vec::new()),
+    ] {
+        assert_eq!(
+            session
+                .query_prepared(
+                    &prepared,
+                    &[Value::Array {
+                        elem_type: BaseType::Uuid,
+                        values,
+                    }],
+                )
+                .unwrap()
+                .rows,
+            expected
+                .into_iter()
+                .map(|value| vec![value])
+                .collect::<Vec<_>>()
+        );
+    }
+    assert!(
+        session
+            .query_prepared(&prepared, &[Value::Null])
+            .unwrap()
+            .rows
+            .is_empty()
+    );
+}
+
+#[test]
+#[cfg_attr(feature = "execution-log", tracing::instrument(skip_all))]
 fn preserves_comparison_coercion_for_point_lookup_candidates() {
     let db = Db::create();
     let mut session = db.create_session();

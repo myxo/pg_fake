@@ -5,7 +5,7 @@ use crate::{
     error::{PgError, Result, SqlState, reject_unsupported},
     executor, parser,
     txn::{RelationLockMode, Snapshot},
-    value::Value,
+    value::{BaseType, Value},
 };
 
 use super::{
@@ -342,55 +342,75 @@ impl Session {
             return self.execute_prepared_statement(&refreshed, params);
         }
         let parameters;
-        let (bound_statement, prepared_query) = if let Some(query_plan) = &statement.query_plan {
-            parameters = match analyzer::coerce_parameters(&statement.parameter_types, params) {
-                Ok(parameters) => parameters,
-                Err(error) => return self.abort_with_error(error),
-            };
-            (
-                if statement.relation_locks.is_some() {
-                    None
-                } else {
-                    Some(
-                        match analyzer::bind_parameters(
-                            &statement.statement,
-                            &statement.parameter_types,
-                            params,
-                        ) {
-                            Ok(statement) => statement,
-                            Err(error) => return self.abort_with_error(error),
-                        },
-                    )
-                },
-                Some((
-                    query_plan,
-                    parameters.as_slice(),
-                    statement.columns.as_slice(),
-                )),
-            )
-        } else if statement.parameter_types.is_empty() && params.is_empty() {
-            (None, None)
-        } else {
-            (
-                Some(
-                    match analyzer::bind_parameters(
-                        &statement.statement,
-                        &statement.parameter_types,
-                        params,
-                    ) {
-                        Ok(statement) => statement,
-                        Err(error) => return self.abort_with_error(error),
+        let (bound_statement, prepared_query, prepared_parameters) =
+            if let Some(query_plan) = &statement.query_plan {
+                parameters = match analyzer::coerce_parameters(&statement.parameter_types, params) {
+                    Ok(parameters) => parameters,
+                    Err(error) => return self.abort_with_error(error),
+                };
+                (
+                    if statement.relation_locks.is_some() {
+                        None
+                    } else {
+                        Some(
+                            match analyzer::bind_parameters(
+                                &statement.statement,
+                                &statement.parameter_types,
+                                params,
+                            ) {
+                                Ok(statement) => statement,
+                                Err(error) => return self.abort_with_error(error),
+                            },
+                        )
                     },
-                ),
-                None,
-            )
-        };
+                    Some((
+                        query_plan,
+                        parameters.as_slice(),
+                        statement.columns.as_slice(),
+                    )),
+                    None,
+                )
+            } else if statement.parameter_types.is_empty() && params.is_empty() {
+                (None, None, None)
+            } else {
+                let (bound_statement, parameters) = match analyzer::bind_prepared_parameters(
+                    &statement.statement,
+                    &statement.parameter_types,
+                    params,
+                ) {
+                    Ok(parameters) => parameters,
+                    Err(error) => return self.abort_with_error(error),
+                };
+                let runtime_parameters = statement
+                    .parameter_types
+                    .iter()
+                    .zip(parameters)
+                    .map(|(parameter_type, value)| {
+                        (parameter_type.get_array_element_type() == Some(BaseType::Uuid))
+                            .then_some(value)
+                    })
+                    .collect::<Vec<_>>();
+                (
+                    Some(bound_statement),
+                    None,
+                    runtime_parameters
+                        .iter()
+                        .any(Option::is_some)
+                        .then_some(runtime_parameters),
+                )
+            };
         let execution_statement = bound_statement.as_deref().unwrap_or(&statement.statement);
         let started_implicit_transaction = self.transaction.is_none();
         if started_implicit_transaction {
             self.start_transaction(self.settings.default_isolation, true);
         }
-        match self.execute_statement(execution_statement, prepared_query, Some(statement), None) {
+        match self.execute_statement(
+            execution_statement,
+            prepared_query,
+            Some(statement),
+            prepared_parameters,
+            None,
+        ) {
             Ok(mut result) => {
                 if let StatementResult::Query(query) = &mut result {
                     assert_eq!(query.columns.len(), statement.columns.len());

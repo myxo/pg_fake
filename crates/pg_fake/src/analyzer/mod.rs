@@ -96,6 +96,24 @@ pub(crate) fn bind_parameters<'a>(
     values: &[Value],
 ) -> Result<Cow<'a, ast::Statement>> {
     let values = coerce_parameters(parameter_types, values)?;
+    bind_coerced_parameters(statement, parameter_types, &values)
+}
+
+pub(crate) fn bind_prepared_parameters<'a>(
+    statement: &'a ast::Statement,
+    parameter_types: &[BaseType],
+    values: &[Value],
+) -> Result<(Cow<'a, ast::Statement>, Vec<Value>)> {
+    let values = coerce_parameters(parameter_types, values)?;
+    let statement = bind_coerced_parameters(statement, parameter_types, &values)?;
+    Ok((statement, values))
+}
+
+fn bind_coerced_parameters<'a>(
+    statement: &'a ast::Statement,
+    parameter_types: &[BaseType],
+    values: &[Value],
+) -> Result<Cow<'a, ast::Statement>> {
     if values.is_empty() {
         return Ok(Cow::Borrowed(statement));
     }
@@ -116,7 +134,11 @@ pub(crate) fn bind_parameters<'a>(
             }
         };
         let target = parameter_types[index];
-        *expression = create_typed_literal(values[index].clone(), PgType::create(target));
+        *expression = if target.get_array_element_type() == Some(BaseType::Uuid) {
+            create_typed_cast(expression.clone(), PgType::create(target))
+        } else {
+            create_typed_literal(values[index].clone(), PgType::create(target))
+        };
         ControlFlow::Continue(())
     });
     error.map_or(Ok(Cow::Owned(statement)), Err)

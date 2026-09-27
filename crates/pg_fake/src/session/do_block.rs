@@ -287,7 +287,7 @@ impl Session {
         );
         self.substitute_scoped_procedural_locals(&mut statement, locals)?;
         let StatementResult::Query(query) =
-            self.execute_statement(&statement, None, None, Some(procedural))?
+            self.execute_statement(&statement, None, None, None, Some(procedural))?
         else {
             unreachable!("generated expression query returns rows")
         };
@@ -415,7 +415,7 @@ impl Session {
                 Some(ast::LimitClause::OffsetCommaLimit { .. }) => unreachable!(),
             }
         }
-        let result = self.execute_statement(&statement, None, None, Some(procedural))?;
+        let result = self.execute_statement(&statement, None, None, None, Some(procedural))?;
         let Some(into) = into else {
             *row_count = match &result {
                 StatementResult::Affected(affected) => *affected,

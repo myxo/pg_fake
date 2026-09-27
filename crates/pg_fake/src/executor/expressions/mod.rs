@@ -361,6 +361,21 @@ fn evaluate_inner(
                 &context.get_timezone(),
             )
         }
+        ast::Expr::Value(value) if let ast::Value::Placeholder(placeholder) = &value.value => {
+            let index = crate::analyzer::parse_placeholder_index(placeholder)?;
+            context
+                .parameters
+                .as_ref()
+                .and_then(|parameters| parameters.get(index))
+                .and_then(Option::as_ref)
+                .cloned()
+                .ok_or_else(|| {
+                    PgError::create(
+                        SqlState::UndefinedParameter,
+                        format!("there is no parameter {placeholder}"),
+                    )
+                })
+        }
         ast::Expr::Value(_) | ast::Expr::TypedString(_) => evaluate_literal(expr),
         ast::Expr::Nested(expr) => evaluate(expr, schema, row, context),
         ast::Expr::UnaryOp { op, expr } => {
@@ -974,6 +989,20 @@ fn evaluate_inner(
             }
             if let Some(text) = extract_unknown_string_literal(expr) {
                 coerce_unknown_with_context(text, target, CastContext::Explicit, context)
+            } else if is_parameter_placeholder(expr) {
+                let value = evaluate(expr, schema, row, context)?;
+                let source = value.get_base_type().unwrap_or(target.base);
+                if source == target.base && target.typmod == PgType::NO_TYPEMOD {
+                    Ok(value)
+                } else {
+                    coercion::coerce(
+                        value,
+                        source,
+                        target,
+                        CastContext::Explicit,
+                        &context.get_timezone(),
+                    )
+                }
             } else {
                 coercion::coerce(
                     evaluate(expr, schema, row, context)?,
