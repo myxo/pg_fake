@@ -118,6 +118,12 @@ struct UniqueIndex {
     entries: BTreeMap<UniqueIndexKey, BTreeSet<RowId>>,
 }
 
+#[derive(Default)]
+pub(crate) struct PendingUniqueChanges {
+    entries: Vec<BTreeMap<UniqueIndexKey, BTreeSet<RowId>>>,
+    row_keys: BTreeMap<RowId, Vec<Option<UniqueIndexKey>>>,
+}
+
 #[derive(Debug, Clone, PartialEq)]
 pub(crate) struct Table {
     pub(crate) schema: Arc<TableSchema>,
@@ -575,6 +581,102 @@ impl Table {
                     })
                 })
             })
+    }
+
+    pub(crate) fn pending_unique_changes(&self) -> PendingUniqueChanges {
+        PendingUniqueChanges {
+            entries: std::iter::repeat_with(BTreeMap::new)
+                .take(self.indexes.len())
+                .collect(),
+            row_keys: BTreeMap::new(),
+        }
+    }
+
+    pub(crate) fn has_visible_unique_conflict_with_pending(
+        &self,
+        row: &Row,
+        snapshot: &Snapshot,
+        current_xid: Xid,
+        transactions: &TransactionRegistry,
+        excluded_row: Option<RowId>,
+        context: &StatementContext,
+        pending: &PendingUniqueChanges,
+    ) -> bool {
+        let snapshot = snapshot.include_current_command();
+        self.indexes
+            .iter()
+            .enumerate()
+            .any(|(index_number, index)| {
+                if !matches_index_predicate(&self.schema, index, row, context) {
+                    return false;
+                }
+                let Some(key) = build_row_index_key(&self.schema, index, row) else {
+                    return false;
+                };
+                if pending.entries[index_number]
+                    .get(&key)
+                    .is_some_and(|row_ids| {
+                        row_ids.iter().any(|row_id| Some(*row_id) != excluded_row)
+                    })
+                {
+                    return true;
+                }
+                index.entries.get(&key).is_some_and(|row_ids| {
+                    row_ids.iter().any(|row_id| {
+                        if Some(*row_id) == excluded_row || pending.row_keys.contains_key(row_id) {
+                            return false;
+                        }
+                        let Some(version) =
+                            self.version_chains.chains.get(row_id).and_then(|chain| {
+                                find_visible_version(chain, &snapshot, current_xid, transactions)
+                            })
+                        else {
+                            return false;
+                        };
+                        matches_index_predicate(&self.schema, index, &version.row, context)
+                            && build_row_index_key(&self.schema, index, &version.row).as_ref()
+                                == Some(&key)
+                    })
+                })
+            })
+    }
+
+    pub(crate) fn record_pending_unique_change(
+        &self,
+        row_id: RowId,
+        row: &Row,
+        pending: &mut PendingUniqueChanges,
+        context: &StatementContext,
+    ) {
+        if let Some(previous_keys) = pending.row_keys.remove(&row_id) {
+            for (entries, key) in pending.entries.iter_mut().zip(previous_keys) {
+                if let Some(key) = key
+                    && let Some(row_ids) = entries.get_mut(&key)
+                {
+                    row_ids.remove(&row_id);
+                    if row_ids.is_empty() {
+                        entries.remove(&key);
+                    }
+                }
+            }
+        }
+
+        let keys = self
+            .indexes
+            .iter()
+            .map(|index| {
+                if !matches_index_predicate(&self.schema, index, row, context) {
+                    return None;
+                }
+                build_row_index_key(&self.schema, index, row)
+            })
+            .collect::<Vec<_>>();
+        for (entries, key) in pending.entries.iter_mut().zip(&keys) {
+            if let Some(key) = key {
+                entries.entry(key.clone()).or_default().insert(row_id);
+            }
+        }
+        pending.row_keys.insert(row_id, keys);
     }
 
     pub(crate) fn rows_have_unique_conflict(

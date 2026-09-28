@@ -3141,6 +3141,65 @@ fn enforces_primary_and_multi_column_unique_constraints() {
 
 #[test]
 #[cfg_attr(feature = "execution-log", tracing::instrument(skip_all))]
+fn preserves_partial_unique_validation_across_updated_rows() {
+    let db = Db::create();
+    let mut session = db.create_session();
+    session
+        .execute(
+            "CREATE TABLE memberships (id INTEGER PRIMARY KEY, account_id INTEGER, active BOOLEAN)",
+        )
+        .unwrap();
+    session
+        .execute(
+            "CREATE UNIQUE INDEX memberships_active_account ON memberships (account_id) WHERE active",
+        )
+        .unwrap();
+    session
+        .execute(
+            "INSERT INTO memberships VALUES (1, 8, true), (2, 8, false), (3, NULL, false), (4, NULL, false), (5, 9, false), (6, 9, false)",
+        )
+        .unwrap();
+
+    session
+        .execute("UPDATE memberships SET active = id <> 1 WHERE id <= 4")
+        .unwrap();
+    assert_eq!(
+        session
+            .query(
+                "SELECT id, active FROM memberships WHERE id <= 4 ORDER BY id",
+                &[]
+            )
+            .unwrap()
+            .rows,
+        vec![
+            vec![Value::Int4(1), Value::Bool(false)],
+            vec![Value::Int4(2), Value::Bool(true)],
+            vec![Value::Int4(3), Value::Bool(true)],
+            vec![Value::Int4(4), Value::Bool(true)],
+        ]
+    );
+
+    assert_eq!(
+        session
+            .execute("UPDATE memberships SET active = true WHERE id IN (5, 6)")
+            .unwrap_err()
+            .sqlstate,
+        SqlState::UniqueViolation
+    );
+    assert_eq!(
+        session
+            .query(
+                "SELECT active FROM memberships WHERE id IN (5, 6) ORDER BY id",
+                &[]
+            )
+            .unwrap()
+            .rows,
+        vec![vec![Value::Bool(false)], vec![Value::Bool(false)]]
+    );
+}
+
+#[test]
+#[cfg_attr(feature = "execution-log", tracing::instrument(skip_all))]
 fn rebuilds_unique_indexes_after_rollback() {
     let db = Db::create();
     let mut session = db.create_session();

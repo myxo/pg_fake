@@ -447,11 +447,11 @@ pub(in crate::executor) fn prepare_update_rows(
     let update_span = update.span();
     let prepared_inputs = context.prepare_update_inputs(update, update_span);
     let mut rows = Vec::new();
-    let mut validation_table = state
+    let validation_table = state
         .tables
         .get(&schema.id)
-        .expect("catalog table must have storage")
-        .clone();
+        .expect("catalog table must have storage");
+    let mut pending_unique_changes = validation_table.pending_unique_changes();
     for (row_id, version_xmin, current, bound_row) in targets {
         let cached = context.get_prepared_update_input(
             prepared_inputs,
@@ -520,16 +520,14 @@ pub(in crate::executor) fn prepare_update_rows(
         if let Some(updated) = &updated {
             validate_not_null(schema, updated)?;
             validate_check_constraints(schema, updated, context)?;
-            if validation_table.has_visible_unique_conflict(
+            if validation_table.has_visible_unique_conflict_with_pending(
                 updated,
                 snapshot,
                 xid,
                 &state.transactions,
                 Some(row_id),
-                None,
-                None,
-                None,
                 context,
+                &pending_unique_changes,
             ) {
                 return Err(PgError::create(
                     SqlState::UniqueViolation,
@@ -539,13 +537,11 @@ pub(in crate::executor) fn prepare_update_rows(
                     ),
                 ));
             }
-            validation_table.append_updated_version(
+            validation_table.record_pending_unique_change(
                 row_id,
-                version_xmin,
-                xid,
-                context.command_id,
-                updated.clone(),
-                None,
+                updated,
+                &mut pending_unique_changes,
+                context,
             );
         }
         rows.push(PreparedUpdateRow {
