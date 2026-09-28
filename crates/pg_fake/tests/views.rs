@@ -351,6 +351,113 @@ fn comments_do_not_invalidate_prepared_view_queries() {
 }
 
 #[test]
+fn reuses_prepared_nested_view_expansion_with_fresh_rows_and_parameters() {
+    let db = Db::create();
+    let mut session = db.create_session();
+    session
+        .execute(
+            "CREATE TABLE prepared_view_source (id INTEGER, value TEXT); \
+             INSERT INTO prepared_view_source VALUES (1, 'one'), (2, 'two'); \
+             CREATE VIEW prepared_view_inner AS \
+               SELECT id, value FROM prepared_view_source WHERE id > 0; \
+             CREATE VIEW prepared_view_outer AS \
+               SELECT id, value FROM prepared_view_inner WHERE id < 10",
+        )
+        .unwrap();
+    let prepared = session
+        .prepare("SELECT value FROM prepared_view_outer WHERE id = $1")
+        .unwrap();
+
+    assert_eq!(
+        session
+            .query_prepared(&prepared, &[Value::Int4(2)])
+            .unwrap()
+            .rows,
+        vec![vec![Value::Text("two".into())]]
+    );
+    session
+        .execute("UPDATE prepared_view_source SET value = 'changed' WHERE id = 2")
+        .unwrap();
+    assert_eq!(
+        session
+            .query_prepared(&prepared, &[Value::Int4(2)])
+            .unwrap()
+            .rows,
+        vec![vec![Value::Text("changed".into())]]
+    );
+
+    session
+        .execute(
+            "CREATE OR REPLACE VIEW prepared_view_outer AS \
+             SELECT id, value FROM prepared_view_inner WHERE id > 10",
+        )
+        .unwrap();
+    assert_eq!(
+        session
+            .query_prepared(&prepared, &[Value::Int4(2)])
+            .unwrap_err()
+            .sqlstate,
+        SqlState::FeatureNotSupported
+    );
+}
+
+#[test]
+fn reprepares_cached_view_expansion_after_search_path_change() {
+    let db = Db::create();
+    let mut session = db.create_session();
+    session
+        .execute("CREATE VIEW lookup AS SELECT 1 AS value")
+        .unwrap();
+    session
+        .execute("CREATE TEMP VIEW lookup AS SELECT 2 AS value")
+        .unwrap();
+    session
+        .execute("SET search_path TO public, pg_temp")
+        .unwrap();
+    let prepared = session.prepare("SELECT value FROM lookup").unwrap();
+    assert_eq!(
+        session.query_prepared(&prepared, &[]).unwrap().rows,
+        vec![vec![Value::Int4(1)]]
+    );
+
+    session
+        .execute("SET search_path TO pg_temp, public")
+        .unwrap();
+    assert_eq!(
+        session.query_prepared(&prepared, &[]).unwrap().rows,
+        vec![vec![Value::Int4(2)]]
+    );
+}
+
+#[test]
+fn prepared_view_expansion_recovers_after_transactional_replacement_rollback() {
+    let db = Db::create();
+    let mut session = db.create_session();
+    session
+        .execute("CREATE VIEW transactional_prepared_view AS SELECT 1 AS value")
+        .unwrap();
+    let prepared = session
+        .prepare("SELECT value FROM transactional_prepared_view")
+        .unwrap();
+
+    session
+        .execute(
+            "BEGIN; \
+             CREATE OR REPLACE VIEW transactional_prepared_view AS SELECT 2 AS value",
+        )
+        .unwrap();
+    assert_eq!(
+        session.query_prepared(&prepared, &[]).unwrap_err().sqlstate,
+        SqlState::FeatureNotSupported
+    );
+    session.execute("ROLLBACK").unwrap();
+    assert_eq!(
+        session.query_prepared(&prepared, &[]).unwrap().rows,
+        vec![vec![Value::Int4(1)]]
+    );
+}
+
+#[test]
 fn distinguishes_used_and_unused_column_dependencies() {
     let db = Db::create();
     let mut session = db.create_session();

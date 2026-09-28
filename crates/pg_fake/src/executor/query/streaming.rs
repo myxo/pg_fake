@@ -105,13 +105,17 @@ pub(in crate::executor) fn stream_query_rows(
         None => None,
     };
     let query = cached_query.as_ref().unwrap_or(query);
-    if let Some(expanded) = expand_query_views(&state.catalog, query)? {
+    if !context.views_expanded
+        && let Some(expanded) = expand_query_views(&state.catalog, query)?
+    {
+        let mut expanded_context = context.clone();
+        expanded_context.views_expanded = true;
         return stream_query_rows(
             state,
             &expanded,
             xid,
             snapshot,
-            context,
+            &expanded_context,
             maximum_rows,
             prepared,
             consume,

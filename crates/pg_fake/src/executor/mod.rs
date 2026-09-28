@@ -96,6 +96,17 @@ mod system_catalog;
 mod table_ddl;
 mod truncate;
 mod views;
+
+pub(crate) fn expand_statement_views(
+    catalog: &crate::catalog::Catalog,
+    statement: &ast::Statement,
+) -> crate::error::Result<Option<ast::Statement>> {
+    let ast::Statement::Query(query) = statement else {
+        return Ok(None);
+    };
+    views::expand_query_views(catalog, query)
+        .map(|expanded| expanded.map(|query| ast::Statement::Query(Box::new(query))))
+}
 mod writes;
 
 pub(crate) use crate::database::DatabaseState;

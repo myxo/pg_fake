@@ -379,6 +379,8 @@ impl Session {
             retain_row_origins: false,
             query_row_demand: None,
             query_invocation: Vec::new(),
+            views_expanded: prepared_statement
+                .is_some_and(|statement| statement.expanded_views_statement.is_some()),
             query_source_state,
             inherited_row_lock: None,
             source_row_locks: Vec::new(),

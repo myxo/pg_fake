@@ -25,6 +25,7 @@ pub struct PreparedStatement {
     pub(super) parameter_types: Vec<crate::value::BaseType>,
     pub(super) columns: Vec<ColumnMeta>,
     pub(super) query_plan: Option<executor::PreparedQueryPlan>,
+    pub(super) expanded_views_statement: Option<ast::Statement>,
     pub(super) catalog_dependencies: Vec<CatalogDependency>,
     pub(super) catalog_identity: crate::catalog::CatalogIdentity,
     pub(super) relation_locks: Option<Vec<(String, RelationLockMode)>>,
@@ -251,6 +252,7 @@ impl Session {
                                 catalog_dependencies,
                                 relation_locks,
                                 state.catalog.create_identity(),
+                                executor::expand_statement_views(&state.catalog, &statement)?,
                             ))
                         })
                     },
@@ -264,6 +266,7 @@ impl Session {
                 catalog_dependencies,
                 relation_locks,
                 catalog_identity,
+                expanded_views_statement,
             )) => Ok(PreparedStatement {
                 search_path: self.settings.search_path.clone(),
                 source_sql: sql.into(),
@@ -273,6 +276,7 @@ impl Session {
                 parameter_types,
                 columns,
                 query_plan,
+                expanded_views_statement,
                 catalog_dependencies,
                 relation_locks,
                 catalog_identity,
@@ -373,8 +377,12 @@ impl Session {
             } else if statement.parameter_types.is_empty() && params.is_empty() {
                 (None, None, None)
             } else {
+                let bind_statement = statement
+                    .expanded_views_statement
+                    .as_ref()
+                    .unwrap_or(&statement.statement);
                 let (bound_statement, parameters) = match analyzer::bind_prepared_parameters(
-                    &statement.statement,
+                    bind_statement,
                     &statement.parameter_types,
                     params,
                 ) {
@@ -399,7 +407,12 @@ impl Session {
                         .then_some(runtime_parameters),
                 )
             };
-        let execution_statement = bound_statement.as_deref().unwrap_or(&statement.statement);
+        let execution_statement = bound_statement.as_deref().unwrap_or_else(|| {
+            statement
+                .expanded_views_statement
+                .as_ref()
+                .unwrap_or(&statement.statement)
+        });
         let started_implicit_transaction = self.transaction.is_none();
         if started_implicit_transaction {
             self.start_transaction(self.settings.default_isolation, true);

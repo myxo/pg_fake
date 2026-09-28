@@ -281,10 +281,13 @@ fn execute_query_inner(
             .lock()
             .expect("locking CTE mutex is poisoned"),
     )?;
-    if let Some(expanded) = expand_query_views(&state.catalog, query)? {
+    if !context.views_expanded
+        && let Some(expanded) = expand_query_views(&state.catalog, query)?
+    {
         let mut expanded_context = context.clone();
         expanded_context.query_row_demand = maximum_rows;
         expanded_context.inherited_row_lock = inherited;
+        expanded_context.views_expanded = true;
         return execute_query(state, &expanded, xid, snapshot, &expanded_context);
     }
     if context.capture_lock_queries {

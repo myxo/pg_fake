@@ -56,6 +56,7 @@ pub(crate) struct StatementContext {
     pub(crate) retain_row_origins: bool,
     pub(crate) query_row_demand: Option<usize>,
     pub(crate) query_invocation: Vec<usize>,
+    pub(crate) views_expanded: bool,
     pub(crate) query_source_state:
         Arc<Mutex<std::collections::BTreeMap<TableId, QuerySourceTable>>>,
     pub(crate) inherited_row_lock: Option<super::query::SelectLock>,
