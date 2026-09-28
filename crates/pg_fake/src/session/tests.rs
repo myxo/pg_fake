@@ -9859,6 +9859,65 @@ fn substitutes_typed_subqueries_in_data_modifying_ctes() {
 }
 
 #[test]
+fn hash_joins_materialized_cte_rows_with_postgres_equality_semantics() {
+    let db = Db::create();
+    let mut session = db.create_session();
+    let result = session
+        .query(
+            "WITH left_rows(key, value) AS (
+                 VALUES (1, 'a'), (1, 'b'), (NULL::INTEGER, 'null'), (3, 'unmatched')
+             ), right_rows(key, value) AS (
+                 VALUES (1, 'a'), (1, 'b'), (2, 'unmatched'), (NULL::INTEGER, 'null')
+             )
+             SELECT left_rows.value, right_rows.value
+             FROM left_rows LEFT JOIN right_rows ON left_rows.key = right_rows.key
+             ORDER BY left_rows.value, right_rows.value",
+            &[],
+        )
+        .unwrap();
+    assert_eq!(
+        result.rows,
+        vec![
+            vec![Value::Text("a".into()), Value::Text("a".into())],
+            vec![Value::Text("a".into()), Value::Text("b".into())],
+            vec![Value::Text("b".into()), Value::Text("a".into())],
+            vec![Value::Text("b".into()), Value::Text("b".into())],
+            vec![Value::Text("null".into()), Value::Null],
+            vec![Value::Text("unmatched".into()), Value::Null],
+        ]
+    );
+
+    let result = session
+        .query(
+            "WITH left_rows(key, value) AS (VALUES (1::NUMERIC, 'left')),
+                  right_rows(key, value) AS (VALUES (1::INTEGER, 'right'))
+             SELECT left_rows.value, right_rows.value
+             FROM left_rows JOIN right_rows
+               ON left_rows.key = right_rows.key AND left_rows.value < right_rows.value",
+            &[],
+        )
+        .unwrap();
+    assert_eq!(
+        result.rows,
+        vec![vec![
+            Value::Text("left".into()),
+            Value::Text("right".into())
+        ]]
+    );
+
+    let result = session
+        .query(
+            "WITH left_rows(key) AS (VALUES ('x'::BPCHAR)),
+                  right_rows(key) AS (VALUES ('x '::BPCHAR))
+             SELECT left_rows.key
+             FROM left_rows JOIN right_rows ON left_rows.key = right_rows.key",
+            &[],
+        )
+        .unwrap();
+    assert_eq!(result.rows, vec![vec![Value::Text("x".into())]]);
+}
+
+#[test]
 #[cfg_attr(feature = "execution-log", tracing::instrument(skip_all))]
 fn permits_nonrecursive_mutations_under_with_recursive() {
     let db = Db::create();

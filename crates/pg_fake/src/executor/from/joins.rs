@@ -191,6 +191,15 @@ fn resolve_hash_join_slots(
     .then_some((left_slot, right_slot, preserve_left))
 }
 
+fn create_hash_join_key(value: &Value, data_type: BaseType) -> Option<EqualityKey> {
+    if data_type == BaseType::Bpchar
+        && let Value::Text(value) = value
+    {
+        return Some(EqualityKey::Text(value.trim_end_matches(' ').to_owned()));
+    }
+    create_equality_key(value)
+}
+
 #[cfg_attr(feature = "execution-log", tracing::instrument(skip_all))]
 fn visit_hash_join_chain_rows(
     state: &DatabaseState,
@@ -226,6 +235,7 @@ fn visit_hash_join_chain_rows(
             .get(index + 2)
             .copied()
             .unwrap_or(scope.columns.len());
+        let key_type = scope.columns[left_slot].data_type.base;
         let mut right_rows = std::collections::HashMap::<EqualityKey, Vec<Vec<Value>>>::new();
         visit_table_factor_rows(
             state,
@@ -237,7 +247,7 @@ fn visit_hash_join_chain_rows(
             selection,
             right_start,
             &mut |row| {
-                if let Some(key) = create_equality_key(&row[right_slot]) {
+                if let Some(key) = create_hash_join_key(&row[right_slot], key_type) {
                     right_rows
                         .entry(key)
                         .or_default()
@@ -248,8 +258,8 @@ fn visit_hash_join_chain_rows(
         )?;
         let mut joined = Vec::new();
         for left in rows {
-            let matches =
-                create_equality_key(&left[left_slot]).and_then(|key| right_rows.get(&key));
+            let matches = create_hash_join_key(&left[left_slot], key_type)
+                .and_then(|key| right_rows.get(&key));
             if let Some(matches) = matches {
                 joined.extend(matches.iter().map(|right| {
                     let mut row = left.clone();
