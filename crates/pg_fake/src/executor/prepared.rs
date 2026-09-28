@@ -5,6 +5,7 @@ use crate::{
     database::DatabaseState,
     error::{PgError, Result, SqlState},
     executor::{
+        StatementContext,
         aggregates::{
             AggregateDescriptor, AggregateInput, AggregateState, is_aggregate_function,
             parse_aggregate_call,
@@ -25,10 +26,9 @@ use std::time::Instant;
 
 #[derive(Debug, Clone)]
 pub(crate) struct PreparedQueryPlan {
-    table_id: TableId,
+    source: PreparedSource,
     output: PreparedOutput,
     selection: Option<PreparedExpression>,
-    access: PreparedAccess,
     columns: Vec<ColumnMeta>,
 }
 
@@ -44,6 +44,17 @@ enum PreparedAccess {
     Unique {
         column: usize,
         value: PreparedExpression,
+    },
+}
+
+#[derive(Debug, Clone)]
+enum PreparedSource {
+    Table {
+        table_id: TableId,
+        access: PreparedAccess,
+    },
+    CteRows {
+        id: usize,
     },
 }
 
@@ -205,16 +216,24 @@ pub(crate) fn build_prepared_query_plan(
     {
         return Ok(None);
     }
-    let relation_name = normalize_relation_name(name)?;
-    if super::describe_visible_system_relation(&state.catalog, &relation_name).is_some() {
-        return Ok(None);
-    }
-    if state.catalog.require_named_view(&relation_name).is_ok() {
-        return Ok(None);
-    }
-    let schema = state.catalog.require_named_table(&relation_name)?;
+    let cte_row_source = crate::executor::ctes::cte_row_source_id(name);
+    let schema = if cte_row_source.is_some() {
+        None
+    } else {
+        let relation_name = normalize_relation_name(name)?;
+        if super::describe_visible_system_relation(&state.catalog, &relation_name).is_some() {
+            return Ok(None);
+        }
+        if state.catalog.require_named_view(&relation_name).is_ok() {
+            return Ok(None);
+        }
+        Some(state.catalog.require_named_table(&relation_name)?)
+    };
     let scope = bind_query_scope(&state.catalog, select)?;
     if aggregate_query && described_columns.is_none() {
+        if schema.is_none() {
+            return Ok(None);
+        }
         super::query::validate_select_predicates(state, select, &scope)?;
     }
     let mut columns = Vec::new();
@@ -391,15 +410,24 @@ pub(crate) fn build_prepared_query_plan(
         }
         None => None,
     };
-    let access = selection
-        .as_ref()
-        .and_then(|selection| find_unique_access(selection, schema))
-        .unwrap_or(PreparedAccess::Scan);
+    let source = match (cte_row_source, schema) {
+        (Some(id), None) => PreparedSource::CteRows { id },
+        (None, Some(schema)) => {
+            let access = selection
+                .as_ref()
+                .and_then(|selection| find_unique_access(selection, schema))
+                .unwrap_or(PreparedAccess::Scan);
+            PreparedSource::Table {
+                table_id: schema.id,
+                access,
+            }
+        }
+        _ => unreachable!("CTE row source and table schema are mutually exclusive"),
+    };
     Ok(Some(PreparedQueryPlan {
-        table_id: schema.id,
+        source,
         output,
         selection,
-        access,
         columns,
     }))
 }
@@ -614,13 +642,9 @@ pub(crate) fn execute_prepared_query(
     parameters: &[Value],
     xid: Xid,
     snapshot: &Snapshot,
+    context: Option<&StatementContext>,
     deadline: Option<Instant>,
 ) -> Result<Vec<Vec<Value>>> {
-    state.catalog.require_table_by_id(plan.table_id)?;
-    let table = state
-        .tables
-        .get(&plan.table_id)
-        .expect("prepared table must have storage");
     let mut rows = Vec::new();
     let mut aggregate_states = match &plan.output {
         PreparedOutput::Rows(_) => Vec::new(),
@@ -679,37 +703,58 @@ pub(crate) fn execute_prepared_query(
         }
         Ok(())
     };
-    match &plan.access {
-        PreparedAccess::Scan => {
-            state.record_read(xid, crate::serializable::Access::Relation(plan.table_id));
-            for (row_id, chain) in table.iterate_version_chains() {
-                if let Some(version) =
-                    find_visible_version(chain, snapshot, xid, &state.transactions)
-                {
-                    state.record_read(xid, crate::serializable::Access::Row(plan.table_id, row_id));
-                    visit(&version.row)?;
-                }
+    match &plan.source {
+        PreparedSource::CteRows { id } => {
+            let source = context
+                .expect("prepared CTE source requires its statement context")
+                .get_cte_row_source(*id)
+                .expect("prepared CTE row source was registered");
+            for row in &source.rows {
+                visit(row)?;
             }
         }
-        PreparedAccess::Unique { column, value } => {
-            let value = evaluate_prepared_expression(value, &[], parameters, deadline)?;
-            if let Some(key) =
-                table.create_unique_read_key(&[*column], std::slice::from_ref(&value))
-            {
-                state.record_read(
-                    xid,
-                    crate::serializable::Access::Unique(plan.table_id, vec![*column], key),
-                );
-            }
-            if let Some((row_id, version)) = table.find_unique_visible_version(
-                &[*column],
-                &[value],
-                snapshot,
-                xid,
-                &state.transactions,
-            ) {
-                state.record_read(xid, crate::serializable::Access::Row(plan.table_id, row_id));
-                visit(&version.row)?;
+        PreparedSource::Table { table_id, access } => {
+            state.catalog.require_table_by_id(*table_id)?;
+            let table = state
+                .tables
+                .get(table_id)
+                .expect("prepared table must have storage");
+            match access {
+                PreparedAccess::Scan => {
+                    state.record_read(xid, crate::serializable::Access::Relation(*table_id));
+                    for (row_id, chain) in table.iterate_version_chains() {
+                        if let Some(version) =
+                            find_visible_version(chain, snapshot, xid, &state.transactions)
+                        {
+                            state.record_read(
+                                xid,
+                                crate::serializable::Access::Row(*table_id, row_id),
+                            );
+                            visit(&version.row)?;
+                        }
+                    }
+                }
+                PreparedAccess::Unique { column, value } => {
+                    let value = evaluate_prepared_expression(value, &[], parameters, deadline)?;
+                    if let Some(key) =
+                        table.create_unique_read_key(&[*column], std::slice::from_ref(&value))
+                    {
+                        state.record_read(
+                            xid,
+                            crate::serializable::Access::Unique(*table_id, vec![*column], key),
+                        );
+                    }
+                    if let Some((row_id, version)) = table.find_unique_visible_version(
+                        &[*column],
+                        &[value],
+                        snapshot,
+                        xid,
+                        &state.transactions,
+                    ) {
+                        state.record_read(xid, crate::serializable::Access::Row(*table_id, row_id));
+                        visit(&version.row)?;
+                    }
+                }
             }
         }
     }

@@ -247,6 +247,7 @@ impl Session {
                 parameters,
                 transaction.xid,
                 &snapshot,
+                None,
                 statement_deadline,
             ) {
                 Ok(rows) => match check_statement_timeout(statement_deadline) {
@@ -292,6 +293,7 @@ impl Session {
                 &[],
                 transaction.xid,
                 &snapshot,
+                None,
                 statement_deadline,
             ) {
                 Ok(rows) => match check_statement_timeout(statement_deadline) {

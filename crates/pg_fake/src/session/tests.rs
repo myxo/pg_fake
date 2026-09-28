@@ -495,6 +495,25 @@ fn interrupts_prepared_scans_at_the_statement_deadline() {
 }
 
 #[test]
+fn interrupts_prepared_recursive_ctes_at_the_statement_deadline() {
+    let db = Db::create();
+    let mut session = db.create_session();
+    session.execute("SET statement_timeout = '10ms'").unwrap();
+    let started = Instant::now();
+    assert_eq!(
+        session
+            .query(
+                "WITH RECURSIVE series(value) AS (VALUES (1) UNION ALL SELECT value + 1 FROM series WHERE value < 1000000) SELECT value FROM series",
+                &[],
+            )
+            .unwrap_err()
+            .sqlstate,
+        SqlState::QueryCanceled
+    );
+    assert!(started.elapsed() < Duration::from_millis(500));
+}
+
+#[test]
 fn applies_one_statement_deadline_to_a_do_block() {
     let db = Db::create();
     let mut session = db.create_session();

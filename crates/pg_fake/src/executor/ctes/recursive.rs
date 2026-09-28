@@ -649,6 +649,13 @@ pub(super) fn execute_recursive_cte(
         }],
         Some(context),
     );
+    let recursive_statement = ast::Statement::Query(Box::new(recursive_query.clone()));
+    let prepared_recursive_query = crate::executor::build_prepared_query_plan(
+        state,
+        &recursive_statement,
+        &[],
+        Some(&columns),
+    )?;
     while !working.is_empty()
         && generation_demand.is_none_or(|generation_demand| rows.len() < generation_demand)
     {
@@ -662,8 +669,22 @@ pub(super) fn execute_recursive_cte(
         let iteration = rows.len();
         let mut invocation = context.clone();
         invocation.query_invocation.push(iteration);
-        let result = execute_query(state, &recursive_query, xid, snapshot, &invocation);
-        let result = result?.result;
+        let result = if let Some(plan) = &prepared_recursive_query {
+            QueryResult {
+                columns: plan.columns().to_vec(),
+                rows: crate::executor::execute_prepared_query(
+                    state,
+                    plan,
+                    &[],
+                    xid,
+                    snapshot,
+                    Some(&invocation),
+                    invocation.deadline,
+                )?,
+            }
+        } else {
+            execute_query(state, &recursive_query, xid, snapshot, &invocation)?.result
+        };
         working = coerce_set_rows(result.rows, &result.columns, &columns)?;
         if distinct {
             working = remove_set_duplicates(working)?;
