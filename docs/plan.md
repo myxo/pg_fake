@@ -2202,7 +2202,7 @@ the audit-gate fixes.
 
 **Notes:** This task fixes integration defects but does not add new SQL families.
 
-### Task 41 — External PostgreSQL-driven fuzzing
+### Task 41 — External PostgreSQL-driven fuzzing [COMPLETE]
 
 **Goal:** Discover SQL through an external fuzzer running against PostgreSQL,
 then replay the captured workload against `pg_fake` to find behavioral gaps that
@@ -2251,9 +2251,10 @@ stateful workload model are intentionally research outcomes of this task.
 
 **Progress:**
 
-- [ ] Select and implement a replacement for the discarded SQLancer
-  log-and-replay approach. The SQLancer harness and campaign artifacts were
-  removed at the user's request; Task 41 remains open.
+- [x] Select and implement Squirrel + AFL++ as the replacement for the discarded
+  SQLancer log-and-replay approach. The SQLancer harness and campaign artifacts
+  were removed at the user's request. Task 41 was approved as complete with
+  the remaining fuzzing DoD items deferred.
 - [x] Differential harness `fuzz/fuzz_targets/squirrel_matches_postgres.rs`:
   splits a script into statements, executes each against PostgreSQL 18 (rolled
   back transaction, 2s statement timeout) and pg_fake, and aborts on Tier-A
@@ -2266,15 +2267,15 @@ stateful workload model are intentionally research outcomes of this task.
   pg_fake/pg_fake_sqlx/sqlparser via `rustc_wrapper.sh`), corpus growth,
   first real mismatches found and reproducible via `just fuzz-squirrel-repro`.
   Seeds are limited to Squirrel's grammar subset (no RETURNING/DELETE/
-  aggregates); widening the SQL surface, mismatch classification/dedup and
-  the regression corpus remain open.
+  aggregates). Widening the SQL surface, mismatch classification/dedup, and
+  the regression corpus remain future work.
 
 ---
 
 ## Phase 3 exit criteria
 
-- All 41 tasks meet their DoD and have been approved before being marked
-  complete.
+- All 41 tasks have been approved before being marked complete. Task 41's
+  remaining fuzzing DoD items are a user-approved exception.
 - The prioritized migration and SQLx application-workload gates in Tasks 20
   and 30 pass without unsupported, unclassified, or silently skipped SQL.
 - The Phase 3 conformance manifest passes against PostgreSQL 18 without
@@ -2291,8 +2292,8 @@ stateful workload model are intentionally research outcomes of this task.
 - Tier-A behavior for the supported Phase 3 surface matches PostgreSQL for
   results, NULL semantics, types, constraints, catalog visibility, transaction
   recovery, locking, concurrent outcomes, and SQLSTATE.
-- The external PostgreSQL-driven fuzzing campaign has no untriaged in-scope
-  mismatch, and minimized fixed cases are retained as deterministic regressions.
+- The external PostgreSQL-driven fuzzing campaign, mismatch triage, and
+  deterministic regression corpus remain deferred under the Task 41 exception.
 - Later work remains explicit: JSONPath and the broader SQL/JSON surface,
   multidimensional/non-default-bound arrays, materialized/updatable/recursive
   views, rules, general-purpose PL/pgSQL/triggers/schema/index/`ALTER TABLE`
