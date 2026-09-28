@@ -126,7 +126,7 @@ pub(crate) fn infer_expression_type(expr: &ast::Expr, schema: RowScope<'_>) -> R
             Ok(
                 super::runtime::infer_runtime_function("floor", &[expr], schema)?
                     .expect("floor is a runtime function")
-                    .1,
+                    .result_type,
             )
         }
         ast::Expr::AtTimeZone {

@@ -517,10 +517,10 @@ pub(super) fn infer_function_return_type(
     if let Some(base) = json::infer_json_function(&function_name, &arguments, schema)? {
         return Ok(base);
     }
-    if let Some((_, result)) =
+    if let Some(signature) =
         super::runtime::infer_runtime_function(&function_name, &arguments, schema)?
     {
-        return Ok(result);
+        return Ok(signature.result_type);
     }
     if let Some(result) = super::arrays::infer_array_function(&function_name, &arguments, schema)? {
         return Ok(result);
@@ -711,13 +711,13 @@ pub(super) fn evaluate_function(
             context,
         );
     }
-    if let Some((targets, _)) =
+    if let Some(signature) =
         super::runtime::infer_runtime_function(&function_name, &arguments, schema)?
     {
         return super::runtime::evaluate_runtime_function(
             &function_name,
             &arguments,
-            &targets,
+            &signature,
             schema,
             row,
             context,

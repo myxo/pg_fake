@@ -81,11 +81,17 @@ pub(crate) fn resolve_runtime_function(
     })
 }
 
+pub(super) struct RuntimeFunctionSignature {
+    pub(super) argument_types: Vec<Option<BaseType>>,
+    pub(super) targets: Vec<BaseType>,
+    pub(super) result_type: BaseType,
+}
+
 pub(super) fn infer_runtime_function(
     name: &str,
     arguments: &[&ast::Expr],
     schema: RowScope<'_>,
-) -> Result<Option<(Vec<BaseType>, BaseType)>> {
+) -> Result<Option<RuntimeFunctionSignature>> {
     if !matches!(
         name,
         "to_timestamp"
@@ -109,38 +115,75 @@ pub(super) fn infer_runtime_function(
             }
         })
         .collect::<Result<Vec<_>>>()?;
-    let (targets, result) =
+    let (targets, result_type) =
         resolve_runtime_function(name, &types).expect("runtime function was recognized")?;
-    for (argument, target) in arguments.iter().zip(&targets) {
-        super::validate_function_argument(argument, *target, schema, &|| {
-            PgError::create(
+    for ((argument, source), target) in arguments.iter().zip(&types).zip(&targets) {
+        if is_null_literal(argument) {
+            continue;
+        }
+        if let Some(text) = extract_unknown_string_literal(argument) {
+            crate::coercion::coerce_unknown(
+                text,
+                crate::value::PgType::create(*target),
+                CastContext::Implicit,
+                "UTC",
+            )?;
+            continue;
+        }
+        if !source
+            .is_some_and(|source| crate::coercion::can_cast(source, *target, CastContext::Implicit))
+        {
+            return Err(PgError::create(
                 SqlState::UndefinedFunction,
                 format!("function {name} does not exist"),
-            )
-        })?;
+            ));
+        }
     }
-    Ok(Some((targets, result)))
+    Ok(Some(RuntimeFunctionSignature {
+        argument_types: types,
+        targets,
+        result_type,
+    }))
 }
 
 pub(super) fn evaluate_runtime_function(
     name: &str,
     arguments: &[&ast::Expr],
-    targets: &[BaseType],
+    signature: &RuntimeFunctionSignature,
     schema: RowScope<'_>,
     row: &[Value],
     context: &StatementContext,
 ) -> Result<Value> {
     let values = arguments
         .iter()
-        .zip(targets)
-        .map(|(argument, target)| {
-            evaluate_and_coerce(
-                argument,
-                *target,
+        .zip(&signature.argument_types)
+        .zip(&signature.targets)
+        .map(|((argument, source), target)| {
+            if let Some(text) = extract_unknown_string_literal(argument) {
+                return super::coerce_unknown_with_context(
+                    text,
+                    crate::value::PgType::create(*target),
+                    CastContext::Implicit,
+                    context,
+                );
+            }
+            if source.is_none() {
+                return evaluate_and_coerce(
+                    argument,
+                    *target,
+                    CastContext::Implicit,
+                    schema,
+                    row,
+                    context,
+                );
+            }
+            let value = super::evaluate(argument, schema, row, context)?;
+            crate::coercion::coerce(
+                value,
+                source.expect("checked source type"),
+                crate::value::PgType::create(*target),
                 CastContext::Implicit,
-                schema,
-                row,
-                context,
+                &context.get_timezone(),
             )
         })
         .collect::<Result<Vec<_>>>()?;

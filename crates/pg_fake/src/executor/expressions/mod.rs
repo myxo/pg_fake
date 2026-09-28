@@ -412,8 +412,9 @@ fn evaluate_inner(
             Value::parse(BaseType::Interval, text)
         }
         ast::Expr::Floor { expr: value, .. } => {
-            let target = infer_expression_type(expr, schema)?;
-            runtime::evaluate_runtime_function("floor", &[value], &[target], schema, row, context)
+            let signature = runtime::infer_runtime_function("floor", &[value], schema)?
+                .expect("floor is a runtime function");
+            runtime::evaluate_runtime_function("floor", &[value], &signature, schema, row, context)
         }
         ast::Expr::AtTimeZone {
             timestamp,
