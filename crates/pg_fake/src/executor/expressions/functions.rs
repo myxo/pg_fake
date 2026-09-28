@@ -699,10 +699,9 @@ pub(super) fn evaluate_function(
             "aggregate function is not allowed in this context",
         ));
     }
-    let result_type = infer_function_return_type(function, schema)?;
     let function_name = normalize_function_name(&function.name)?;
     let arguments = extract_function_arguments(function)?;
-    if json::infer_json_function(&function_name, &arguments, schema)?.is_some() {
+    if let Some(result_type) = json::infer_json_function(&function_name, &arguments, schema)? {
         return json::evaluate_json_function(
             &function_name,
             &arguments,
@@ -724,7 +723,9 @@ pub(super) fn evaluate_function(
             context,
         );
     }
-    if super::arrays::infer_array_function(&function_name, &arguments, schema)?.is_some() {
+    if let Some(result_type) =
+        super::arrays::infer_array_function(&function_name, &arguments, schema)?
+    {
         return super::arrays::evaluate_array_function(
             &function_name,
             &arguments,
@@ -734,6 +735,7 @@ pub(super) fn evaluate_function(
             context,
         );
     }
+    let result_type = infer_function_return_type(function, schema)?;
     match function_name.as_str() {
         "num_nulls" | "num_nonnulls" => {
             let mut count = 0;
