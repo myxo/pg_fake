@@ -9918,6 +9918,82 @@ fn hash_joins_materialized_cte_rows_with_postgres_equality_semantics() {
 }
 
 #[test]
+fn hash_joins_eligible_derived_sources_and_keeps_fallback_semantics() {
+    let db = Db::create();
+    let mut session = db.create_session();
+    session
+        .execute(
+            "CREATE TABLE hash_join_left (key INTEGER, value TEXT);
+             CREATE TABLE hash_join_right (key INTEGER, value TEXT);
+             INSERT INTO hash_join_left VALUES (1, 'a'), (1, 'b'), (NULL, 'null'), (3, 'unmatched');
+             INSERT INTO hash_join_right VALUES (1, 'a'), (1, 'b'), (2, 'unmatched'), (NULL, 'null')",
+        )
+        .unwrap();
+
+    let result = session
+        .query(
+            "SELECT l.value, r.value
+             FROM (SELECT key, value FROM hash_join_left) AS l
+             JOIN (SELECT key, value FROM hash_join_right) AS r ON l.key = r.key
+             ORDER BY l.value, r.value",
+            &[],
+        )
+        .unwrap();
+    assert_eq!(
+        result.rows,
+        vec![
+            vec![Value::Text("a".into()), Value::Text("a".into())],
+            vec![Value::Text("a".into()), Value::Text("b".into())],
+            vec![Value::Text("b".into()), Value::Text("a".into())],
+            vec![Value::Text("b".into()), Value::Text("b".into())],
+        ]
+    );
+
+    let result = session
+        .query(
+            "SELECT l.key
+             FROM (SELECT 'x'::BPCHAR AS key) AS l
+             JOIN (SELECT 'x '::BPCHAR AS key) AS r ON l.key = r.key",
+            &[],
+        )
+        .unwrap();
+    assert_eq!(result.rows, vec![vec![Value::Text("x".into())]]);
+
+    let result = session
+        .query(
+            "SELECT l.value, r.value
+             FROM (SELECT 1::NUMERIC AS key, 'left'::TEXT AS value) AS l
+             JOIN (SELECT 1::INTEGER AS key, 'right'::TEXT AS value) AS r ON l.key = r.key",
+            &[],
+        )
+        .unwrap();
+    assert_eq!(
+        result.rows,
+        vec![vec![
+            Value::Text("left".into()),
+            Value::Text("right".into())
+        ]]
+    );
+
+    let result = session
+        .query(
+            "SELECT l.value, r.value
+             FROM (SELECT 1::INTEGER AS key, 'left'::TEXT AS value) AS l
+             JOIN (SELECT 1::INTEGER AS key, 'right'::TEXT AS value) AS r
+               ON l.key = r.key AND l.value < r.value",
+            &[],
+        )
+        .unwrap();
+    assert_eq!(
+        result.rows,
+        vec![vec![
+            Value::Text("left".into()),
+            Value::Text("right".into())
+        ]]
+    );
+}
+
+#[test]
 #[cfg_attr(feature = "execution-log", tracing::instrument(skip_all))]
 fn permits_nonrecursive_mutations_under_with_recursive() {
     let db = Db::create();

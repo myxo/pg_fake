@@ -510,6 +510,12 @@ pub fn list_benchmarks() -> Vec<Benchmark> {
             build_postgres_comparisons(),
         ),
         build_benchmark(
+            BenchmarkTier::Important,
+            "derived_source_join_100_rows",
+            build_postgres_values(),
+            build_postgres_comparisons(),
+        ),
+        build_benchmark(
             BenchmarkTier::Rare,
             "data_modifying_cte_update_100_rows",
             build_postgres_values(),

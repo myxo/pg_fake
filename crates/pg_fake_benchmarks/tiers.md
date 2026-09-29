@@ -36,7 +36,7 @@ in [`src/lib.rs`](src/lib.rs); update this assessment when adding or moving one.
 | `tier1_selective_inner_join` | Performs a two-table equality join with a simple filter and one matching result. |
 | `tier1_many_match_inner_join` | Performs the same basic equality-join shape with multiple matches; no lateral, recursive, or aggregate operation. |
 
-## Tier 2: important operations (44 groups)
+## Tier 2: important operations (45 groups)
 
 | Benchmark | Reason |
 | --- | --- |
@@ -78,6 +78,7 @@ in [`src/lib.rs`](src/lib.rs); update this assessment when adding or moving one.
 | `tier2_foreign_key_insert` | Times both a parent insert and a referencing child insert, exercising referential checks across tables. |
 | `tier2_derived_and_scalar_subquery_100_rows` | Combines a derived table, scalar subquery, and subquery membership test. |
 | `tier2_materialized_cte_100_rows` | Reuses a non-recursive read CTE from two sides of a join. |
+| `tier2_derived_source_join_100_rows` | Joins two derived table sources on an equality key, covering the materialized-source path. |
 | `tier2_correlated_exists_100_rows` | Checks related-row existence through a correlated subquery. |
 | `tier2_global_aggregate_100_rows` | Computes count, sum, average, minimum, and maximum over a table. |
 | `tier2_grouped_aggregate_100_rows` | Summarizes rows with GROUP BY, HAVING, and ordering. |

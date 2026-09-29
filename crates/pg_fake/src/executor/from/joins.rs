@@ -200,6 +200,27 @@ fn create_hash_join_key(value: &Value, data_type: BaseType) -> Option<EqualityKe
     create_equality_key(value)
 }
 
+fn hash_join_matches<'left, 'right>(
+    left_keys: impl Iterator<Item = &'left Value>,
+    right_keys: impl Iterator<Item = &'right Value>,
+    data_type: BaseType,
+) -> Vec<Vec<usize>> {
+    let mut right_by_key = std::collections::HashMap::<EqualityKey, Vec<usize>>::new();
+    for (index, value) in right_keys.enumerate() {
+        if let Some(key) = create_hash_join_key(value, data_type) {
+            right_by_key.entry(key).or_default().push(index);
+        }
+    }
+    left_keys
+        .map(|value| {
+            create_hash_join_key(value, data_type)
+                .and_then(|key| right_by_key.get(&key))
+                .cloned()
+                .unwrap_or_default()
+        })
+        .collect()
+}
+
 #[cfg_attr(feature = "execution-log", tracing::instrument(skip_all))]
 fn visit_hash_join_chain_rows(
     state: &DatabaseState,
@@ -236,7 +257,7 @@ fn visit_hash_join_chain_rows(
             .copied()
             .unwrap_or(scope.columns.len());
         let key_type = scope.columns[left_slot].data_type.base;
-        let mut right_rows = std::collections::HashMap::<EqualityKey, Vec<Vec<Value>>>::new();
+        let mut right_rows = Vec::new();
         visit_table_factor_rows(
             state,
             &table.joins[index].relation,
@@ -247,23 +268,21 @@ fn visit_hash_join_chain_rows(
             selection,
             right_start,
             &mut |row| {
-                if let Some(key) = create_hash_join_key(&row[right_slot], key_type) {
-                    right_rows
-                        .entry(key)
-                        .or_default()
-                        .push(row[right_start..right_end].to_vec());
-                }
+                right_rows.push(row[right_start..right_end].to_vec());
                 Ok(())
             },
         )?;
         let mut joined = Vec::new();
-        for left in rows {
-            let matches = create_hash_join_key(&left[left_slot], key_type)
-                .and_then(|key| right_rows.get(&key));
-            if let Some(matches) = matches {
-                joined.extend(matches.iter().map(|right| {
+        let matches = hash_join_matches(
+            rows.iter().map(|row| &row[left_slot]),
+            right_rows.iter().map(|row| &row[right_slot - right_start]),
+            key_type,
+        );
+        for (left, matches) in rows.into_iter().zip(matches) {
+            if !matches.is_empty() {
+                joined.extend(matches.into_iter().map(|index| {
                     let mut row = left.clone();
-                    row.extend_from_slice(right);
+                    row.extend_from_slice(&right_rows[index]);
                     row
                 }));
             } else if preserve_left {
@@ -474,6 +493,29 @@ pub(super) fn materialize_table_with_joins_rows(
             prefix,
         )?;
         let mut joined = Vec::new();
+        if let Some((left_slot, right_slot)) =
+            resolve_hash_join_slots(&join.join_operator, scope, left_start, right_start).and_then(
+                |(left_slot, right_slot, preserve_left)| {
+                    (!preserve_left).then_some((left_slot, right_slot))
+                },
+            )
+        {
+            let key_type = scope.columns[left_slot].data_type.base;
+            let matches = hash_join_matches(
+                rows.iter().map(|row| &row.values[left_slot]),
+                right_rows.iter().map(|row| &row.values[right_slot]),
+                key_type,
+            );
+            for (left, matches) in rows.iter().zip(matches) {
+                joined.extend(
+                    matches
+                        .into_iter()
+                        .map(|index| left.combine(&right_rows[index])),
+                );
+            }
+            rows = joined;
+            continue;
+        }
         let mut matched_right = vec![false; right_rows.len()];
         for left in &rows {
             let mut matched_left = false;

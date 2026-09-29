@@ -2,7 +2,7 @@ use std::cmp::Ordering;
 
 use crate::{error::Result, executor::expressions::compare_values, value::Value};
 
-#[derive(Eq, Hash, PartialEq)]
+#[derive(Clone, Eq, Hash, PartialEq)]
 pub(super) enum EqualityKey {
     Jsonb(crate::jsonb::Jsonb),
     Bool(bool),

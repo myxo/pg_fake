@@ -2132,6 +2132,7 @@ fn benchmarks(criterion: &mut Criterion) {
         benchmark_skip_locked(criterion, &runtime, &mut connections);
         derived_and_scalar_subquery_benchmark(criterion, &runtime, &mut connections);
         materialized_cte_benchmark(criterion, &runtime, &mut connections);
+        derived_source_join_benchmark(criterion, &runtime, &mut connections);
         data_modifying_cte_benchmark(criterion, &runtime, &mut connections);
         recursive_cte_benchmark(criterion, &runtime, &mut connections);
         global_aggregate_benchmark(criterion, &runtime, &mut connections);
@@ -2431,6 +2432,44 @@ fn materialized_cte_benchmark(
     group.finish();
     for (_, connection) in connections.iter_mut() {
         connection.execute(runtime, "DROP TABLE materialized_cte_100_rows");
+    }
+}
+
+fn derived_source_join_benchmark(
+    criterion: &mut Criterion,
+    runtime: &Runtime,
+    connections: &mut [NamedBenchmarkConnection<'_>],
+) {
+    let values = (1..=100)
+        .map(|id| format!("({id})"))
+        .collect::<Vec<_>>()
+        .join(",");
+    for (_, connection) in connections.iter_mut() {
+        connection.execute(runtime, "CREATE TABLE derived_join_left (id INTEGER)");
+        connection.execute(runtime, "CREATE TABLE derived_join_right (id INTEGER)");
+        connection.execute(
+            runtime,
+            &format!("INSERT INTO derived_join_left VALUES {values}"),
+        );
+        connection.execute(
+            runtime,
+            &format!("INSERT INTO derived_join_right VALUES {values}"),
+        );
+    }
+    let query = "SELECT left_source.id FROM (SELECT id FROM derived_join_left) AS left_source JOIN (SELECT id FROM derived_join_right) AS right_source ON left_source.id = right_source.id ORDER BY left_source.id";
+    let mut group = criterion
+        .benchmark_group(benchmarks::find_benchmark("derived_source_join_100_rows").format_name());
+    group.throughput(Throughput::Elements(100));
+    for (name, connection) in connections.iter_mut() {
+        group.bench_function(*name, |benchmark| {
+            benchmark.iter(|| {
+                connection.fetch(runtime, query);
+            });
+        });
+    }
+    group.finish();
+    for (_, connection) in connections.iter_mut() {
+        connection.execute(runtime, "DROP TABLE derived_join_left, derived_join_right");
     }
 }
 
