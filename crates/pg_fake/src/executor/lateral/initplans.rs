@@ -15,6 +15,7 @@ pub(in crate::executor) enum InitplanKey {
     Scalar(Vec<(Span, String)>),
     DerivedCte(Vec<(Span, String)>),
     Cte(Span, String),
+    Lateral(String),
 }
 
 impl InitplanKey {
@@ -113,6 +114,18 @@ impl InitplanCache {
     pub(in crate::executor) fn set_result(&mut self, key: &InitplanKey, result: QueryResult) {
         if let Some((_, cached)) = self.entries.iter_mut().find(|(cached, _)| cached == key) {
             *cached = Some(result);
+        }
+    }
+
+    pub(in crate::executor) fn set_lateral_result(
+        &mut self,
+        key: InitplanKey,
+        result: QueryResult,
+    ) {
+        if let Some((_, cached)) = self.entries.iter_mut().find(|(cached, _)| cached == &key) {
+            *cached = Some(result);
+        } else {
+            self.entries.push((key, Some(result)));
         }
     }
 }

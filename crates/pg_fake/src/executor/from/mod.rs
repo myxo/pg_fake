@@ -437,25 +437,58 @@ fn materialize_table_factor_rows(
             subqueries::push_derived_filters(state, query, scope, *next_slot, selection)?
         };
         let query = filtered.as_ref().unwrap_or(query);
+        let mut volatile = false;
+        let _ = ast::visit_expressions(query, |expression| {
+            if super::query::contains_volatile_expression(expression) {
+                volatile = true;
+                std::ops::ControlFlow::Break(())
+            } else {
+                std::ops::ControlFlow::Continue(())
+            }
+        });
+        let lateral_memo_key = (correlated
+            && !context.capture_lock_queries
+            && inherited.is_none()
+            && query.with.is_none()
+            && !super::query::contains_locking_operations(query)
+            && !volatile)
+            .then(|| {
+                InitplanKey::Lateral(format!(
+                    "{:?} {:?} {query}",
+                    query.span(),
+                    context.query_invocation
+                ))
+            });
         let InitplanKey::Scalar(projection) = InitplanKey::create_scalar(query) else {
             unreachable!("scalar key")
         };
         let initplan = InitplanKey::DerivedCte(projection);
-        let cached = (!context.capture_lock_queries && inherited.is_none())
-            .then(|| {
-                context
-                    .lateral_initplans
-                    .lock()
-                    .expect("lateral initplans mutex is poisoned")
-                    .get_result(&initplan)
-                    .map(super::query::QueryOutput::create)
-                    .or_else(|| {
-                        (!correlated)
-                            .then(|| context.get_prepared_subquery_result(query))
-                            .flatten()
+        let cached = if !context.capture_lock_queries && inherited.is_none() {
+            let initplan_result = context
+                .lateral_initplans
+                .lock()
+                .expect("lateral initplans mutex is poisoned")
+                .get_result(&initplan)
+                .map(super::query::QueryOutput::create);
+            initplan_result
+                .or_else(|| {
+                    (!correlated)
+                        .then(|| context.get_prepared_subquery_result(query))
+                        .flatten()
+                })
+                .or_else(|| {
+                    lateral_memo_key.as_ref().and_then(|key| {
+                        context
+                            .lateral_initplans
+                            .lock()
+                            .expect("lateral initplans mutex is poisoned")
+                            .get_result(key)
+                            .map(super::query::QueryOutput::create)
                     })
-            })
-            .flatten();
+                })
+        } else {
+            None
+        };
         let result = if let Some(result) = cached {
             result
         } else {
@@ -476,6 +509,13 @@ fn materialize_table_factor_rows(
                 .lock()
                 .expect("lateral initplans mutex is poisoned")
                 .set_result(&initplan, result.result.clone());
+            if let Some(key) = lateral_memo_key {
+                context
+                    .lateral_initplans
+                    .lock()
+                    .expect("lateral initplans mutex is poisoned")
+                    .set_lateral_result(key, result.result.clone());
+            }
             result
         };
         let start = *next_slot;
