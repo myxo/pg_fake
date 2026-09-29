@@ -28,7 +28,8 @@ pub(super) use streaming::recheck_join_conditions;
 
 type RowConsumer<'a> = dyn FnMut(&[Value], &[RowOrigin]) -> Result<()> + 'a;
 
-use joins::{can_stream_join, materialize_table_with_joins_rows, visit_streamed_join_rows};
+use joins::materialize_table_with_joins_rows;
+pub(super) use joins::{can_stream_join, visit_streamed_join_rows};
 use scans::collect_pushdown_filters;
 pub(super) use scans::{is_selection_fully_pushed, resolve_unique_point_lookup};
 

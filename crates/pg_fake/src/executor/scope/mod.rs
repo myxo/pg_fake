@@ -25,7 +25,7 @@ pub(crate) use sources::{
 pub(super) use subqueries::infer_expression_data_type;
 pub(crate) use subqueries::substitute_typed_subqueries;
 
-#[derive(Clone)]
+#[derive(Debug, Clone)]
 pub(super) struct BoundColumn {
     pub(super) name: String,
     pub(super) data_type: PgType,
@@ -42,7 +42,7 @@ pub(super) struct BoundColumn {
     pub(super) source_name: String,
 }
 
-#[derive(Clone)]
+#[derive(Debug, Clone)]
 pub(crate) struct BoundScope {
     pub(super) columns: Vec<BoundColumn>,
 }

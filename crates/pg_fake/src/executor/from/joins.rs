@@ -17,7 +17,7 @@ use sqlparser::ast;
 use super::{SourceRow, materialize_table_factor_rows, scans::visit_table_factor_rows};
 
 #[cfg_attr(feature = "execution-log", tracing::instrument(skip_all))]
-pub(super) fn can_stream_join(table: &ast::TableWithJoins) -> bool {
+pub(crate) fn can_stream_join(table: &ast::TableWithJoins) -> bool {
     matches!(table.relation, ast::TableFactor::Table { args: None, .. })
         && table.joins.iter().all(|join| {
             matches!(join.relation, ast::TableFactor::Table { args: None, .. })
@@ -33,7 +33,7 @@ pub(super) fn can_stream_join(table: &ast::TableWithJoins) -> bool {
 }
 
 #[cfg_attr(feature = "execution-log", tracing::instrument(skip_all))]
-pub(super) fn visit_streamed_join_rows(
+pub(crate) fn visit_streamed_join_rows(
     state: &DatabaseState,
     table: &ast::TableWithJoins,
     scope: &BoundScope,

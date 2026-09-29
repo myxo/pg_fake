@@ -56,6 +56,10 @@ enum PreparedSource {
     CteRows {
         id: usize,
     },
+    StreamedJoin {
+        table: ast::TableWithJoins,
+        scope: BoundScope,
+    },
 }
 
 #[derive(Debug, Clone)]
@@ -178,7 +182,6 @@ pub(crate) fn build_prepared_query_plan(
         || select.qualify.is_some()
         || select.value_table_mode.is_some()
         || select.from.len() != 1
-        || !select.from[0].joins.is_empty()
     {
         return Ok(None);
     }
@@ -217,6 +220,23 @@ pub(crate) fn build_prepared_query_plan(
         return Ok(None);
     }
     let cte_row_source = crate::executor::ctes::cte_row_source_id(name);
+    if !select.from[0].joins.is_empty()
+        && (cte_row_source.is_none()
+            || select.from[0].joins.len() != 1
+            || !crate::executor::from::can_stream_join(&select.from[0])
+            || !matches!(
+                select.from[0].joins[0].join_operator,
+                ast::JoinOperator::Join(ast::JoinConstraint::On(ast::Expr::BinaryOp {
+                    op: ast::BinaryOperator::Eq,
+                    ..
+                })) | ast::JoinOperator::Inner(ast::JoinConstraint::On(ast::Expr::BinaryOp {
+                    op: ast::BinaryOperator::Eq,
+                    ..
+                }))
+            ))
+    {
+        return Ok(None);
+    }
     let schema = if cte_row_source.is_some() {
         None
     } else {
@@ -410,19 +430,26 @@ pub(crate) fn build_prepared_query_plan(
         }
         None => None,
     };
-    let source = match (cte_row_source, schema) {
-        (Some(id), None) => PreparedSource::CteRows { id },
-        (None, Some(schema)) => {
-            let access = selection
-                .as_ref()
-                .and_then(|selection| find_unique_access(selection, schema))
-                .unwrap_or(PreparedAccess::Scan);
-            PreparedSource::Table {
-                table_id: schema.id,
-                access,
-            }
+    let source = if !select.from[0].joins.is_empty() {
+        PreparedSource::StreamedJoin {
+            table: select.from[0].clone(),
+            scope: scope.clone(),
         }
-        _ => unreachable!("CTE row source and table schema are mutually exclusive"),
+    } else {
+        match (cte_row_source, schema) {
+            (Some(id), None) => PreparedSource::CteRows { id },
+            (None, Some(schema)) => {
+                let access = selection
+                    .as_ref()
+                    .and_then(|selection| find_unique_access(selection, schema))
+                    .unwrap_or(PreparedAccess::Scan);
+                PreparedSource::Table {
+                    table_id: schema.id,
+                    access,
+                }
+            }
+            _ => unreachable!("CTE row source and table schema are mutually exclusive"),
+        }
     };
     Ok(Some(PreparedQueryPlan {
         source,
@@ -712,6 +739,18 @@ pub(crate) fn execute_prepared_query(
             for row in &source.rows {
                 visit(row)?;
             }
+        }
+        PreparedSource::StreamedJoin { table, scope } => {
+            crate::executor::from::visit_streamed_join_rows(
+                state,
+                table,
+                scope,
+                xid,
+                snapshot,
+                context.expect("prepared recursive join requires its statement context"),
+                None,
+                &mut |row| visit(row),
+            )?;
         }
         PreparedSource::Table { table_id, access } => {
             state.catalog.require_table_by_id(*table_id)?;
