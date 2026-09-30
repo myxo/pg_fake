@@ -204,10 +204,7 @@ pub(super) fn execute_query(
     context: &StatementContext,
 ) -> Result<QueryOutput> {
     let mut output = execute_query_inner(state, query, xid, snapshot, context)?;
-    restore_query_projection_names(
-        &ast::Statement::Query(Box::new(query.clone())),
-        &mut output.result.columns,
-    );
+    restore_query_projection_names(query, &mut output.result.columns);
     Ok(output)
 }
 

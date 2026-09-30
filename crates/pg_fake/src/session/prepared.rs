@@ -218,7 +218,9 @@ impl Session {
                                     executor::describe_query_result_columns(&state, &described)?
                                 }
                             };
-                            executor::restore_query_projection_names(&statement, &mut columns);
+                            if let ast::Statement::Query(query) = &statement {
+                                executor::restore_query_projection_names(query, &mut columns);
+                            }
                             let query_plan = executor::build_prepared_query_plan(
                                 &state,
                                 &statement,

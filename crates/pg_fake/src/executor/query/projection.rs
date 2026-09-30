@@ -436,13 +436,7 @@ pub(in crate::executor) fn get_projection_name(
     }
 }
 
-pub(crate) fn restore_query_projection_names(
-    statement: &ast::Statement,
-    columns: &mut [ColumnMeta],
-) {
-    let ast::Statement::Query(query) = statement else {
-        return;
-    };
+pub(crate) fn restore_query_projection_names(query: &ast::Query, columns: &mut [ColumnMeta]) {
     let ast::SetExpr::Select(select) = query.body.as_ref() else {
         return;
     };
