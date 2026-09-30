@@ -28,7 +28,10 @@ use super::{
     ordering::{OrderKey, RowOrderSpec},
     projection::ProjectionSource,
     select::evaluate_where_clause,
-    windows::{WindowFunction, calculate_window_values, materialize_window_expression},
+    windows::{
+        WindowFunction, calculate_window_values, materialize_window_expression,
+        prepare_window_expressions,
+    },
 };
 
 mod validation;
@@ -635,6 +638,8 @@ pub(super) fn execute_grouped_select_rows(
         snapshot,
         context,
     )?;
+    let expressions =
+        prepare_window_expressions(projections, order_specs, distinct, window_functions);
     let evaluated = (|| {
         for ((row, aggregate_values), window_values) in
             groups.into_iter().zip(window_values).skip(prepared.next)
@@ -644,12 +649,13 @@ pub(super) fn execute_grouped_select_rows(
                     .iter()
                     .enumerate()
                     .map(|(index, projection)| match projection {
-                        ProjectionSource::Expression(expression) => {
+                        ProjectionSource::Expression(_) => {
                             let expression = materialize_window_expression(
-                                expression,
+                                expressions.projections[index]
+                                    .as_ref()
+                                    .expect("expression has a window template"),
                                 window_functions,
                                 &window_values,
-                                AggregateOwner::Projection(index),
                             );
                             evaluate_select_expression(
                                 state,
@@ -680,12 +686,13 @@ pub(super) fn execute_grouped_select_rows(
                     .map(|(index, order)| match order.key {
                         OrderKey::Output(index) => Ok(values[index].clone()),
                         OrderKey::Input(slot, _) => Ok(row[slot].clone()),
-                        OrderKey::Expression(expression) => {
+                        OrderKey::Expression(_) => {
                             let expression = materialize_window_expression(
-                                expression,
+                                expressions.ordering[index]
+                                    .as_ref()
+                                    .expect("expression has a window template"),
                                 window_functions,
                                 &window_values,
-                                AggregateOwner::Order(index),
                             );
                             evaluate_select_expression(
                                 state,
@@ -707,12 +714,13 @@ pub(super) fn execute_grouped_select_rows(
                         .map(|(index, key)| match key {
                             DistinctKey::Output(index) => Ok(values[*index].clone()),
                             DistinctKey::Order(index) => Ok(keys[*index].clone()),
-                            DistinctKey::Expression(expression) => {
+                            DistinctKey::Expression(_) => {
                                 let expression = materialize_window_expression(
-                                    expression,
+                                    expressions.distinct[index]
+                                        .as_ref()
+                                        .expect("expression has a window template"),
                                     window_functions,
                                     &window_values,
-                                    AggregateOwner::Distinct(index),
                                 );
                                 evaluate_select_expression(
                                     state,

@@ -1,5 +1,5 @@
 use sqlparser::ast::{self, VisitMut as _};
-use std::{cmp::Ordering, collections::BTreeMap};
+use std::{borrow::Cow, cmp::Ordering, collections::BTreeMap};
 
 use crate::{
     coercion::{self, CastContext},
@@ -35,12 +35,22 @@ struct WindowCollector {
     query_depth: usize,
 }
 
-struct WindowMaterializer<'a> {
+struct WindowTemplateCompiler<'a> {
     functions: &'a [WindowFunction],
-    values: &'a [Value],
     owner: AggregateOwner,
     seen: BTreeMap<ast::Function, usize>,
     query_depth: usize,
+}
+
+pub(super) struct WindowExpressions<'a> {
+    pub(super) projections: Vec<Option<Cow<'a, ast::Expr>>>,
+    pub(super) ordering: Vec<Option<Cow<'a, ast::Expr>>>,
+    pub(super) distinct: Vec<Option<Cow<'a, ast::Expr>>>,
+}
+
+struct WindowMaterializer<'a> {
+    functions: &'a [WindowFunction],
+    values: &'a [Value],
 }
 
 pub(super) struct WindowFunction {
@@ -264,24 +274,78 @@ pub(super) fn resolve_window_functions(
         .collect()
 }
 
-pub(super) fn materialize_window_expression(
-    expression: &ast::Expr,
+pub(super) fn prepare_window_expressions<'a>(
+    projections: &[ProjectionSource<'a>],
+    order_specs: &[RowOrderSpec<'a>],
+    distinct: &DistinctPlan<'a>,
+    functions: &[WindowFunction],
+) -> WindowExpressions<'a> {
+    let prepare = |expression: &'a ast::Expr, owner| {
+        if !functions.iter().any(|function| function.owner == owner) {
+            return Cow::Borrowed(expression);
+        }
+        let mut expression = expression.clone();
+        let _ = expression.visit(&mut crate::ast_visit::WriteVisitor(
+            &mut WindowTemplateCompiler {
+                functions,
+                owner,
+                seen: BTreeMap::new(),
+                query_depth: 0,
+            },
+        ));
+        Cow::Owned(expression)
+    };
+    WindowExpressions {
+        projections: projections
+            .iter()
+            .enumerate()
+            .map(|(index, projection)| match projection {
+                ProjectionSource::Expression(expression) => {
+                    Some(prepare(expression, AggregateOwner::Projection(index)))
+                }
+                _ => None,
+            })
+            .collect(),
+        ordering: order_specs
+            .iter()
+            .enumerate()
+            .map(|(index, order)| match order.key {
+                OrderKey::Expression(expression) => {
+                    Some(prepare(expression, AggregateOwner::Order(index)))
+                }
+                _ => None,
+            })
+            .collect(),
+        distinct: match distinct {
+            DistinctPlan::On { keys, .. } => keys
+                .iter()
+                .enumerate()
+                .map(|(index, key)| match key {
+                    DistinctKey::Expression(expression) => {
+                        Some(prepare(expression, AggregateOwner::Distinct(index)))
+                    }
+                    _ => None,
+                })
+                .collect(),
+            DistinctPlan::None | DistinctPlan::Rows => Vec::new(),
+        },
+    }
+}
+
+pub(super) fn materialize_window_expression<'a>(
+    expression: &'a Cow<'_, ast::Expr>,
     functions: &[WindowFunction],
     values: &[Value],
-    owner: AggregateOwner,
-) -> ast::Expr {
+) -> Cow<'a, ast::Expr> {
     assert_eq!(functions.len(), values.len());
-    let mut expression = expression.clone();
+    if matches!(expression, Cow::Borrowed(_)) {
+        return Cow::Borrowed(expression.as_ref());
+    }
+    let mut expression = expression.as_ref().clone();
     let _ = expression.visit(&mut crate::ast_visit::WriteVisitor(
-        &mut WindowMaterializer {
-            functions,
-            values,
-            owner,
-            seen: BTreeMap::new(),
-            query_depth: 0,
-        },
+        &mut WindowMaterializer { functions, values },
     ));
-    expression
+    Cow::Owned(expression)
 }
 
 fn compare_window_order_keys(
@@ -1366,6 +1430,7 @@ pub(super) fn execute_windowed_select_rows(
         snapshot,
         context,
     )?;
+    let expressions = prepare_window_expressions(projections, order_specs, distinct, functions);
     source_rows
         .iter()
         .zip(&window_values)
@@ -1396,13 +1461,14 @@ pub(super) fn execute_windowed_select_rows(
                             )
                         }
                     }
-                    ProjectionSource::Expression(expression) => evaluate_select_expression(
+                    ProjectionSource::Expression(_) => evaluate_select_expression(
                         state,
                         &materialize_window_expression(
-                            expression,
+                            expressions.projections[index]
+                                .as_ref()
+                                .expect("expression has a window template"),
                             functions,
                             window_values,
-                            AggregateOwner::Projection(index),
                         ),
                         scope,
                         row,
@@ -1419,13 +1485,14 @@ pub(super) fn execute_windowed_select_rows(
                 .map(|(index, order)| match order.key {
                     OrderKey::Output(index) => Ok(values[index].clone()),
                     OrderKey::Input(slot, _) => Ok(row[slot].clone()),
-                    OrderKey::Expression(expression) => evaluate_select_expression(
+                    OrderKey::Expression(_) => evaluate_select_expression(
                         state,
                         &materialize_window_expression(
-                            expression,
+                            expressions.ordering[index]
+                                .as_ref()
+                                .expect("expression has a window template"),
                             functions,
                             window_values,
-                            AggregateOwner::Order(index),
                         ),
                         scope,
                         row,
@@ -1443,13 +1510,14 @@ pub(super) fn execute_windowed_select_rows(
                     .map(|(index, key)| match key {
                         DistinctKey::Output(index) => Ok(values[*index].clone()),
                         DistinctKey::Order(index) => Ok(keys[*index].clone()),
-                        DistinctKey::Expression(expression) => evaluate_select_expression(
+                        DistinctKey::Expression(_) => evaluate_select_expression(
                             state,
                             &materialize_window_expression(
-                                expression,
+                                expressions.distinct[index]
+                                    .as_ref()
+                                    .expect("expression has a window template"),
                                 functions,
                                 window_values,
-                                AggregateOwner::Distinct(index),
                             ),
                             scope,
                             row,
@@ -1495,7 +1563,7 @@ impl ast::VisitorMut for WindowCollector {
                 || !self
                     .functions
                     .iter()
-                    .any(|(candidate, _)| candidate == function))
+                    .any(|(candidate, owner)| candidate == function && *owner == self.owner))
         {
             self.functions.push((function.clone(), self.owner));
         }
@@ -1503,7 +1571,7 @@ impl ast::VisitorMut for WindowCollector {
     }
 }
 
-impl ast::VisitorMut for WindowMaterializer<'_> {
+impl ast::VisitorMut for WindowTemplateCompiler<'_> {
     type Break = ();
 
     fn pre_visit_query(&mut self, _query: &mut ast::Query) -> std::ops::ControlFlow<Self::Break> {
@@ -1537,11 +1605,30 @@ impl ast::VisitorMut for WindowMaterializer<'_> {
                 *count += 1;
             }
             if let Some(index) = index {
-                *expression = crate::analyzer::create_typed_literal(
-                    self.values[index].clone(),
-                    PgType::create(self.functions[index].data_type),
-                );
+                // Unquoted NUL cannot originate in a SQL identifier.
+                *expression =
+                    ast::Expr::Identifier(ast::Ident::new(format!("\0pg_fake_window_{index}")));
             }
+        }
+        std::ops::ControlFlow::Continue(())
+    }
+}
+
+impl ast::VisitorMut for WindowMaterializer<'_> {
+    type Break = ();
+
+    fn pre_visit_expr(&mut self, expression: &mut ast::Expr) -> std::ops::ControlFlow<Self::Break> {
+        if let ast::Expr::Identifier(identifier) = expression
+            && identifier.quote_style.is_none()
+            && let Some(slot) = identifier.value.strip_prefix("\0pg_fake_window_")
+        {
+            let slot: usize = slot
+                .parse()
+                .expect("window slot marker has a numeric index");
+            *expression = crate::analyzer::create_typed_literal(
+                self.values[slot].clone(),
+                PgType::create(self.functions[slot].data_type),
+            );
         }
         std::ops::ControlFlow::Continue(())
     }

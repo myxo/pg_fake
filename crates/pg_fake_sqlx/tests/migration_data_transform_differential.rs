@@ -350,3 +350,30 @@ fn matches_migration_data_transform_queries() {
         .collect::<Vec<_>>();
     assert_eq!(fake_metadata, postgres_metadata);
 }
+
+#[test]
+fn matches_reused_window_expression_templates() {
+    let server = start_isolated_postgres_server();
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap();
+    let mut postgres = runtime
+        .block_on(PgConnection::connect(&server.url))
+        .unwrap();
+    let mut fake = PgFakeConnection::new(Db::create());
+    for sql in [
+        "CREATE TABLE window_templates (id integer, bucket integer, \"__pg_fake_window_0\" integer)",
+        "INSERT INTO window_templates VALUES (1, 1, 91), (2, 1, 92), (3, 2, 93)",
+        "SELECT id, row_number() OVER (ORDER BY id), row_number() OVER (ORDER BY id), row_number() OVER (ORDER BY id) + row_number() OVER (ORDER BY id) FROM window_templates ORDER BY row_number() OVER (ORDER BY id) + 0",
+        "SELECT id, \"__pg_fake_window_0\" + row_number() OVER (ORDER BY id) FROM window_templates ORDER BY id",
+        "SELECT bucket, sum(count(*)) OVER (ORDER BY bucket), sum(count(*)) OVER (ORDER BY bucket) + sum(count(*)) OVER (ORDER BY bucket) FROM window_templates GROUP BY bucket ORDER BY sum(count(*)) OVER (ORDER BY bucket) + 0",
+        "SELECT id, row_number() OVER (ORDER BY id) + (SELECT row_number() OVER ()) FROM window_templates ORDER BY id",
+        "SELECT DISTINCT ON (row_number() OVER (ORDER BY id) + 0) id, row_number() OVER (ORDER BY id) FROM window_templates ORDER BY row_number() OVER (ORDER BY id) + 0",
+        "CREATE SEQUENCE window_template_values",
+        "SELECT id, lag(nextval('window_template_values'), 0) OVER (ORDER BY id) <> lag(nextval('window_template_values'), 0) OVER (ORDER BY id) FROM window_templates ORDER BY id",
+        "SELECT nextval('window_template_values')",
+    ] {
+        assert_statement(&runtime, &mut postgres, &mut fake, sql, RowOrder::Ordered);
+    }
+}
