@@ -11018,3 +11018,61 @@ fn does_not_add_predicate_read_for_do_nothing() {
     );
     second.execute("ROLLBACK").unwrap();
 }
+
+#[test]
+fn reuse_prepared_temporal_bindings_across_timezone_changes() {
+    let db = Db::create();
+    let mut session = db.create_session();
+    session.execute("CREATE TABLE temporal_bindings (id integer PRIMARY KEY); INSERT INTO temporal_bindings VALUES (1), (3601), (90001)").unwrap();
+    for sql in [
+        "SELECT id, to_char(date_trunc('minute', to_timestamp(id)), 'YYYY-MM-DD HH24:MI:SS'), floor(id::numeric / 7) FROM temporal_bindings",
+        "SELECT to_timestamp('1'), to_timestamp(NULL), floor(id::double precision), (id::bigint) FROM temporal_bindings",
+        "SELECT to_timestamp($1) AS epoch FROM temporal_bindings WHERE id = $2",
+        "SELECT id::smallint FROM temporal_bindings WHERE id < 2",
+        "SELECT id::smallint IS NULL OR true FROM temporal_bindings",
+        "SELECT to_timestamp(id / 0) IS NULL AND false FROM temporal_bindings",
+        "SELECT false AND (id::smallint IS NULL), true OR (id::smallint IS NULL) FROM temporal_bindings",
+    ] {
+        session.execute("SET TIME ZONE 'UTC'").unwrap();
+        let parameters = if sql.contains("$1") {
+            vec![Value::Float8(90001.0), Value::Int4(1)]
+        } else {
+            vec![]
+        };
+        let prepared = session.prepare(sql).unwrap();
+        assert!(prepared.query_plan.is_some(), "{sql}");
+        for zone in ["UTC", "America/New_York"] {
+            session.execute(&format!("SET TIME ZONE '{zone}'")).unwrap();
+            let actual = session.query_prepared(&prepared, &parameters).unwrap();
+            let generic = session
+                .query(&format!("{sql} OFFSET 0"), &parameters)
+                .unwrap();
+            assert_eq!(actual.rows, generic.rows, "{sql}, {zone}");
+            assert_eq!(actual.columns, generic.columns, "{sql}, {zone}");
+            if parameters.is_empty() {
+                let results = session.execute(sql).unwrap();
+                let StatementResult::Query(one_shot) = &results[0] else {
+                    panic!("expected query");
+                };
+                assert_eq!(one_shot.rows, generic.rows, "one-shot {sql}, {zone}");
+                assert_eq!(one_shot.columns, generic.columns, "one-shot {sql}, {zone}");
+            }
+        }
+    }
+    let typmod = session
+        .prepare("SELECT id::numeric(10,2) FROM temporal_bindings")
+        .unwrap();
+    assert!(typmod.query_plan.is_none());
+    let unsupported = "SELECT floor(id TO YEAR) FROM temporal_bindings";
+    assert_eq!(
+        session.execute(unsupported).unwrap_err().sqlstate,
+        SqlState::FeatureNotSupported
+    );
+    assert_eq!(
+        session
+            .query(&format!("{unsupported} OFFSET 0"), &[])
+            .unwrap_err()
+            .sqlstate,
+        SqlState::FeatureNotSupported
+    );
+}

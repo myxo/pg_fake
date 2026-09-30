@@ -265,6 +265,7 @@ pub(crate) fn collect_required_row_locks(
                             &version.row,
                             &[],
                             context.deadline,
+                            &context.get_timezone(),
                         )?
                     } else {
                         super::subqueries::evaluate_query_expression(

@@ -680,6 +680,7 @@ pub(super) fn execute_recursive_cte(
                     snapshot,
                     Some(&invocation),
                     invocation.deadline,
+                    &invocation.get_timezone(),
                 )?,
             }
         } else {

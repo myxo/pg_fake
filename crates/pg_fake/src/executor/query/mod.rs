@@ -939,3 +939,5 @@ pub(in crate::executor) fn simplify_exists_query(
     query.limit_clause = None;
     Ok(())
 }
+
+pub(super) use projection::get_projection_name;

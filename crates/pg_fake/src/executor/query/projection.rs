@@ -393,7 +393,10 @@ pub(in crate::executor) fn build_projection_plan<'a>(
     Ok((projections, columns))
 }
 
-pub(super) fn get_projection_name(expr: &ast::Expr, data_type: PgType) -> Result<String> {
+pub(in crate::executor) fn get_projection_name(
+    expr: &ast::Expr,
+    data_type: PgType,
+) -> Result<String> {
     match expr {
         ast::Expr::Identifier(identifier) => Ok(normalize_identifier(identifier)),
         ast::Expr::CompoundIdentifier(identifiers) => Ok(identifiers

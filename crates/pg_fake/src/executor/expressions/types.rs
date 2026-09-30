@@ -574,7 +574,7 @@ pub(crate) fn infer_expression_data_type(
 }
 
 #[cfg_attr(feature = "execution-log", tracing::instrument(skip_all))]
-pub(super) fn is_numeric_type(base: BaseType) -> bool {
+pub(in crate::executor) fn is_numeric_type(base: BaseType) -> bool {
     matches!(
         base,
         BaseType::Int2

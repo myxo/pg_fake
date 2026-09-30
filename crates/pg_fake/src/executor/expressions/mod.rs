@@ -40,9 +40,10 @@ pub(crate) use resume::{EvaluationCursor, PendingEvaluation, PendingOperation};
 pub(super) use resume::{
     EvaluationOperation, evaluate, evaluate_in_cursor, resume_evaluation, resume_operation,
 };
+pub(super) use runtime::evaluate_prepared_runtime_function;
 pub(crate) use runtime::resolve_runtime_function;
-pub(super) use types::resolve_operator_type;
 pub(crate) use types::{infer_expression_data_type, infer_expression_type};
+pub(super) use types::{is_numeric_type, resolve_operator_type};
 
 use comparisons::{evaluate_membership, evaluate_quantified};
 use functions::{evaluate_function, extract_datetime_field};
@@ -192,7 +193,7 @@ pub(crate) fn create_constant_expression_schema() -> TableSchema {
     }
 }
 
-fn is_constant_expression(expr: &ast::Expr) -> bool {
+pub(in crate::executor) fn is_constant_expression(expr: &ast::Expr) -> bool {
     match expr {
         ast::Expr::Value(_) => true,
         ast::Expr::Nested(inner)

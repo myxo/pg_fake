@@ -230,6 +230,7 @@ pub(in crate::executor) fn execute_update(
                             &assignment_row,
                             &[],
                             context.deadline,
+                            &context.get_timezone(),
                         )?
                     } else {
                         evaluate_mutation_assignment(
@@ -480,6 +481,7 @@ pub(in crate::executor) fn prepare_update_rows(
                                 assignment_row,
                                 &[],
                                 context.deadline,
+                                &context.get_timezone(),
                             )?
                         } else {
                             evaluate_mutation_assignment(

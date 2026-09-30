@@ -193,27 +193,10 @@ pub(super) fn evaluate_runtime_function(
     if let Some(function) = crate::advisory::resolve_advisory_function(name) {
         return context.advisory.evaluate(function, &values);
     }
+    if matches!(name, "floor" | "to_timestamp" | "to_char" | "date_trunc") {
+        return evaluate_prepared_runtime_function(name, &values, &context.get_timezone());
+    }
     match (name, values.as_slice()) {
-        ("floor", [Value::Float8(value)]) => Ok(Value::Float8(value.floor())),
-        ("floor", [Value::Numeric(value)]) => Ok(Value::Numeric(
-            value.with_scale_round(0, bigdecimal::RoundingMode::Floor),
-        )),
-        ("to_timestamp", [Value::Float8(seconds)]) => super::temporal::convert_epoch(*seconds),
-        ("to_char", [value, Value::Text(format)]) => {
-            super::temporal::format_timestamp(value, format, &context.get_timezone())
-        }
-        ("date_trunc", [Value::Text(unit), value]) => super::temporal::truncate_timestamp(
-            unit,
-            value.clone(),
-            crate::coercion::time_zones::parse_session_zone(&context.get_timezone())?,
-        ),
-        ("date_trunc", [Value::Text(unit), value, Value::Text(zone)]) => {
-            super::temporal::truncate_timestamp(
-                unit,
-                value.clone(),
-                crate::coercion::time_zones::parse_zone(zone)?,
-            )
-        }
         ("regexp_like", [Value::Text(value), Value::Text(pattern)]) => {
             super::patterns::evaluate_regex(
                 value,
@@ -240,5 +223,38 @@ pub(super) fn evaluate_runtime_function(
             super::hashing::calculate_extended_text_hash(value, *seed),
         )),
         _ => unreachable!("runtime function arguments were coerced"),
+    }
+}
+
+pub(in crate::executor) fn evaluate_prepared_runtime_function(
+    name: &str,
+    values: &[Value],
+    timezone: &str,
+) -> Result<Value> {
+    if values.iter().any(Value::is_null) {
+        return Ok(Value::Null);
+    }
+    match (name, values) {
+        ("floor", [Value::Float8(value)]) => Ok(Value::Float8(value.floor())),
+        ("floor", [Value::Numeric(value)]) => Ok(Value::Numeric(
+            value.with_scale_round(0, bigdecimal::RoundingMode::Floor),
+        )),
+        ("to_timestamp", [Value::Float8(seconds)]) => super::temporal::convert_epoch(*seconds),
+        ("to_char", [value, Value::Text(format)]) => {
+            super::temporal::format_timestamp(value, format, timezone)
+        }
+        ("date_trunc", [Value::Text(unit), value]) => super::temporal::truncate_timestamp(
+            unit,
+            value.clone(),
+            crate::coercion::time_zones::parse_session_zone(timezone)?,
+        ),
+        ("date_trunc", [Value::Text(unit), value, Value::Text(zone)]) => {
+            super::temporal::truncate_timestamp(
+                unit,
+                value.clone(),
+                crate::coercion::time_zones::parse_zone(zone)?,
+            )
+        }
+        _ => unreachable!("prepared runtime arguments were coerced"),
     }
 }

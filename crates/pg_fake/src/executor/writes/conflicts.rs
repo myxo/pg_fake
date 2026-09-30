@@ -357,6 +357,7 @@ pub(super) fn prepare_conflict_update(
                         &bound_row,
                         &[],
                         context.deadline,
+                        &context.get_timezone(),
                     )?
                 } else {
                     evaluate_mutation_assignment(
@@ -550,7 +551,13 @@ pub(super) fn execute_insert_conflict(
         updated[assignment.index] = if is_default_expression(assignment.expression) {
             evaluate_column_default(&schema.columns[assignment.index], context)?
         } else if let Some(prepared) = &assignment.prepared {
-            prepared::evaluate_prepared_expression(prepared, &bound_row, &[], context.deadline)?
+            prepared::evaluate_prepared_expression(
+                prepared,
+                &bound_row,
+                &[],
+                context.deadline,
+                &context.get_timezone(),
+            )?
         } else {
             evaluate_mutation_assignment(
                 state,

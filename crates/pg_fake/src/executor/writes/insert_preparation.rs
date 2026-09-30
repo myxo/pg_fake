@@ -177,7 +177,13 @@ pub(super) fn evaluate_insert_rows(
                 prepared::bind_prepared_expression(assignment.expression, &update.scope, &[])?
                 && prepared.is_constant()
             {
-                prepared::evaluate_prepared_expression(&prepared, &[], &[], context.deadline)?;
+                prepared::evaluate_prepared_expression(
+                    &prepared,
+                    &[],
+                    &[],
+                    context.deadline,
+                    &context.get_timezone(),
+                )?;
             }
         }
     }

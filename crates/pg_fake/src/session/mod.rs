@@ -250,6 +250,7 @@ impl Session {
                 &snapshot,
                 None,
                 statement_deadline,
+                &self.settings.timezone,
             ) {
                 Ok(rows) => match check_statement_timeout(statement_deadline) {
                     Ok(()) => {
@@ -296,6 +297,7 @@ impl Session {
                 &snapshot,
                 None,
                 statement_deadline,
+                &self.settings.timezone,
             ) {
                 Ok(rows) => match check_statement_timeout(statement_deadline) {
                     Ok(()) => {
