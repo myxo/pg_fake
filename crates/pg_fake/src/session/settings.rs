@@ -185,7 +185,7 @@ impl SessionSettings {
 pub(crate) struct GucExecutionContext {
     current: SessionSettings,
     on_commit: SessionSettings,
-    defaults: SessionSettings,
+    defaults: Arc<SessionSettings>,
     custom_settings: Arc<BTreeSet<String>>,
     isolation: IsolationLevel,
     strict: bool,
@@ -313,7 +313,7 @@ impl Session {
             ast::Statement::Reset(reset) => {
                 match &reset.reset {
                     ast::Reset::ALL => {
-                        let defaults = SessionSettings::create(self.default_lock_timeout);
+                        let defaults = self.default_settings.clone();
                         // RESET ALL skips parameters that cannot change in an established session.
                         for spec in list_settings()
                             .iter()
@@ -363,10 +363,7 @@ impl Session {
                                 .abort_with_error(create_cannot_reset_setting_error(spec.name));
                         }
                         spec.validate_access(self.db.strict, true)?;
-                        self.reset_setting(
-                            spec,
-                            &SessionSettings::create(self.default_lock_timeout),
-                        );
+                        self.reset_setting(spec, &self.default_settings.clone());
                     }
                     _ => return Ok(None),
                 }
@@ -434,7 +431,7 @@ impl Session {
         spec.validate_access(self.db.strict, true)?;
         let reset = matches!(values.as_slice(), [ast::Expr::Identifier(ident)] if ident.quote_style.is_none() && (ident.value.eq_ignore_ascii_case("default") || (matches!(spec.kind, SettingType::TimeZone) && ident.value.eq_ignore_ascii_case("local"))));
         if reset {
-            let defaults = SessionSettings::create(self.default_lock_timeout);
+            let defaults = self.default_settings.clone();
             let value = defaults.read_value(spec);
             self.settings.assign_value(spec, value.clone());
             if !local {
@@ -512,7 +509,7 @@ impl Session {
                 .settings_on_commit
                 .clone()
                 .expect("statement has transaction settings"),
-            defaults: SessionSettings::create(self.default_lock_timeout),
+            defaults: self.default_settings.clone(),
             custom_settings: self.custom_settings.clone(),
             isolation: match self.transaction.expect("statement has a transaction") {
                 SessionTransactionState::Active(transaction)

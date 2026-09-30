@@ -41,7 +41,7 @@ pub struct Session {
     savepoints: Vec<savepoints::Savepoint>,
     settings: SessionSettings,
     custom_settings: Arc<BTreeSet<String>>,
-    default_lock_timeout: Duration,
+    default_settings: Arc<SessionSettings>,
     settings_undo: Option<SessionSettings>,
     settings_on_commit: Option<SessionSettings>,
     deferred_constraints: BTreeSet<ConstraintId>,
@@ -58,14 +58,15 @@ impl Session {
             .expect("database mutex is poisoned")
             .catalog_history
             .create_temporary_schema_id();
+        let default_settings = Arc::new(SessionSettings::create(lock_timeout));
         Session {
             db,
             temporary_schema_id,
             transaction: None,
             savepoints: Vec::new(),
-            settings: SessionSettings::create(lock_timeout),
+            settings: (*default_settings).clone(),
             custom_settings: Arc::new(BTreeSet::new()),
-            default_lock_timeout: lock_timeout,
+            default_settings,
             settings_undo: None,
             settings_on_commit: None,
             deferred_constraints: BTreeSet::new(),
