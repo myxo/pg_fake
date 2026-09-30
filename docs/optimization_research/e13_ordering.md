@@ -2,9 +2,8 @@
 
 Baseline is `c5adffb` plus the separately measured E11 and E7 changes.
 The baseline source snapshots for the four modified files are saved locally
-as `/tmp/e13-{prepared,query-mod,ordering,select}-before.rs`. Git commits remain
-blocked by automatic approval review; none of these restored experiments is
-committed yet.
+as `/tmp/e13-{prepared,query-mod,ordering,select}-before.rs`. The retained
+experiment is committed as `971f0cd`.
 
 Both variants use `cargo build -p pg_fake -p pg_fake_sqlx --release --examples`,
 macOS arm64, Cargo 1.98.1, default features, no execution tracing. Run each of
@@ -120,8 +119,7 @@ Three sequential release runs; microseconds per operation.
 | SQLx rows=100 page=true persistent=true | 25.025, 24.982, 25.022 | 25.010 | 81.8% |
 
 All measured cases improve, including the previously regressing wide fixture.
-The retained implementation is reviewed and measured but not committed because
-Git writes remain blocked by automatic approval review.
+The retained implementation is reviewed, measured and committed as `971f0cd`.
 
 ## Prepare and first-execution diagnostics
 

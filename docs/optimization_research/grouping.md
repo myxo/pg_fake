@@ -232,5 +232,4 @@ no small-group improvement claimed. The initial always-hash implementation's
 6–11% small-group slowdown was rejected. No additional optimization was retained
 solely on noisy first-launch observations. Formatting, core/differential tests,
 and source/documentation review pass. The final review independently checked all
-96 case records across the six timing series. Git commit remains
-blocked by automatic approval review.
+96 case records across the six timing series. Committed as `5247ad1`.

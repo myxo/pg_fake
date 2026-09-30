@@ -135,5 +135,4 @@ multiple output owners, repeated deterministic calls, grouped windows, nested
 queries, DISTINCT ordering, quoted names, and duplicate sequence-backed volatile
 calls. Formatting passes. Independent code and harness reviews found no remaining
 issue. No partition/specification cache or moving-frame algorithm rewrite was
-added. Git commits remain blocked by automatic approval review; this accepted
-experiment has not been committed.
+added. This accepted experiment is committed as `64c30e9`.

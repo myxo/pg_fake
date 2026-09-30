@@ -1,8 +1,8 @@
 # E7: bind prepared temporal expressions
 
 Baseline: `c5adffb` plus the separately measured E11 default-sharing change.
-The Git approval reviewer currently blocks commits, so these experiments remain
-uncommitted. The baseline prepared executor has no scalar function nodes.
+Committed as `e569753` after explicit Git authorization. The baseline prepared
+executor has no scalar function nodes.
 
 Reproduce with `cargo build -p pg_fake --release --example temporal_probe`, then
 run `target/release/examples/temporal_probe` three times. Native API,

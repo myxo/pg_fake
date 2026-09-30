@@ -57,4 +57,5 @@ Native inline INSERT has a cold-run outlier (25.883 µs versus approximately
 not be presented as a stable speedup. The SQLx observations are consistent.
 
 The probe compiles and all three runs succeed. Independent harness review found
-no blocking issue; the native INSERT variability is disclosed above. It has not been committed because Git writes remain blocked.
+no blocking issue; the native INSERT variability is disclosed above.
+Committed as `c072977`.
