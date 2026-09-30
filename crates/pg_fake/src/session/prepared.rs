@@ -25,7 +25,7 @@ pub struct PreparedStatement {
     pub(super) parameter_types: Vec<crate::value::BaseType>,
     pub(super) columns: Vec<ColumnMeta>,
     pub(super) query_plan: Option<executor::PreparedQueryPlan>,
-    pub(super) expanded_views_statement: Option<ast::Statement>,
+    pub(super) expanded_views_statement: Option<Box<ast::Statement>>,
     pub(super) catalog_dependencies: Vec<CatalogDependency>,
     pub(super) catalog_identity: crate::catalog::CatalogIdentity,
     pub(super) relation_locks: Option<Vec<(String, RelationLockMode)>>,
@@ -278,7 +278,7 @@ impl Session {
                 parameter_types,
                 columns,
                 query_plan,
-                expanded_views_statement,
+                expanded_views_statement: expanded_views_statement.map(Box::new),
                 catalog_dependencies,
                 relation_locks,
                 catalog_identity,
@@ -381,7 +381,7 @@ impl Session {
             } else {
                 let bind_statement = statement
                     .expanded_views_statement
-                    .as_ref()
+                    .as_deref()
                     .unwrap_or(&statement.statement);
                 let (bound_statement, parameters) = match analyzer::bind_prepared_parameters(
                     bind_statement,
@@ -412,7 +412,7 @@ impl Session {
         let execution_statement = bound_statement.as_deref().unwrap_or_else(|| {
             statement
                 .expanded_views_statement
-                .as_ref()
+                .as_deref()
                 .unwrap_or(&statement.statement)
         });
         let started_implicit_transaction = self.transaction.is_none();

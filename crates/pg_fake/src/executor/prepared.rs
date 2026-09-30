@@ -60,7 +60,7 @@ enum PreparedSource {
         id: usize,
     },
     StreamedJoin {
-        table: ast::TableWithJoins,
+        table: Box<ast::TableWithJoins>,
         scope: BoundScope,
     },
 }
@@ -556,7 +556,7 @@ pub(crate) fn build_prepared_query_plan(
     };
     let source = if !select.from[0].joins.is_empty() {
         PreparedSource::StreamedJoin {
-            table: select.from[0].clone(),
+            table: Box::new(select.from[0].clone()),
             scope: scope.clone(),
         }
     } else {

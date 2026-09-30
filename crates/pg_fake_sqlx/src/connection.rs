@@ -152,7 +152,7 @@ impl ConnectOptions for PgFakeConnectOptions {
 
 struct ConnectionState {
     session: Session,
-    statements: LinkedHashMap<(String, Vec<Option<BaseType>>), CoreStatement>,
+    statements: LinkedHashMap<(String, Vec<Option<BaseType>>), Arc<CoreStatement>>,
     statement_cache_bytes: usize,
     statement_cache_limit_bytes: usize,
 }
@@ -263,6 +263,7 @@ impl PgFakeConnection {
                             let statement = state
                                 .session
                                 .prepare_with_parameter_types(&sql, &parameter_types)
+                                .map(Arc::new)
                                 .map_err(database_error)?;
                             if sql.len() <= state.statement_cache_limit_bytes {
                                 state.statement_cache_bytes += sql.len();
@@ -277,6 +278,7 @@ impl PgFakeConnection {
                         state
                             .session
                             .prepare_with_parameter_types(&sql, &parameter_types)
+                            .map(Arc::new)
                             .map_err(database_error)?
                     };
                     let result = state
@@ -293,6 +295,7 @@ impl PgFakeConnection {
                         let prepared = state
                             .session
                             .prepare_with_parameter_types(&sql, &parameter_types)
+                            .map(Arc::new)
                             .map_err(database_error)?;
                         if sql.len() <= state.statement_cache_limit_bytes {
                             state.statements.insert(cache_key, prepared.clone());
@@ -515,6 +518,7 @@ impl<'c> Executor<'c> for &'c mut PgFakeConnection {
                     let statement = state
                         .session
                         .prepare_with_parameter_types(&query, &parameter_types)
+                        .map(Arc::new)
                         .map_err(database_error)?;
                     let parameters = statement
                         .get_parameter_types()
@@ -653,7 +657,7 @@ impl TransactionManager for PgFakeTransactionManager {
 #[derive(Debug, Clone)]
 pub struct PgFakeStatement<'q> {
     sql: Cow<'q, str>,
-    statement: CoreStatement,
+    statement: Arc<CoreStatement>,
     parameters: Vec<PgFakeTypeInfo>,
     columns: Vec<PgFakeColumn>,
 }
