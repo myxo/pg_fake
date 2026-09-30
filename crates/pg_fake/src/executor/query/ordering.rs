@@ -21,20 +21,22 @@ use crate::{
 use sqlparser::ast;
 use std::cmp::Ordering;
 
-pub(super) enum OrderKey<'a> {
+#[derive(Debug, Clone)]
+pub(in crate::executor) enum OrderKey<'a> {
     Output(usize),
     Input(usize, &'a ast::Expr),
     Expression(&'a ast::Expr),
 }
 
-pub(super) struct RowOrderSpec<'a> {
-    pub(super) key: OrderKey<'a>,
-    pub(super) ascending: bool,
-    pub(super) nulls_first: bool,
+#[derive(Debug, Clone)]
+pub(in crate::executor) struct RowOrderSpec<'a> {
+    pub(in crate::executor) key: OrderKey<'a>,
+    pub(in crate::executor) ascending: bool,
+    pub(in crate::executor) nulls_first: bool,
 }
 
 #[cfg_attr(feature = "execution-log", tracing::instrument(skip_all))]
-pub(super) fn resolve_order_specs<'a>(
+pub(in crate::executor) fn resolve_order_specs<'a>(
     state: &DatabaseState,
     query: &'a ast::Query,
     projections: &[ProjectionSource<'_>],
@@ -200,7 +202,7 @@ pub(super) fn compare_ordered_rows(
     compare_order_keys(&left.keys, &right.keys, order_specs)
 }
 
-pub(super) fn compare_order_keys(
+pub(in crate::executor) fn compare_order_keys(
     left: &[Value],
     right: &[Value],
     order_specs: &[RowOrderSpec<'_>],
@@ -240,11 +242,11 @@ pub(super) fn compare_order_keys(
         .unwrap_or(Ordering::Equal)
 }
 
-pub(super) fn retain_top_ordered_row(
-    rows: &mut Vec<SelectRow>,
-    row: SelectRow,
+pub(in crate::executor) fn retain_top_ordered_row<T>(
+    rows: &mut Vec<T>,
+    row: T,
     top_k: Option<usize>,
-    order_specs: &[RowOrderSpec<'_>],
+    compare: impl Fn(&T, &T) -> Ordering,
 ) {
     let Some(top_k) = top_k else {
         rows.push(row);
@@ -258,7 +260,7 @@ pub(super) fn retain_top_ordered_row(
         let mut child = rows.len() - 1;
         while child > 0 {
             let parent = (child - 1) / 2;
-            if compare_ordered_rows(&rows[parent], &rows[child], order_specs) != Ordering::Less {
+            if compare(&rows[parent], &rows[child]) != Ordering::Less {
                 break;
             }
             rows.swap(parent, child);
@@ -266,7 +268,7 @@ pub(super) fn retain_top_ordered_row(
         }
         return;
     }
-    if compare_ordered_rows(&row, &rows[0], order_specs) != Ordering::Less {
+    if compare(&row, &rows[0]) != Ordering::Less {
         return;
     }
     rows[0] = row;
@@ -277,14 +279,13 @@ pub(super) fn retain_top_ordered_row(
             break;
         }
         let right = left + 1;
-        let worse_child = if right < rows.len()
-            && compare_ordered_rows(&rows[left], &rows[right], order_specs) == Ordering::Less
-        {
-            right
-        } else {
-            left
-        };
-        if compare_ordered_rows(&rows[parent], &rows[worse_child], order_specs) != Ordering::Less {
+        let worse_child =
+            if right < rows.len() && compare(&rows[left], &rows[right]) == Ordering::Less {
+                right
+            } else {
+                left
+            };
+        if compare(&rows[parent], &rows[worse_child]) != Ordering::Less {
             break;
         }
         rows.swap(parent, worse_child);

@@ -43,7 +43,10 @@ pub(super) use locking::{
     contains_locking_operations, requires_nested_locking, resolve_query_lock_targets,
     resolve_select_lock_mode,
 };
-use ordering::{RowOrderSpec, compare_ordered_rows, resolve_order_specs, sort_ordered_rows};
+pub(super) use ordering::{
+    OrderKey, RowOrderSpec, compare_order_keys, resolve_order_specs, retain_top_ordered_row,
+};
+use ordering::{compare_ordered_rows, sort_ordered_rows};
 pub(crate) use projection::describe_query_result_columns;
 pub(crate) use projection::restore_query_projection_names;
 pub(super) use projection::{

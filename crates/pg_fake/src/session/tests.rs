@@ -11076,3 +11076,105 @@ fn reuse_prepared_temporal_bindings_across_timezone_changes() {
         SqlState::FeatureNotSupported
     );
 }
+
+#[test]
+fn reuse_prepared_ordering_and_pages_without_eager_projection() {
+    let db = Db::create();
+    let mut session = db.create_session();
+    session.execute("CREATE TABLE ordered_bindings (id integer PRIMARY KEY, price integer, label text); INSERT INTO ordered_bindings VALUES (1, 20, 'b'), (2, NULL, 'a'), (3, 10, 'c'), (4, 20, NULL)").unwrap();
+    for suffix in [
+        "",
+        " LIMIT 2 OFFSET 1",
+        " LIMIT NULL OFFSET NULL",
+        " LIMIT ALL OFFSET 1",
+        " OFFSET 10",
+    ] {
+        for projection in [
+            "*",
+            "id AS KEY, price, label",
+            "id, price, to_timestamp(id)",
+        ] {
+            if projection.contains("to_timestamp")
+                && !matches!(suffix, "" | " LIMIT NULL OFFSET NULL")
+            {
+                continue;
+            }
+            for ordering in ["price DESC NULLS LAST, 1", "price ASC NULLS FIRST, 1 DESC"] {
+                let sql = format!(
+                    "SELECT {projection} FROM ordered_bindings ORDER BY {ordering}{suffix}"
+                );
+                let prepared = session.prepare(&sql).unwrap();
+                assert!(prepared.query_plan.is_some(), "{sql}");
+                let actual = session.query_prepared(&prepared, &[]).unwrap();
+                let generic_sql = if suffix.is_empty() {
+                    format!("{sql} OFFSET (0)")
+                } else {
+                    sql.replace("LIMIT 2", "LIMIT (2)")
+                        .replace("OFFSET 10", "OFFSET (10)")
+                        .replace("OFFSET 1", "OFFSET (1)")
+                        .replace("LIMIT NULL", "LIMIT (NULL)")
+                };
+                let generic = session.query(&generic_sql, &[]).unwrap();
+                assert_eq!(actual.rows, generic.rows, "{sql}");
+                assert_eq!(actual.columns, generic.columns, "{sql}");
+                let StatementResult::Query(one_shot) = &session.execute(&sql).unwrap()[0] else {
+                    panic!("expected query")
+                };
+                assert_eq!(one_shot.rows, generic.rows, "one-shot {sql}");
+            }
+        }
+    }
+    for sql in [
+        "SELECT id AS KEY FROM ordered_bindings ORDER BY key",
+        "SELECT id AS PRICE, price AS original FROM ordered_bindings ORDER BY price",
+    ] {
+        let prepared = session.prepare(sql).unwrap();
+        assert!(prepared.query_plan.is_some());
+        let actual = session.query_prepared(&prepared, &[]).unwrap();
+        let generic = session.query(&format!("{sql} OFFSET (0)"), &[]).unwrap();
+        assert_eq!(actual.rows, generic.rows);
+        assert_eq!(actual.columns, generic.columns);
+    }
+    for sql in [
+        "SELECT id FROM ordered_bindings ORDER BY id + $1",
+        "SELECT id FROM ordered_bindings ORDER BY $1",
+    ] {
+        let prepared = session
+            .prepare_with_parameter_types(sql, &[Some(BaseType::Int4)])
+            .unwrap();
+        assert!(prepared.query_plan.is_none());
+        session
+            .query_prepared(&prepared, &[Value::Int4(1)])
+            .unwrap();
+    }
+    for sql in [
+        "SELECT id, price, 100 / (id - 2) FROM ordered_bindings ORDER BY price ASC NULLS FIRST, id DESC LIMIT 2 OFFSET 1",
+        "SELECT id, price, 100 / (id - 2) FROM ordered_bindings ORDER BY price ASC NULLS FIRST, id DESC LIMIT (2) OFFSET 1",
+    ] {
+        assert_eq!(
+            session.query(sql, &[]).unwrap_err().sqlstate,
+            SqlState::DivisionByZero
+        );
+    }
+    let parameterized = session.prepare("SELECT id, price FROM ordered_bindings WHERE id > $1 ORDER BY price DESC NULLS FIRST, id LIMIT 2").unwrap();
+    assert!(parameterized.query_plan.is_some());
+    for minimum in [0, 2, 4] {
+        let actual = session
+            .query_prepared(&parameterized, &[Value::Int4(minimum)])
+            .unwrap();
+        let generic = session.query("SELECT id, price FROM ordered_bindings WHERE id > $1 ORDER BY price DESC NULLS FIRST, id LIMIT (2)", &[Value::Int4(minimum)]).unwrap();
+        assert_eq!(actual.rows, generic.rows);
+        assert_eq!(actual.columns, generic.columns);
+    }
+    for sql in [
+        "SELECT 1 / 0 FROM ordered_bindings ORDER BY id LIMIT 0",
+        "SELECT id FROM ordered_bindings LIMIT 1",
+        "SELECT id FROM ordered_bindings OFFSET 1",
+        "SELECT id + 1 AS key FROM ordered_bindings ORDER BY key",
+        "SELECT id, price, 100 / (id - 1) FROM ordered_bindings ORDER BY price ASC NULLS FIRST, id DESC LIMIT 2 OFFSET 1",
+        "SELECT id, to_timestamp(id) FROM ordered_bindings ORDER BY id OFFSET 1",
+        "SELECT id FROM ordered_bindings ORDER BY price",
+    ] {
+        assert!(session.prepare(sql).unwrap().query_plan.is_none(), "{sql}");
+    }
+}

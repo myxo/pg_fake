@@ -3,7 +3,8 @@ use super::{
     distinct::{DistinctPlan, evaluate_distinct_keys},
     expressions::infer_query_expression_type,
     ordering::{
-        OrderKey, RowOrderSpec, evaluate_order_keys, retain_top_ordered_row, sort_ordered_rows,
+        OrderKey, RowOrderSpec, compare_ordered_rows, evaluate_order_keys, retain_top_ordered_row,
+        sort_ordered_rows,
     },
     projection::{ProjectionSource, evaluate_projection_value, evaluate_projection_values},
 };
@@ -225,7 +226,7 @@ pub(super) fn execute_plain_select_rows(
                             evaluated_projections: Some(evaluated),
                         },
                         top_k,
-                        order_specs,
+                        |left, right| compare_ordered_rows(left, right, order_specs),
                     );
                     visited += 1;
                     if order_specs.is_empty() && top_k.is_some_and(|top_k| rows.len() >= top_k) {
@@ -271,7 +272,7 @@ pub(super) fn execute_plain_select_rows(
                         evaluated_projections: None,
                     },
                     top_k,
-                    order_specs,
+                    |left, right| compare_ordered_rows(left, right, order_specs),
                 );
                 visited += 1;
                 if order_specs.is_empty() && top_k.is_some_and(|top_k| rows.len() >= top_k) {

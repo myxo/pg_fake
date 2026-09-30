@@ -30,6 +30,9 @@ pub(crate) struct PreparedQueryPlan {
     output: PreparedOutput,
     selection: Option<PreparedExpression>,
     columns: Vec<ColumnMeta>,
+    ordering: Vec<super::query::RowOrderSpec<'static>>,
+    limit: Option<usize>,
+    offset: usize,
 }
 
 impl PreparedQueryPlan {
@@ -165,8 +168,6 @@ pub(crate) fn build_prepared_query_plan(
         return Ok(None);
     };
     if query.with.is_some()
-        || query.order_by.is_some()
-        || query.limit_clause.is_some()
         || query.fetch.is_some()
         || !query.locks.is_empty()
         || query.for_clause.is_some()
@@ -174,6 +175,52 @@ pub(crate) fn build_prepared_query_plan(
         || query.format_clause.is_some()
         || !query.pipe_operators.is_empty()
     {
+        return Ok(None);
+    }
+    let mut counts = [None, None];
+    if let Some(clause) = &query.limit_clause {
+        let ast::LimitClause::LimitOffset {
+            limit,
+            offset,
+            limit_by,
+        } = clause
+        else {
+            return Ok(None);
+        };
+        if !limit_by.is_empty() {
+            return Ok(None);
+        }
+        for (index, expression) in [limit.as_ref(), offset.as_ref().map(|offset| &offset.value)]
+            .into_iter()
+            .enumerate()
+        {
+            let Some(expression) = expression else {
+                continue;
+            };
+            match expression {
+                ast::Expr::Value(value) => match &value.value {
+                    ast::Value::Null => {}
+                    ast::Value::Number(number, _)
+                        if number.bytes().all(|byte| byte.is_ascii_digit()) =>
+                    {
+                        let Ok(value) = number.parse::<i64>() else {
+                            return Ok(None);
+                        };
+                        counts[index] = Some(usize::try_from(value).unwrap_or(usize::MAX));
+                    }
+                    _ => return Ok(None),
+                },
+                ast::Expr::Identifier(ident)
+                    if index == 0
+                        && ident.quote_style.is_none()
+                        && ident.value.eq_ignore_ascii_case("all") => {}
+                _ => return Ok(None),
+            }
+        }
+    }
+    let [limit, offset] = counts;
+    let offset = offset.unwrap_or(0);
+    if limit == Some(0) || (query.limit_clause.is_some() && query.order_by.is_none()) {
         return Ok(None);
     }
     let ast::SetExpr::Select(select) = query.body.as_ref() else {
@@ -358,7 +405,7 @@ pub(crate) fn build_prepared_query_plan(
                     let (slot, data_type) = scope.resolve_column(std::slice::from_ref(column))?;
                     projection.push(PreparedProjection::Column(slot));
                     columns.push(ColumnMeta {
-                        name: column.value.clone(),
+                        name: normalize_identifier(column),
                         type_oid: data_type.map_to_oid(),
                         typmod: data_type.typmod,
                     });
@@ -367,11 +414,11 @@ pub(crate) fn build_prepared_query_plan(
                     let (slot, data_type) = scope.resolve_column(identifiers)?;
                     projection.push(PreparedProjection::Column(slot));
                     columns.push(ColumnMeta {
-                        name: identifiers
-                            .last()
-                            .expect("compound identifier is non-empty")
-                            .value
-                            .clone(),
+                        name: normalize_identifier(
+                            identifiers
+                                .last()
+                                .expect("compound identifier is non-empty"),
+                        ),
                         type_oid: data_type.map_to_oid(),
                         typmod: data_type.typmod,
                     });
@@ -383,7 +430,7 @@ pub(crate) fn build_prepared_query_plan(
                     let (slot, data_type) = scope.resolve_column(std::slice::from_ref(column))?;
                     projection.push(PreparedProjection::Column(slot));
                     columns.push(ColumnMeta {
-                        name: alias.value.clone(),
+                        name: normalize_identifier(alias),
                         type_oid: data_type.map_to_oid(),
                         typmod: data_type.typmod,
                     });
@@ -395,7 +442,7 @@ pub(crate) fn build_prepared_query_plan(
                     let (slot, data_type) = scope.resolve_column(identifiers)?;
                     projection.push(PreparedProjection::Column(slot));
                     columns.push(ColumnMeta {
-                        name: alias.value.clone(),
+                        name: normalize_identifier(alias),
                         type_oid: data_type.map_to_oid(),
                         typmod: data_type.typmod,
                     });
@@ -440,6 +487,60 @@ pub(crate) fn build_prepared_query_plan(
         }
         PreparedOutput::Rows(projection)
     };
+    let mut ordering = Vec::new();
+    if query.order_by.is_some() || query.limit_clause.is_some() {
+        let PreparedOutput::Rows(projection) = &output else {
+            return Ok(None);
+        };
+        if (limit.is_some() || offset != 0)
+            && !projection
+                .iter()
+                .all(|projection| matches!(projection, PreparedProjection::Column(_)))
+        {
+            return Ok(None);
+        }
+        if let Some(order_by) = &query.order_by {
+            let ast::OrderByKind::Expressions(orders) = &order_by.kind else {
+                return Ok(None);
+            };
+            if !orders.iter().all(|order| match &order.expr {
+                ast::Expr::Identifier(ident) => columns.iter().any(|column| column.name == normalize_identifier(ident)),
+                ast::Expr::Value(value) => matches!(&value.value, ast::Value::Number(number, _) if number.bytes().all(|byte| byte.is_ascii_digit())),
+                _ => false,
+            }) { return Ok(None); }
+            let mut sources = Vec::new();
+            for item in &select.projection {
+                match item {
+                    ast::SelectItem::Wildcard(_) => sources.extend(
+                        scope
+                            .columns
+                            .iter()
+                            .filter(|column| column.wildcard)
+                            .map(|column| super::query::ProjectionSource::Column(column.slot)),
+                    ),
+                    ast::SelectItem::UnnamedExpr(expression)
+                    | ast::SelectItem::ExprWithAlias {
+                        expr: expression, ..
+                    } => sources.push(super::query::ProjectionSource::Expression(expression)),
+                    _ => return Ok(None),
+                }
+            }
+            for spec in super::query::resolve_order_specs(state, query, &sources, &columns, &scope)?
+            {
+                let super::query::OrderKey::Output(output_slot) = spec.key else {
+                    return Ok(None);
+                };
+                let PreparedProjection::Column(source_slot) = projection[output_slot] else {
+                    return Ok(None);
+                };
+                ordering.push(super::query::RowOrderSpec {
+                    key: super::query::OrderKey::Output(source_slot),
+                    ascending: spec.ascending,
+                    nulls_first: spec.nulls_first,
+                });
+            }
+        }
+    }
     let selection = match &select.selection {
         Some(selection) => {
             let Some(selection) = bind_prepared_expression(selection, &scope, parameter_types)?
@@ -479,6 +580,9 @@ pub(crate) fn build_prepared_query_plan(
         output,
         selection,
         columns,
+        ordering,
+        limit,
+        offset,
     }))
 }
 
@@ -849,6 +953,38 @@ pub(crate) fn execute_prepared_query(
             .map(|aggregate| AggregateState::create(&aggregate.descriptor))
             .collect::<Vec<_>>(),
     };
+    let defer_projection = !plan.ordering.is_empty() || plan.limit.is_some() || plan.offset != 0;
+    let project = |row: &[Value]| -> Result<Vec<Value>> {
+        let PreparedOutput::Rows(projection) = &plan.output else {
+            unreachable!("row projection requires row output");
+        };
+        projection
+            .iter()
+            .map(|projection| match projection {
+                PreparedProjection::Column(slot) => Ok(row[*slot].clone()),
+                PreparedProjection::Expression(expression) => {
+                    evaluate_prepared_expression(expression, row, parameters, deadline, timezone)
+                }
+            })
+            .collect()
+    };
+    let compare = |left: &Vec<Value>, right: &Vec<Value>| {
+        plan.ordering
+            .iter()
+            .map(|spec| {
+                let super::query::OrderKey::Output(slot) = spec.key else {
+                    unreachable!("prepared ordering uses source slots");
+                };
+                super::query::compare_order_keys(
+                    std::slice::from_ref(&left[slot]),
+                    std::slice::from_ref(&right[slot]),
+                    std::slice::from_ref(spec),
+                )
+            })
+            .find(|ordering| !ordering.is_eq())
+            .unwrap_or(std::cmp::Ordering::Equal)
+    };
+    let top_k = plan.limit.map(|limit| plan.offset.saturating_add(limit));
     let mut visit = |row: &[Value]| -> Result<()> {
         if deadline.is_some_and(|deadline| Instant::now() >= deadline) {
             return Err(PgError::create(
@@ -865,17 +1001,13 @@ pub(crate) fn execute_prepared_query(
             return Ok(());
         }
         match &plan.output {
-            PreparedOutput::Rows(projection) => rows.push(
-                projection
-                    .iter()
-                    .map(|projection| match projection {
-                        PreparedProjection::Column(slot) => Ok(row[*slot].clone()),
-                        PreparedProjection::Expression(expression) => evaluate_prepared_expression(
-                            expression, row, parameters, deadline, timezone,
-                        ),
-                    })
-                    .collect::<Result<_>>()?,
-            ),
+            PreparedOutput::Rows(_) => {
+                if defer_projection {
+                    super::query::retain_top_ordered_row(&mut rows, row.to_vec(), top_k, &compare);
+                } else {
+                    rows.push(project(row)?);
+                }
+            }
             PreparedOutput::Aggregates(aggregates) => {
                 for (aggregate, aggregate_state) in aggregates.iter().zip(&mut aggregate_states) {
                     let argument = aggregate
@@ -968,6 +1100,14 @@ pub(crate) fn execute_prepared_query(
                 }
             }
         }
+    }
+    if defer_projection {
+        rows.sort_by(compare);
+        let projected = rows
+            .iter()
+            .map(|row| project(row))
+            .collect::<Result<Vec<_>>>()?;
+        return Ok(projected.into_iter().skip(plan.offset).collect());
     }
     if let PreparedOutput::Aggregates(aggregates) = &plan.output {
         rows.push(
