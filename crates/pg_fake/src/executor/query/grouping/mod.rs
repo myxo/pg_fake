@@ -1,5 +1,8 @@
 use sqlparser::ast::{self, Spanned as _, VisitMut as _};
-use std::{cell::Cell, collections::BTreeSet};
+use std::{
+    cell::Cell,
+    collections::{BTreeSet, HashMap},
+};
 
 use crate::{
     catalog::ConstraintId,
@@ -10,7 +13,7 @@ use crate::{
             AggregateCall, AggregateInput, AggregateState, is_aggregate_function,
             parse_aggregate_call, prepare_aggregate_function_input,
         },
-        equality::are_rows_not_distinct,
+        equality::{EqualityKey, are_rows_not_distinct, create_equality_key},
         expressions::{EvaluationCursor, resume_evaluation},
         from::visit_query_source_rows,
         scope::{BoundScope, RowScope, substitute_typed_subqueries},
@@ -323,6 +326,19 @@ fn prepare_group_aggregate_input(
     })
 }
 
+fn create_grouping_key(values: &[Value]) -> Option<Vec<Option<EqualityKey>>> {
+    values
+        .iter()
+        .map(|value| {
+            if value.is_null() {
+                Some(None)
+            } else {
+                create_equality_key(value).map(Some)
+            }
+        })
+        .collect()
+}
+
 #[cfg_attr(feature = "execution-log", tracing::instrument(skip_all))]
 pub(super) fn collect_grouped_select_rows(
     state: &DatabaseState,
@@ -377,6 +393,8 @@ pub(super) fn collect_grouped_select_rows(
             complete: false,
         });
     drop(cached);
+    let mut group_lookup = None;
+    let mut checked_group_lookup = false;
     let mut source_index = 0;
     let evaluated = if prepared.complete {
         Ok(())
@@ -409,10 +427,16 @@ pub(super) fn collect_grouped_select_rows(
                     }
                     let key = grouped_expressions
                         .iter()
-                        .map(|(expression, _)| {
-                            evaluate_query_expression(
+                        .map(|(expression, data_type)| {
+                            let mut value = evaluate_query_expression(
                                 state, expression, scope, row, xid, snapshot, context,
-                            )
+                            )?;
+                            if data_type.base == BaseType::Bpchar
+                                && let Value::Text(text) = &mut value
+                            {
+                                text.truncate(text.trim_end_matches(' ').len());
+                            }
+                            Ok(value)
                         })
                         .collect::<Result<Vec<_>>>()?;
                     let inputs = aggregate_functions
@@ -442,17 +466,43 @@ pub(super) fn collect_grouped_select_rows(
                 let Some((key, inputs)) = evaluated else {
                     return Ok(());
                 };
-                let groups = &mut prepared.groups;
-                let mut matching = None;
-                for (index, group) in groups.iter().enumerate() {
-                    if are_rows_not_distinct(&group.key, &key)? {
-                        matching = Some(index);
-                        break;
-                    }
+                if !checked_group_lookup && prepared.groups.len() >= 128 {
+                    checked_group_lookup = true;
+                    group_lookup = prepared
+                        .groups
+                        .iter()
+                        .enumerate()
+                        .map(|(index, group)| {
+                            create_grouping_key(&group.key).map(|key| (key, index))
+                        })
+                        .collect::<Option<HashMap<_, _>>>();
                 }
+                let hash_key = group_lookup
+                    .as_ref()
+                    .and_then(|_| create_grouping_key(&key));
+                if hash_key.is_none() {
+                    group_lookup = None;
+                }
+                let groups = &mut prepared.groups;
+                let matching = if let (Some(lookup), Some(hash_key)) = (&group_lookup, &hash_key) {
+                    lookup.get(hash_key).copied()
+                } else {
+                    let mut matching = None;
+                    for (index, group) in groups.iter().enumerate() {
+                        if are_rows_not_distinct(&group.key, &key)? {
+                            matching = Some(index);
+                            break;
+                        }
+                    }
+                    matching
+                };
                 let index = match matching {
                     Some(index) => index,
                     None => {
+                        let index = groups.len();
+                        if let (Some(lookup), Some(hash_key)) = (&mut group_lookup, hash_key) {
+                            lookup.insert(hash_key, index);
+                        }
                         groups.push(CollectedGroup {
                             key,
                             source: None,
@@ -460,7 +510,7 @@ pub(super) fn collect_grouped_select_rows(
                                 .map(|_| None)
                                 .collect(),
                         });
-                        groups.len() - 1
+                        index
                     }
                 };
                 let group = &mut groups[index];

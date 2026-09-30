@@ -229,3 +229,46 @@ fn releases_advisory_locks_when_sessions_drop() {
         );
     }
 }
+
+#[test]
+fn resumes_group_lookup_after_a_partial_grouping_scan() {
+    let db = Db::create();
+    let mut holder = db.create_session();
+    holder
+        .execute("CREATE TABLE grouped_wait (id integer, bucket integer); CREATE SEQUENCE grouped_values")
+        .unwrap();
+    holder
+        .execute(&format!(
+            "INSERT INTO grouped_wait VALUES {}",
+            (1..=320)
+                .map(|id| format!("({id}, {})", id % 160))
+                .collect::<Vec<_>>()
+                .join(",")
+        ))
+        .unwrap();
+    holder
+        .execute("BEGIN; SELECT pg_advisory_xact_lock(200)")
+        .unwrap();
+    let mut worker = db.create_session();
+    let waiting = thread::spawn(move || {
+        let rows = worker.query(
+            "SELECT bucket, count(nextval('grouped_values') + (pg_advisory_xact_lock(id) IS NULL)::integer) FROM grouped_wait GROUP BY bucket ORDER BY bucket",
+            &[],
+        ).unwrap().rows;
+        let next = worker
+            .query("SELECT nextval('grouped_values')", &[])
+            .unwrap()
+            .rows;
+        (rows, next)
+    });
+    wait_until_advisory_blocked(&db);
+    holder.execute("COMMIT").unwrap();
+    let (rows, next) = waiting.join().unwrap();
+    assert_eq!(
+        rows,
+        (0..160)
+            .map(|bucket| vec![Value::Int4(bucket), Value::Int8(2)])
+            .collect::<Vec<_>>()
+    );
+    assert_eq!(next, vec![vec![Value::Int8(321)]]);
+}
