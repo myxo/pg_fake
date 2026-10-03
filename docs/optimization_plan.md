@@ -1,0 +1,547 @@
+# Tier 1 optimization plan
+
+**Status: ready for review and user approval. All implementation tasks below are pending.**
+
+Research date: 2026-10-03. Scope: make everyday inserts, updates, transactions,
+selects, ordering/paging and simple inner joins substantially faster while
+preserving the project's PostgreSQL fidelity contract. This document is separate
+from the Phase 4 compatibility plan in [plan.md](plan.md).
+
+The strongest opportunities are to compile ordinary join execution, remove
+general-purpose write preparation from simple mutations, and reduce SQLx handoff
+cost. The statement cache also needs a real memory bound: a controlled insertion
+experiment retained approximately 600 MiB more memory with unique literal SQL
+than with bound parameters or caching disabled. Replacing the storage map or
+adding a different join algorithm is not the first step.
+
+## Evidence and measurement limits
+
+The checked-in [benchmark report](../crates/pg_fake_benchmarks/results/report.md)
+was inspected alongside the timed SQL and executor paths. Fresh research adds:
+
+- A complete Tier 1 PostgreSQL comparison: 20 Criterion samples, 1-second warmup
+  and 2-second measurement per benchmark. The clean rerun reproduces the major
+  findings of the saved report. An earlier run overlapped a compiler and was
+  discarded; Criterion's printed change percentages compare transient local
+  measurements, not the checked-in report, and are not optimization evidence.
+- 49 isolated probe configurations, each run in three fresh processes for
+  0.5 seconds after 64 warmup operations. Values below are medians of run means,
+  not percentile latencies or Criterion confidence intervals.
+- Eight fresh macOS `sample` profiles, each sampling for 3 seconds at a nominal
+  1 ms interval during a 5-second workload. They cover prepared point/full reads,
+  joins, paging, update, insert/delete cycles, and a cached SQLx point read.
+- Equal-size memory experiments: 32,768 measured inserts plus 64 warmup inserts
+  into the same constrained table, using `/usr/bin/time -l` peak resident bytes.
+
+The machine is Apple M2 / aarch64, macOS 15.7.9, Rust 1.98.1. Probes use release
+optimization with debug symbols and one Tokio worker; the comparison suite uses
+its existing runtime configuration. All database execution is local. Fixtures,
+preparation and process startup are outside probe timers; result destruction is
+inside. Native reads here use autocommit, whereas some existing diagnostic
+benchmarks keep an explicit transaction open. Their sub-microsecond numbers are
+therefore not interchangeable with these autocommit measurements.
+
+Probe tables `l` and `r` have `id`, `bucket`, and a text payload; the existing
+join benchmarks have only two integer columns. Probes use short SQL/table names,
+and update a stable constrained row rather than inserting/deleting its fixture
+around every timed update. These are diagnostic workloads, not replacements for
+the official benchmarks. Large fixtures are seeded in batches of 100 to avoid
+quadratic same-statement unique validation during setup. Insert/delete and
+begin/insert/rollback cycle measurements include the entire named cycle; they
+are not isolated insert or commit timings.
+
+Durable inputs, timing triples, Criterion mean confidence intervals, profiles,
+memory measurements, source fingerprints and compressed samples are in
+[optimization_evidence/2026-10-03](optimization_evidence/2026-10-03/).
+The older `target/optimization_research` profiles were inspected but not used to
+quantify the current plan. No production engine or adapter implementation was
+changed during this research.
+
+### Fresh Tier 1 comparison
+
+All timings are arithmetic means in microseconds. PostgreSQL includes its
+normal SQLx, protocol and local-server costs, so these are application-facing
+comparisons, not equivalent executor CPU measurements.
+
+| Existing benchmark | pg_fake | PostgreSQL | PostgreSQL / pg_fake |
+| --- | ---: | ---: | ---: |
+| Insert row | 41.72 | 93.39 | 2.24x |
+| Update row | 33.27 | 97.10 | 2.92x |
+| Transaction insert | 43.84 | 137.55 | 3.14x |
+| Select 100 rows | 27.69 | 58.07 | 2.10x |
+| Heap equality select, 100 rows | 14.16 | 34.58 | 2.44x |
+| Indexed equality select, 100 rows | 8.21 | 34.46 | 4.20x |
+| Ordered limit/offset, 100 rows | 32.75 | 42.14 | 1.29x |
+| Multi-key ordering, 100 rows | 39.40 | 66.16 | 1.68x |
+| Selective inner join | 89.68 | 39.47 | 0.44x |
+| Many-match inner join | 158.63 | 65.04 | 0.41x |
+
+Both join cases are more than twice as slow as PostgreSQL. Paging barely wins.
+The remaining advantages are useful but fall short of the specification's
+orders-of-magnitude aspiration.
+
+### Isolated execution costs
+
+| Probe, 100 rows per source | Native execute | Native prepared reuse | SQLx cached query |
+| --- | ---: | ---: | ---: |
+| `SELECT 1` | 9.23 | 6.47 | 14.53 |
+| Full select, 100 output rows | 17.78 | 10.39 | 25.67 |
+| Heap equality, one output row | 13.02 | 4.96 | 11.26 |
+| Primary-key equality, one output row | 9.68 | 1.32 | 8.24 |
+| Multi-key order, 100 output rows | 31.12 | 20.22 | 38.51 |
+| Ordered paging, 10 output rows | 29.27 | 19.08 | 30.22 |
+| Selective inner join, one output row | 87.75 | 76.31 | 90.53 |
+| Many-match inner join, 100 output rows | 154.57 | 144.62 | 162.55 |
+| Update one constrained row | 29.77 | 21.89 | 35.19 |
+
+Native `query(sql, &[])` prepares again on every call: the indexed probe takes
+19.69 us through that API. The same SQLx point query takes 18.47 us through the
+raw string executor, 32.26 us with `.persistent(false)`, and 8.24 us cached.
+Consequently, the existing `adapter_overhead_select_100_rows` diagnostic cannot
+measure adapter overhead by subtracting its two results: its core path prepares
+on each call while SQLx reuses a prepared statement. The approximately 6.9 us
+gap between equivalent prepared core and cached SQLx point probes includes
+handoff, cache lookup, conversion and different API machinery; it is not a
+precise measurement of `spawn_blocking` alone.
+
+| Prepared scaling probe | 100 source rows | 10,000 source rows |
+| --- | ---: | ---: |
+| Heap equality | 4.96 | 406.45 |
+| Unique-index equality | 1.32 | 1.32 |
+| Ordered paging, `LIMIT 10 OFFSET 40` | 19.08 | 1,559.54 |
+| Multi-key ordering | 20.22 | 2,319.14 |
+| Selective join, heap tables | 76.31 | 6,360.09 |
+| Same join, primary keys on both tables | 33.69 | 1,954.92 |
+| Heap join with explicit equality filters on both sides | 107.26 | 8,713.98 |
+
+Adding `AND r.id = 50` slows the existing interpreted heap join despite reducing
+its hash-build input. Likewise, filtering both bucket inputs slows the 100-row
+many-match join from 144.62 to 294.74 us. Per-row filtering overhead is substantial;
+predicate propagation alone is not a demonstrated improvement. Both indexed
+join tables still scale poorly because the right-side index is not used to
+probe the left equality key in this workload.
+
+### Profile findings
+
+Percentages are approximate, inclusive shares of retained active stack samples,
+except the allocator column, which counts leaf frames. Categories overlap and
+must not be summed. Inlining, sampling bias and deduplicated symbols limit
+precision. The stack-collapse tool removes common waiting stacks; the summary
+also removes remaining recognizable wait leaves. The SQLx raw profile has
+9,064 thread samples but only 1,453 retained active samples. Waiting is evidence
+of handoffs, not CPU time spent computing results.
+
+| Profile | Principal inclusive categories | Allocator leaf share |
+| --- | --- | ---: |
+| Selective join | Source scans 65.6%; expression evaluation 43.9%; type/name resolution 27.4%; AST traversal 19.0% | 19.5% |
+| Many-match join | Expression evaluation 54.9%; scans 36.3%; type/name resolution 27.2%; AST traversal 22.8%; hash-join frames 8.1% | 18.6% |
+| Prepared update | Type/name resolution 9.0%; expression evaluation 9.4%; AST cloning 8.2% | 32.6% |
+| Prepared insert/delete cycle | AST traversal 17.1%; AST cloning 9.3% | 33.2% |
+| Prepared ordered paging | Top-K retention 33.7%; sorting 13.9%; read bookkeeping 4.8% | 23.6% |
+| Prepared full select | Prepared query 60.8%; read bookkeeping 8.1% | 35.3% |
+| Prepared point select | Transaction start 15.8%; commit 30.4%; pruning 7.8% | 24.9% |
+
+The SQLx point profile's largest active leaf is `__psynch_cvsignal` (305 of
+1,453 active samples). This supports investigating the scheduler boundary, but
+does not show that the entire native/SQLx latency gap can be removed. Removing
+all allocator cost from the update profile would cap CPU speedup near 1.48x;
+allocation reduction alone cannot deliver a 5x write improvement.
+
+### Literal inserts and cache memory
+
+| Equal 32,832-row insertion experiment | Mean us/insert | Peak RSS MiB |
+| --- | ---: | ---: |
+| Native literal execute | 20.23 | 33.1 |
+| Native prepared parameter | 15.81 | 33.1 |
+| SQLx distinct literal query per row, persistent | 41.30 | 635.5 |
+| SQLx bound parameter, persistent | 27.10 | 34.1 |
+| SQLx distinct literals, nonpersistent | 39.49 | 33.8 |
+
+The 0.5-second timing probes independently show a similar 41.10 versus 27.18 us
+literal/bound SQLx difference. Binding helps preparation reuse; it does not yet
+give inserts a compiled mutation kernel. Nonpersistent literal execution saves
+memory but barely improves latency.
+
+In [connection.rs](../crates/pg_fake_sqlx/src/connection.rs), the advertised
+100 MiB statement-cache limit increments/decrements only `sql.len()`. It omits
+owned ASTs, dependencies, plans, parameter types, duplicated keys and container
+overhead. Approximately 1.5 MiB of distinct SQL in this experiment is associated
+with roughly 600 MiB additional RSS. This is an association, not an exact AST
+allocation count. Bounded cache accounting is needed even if speed is unchanged.
+
+## Rules for every optimization attempt
+
+- Measure before and after every optimization attempt, including unsuccessful
+  experiments. Use identical workloads, fixtures, build settings and environment;
+  run the affected diagnostics and every Tier 1 pg_fake benchmark. Keep raw
+  results and report absolute times plus time reduction as
+  `100 * (before - after) / before` percent.
+- Do not commit an optimization unless it produces a noticeable percentage
+  reduction in execution time on its targeted workload, reproducible in
+  independent runs and exceeding measured noise. A tiny or inconclusive change,
+  cleaner code, fewer allocations or memory savings alone is insufficient.
+  Record unsuccessful attempts and discard or revise their implementation.
+- No Tier 1 pg_fake benchmark may become slower. Reject any confirmed slowdown,
+  however small; there is no 5% allowance and improvements elsewhere cannot
+  compensate for it. Repeat measurements to resolve apparent slowdowns or noisy
+  results; do not commit while a possible regression remains unresolved.
+- Commit each accepted optimization separately, with its focused validation.
+  If one task contains several independent optimizations, measure and commit
+  each separately rather than bundling their gains or regressions.
+- Include timing evidence in every optimization commit message: benchmark names,
+  before/after times with units, percentage reductions, measurement settings,
+  and a reference to retained results for the full Tier 1 comparison confirming
+  no regressions. Summarize relevant correctness checks as well.
+
+These rules govern all optimization implementations below, including the
+memory-oriented O2 work. Research, benchmark infrastructure and plan edits do
+not themselves claim an execution-time optimization.
+
+## Implementation tasks, in recommended order
+
+Effort ranges are engineering estimates for one developer including focused
+validation, not commitments. Numerical targets are investigation/acceptance
+budgets on this machine, not measured future results. Re-measure after each
+task; do not add percentage improvements from overlapping paths.
+
+### O1 — Make performance gates equivalent and reproducible [PENDING]
+
+**Effort:** 1–2 days. **Dependency:** none. **Confidence:** high.
+
+- Keep all ten existing Tier 1 comparisons, including their literal insert
+  workload. Add parameterized inserts/updates beside them rather than replacing
+  the costly paths with easier benchmarks.
+- Add matched native prepared, native one-shot, SQLx cached and SQLx uncached
+  diagnostics. Separate preparation/cache misses from steady-state execution.
+- Add fixed-size insert batches, misses as well as hits, 100/1,000/10,000-row
+  scans and joins, narrow/wide rows, and ordered paging with small/large offsets.
+  Bound fixture growth and report cache-entry count and peak memory separately.
+- Add an isolated Tier 1/core-only mode that avoids unrelated fixture setup and
+  PostgreSQL startup. Compare all existing official workloads with the shared
+  catalog rather than accidentally reading stale `target/criterion` directories.
+- Record environment and source/binary fingerprints, retain raw confidence
+  intervals, run without a competing compiler/profiler, and assert fixture
+  results outside timed loops.
+
+**Acceptance:** repeatable baselines and meaningful layer comparisons; no claim
+of a performance improvement merely from changing the benchmark.
+
+### O2 — Bound retained SQLx statement memory [PENDING]
+
+**Effort:** 1–3 days. **Dependency:** O1. **Confidence:** high for memory reduction;
+low for a large latency gain.
+
+- Account for retained statement data, not only SQL text. Use a conservative
+  owned-size estimate with a bounded entry-count backstop, and store entry cost
+  so replacement, LRU eviction and cache clearing update accounting consistently.
+- Include the typed key and replan state; avoid deep-cloning dependency metadata
+  into every equivalent statement where immutable catalog identity permits
+  sharing. Prioritize a robust bound before introducing a complex size walker.
+- Preserve `.persistent(false)`, explicit statements, parameter-type keys,
+  search-path re-resolution, transactional DDL invalidation and changed-result
+  metadata behavior. An explicit statement retained by the caller is distinct
+  from a cache-owned entry.
+
+**Acceptance:** the configured cache policy places a defensible bound on
+cache-owned memory in a 32k/100k distinct-SQL stress test; LRU/replan tests verify
+accounting. RSS is diagnostic, not an assertion that allocator RSS equals the
+cache limit. All Tier 1 timings must satisfy the rules above: memory reduction
+alone does not qualify this optimization for commit without a noticeable time
+reduction. Disabling caching or rewriting literal SQL is not the proposed default.
+
+### O3 — Compile ordinary inner joins and their filters [PENDING]
+
+**Effort:** 4–7 days. **Dependency:** O1. **Confidence:** high that this is the
+largest join opportunity; medium on the final speedup.
+
+Relevant code: [prepared.rs](../crates/pg_fake/src/executor/prepared.rs),
+[scans.rs](../crates/pg_fake/src/executor/from/scans.rs),
+[joins.rs](../crates/pg_fake/src/executor/from/joins.rs),
+[query/select.rs](../crates/pg_fake/src/executor/query/select.rs).
+
+- Extend the existing enum-based bound plan with ordinary table inner joins:
+  table IDs, column slots, access paths, typed equality keys, local filters and
+  residual predicates. Bind names/types once and evaluate prepared parameters
+  directly. Start with the two supported integer-equality benchmark shapes.
+- The current prepared builder excludes ordinary table joins: `StreamedJoin`
+  is admitted only for a special CTE source. Prepared ordinary joins therefore
+  still reconstruct general scopes, projections and execution context.
+- Implement a context-free join kernel or explicitly construct the context it
+  requires. Simply relaxing the builder gate is wrong: the current prepared join
+  executor calls `context.expect(...)`, while the session fast path supplies
+  `None`.
+- Preserve the existing hash join as the algorithm. Compile source filters and
+  output expressions, avoid repeated type/name resolution, and avoid evaluating
+  an already-applied immutable predicate again after the join.
+- Add one-shot support by building this bound plan once per execution; it need
+  not introduce a native SQL-text plan cache, which the specification excludes.
+
+**Validation:** differential generated integer joins, duplicates, NULL keys,
+empty inputs/results and parameters; preserve metadata, SQLSTATE, statement
+visibility and SSI reads. Other joins/coercions remain on the general path.
+
+**Acceptance:** both official joins must beat their fresh PostgreSQL comparison;
+first budgets are selective join ≤35 us and many-match join ≤55 us through SQLx.
+Require lower type/name/AST profile shares and improved scaling. These budgets
+represent approximately 2.6–2.9x improvement, not a promised 10x.
+
+### O4 — Reduce join intermediates and select useful access paths [PENDING]
+
+**Effort:** 2–4 days. **Dependency:** O3. **Confidence:** high for wasted work;
+medium for benefit on the smallest tables.
+
+- The hash join currently collects both sources into owned rows, builds
+  `Vec<Vec<usize>>` match lists, clones rows into `joined`, then visits them.
+  Emit matches directly into projection using reusable scratch slots or borrowed
+  source rows/row IDs. Keep owned values only when required for the final result.
+- Prune unused payload columns before cloning. Choose an indexed probe when a
+  selective left row joins to a unique right key; avoid hashing all right rows
+  just because both sides happen to have indexes.
+- Propagate safe same-type equality constants through inner joins only after
+  compiled filters exist. Preserve remaining predicates and snapshot/SSI
+  accesses. Do not propagate these rules across outer joins or volatile/error
+  expressions without proving the semantics.
+- Choose scan/hash/probe with small, explainable rules; defer a cost-based
+  optimizer and arbitrary join reordering.
+
+**Acceptance:** indexed selective joins should stop scaling linearly with the
+unselected right table; demonstrate it at 100 and 10,000 rows. Targets after O3
+are a further 10–30% where copying matters, not an additional universal multiplier.
+
+### O5 — Prepare simple mutation structure once; specialize resumption [PENDING]
+
+**Effort:** 4–7 days. **Dependency:** O1. **Confidence:** high for redundant work;
+medium for target latency.
+
+Relevant code: [writes](../crates/pg_fake/src/executor/writes/),
+[locks/mod.rs](../crates/pg_fake/src/executor/locks/mod.rs),
+[expressions/resume.rs](../crates/pg_fake/src/executor/expressions/resume.rs),
+[session/mod.rs](../crates/pg_fake/src/session/mod.rs).
+
+- `build_prepared_query_plan` only returns plans for queries. Prepared INSERT
+  and UPDATE avoid parsing, but still bind assignments/targets, clone schemas,
+  build validation state, construct resume keys and traverse ASTs on execution.
+- Add bound INSERT VALUES and single-table UPDATE plans with typed input slots,
+  assignment/coercion plans, unique access, constraint expressions, and immutable
+  feature flags. Compile static CHECK/default structure while evaluating runtime
+  defaults and constraints at their PostgreSQL-required times.
+- Add a lean execution route for eligible statements without triggers, upserts,
+  foreign keys, subqueries, advisory functions or RETURNING. Keep constraints,
+  transaction visibility, lock modes and unique-conflict waits fully enforced.
+  Unsupported shapes retain the current general machinery.
+- Avoid unconditional INSERT AST cloning and expression cursor creation for
+  operations proven not to require expression-level resumption. Audit repeated
+  unique validation and target/update clones before removing them; some checks
+  are necessary after blocking and snapshot refresh.
+- Prefer stable per-statement occurrence IDs to repeated `to_string()` keys.
+  Lazily create fallback caches. Existing SessionSettings maps already share
+  through Arc; this is not a proposal to eliminate a full-map copy on every call.
+
+**Validation:** literal and bound writes, NULL/CHECK/unique violations,
+overflow/coercion SQLSTATE, multirow statement atomicity, savepoints/rollback,
+Read Committed rechecks, Repeatable Read conflicts, deadlocks and SSI.
+Verify sequences and volatile functions execute once across waits on fallback
+paths. Eligibility must be revalidated after relevant transactional DDL.
+
+**Acceptance:** first budgets are native prepared constrained insert/update
+≤8–12 us and official SQLx literal insert/update ≤25/22 us. Report cache misses
+separately. If only allocations improve, expect tens of percent rather than 5x.
+
+### O6 — Move native rows into the SQLx adapter [PENDING]
+
+**Effort:** 1–2 days. **Dependency:** O1. **Confidence:** high for eliminating an
+allocation; medium for latency effect.
+
+In [connection.rs](../crates/pg_fake_sqlx/src/connection.rs) `map_results`
+rebuilds each `Vec<Value>` as `Vec<PgFakeValue>`, repeats type information per
+cell, creates an intermediate result vector, and then collects stream output.
+[row.rs](../crates/pg_fake_sqlx/src/row.rs) already represents a borrowed value
+as a native value reference plus type info.
+
+- Store owned native row vectors in PgFakeRow; resolve type info from shared
+  columns in `try_get_raw`. Preserve PgFakeValue for explicitly owned values.
+- Transfer row vectors directly, reserve output capacity, and avoid unnecessary
+  intermediate `Either` collections where SQLx's required ordering permits.
+- Share immutable prepared column metadata where identity/invalidation permits;
+  preserve declared types and typmods for NULL and empty results.
+
+**Acceptance:** typed SQLx round trips and ownership tests pass, and an allocation
+trace confirms the row-vector replacement is removed. Initial budget: 10–25%
+improvement on 100-row SQLx results; point reads may barely change.
+
+### O7 — Reduce per-statement SQLx scheduling cost safely [PENDING]
+
+**Effort:** 3–6 days for a feasibility experiment and validated implementation.
+**Dependency:** O1, O6; re-measure after O3/O5. **Confidence:** medium.
+
+Every `run` and `run_control` currently submits a fresh `spawn_blocking` task.
+This is necessary for real row-lock waits but costly for tiny cached reads and
+basic transactions. Cheap cache-key borrowing and avoiding redundant SQL/type
+vector cloning are low-risk first steps; they alone will not remove handoffs.
+
+- Prototype a bounded nonblocking attempt for eligible prepared reads. It must
+  use `try_lock` for every potentially contended internal mutex, handle relation
+  lock waits, and bound scan/result work so a large query cannot occupy a Tokio
+  worker indefinitely. Fall back to blocking execution before observable work,
+  or continue from an explicit state machine; never replay side effects.
+- Preserve pending rollback ordering, cancellation/drop behavior, session
+  serialization and public SQLx behavior. Test a blocked relation/row lock and
+  a busy database mutex on a single-worker runtime to prove other tasks progress.
+- If these semantics make the read attempt too complex, measure a persistent
+  connection worker instead. It may reduce task allocation but still pays
+  wakeups; do not assume it wins or ship it without data.
+
+**Acceptance:** demonstrate a meaningful reduction on matched cached point
+queries, with a provisional SQLx budget ≤4 us. Read/write concurrency and lock
+tests must pass. Keep the current scheduler if the experiment does not improve
+latency or requires broad concurrency redesign. Extend to control statements
+only after equivalent guarantees are established.
+
+### O8 — Remove read bookkeeping that has no effect at this isolation [PENDING]
+
+**Effort:** 1–3 days. **Dependency:** O1. **Confidence:** high for unnecessary
+bookkeeping; medium for its end-to-end significance.
+
+[DatabaseState::record_read](../crates/pg_fake/src/database/state.rs) locks the
+SSI graph on every visited row. `DependencyGraph::read` then discards the read
+unless that reader is serializable. Point lookup also constructs owned access
+keys before they can be discarded. Source profiles attribute 8.1% of full-read
+samples to this machinery.
+
+- Decide reader tracking once per statement under the existing synchronization
+  contract, then avoid constructing/locking read accesses for nonserializable
+  readers. Continue tracking writes from nonserializable transactions whenever
+  they can affect active serializable readers.
+- Profile remaining autocommit start/commit overhead before changes: point-read
+  query execution is only about 19% of its native samples. Reduce unchanged
+  settings snapshots, metadata duplication and redundant empty-GC work only
+  while preserving snapshot horizons and catalog/lock lifecycle.
+
+**Acceptance:** SSI differential histories and snapshot/locking regressions
+pass. Expect roughly 5–15% native scan improvement from read bookkeeping;
+absolute savings on a 1.3-us point read will be small. Do not bypass MVCC or
+stop tracking conflicting writes to meet a target.
+
+### O9 — Reduce ordered-row copying and comparator overhead [PENDING]
+
+**Effort:** 2–4 days. **Dependency:** O1, O8. **Confidence:** high for extra copies;
+medium for speedup.
+
+Prepared paging already uses a bounded heap with `K = LIMIT + OFFSET`, and
+prepared ordering already defers projection. Adding Top-K from scratch is not
+an opportunity. However, `execute_prepared_query` calls `row.to_vec()` before
+heap admission, stores all source columns, then projects retained rows before
+discarding OFFSET rows. Full ordering similarly clones source rows and projects
+them into a second result representation.
+
+- Retain row handles/borrowed rows or compact order keys plus necessary values;
+  clone text/blob payload only when selected for output. Project after OFFSET
+  where supported expression evaluation semantics permit it.
+- Bind comparator data types once and benchmark typed key comparisons. Keep
+  stable tie behavior, NULL placement, direction, float/NaN semantics and the
+  existing collation contract. Test volatile/error expressions on excluded rows
+  before changing when any expression executes.
+- Benchmark a small-N collect/sort route versus a heap when K approaches N;
+  use an evidence-based threshold. Ordered index traversal is later work,
+  because the current indexes are not an already-available ordered-query path.
+
+**Acceptance:** prepared_ordering_differential plus generated ordering/paging
+cases pass. Initial official SQLx budgets: paging ≤22 us, ordering ≤28 us;
+also demonstrate reductions on wide 10k-row inputs. Heap work and final sorting
+are real costs, so copying alone cannot make paging constant time.
+
+## Milestones and stopping rules
+
+1. Establish trustworthy gates and bound cache retention: O1–O2.
+2. Make both Tier 1 joins decisively faster than PostgreSQL: O3–O4.
+3. Improve writes and remove adapter row copies: O5–O6.
+4. Measure scheduler feasibility and remaining read/ordering cost: O7–O9.
+
+For each task, run focused differential/property/concurrency tests for the
+affected semantics, formatting and strict Clippy. Before accepting an engine
+change, run the workspace regression gate and remeasure all Tier 1 groups;
+exercise affected Tier 2/3 fallback paths as well. Use the existing extended
+property gate for broad executor, transaction or scheduling changes. Apply the
+timing and separate-commit rules above to every optimization attempt; accept no
+Tier 1 slowdown. Update the official recorded baseline only after a change has
+been accepted.
+
+Several targets overlap. An overall 2–4x improvement in the currently slow
+Tier 1 operations is a reasonable investigation objective; a universal 10–100x
+SQLx advantage is not established by this evidence. Fast native prepared point
+reads are already near a practical small-operation floor. A final milestone
+should require a fresh PostgreSQL comparison and report absolute latency,
+memory and fidelity results, rather than claiming success from aggregate ratios.
+
+## Deferred ideas
+
+- **New hash join algorithm:** hash joins already exist, and their hashing is
+  not the leading observed cost. Compile filters and reduce materialization first.
+- **Persistent storage maps / full Value redesign / fine-grained locks:** these
+  are larger changes without sufficient Tier 1 evidence. Profile their remaining
+  cost after the localized work; retain deterministic iteration and MVCC.
+- **Transaction-status pruning as the first project:** the saved diagnostic
+  point read is essentially flat from 1 to 100,000 completed transactions.
+  History memory can matter, but that report does not support a Tier 1 latency
+  priority ahead of joins, writes and SQLx.
+- **Broad parse cache or literal SQL normalization in the core:** native explicit
+  preparation already exists; the specification deliberately excludes a core
+  SQL-text cache. SQLx cache retention/reuse can be fixed in its existing layer.
+- **Disable locking, constraints, GC or SSI:** none is an acceptable shortcut.
+  Eliminate irrelevant work using proven statement/isolation conditions.
+- **Tier 2/3 regex, temporal, windows and recursive-query tuning:** some saved
+  cases are slow, but they do not outrank the requested Tier 1 work.
+
+## Reproducing the research
+
+From the repository root:
+
+```sh
+cargo bench --offline -p pg_fake_benchmarks --bench workloads -- tier1_ --sample-size 20 --warm-up-time 1 --measurement-time 2 --noplot
+CARGO_PROFILE_RELEASE_DEBUG=true cargo build --offline --release -p pg_fake_benchmarks --example research_tier1
+python3 scripts/research-tier1.py
+python3 scripts/research-tier1.py --profiles
+python3 scripts/research-tier1.py --summarize
+python3 scripts/research-tier1.py --memory
+```
+
+The comparison uses the configured local PostgreSQL instance and manages only
+its reserved `pgfake_benchmark` schema. Profiles/memory metrics require macOS
+process access; profiles require FlameGraph tools and Perl. Generated flame
+graphs and raw reports live in `target/tier1-research`. The durable evidence
+archive contains the collected raw samples and folded stacks. The fixed-count
+memory option was added after timing/profile collection. Review subsequently
+changed the untimed preflight to validate the selected API rather than always
+validating native `execute` / cached SQLx. Neither change alters fixture SQL or
+timed database operations. All selected routes were subsequently checked again.
+Each evidence environment records the exact binary/source fingerprints used.
+
+Research validation passed the probe build and all 49 timing configurations,
+eight profile collections, five memory configurations, Python syntax,
+rustfmt, evidence-count/archive checks, local document links and scoped
+Clippy (`--no-deps`, `-D warnings`). Full dependency linting remains blocked by
+four existing engine warnings in `executor/mod.rs:33`,
+`executor/prepared.rs:1006`, `executor/query/select.rs:577` and
+`executor/query/windows.rs:336`. Production code was left unchanged. These
+checks validate the research artifacts; they are not a new full conformance run.
+
+Single probes can be run directly:
+
+```sh
+target/release/examples/research_tier1 join prepared 100 5
+target/release/examples/research_tier1 join_indexed prepared 10000 5
+target/release/examples/research_tier1 point sqlx 100 5
+PG_FAKE_RESEARCH_ITERATIONS=32768 target/release/examples/research_tier1 insert_growing sqlx_bound 100 1
+```
+
+No new SQL features are proposed or claimed as implemented. Representative
+already-supported workloads targeted by this plan include:
+
+```sql
+INSERT INTO items VALUES ($1, 'benchmark');
+UPDATE items SET amount = amount + 1 WHERE id = $1;
+SELECT id, name FROM items WHERE id = $1;
+SELECT id, name FROM items ORDER BY id DESC LIMIT 10 OFFSET 40;
+SELECT l.id FROM left_items l INNER JOIN right_items r ON l.id = r.id WHERE l.id = 50;
+SELECT l.id FROM left_items l INNER JOIN right_items r ON l.bucket = r.bucket WHERE l.bucket = 0;
+```
