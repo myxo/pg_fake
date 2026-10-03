@@ -2,7 +2,7 @@
 
 This registry describes the SQL surface exercised by the Phase 3 conformance
 manifest. PostgreSQL 18 is the comparison target. A supported family includes
-the forms listed here and in the [implementation plan](plan.md); the family
+the forms listed here and in the [implementation plan](plan_phase3_complete.md); the family
 name does not imply every PostgreSQL form is implemented.
 
 | Family | Supported forms | Later or outside the current surface |

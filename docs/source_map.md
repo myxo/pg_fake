@@ -212,7 +212,7 @@ implements epoch conversion and bounded timestamp formatting/truncation.
 zones and supplies conversions shared by casts and `AT TIME ZONE`. Execution
 passes the session time zone into central coercion. [`patterns.rs`](../crates/pg_fake/src/executor/expressions/patterns.rs)
 implements LIKE escaping and the supported ASCII regular-expression predicates.
-The exact runtime scope is recorded under Task 21 in `plan.md` and exercised by
+The exact runtime scope is recorded under Task 21 in `plan_phase3_complete.md` and exercised by
 `tests/fixtures/runtime_expressions.sql` in the SQLx crate.
 
 [`resume.rs`](../crates/pg_fake/src/executor/expressions/resume.rs) journals completed

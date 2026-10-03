@@ -8,8 +8,11 @@ for Unicode), so text comparison and `ORDER BY` can differ by database locale.
 For example, PostgreSQL may sort `fallback` before `MiXeD`, while `pg_fake`
 sorts `MiXeD` first.
 
-Differential properties should use collation-independent order keys until the
-project defines and implements a collation contract.
+Phase 4 will implement English and Russian collations, including case-insensitive,
+accent-insensitive and combined variants, alongside C/POSIX ordering (Task 04 in
+`plan.md`). This bug remains open until that support is implemented.
+Until then, differential properties should use collation-independent order keys
+or compare with PostgreSQL configured for C collation.
 
 ## INSERT with omitted trailing columns
 

@@ -91,9 +91,7 @@ RESET ALL;
 Known planner settings are validated and tracked without changing execution;
 strict mode rejects them. Unknown names are rejected rather than accepted by
 prefix. READ COMMITTED, REPEATABLE READ, and SERIALIZABLE isolation are
-implemented; non-UTF-8 encodings remain unsupported.
-Time zones support named IANA zones and numeric offsets; arbitrary POSIX zone
-rules and interval-valued settings remain outside this registry's current surface.
+implemented. Time zones currently support named IANA zones and numeric offsets.
 
 ## SQL coverage
 
@@ -103,6 +101,9 @@ scalar types, savepoints, session settings, row locks, transactional DDL, and
 SERIALIZABLE transactions. The supported forms are bounded; see the
 [Phase 3 feature registry](docs/phase3_coverage.md) for examples, explicit
 gaps, and handling in strict mode.
+
+See [unsupported PostgreSQL features](docs/unsupported.md) for the permanent
+scope exclusions and fidelity limits.
 
 ## Command-line interface
 

@@ -1,6 +1,6 @@
 # pg_fake — Design Specification
 
-## 1. Goal & Non-Goals
+## 1. Goal and Scope
 
 ### 1.1 Goal
 `pg_fake` is an in-memory, embeddable fake of PostgreSQL for use as a test
@@ -19,12 +19,10 @@ magnitude faster.
 The reference implementation target is **PostgreSQL 18**. All fidelity claims
 and differential tests are measured against Postgres 18 behavior.
 
-### 1.2 Non-Goals
-- Not a production database: no durability, crash recovery, on-disk WAL, or
-  replication.
-- Not a wire-protocol server. The core is function-call only. (A wire server is
-  possible future work; see §12.)
-- Not optimized for large datasets; test datasets are assumed small.
+### 1.2 Scope
+
+The engine targets small automated-test datasets through an in-process API.
+See [unsupported PostgreSQL features](unsupported.md) for scope exclusions.
 
 ### 1.3 Fidelity Contract
 Full bit-for-bit fidelity with Postgres is unbounded work, so observable
@@ -46,11 +44,9 @@ behavior is grouped into three tiers.
 - numeric and floating-point text formatting;
 - `now()` / clock values (subject to the time control in §1.4).
 
-**Tier C — explicitly not guaranteed:**
-- row order in the absence of `ORDER BY` (Postgres does not guarantee this
-  either);
-- physical planning, `EXPLAIN` output, and performance;
-- `ctid` values.
+**Tier C — implementation-dependent behavior:** see the
+[fidelity limits](unsupported.md#fidelity-limits). `ORDER BY` determines promised
+row ordering.
 
 `sqlx` is the expected primary driver, and error **category** fidelity is
 verified through it. Error-code fidelity is nonetheless defined at the
@@ -452,8 +448,7 @@ let rows = sess.query_prepared(&stmt, &[Value::Int4(1)])?;
   this crate, which adapts the synchronous core (e.g. via `spawn_blocking`,
   since row-lock waits block the thread).
 
-Support for other drivers would each require a similar adapter crate, or a
-wire-protocol server (§12).
+Support for other drivers would each require a similar adapter crate.
 
 ---
 
@@ -493,31 +488,11 @@ Each phase ships with a conformance test suite run against real Postgres (§11).
 
 ---
 
-## 10. Unsupported-Feature Policy
+## 10. Feature Handling
 
-Because not all of Postgres is implemented at once, behavior for anything not
-yet implemented is explicit and predictable, and distinguishes features a *user*
-wrote from features a *driver* emits internally.
-
-An explicit **registry** of unsupported / not-yet-supported features assigns
-each entry a handling policy:
-- **`Error`** — reject with an appropriate error, using the same `SQLSTATE`
-  Postgres would use where applicable (e.g. `0A000 feature_not_supported`, or a
-  syntax/undefined error where that is what Postgres returns). This is the
-  default for user-facing features, so tests fail loudly rather than silently
-  misbehaving.
-- **`Tolerate`** (accept-and-ignore / no-op) — for driver-internal plumbing that
-  a driver such as `sqlx` emits and that is safe to treat as a no-op or benign
-  default (e.g. certain `SET`/session parameters, protocol-level statements). The
-  statement succeeds so the driver keeps working, even though the feature is not
-  fully modeled.
-
-A **`restrict` (strict) flag**, off by default, turns tolerance off: when
-enabled, every unsupported feature — including `Tolerate` ones — raises an error.
-This is used to audit exactly what a driver/app relies on and to surface silent
-gaps (e.g. in CI). With the flag off (the normal test-run default),
-driver-internal features are tolerated while genuinely unsupported user-level
-features still error.
+The [unsupported-feature document](unsupported.md) defines permanent exclusions,
+fidelity limits and rejection/tolerance behavior. The registry records each
+feature's handling policy; the `restrict` flag enables strict mode.
 
 ---
 
@@ -563,15 +538,10 @@ Details:
 
 ## 13. Future Work
 
-- **Wire-protocol server** — an optional layer that speaks the Postgres wire
-  protocol so arbitrary drivers (`tokio-postgres`, `diesel`, ...) can connect,
-  instead of one adapter crate per driver.
 - **Cooperative scheduler** — controlled interleaving of concurrent transactions
   for fully reproducible concurrency tests.
-- **Unsupported-feature catalog detail** — exact registry contents, per-feature
-  `SQLSTATE` choices, and whether `restrict` is set per-`Db` or per-`Session`
-  (leaning toward both, with session overriding DB), to be filled in as features
-  land.
+- **Feature registry detail** — per-feature `SQLSTATE` choices and per-Db/session
+  configuration, filled in as features land.
 - **Persistent-map storage** — swap `BTreeMap` for a structurally-shared
   persistent map to make snapshots near-O(1), if snapshot cost becomes
   significant.
