@@ -110,7 +110,7 @@ impl Session {
     fn execute_statement(
         &mut self,
         statement: &ast::Statement,
-        prepared_query: Option<(&executor::PreparedQueryPlan, &[Value], &[ColumnMeta])>,
+        prepared_query: Option<(&executor::PreparedReadPlan, &[Value], &[ColumnMeta])>,
         prepared_statement: Option<&PreparedStatement>,
         prepared_parameters: Option<Vec<Option<Value>>>,
         procedural: Option<DoBlockContext>,
@@ -242,7 +242,7 @@ impl Session {
         transaction.statement_started = true;
         self.transaction = Some(SessionTransactionState::Active(transaction));
         if let Some((plan, parameters, columns)) = prepared_query {
-            return match executor::execute_prepared_query(
+            return match executor::execute_prepared_read(
                 &state,
                 plan,
                 parameters,
@@ -281,7 +281,11 @@ impl Session {
             };
         }
         let one_shot_plan = match executor::build_prepared_query_plan(&state, statement, &[], None)
-        {
+            .and_then(|plan| match plan {
+                Some(plan) => Ok(Some(executor::PreparedReadPlan::Query(plan))),
+                None => executor::build_prepared_join_plan(&state, statement, &[], None)
+                    .map(|plan| plan.map(executor::PreparedReadPlan::InnerJoin)),
+            }) {
             Ok(plan) => plan,
             Err(error) => {
                 drop(state);
@@ -289,7 +293,7 @@ impl Session {
             }
         };
         if let Some(plan) = one_shot_plan {
-            return match executor::execute_prepared_query(
+            return match executor::execute_prepared_read(
                 &state,
                 &plan,
                 &[],

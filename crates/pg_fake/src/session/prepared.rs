@@ -26,7 +26,7 @@ pub struct PreparedStatement {
     replan_revision: std::sync::Arc<AtomicU64>,
     pub(super) parameter_types: Vec<crate::value::BaseType>,
     pub(super) columns: Vec<ColumnMeta>,
-    pub(super) query_plan: Option<executor::PreparedQueryPlan>,
+    pub(super) query_plan: Option<executor::PreparedReadPlan>,
     pub(super) expanded_views_statement: Option<Box<ast::Statement>>,
     pub(super) catalog_dependencies: Vec<CatalogDependency>,
     pub(super) catalog_identity: crate::catalog::CatalogIdentity,
@@ -223,12 +223,21 @@ impl Session {
                             if let ast::Statement::Query(query) = &statement {
                                 executor::restore_query_projection_names(query, &mut columns);
                             }
-                            let query_plan = executor::build_prepared_query_plan(
+                            let query_plan = match executor::build_prepared_query_plan(
                                 &state,
                                 &statement,
                                 &parameter_types,
                                 Some(&columns),
-                            )?;
+                            )? {
+                                Some(plan) => Some(executor::PreparedReadPlan::Query(plan)),
+                                None => executor::build_prepared_join_plan(
+                                    &state,
+                                    &statement,
+                                    &parameter_types,
+                                    Some(&columns),
+                                )?
+                                .map(executor::PreparedReadPlan::InnerJoin),
+                            };
                             let relation_locks = if can_cache_read_locks(&statement)
                                 && catalog_dependencies
                                     .iter()

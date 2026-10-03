@@ -85,6 +85,7 @@ mod lateral;
 mod locks;
 mod outer_references;
 mod prepared;
+mod prepared_joins;
 mod procedural;
 mod query;
 mod row_constraints;
@@ -133,6 +134,9 @@ pub(crate) use locks::{
     mutation_locks_cover_targets,
 };
 pub(crate) use prepared::{PreparedQueryPlan, build_prepared_query_plan, execute_prepared_query};
+pub(crate) use prepared_joins::{
+    PreparedReadPlan, build_prepared_join_plan, execute_prepared_read,
+};
 pub(crate) use procedural::{
     coerce_procedural_value, format_procedural_exception, substitute_procedural_references,
     validate_procedural_raise_arity,

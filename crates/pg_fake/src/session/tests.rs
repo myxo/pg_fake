@@ -11178,3 +11178,107 @@ fn reuse_prepared_ordering_and_pages_without_eager_projection() {
         assert!(session.prepare(sql).unwrap().query_plan.is_none(), "{sql}");
     }
 }
+
+#[test]
+fn match_compiled_integer_joins_with_general_execution() {
+    let db = Db::create();
+    let mut session = db.create_session();
+    session.execute("CREATE TABLE join_left (id integer, bucket integer); CREATE TABLE join_right (id integer, bucket integer)").unwrap();
+    session.execute("INSERT INTO join_left VALUES (1, 0), (2, 0), (2, 1), (NULL, 0), (3, NULL); INSERT INTO join_right VALUES (1, 0), (2, 0), (2, 0), (NULL, 0), (4, NULL)").unwrap();
+    for (condition, filter, parameters) in [
+        ("l.id = r.id", "l.id = 2", vec![]),
+        ("r.id = l.id", "2 = l.id", vec![]),
+        ("l.bucket = r.bucket", "l.bucket = 0", vec![]),
+        ("l.id = r.id", "l.id = $1", vec![Value::Int4(2)]),
+        ("l.id = r.id", "l.id = $1", vec![Value::Null]),
+        ("l.id = r.id", "l.id = 99", vec![]),
+    ] {
+        let sql = format!(
+            "SELECT l.id, r.id FROM join_left l INNER JOIN join_right r ON {condition} WHERE {filter}"
+        );
+        let prepared = session.prepare(&sql).unwrap();
+        assert!(prepared.query_plan.is_some(), "{sql}");
+        let fast = session.query_prepared(&prepared, &parameters).unwrap();
+        let general = session
+            .query(&format!("{sql} OFFSET (0)"), &parameters)
+            .unwrap();
+        let mut fast_rows = fast
+            .rows
+            .iter()
+            .map(|row| format!("{row:?}"))
+            .collect::<Vec<_>>();
+        let mut general_rows = general
+            .rows
+            .iter()
+            .map(|row| format!("{row:?}"))
+            .collect::<Vec<_>>();
+        fast_rows.sort();
+        general_rows.sort();
+        assert_eq!(fast_rows, general_rows, "{sql}");
+        assert_eq!(fast.columns, general.columns, "{sql}");
+        if parameters.is_empty() {
+            let StatementResult::Query(one_shot) = &session.execute(&sql).unwrap()[0] else {
+                panic!("expected query")
+            };
+            let mut one_shot_rows = one_shot
+                .rows
+                .iter()
+                .map(|row| format!("{row:?}"))
+                .collect::<Vec<_>>();
+            one_shot_rows.sort();
+            assert_eq!(one_shot_rows, general_rows, "one-shot {sql}");
+        }
+    }
+}
+
+#[test]
+fn track_compiled_join_reads_and_statement_snapshots() {
+    let db = Db::create();
+    let mut reader = db.create_session();
+    let mut writer = db.create_session();
+    reader.execute("CREATE TABLE read_left (id integer); CREATE TABLE read_right (id integer); INSERT INTO read_left VALUES (1)").unwrap();
+    let statement = reader
+        .prepare("SELECT l.id FROM read_left l JOIN read_right r ON l.id = r.id WHERE l.id = 1")
+        .unwrap();
+    assert!(statement.query_plan.is_some());
+    reader
+        .execute("BEGIN ISOLATION LEVEL SERIALIZABLE")
+        .unwrap();
+    writer.execute("BEGIN").unwrap();
+    let Some(SessionTransactionState::Active(reader_transaction)) = reader.transaction else {
+        panic!("reader transaction is active")
+    };
+    let Some(SessionTransactionState::Active(writer_transaction)) = writer.transaction else {
+        panic!("writer transaction is active")
+    };
+    assert!(
+        reader
+            .query_prepared(&statement, &[])
+            .unwrap()
+            .rows
+            .is_empty()
+    );
+    writer.execute("INSERT INTO read_right VALUES (1)").unwrap();
+    assert!(
+        db.state
+            .lock()
+            .unwrap()
+            .serializable
+            .lock()
+            .unwrap()
+            .has_edge(reader_transaction.xid, writer_transaction.xid)
+    );
+    writer.execute("COMMIT").unwrap();
+    assert!(
+        reader
+            .query_prepared(&statement, &[])
+            .unwrap()
+            .rows
+            .is_empty()
+    );
+    reader.execute("COMMIT").unwrap();
+    assert_eq!(
+        reader.query_prepared(&statement, &[]).unwrap().rows,
+        vec![vec![Value::Int4(1)]]
+    );
+}

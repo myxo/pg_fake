@@ -51,8 +51,8 @@ begin/insert/rollback cycle measurements include the entire named cycle; they
 are not isolated insert or commit timings.
 
 Durable inputs, timing triples, Criterion mean confidence intervals, profiles,
-memory measurements, source fingerprints and compressed samples are in
-[optimization_evidence/2026-10-03](optimization_evidence/2026-10-03/).
+memory measurements, source fingerprints and compressed samples are retained
+locally outside version control.
 The older `target/optimization_research` profiles were inspected but not used to
 quantify the current plan. No production engine or adapter implementation was
 changed during this research.
@@ -245,9 +245,9 @@ The matched distinct-literal insert median improves 41.323→38.280 us (7.36%);
 32k peak RSS falls 635.55→34.72 MiB, and 100k RSS is 81.16 MiB. Focused
 Tier 1 repeats resolve noisy full-run update/indexed/join readings without a
 confirmed slowdown. Raw timings, memory measurements, Tier 1 comparisons and
-validation notes are in [O2 evidence](optimization_evidence/2026-10-03-o2/summary.md).
+validation notes are retained locally outside version control.
 
-### O3 — Compile ordinary inner joins and their filters [PENDING]
+### O3 — Compile ordinary inner joins and their filters [COMPLETE]
 
 **Effort:** 4–7 days. **Dependency:** O1. **Confidence:** high that this is the
 largest join opportunity; medium on the final speedup.
@@ -282,6 +282,17 @@ visibility and SSI reads. Other joins/coercions remain on the general path.
 first budgets are selective join ≤35 us and many-match join ≤55 us through SQLx.
 Require lower type/name/AST profile shares and improved scaling. These budgets
 represent approximately 2.6–2.9x improvement, not a promised 10x.
+
+Completed 2026-10-03 for two-table `integer = integer` inner joins with a
+simple local equality filter and direct-column projection. The full Tier 1
+SQLx selective and many-match joins improve 90.332→22.876 us and
+159.060→29.459 us and beat PostgreSQL 18's 39.745/66.023 us. The separate
+prepared-read plan preserves the existing non-join executor. Matched paired
+probes show paging/order flat within noise, although the full Criterion run
+shows 3.0–3.3% slower paging/order; the user explicitly accepted that possible
+tradeoff for the join gain. Raw timing, scaling, profile and validation results
+are retained locally outside version control. Other join shapes
+remain on the general path.
 
 ### O4 — Reduce join intermediates and select useful access paths [PENDING]
 

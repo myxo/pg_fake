@@ -1,9 +1,0 @@
-connect to manually setup postgres on postgresql://myxo@127.0.0.1:5432/postgres
-Benchmarking tier1_select_where_indexed_100_rows/pg_fake
-Benchmarking tier1_select_where_indexed_100_rows/pg_fake: Warming up for 2.0000 s
-Benchmarking tier1_select_where_indexed_100_rows/pg_fake: Collecting 30 samples in estimated 5.0001 s (577k iterations)
-Benchmarking tier1_select_where_indexed_100_rows/pg_fake: Analyzing
-tier1_select_where_indexed_100_rows/pg_fake
-                        time:   [8.5392 µs 8.5757 µs 8.6147 µs]
-                        change: [+3.1955% +4.1546% +5.0292%] (p = 0.00 < 0.05)
-                        Performance has regressed.
