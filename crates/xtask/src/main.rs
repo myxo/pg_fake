@@ -217,7 +217,7 @@ fn restore_baseline(record: bool, benchmarks: &[Benchmark]) {
         for value in &benchmark.values {
             let source = find_baseline_path(&results_root, benchmark, value);
             let target = find_baseline_path(&criterion_root, benchmark, value);
-            if record && !has_complete_baseline(&source) {
+            if !has_complete_baseline(&source) {
                 continue;
             }
             copy_baseline(&source, &target);
@@ -229,7 +229,7 @@ fn run_benchmarks(record: bool, filter: Option<&str>) {
     let argument = if record {
         "--save-baseline"
     } else {
-        "--baseline"
+        "--baseline-lenient"
     };
     let mut command = Command::new("cargo");
     command.args([

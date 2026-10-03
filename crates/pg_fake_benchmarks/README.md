@@ -128,3 +128,9 @@ Direct `cargo bench -p pg_fake_benchmarks --bench workloads` remains an ordinary
 Criterion run and does not read or write the committed results.
 For example, `cargo bench -p pg_fake_benchmarks --bench workloads -- tier1_`
 runs only Tier 1 measurements using Criterion's built-in name filter.
+
+Tier 1 insert/transaction fixtures and update caches are bounded with untimed
+cleanup every 128 operations. The adapter comparison uses prepared native
+execution. `insert_bound_row` and `update_bound_row` add parameterized writes.
+Record a fresh baseline with `cargo x bench record` before measuring changes;
+the old growing-fixture and native one-shot timings are not comparable.

@@ -64,6 +64,18 @@ pub fn list_benchmarks() -> Vec<Benchmark> {
     vec![
         build_benchmark(
             BenchmarkTier::Important,
+            "insert_bound_row",
+            build_postgres_values(),
+            build_postgres_comparisons(),
+        ),
+        build_benchmark(
+            BenchmarkTier::Important,
+            "update_bound_row",
+            build_postgres_values(),
+            build_postgres_comparisons(),
+        ),
+        build_benchmark(
+            BenchmarkTier::Important,
             "core_snapshot_100_rows",
             vec![build_value("pg_fake", &["pg_fake"])],
             vec![],

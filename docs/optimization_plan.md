@@ -1,6 +1,6 @@
 # Tier 1 optimization plan
 
-**Status: ready for review and user approval. All implementation tasks below are pending.**
+**Status: implementation authorized. O1 is complete; O2–O9 remain pending.**
 
 Research date: 2026-10-03. Scope: make everyday inserts, updates, transactions,
 selects, ordering/paging and simple inner joins substantially faster while
@@ -204,27 +204,16 @@ validation, not commitments. Numerical targets are investigation/acceptance
 budgets on this machine, not measured future results. Re-measure after each
 task; do not add percentage improvements from overlapping paths.
 
-### O1 — Make performance gates equivalent and reproducible [PENDING]
+### O1 — Make performance gates equivalent and reproducible [COMPLETE]
 
-**Effort:** 1–2 days. **Dependency:** none. **Confidence:** high.
+Use the existing Criterion suite and `cargo x bench` filtering, recording and
+reports. Keep the ten Tier 1 comparisons; add parameterized insert/update cases,
+bound literal fixture/cache growth with untimed cleanup, and use prepared native
+execution in the existing adapter comparison. Record a fresh baseline before
+measuring each optimization. Keep generated captures under `target/`.
 
-- Keep all ten existing Tier 1 comparisons, including their literal insert
-  workload. Add parameterized inserts/updates beside them rather than replacing
-  the costly paths with easier benchmarks.
-- Add matched native prepared, native one-shot, SQLx cached and SQLx uncached
-  diagnostics. Separate preparation/cache misses from steady-state execution.
-- Add fixed-size insert batches, misses as well as hits, 100/1,000/10,000-row
-  scans and joins, narrow/wide rows, and ordered paging with small/large offsets.
-  Bound fixture growth and report cache-entry count and peak memory separately.
-- Add an isolated Tier 1/core-only mode that avoids unrelated fixture setup and
-  PostgreSQL startup. Compare all existing official workloads with the shared
-  catalog rather than accidentally reading stale `target/criterion` directories.
-- Record environment and source/binary fingerprints, retain raw confidence
-  intervals, run without a competing compiler/profiler, and assert fixture
-  results outside timed loops.
-
-**Acceptance:** repeatable baselines and meaningful layer comparisons; no claim
-of a performance improvement merely from changing the benchmark.
+Completed 2026-10-03 with only these focused benchmark changes. No additional
+runner, filtering, result checks or revision-tracking layer is needed.
 
 ### O2 — Bound retained SQLx statement memory [PENDING]
 

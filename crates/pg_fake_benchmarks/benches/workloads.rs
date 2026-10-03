@@ -41,6 +41,34 @@ impl BenchmarkConnection<'_> {
         }
     }
 
+    fn execute_bound(&mut self, runtime: &Runtime, sql: &str, parameter: i64) {
+        match self {
+            Self::PgFake(connection) => {
+                let result = runtime
+                    .block_on(sqlx::query(sql).bind(parameter).execute(&mut **connection))
+                    .unwrap();
+                black_box(result);
+            }
+            Self::Postgres(connection) => {
+                let result = runtime
+                    .block_on(sqlx::query(sql).bind(parameter).execute(&mut **connection))
+                    .unwrap();
+                black_box(result);
+            }
+        }
+    }
+
+    fn clear_statements(&mut self, runtime: &Runtime) {
+        match self {
+            Self::PgFake(connection) => runtime
+                .block_on(connection.clear_cached_statements())
+                .unwrap(),
+            Self::Postgres(connection) => runtime
+                .block_on(connection.clear_cached_statements())
+                .unwrap(),
+        }
+    }
+
     fn execute_expect_serialization_failure(&mut self, runtime: &Runtime) {
         let result = match self {
             Self::PgFake(connection) => runtime
@@ -1170,6 +1198,53 @@ fn migration_data_transform_benchmark(
     }
 }
 
+fn benchmark_bound_writes(
+    criterion: &mut Criterion,
+    runtime: &Runtime,
+    connections: &mut [NamedBenchmarkConnection<'_>],
+) {
+    for (name, sql, setup) in [
+        (
+            "insert_bound_row",
+            "INSERT INTO bound_write VALUES ($1, 'benchmark')",
+            "CREATE TABLE bound_write (id BIGINT PRIMARY KEY CHECK (id > 0), name TEXT NOT NULL DEFAULT upper('benchmark'), CHECK (length(name) > 0))",
+        ),
+        (
+            "update_bound_row",
+            "UPDATE bound_write SET amount = amount + 1 WHERE id = $1",
+            "CREATE TABLE bound_write (id BIGINT PRIMARY KEY, amount INTEGER)",
+        ),
+    ] {
+        let insert = name == "insert_bound_row";
+        let mut group = criterion.benchmark_group(benchmarks::find_benchmark(name).format_name());
+        for (route, connection) in connections.iter_mut() {
+            connection.execute(runtime, setup);
+            if !insert {
+                connection.execute(runtime, "INSERT INTO bound_write VALUES (1, 0)");
+            }
+            let mut id = 0i64;
+            group.bench_function(*route, |benchmark| {
+                benchmark.iter_custom(|iterations| {
+                    let mut elapsed = Duration::ZERO;
+                    for _ in 0..iterations {
+                        id += 1;
+                        let started = Instant::now();
+                        connection.execute_bound(runtime, sql, if insert { id } else { 1 });
+                        elapsed += started.elapsed();
+                        if insert {
+                            connection.execute(runtime, "DELETE FROM bound_write");
+                        }
+                    }
+                    elapsed
+                })
+            });
+            connection.execute(runtime, "DROP TABLE bound_write");
+            connection.clear_statements(runtime);
+        }
+        group.finish();
+    }
+}
+
 fn insert_benchmark(
     criterion: &mut Criterion,
     runtime: &Runtime,
@@ -1190,12 +1265,25 @@ fn insert_benchmark(
     for (name, connection) in connections.iter_mut() {
         let mut id = 0;
         group.bench_function(*name, |benchmark| {
-            benchmark.iter(|| {
-                id += 1;
-                connection.execute(
-                    runtime,
-                    &format!("INSERT INTO insert_row VALUES ({id}, 'benchmark')"),
-                );
+            benchmark.iter_custom(|iterations| {
+                let mut elapsed = Duration::ZERO;
+                let mut remaining = iterations;
+                while remaining > 0 {
+                    let batch = remaining.min(128);
+                    let started = Instant::now();
+                    for _ in 0..batch {
+                        id += 1;
+                        connection.execute(
+                            runtime,
+                            &format!("INSERT INTO insert_row VALUES ({id}, 'benchmark')"),
+                        );
+                    }
+                    elapsed += started.elapsed();
+                    connection.execute(runtime, "DELETE FROM insert_row");
+                    connection.clear_statements(runtime);
+                    remaining -= batch;
+                }
+                elapsed
             });
         });
     }
@@ -1280,6 +1368,9 @@ fn update_benchmark(
                     connection.execute(runtime, &update);
                     elapsed += started.elapsed();
                     connection.execute(runtime, &format!("DELETE FROM update_row WHERE id = {id}"));
+                    if id % 128 == 127 {
+                        connection.clear_statements(runtime);
+                    }
                 }
                 elapsed
             });
@@ -1369,12 +1460,25 @@ fn transaction_benchmark(
     for (name, connection) in connections.iter_mut() {
         let mut id = 0;
         group.bench_function(*name, |benchmark| {
-            benchmark.iter(|| {
-                id += 1;
-                connection.execute_in_transaction(
-                    runtime,
-                    &format!("INSERT INTO transaction_insert VALUES ({id})"),
-                );
+            benchmark.iter_custom(|iterations| {
+                let mut elapsed = Duration::ZERO;
+                let mut remaining = iterations;
+                while remaining > 0 {
+                    let batch = remaining.min(128);
+                    let started = Instant::now();
+                    for _ in 0..batch {
+                        id += 1;
+                        connection.execute_in_transaction(
+                            runtime,
+                            &format!("INSERT INTO transaction_insert VALUES ({id})"),
+                        );
+                    }
+                    elapsed += started.elapsed();
+                    connection.execute(runtime, "DELETE FROM transaction_insert");
+                    connection.clear_statements(runtime);
+                    remaining -= batch;
+                }
+                elapsed
             });
         });
     }
@@ -1684,6 +1788,7 @@ fn core_vs_sqlx_benchmark(criterion: &mut Criterion, runtime: &Runtime) {
     );
     core_execute(&mut core, "BEGIN");
     let query = "SELECT id, name FROM adapter_overhead_select_100_rows ORDER BY id";
+    let prepared = core.prepare(query).unwrap();
 
     let mut sqlx = PgFakeConnection::new(Db::create());
     fake_execute(
@@ -1704,7 +1809,7 @@ fn core_vs_sqlx_benchmark(criterion: &mut Criterion, runtime: &Runtime) {
     group.throughput(Throughput::Elements(100));
     group.bench_function("core", |benchmark| {
         benchmark.iter(|| {
-            let result = core.query(query, &[]).unwrap();
+            let result = core.query_prepared(&prepared, &[]).unwrap();
             black_box(result);
         });
     });
@@ -2139,6 +2244,7 @@ fn benchmarks(criterion: &mut Criterion) {
         grouped_aggregate_benchmark(criterion, &runtime, &mut connections);
         select_distinct_benchmark(criterion, &runtime, &mut connections);
         set_operation_benchmark(criterion, &runtime, &mut connections);
+        benchmark_bound_writes(criterion, &runtime, &mut connections);
     }
     runtime
         .block_on(
