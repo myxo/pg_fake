@@ -9,7 +9,8 @@ use crate::{
         scope::{self, BoundScope, try_resolve_column_reference},
         subqueries::evaluate_query_expression,
     },
-    txn::{Snapshot, Xid},
+    serializable::Access,
+    txn::{Snapshot, Xid, find_visible_version},
     value::{BaseType, PgType, Value},
 };
 use sqlparser::ast;
@@ -77,6 +78,34 @@ pub(crate) fn visit_streamed_join_rows(
     if let Some(hash_slots) = hash_slots
         && !hash_slots.is_empty()
     {
+        if let [(left_slot, right_slot, false)] = hash_slots.as_slice()
+            && selection.is_none()
+            && context
+                .query_source_state
+                .lock()
+                .expect("query source mutex is poisoned")
+                .is_empty()
+            && let ast::TableFactor::Table {
+                name: left_name, ..
+            } = &table.relation
+            && let ast::TableFactor::Table {
+                name: right_name, ..
+            } = &table.joins[0].relation
+            && crate::executor::ctes::cte_row_source_id(left_name).is_none()
+            && crate::executor::ctes::cte_row_source_id(right_name).is_none()
+        {
+            return visit_borrowed_hash_inner_join(
+                state,
+                left_name,
+                right_name,
+                scope,
+                xid,
+                snapshot,
+                *left_slot,
+                *right_slot - starts[1],
+                visit,
+            );
+        }
         return visit_hash_join_chain_rows(
             state,
             table,
@@ -134,6 +163,68 @@ pub(crate) fn visit_streamed_join_rows(
             )
         },
     )
+}
+
+fn visit_borrowed_hash_inner_join(
+    state: &DatabaseState,
+    left_name: &ast::ObjectName,
+    right_name: &ast::ObjectName,
+    scope: &BoundScope,
+    xid: Xid,
+    snapshot: &Snapshot,
+    left_key: usize,
+    right_key: usize,
+    visit: &mut dyn FnMut(&[Value]) -> Result<()>,
+) -> Result<()> {
+    let left_schema = state
+        .catalog
+        .require_named_table(&normalize_relation_name(left_name)?)?;
+    let right_schema = state
+        .catalog
+        .require_named_table(&normalize_relation_name(right_name)?)?;
+    let left_table = state
+        .tables
+        .get(&left_schema.id)
+        .expect("catalog table must have storage");
+    let right_table = state
+        .tables
+        .get(&right_schema.id)
+        .expect("catalog table must have storage");
+    let key_type = scope.columns[left_key].data_type.base;
+    let mut left_rows = Vec::new();
+    state.record_read(xid, Access::Relation(left_schema.id));
+    for (row_id, chain) in left_table.iterate_version_chains() {
+        let Some(version) = find_visible_version(chain, snapshot, xid, &state.transactions) else {
+            continue;
+        };
+        state.record_read(xid, Access::Row(left_schema.id, row_id));
+        left_rows.push(&version.row);
+    }
+    let mut right_by_key = std::collections::HashMap::<_, Vec<&[Value]>>::new();
+    state.record_read(xid, Access::Relation(right_schema.id));
+    for (row_id, chain) in right_table.iterate_version_chains() {
+        let Some(version) = find_visible_version(chain, snapshot, xid, &state.transactions) else {
+            continue;
+        };
+        state.record_read(xid, Access::Row(right_schema.id, row_id));
+        if let Some(key) = create_hash_join_key(&version.row[right_key], key_type) {
+            right_by_key.entry(key).or_default().push(&version.row);
+        }
+    }
+    let mut joined = Vec::with_capacity(scope.columns.len());
+    for left in left_rows {
+        if let Some(key) = create_hash_join_key(&left[left_key], key_type)
+            && let Some(matches) = right_by_key.get(&key)
+        {
+            for right in matches {
+                joined.clear();
+                joined.extend_from_slice(left);
+                joined.extend_from_slice(right);
+                visit(&joined)?;
+            }
+        }
+    }
+    Ok(())
 }
 
 #[cfg_attr(feature = "execution-log", tracing::instrument(skip_all))]

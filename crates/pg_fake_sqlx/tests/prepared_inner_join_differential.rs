@@ -68,6 +68,8 @@ fn compares_generated_integer_inner_joins() {
             );
         }
         for sql in [
+            "SELECT l.id, r.id FROM integer_join_left l JOIN integer_join_right r ON l.id = r.id",
+            "SELECT l.bucket, r.bucket FROM integer_join_left l JOIN integer_join_right r ON l.bucket = r.bucket",
             "SELECT l.id, r.id FROM integer_join_left l INNER JOIN integer_join_right r ON l.id = r.id WHERE l.id = 2",
             "SELECT l.id, r.id FROM integer_join_left l JOIN integer_join_right r ON r.id = l.id WHERE 2 = l.id",
             "SELECT l.bucket, r.bucket FROM integer_join_left l JOIN integer_join_right r ON l.bucket = r.bucket WHERE l.bucket = 0",

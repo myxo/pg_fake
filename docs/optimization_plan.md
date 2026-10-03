@@ -357,6 +357,20 @@ measured 8.590→8.261 µs. Heap equality select was flat in exact repeats.
 Raw results remain under `target/o4-asymmetric-*`. General join intermediate
 copying remains pending.
 
+An unfiltered two-table equality join now borrows visible source rows while
+building its hash table and reuses a joined-row buffer during result visits.
+The path retains the original left scan, right scan, then result-visit order;
+filtered, frozen-source and other join shapes retain the prior executor. For
+`SELECT l.name, r.name FROM l JOIN r ON l.id = r.id`, three paired 0.5-second
+SQLx probes improve 94.849→67.366 µs (28.98%) at 100 rows and
+6,876.073→3,946.860 µs (42.60%) at 10,000 rows. Native prepared probes
+improve 71.602→46.766 µs (34.69%) and 6,412.428→3,429.883 µs (46.51%).
+The full Tier 1 Criterion run improves the selective and many-match joins
+16.770→16.393 µs and 26.785→26.233 µs. Its noisy update and small heap/insert
+differences were checked with alternating baseline/candidate probes; no
+non-join slowdown was reproducible. Raw timings and the full comparison remain
+locally under `target/o4-borrowed-*`. Other O4 work remains pending.
+
 ### O5 — Prepare simple mutation structure once; specialize resumption [PENDING]
 
 **Effort:** 4–7 days. **Dependency:** O1. **Confidence:** high for redundant work;

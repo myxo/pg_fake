@@ -11303,6 +11303,49 @@ fn track_compiled_join_reads_and_statement_snapshots() {
 }
 
 #[test]
+fn track_unfiltered_hash_join_reads() {
+    let db = Db::create();
+    let mut reader = db.create_session();
+    let mut writer = db.create_session();
+    reader.execute("CREATE TABLE hash_read_left (id integer); CREATE TABLE hash_read_right (id integer); INSERT INTO hash_read_left VALUES (1)").unwrap();
+    let statement = reader
+        .prepare("SELECT l.id FROM hash_read_left l JOIN hash_read_right r ON l.id = r.id")
+        .unwrap();
+    assert!(statement.query_plan.is_none());
+    reader
+        .execute("BEGIN ISOLATION LEVEL SERIALIZABLE")
+        .unwrap();
+    writer.execute("BEGIN").unwrap();
+    let Some(SessionTransactionState::Active(reader_transaction)) = reader.transaction else {
+        panic!("reader transaction is active")
+    };
+    let Some(SessionTransactionState::Active(writer_transaction)) = writer.transaction else {
+        panic!("writer transaction is active")
+    };
+    assert!(
+        reader
+            .query_prepared(&statement, &[])
+            .unwrap()
+            .rows
+            .is_empty()
+    );
+    writer
+        .execute("INSERT INTO hash_read_right VALUES (1)")
+        .unwrap();
+    assert!(
+        db.state
+            .lock()
+            .unwrap()
+            .serializable
+            .lock()
+            .unwrap()
+            .has_edge(reader_transaction.xid, writer_transaction.xid)
+    );
+    reader.execute("ROLLBACK").unwrap();
+    writer.execute("ROLLBACK").unwrap();
+}
+
+#[test]
 fn track_double_filtered_join_reads() {
     let db = Db::create();
     let mut reader = db.create_session();
