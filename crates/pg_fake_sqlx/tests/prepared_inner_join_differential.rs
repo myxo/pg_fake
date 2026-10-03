@@ -166,3 +166,72 @@ fn compares_generated_integer_inner_joins() {
         }
     });
 }
+
+#[test]
+fn compares_off_key_filters_with_unique_right_join_key() {
+    let server = start_isolated_postgres_server();
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap();
+    let mut postgres = runtime
+        .block_on(PgConnection::connect(&server.url))
+        .unwrap();
+    let mut fake = PgFakeConnection::new(Db::create());
+    for sql in [
+        "CREATE TABLE offkey_left (id integer, tag integer)",
+        "CREATE TABLE offkey_right (id integer PRIMARY KEY, name text)",
+    ] {
+        assert_statement(&runtime, &mut postgres, &mut fake, sql, RowOrder::Unordered);
+    }
+    let left = (1..=100)
+        .map(|id| format!("({id}, {})", if id == 1 { 9 } else { id % 2 }))
+        .chain(["(1, 9)".to_owned(), "(NULL, 9)".to_owned()])
+        .collect::<Vec<_>>()
+        .join(", ");
+    let right = (1..=100)
+        .map(|id| format!("({id}, 'name-{id}')"))
+        .collect::<Vec<_>>()
+        .join(", ");
+    for sql in [
+        format!("INSERT INTO offkey_left VALUES {left}"),
+        format!("INSERT INTO offkey_right VALUES {right}"),
+    ] {
+        assert_statement(
+            &runtime,
+            &mut postgres,
+            &mut fake,
+            &sql,
+            RowOrder::Unordered,
+        );
+    }
+    for tag in [9, 0, 7] {
+        assert_statement(
+            &runtime,
+            &mut postgres,
+            &mut fake,
+            &format!(
+                "SELECT l.id, r.name FROM offkey_left l JOIN offkey_right r ON l.id = r.id WHERE l.tag = {tag}"
+            ),
+            RowOrder::Unordered,
+        );
+    }
+    runtime.block_on(async {
+        let sql = "SELECT l.id, r.name FROM offkey_left l JOIN offkey_right r ON l.id = r.id WHERE l.tag = $1";
+        for tag in [Some(9_i32), Some(0), None] {
+            let mut expected: Vec<(i32, String)> = sqlx::query_as(sql)
+                .bind(tag)
+                .fetch_all(&mut postgres)
+                .await
+                .unwrap();
+            let mut actual: Vec<(i32, String)> = sqlx::query_as(sql)
+                .bind(tag)
+                .fetch_all(&mut fake)
+                .await
+                .unwrap();
+            expected.sort();
+            actual.sort();
+            assert_eq!(actual, expected, "tag={tag:?}");
+        }
+    });
+}

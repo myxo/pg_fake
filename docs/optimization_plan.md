@@ -371,6 +371,25 @@ differences were checked with alternating baseline/candidate probes; no
 non-join slowdown was reproducible. Raw timings and the full comparison remain
 locally under `target/o4-borrowed-*`. Other O4 work remains pending.
 
+A further O4 access path probes a unique right join key when an equality filter
+on a different, nonunique left column selects few rows. It stops collecting
+left rows after more than 1/32 of the right table's stored row count qualifies,
+then builds the existing hash table and continues the same left scan. For
+`SELECT l.name, r.name FROM l JOIN r ON l.id = r.id WHERE l.bucket = 1`, three
+paired 0.5-second SQLx probes improve 16.638→8.719 µs (47.60%) at 100 rows
+and 998.467→247.163 µs (75.25%) at 10,000 rows. Native prepared probes
+improve 8.903→2.802 µs (68.53%) and 977.087→226.997 µs (76.77%). A dense
+filter taking the hash branch is 24.264→25.033 µs (3.17% slower) at 100 rows
+and 1,670.455→1,712.220 µs (2.50% slower) at 10,000 through SQLx. A separate
+paired probe of the existing selective join reads 9.889→10.322 µs (4.38%
+slower); the user explicitly accepted that join tradeoff for the sparse gain.
+The quiet back-to-back full Tier 1 Criterion pair instead reads
+17.182→16.539 µs and 27.635→26.409 µs for the official joins. Other apparent
+full-run write slowdowns did not reproduce in direct paired probes; exact
+update and transaction-insert Criterion repeats have overlapping confidence
+intervals. Raw comparisons remain locally under `target/o4-offkey-*`; earlier
+runs that overlapped compilation were discarded. Other O4 work remains pending.
+
 ### O5 — Prepare simple mutation structure once; specialize resumption [PENDING]
 
 **Effort:** 4–7 days. **Dependency:** O1. **Confidence:** high for redundant work;

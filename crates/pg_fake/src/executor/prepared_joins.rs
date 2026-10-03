@@ -22,6 +22,7 @@ pub(crate) enum PreparedReadPlan {
     Query(PreparedQueryPlan),
     InnerJoin(PreparedInnerJoinPlan),
     UniqueInnerJoin(PreparedInnerJoinPlan),
+    AdaptiveUniqueInnerJoin(PreparedInnerJoinPlan),
     DoubleFilteredInnerJoin(Box<PreparedDoubleFilteredInnerJoinPlan>),
 }
 
@@ -29,7 +30,9 @@ impl PreparedReadPlan {
     pub(crate) fn columns(&self) -> &[ColumnMeta] {
         match self {
             Self::Query(plan) => plan.columns(),
-            Self::InnerJoin(plan) | Self::UniqueInnerJoin(plan) => &plan.columns,
+            Self::InnerJoin(plan)
+            | Self::UniqueInnerJoin(plan)
+            | Self::AdaptiveUniqueInnerJoin(plan) => &plan.columns,
             Self::DoubleFilteredInnerJoin(plan) => &plan.join.columns,
         }
     }
@@ -264,10 +267,11 @@ pub(crate) fn build_prepared_join_plan(
         Some(columns) => columns.to_vec(),
         None => describe_query_result_columns(state, statement)?,
     };
-    let use_unique_probe = state
+    let right_is_unique = state
         .tables
         .get(&right_schema.id)
-        .is_some_and(|table| table.has_unique_index(&[right_key]))
+        .is_some_and(|table| table.has_unique_index(&[right_key]));
+    let use_unique_probe = right_is_unique
         && (filter_slot == left_key
             || state
                 .tables
@@ -295,6 +299,8 @@ pub(crate) fn build_prepared_join_plan(
             ))
         } else if use_unique_probe {
             PreparedReadPlan::UniqueInnerJoin(plan)
+        } else if right_is_unique {
+            PreparedReadPlan::AdaptiveUniqueInnerJoin(plan)
         } else {
             PreparedReadPlan::InnerJoin(plan)
         },
@@ -318,6 +324,9 @@ pub(crate) fn execute_prepared_read(
         PreparedReadPlan::UniqueInnerJoin(plan) => {
             execute_prepared_unique_join(state, plan, parameters, xid, snapshot, deadline, timezone)
         }
+        PreparedReadPlan::AdaptiveUniqueInnerJoin(plan) => execute_prepared_adaptive_unique_join(
+            state, plan, parameters, xid, snapshot, deadline, timezone,
+        ),
         PreparedReadPlan::DoubleFilteredInnerJoin(plan) => {
             let right_filter_value = evaluate_prepared_expression(
                 &plan.right_filter_value,
@@ -573,4 +582,172 @@ fn execute_prepared_unique_join(
             })
             .collect(),
     ])
+}
+
+#[inline(never)]
+fn execute_prepared_adaptive_unique_join(
+    state: &DatabaseState,
+    plan: &PreparedInnerJoinPlan,
+    parameters: &[Value],
+    xid: Xid,
+    snapshot: &Snapshot,
+    deadline: Option<Instant>,
+    timezone: &str,
+) -> Result<Vec<Vec<Value>>> {
+    state.catalog.require_table_by_id(plan.left_table_id)?;
+    state.catalog.require_table_by_id(plan.right_table_id)?;
+    let left_table = state
+        .tables
+        .get(&plan.left_table_id)
+        .expect("prepared left table must have storage");
+    let right_table = state
+        .tables
+        .get(&plan.right_table_id)
+        .expect("prepared right table must have storage");
+    if !right_table.has_unique_index(&[plan.right_key]) {
+        return execute_prepared_inner_join::<false>(
+            state, plan, parameters, xid, snapshot, deadline, timezone, None,
+        );
+    }
+    if plan.filter_slot == plan.left_key || left_table.has_unique_index(&[plan.filter_slot]) {
+        return execute_prepared_unique_join(
+            state, plan, parameters, xid, snapshot, deadline, timezone,
+        );
+    }
+    let filter_value =
+        evaluate_prepared_expression(&plan.filter_value, &[], parameters, deadline, timezone)?;
+    if filter_value.is_null() {
+        return Ok(Vec::new());
+    }
+    execute_prepared_off_key_unique_join(
+        state,
+        plan,
+        left_table,
+        right_table,
+        &filter_value,
+        xid,
+        snapshot,
+        deadline,
+    )
+}
+
+#[inline(never)]
+fn execute_prepared_off_key_unique_join(
+    state: &DatabaseState,
+    plan: &PreparedInnerJoinPlan,
+    left_table: &crate::storage::Table,
+    right_table: &crate::storage::Table,
+    filter_value: &Value,
+    xid: Xid,
+    snapshot: &Snapshot,
+    deadline: Option<Instant>,
+) -> Result<Vec<Vec<Value>>> {
+    let max_probes = right_table.iterate_version_chains().size_hint().0 / 32;
+    let mut left_iter = left_table.iterate_version_chains();
+    let mut left_rows = Vec::new();
+    state.record_read(xid, Access::Relation(plan.left_table_id));
+    while left_rows.len() <= max_probes {
+        let Some((row_id, chain)) = left_iter.next() else {
+            break;
+        };
+        let Some(version) = find_visible_version(chain, snapshot, xid, &state.transactions) else {
+            continue;
+        };
+        state.record_read(xid, Access::Row(plan.left_table_id, row_id));
+        if &version.row[plan.filter_slot] == filter_value {
+            left_rows.push(&version.row);
+        }
+    }
+    let mut rows = Vec::new();
+    if left_rows.len() <= max_probes {
+        for left in left_rows {
+            let join_key = &left[plan.left_key];
+            if join_key.is_null() {
+                continue;
+            }
+            if let Some(key) = right_table
+                .create_unique_read_key(&[plan.right_key], std::slice::from_ref(join_key))
+            {
+                state.record_read(
+                    xid,
+                    Access::Unique(plan.right_table_id, vec![plan.right_key], key),
+                );
+            }
+            let Some((right_row_id, right_version)) = right_table.find_unique_visible_version(
+                &[plan.right_key],
+                std::slice::from_ref(join_key),
+                snapshot,
+                xid,
+                &state.transactions,
+            ) else {
+                continue;
+            };
+            state.record_read(xid, Access::Row(plan.right_table_id, right_row_id));
+            if deadline.is_some_and(|deadline| Instant::now() >= deadline) {
+                return Err(PgError::create(
+                    SqlState::QueryCanceled,
+                    "canceling statement due to statement timeout",
+                ));
+            }
+            rows.push(
+                plan.projection
+                    .iter()
+                    .map(|slot| {
+                        if *slot < plan.left_width {
+                            left[*slot].clone()
+                        } else {
+                            right_version.row[*slot - plan.left_width].clone()
+                        }
+                    })
+                    .collect(),
+            );
+        }
+    } else {
+        let mut right_by_key = HashMap::<i32, Vec<&[Value]>>::new();
+        state.record_read(xid, Access::Relation(plan.right_table_id));
+        for (row_id, chain) in right_table.iterate_version_chains() {
+            let Some(version) = find_visible_version(chain, snapshot, xid, &state.transactions)
+            else {
+                continue;
+            };
+            state.record_read(xid, Access::Row(plan.right_table_id, row_id));
+            if let Value::Int4(key) = version.row[plan.right_key] {
+                right_by_key.entry(key).or_default().push(&version.row);
+            }
+        }
+        let remaining_left = left_iter.filter_map(|(row_id, chain)| {
+            let version = find_visible_version(chain, snapshot, xid, &state.transactions)?;
+            state.record_read(xid, Access::Row(plan.left_table_id, row_id));
+            (&version.row[plan.filter_slot] == filter_value).then_some(&version.row)
+        });
+        for left in left_rows.into_iter().chain(remaining_left) {
+            let Value::Int4(key) = left[plan.left_key] else {
+                continue;
+            };
+            let Some(matches) = right_by_key.get(&key) else {
+                continue;
+            };
+            for right in matches {
+                if deadline.is_some_and(|deadline| Instant::now() >= deadline) {
+                    return Err(PgError::create(
+                        SqlState::QueryCanceled,
+                        "canceling statement due to statement timeout",
+                    ));
+                }
+                rows.push(
+                    plan.projection
+                        .iter()
+                        .map(|slot| {
+                            if *slot < plan.left_width {
+                                left[*slot].clone()
+                            } else {
+                                right[*slot - plan.left_width].clone()
+                            }
+                        })
+                        .collect(),
+                );
+            }
+        }
+    }
+    Ok(rows)
 }

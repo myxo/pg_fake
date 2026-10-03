@@ -11346,6 +11346,103 @@ fn track_unfiltered_hash_join_reads() {
 }
 
 #[test]
+fn track_off_key_unique_join_reads() {
+    let db = Db::create();
+    let mut reader = db.create_session();
+    let mut writer = db.create_session();
+    reader
+        .execute("CREATE TABLE offkey_read_left (id integer, tag integer); CREATE TABLE offkey_read_right (id integer PRIMARY KEY); INSERT INTO offkey_read_left VALUES (1, 9)")
+        .unwrap();
+    let right_rows = (2..=64)
+        .map(|id| format!("({id})"))
+        .collect::<Vec<_>>()
+        .join(", ");
+    reader
+        .execute(&format!(
+            "INSERT INTO offkey_read_right VALUES {right_rows}"
+        ))
+        .unwrap();
+    let statement = reader
+        .prepare("SELECT l.id FROM offkey_read_left l JOIN offkey_read_right r ON l.id = r.id WHERE l.tag = 9")
+        .unwrap();
+    assert!(matches!(
+        statement.query_plan.as_ref(),
+        Some(crate::executor::PreparedReadPlan::AdaptiveUniqueInnerJoin(
+            _
+        ))
+    ));
+    reader
+        .execute("BEGIN ISOLATION LEVEL SERIALIZABLE")
+        .unwrap();
+    writer.execute("BEGIN").unwrap();
+    let Some(SessionTransactionState::Active(reader_transaction)) = reader.transaction else {
+        panic!("reader transaction is active")
+    };
+    let Some(SessionTransactionState::Active(writer_transaction)) = writer.transaction else {
+        panic!("writer transaction is active")
+    };
+    assert!(
+        reader
+            .query_prepared(&statement, &[])
+            .unwrap()
+            .rows
+            .is_empty()
+    );
+    writer
+        .execute("INSERT INTO offkey_read_right VALUES (1)")
+        .unwrap();
+    assert!(
+        db.state
+            .lock()
+            .unwrap()
+            .serializable
+            .lock()
+            .unwrap()
+            .has_edge(reader_transaction.xid, writer_transaction.xid)
+    );
+    reader.execute("ROLLBACK").unwrap();
+    writer.execute("ROLLBACK").unwrap();
+
+    reader
+        .execute("INSERT INTO offkey_read_left VALUES (100, 0), (101, 0)")
+        .unwrap();
+    let dense_statement = reader
+        .prepare("SELECT l.id FROM offkey_read_left l JOIN offkey_read_right r ON l.id = r.id WHERE l.tag = 0")
+        .unwrap();
+    reader
+        .execute("BEGIN ISOLATION LEVEL SERIALIZABLE")
+        .unwrap();
+    writer.execute("BEGIN").unwrap();
+    let Some(SessionTransactionState::Active(reader_transaction)) = reader.transaction else {
+        panic!("reader transaction is active")
+    };
+    let Some(SessionTransactionState::Active(writer_transaction)) = writer.transaction else {
+        panic!("writer transaction is active")
+    };
+    assert!(
+        reader
+            .query_prepared(&dense_statement, &[])
+            .unwrap()
+            .rows
+            .is_empty()
+    );
+    writer
+        .execute("INSERT INTO offkey_read_right VALUES (100)")
+        .unwrap();
+    assert!(
+        db.state
+            .lock()
+            .unwrap()
+            .serializable
+            .lock()
+            .unwrap()
+            .has_edge(reader_transaction.xid, writer_transaction.xid)
+    );
+    reader.execute("ROLLBACK").unwrap();
+    writer.execute("ROLLBACK").unwrap();
+}
+
+#[test]
 fn track_double_filtered_join_reads() {
     let db = Db::create();
     let mut reader = db.create_session();
