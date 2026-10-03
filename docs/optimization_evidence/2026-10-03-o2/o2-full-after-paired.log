@@ -1,0 +1,229 @@
+connect to manually setup postgres on postgresql://myxo@127.0.0.1:5432/postgres
+Benchmarking tier1_insert_row/pg_fake
+Benchmarking tier1_insert_row/pg_fake: Warming up for 1.0000 s
+Benchmarking tier1_insert_row/pg_fake: Collecting 20 samples in estimated 2.0010 s (51k iterations)
+Benchmarking tier1_insert_row/pg_fake: Analyzing
+tier1_insert_row/pg_fake
+                        time:   [37.883 µs 37.997 µs 38.123 µs]
+                        change: [-2.8558% -2.5607% -2.2641%] (p = 0.00 < 0.05)
+                        Performance has improved.
+Benchmarking tier1_insert_row/postgres_18
+Benchmarking tier1_insert_row/postgres_18: Warming up for 1.0000 s
+Benchmarking tier1_insert_row/postgres_18: Collecting 20 samples in estimated 2.0014 s (26k iterations)
+Benchmarking tier1_insert_row/postgres_18: Analyzing
+tier1_insert_row/postgres_18
+                        time:   [73.906 µs 74.064 µs 74.212 µs]
+                        change: [+0.2157% +0.6859% +1.2350%] (p = 0.01 < 0.05)
+                        Change within noise threshold.
+Found 3 outliers among 20 measurements (15.00%)
+  2 (10.00%) low mild
+  1 (5.00%) high mild
+
+Benchmarking tier1_update_row/pg_fake
+Benchmarking tier1_update_row/pg_fake: Warming up for 1.0000 s
+Benchmarking tier1_update_row/pg_fake: Collecting 20 samples in estimated 2.0015 s (18k iterations)
+Benchmarking tier1_update_row/pg_fake: Analyzing
+tier1_update_row/pg_fake
+                        time:   [42.351 µs 78.081 µs 116.41 µs]
+                        change: [-4.9804% +26.808% +73.877%] (p = 0.23 > 0.05)
+                        No change in performance detected.
+Found 5 outliers among 20 measurements (25.00%)
+  2 (10.00%) low mild
+  3 (15.00%) high severe
+Benchmarking tier1_update_row/postgres_18
+Benchmarking tier1_update_row/postgres_18: Warming up for 1.0000 s
+Benchmarking tier1_update_row/postgres_18: Collecting 20 samples in estimated 2.0515 s (7560 iterations)
+Benchmarking tier1_update_row/postgres_18: Analyzing
+tier1_update_row/postgres_18
+                        time:   [91.118 µs 92.072 µs 93.078 µs]
+                        change: [-3.3632% -0.2911% +2.9579%] (p = 0.86 > 0.05)
+                        No change in performance detected.
+Found 2 outliers among 20 measurements (10.00%)
+  1 (5.00%) low severe
+  1 (5.00%) low mild
+
+Benchmarking tier1_transaction_insert/pg_fake
+Benchmarking tier1_transaction_insert/pg_fake: Warming up for 1.0000 s
+Benchmarking tier1_transaction_insert/pg_fake: Collecting 20 samples in estimated 2.0001 s (46k iterations)
+Benchmarking tier1_transaction_insert/pg_fake: Analyzing
+tier1_transaction_insert/pg_fake
+                        time:   [42.485 µs 42.984 µs 43.870 µs]
+                        change: [-4.6295% -2.1347% +0.4301%] (p = 0.13 > 0.05)
+                        No change in performance detected.
+Found 2 outliers among 20 measurements (10.00%)
+  2 (10.00%) high severe
+Benchmarking tier1_transaction_insert/postgres_18
+Benchmarking tier1_transaction_insert/postgres_18: Warming up for 1.0000 s
+Benchmarking tier1_transaction_insert/postgres_18: Collecting 20 samples in estimated 2.0120 s (17k iterations)
+Benchmarking tier1_transaction_insert/postgres_18: Analyzing
+tier1_transaction_insert/postgres_18
+                        time:   [118.01 µs 118.26 µs 118.48 µs]
+                        change: [-1.0233% -0.2013% +0.6342%] (p = 0.67 > 0.05)
+                        No change in performance detected.
+Found 1 outliers among 20 measurements (5.00%)
+  1 (5.00%) low severe
+
+Benchmarking tier1_select_100_rows/pg_fake
+Benchmarking tier1_select_100_rows/pg_fake: Warming up for 1.0000 s
+Benchmarking tier1_select_100_rows/pg_fake: Collecting 20 samples in estimated 2.0005 s (74k iterations)
+Benchmarking tier1_select_100_rows/pg_fake: Analyzing
+tier1_select_100_rows/pg_fake
+                        time:   [27.014 µs 27.112 µs 27.241 µs]
+                        change: [-2.1275% -1.6158% -1.0614%] (p = 0.00 < 0.05)
+                        Performance has improved.
+Found 1 outliers among 20 measurements (5.00%)
+  1 (5.00%) low mild
+Benchmarking tier1_select_100_rows/postgres_18
+Benchmarking tier1_select_100_rows/postgres_18: Warming up for 1.0000 s
+Benchmarking tier1_select_100_rows/postgres_18: Collecting 20 samples in estimated 2.0021 s (34k iterations)
+Benchmarking tier1_select_100_rows/postgres_18: Analyzing
+tier1_select_100_rows/postgres_18
+                        time:   [57.938 µs 58.203 µs 58.490 µs]
+                        change: [-0.7273% -0.0042% +0.6639%] (p = 0.99 > 0.05)
+                        No change in performance detected.
+Found 2 outliers among 20 measurements (10.00%)
+  1 (5.00%) low mild
+  1 (5.00%) high mild
+
+Benchmarking tier1_select_where_100_rows/pg_fake
+Benchmarking tier1_select_where_100_rows/pg_fake: Warming up for 1.0000 s
+Benchmarking tier1_select_where_100_rows/pg_fake: Collecting 20 samples in estimated 2.0008 s (142k iterations)
+Benchmarking tier1_select_where_100_rows/pg_fake: Analyzing
+tier1_select_where_100_rows/pg_fake
+                        time:   [14.154 µs 14.247 µs 14.344 µs]
+                        change: [-7.3159% -6.8880% -6.4211%] (p = 0.00 < 0.05)
+                        Performance has improved.
+Found 1 outliers among 20 measurements (5.00%)
+  1 (5.00%) high mild
+Benchmarking tier1_select_where_100_rows/postgres_18
+Benchmarking tier1_select_where_100_rows/postgres_18: Warming up for 1.0000 s
+Benchmarking tier1_select_where_100_rows/postgres_18: Collecting 20 samples in estimated 2.0053 s (56k iterations)
+Benchmarking tier1_select_where_100_rows/postgres_18: Analyzing
+tier1_select_where_100_rows/postgres_18
+                        time:   [34.430 µs 34.638 µs 34.919 µs]
+                        change: [-1.3981% -0.2638% +0.8029%] (p = 0.65 > 0.05)
+                        No change in performance detected.
+Found 1 outliers among 20 measurements (5.00%)
+  1 (5.00%) high mild
+
+Benchmarking tier1_select_where_indexed_100_rows/pg_fake
+Benchmarking tier1_select_where_indexed_100_rows/pg_fake: Warming up for 1.0000 s
+Benchmarking tier1_select_where_indexed_100_rows/pg_fake: Collecting 20 samples in estimated 2.0007 s (248k iterations)
+Benchmarking tier1_select_where_indexed_100_rows/pg_fake: Analyzing
+tier1_select_where_indexed_100_rows/pg_fake
+                        time:   [8.1551 µs 8.1958 µs 8.2582 µs]
+                        change: [+12.197% +13.292% +14.440%] (p = 0.00 < 0.05)
+                        Performance has regressed.
+Found 1 outliers among 20 measurements (5.00%)
+  1 (5.00%) high mild
+Benchmarking tier1_select_where_indexed_100_rows/postgres_18
+Benchmarking tier1_select_where_indexed_100_rows/postgres_18: Warming up for 1.0000 s
+Benchmarking tier1_select_where_indexed_100_rows/postgres_18: Collecting 20 samples in estimated 2.0029 s (66k iterations)
+Benchmarking tier1_select_where_indexed_100_rows/postgres_18: Analyzing
+tier1_select_where_indexed_100_rows/postgres_18
+                        time:   [29.768 µs 29.936 µs 30.068 µs]
+                        change: [+0.0576% +0.8344% +1.8752%] (p = 0.08 > 0.05)
+                        No change in performance detected.
+Found 2 outliers among 20 measurements (10.00%)
+  1 (5.00%) low mild
+  1 (5.00%) high mild
+
+Benchmarking tier1_limit_offset_ordered_100_rows/pg_fake
+Benchmarking tier1_limit_offset_ordered_100_rows/pg_fake: Warming up for 1.0000 s
+Benchmarking tier1_limit_offset_ordered_100_rows/pg_fake: Collecting 20 samples in estimated 2.0042 s (61k iterations)
+Benchmarking tier1_limit_offset_ordered_100_rows/pg_fake: Analyzing
+tier1_limit_offset_ordered_100_rows/pg_fake
+                        time:   [32.710 µs 32.802 µs 32.915 µs]
+                        change: [-3.3716% -2.5852% -1.5754%] (p = 0.00 < 0.05)
+                        Performance has improved.
+Found 3 outliers among 20 measurements (15.00%)
+  1 (5.00%) high mild
+  2 (10.00%) high severe
+Benchmarking tier1_limit_offset_ordered_100_rows/postgres_18
+Benchmarking tier1_limit_offset_ordered_100_rows/postgres_18: Warming up for 1.0000 s
+Benchmarking tier1_limit_offset_ordered_100_rows/postgres_18: Collecting 20 samples in estimated 2.0026 s (47k iterations)
+Benchmarking tier1_limit_offset_ordered_100_rows/postgres_18: Analyzing
+tier1_limit_offset_ordered_100_rows/postgres_18
+                        time:   [41.595 µs 41.710 µs 41.850 µs]
+                        change: [-1.0793% -0.7233% -0.2770%] (p = 0.00 < 0.05)
+                        Change within noise threshold.
+Found 2 outliers among 20 measurements (10.00%)
+  1 (5.00%) low mild
+  1 (5.00%) high severe
+
+Benchmarking tier1_order_by_100_rows/pg_fake
+Benchmarking tier1_order_by_100_rows/pg_fake: Warming up for 1.0000 s
+Benchmarking tier1_order_by_100_rows/pg_fake: Collecting 20 samples in estimated 2.0023 s (52k iterations)
+Benchmarking tier1_order_by_100_rows/pg_fake: Analyzing
+tier1_order_by_100_rows/pg_fake
+                        time:   [37.755 µs 37.868 µs 37.963 µs]
+                        change: [-2.5469% -2.2293% -1.9352%] (p = 0.00 < 0.05)
+                        Performance has improved.
+Benchmarking tier1_order_by_100_rows/postgres_18
+Benchmarking tier1_order_by_100_rows/postgres_18: Warming up for 1.0000 s
+Benchmarking tier1_order_by_100_rows/postgres_18: Collecting 20 samples in estimated 2.0090 s (30k iterations)
+Benchmarking tier1_order_by_100_rows/postgres_18: Analyzing
+tier1_order_by_100_rows/postgres_18
+                        time:   [65.983 µs 66.080 µs 66.161 µs]
+                        change: [-0.4619% -0.1986% +0.0667%] (p = 0.17 > 0.05)
+                        No change in performance detected.
+Found 2 outliers among 20 measurements (10.00%)
+  1 (5.00%) low mild
+  1 (5.00%) high mild
+
+Benchmarking tier1_selective_inner_join/pg_fake
+Benchmarking tier1_selective_inner_join/pg_fake: Warming up for 1.0000 s
+Benchmarking tier1_selective_inner_join/pg_fake: Collecting 20 samples in estimated 2.0008 s (22k iterations)
+Benchmarking tier1_selective_inner_join/pg_fake: Analyzing
+tier1_selective_inner_join/pg_fake
+                        time:   [89.899 µs 90.332 µs 90.957 µs]
+                        thrpt:  [10.994 Kelem/s 11.070 Kelem/s 11.124 Kelem/s]
+                 change:
+                        time:   [-4.2713% -2.2127% -0.9699%] (p = 0.01 < 0.05)
+                        thrpt:  [+0.9794% +2.2627% +4.4619%]
+                        Change within noise threshold.
+Found 2 outliers among 20 measurements (10.00%)
+  1 (5.00%) high mild
+  1 (5.00%) high severe
+Benchmarking tier1_selective_inner_join/postgres_18
+Benchmarking tier1_selective_inner_join/postgres_18: Warming up for 1.0000 s
+Benchmarking tier1_selective_inner_join/postgres_18: Collecting 20 samples in estimated 2.0041 s (49k iterations)
+Benchmarking tier1_selective_inner_join/postgres_18: Analyzing
+tier1_selective_inner_join/postgres_18
+                        time:   [39.607 µs 39.783 µs 40.037 µs]
+                        thrpt:  [24.977 Kelem/s 25.136 Kelem/s 25.248 Kelem/s]
+                 change:
+                        time:   [-0.2232% +0.3150% +0.9038%] (p = 0.31 > 0.05)
+                        thrpt:  [-0.8957% -0.3140% +0.2237%]
+                        No change in performance detected.
+Found 3 outliers among 20 measurements (15.00%)
+  1 (5.00%) low mild
+  1 (5.00%) high mild
+  1 (5.00%) high severe
+
+Benchmarking tier1_many_match_inner_join/pg_fake
+Benchmarking tier1_many_match_inner_join/pg_fake: Warming up for 1.0000 s
+Benchmarking tier1_many_match_inner_join/pg_fake: Collecting 20 samples in estimated 2.0272 s (13k iterations)
+Benchmarking tier1_many_match_inner_join/pg_fake: Analyzing
+tier1_many_match_inner_join/pg_fake
+                        time:   [158.86 µs 159.06 µs 159.29 µs]
+                        thrpt:  [627.79 Kelem/s 628.71 Kelem/s 629.49 Kelem/s]
+                 change:
+                        time:   [+0.1239% +0.3464% +0.5534%] (p = 0.00 < 0.05)
+                        thrpt:  [-0.5503% -0.3452% -0.1237%]
+                        Change within noise threshold.
+Found 3 outliers among 20 measurements (15.00%)
+  3 (15.00%) high mild
+Benchmarking tier1_many_match_inner_join/postgres_18
+Benchmarking tier1_many_match_inner_join/postgres_18: Warming up for 1.0000 s
+Benchmarking tier1_many_match_inner_join/postgres_18: Collecting 20 samples in estimated 2.0013 s (30k iterations)
+Benchmarking tier1_many_match_inner_join/postgres_18: Analyzing
+tier1_many_match_inner_join/postgres_18
+                        time:   [65.759 µs 65.825 µs 65.906 µs]
+                        thrpt:  [1.5173 Melem/s 1.5192 Melem/s 1.5207 Melem/s]
+                 change:
+                        time:   [-0.8187% -0.3110% +0.2993%] (p = 0.32 > 0.05)
+                        thrpt:  [-0.2984% +0.3119% +0.8255%]
+                        No change in performance detected.
+Found 2 outliers among 20 measurements (10.00%)
+  2 (10.00%) high mild

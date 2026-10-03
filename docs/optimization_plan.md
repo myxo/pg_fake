@@ -1,6 +1,6 @@
 # Tier 1 optimization plan
 
-**Status: implementation authorized. O1 is complete; O2–O9 remain pending.**
+**Status: implementation authorized. O1–O2 are complete; O3–O9 remain pending.**
 
 Research date: 2026-10-03. Scope: make everyday inserts, updates, transactions,
 selects, ordering/paging and simple inner joins substantially faster while
@@ -215,7 +215,7 @@ measuring each optimization. Keep generated captures under `target/`.
 Completed 2026-10-03 with only these focused benchmark changes. No additional
 runner, filtering, result checks or revision-tracking layer is needed.
 
-### O2 — Bound retained SQLx statement memory [PENDING]
+### O2 — Bound retained SQLx statement memory [COMPLETE]
 
 **Effort:** 1–3 days. **Dependency:** O1. **Confidence:** high for memory reduction;
 low for a large latency gain.
@@ -237,6 +237,15 @@ accounting. RSS is diagnostic, not an assertion that allocator RSS equals the
 cache limit. All Tier 1 timings must satisfy the rules above: memory reduction
 alone does not qualify this optimization for commit without a noticeable time
 reduction. Disabling caching or rewriting literal SQL is not the proposed default.
+
+Completed 2026-10-03. The SQLx cache now accounts for typed keys, prepared
+syntax/metadata, replan state and conservatively estimated catalog definitions,
+with a 2,048-entry backstop. Catalog dependencies share immutable schemas.
+The matched distinct-literal insert median improves 41.323→38.280 us (7.36%);
+32k peak RSS falls 635.55→34.72 MiB, and 100k RSS is 81.16 MiB. Focused
+Tier 1 repeats resolve noisy full-run update/indexed/join readings without a
+confirmed slowdown. Raw timings, memory measurements, Tier 1 comparisons and
+validation notes are in [O2 evidence](optimization_evidence/2026-10-03-o2/summary.md).
 
 ### O3 — Compile ordinary inner joins and their filters [PENDING]
 

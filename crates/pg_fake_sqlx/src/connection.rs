@@ -27,6 +27,7 @@ use crate::{
 };
 
 pub const DEFAULT_STATEMENT_CACHE_LIMIT_BYTES: usize = 100 * 1024 * 1024;
+const MAX_STATEMENT_CACHE_ENTRIES: usize = 2048;
 
 #[derive(Debug)]
 pub struct PgFake;
@@ -152,9 +153,14 @@ impl ConnectOptions for PgFakeConnectOptions {
 
 struct ConnectionState {
     session: Session,
-    statements: LinkedHashMap<(String, Vec<Option<BaseType>>), Arc<CoreStatement>>,
+    statements: LinkedHashMap<(String, Vec<Option<BaseType>>), CachedStatement>,
     statement_cache_bytes: usize,
     statement_cache_limit_bytes: usize,
+}
+
+struct CachedStatement {
+    statement: Arc<CoreStatement>,
+    owned_bytes: usize,
 }
 
 impl ConnectionState {
@@ -166,13 +172,45 @@ impl ConnectionState {
     }
 
     fn prune_cached_statements(&mut self) {
-        while self.statement_cache_bytes > self.statement_cache_limit_bytes {
-            let ((sql, _), _) = self
+        while self.statement_cache_bytes > self.statement_cache_limit_bytes
+            || self.statements.len() > MAX_STATEMENT_CACHE_ENTRIES
+        {
+            let (_, cached) = self
                 .statements
                 .pop_front()
                 .expect("cache must contain an entry while over its byte limit");
-            self.statement_cache_bytes -= sql.len();
+            self.statement_cache_bytes -= cached.owned_bytes;
         }
+    }
+
+    fn insert_cached_statement(
+        &mut self,
+        key: (String, Vec<Option<BaseType>>),
+        statement: Arc<CoreStatement>,
+    ) {
+        let owned_bytes = statement
+            .estimate_owned_bytes()
+            .saturating_add(key.0.capacity())
+            .saturating_add(key.1.capacity() * std::mem::size_of::<Option<BaseType>>())
+            .saturating_add(std::mem::size_of::<CachedStatement>())
+            .saturating_add(std::mem::size_of::<(String, Vec<Option<BaseType>>)>());
+        if owned_bytes > self.statement_cache_limit_bytes {
+            if let Some(previous) = self.statements.remove(&key) {
+                self.statement_cache_bytes -= previous.owned_bytes;
+            }
+            return;
+        }
+        if let Some(previous) = self.statements.insert(
+            key,
+            CachedStatement {
+                statement,
+                owned_bytes,
+            },
+        ) {
+            self.statement_cache_bytes -= previous.owned_bytes;
+        }
+        self.statement_cache_bytes += owned_bytes;
+        self.prune_cached_statements();
     }
 }
 
@@ -257,21 +295,15 @@ impl PgFakeConnection {
                     let prepared = if let Some(statement) = statement {
                         statement.statement
                     } else if persistent {
-                        if let Some(statement) = state.statements.to_back(&cache_key) {
-                            statement.clone()
+                        if let Some(cached) = state.statements.to_back(&cache_key) {
+                            cached.statement.clone()
                         } else {
                             let statement = state
                                 .session
                                 .prepare_with_parameter_types(&sql, &parameter_types)
                                 .map(Arc::new)
                                 .map_err(database_error)?;
-                            if sql.len() <= state.statement_cache_limit_bytes {
-                                state.statement_cache_bytes += sql.len();
-                                state
-                                    .statements
-                                    .insert(cache_key.clone(), statement.clone());
-                                state.prune_cached_statements();
-                            }
+                            state.insert_cached_statement(cache_key.clone(), statement.clone());
                             statement
                         }
                     } else {
@@ -281,9 +313,16 @@ impl PgFakeConnection {
                             .map(Arc::new)
                             .map_err(database_error)?
                     };
+                    let replan_revision = prepared.get_replan_revision();
                     let result = state
                         .session
                         .execute_prepared_statement(&prepared, &arguments.values);
+                    if persistent
+                        && !is_explicit_statement
+                        && prepared.get_replan_revision() != replan_revision
+                    {
+                        state.insert_cached_statement(cache_key.clone(), prepared.clone());
+                    }
                     let result = if persistent
                         && !is_explicit_statement
                         && matches!(
@@ -297,9 +336,7 @@ impl PgFakeConnection {
                             .prepare_with_parameter_types(&sql, &parameter_types)
                             .map(Arc::new)
                             .map_err(database_error)?;
-                        if sql.len() <= state.statement_cache_limit_bytes {
-                            state.statements.insert(cache_key, prepared.clone());
-                        }
+                        state.insert_cached_statement(cache_key, prepared.clone());
                         state
                             .session
                             .execute_prepared_statement(&prepared, &arguments.values)

@@ -1,0 +1,11 @@
+connect to manually setup postgres on postgresql://myxo@127.0.0.1:5432/postgres
+Benchmarking tier1_select_where_indexed_100_rows/pg_fake
+Benchmarking tier1_select_where_indexed_100_rows/pg_fake: Warming up for 2.0000 s
+Benchmarking tier1_select_where_indexed_100_rows/pg_fake: Collecting 30 samples in estimated 5.0022 s (579k iterations)
+Benchmarking tier1_select_where_indexed_100_rows/pg_fake: Analyzing
+tier1_select_where_indexed_100_rows/pg_fake
+                        time:   [8.4183 µs 8.4568 µs 8.4902 µs]
+                        change: [-2.4300% -1.9840% -1.5472%] (p = 0.00 < 0.05)
+                        Performance has improved.
+Found 2 outliers among 30 measurements (6.67%)
+  2 (6.67%) low mild

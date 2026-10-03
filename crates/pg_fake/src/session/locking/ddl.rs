@@ -451,7 +451,7 @@ pub(super) fn collect_ddl_relation_locks(
                             .entry(
                                 ResolvedRelationName {
                                     schema_id: schema.schema_id,
-                                    name: schema.name,
+                                    name: schema.name.clone(),
                                 }
                                 .get_lock_name(),
                             )
@@ -462,7 +462,7 @@ pub(super) fn collect_ddl_relation_locks(
                             .entry(
                                 ResolvedRelationName {
                                     schema_id: schema.schema_id,
-                                    name: schema.name,
+                                    name: schema.name.clone(),
                                 }
                                 .get_lock_name(),
                             )

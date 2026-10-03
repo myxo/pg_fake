@@ -1,4 +1,5 @@
 use sqlparser::ast;
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use crate::{
     analyzer,
@@ -22,6 +23,7 @@ pub struct PreparedStatement {
     source_sql: String,
     pub(super) literal_timezone: String,
     replanned: std::sync::Arc<std::sync::Mutex<Option<std::sync::Arc<PreparedStatement>>>>,
+    replan_revision: std::sync::Arc<AtomicU64>,
     pub(super) parameter_types: Vec<crate::value::BaseType>,
     pub(super) columns: Vec<ColumnMeta>,
     pub(super) query_plan: Option<executor::PreparedQueryPlan>,
@@ -274,6 +276,7 @@ impl Session {
                 source_sql: sql.into(),
                 literal_timezone: self.settings.timezone.clone(),
                 replanned: Default::default(),
+                replan_revision: Default::default(),
                 statement,
                 parameter_types,
                 columns,
@@ -322,6 +325,7 @@ impl Session {
         params: &[Value],
     ) -> Result<StatementResult> {
         let replan_cache = &statement.replanned;
+        let replan_revision = &statement.replan_revision;
         let cached = replan_cache
             .lock()
             .expect("prepared statement mutex is poisoned")
@@ -345,6 +349,7 @@ impl Session {
             *replan_cache
                 .lock()
                 .expect("prepared statement mutex is poisoned") = Some(refreshed.clone());
+            replan_revision.fetch_add(1, Ordering::Relaxed);
             return self.execute_prepared_statement(&refreshed, params);
         }
         let parameters;
@@ -447,6 +452,52 @@ impl Session {
 }
 
 impl PreparedStatement {
+    pub fn get_replan_revision(&self) -> u64 {
+        self.replan_revision.load(Ordering::Relaxed)
+    }
+
+    pub fn estimate_owned_bytes(&self) -> usize {
+        let own = self.estimate_base_owned_bytes();
+        let replanned = self
+            .replanned
+            .lock()
+            .expect("prepared statement mutex is poisoned");
+        own.max(
+            replanned
+                .as_ref()
+                .map_or(own, |statement| statement.estimate_base_owned_bytes()),
+        )
+        .saturating_mul(2)
+    }
+
+    fn estimate_base_owned_bytes(&self) -> usize {
+        let expanded = self
+            .expanded_views_statement
+            .as_ref()
+            .map_or(0, |statement| statement.to_string().len());
+        let syntax_bytes = self
+            .source_sql
+            .capacity()
+            .saturating_add(expanded)
+            .saturating_mul(512);
+        let metadata_bytes = self
+            .catalog_dependencies
+            .iter()
+            .map(CatalogDependency::estimate_retained_bytes)
+            .fold(0usize, usize::saturating_add)
+            .saturating_add(self.columns.len().saturating_mul(512))
+            .saturating_add(self.parameter_types.len().saturating_mul(128))
+            .saturating_add(
+                self.relation_locks
+                    .as_ref()
+                    .map_or(0, |locks| locks.len().saturating_mul(1024)),
+            );
+        std::mem::size_of::<Self>()
+            .saturating_add(32 * 1024)
+            .saturating_add(syntax_bytes)
+            .saturating_add(metadata_bytes)
+    }
+
     #[cfg_attr(feature = "execution-log", tracing::instrument(skip_all))]
     pub fn get_parameter_types(&self) -> &[crate::value::BaseType] {
         &self.parameter_types

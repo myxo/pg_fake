@@ -73,6 +73,36 @@ impl Default for Catalog {
 }
 
 impl Catalog {
+    pub(crate) fn clone_named_table(&self, name: &RelationName) -> Result<Arc<TableSchema>> {
+        let table = self.require_named_table(name)?;
+        Ok(self
+            .get_schema_by_id(table.schema_id)
+            .tables
+            .get(&table.name)
+            .expect("resolved table belongs to its schema")
+            .clone())
+    }
+
+    pub(crate) fn clone_named_view(&self, name: &RelationName) -> Result<Arc<ViewSchema>> {
+        let view = self.require_named_view(name)?;
+        Ok(self
+            .get_schema_by_id(view.schema_id)
+            .views
+            .get(&view.name)
+            .expect("resolved view belongs to its schema")
+            .clone())
+    }
+
+    pub(crate) fn clone_named_sequence(&self, name: &RelationName) -> Result<Arc<SequenceSchema>> {
+        let sequence = self.require_named_sequence(name)?;
+        Ok(self
+            .get_schema_by_id(sequence.schema_id)
+            .sequences
+            .get(&sequence.name)
+            .expect("resolved sequence belongs to its schema")
+            .clone())
+    }
+
     pub(crate) fn create_identity(&self) -> CatalogIdentity {
         CatalogIdentity(Arc::downgrade(&self.relations))
     }

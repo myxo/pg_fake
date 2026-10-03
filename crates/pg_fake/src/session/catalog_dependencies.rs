@@ -1,9 +1,10 @@
 use sqlparser::ast::{self, Visit as _};
+use std::sync::Arc;
 
 use crate::{
     catalog::{
-        ConstraintId, RelationName, ResolvedRelationName, SequenceSchema, TableId, TableSchema,
-        ViewSchema,
+        Constraint, ConstraintId, RelationName, ResolvedRelationName, SequenceSchema, TableId,
+        TableSchema, ViewSchema,
     },
     error::{PgError, Result, SqlState},
     executor,
@@ -13,11 +14,11 @@ use crate::{
 pub(super) enum CatalogDependency {
     Table {
         name: RelationName,
-        schema: TableSchema,
+        schema: Arc<TableSchema>,
     },
     Sequence {
         name: RelationName,
-        schema: SequenceSchema,
+        schema: Arc<SequenceSchema>,
     },
     Constraint {
         table: TableId,
@@ -25,8 +26,95 @@ pub(super) enum CatalogDependency {
     },
     View {
         name: RelationName,
-        schema: ViewSchema,
+        schema: Arc<ViewSchema>,
     },
+}
+
+impl CatalogDependency {
+    pub(super) fn estimate_retained_bytes(&self) -> usize {
+        // Catalog schemas can outlive DROP through a cached prepared statement.
+        // SQL rendering captures variable-length AST content; the large factor
+        // also covers the nodes, vectors and spare capacity behind that text.
+        let text = match self {
+            Self::Table { schema, .. } => {
+                let mut bytes = schema.name.len().saturating_add(4096);
+                for column in &schema.columns {
+                    bytes = bytes.saturating_add(column.name.len() + 256);
+                    if let Some(default) = &column.default {
+                        bytes = bytes.saturating_add(default.to_string().len());
+                    }
+                    if let Some(sequence) = &column.default_sequence {
+                        bytes = bytes.saturating_add(sequence.name.len());
+                    }
+                }
+                for constraint in &schema.constraints {
+                    bytes = bytes.saturating_add(match constraint {
+                        Constraint::PrimaryKey { name, columns, .. }
+                        | Constraint::Unique { name, columns, .. } => {
+                            name.len() + columns.iter().map(String::len).sum::<usize>()
+                        }
+                        Constraint::Check {
+                            name, expression, ..
+                        } => name.len() + expression.to_string().len(),
+                        Constraint::ForeignKey(foreign) => {
+                            foreign.name.len()
+                                + foreign.foreign_table.name.len()
+                                + foreign.foreign_table.schema.as_ref().map_or(0, String::len)
+                                + foreign.columns.iter().map(String::len).sum::<usize>()
+                                + foreign
+                                    .referred_columns
+                                    .iter()
+                                    .map(String::len)
+                                    .sum::<usize>()
+                        }
+                    });
+                }
+                for index in &schema.indexes {
+                    bytes = bytes.saturating_add(index.name.len() + 256);
+                    bytes = bytes.saturating_add(
+                        index
+                            .columns
+                            .iter()
+                            .map(|column| column.name.len())
+                            .sum::<usize>()
+                            + index.include.iter().map(String::len).sum::<usize>(),
+                    );
+                    if let Some(predicate) = &index.predicate {
+                        bytes = bytes.saturating_add(predicate.to_string().len());
+                    }
+                }
+                for trigger in &schema.triggers {
+                    bytes = bytes
+                        .saturating_add(trigger.name.len() + trigger.definition.to_string().len());
+                }
+                bytes
+            }
+            Self::View { schema, .. } => {
+                schema.name.len()
+                    + schema.query.to_string().len()
+                    + schema.comment.as_ref().map_or(0, String::len)
+                    + schema
+                        .columns
+                        .iter()
+                        .map(|column| column.name.len() + 256)
+                        .sum::<usize>()
+                    + schema.dependencies.len().saturating_mul(64)
+                    + schema
+                        .column_dependencies
+                        .values()
+                        .map(|columns| columns.iter().map(String::len).sum::<usize>() + 128)
+                        .sum::<usize>()
+                    + 4096
+            }
+            Self::Sequence { schema, .. } => {
+                schema.name.len()
+                    + schema.owned_by.as_ref().map_or(0, |(_, name)| name.len())
+                    + 1024
+            }
+            Self::Constraint { .. } => 1024,
+        };
+        text.saturating_mul(512)
+    }
 }
 
 pub(super) fn extract_sequence_name(expression: &ast::Expr) -> Option<&str> {
@@ -126,10 +214,10 @@ impl CatalogDependencyCollector<'_> {
         if executor::describe_visible_system_relation(self.catalog, &name).is_some() {
             return Ok(());
         }
-        let table = match self.catalog.require_named_table(&name) {
-            Ok(table) => table.clone(),
+        let table = match self.catalog.clone_named_table(&name) {
+            Ok(table) => table,
             Err(error) if error.sqlstate == SqlState::WrongObjectType => {
-                let view = self.catalog.require_named_view(&name)?.clone();
+                let view = self.catalog.clone_named_view(&name)?;
                 self.add_dependency(CatalogDependency::View {
                     name,
                     schema: view.clone(),
@@ -169,7 +257,7 @@ impl CatalogDependencyCollector<'_> {
                 ),
                 sequence_name.name.clone(),
             );
-            let sequence = self.catalog.require_named_sequence(&name)?.clone();
+            let sequence = self.catalog.clone_named_sequence(&name)?;
             self.add_dependency(CatalogDependency::Sequence {
                 name,
                 schema: sequence,
@@ -254,11 +342,11 @@ impl ast::Visitor for CatalogDependencyCollector<'_> {
                 return std::ops::ControlFlow::Break(());
             }
         };
-        match self.catalog.require_named_sequence(&name) {
+        match self.catalog.clone_named_sequence(&name) {
             Ok(sequence) => {
                 self.add_dependency(CatalogDependency::Sequence {
                     name,
-                    schema: sequence.clone(),
+                    schema: sequence,
                 });
                 std::ops::ControlFlow::Continue(())
             }
@@ -298,10 +386,10 @@ pub(super) fn collect_catalog_dependencies<'a>(
                     let Ok(name) = executor::normalize_relation_name(name) else {
                         continue;
                     };
-                    if let Ok(table) = catalog.require_named_table(&name) {
+                    if let Ok(table) = catalog.clone_named_table(&name) {
                         collector.add_dependency(CatalogDependency::Table {
                             name,
-                            schema: table.clone(),
+                            schema: table,
                         });
                     }
                 }
@@ -315,10 +403,10 @@ pub(super) fn collect_catalog_dependencies<'a>(
                     let Ok(name) = executor::normalize_relation_name(name) else {
                         continue;
                     };
-                    if let Ok(sequence) = catalog.require_named_sequence(&name) {
+                    if let Ok(sequence) = catalog.clone_named_sequence(&name) {
                         collector.add_dependency(CatalogDependency::Sequence {
                             name,
-                            schema: sequence.clone(),
+                            schema: sequence,
                         });
                     }
                 }
@@ -386,7 +474,12 @@ pub(super) fn validate_catalog_dependencies(
                 Err(error) => return Some(error),
             }
             match catalog.require_table_by_id(schema.id) {
-                Ok(table) if does_prepared_table_match(table, schema) => None,
+                Ok(table)
+                    if std::ptr::eq(table, schema.as_ref())
+                        || does_prepared_table_match(table, schema) =>
+                {
+                    None
+                }
                 Ok(_) => Some(PgError::create(
                     SqlState::FeatureNotSupported,
                     "cached plan must be replanned",
@@ -422,7 +515,11 @@ pub(super) fn validate_catalog_dependencies(
                 .iterate_sequences()
                 .find(|sequence| sequence.id == schema.id)
             {
-                Some(sequence) if sequence == schema => None,
+                Some(sequence)
+                    if std::ptr::eq(sequence, schema.as_ref()) || sequence == schema.as_ref() =>
+                {
+                    None
+                }
                 Some(_) => Some(PgError::create(
                     SqlState::FeatureNotSupported,
                     "cached plan must be replanned",
@@ -456,13 +553,14 @@ pub(super) fn validate_catalog_dependencies(
         }
         CatalogDependency::View { name, schema } => match catalog.require_named_view(name) {
             Ok(view)
-                if view.id == schema.id
-                    && view.schema_id == schema.schema_id
-                    && view.name == schema.name
-                    && view.columns == schema.columns
-                    && view.query == schema.query
-                    && view.dependencies == schema.dependencies
-                    && view.column_dependencies == schema.column_dependencies =>
+                if std::ptr::eq(view, schema.as_ref())
+                    || (view.id == schema.id
+                        && view.schema_id == schema.schema_id
+                        && view.name == schema.name
+                        && view.columns == schema.columns
+                        && view.query == schema.query
+                        && view.dependencies == schema.dependencies
+                        && view.column_dependencies == schema.column_dependencies) =>
             {
                 None
             }

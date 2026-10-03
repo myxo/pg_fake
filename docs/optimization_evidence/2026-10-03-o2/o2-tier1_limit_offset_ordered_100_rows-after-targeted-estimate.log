@@ -1,0 +1,9 @@
+connect to manually setup postgres on postgresql://myxo@127.0.0.1:5432/postgres
+Benchmarking tier1_limit_offset_ordered_100_rows/pg_fake
+Benchmarking tier1_limit_offset_ordered_100_rows/pg_fake: Warming up for 2.0000 s
+Benchmarking tier1_limit_offset_ordered_100_rows/pg_fake: Collecting 30 samples in estimated 5.0085 s (163k iterations)
+Benchmarking tier1_limit_offset_ordered_100_rows/pg_fake: Analyzing
+tier1_limit_offset_ordered_100_rows/pg_fake
+                        time:   [30.662 µs 30.701 µs 30.740 µs]
+                        change: [-0.2158% +0.2453% +0.6593%] (p = 0.30 > 0.05)
+                        No change in performance detected.
