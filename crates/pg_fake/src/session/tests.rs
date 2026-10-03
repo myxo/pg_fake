@@ -11381,6 +11381,88 @@ fn match_compiled_join_after_unique_index_changes() {
 }
 
 #[test]
+fn match_compiled_join_with_only_right_unique_key() {
+    let db = Db::create();
+    let mut session = db.create_session();
+    session.execute("CREATE TABLE right_probe_left (id integer, payload text); CREATE TABLE right_probe_right (id integer, payload text); INSERT INTO right_probe_left VALUES (1, 'a'), (2, 'b'), (2, 'c'), (NULL, 'd'), (3, 'e'); INSERT INTO right_probe_right VALUES (1, 'one'), (2, 'two'), (NULL, 'null'); CREATE UNIQUE INDEX right_probe_right_id_key ON right_probe_right (id)").unwrap();
+    let sql = "SELECT l.payload, r.payload FROM right_probe_left l JOIN right_probe_right r ON l.id = r.id WHERE l.id = $1";
+    let statement = session.prepare(sql).unwrap();
+    assert!(matches!(
+        statement.query_plan.as_ref(),
+        Some(crate::executor::PreparedReadPlan::UniqueInnerJoin(_))
+    ));
+    for key in [Value::Int4(1), Value::Int4(2), Value::Int4(3), Value::Null] {
+        let actual = session
+            .query_prepared(&statement, std::slice::from_ref(&key))
+            .unwrap();
+        let generic = session.query(&format!("{sql} OFFSET (0)"), &[key]).unwrap();
+        assert_eq!(actual.rows, generic.rows);
+        assert_eq!(actual.columns, generic.columns);
+    }
+    session
+        .execute("DROP INDEX right_probe_right_id_key")
+        .unwrap();
+    let statement = session.prepare(sql).unwrap();
+    assert!(matches!(
+        statement.query_plan.as_ref(),
+        Some(crate::executor::PreparedReadPlan::InnerJoin(_))
+    ));
+    let actual = session
+        .query_prepared(&statement, &[Value::Int4(2)])
+        .unwrap();
+    let generic = session
+        .query(&format!("{sql} OFFSET (0)"), &[Value::Int4(2)])
+        .unwrap();
+    assert_eq!(actual.rows, generic.rows);
+}
+
+#[test]
+fn track_right_only_unique_join_reads() {
+    let db = Db::create();
+    let mut reader = db.create_session();
+    let mut writer = db.create_session();
+    reader.execute("CREATE TABLE probe_read_left (id integer); CREATE TABLE probe_read_right (id integer); CREATE UNIQUE INDEX probe_read_right_id ON probe_read_right (id); INSERT INTO probe_read_left VALUES (1)").unwrap();
+    let statement = reader
+        .prepare("SELECT l.id FROM probe_read_left l JOIN probe_read_right r ON l.id = r.id WHERE l.id = 1")
+        .unwrap();
+    assert!(matches!(
+        statement.query_plan.as_ref(),
+        Some(crate::executor::PreparedReadPlan::UniqueInnerJoin(_))
+    ));
+    reader
+        .execute("BEGIN ISOLATION LEVEL SERIALIZABLE")
+        .unwrap();
+    writer.execute("BEGIN").unwrap();
+    let Some(SessionTransactionState::Active(reader_transaction)) = reader.transaction else {
+        panic!("reader transaction is active")
+    };
+    let Some(SessionTransactionState::Active(writer_transaction)) = writer.transaction else {
+        panic!("writer transaction is active")
+    };
+    assert!(
+        reader
+            .query_prepared(&statement, &[])
+            .unwrap()
+            .rows
+            .is_empty()
+    );
+    writer
+        .execute("INSERT INTO probe_read_right VALUES (1)")
+        .unwrap();
+    assert!(
+        db.state
+            .lock()
+            .unwrap()
+            .serializable
+            .lock()
+            .unwrap()
+            .has_edge(reader_transaction.xid, writer_transaction.xid)
+    );
+    reader.execute("ROLLBACK").unwrap();
+    writer.execute("ROLLBACK").unwrap();
+}
+
+#[test]
 fn match_compiled_unique_join_with_distinct_filter_and_join_keys() {
     let db = Db::create();
     let mut session = db.create_session();

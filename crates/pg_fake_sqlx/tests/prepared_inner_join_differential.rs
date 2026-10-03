@@ -146,5 +146,21 @@ fn compares_generated_integer_inner_joins() {
                 .unwrap();
             assert_eq!(actual, expected, "indexed key={key:?}");
         }
+        let sql = "SELECT l.id, r.id FROM integer_join_left l JOIN indexed_join_right r ON l.id = r.id WHERE l.id = $1";
+        for key in [Some(2_i32), Some(3), None] {
+            let mut expected: Vec<(Option<i32>, Option<i32>)> = sqlx::query_as(sql)
+                .bind(key)
+                .fetch_all(&mut postgres)
+                .await
+                .unwrap();
+            let mut actual: Vec<(Option<i32>, Option<i32>)> = sqlx::query_as(sql)
+                .bind(key)
+                .fetch_all(&mut fake)
+                .await
+                .unwrap();
+            expected.sort();
+            actual.sort();
+            assert_eq!(actual, expected, "right-only index key={key:?}");
+        }
     });
 }

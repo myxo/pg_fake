@@ -343,6 +343,20 @@ update, indexed-select and join repeats resolved noisy full-run readings; raw
 results remain under `target/o4-double-filter-*`. General join
 intermediate-copying work remains pending.
 
+The next O4 access path probes a unique right join key when the left equality
+filter fixes that key, even if the left column is not unique. A fixed 100-row
+left table joined to a right table with 100 or 10,000 rows improves from
+10.248→8.544 µs (16.63%) and 195.096→8.803 µs (95.49%) through SQLx;
+the 10,000-row native prepared probe improves 181.009→2.959 µs (98.37%).
+These are medians of three matched baseline/candidate runs. The full Tier 1
+Criterion comparison and exact repeats found no confirmed slowdown; the
+noisy transaction-insert reading resolved to 42.601→42.662 µs with overlapping
+intervals. Final exact repeats measured the selective and many-match joins at
+11.748→11.681 µs and 21.290→20.812 µs; a reverse-order indexed-select repeat
+measured 8.590→8.261 µs. Heap equality select was flat in exact repeats.
+Raw results remain under `target/o4-asymmetric-*`. General join intermediate
+copying remains pending.
+
 ### O5 — Prepare simple mutation structure once; specialize resumption [PENDING]
 
 **Effort:** 4–7 days. **Dependency:** O1. **Confidence:** high for redundant work;

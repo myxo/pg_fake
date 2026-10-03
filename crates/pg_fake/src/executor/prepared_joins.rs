@@ -266,12 +266,13 @@ pub(crate) fn build_prepared_join_plan(
     };
     let use_unique_probe = state
         .tables
-        .get(&left_schema.id)
-        .is_some_and(|table| table.has_unique_index(&[filter_slot]))
-        && state
-            .tables
-            .get(&right_schema.id)
-            .is_some_and(|table| table.has_unique_index(&[right_key]));
+        .get(&right_schema.id)
+        .is_some_and(|table| table.has_unique_index(&[right_key]))
+        && (filter_slot == left_key
+            || state
+                .tables
+                .get(&left_schema.id)
+                .is_some_and(|table| table.has_unique_index(&[filter_slot])));
     let plan = PreparedInnerJoinPlan {
         left_table_id: left_schema.id,
         right_table_id: right_schema.id,
@@ -450,8 +451,9 @@ fn execute_prepared_unique_join(
         .tables
         .get(&plan.right_table_id)
         .expect("prepared right table must have storage");
-    if !left_table.has_unique_index(&[plan.filter_slot])
-        || !right_table.has_unique_index(&[plan.right_key])
+    let left_unique = left_table.has_unique_index(&[plan.filter_slot]);
+    if !right_table.has_unique_index(&[plan.right_key])
+        || (!left_unique && plan.filter_slot != plan.left_key)
     {
         return execute_prepared_inner_join::<false>(
             state, plan, parameters, xid, snapshot, deadline, timezone, None,
@@ -461,6 +463,63 @@ fn execute_prepared_unique_join(
         evaluate_prepared_expression(&plan.filter_value, &[], parameters, deadline, timezone)?;
     if filter_value.is_null() {
         return Ok(Vec::new());
+    }
+    if !left_unique {
+        let mut left_rows = Vec::new();
+        state.record_read(xid, Access::Relation(plan.left_table_id));
+        for (row_id, chain) in left_table.iterate_version_chains() {
+            let Some(version) = find_visible_version(chain, snapshot, xid, &state.transactions)
+            else {
+                continue;
+            };
+            state.record_read(xid, Access::Row(plan.left_table_id, row_id));
+            if version.row[plan.filter_slot] == filter_value {
+                left_rows.push(&version.row);
+            }
+        }
+        if left_rows.is_empty() {
+            return Ok(Vec::new());
+        }
+        if let Some(key) = right_table
+            .create_unique_read_key(&[plan.right_key], std::slice::from_ref(&filter_value))
+        {
+            state.record_read(
+                xid,
+                Access::Unique(plan.right_table_id, vec![plan.right_key], key),
+            );
+        }
+        let Some((right_row_id, right_version)) = right_table.find_unique_visible_version(
+            &[plan.right_key],
+            std::slice::from_ref(&filter_value),
+            snapshot,
+            xid,
+            &state.transactions,
+        ) else {
+            return Ok(Vec::new());
+        };
+        state.record_read(xid, Access::Row(plan.right_table_id, right_row_id));
+        let mut rows = Vec::with_capacity(left_rows.len());
+        for left in left_rows {
+            if deadline.is_some_and(|deadline| Instant::now() >= deadline) {
+                return Err(PgError::create(
+                    SqlState::QueryCanceled,
+                    "canceling statement due to statement timeout",
+                ));
+            }
+            rows.push(
+                plan.projection
+                    .iter()
+                    .map(|slot| {
+                        if *slot < plan.left_width {
+                            left[*slot].clone()
+                        } else {
+                            right_version.row[*slot - plan.left_width].clone()
+                        }
+                    })
+                    .collect(),
+            );
+        }
+        return Ok(rows);
     }
     if let Some(key) =
         left_table.create_unique_read_key(&[plan.filter_slot], std::slice::from_ref(&filter_value))
