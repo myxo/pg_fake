@@ -330,6 +330,19 @@ regression; exact paired O3/O4 Criterion repeats resolved noisy write readings:
 insert 38.195→37.880 µs, transaction insert 42.435→41.971 µs, and update
 42.717→42.394 µs (20 samples, 1-second warmup, 2-second measurement).
 
+A terminal-stage general hash-join experiment removed match-list and joined-row
+materialization but was discarded: the 100-row two-filter SQLx join measured
+121.600→124.981 µs and the 10,000-row prepared case measured
+8,653.049→8,750.160 µs. The accepted next step compiles an inner join with
+one simple integer equality filter on each source. Matched SQLx probes improve
+120.670→10.475 µs (91.32%) for 100 selective rows,
+310.287→19.767 µs (93.63%) for 100 many-match rows, and
+8,365.555→410.470 µs (95.09%) for 10,000 selective rows. The full Tier 1
+Criterion run and matched repeats found no confirmed slowdown. Exact paired
+update, indexed-select and join repeats resolved noisy full-run readings; raw
+results remain under `target/o4-double-filter-*`. General join
+intermediate-copying work remains pending.
+
 ### O5 — Prepare simple mutation structure once; specialize resumption [PENDING]
 
 **Effort:** 4–7 days. **Dependency:** O1. **Confidence:** high for redundant work;

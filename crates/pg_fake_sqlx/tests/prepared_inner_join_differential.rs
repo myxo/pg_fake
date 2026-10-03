@@ -42,7 +42,7 @@ fn compares_generated_integer_inner_joins() {
                 &format!("DELETE FROM {table}"),
                 RowOrder::Unordered,
             );
-            let values = (0..12)
+            let mut values = (0..12)
                 .map(|index| {
                     let id = if (index + seed) % 7 == 0 {
                         "NULL".to_owned()
@@ -56,8 +56,9 @@ fn compares_generated_integer_inner_joins() {
                     };
                     format!("({id}, {bucket})")
                 })
-                .collect::<Vec<_>>()
-                .join(", ");
+                .collect::<Vec<_>>();
+            values.push("(2, NULL)".to_owned());
+            let values = values.join(", ");
             assert_statement(
                 &runtime,
                 &mut postgres,
@@ -71,6 +72,9 @@ fn compares_generated_integer_inner_joins() {
             "SELECT l.id, r.id FROM integer_join_left l JOIN integer_join_right r ON r.id = l.id WHERE 2 = l.id",
             "SELECT l.bucket, r.bucket FROM integer_join_left l JOIN integer_join_right r ON l.bucket = r.bucket WHERE l.bucket = 0",
             "SELECT l.id, r.id FROM integer_join_left l JOIN integer_join_right r ON l.id = r.id WHERE l.id = 99",
+            "SELECT l.id, r.id FROM integer_join_left l JOIN integer_join_right r ON l.id = r.id WHERE l.id = 2 AND r.id = 2",
+            "SELECT l.id, r.id FROM integer_join_left l JOIN integer_join_right r ON l.id = r.id WHERE l.id = 2 AND r.id = 1",
+            "SELECT l.id, r.id FROM integer_join_left l JOIN integer_join_right r ON l.id = r.id WHERE r.bucket = 0 AND l.id = 2",
         ] {
             assert_statement(&runtime, &mut postgres, &mut fake, sql, RowOrder::Unordered);
         }
@@ -91,6 +95,22 @@ fn compares_generated_integer_inner_joins() {
                 actual.sort();
                 assert_eq!(actual, expected, "seed={seed}, key={key:?}");
             }
+            let sql = "SELECT l.id, r.id FROM integer_join_left l JOIN integer_join_right r ON l.id = r.id WHERE l.id = $1 AND r.bucket = $2";
+            let mut expected: Vec<(Option<i32>, Option<i32>)> = sqlx::query_as(sql)
+                .bind(Some(2_i32))
+                .bind(None::<i32>)
+                .fetch_all(&mut postgres)
+                .await
+                .unwrap();
+            let mut actual: Vec<(Option<i32>, Option<i32>)> = sqlx::query_as(sql)
+                .bind(Some(2_i32))
+                .bind(None::<i32>)
+                .fetch_all(&mut fake)
+                .await
+                .unwrap();
+            expected.sort();
+            actual.sort();
+            assert_eq!(actual, expected, "seed={seed}, right filter NULL");
         });
     }
     assert_statement_allow_error(

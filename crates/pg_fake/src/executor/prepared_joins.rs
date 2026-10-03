@@ -22,6 +22,7 @@ pub(crate) enum PreparedReadPlan {
     Query(PreparedQueryPlan),
     InnerJoin(PreparedInnerJoinPlan),
     UniqueInnerJoin(PreparedInnerJoinPlan),
+    DoubleFilteredInnerJoin(Box<PreparedDoubleFilteredInnerJoinPlan>),
 }
 
 impl PreparedReadPlan {
@@ -29,6 +30,7 @@ impl PreparedReadPlan {
         match self {
             Self::Query(plan) => plan.columns(),
             Self::InnerJoin(plan) | Self::UniqueInnerJoin(plan) => &plan.columns,
+            Self::DoubleFilteredInnerJoin(plan) => &plan.join.columns,
         }
     }
 }
@@ -44,6 +46,58 @@ pub(crate) struct PreparedInnerJoinPlan {
     filter_value: PreparedExpression,
     projection: Vec<usize>,
     columns: Vec<ColumnMeta>,
+}
+
+#[derive(Debug, Clone)]
+pub(crate) struct PreparedDoubleFilteredInnerJoinPlan {
+    join: PreparedInnerJoinPlan,
+    right_filter_slot: usize,
+    right_filter_value: PreparedExpression,
+}
+
+fn extract_integer_join_filter(
+    expression: PreparedExpression,
+) -> Option<(usize, PreparedExpression)> {
+    let PreparedExpression::Binary {
+        left,
+        operator: ast::BinaryOperator::Eq,
+        right,
+        ..
+    } = expression
+    else {
+        return None;
+    };
+    match (*left, *right) {
+        (
+            PreparedExpression::Column {
+                slot,
+                data_type: BaseType::Int4,
+            },
+            value @ (PreparedExpression::Literal {
+                data_type: BaseType::Int4,
+                ..
+            }
+            | PreparedExpression::Parameter {
+                data_type: BaseType::Int4,
+                ..
+            }),
+        )
+        | (
+            value @ (PreparedExpression::Literal {
+                data_type: BaseType::Int4,
+                ..
+            }
+            | PreparedExpression::Parameter {
+                data_type: BaseType::Int4,
+                ..
+            }),
+            PreparedExpression::Column {
+                slot,
+                data_type: BaseType::Int4,
+            },
+        ) => Some((slot, value)),
+        _ => None,
+    }
 }
 
 pub(crate) fn build_prepared_join_plan(
@@ -164,45 +218,33 @@ pub(crate) fn build_prepared_join_plan(
     let Some(selection) = select.selection.as_ref() else {
         return Ok(None);
     };
-    let Some(PreparedExpression::Binary {
-        left,
-        operator: ast::BinaryOperator::Eq,
-        right,
-        ..
-    }) = bind_prepared_expression(selection, &scope, parameter_types)?
-    else {
-        return Ok(None);
+    let filters = match selection {
+        ast::Expr::BinaryOp {
+            left,
+            op: ast::BinaryOperator::And,
+            right,
+        } => vec![left.as_ref(), right.as_ref()],
+        expression => vec![expression],
     };
-    let (filter_slot, filter_value) = match (*left, *right) {
-        (
-            PreparedExpression::Column {
-                slot,
-                data_type: BaseType::Int4,
-            },
-            value @ (PreparedExpression::Literal {
-                data_type: BaseType::Int4,
-                ..
+    let mut left_filter = None;
+    let mut right_filter = None;
+    for expression in filters {
+        let Some(bound) = bind_prepared_expression(expression, &scope, parameter_types)? else {
+            return Ok(None);
+        };
+        let Some((slot, value)) = extract_integer_join_filter(bound) else {
+            return Ok(None);
+        };
+        if slot < left_width {
+            if left_filter.replace((slot, value)).is_some() {
+                return Ok(None);
             }
-            | PreparedExpression::Parameter {
-                data_type: BaseType::Int4,
-                ..
-            }),
-        ) if slot < left_width => (slot, value),
-        (
-            value @ (PreparedExpression::Literal {
-                data_type: BaseType::Int4,
-                ..
-            }
-            | PreparedExpression::Parameter {
-                data_type: BaseType::Int4,
-                ..
-            }),
-            PreparedExpression::Column {
-                slot,
-                data_type: BaseType::Int4,
-            },
-        ) if slot < left_width => (slot, value),
-        _ => return Ok(None),
+        } else if right_filter.replace((slot - left_width, value)).is_some() {
+            return Ok(None);
+        }
+    }
+    let Some((filter_slot, filter_value)) = left_filter else {
+        return Ok(None);
     };
     let mut projection = Vec::with_capacity(select.projection.len());
     for item in &select.projection {
@@ -241,11 +283,21 @@ pub(crate) fn build_prepared_join_plan(
         projection,
         columns,
     };
-    Ok(Some(if use_unique_probe {
-        PreparedReadPlan::UniqueInnerJoin(plan)
-    } else {
-        PreparedReadPlan::InnerJoin(plan)
-    }))
+    Ok(Some(
+        if let Some((right_filter_slot, right_filter_value)) = right_filter {
+            PreparedReadPlan::DoubleFilteredInnerJoin(Box::new(
+                PreparedDoubleFilteredInnerJoinPlan {
+                    join: plan,
+                    right_filter_slot,
+                    right_filter_value,
+                },
+            ))
+        } else if use_unique_probe {
+            PreparedReadPlan::UniqueInnerJoin(plan)
+        } else {
+            PreparedReadPlan::InnerJoin(plan)
+        },
+    ))
 }
 
 pub(crate) fn execute_prepared_read(
@@ -265,13 +317,32 @@ pub(crate) fn execute_prepared_read(
         PreparedReadPlan::UniqueInnerJoin(plan) => {
             execute_prepared_unique_join(state, plan, parameters, xid, snapshot, deadline, timezone)
         }
-        PreparedReadPlan::InnerJoin(plan) => {
-            execute_prepared_inner_join(state, plan, parameters, xid, snapshot, deadline, timezone)
+        PreparedReadPlan::DoubleFilteredInnerJoin(plan) => {
+            let right_filter_value = evaluate_prepared_expression(
+                &plan.right_filter_value,
+                &[],
+                parameters,
+                deadline,
+                timezone,
+            )?;
+            execute_prepared_inner_join::<true>(
+                state,
+                &plan.join,
+                parameters,
+                xid,
+                snapshot,
+                deadline,
+                timezone,
+                Some((plan.right_filter_slot, &right_filter_value)),
+            )
         }
+        PreparedReadPlan::InnerJoin(plan) => execute_prepared_inner_join::<false>(
+            state, plan, parameters, xid, snapshot, deadline, timezone, None,
+        ),
     }
 }
 
-fn execute_prepared_inner_join(
+fn execute_prepared_inner_join<const RIGHT_FILTER: bool>(
     state: &DatabaseState,
     plan: &PreparedInnerJoinPlan,
     parameters: &[Value],
@@ -279,6 +350,7 @@ fn execute_prepared_inner_join(
     snapshot: &Snapshot,
     deadline: Option<Instant>,
     timezone: &str,
+    right_filter: Option<(usize, &Value)>,
 ) -> Result<Vec<Vec<Value>>> {
     state.catalog.require_table_by_id(plan.left_table_id)?;
     state.catalog.require_table_by_id(plan.right_table_id)?;
@@ -307,6 +379,12 @@ fn execute_prepared_inner_join(
             continue;
         };
         state.record_read(xid, Access::Row(plan.right_table_id, row_id));
+        if RIGHT_FILTER {
+            let (slot, value) = right_filter.expect("double-filtered join has a right filter");
+            if value.is_null() || &version.row[slot] != value {
+                continue;
+            }
+        }
         if let Value::Int4(key) = version.row[plan.right_key]
             && right_filter_key.is_none_or(|filter_key| filter_key == key)
         {
@@ -375,8 +453,8 @@ fn execute_prepared_unique_join(
     if !left_table.has_unique_index(&[plan.filter_slot])
         || !right_table.has_unique_index(&[plan.right_key])
     {
-        return execute_prepared_inner_join(
-            state, plan, parameters, xid, snapshot, deadline, timezone,
+        return execute_prepared_inner_join::<false>(
+            state, plan, parameters, xid, snapshot, deadline, timezone, None,
         );
     }
     let filter_value =

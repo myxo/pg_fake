@@ -11184,7 +11184,7 @@ fn match_compiled_integer_joins_with_general_execution() {
     let db = Db::create();
     let mut session = db.create_session();
     session.execute("CREATE TABLE join_left (id integer, bucket integer); CREATE TABLE join_right (id integer, bucket integer)").unwrap();
-    session.execute("INSERT INTO join_left VALUES (1, 0), (2, 0), (2, 1), (NULL, 0), (3, NULL); INSERT INTO join_right VALUES (1, 0), (2, 0), (2, 0), (NULL, 0), (4, NULL)").unwrap();
+    session.execute("INSERT INTO join_left VALUES (1, 0), (2, 0), (2, 1), (NULL, 0), (3, NULL); INSERT INTO join_right VALUES (1, 0), (2, 0), (2, 0), (2, NULL), (NULL, 0), (4, NULL)").unwrap();
     for (condition, filter, parameters) in [
         ("l.id = r.id", "l.id = 2", vec![]),
         ("r.id = l.id", "2 = l.id", vec![]),
@@ -11192,6 +11192,25 @@ fn match_compiled_integer_joins_with_general_execution() {
         ("l.id = r.id", "l.id = $1", vec![Value::Int4(2)]),
         ("l.id = r.id", "l.id = $1", vec![Value::Null]),
         ("l.id = r.id", "l.id = 99", vec![]),
+        ("l.id = r.id", "l.id = 2 AND r.id = 2", vec![]),
+        ("l.id = r.id", "r.id = 2 AND l.id = 2", vec![]),
+        ("l.id = r.id", "l.id = 2 AND r.id = 1", vec![]),
+        ("l.id = r.id", "l.id = 2 AND r.bucket = 0", vec![]),
+        (
+            "l.id = r.id",
+            "l.id = $1 AND r.id = $2",
+            vec![Value::Int4(2), Value::Int4(2)],
+        ),
+        (
+            "l.id = r.id",
+            "l.id = $1 AND r.id = $2",
+            vec![Value::Int4(2), Value::Null],
+        ),
+        (
+            "l.id = r.id",
+            "l.id = $1 AND r.bucket = $2",
+            vec![Value::Int4(2), Value::Null],
+        ),
     ] {
         let sql = format!(
             "SELECT l.id, r.id FROM join_left l INNER JOIN join_right r ON {condition} WHERE {filter}"
@@ -11281,6 +11300,54 @@ fn track_compiled_join_reads_and_statement_snapshots() {
         reader.query_prepared(&statement, &[]).unwrap().rows,
         vec![vec![Value::Int4(1)]]
     );
+}
+
+#[test]
+fn track_double_filtered_join_reads() {
+    let db = Db::create();
+    let mut reader = db.create_session();
+    let mut writer = db.create_session();
+    reader.execute("CREATE TABLE filtered_read_left (id integer); CREATE TABLE filtered_read_right (id integer); INSERT INTO filtered_read_left VALUES (1)").unwrap();
+    let statement = reader
+        .prepare("SELECT l.id FROM filtered_read_left l JOIN filtered_read_right r ON l.id = r.id WHERE l.id = 1 AND r.id = 1")
+        .unwrap();
+    assert!(matches!(
+        statement.query_plan.as_ref(),
+        Some(crate::executor::PreparedReadPlan::DoubleFilteredInnerJoin(
+            _
+        ))
+    ));
+    reader
+        .execute("BEGIN ISOLATION LEVEL SERIALIZABLE")
+        .unwrap();
+    writer.execute("BEGIN").unwrap();
+    let Some(SessionTransactionState::Active(reader_transaction)) = reader.transaction else {
+        panic!("reader transaction is active")
+    };
+    let Some(SessionTransactionState::Active(writer_transaction)) = writer.transaction else {
+        panic!("writer transaction is active")
+    };
+    assert!(
+        reader
+            .query_prepared(&statement, &[])
+            .unwrap()
+            .rows
+            .is_empty()
+    );
+    writer
+        .execute("INSERT INTO filtered_read_right VALUES (1)")
+        .unwrap();
+    assert!(
+        db.state
+            .lock()
+            .unwrap()
+            .serializable
+            .lock()
+            .unwrap()
+            .has_edge(reader_transaction.xid, writer_transaction.xid)
+    );
+    reader.execute("ROLLBACK").unwrap();
+    writer.execute("ROLLBACK").unwrap();
 }
 
 #[test]
