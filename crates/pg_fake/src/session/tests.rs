@@ -11443,6 +11443,70 @@ fn track_off_key_unique_join_reads() {
 }
 
 #[test]
+fn track_right_filtered_unique_join_reads() {
+    let db = Db::create();
+    let mut reader = db.create_session();
+    let mut writer = db.create_session();
+    reader
+        .execute("CREATE TABLE right_filtered_left (id integer PRIMARY KEY); CREATE TABLE right_filtered_right (id integer PRIMARY KEY); INSERT INTO right_filtered_right VALUES (1)")
+        .unwrap();
+    let statement = reader
+        .prepare("SELECT l.id FROM right_filtered_left l JOIN right_filtered_right r ON l.id = r.id WHERE r.id = 1")
+        .unwrap();
+    assert!(matches!(
+        statement.query_plan.as_ref(),
+        Some(crate::executor::PreparedReadPlan::UniqueInnerJoin(_))
+    ));
+    reader
+        .execute("BEGIN ISOLATION LEVEL SERIALIZABLE")
+        .unwrap();
+    writer.execute("BEGIN").unwrap();
+    let Some(SessionTransactionState::Active(reader_transaction)) = reader.transaction else {
+        panic!("reader transaction is active")
+    };
+    let Some(SessionTransactionState::Active(writer_transaction)) = writer.transaction else {
+        panic!("writer transaction is active")
+    };
+    assert!(
+        reader
+            .query_prepared(&statement, &[])
+            .unwrap()
+            .rows
+            .is_empty()
+    );
+    writer
+        .execute("INSERT INTO right_filtered_left VALUES (1)")
+        .unwrap();
+    assert!(
+        db.state
+            .lock()
+            .unwrap()
+            .serializable
+            .lock()
+            .unwrap()
+            .has_edge(reader_transaction.xid, writer_transaction.xid)
+    );
+    reader.execute("ROLLBACK").unwrap();
+    writer.execute("ROLLBACK").unwrap();
+
+    reader
+        .execute("CREATE TABLE right_filtered_heap_left (id integer)")
+        .unwrap();
+    let fallback = reader
+        .prepare("SELECT l.id FROM right_filtered_heap_left l JOIN right_filtered_right r ON l.id = r.id WHERE r.id = 1")
+        .unwrap();
+    assert!(fallback.query_plan.is_none());
+
+    reader
+        .execute("CREATE TABLE right_filtered_heap_right (id integer, tag integer)")
+        .unwrap();
+    let fallback = reader
+        .prepare("SELECT l.id FROM right_filtered_left l JOIN right_filtered_heap_right r ON l.id = r.id WHERE r.tag = 9")
+        .unwrap();
+    assert!(fallback.query_plan.is_none());
+}
+
+#[test]
 fn track_double_filtered_join_reads() {
     let db = Db::create();
     let mut reader = db.create_session();

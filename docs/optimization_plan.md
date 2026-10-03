@@ -390,6 +390,21 @@ update and transaction-insert Criterion repeats have overlapping confidence
 intervals. Raw comparisons remain locally under `target/o4-offkey-*`; earlier
 runs that overlapped compilation were discarded. Other O4 work remains pending.
 
+A symmetric O4 access path handles a right-only equality filter when its column
+has a unique index and the left join key is unique. It reverses the two sources
+inside the prepared inner-join plan and remaps projected columns, so the existing
+unique probe reads at most one filtered right row and probes the left key.
+`SELECT l.name, r.name FROM l JOIN r ON l.id = r.id WHERE r.id = 50` improves
+44.463→8.785 µs (80.24%) at 100 rows and 1,094.680→7.810 µs (99.29%) at
+10,000 rows through SQLx, using medians of three 0.5-second runs. Native
+prepared timings improve 30.964→1.444 µs (95.33%) and 1,077.135→1.525 µs
+(99.86%). Right-only-filter joins without both unique indexes retain the
+general path. The isolated full Tier 1 comparison found no confirmed
+regression; exact alternating update, insert, heap-select, indexed-select and
+transaction-insert repeats resolved noisy readings. Raw timings and the separate
+baseline build remain locally under `target/o4-right-filter-*`. General join
+intermediate-copying work remains pending.
+
 ### O5 — Prepare simple mutation structure once; specialize resumption [PENDING]
 
 **Effort:** 4–7 days. **Dependency:** O1. **Confidence:** high for redundant work;

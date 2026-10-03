@@ -246,8 +246,28 @@ pub(crate) fn build_prepared_join_plan(
             return Ok(None);
         }
     }
-    let Some((filter_slot, filter_value)) = left_filter else {
+    let reverse_sources = left_filter.is_none();
+    if reverse_sources
+        && (!state
+            .tables
+            .get(&left_schema.id)
+            .is_some_and(|table| table.has_unique_index(&[left_key]))
+            || !right_filter.as_ref().is_some_and(|(slot, _)| {
+                state
+                    .tables
+                    .get(&right_schema.id)
+                    .is_some_and(|table| table.has_unique_index(&[*slot]))
+            }))
+    {
         return Ok(None);
+    }
+    let (filter_slot, filter_value) = if let Some(filter) = left_filter {
+        filter
+    } else {
+        let Some(filter) = right_filter.take() else {
+            return Ok(None);
+        };
+        filter
     };
     let mut projection = Vec::with_capacity(select.projection.len());
     for item in &select.projection {
@@ -261,11 +281,30 @@ pub(crate) fn build_prepared_join_plan(
         let Some((slot, _)) = try_resolve_column_reference(expression, &scope) else {
             return Ok(None);
         };
-        projection.push(slot);
+        projection.push(if reverse_sources {
+            if slot < left_width {
+                right_schema.columns.len() + slot
+            } else {
+                slot - left_width
+            }
+        } else {
+            slot
+        });
     }
     let columns = match described_columns {
         Some(columns) => columns.to_vec(),
         None => describe_query_result_columns(state, statement)?,
+    };
+    let (left_schema, right_schema, left_width, left_key, right_key) = if reverse_sources {
+        (
+            right_schema,
+            left_schema,
+            right_schema.columns.len(),
+            right_key,
+            left_key,
+        )
+    } else {
+        (left_schema, right_schema, left_width, left_key, right_key)
     };
     let right_is_unique = state
         .tables
