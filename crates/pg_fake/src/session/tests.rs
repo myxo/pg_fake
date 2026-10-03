@@ -11282,3 +11282,105 @@ fn track_compiled_join_reads_and_statement_snapshots() {
         vec![vec![Value::Int4(1)]]
     );
 }
+
+#[test]
+fn match_compiled_join_after_unique_index_changes() {
+    let db = Db::create();
+    let mut session = db.create_session();
+    session.execute("CREATE TABLE indexed_join_left (id integer); CREATE TABLE indexed_join_right (id integer); INSERT INTO indexed_join_left VALUES (1), (2), (3); INSERT INTO indexed_join_right VALUES (1), (2), (4)").unwrap();
+    let sql = "SELECT l.id, r.id FROM indexed_join_left l JOIN indexed_join_right r ON l.id = r.id WHERE l.id = $1";
+    let mut statement = session.prepare(sql).unwrap();
+    assert!(statement.query_plan.is_some());
+    for ddl in [
+        None,
+        Some("CREATE UNIQUE INDEX indexed_join_left_id ON indexed_join_left (id)"),
+        Some("CREATE UNIQUE INDEX indexed_join_right_id ON indexed_join_right (id)"),
+        Some("DROP INDEX indexed_join_left_id"),
+        Some("DROP INDEX indexed_join_right_id"),
+    ] {
+        if let Some(ddl) = ddl {
+            session.execute(ddl).unwrap();
+            statement = session.prepare(sql).unwrap();
+        }
+        for key in [Value::Int4(1), Value::Int4(2), Value::Int4(3), Value::Null] {
+            let actual = session
+                .query_prepared(&statement, std::slice::from_ref(&key))
+                .unwrap();
+            let generic = session.query(&format!("{sql} OFFSET (0)"), &[key]).unwrap();
+            assert_eq!(actual.rows, generic.rows);
+            assert_eq!(actual.columns, generic.columns);
+        }
+    }
+}
+
+#[test]
+fn match_compiled_unique_join_with_distinct_filter_and_join_keys() {
+    let db = Db::create();
+    let mut session = db.create_session();
+    session.execute("CREATE TABLE probe_left (id integer PRIMARY KEY, key integer); CREATE TABLE probe_right (id integer PRIMARY KEY, key integer UNIQUE); INSERT INTO probe_left VALUES (1, 20), (2, NULL), (3, 30); INSERT INTO probe_right VALUES (10, 20), (11, 40)").unwrap();
+    let sql =
+        "SELECT l.id, r.id FROM probe_left l JOIN probe_right r ON l.key = r.key WHERE l.id = $1";
+    let statement = session.prepare(sql).unwrap();
+    assert!(matches!(
+        statement.query_plan.as_ref(),
+        Some(crate::executor::PreparedReadPlan::UniqueInnerJoin(_))
+    ));
+    for key in [Value::Int4(1), Value::Int4(2), Value::Int4(3), Value::Null] {
+        let actual = session
+            .query_prepared(&statement, std::slice::from_ref(&key))
+            .unwrap();
+        let generic = session.query(&format!("{sql} OFFSET (0)"), &[key]).unwrap();
+        assert_eq!(actual.rows, generic.rows);
+    }
+}
+
+#[test]
+fn track_compiled_indexed_join_key_gaps() {
+    let db = Db::create();
+    let mut reader = db.create_session();
+    let mut writer = db.create_session();
+    reader.execute("CREATE TABLE gap_left (id integer PRIMARY KEY); CREATE TABLE gap_right (id integer PRIMARY KEY); INSERT INTO gap_left VALUES (1)").unwrap();
+    let statement = reader
+        .prepare("SELECT l.id FROM gap_left l JOIN gap_right r ON l.id = r.id WHERE l.id = 1")
+        .unwrap();
+    assert!(statement.query_plan.is_some());
+    reader
+        .execute("BEGIN ISOLATION LEVEL SERIALIZABLE")
+        .unwrap();
+    writer.execute("BEGIN").unwrap();
+    let Some(SessionTransactionState::Active(reader_transaction)) = reader.transaction else {
+        panic!("reader transaction is active")
+    };
+    let Some(SessionTransactionState::Active(writer_transaction)) = writer.transaction else {
+        panic!("writer transaction is active")
+    };
+    assert!(
+        reader
+            .query_prepared(&statement, &[])
+            .unwrap()
+            .rows
+            .is_empty()
+    );
+    writer.execute("INSERT INTO gap_right VALUES (2)").unwrap();
+    assert!(
+        !db.state
+            .lock()
+            .unwrap()
+            .serializable
+            .lock()
+            .unwrap()
+            .has_edge(reader_transaction.xid, writer_transaction.xid)
+    );
+    writer.execute("INSERT INTO gap_right VALUES (1)").unwrap();
+    assert!(
+        db.state
+            .lock()
+            .unwrap()
+            .serializable
+            .lock()
+            .unwrap()
+            .has_edge(reader_transaction.xid, writer_transaction.xid)
+    );
+    reader.execute("ROLLBACK").unwrap();
+    writer.execute("ROLLBACK").unwrap();
+}

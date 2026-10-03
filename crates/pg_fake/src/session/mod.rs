@@ -283,8 +283,7 @@ impl Session {
         let one_shot_plan = match executor::build_prepared_query_plan(&state, statement, &[], None)
             .and_then(|plan| match plan {
                 Some(plan) => Ok(Some(executor::PreparedReadPlan::Query(plan))),
-                None => executor::build_prepared_join_plan(&state, statement, &[], None)
-                    .map(|plan| plan.map(executor::PreparedReadPlan::InnerJoin)),
+                None => executor::build_prepared_join_plan(&state, statement, &[], None),
             }) {
             Ok(plan) => plan,
             Err(error) => {

@@ -235,8 +235,7 @@ impl Session {
                                     &statement,
                                     &parameter_types,
                                     Some(&columns),
-                                )?
-                                .map(executor::PreparedReadPlan::InnerJoin),
+                                )?,
                             };
                             let relation_locks = if can_cache_read_locks(&statement)
                                 && catalog_dependencies

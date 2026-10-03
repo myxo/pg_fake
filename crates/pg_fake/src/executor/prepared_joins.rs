@@ -21,13 +21,14 @@ use super::{
 pub(crate) enum PreparedReadPlan {
     Query(PreparedQueryPlan),
     InnerJoin(PreparedInnerJoinPlan),
+    UniqueInnerJoin(PreparedInnerJoinPlan),
 }
 
 impl PreparedReadPlan {
     pub(crate) fn columns(&self) -> &[ColumnMeta] {
         match self {
             Self::Query(plan) => plan.columns(),
-            Self::InnerJoin(plan) => &plan.columns,
+            Self::InnerJoin(plan) | Self::UniqueInnerJoin(plan) => &plan.columns,
         }
     }
 }
@@ -50,7 +51,7 @@ pub(crate) fn build_prepared_join_plan(
     statement: &ast::Statement,
     parameter_types: &[BaseType],
     described_columns: Option<&[ColumnMeta]>,
-) -> Result<Option<PreparedInnerJoinPlan>> {
+) -> Result<Option<PreparedReadPlan>> {
     let ast::Statement::Query(query) = statement else {
         return Ok(None);
     };
@@ -221,7 +222,15 @@ pub(crate) fn build_prepared_join_plan(
         Some(columns) => columns.to_vec(),
         None => describe_query_result_columns(state, statement)?,
     };
-    Ok(Some(PreparedInnerJoinPlan {
+    let use_unique_probe = state
+        .tables
+        .get(&left_schema.id)
+        .is_some_and(|table| table.has_unique_index(&[filter_slot]))
+        && state
+            .tables
+            .get(&right_schema.id)
+            .is_some_and(|table| table.has_unique_index(&[right_key]));
+    let plan = PreparedInnerJoinPlan {
         left_table_id: left_schema.id,
         right_table_id: right_schema.id,
         left_width,
@@ -231,6 +240,11 @@ pub(crate) fn build_prepared_join_plan(
         filter_value,
         projection,
         columns,
+    };
+    Ok(Some(if use_unique_probe {
+        PreparedReadPlan::UniqueInnerJoin(plan)
+    } else {
+        PreparedReadPlan::InnerJoin(plan)
     }))
 }
 
@@ -248,6 +262,9 @@ pub(crate) fn execute_prepared_read(
         PreparedReadPlan::Query(plan) => super::execute_prepared_query(
             state, plan, parameters, xid, snapshot, context, deadline, timezone,
         ),
+        PreparedReadPlan::UniqueInnerJoin(plan) => {
+            execute_prepared_unique_join(state, plan, parameters, xid, snapshot, deadline, timezone)
+        }
         PreparedReadPlan::InnerJoin(plan) => {
             execute_prepared_inner_join(state, plan, parameters, xid, snapshot, deadline, timezone)
         }
@@ -275,6 +292,14 @@ fn execute_prepared_inner_join(
         .expect("prepared right table must have storage");
     let filter_value =
         evaluate_prepared_expression(&plan.filter_value, &[], parameters, deadline, timezone)?;
+    let right_filter_key = if plan.filter_slot == plan.left_key {
+        match &filter_value {
+            Value::Int4(key) => Some(*key),
+            _ => None,
+        }
+    } else {
+        None
+    };
     let mut right_by_key = HashMap::<i32, Vec<&[Value]>>::new();
     state.record_read(xid, Access::Relation(plan.right_table_id));
     for (row_id, chain) in right_table.iterate_version_chains() {
@@ -282,7 +307,9 @@ fn execute_prepared_inner_join(
             continue;
         };
         state.record_read(xid, Access::Row(plan.right_table_id, row_id));
-        if let Value::Int4(key) = version.row[plan.right_key] {
+        if let Value::Int4(key) = version.row[plan.right_key]
+            && right_filter_key.is_none_or(|filter_key| filter_key == key)
+        {
             right_by_key.entry(key).or_default().push(&version.row);
         }
     }
@@ -324,4 +351,89 @@ fn execute_prepared_inner_join(
         }
     }
     Ok(rows)
+}
+
+fn execute_prepared_unique_join(
+    state: &DatabaseState,
+    plan: &PreparedInnerJoinPlan,
+    parameters: &[Value],
+    xid: Xid,
+    snapshot: &Snapshot,
+    deadline: Option<Instant>,
+    timezone: &str,
+) -> Result<Vec<Vec<Value>>> {
+    state.catalog.require_table_by_id(plan.left_table_id)?;
+    state.catalog.require_table_by_id(plan.right_table_id)?;
+    let left_table = state
+        .tables
+        .get(&plan.left_table_id)
+        .expect("prepared left table must have storage");
+    let right_table = state
+        .tables
+        .get(&plan.right_table_id)
+        .expect("prepared right table must have storage");
+    if !left_table.has_unique_index(&[plan.filter_slot])
+        || !right_table.has_unique_index(&[plan.right_key])
+    {
+        return execute_prepared_inner_join(
+            state, plan, parameters, xid, snapshot, deadline, timezone,
+        );
+    }
+    let filter_value =
+        evaluate_prepared_expression(&plan.filter_value, &[], parameters, deadline, timezone)?;
+    if filter_value.is_null() {
+        return Ok(Vec::new());
+    }
+    if let Some(key) =
+        left_table.create_unique_read_key(&[plan.filter_slot], std::slice::from_ref(&filter_value))
+    {
+        state.record_read(
+            xid,
+            Access::Unique(plan.left_table_id, vec![plan.filter_slot], key),
+        );
+    }
+    let Some((left_row_id, left_version)) = left_table.find_unique_visible_version(
+        &[plan.filter_slot],
+        std::slice::from_ref(&filter_value),
+        snapshot,
+        xid,
+        &state.transactions,
+    ) else {
+        return Ok(Vec::new());
+    };
+    state.record_read(xid, Access::Row(plan.left_table_id, left_row_id));
+    let join_key = &left_version.row[plan.left_key];
+    if join_key.is_null() {
+        return Ok(Vec::new());
+    }
+    if let Some(key) =
+        right_table.create_unique_read_key(&[plan.right_key], std::slice::from_ref(join_key))
+    {
+        state.record_read(
+            xid,
+            Access::Unique(plan.right_table_id, vec![plan.right_key], key),
+        );
+    }
+    let Some((right_row_id, right_version)) = right_table.find_unique_visible_version(
+        &[plan.right_key],
+        std::slice::from_ref(join_key),
+        snapshot,
+        xid,
+        &state.transactions,
+    ) else {
+        return Ok(Vec::new());
+    };
+    state.record_read(xid, Access::Row(plan.right_table_id, right_row_id));
+    Ok(vec![
+        plan.projection
+            .iter()
+            .map(|slot| {
+                if *slot < plan.left_width {
+                    left_version.row[*slot].clone()
+                } else {
+                    right_version.row[*slot - plan.left_width].clone()
+                }
+            })
+            .collect(),
+    ])
 }

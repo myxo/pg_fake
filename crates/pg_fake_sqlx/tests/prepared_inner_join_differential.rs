@@ -100,4 +100,31 @@ fn compares_generated_integer_inner_joins() {
         "SELECT l.id, r.id FROM integer_join_left l JOIN integer_join_right r ON l.id = r.id WHERE l.id = 2 ORDER BY l.id, r.id",
         RowOrder::Ordered,
     );
+    for sql in [
+        "CREATE TABLE indexed_join_left (id integer PRIMARY KEY)",
+        "CREATE TABLE indexed_join_right (id integer PRIMARY KEY)",
+        "INSERT INTO indexed_join_left VALUES (1), (2), (3)",
+        "INSERT INTO indexed_join_right VALUES (1), (2), (4)",
+        "SELECT l.id, r.id FROM indexed_join_left l JOIN indexed_join_right r ON l.id = r.id WHERE l.id = 2",
+        "SELECT l.id, r.id FROM indexed_join_left l JOIN indexed_join_right r ON l.id = r.id WHERE l.id = 3",
+        "SELECT l.id, r.id FROM integer_join_left l JOIN indexed_join_right r ON l.id = r.id WHERE l.id = 2",
+    ] {
+        assert_statement(&runtime, &mut postgres, &mut fake, sql, RowOrder::Unordered);
+    }
+    runtime.block_on(async {
+        let sql = "SELECT l.id, r.id FROM indexed_join_left l JOIN indexed_join_right r ON l.id = r.id WHERE l.id = $1";
+        for key in [Some(1_i32), Some(2), Some(3), None] {
+            let expected: Vec<(i32, i32)> = sqlx::query_as(sql)
+                .bind(key)
+                .fetch_all(&mut postgres)
+                .await
+                .unwrap();
+            let actual: Vec<(i32, i32)> = sqlx::query_as(sql)
+                .bind(key)
+                .fetch_all(&mut fake)
+                .await
+                .unwrap();
+            assert_eq!(actual, expected, "indexed key={key:?}");
+        }
+    });
 }

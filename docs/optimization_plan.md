@@ -1,6 +1,6 @@
 # Tier 1 optimization plan
 
-**Status: implementation authorized. O1–O2 are complete; O3–O9 remain pending.**
+**Status: implementation authorized. O1–O3 are complete; O4–O9 remain pending.**
 
 Research date: 2026-10-03. Scope: make everyday inserts, updates, transactions,
 selects, ordering/paging and simple inner joins substantially faster while
@@ -317,6 +317,19 @@ medium for benefit on the smallest tables.
 unselected right table; demonstrate it at 100 and 10,000 rows. Targets after O3
 are a further 10–30% where copying matters, not an additional universal multiplier.
 
+The first O4 access-path step uses unique indexes on the filtered left column
+and right join key for paired point probes. When the left filter fixes its join
+key without those indexes, the hash build retains only matching right rows.
+At 100 rows, matched SQLx indexed probes improve 16.726→8.853 µs (47.07%);
+at 10,000 rows they improve 990.497→7.422 µs (99.25%). The unindexed SQLx
+probe improves 16.689→10.230 µs (38.71%) at 100 rows. Full Tier 1 joins
+improve 22.876→16.589 µs (27.48%) and 29.459→26.334 µs (10.61%).
+Other O4 intermediate-copying and access-path work remains pending. Raw runs
+are retained locally under `target/o4-*`. The full Tier 1 run found no confirmed
+regression; exact paired O3/O4 Criterion repeats resolved noisy write readings:
+insert 38.195→37.880 µs, transaction insert 42.435→41.971 µs, and update
+42.717→42.394 µs (20 samples, 1-second warmup, 2-second measurement).
+
 ### O5 — Prepare simple mutation structure once; specialize resumption [PENDING]
 
 **Effort:** 4–7 days. **Dependency:** O1. **Confidence:** high for redundant work;
@@ -517,8 +530,8 @@ python3 scripts/research-tier1.py --memory
 The comparison uses the configured local PostgreSQL instance and manages only
 its reserved `pgfake_benchmark` schema. Profiles/memory metrics require macOS
 process access; profiles require FlameGraph tools and Perl. Generated flame
-graphs and raw reports live in `target/tier1-research`. The durable evidence
-archive contains the collected raw samples and folded stacks. The fixed-count
+graphs and raw reports live in `target/tier1-research`. Local evidence includes
+the collected raw samples and folded stacks. The fixed-count
 memory option was added after timing/profile collection. Review subsequently
 changed the untimed preflight to validate the selected API rather than always
 validating native `execute` / cached SQLx. Neither change alters fixture SQL or
