@@ -237,3 +237,32 @@ fn compares_multi_table_hash_join_chains() {
         assert_statement(&runtime, &mut postgres, &mut fake, sql, RowOrder::Unordered);
     }
 }
+
+#[test]
+fn compares_prepared_unfiltered_left_joins() {
+    let server = start_isolated_postgres_server();
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap();
+    let mut postgres = runtime
+        .block_on(PgConnection::connect(&server.url))
+        .unwrap();
+    let mut fake = PgFakeConnection::new(Db::create());
+    for sql in [
+        "CREATE TABLE prepared_left_l (id integer, name text)",
+        "CREATE TABLE prepared_left_r (id integer, name text)",
+        "INSERT INTO prepared_left_l VALUES (1,'a1'), (1,'a2'), (2,'a3'), (3,'a4'), (NULL,'an')",
+        "INSERT INTO prepared_left_r VALUES (1,'b1'), (1,'b2'), (4,'b4'), (NULL,'bn')",
+        "SELECT l.name,r.name FROM prepared_left_l l LEFT JOIN prepared_left_r r ON l.id=r.id",
+        "SELECT r.name,l.name FROM prepared_left_l l LEFT OUTER JOIN prepared_left_r r ON r.id=l.id",
+        "SELECT l.name,r.name FROM prepared_left_l l LEFT JOIN prepared_left_r r ON l.id=r.id WHERE r.id IS NULL",
+        "BEGIN ISOLATION LEVEL SERIALIZABLE",
+        "SELECT l.name,r.name FROM prepared_left_l l LEFT JOIN prepared_left_r r ON l.id=r.id",
+        "COMMIT",
+        "DELETE FROM prepared_left_r",
+        "SELECT l.name,r.name FROM prepared_left_l l LEFT JOIN prepared_left_r r ON l.id=r.id",
+    ] {
+        assert_statement(&runtime, &mut postgres, &mut fake, sql, RowOrder::Unordered);
+    }
+}

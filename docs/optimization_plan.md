@@ -619,6 +619,26 @@ suite passes with the two existing exclusions. Raw probes, matching binaries
 and full Tier 1 logs remain under `target/o4-wide-*`. Other O4 work remains
 pending.
 
+An unfiltered two-table `integer` equality `LEFT JOIN` with direct-column
+projections now uses a prepared route that borrows visible source rows and
+clones only output values. It emits null-extended left rows for missing or
+NULL keys; filtered and other left joins retain the general path. For
+`SELECT l.name,r.name FROM l LEFT JOIN r ON l.id=r.id` with half the right
+keys present, medians of three alternating 0.5-second SQLx probes improve
+68.937→22.710 us (67.06%) at 100 left rows and 4,369.869→1,423.324 us
+(67.43%) at 10,000 left rows. Native prepared probes improve
+55.042→12.055 us (78.10%) and 4,299.508→1,250.101 us (70.92%). The full
+Tier 1 sweep favored the candidate outside an apparent transaction-insert
+slowdown. Isolated 30-sample transaction-insert pairs changed direction:
+42.611→42.316 us, then 42.250→42.640 us in reverse order; no slowdown was
+confirmed. The PostgreSQL differential covers duplicate matches, unmatched
+and NULL keys, reversed equality operands, serializable reads, empty right
+tables and a filtered fallback. The workspace suite with two established
+exclusions, all 11 extended property cases, formatting, scoped Clippy, and
+the execution-log build pass.
+Raw timings and matching binaries remain under `target/o4-left-*`. Other
+O4 work remains pending.
+
 ### O5 — Prepare simple mutation structure once; specialize resumption [PENDING]
 
 **Effort:** 4–7 days. **Dependency:** O1. **Confidence:** high for redundant work;

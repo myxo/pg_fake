@@ -25,6 +25,7 @@ pub(crate) enum PreparedReadPlan {
     AdaptiveUniqueInnerJoin(PreparedInnerJoinPlan),
     DoubleFilteredInnerJoin(Box<PreparedDoubleFilteredInnerJoinPlan>),
     UnfilteredInnerJoin(PreparedUnfilteredInnerJoinPlan),
+    UnfilteredLeftJoin(PreparedUnfilteredInnerJoinPlan),
     UnfilteredJoinChain(PreparedUnfilteredJoinChainPlan),
 }
 
@@ -36,7 +37,7 @@ impl PreparedReadPlan {
             | Self::UniqueInnerJoin(plan)
             | Self::AdaptiveUniqueInnerJoin(plan) => &plan.columns,
             Self::DoubleFilteredInnerJoin(plan) => &plan.join.columns,
-            Self::UnfilteredInnerJoin(plan) => &plan.columns,
+            Self::UnfilteredInnerJoin(plan) | Self::UnfilteredLeftJoin(plan) => &plan.columns,
             Self::UnfilteredJoinChain(plan) => &plan.columns,
         }
     }
@@ -203,11 +204,16 @@ pub(crate) fn build_prepared_join_plan(
     else {
         return Ok(None);
     };
-    let condition = match &join.join_operator {
+    let (condition, preserve_left) = match &join.join_operator {
         ast::JoinOperator::Join(ast::JoinConstraint::On(condition))
-        | ast::JoinOperator::Inner(ast::JoinConstraint::On(condition)) => condition,
+        | ast::JoinOperator::Inner(ast::JoinConstraint::On(condition)) => (condition, false),
+        ast::JoinOperator::Left(ast::JoinConstraint::On(condition))
+        | ast::JoinOperator::LeftOuter(ast::JoinConstraint::On(condition)) => (condition, true),
         _ => return Ok(None),
     };
+    if preserve_left && select.selection.is_some() {
+        return Ok(None);
+    }
     let ast::Expr::BinaryOp {
         left,
         op: ast::BinaryOperator::Eq,
@@ -313,17 +319,20 @@ pub(crate) fn build_prepared_join_plan(
         None => describe_query_result_columns(state, statement)?,
     };
     if left_filter.is_none() && right_filter.is_none() {
-        return Ok(Some(PreparedReadPlan::UnfilteredInnerJoin(
-            PreparedUnfilteredInnerJoinPlan {
-                left_table_id: left_schema.id,
-                right_table_id: right_schema.id,
-                left_width,
-                left_key,
-                right_key,
-                projection,
-                columns,
-            },
-        )));
+        let plan = PreparedUnfilteredInnerJoinPlan {
+            left_table_id: left_schema.id,
+            right_table_id: right_schema.id,
+            left_width,
+            left_key,
+            right_key,
+            projection,
+            columns,
+        };
+        return Ok(Some(if preserve_left {
+            PreparedReadPlan::UnfilteredLeftJoin(plan)
+        } else {
+            PreparedReadPlan::UnfilteredInnerJoin(plan)
+        }));
     }
     let (filter_slot, filter_value) = if let Some(filter) = left_filter {
         filter
@@ -536,7 +545,10 @@ pub(crate) fn execute_prepared_read(
             state, plan, parameters, xid, snapshot, deadline, timezone, None,
         ),
         PreparedReadPlan::UnfilteredInnerJoin(plan) => {
-            execute_prepared_unfiltered_join(state, plan, xid, snapshot, deadline)
+            execute_prepared_unfiltered_join::<false>(state, plan, xid, snapshot, deadline)
+        }
+        PreparedReadPlan::UnfilteredLeftJoin(plan) => {
+            execute_prepared_unfiltered_join::<true>(state, plan, xid, snapshot, deadline)
         }
         PreparedReadPlan::UnfilteredJoinChain(plan) => {
             if plan.joins.iter().any(|join| join.3) {
@@ -571,7 +583,7 @@ pub(crate) fn execute_prepared_read(
 }
 
 #[inline(never)]
-fn execute_prepared_unfiltered_join(
+fn execute_prepared_unfiltered_join<const PRESERVE_LEFT: bool>(
     state: &DatabaseState,
     plan: &PreparedUnfilteredInnerJoinPlan,
     xid: Xid,
@@ -610,13 +622,32 @@ fn execute_prepared_unfiltered_join(
     }
     let mut rows = Vec::new();
     for left in left_rows {
-        let Value::Int4(key) = left[plan.left_key] else {
-            continue;
+        let matches = match left[plan.left_key] {
+            Value::Int4(key) => right_by_key.get(&key),
+            _ => None,
         };
-        let Some(matches) = right_by_key.get(&key) else {
-            continue;
-        };
-        for right in matches {
+        if let Some(matches) = matches {
+            for right in matches {
+                if deadline.is_some_and(|deadline| Instant::now() >= deadline) {
+                    return Err(PgError::create(
+                        SqlState::QueryCanceled,
+                        "canceling statement due to statement timeout",
+                    ));
+                }
+                rows.push(
+                    plan.projection
+                        .iter()
+                        .map(|slot| {
+                            if *slot < plan.left_width {
+                                left[*slot].clone()
+                            } else {
+                                right[*slot - plan.left_width].clone()
+                            }
+                        })
+                        .collect(),
+                );
+            }
+        } else if PRESERVE_LEFT {
             if deadline.is_some_and(|deadline| Instant::now() >= deadline) {
                 return Err(PgError::create(
                     SqlState::QueryCanceled,
@@ -630,7 +661,7 @@ fn execute_prepared_unfiltered_join(
                         if *slot < plan.left_width {
                             left[*slot].clone()
                         } else {
-                            right[*slot - plan.left_width].clone()
+                            Value::Null
                         }
                     })
                     .collect(),
