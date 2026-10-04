@@ -579,6 +579,25 @@ and ordering slowed 28.016→28.386 us (1.32%). Paging improved
 the executor change was discarded. Raw timings and matching release binaries
 remain under `target/o4-filtered-borrow-*`.
 
+An unfiltered multi-table integer inner join with direct-column projections
+now has a prepared route that borrows visible rows through each hash-join stage
+and clones only selected output values. Other joins retain the existing path.
+For `SELECT a.name,b.name,c.name FROM a JOIN b ON a.id=b.id JOIN c ON b.id=c.id`,
+medians of three alternating 0.5-second probes improve native prepared
+64.245→26.535 us (58.70%) and SQLx 80.268→41.777 us (47.95%) at 100 rows.
+At 10,000 rows, native prepared improves 5,323.321→3,042.849 us (42.84%)
+and SQLx 5,497.266→3,280.904 us (40.32%). Full Tier 1 sweeps drifted
+across unrelated cases. Isolated 30-sample pairs resolved the apparent
+transaction insert, full-read, heap-select and paging slowdowns:
+42.289→41.897 us, 19.920→19.912 us, 11.011→10.955 us, and
+19.875→19.694 us respectively. The expanded multi-join PostgreSQL
+differential covers reversed equality operands, reordered projections,
+an empty final stage, and a serializable read; generated SQL, all 11 extended
+property cases, the workspace suite with two established exclusions,
+formatting, scoped Clippy, and the execution-log build pass. Raw probes,
+matching binaries and Tier 1 logs
+remain under `target/o4-prepared-chain-*`. Other O4 work remains pending.
+
 ### O5 — Prepare simple mutation structure once; specialize resumption [PENDING]
 
 **Effort:** 4–7 days. **Dependency:** O1. **Confidence:** high for redundant work;

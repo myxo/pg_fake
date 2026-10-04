@@ -25,6 +25,7 @@ pub(crate) enum PreparedReadPlan {
     AdaptiveUniqueInnerJoin(PreparedInnerJoinPlan),
     DoubleFilteredInnerJoin(Box<PreparedDoubleFilteredInnerJoinPlan>),
     UnfilteredInnerJoin(PreparedUnfilteredInnerJoinPlan),
+    UnfilteredJoinChain(PreparedUnfilteredJoinChainPlan),
 }
 
 impl PreparedReadPlan {
@@ -36,6 +37,7 @@ impl PreparedReadPlan {
             | Self::AdaptiveUniqueInnerJoin(plan) => &plan.columns,
             Self::DoubleFilteredInnerJoin(plan) => &plan.join.columns,
             Self::UnfilteredInnerJoin(plan) => &plan.columns,
+            Self::UnfilteredJoinChain(plan) => &plan.columns,
         }
     }
 }
@@ -48,6 +50,14 @@ pub(crate) struct PreparedUnfilteredInnerJoinPlan {
     left_key: usize,
     right_key: usize,
     projection: Vec<usize>,
+    columns: Vec<ColumnMeta>,
+}
+
+#[derive(Debug, Clone)]
+pub(crate) struct PreparedUnfilteredJoinChainPlan {
+    table_ids: Vec<TableId>,
+    joins: Vec<(usize, usize, usize)>,
+    projection: Vec<(usize, usize)>,
     columns: Vec<ColumnMeta>,
 }
 
@@ -162,8 +172,18 @@ pub(crate) fn build_prepared_join_plan(
         || select.qualify.is_some()
         || select.value_table_mode.is_some()
         || select.from.len() != 1
-        || select.from[0].joins.len() != 1
     {
+        return Ok(None);
+    }
+    if select.from[0].joins.len() > 1 {
+        return build_prepared_unfiltered_join_chain_plan(
+            state,
+            statement,
+            select,
+            described_columns,
+        );
+    }
+    if select.from[0].joins.len() != 1 {
         return Ok(None);
     }
     let ast::TableFactor::Table {
@@ -361,6 +381,113 @@ pub(crate) fn build_prepared_join_plan(
     ))
 }
 
+fn build_prepared_unfiltered_join_chain_plan(
+    state: &DatabaseState,
+    statement: &ast::Statement,
+    select: &ast::Select,
+    described_columns: Option<&[ColumnMeta]>,
+) -> Result<Option<PreparedReadPlan>> {
+    if select.selection.is_some() {
+        return Ok(None);
+    }
+    let table = &select.from[0];
+    let mut table_ids = Vec::with_capacity(table.joins.len() + 1);
+    let mut starts = Vec::with_capacity(table.joins.len() + 1);
+    let mut next_slot = 0;
+    for factor in
+        std::iter::once(&table.relation).chain(table.joins.iter().map(|join| &join.relation))
+    {
+        let ast::TableFactor::Table {
+            name, args: None, ..
+        } = factor
+        else {
+            return Ok(None);
+        };
+        let name = normalize_relation_name(name)?;
+        if super::describe_visible_system_relation(&state.catalog, &name).is_some()
+            || state.catalog.require_named_view(&name).is_ok()
+        {
+            return Ok(None);
+        }
+        let schema = state.catalog.require_named_table(&name)?;
+        starts.push(next_slot);
+        next_slot += schema.columns.len();
+        table_ids.push(schema.id);
+    }
+    let scope = bind_query_scope(&state.catalog, select)?;
+    let mut joins = Vec::with_capacity(table.joins.len());
+    for (index, join) in table.joins.iter().enumerate() {
+        let condition = match &join.join_operator {
+            ast::JoinOperator::Join(ast::JoinConstraint::On(condition))
+            | ast::JoinOperator::Inner(ast::JoinConstraint::On(condition)) => condition,
+            _ => return Ok(None),
+        };
+        let ast::Expr::BinaryOp {
+            left,
+            op: ast::BinaryOperator::Eq,
+            right,
+        } = condition
+        else {
+            return Ok(None);
+        };
+        let (Some((first_slot, first_type)), Some((second_slot, second_type))) = (
+            try_resolve_column_reference(left, &scope),
+            try_resolve_column_reference(right, &scope),
+        ) else {
+            return Ok(None);
+        };
+        if first_type.base != BaseType::Int4 || second_type.base != BaseType::Int4 {
+            return Ok(None);
+        }
+        let right_start = starts[index + 1];
+        let right_end = starts.get(index + 2).copied().unwrap_or(next_slot);
+        let (left_slot, right_slot) =
+            if first_slot < right_start && (right_start..right_end).contains(&second_slot) {
+                (first_slot, second_slot)
+            } else if second_slot < right_start && (right_start..right_end).contains(&first_slot) {
+                (second_slot, first_slot)
+            } else {
+                return Ok(None);
+            };
+        let left_source = starts.partition_point(|&start| start <= left_slot) - 1;
+        joins.push((
+            left_source,
+            left_slot - starts[left_source],
+            right_slot - right_start,
+        ));
+    }
+    let mut projection = Vec::with_capacity(select.projection.len());
+    for item in &select.projection {
+        let expression = match item {
+            ast::SelectItem::UnnamedExpr(expression)
+            | ast::SelectItem::ExprWithAlias {
+                expr: expression, ..
+            } => expression,
+            _ => return Ok(None),
+        };
+        let Some((slot, _)) = try_resolve_column_reference(expression, &scope) else {
+            return Ok(None);
+        };
+        if slot >= next_slot {
+            return Ok(None);
+        }
+        let source = starts.partition_point(|&start| start <= slot) - 1;
+        projection.push((source, slot - starts[source]));
+    }
+    let columns = match described_columns {
+        Some(columns) => columns.to_vec(),
+        None => describe_query_result_columns(state, statement)?,
+    };
+    Ok(Some(PreparedReadPlan::UnfilteredJoinChain(
+        PreparedUnfilteredJoinChainPlan {
+            table_ids,
+            joins,
+            projection,
+            columns,
+        },
+    )))
+}
+
 pub(crate) fn execute_prepared_read(
     state: &DatabaseState,
     plan: &PreparedReadPlan,
@@ -405,6 +532,9 @@ pub(crate) fn execute_prepared_read(
         ),
         PreparedReadPlan::UnfilteredInnerJoin(plan) => {
             execute_prepared_unfiltered_join(state, plan, xid, snapshot, deadline)
+        }
+        PreparedReadPlan::UnfilteredJoinChain(plan) => {
+            execute_prepared_unfiltered_join_chain(state, plan, xid, snapshot, deadline)
         }
     }
 }
@@ -477,6 +607,101 @@ fn execute_prepared_unfiltered_join(
         }
     }
     Ok(rows)
+}
+
+#[inline(never)]
+fn execute_prepared_unfiltered_join_chain(
+    state: &DatabaseState,
+    plan: &PreparedUnfilteredJoinChainPlan,
+    xid: Xid,
+    snapshot: &Snapshot,
+    deadline: Option<Instant>,
+) -> Result<Vec<Vec<Value>>> {
+    for table_id in &plan.table_ids {
+        state.catalog.require_table_by_id(*table_id)?;
+    }
+    let first_id = plan.table_ids[0];
+    let first_table = state
+        .tables
+        .get(&first_id)
+        .expect("prepared first table must have storage");
+    let mut left_rows = Vec::new();
+    state.record_read(xid, Access::Relation(first_id));
+    for (row_id, chain) in first_table.iterate_version_chains() {
+        let Some(version) = find_visible_version(chain, snapshot, xid, &state.transactions) else {
+            continue;
+        };
+        state.record_read(xid, Access::Row(first_id, row_id));
+        left_rows.push(version.row.as_slice());
+    }
+    for (index, &(left_source, left_key, right_key)) in plan.joins.iter().enumerate() {
+        let right_id = plan.table_ids[index + 1];
+        let right_table = state
+            .tables
+            .get(&right_id)
+            .expect("prepared right table must have storage");
+        let mut right_by_key = HashMap::<i32, Vec<&[Value]>>::new();
+        state.record_read(xid, Access::Relation(right_id));
+        for (row_id, chain) in right_table.iterate_version_chains() {
+            let Some(version) = find_visible_version(chain, snapshot, xid, &state.transactions)
+            else {
+                continue;
+            };
+            state.record_read(xid, Access::Row(right_id, row_id));
+            if let Value::Int4(key) = version.row[right_key] {
+                right_by_key
+                    .entry(key)
+                    .or_default()
+                    .push(version.row.as_slice());
+            }
+        }
+        if index + 1 == plan.joins.len() {
+            let mut rows = Vec::new();
+            for left in left_rows.chunks_exact(index + 1) {
+                let Value::Int4(key) = left[left_source][left_key] else {
+                    continue;
+                };
+                let Some(matches) = right_by_key.get(&key) else {
+                    continue;
+                };
+                for &right in matches {
+                    if deadline.is_some_and(|deadline| Instant::now() >= deadline) {
+                        return Err(PgError::create(
+                            SqlState::QueryCanceled,
+                            "canceling statement due to statement timeout",
+                        ));
+                    }
+                    rows.push(
+                        plan.projection
+                            .iter()
+                            .map(|&(source, slot)| {
+                                if source == index + 1 {
+                                    right[slot].clone()
+                                } else {
+                                    left[source][slot].clone()
+                                }
+                            })
+                            .collect(),
+                    );
+                }
+            }
+            return Ok(rows);
+        }
+        let mut joined = Vec::new();
+        for left in left_rows.chunks_exact(index + 1) {
+            let Value::Int4(key) = left[left_source][left_key] else {
+                continue;
+            };
+            if let Some(matches) = right_by_key.get(&key) {
+                for &right in matches {
+                    joined.extend_from_slice(left);
+                    joined.push(right);
+                }
+            }
+        }
+        left_rows = joined;
+    }
+    unreachable!("prepared join chain has at least two joins")
 }
 
 fn execute_prepared_inner_join<const RIGHT_FILTER: bool>(

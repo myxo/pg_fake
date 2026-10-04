@@ -34,6 +34,7 @@ fn compares_multi_table_hash_join_chains() {
     }
     for sql in [
         "SELECT a.name,b.name,c.name FROM hash_chain_a a JOIN hash_chain_b b ON a.id=b.id JOIN hash_chain_c c ON b.id=c.id",
+        "SELECT c.name,a.name,b.name FROM hash_chain_a a JOIN hash_chain_b b ON b.id=a.id JOIN hash_chain_c c ON c.id=a.id",
         "SELECT a.name,b.name,c.name FROM hash_chain_a a LEFT JOIN hash_chain_b b ON a.id=b.id LEFT JOIN hash_chain_c c ON b.id=c.id",
         "SELECT a.name,b.name,c.name FROM hash_chain_a a JOIN hash_chain_b b ON a.id=b.id LEFT JOIN hash_chain_c c ON b.id=c.id",
         "SELECT a.name,b.name,c.name FROM hash_chain_a a LEFT JOIN hash_chain_b b ON a.id=b.id JOIN hash_chain_c c ON b.id=c.id",
@@ -72,11 +73,25 @@ fn compares_multi_table_hash_join_chains() {
             assert_eq!(actual, expected, "key={key:?}");
         }
     });
+    for sql in [
+        "BEGIN ISOLATION LEVEL SERIALIZABLE",
+        "SELECT a.name,b.name,c.name FROM hash_chain_a a JOIN hash_chain_b b ON a.id=b.id JOIN hash_chain_c c ON b.id=c.id",
+        "COMMIT",
+    ] {
+        assert_statement(&runtime, &mut postgres, &mut fake, sql, RowOrder::Unordered);
+    }
     assert_statement(
         &runtime,
         &mut postgres,
         &mut fake,
         "DELETE FROM hash_chain_c",
+        RowOrder::Unordered,
+    );
+    assert_statement(
+        &runtime,
+        &mut postgres,
+        &mut fake,
+        "SELECT a.name,b.name,c.name FROM hash_chain_a a JOIN hash_chain_b b ON a.id=b.id JOIN hash_chain_c c ON b.id=c.id",
         RowOrder::Unordered,
     );
     assert_statement(
