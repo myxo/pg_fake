@@ -651,6 +651,19 @@ discarded under the no-slowdown rule. Raw results and the rejected patch remain
 locally under `target/o9-offset-projection-*`; O9's paging and ordering budgets
 remain pending.
 
+A small-table collect/sort experiment replaced the bounded heap when
+`LIMIT + OFFSET` covered at least half of at most 256 stored table rows. The
+revised variant reused the existing collect path and truncated after sorting;
+the 10,000-row path kept its heap. Two exact, profile-matched 20-sample SQLx
+paging pairs improved 26.342→19.764 us (24.97%) and 26.529→19.747 us
+(25.56%). The full Tier 1 sweep improved paging 29.335→22.330 us (23.88%).
+The prepared-ordering differential and generated SQL property test passed.
+However, exact selective-join repeats in both run orders confirmed a slowdown:
+10.099→10.258 us (1.57%) and 10.084→10.298 us (2.12%). Both prototype
+variants were discarded under the no-slowdown rule. Full Tier 1 results,
+isolated probes, build logs, and rejected patches remain locally under
+`target/o9-collect-sort-*`.
+
 ## Milestones and stopping rules
 
 1. Establish trustworthy gates and bound cache retention: O1–O2.
