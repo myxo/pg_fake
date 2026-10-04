@@ -489,6 +489,18 @@ workspace suite with the same two existing exclusions, formatting, and scoped
 Clippy pass. Raw probes, release binaries, and Tier 1 logs remain under
 `target/o4-flat-chain-*`. Other O4 work remains pending.
 
+A further O4 experiment retained only right rows whose keys could match at
+most eight filtered intermediate left rows. For a three-table join with
+`WHERE a.id = 1`, alternating 0.5-second SQLx probes improved
+104.970→85.805 us (18.26%) at 100 rows and 7,530.475→5,080.985 us
+(32.53%) at 10,000 rows. However, exact 30-sample two-table selective-join
+pairs showed 10.018→10.211 us and 10.049→10.225 us, a reproducible slowdown.
+Moving the key check out of the ordinary row callback preserved the sparse
+gain but still slowed the selective join in both run orders:
+10.100→10.193 us and 9.993→10.149 us. The experiment was discarded under
+the no-Tier-1-slowdown rule. Its probes, full Tier 1 sweeps, binaries and
+rejected patch remain locally under `target/o4-selective-chain-*`.
+
 ### O5 — Prepare simple mutation structure once; specialize resumption [PENDING]
 
 **Effort:** 4–7 days. **Dependency:** O1. **Confidence:** high for redundant work;
