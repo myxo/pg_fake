@@ -86,4 +86,45 @@ fn compares_multi_table_hash_join_chains() {
         "SELECT a.name,b.name,c.name FROM hash_chain_a a LEFT JOIN hash_chain_b b ON a.id=b.id LEFT JOIN hash_chain_c c ON b.id=c.id",
         RowOrder::Unordered,
     );
+    for sql in [
+        "CREATE TABLE hash_probe_a (id integer, name text)",
+        "CREATE TABLE hash_probe_b (id integer PRIMARY KEY, name text)",
+        "CREATE TABLE hash_probe_c (id integer PRIMARY KEY, name text)",
+        "INSERT INTO hash_probe_a VALUES (1,'a1'), (1,'ax'), (2,'a2'), (3,'a3'), (NULL,'an')",
+        "INSERT INTO hash_probe_b VALUES (1,'b1'), (2,'b2'), (4,'b4')",
+        "INSERT INTO hash_probe_c VALUES (1,'c1'), (4,'c4')",
+    ] {
+        assert_statement(&runtime, &mut postgres, &mut fake, sql, RowOrder::Unordered);
+    }
+    for sql in [
+        "SELECT a.name,b.name,c.name FROM hash_probe_a a JOIN hash_probe_b b ON a.id=b.id JOIN hash_probe_c c ON b.id=c.id WHERE a.id=1",
+        "SELECT a.name,b.name,c.name FROM hash_probe_a a JOIN hash_probe_b b ON a.id=b.id JOIN hash_probe_c c ON b.id=c.id WHERE a.id=2",
+        "SELECT a.name,b.name,c.name FROM hash_probe_a a JOIN hash_probe_b b ON a.id=b.id JOIN hash_probe_c c ON a.id=c.id WHERE a.id=1",
+        "SELECT a.name,b.name,c.name FROM hash_probe_a a LEFT JOIN hash_probe_b b ON a.id=b.id LEFT JOIN hash_probe_c c ON b.id=c.id WHERE a.id=3",
+        "SELECT a.name,b.name,c.name FROM hash_probe_a a JOIN hash_probe_b b ON a.id=b.id JOIN hash_probe_c c ON b.id=c.id WHERE b.name='b1'",
+        "SELECT a.name,b.name,c.name FROM hash_probe_a a JOIN hash_probe_b b ON a.id=b.id JOIN hash_probe_c c ON b.id=c.id WHERE c.name='c1'",
+    ] {
+        assert_statement(&runtime, &mut postgres, &mut fake, sql, RowOrder::Unordered);
+    }
+    assert_statement(
+        &runtime,
+        &mut postgres,
+        &mut fake,
+        "BEGIN ISOLATION LEVEL SERIALIZABLE",
+        RowOrder::Unordered,
+    );
+    assert_statement(
+        &runtime,
+        &mut postgres,
+        &mut fake,
+        "SELECT a.name,b.name,c.name FROM hash_probe_a a JOIN hash_probe_b b ON a.id=b.id JOIN hash_probe_c c ON b.id=c.id WHERE a.id=1",
+        RowOrder::Unordered,
+    );
+    assert_statement(
+        &runtime,
+        &mut postgres,
+        &mut fake,
+        "COMMIT",
+        RowOrder::Unordered,
+    );
 }

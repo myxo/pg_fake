@@ -15,7 +15,10 @@ use crate::{
 };
 use sqlparser::ast;
 
-use super::{SourceRow, materialize_table_factor_rows, scans::visit_table_factor_rows};
+use super::{
+    SourceRow, materialize_table_factor_rows,
+    scans::{collect_pushdown_filters, visit_table_factor_rows},
+};
 
 #[cfg_attr(feature = "execution-log", tracing::instrument(skip_all))]
 pub(crate) fn can_stream_join(table: &ast::TableWithJoins) -> bool {
@@ -488,13 +491,82 @@ fn visit_hash_join_chain_rows<const PRUNE_SPARSE_RIGHT: bool>(
             .copied()
             .unwrap_or(scope.columns.len());
         let key_type = scope.columns[left_slot].data_type.base;
+        let indexed_right_rows = if PRUNE_SPARSE_RIGHT
+            && rows.len() <= 8
+            && key_type == BaseType::Int4
+            && let Some(selection) = selection
+            && let ast::TableFactor::Table { name, .. } = &table.joins[index].relation
+            && crate::executor::ctes::cte_row_source_id(name).is_none()
+            && context
+                .query_source_state
+                .lock()
+                .expect("query source mutex is poisoned")
+                .is_empty()
+        {
+            let mut filters = Vec::new();
+            collect_pushdown_filters(selection, scope, right_start, right_end, &mut filters);
+            if filters.is_empty() {
+                let schema = state
+                    .catalog
+                    .require_named_table(&normalize_relation_name(name)?)?;
+                let table = state
+                    .tables
+                    .get(&schema.id)
+                    .expect("catalog table must have storage");
+                let right_column = right_slot - right_start;
+                if table.has_unique_index(&[right_column]) {
+                    let mut seen = std::collections::HashSet::new();
+                    let mut indexed = Vec::new();
+                    for left in &rows {
+                        let Value::Int4(value) = &left[left_slot] else {
+                            continue;
+                        };
+                        if !seen.insert(*value) {
+                            continue;
+                        }
+                        let value = Value::Int4(*value);
+                        if state.tracks_serializable_reads(xid)
+                            && let Some(key) = table.create_unique_read_key(
+                                &[right_column],
+                                std::slice::from_ref(&value),
+                            )
+                        {
+                            state.record_read(
+                                xid,
+                                Access::Unique(schema.id, vec![right_column], key),
+                            );
+                        }
+                        if let Some((row_id, version)) = table.find_unique_visible_version(
+                            &[right_column],
+                            std::slice::from_ref(&value),
+                            snapshot,
+                            xid,
+                            &state.transactions,
+                        ) {
+                            state.record_read(xid, Access::Row(schema.id, row_id));
+                            indexed.push((row_id, version.row.clone()));
+                        }
+                    }
+                    indexed.sort_by_key(|(row_id, _)| *row_id);
+                    Some(indexed.into_iter().map(|(_, row)| row).collect::<Vec<_>>())
+                } else {
+                    None
+                }
+            } else {
+                None
+            }
+        } else {
+            None
+        };
         let selective_keys = (PRUNE_SPARSE_RIGHT && rows.len() <= 8).then(|| {
             rows.iter()
                 .filter_map(|row| create_hash_join_key(&row[left_slot], key_type))
                 .collect::<std::collections::HashSet<_>>()
         });
         let mut right_rows = Vec::new();
-        if let Some(keys) = selective_keys {
+        if let Some(indexed) = indexed_right_rows {
+            right_rows = indexed;
+        } else if let Some(keys) = selective_keys {
             visit_table_factor_rows(
                 state,
                 &table.joins[index].relation,

@@ -528,6 +528,25 @@ unresolved and a modest target gain, the change was discarded. Raw probes,
 full comparisons, binaries and the rejected patch remain under
 `target/o4-single-key-*`.
 
+A filtered multi-table chain with at most eight intermediate rows now probes
+a unique integer right join key when that right source has no pushed filter,
+then restores right-table row order before joining. Frozen and CTE sources
+retain the scan path. For the same three-table query with `WHERE a.id = 1`
+and primary keys on all three tables, medians of three alternating 0.5-second
+SQLx probes improve 47.048→37.361 us (20.59%) at 100 rows and
+1,012.833→37.587 us (96.29%) at 10,000 rows. Native prepared probes improve
+33.087→23.917 us (27.72%) and 1,002.010→24.102 us (97.59%). Two full
+ten-case Tier 1 sweeps drifted across unrelated cases. Isolated reverse-order
+selective-join pairs favored the candidate; 30- and 50-sample many-match
+join pairs changed direction with run order, with no confirmed slowdown.
+An isolated full-read check also had overlapping intervals. The expanded
+PostgreSQL differential covers duplicate left keys, missing indexed keys,
+right-side filters, NULL/outer fallbacks and a serializable read. Serializable
+differential, generated SQL, the workspace suite with the same two existing
+exclusions, formatting, scoped Clippy, and the execution-log build pass.
+Raw probes, release binaries and Tier 1 logs remain under
+`target/o4-indexed-chain-*`. Other O4 work remains pending.
+
 ### O5 — Prepare simple mutation structure once; specialize resumption [PENDING]
 
 **Effort:** 4–7 days. **Dependency:** O1. **Confidence:** high for redundant work;
