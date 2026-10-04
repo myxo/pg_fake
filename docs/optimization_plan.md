@@ -440,6 +440,23 @@ failure and 820/850 corpus threshold test excluded. Raw results and matching
 release binaries remain locally under `target/o4-right-offkey-*`. General join
 intermediate-copying work remains pending.
 
+A three-table hash-chain follow-up now builds right-key buckets at each stage,
+moves left rows with one match into intermediate rows, and reuses a scratch row
+for final-stage visits. The single-join path is unchanged. For
+`SELECT a.name, b.name, c.name FROM a JOIN b ON a.id=b.id JOIN c ON b.id=c.id`,
+medians of three 0.5-second SQLx runs per binary improve 124.578→108.582 us
+(12.84%) at 100 rows and 9,996.562→8,294.426 us (17.03%) at 10,000 rows;
+native prepared runs improve 14.04% and 15.25%. The full ten-case Tier 1 sweep
+had broad drift across unrelated cases. Isolated 50-sample reverse-order pairs
+measured ordering at 28.263→27.892 us and selective join at
+10.153→10.103 us, reversing their apparent full-sweep slowdowns. The focused
+multi-join PostgreSQL differential, generated SQL, serializable differential,
+workspace library tests, formatting and scoped Clippy pass. Raw probes, matching
+release binaries and full Tier 1 logs remain under `target/o4-hash-chain-revisit-*`.
+The workspace suite passes with the two existing collation and corpus-threshold
+failures excluded.
+Other O4 join and access-path work remains pending.
+
 ### O5 — Prepare simple mutation structure once; specialize resumption [PENDING]
 
 **Effort:** 4–7 days. **Dependency:** O1. **Confidence:** high for redundant work;

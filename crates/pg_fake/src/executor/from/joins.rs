@@ -312,6 +312,7 @@ fn hash_join_matches<'left, 'right>(
         .collect()
 }
 
+#[inline(never)]
 #[cfg_attr(feature = "execution-log", tracing::instrument(skip_all))]
 fn visit_hash_join_chain_rows(
     state: &DatabaseState,
@@ -363,6 +364,56 @@ fn visit_hash_join_chain_rows(
                 Ok(())
             },
         )?;
+        if hash_slots.len() > 1 {
+            let mut right_by_key = std::collections::HashMap::<EqualityKey, Vec<usize>>::new();
+            for (right_index, right) in right_rows.iter().enumerate() {
+                if let Some(key) = create_hash_join_key(&right[right_slot - right_start], key_type)
+                {
+                    right_by_key.entry(key).or_default().push(right_index);
+                }
+            }
+            if index + 1 == hash_slots.len() {
+                let mut scratch = Vec::with_capacity(right_end);
+                for mut left in rows {
+                    let matches = create_hash_join_key(&left[left_slot], key_type)
+                        .and_then(|key| right_by_key.get(&key));
+                    if let Some(matches) = matches {
+                        for &right_index in matches {
+                            scratch.clear();
+                            scratch.extend_from_slice(&left);
+                            scratch.extend_from_slice(&right_rows[right_index]);
+                            visit(&scratch)?;
+                        }
+                    } else if preserve_left {
+                        left.resize(right_end, Value::Null);
+                        visit(&left)?;
+                    }
+                }
+                return Ok(());
+            }
+            let mut joined = Vec::new();
+            for mut left in rows {
+                let matches = create_hash_join_key(&left[left_slot], key_type)
+                    .and_then(|key| right_by_key.get(&key));
+                if let Some(matches) = matches {
+                    if matches.len() == 1 {
+                        left.extend_from_slice(&right_rows[matches[0]]);
+                        joined.push(left);
+                    } else {
+                        joined.extend(matches.iter().map(|&right_index| {
+                            let mut row = left.clone();
+                            row.extend_from_slice(&right_rows[right_index]);
+                            row
+                        }));
+                    }
+                } else if preserve_left {
+                    left.resize(right_end, Value::Null);
+                    joined.push(left);
+                }
+            }
+            rows = joined;
+            continue;
+        }
         let mut joined = Vec::new();
         let matches = hash_join_matches(
             rows.iter().map(|row| &row[left_slot]),
