@@ -563,6 +563,22 @@ and execution-log build pass. Strict Clippy still reports three existing
 warnings in unrelated files. Matching release binaries and raw timings remain
 under `target/o4-integer-chain-*`.
 
+A further filtered-chain experiment scanned an unfiltered, nonunique right
+table through borrowed visible rows and cloned only keys matching at most eight
+intermediate left rows. For
+`SELECT a.name,b.name,c.name FROM a JOIN b ON a.id=b.id JOIN c ON b.id=c.id WHERE a.id=1`
+with no indexes, three alternating 0.5-second native prepared probes of the
+out-of-line variant improved 74.506→69.066 us (7.30%) at 100 rows and
+5,179.929→4,659.661 us (10.04%) at 10,000 rows. The inline variant passed
+focused join and serializable differential tests. Full Tier 1
+sweeps drifted broadly. The out-of-line variant's isolated 30-sample pairs
+showed many-match join flat at 17.395→17.388 us and transaction insert faster
+at 43.438→42.753 us, but selective join slowed 10.231→10.362 us (1.28%)
+and ordering slowed 28.016→28.386 us (1.32%). Paging improved
+19.774→19.530 us. With two Tier 1 regressions for a modest target gain,
+the executor change was discarded. Raw timings and matching release binaries
+remain under `target/o4-filtered-borrow-*`.
+
 ### O5 — Prepare simple mutation structure once; specialize resumption [PENDING]
 
 **Effort:** 4–7 days. **Dependency:** O1. **Confidence:** high for redundant work;
