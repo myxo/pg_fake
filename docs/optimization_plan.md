@@ -551,6 +551,20 @@ allowed. Raw runs are under `target/o8-read-tracking-*`. The saved point-read
 profile attributes 15.8% of active samples to transaction start, 30.39% to
 commit, and 7.79% to GC, so the remaining start/commit work stays pending.
 
+An O8 follow-up tried skipping version pruning when its table and catalog
+bookkeeping showed no pending work. Alternating 0.5-second native probes
+improved prepared point reads from 1.221 to 1.116 µs (8.60%) in the revised
+read-only variant, with large scans effectively flat. The first broader
+variant slowed the official transaction insert from 41.490 to 44.901 µs in
+the first full sweep and from 42.068 to 43.440 µs in reverse. Restricting
+the shortcut to read-only commits did not resolve the concern: exact
+alternating transaction-insert repeats gave 41.929/41.948 µs for baseline
+and 42.381/42.996 µs for the candidate. The full-suite many-match readings
+also varied substantially, although isolated repeats favored the candidate.
+Both implementations were discarded under the
+no-Tier-1-slowdown rule. Raw probes, Criterion logs and the rejected patch are
+retained locally under `target/o8-prune-*`; start/commit work remains pending.
+
 ### O9 — Reduce ordered-row copying and comparator overhead [PENDING]
 
 **Effort:** 2–4 days. **Dependency:** O1, O8. **Confidence:** high for extra copies;
