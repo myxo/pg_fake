@@ -565,6 +565,17 @@ Both implementations were discarded under the
 no-Tier-1-slowdown rule. Raw probes, Criterion logs and the rejected patch are
 retained locally under `target/o8-prune-*`; start/commit work remains pending.
 
+Another O8 experiment shared the time zone, search path, and search-path text
+across `SessionSettings` snapshots. Three alternating 0.5-second native probes
+improved the prepared point read from 1.216 to 1.032 µs (15.10%), but exact
+official transaction-insert repeats favored baseline at 42.104/41.742 µs
+versus 43.094/42.834 µs. Sharing only the search-path vector still improved
+the native point read from 1.220 to 1.099 µs (9.87%), while the exact SQLx
+transaction insert measured 41.981→43.081 µs (2.62% slower). Both variants
+had full Tier 1 sweeps, but were discarded under the no-slowdown rule. Raw
+probes, Criterion logs, and rejected patches remain under
+`target/o8-shared-settings-*` and `target/o8-search-path-share-*`.
+
 ### O9 — Reduce ordered-row copying and comparator overhead [PENDING]
 
 **Effort:** 2–4 days. **Dependency:** O1, O8. **Confidence:** high for extra copies;
