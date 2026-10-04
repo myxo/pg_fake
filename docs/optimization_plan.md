@@ -676,9 +676,24 @@ paging pairs improved 26.342→19.764 us (24.97%) and 26.529→19.747 us
 The prepared-ordering differential and generated SQL property test passed.
 However, exact selective-join repeats in both run orders confirmed a slowdown:
 10.099→10.258 us (1.57%) and 10.084→10.298 us (2.12%). Both prototype
-variants were discarded under the no-slowdown rule. Full Tier 1 results,
-isolated probes, build logs, and rejected patches remain locally under
-`target/o9-collect-sort-*`.
+variants were initially discarded under the no-slowdown rule. The user later
+accepted this experiment's paging/join tradeoff. Reapplying the revised variant
+and benchmarking matching release binaries gave isolated paging pairs of
+25.893→19.603 us (24.29%) and 26.072→19.733 us (24.31%); selective join was
+9.988→10.110 us (1.22%) and 10.022→10.102 us (0.80%) slower. Full Tier 1
+sweeps showed broad timing drift across unrelated cases, so isolated reverse-order
+checks covered full reads, indexed reads and ordering. Ordering read
+27.863→28.258 us (1.42%) and 28.095→28.197 us (0.36%) slower; full read
+20.020→20.152 us (0.66%) and 19.833→20.138 us (1.54%) slower. Indexed reads
+were flat within run-to-run variation. These small additional readings are
+included in the user's acceptance of this collect/sort experiment, not a change
+to the general no-slowdown rule. The prepared-ordering differential, 256 generated
+SQL cases, workspace library tests, formatting and scoped Clippy pass. The full
+workspace suite stopped on an unrelated existing collation mismatch for
+`SELECT min(label), max(label)` over `VALUES ('a'), ('MiXeD')`; later tests then
+failed from a poisoned shared lock. O9 remains pending for the remaining ordering
+and wide-row work. Raw results and build logs remain locally under
+`target/o9-collect-sort-*` and `target/o9-collect-sort-revisit-*`.
 
 ## Milestones and stopping rules
 

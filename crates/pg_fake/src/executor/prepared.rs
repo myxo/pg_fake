@@ -985,6 +985,26 @@ pub(crate) fn execute_prepared_query(
             .unwrap_or(std::cmp::Ordering::Equal)
     };
     let top_k = plan.limit.map(|limit| plan.offset.saturating_add(limit));
+    let collect_then_sort = if let (
+        PreparedSource::Table {
+            table_id,
+            access: PreparedAccess::Scan,
+        },
+        Some(top_k),
+    ) = (&plan.source, top_k)
+    {
+        let stored_rows = state
+            .tables
+            .get(table_id)
+            .expect("prepared table must have storage")
+            .iterate_version_chains()
+            .size_hint()
+            .0;
+        stored_rows <= 256 && top_k >= stored_rows.div_ceil(2)
+    } else {
+        false
+    };
+    let heap_top_k = if collect_then_sort { None } else { top_k };
     let mut visit = |row: &[Value]| -> Result<()> {
         if deadline.is_some_and(|deadline| Instant::now() >= deadline) {
             return Err(PgError::create(
@@ -1003,13 +1023,13 @@ pub(crate) fn execute_prepared_query(
         match &plan.output {
             PreparedOutput::Rows(_) => {
                 if defer_projection {
-                    if top_k.is_none_or(|limit| {
+                    if heap_top_k.is_none_or(|limit| {
                         rows.len() < limit || (limit != 0 && compare(row, &rows[0]).is_lt())
                     }) {
                         super::query::retain_admitted_top_ordered_row(
                             &mut rows,
                             row.to_vec(),
-                            top_k,
+                            heap_top_k,
                             |left, right| compare(left, right),
                         );
                     }
@@ -1113,6 +1133,9 @@ pub(crate) fn execute_prepared_query(
     }
     if defer_projection {
         rows.sort_by(|left, right| compare(left, right));
+        if collect_then_sort {
+            rows.truncate(top_k.expect("collect and sort requires a limit"));
+        }
         let projected = rows
             .iter()
             .map(|row| project(row))
