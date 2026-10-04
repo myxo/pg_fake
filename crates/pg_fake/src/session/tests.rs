@@ -11311,7 +11311,10 @@ fn track_unfiltered_hash_join_reads() {
     let statement = reader
         .prepare("SELECT l.id FROM hash_read_left l JOIN hash_read_right r ON l.id = r.id")
         .unwrap();
-    assert!(statement.query_plan.is_none());
+    assert!(matches!(
+        statement.query_plan.as_ref(),
+        Some(crate::executor::PreparedReadPlan::UnfilteredInnerJoin(_))
+    ));
     reader
         .execute("BEGIN ISOLATION LEVEL SERIALIZABLE")
         .unwrap();

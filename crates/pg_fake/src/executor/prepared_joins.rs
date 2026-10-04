@@ -24,6 +24,7 @@ pub(crate) enum PreparedReadPlan {
     UniqueInnerJoin(PreparedInnerJoinPlan),
     AdaptiveUniqueInnerJoin(PreparedInnerJoinPlan),
     DoubleFilteredInnerJoin(Box<PreparedDoubleFilteredInnerJoinPlan>),
+    UnfilteredInnerJoin(PreparedUnfilteredInnerJoinPlan),
 }
 
 impl PreparedReadPlan {
@@ -34,8 +35,20 @@ impl PreparedReadPlan {
             | Self::UniqueInnerJoin(plan)
             | Self::AdaptiveUniqueInnerJoin(plan) => &plan.columns,
             Self::DoubleFilteredInnerJoin(plan) => &plan.join.columns,
+            Self::UnfilteredInnerJoin(plan) => &plan.columns,
         }
     }
+}
+
+#[derive(Debug, Clone)]
+pub(crate) struct PreparedUnfilteredInnerJoinPlan {
+    left_table_id: TableId,
+    right_table_id: TableId,
+    left_width: usize,
+    left_key: usize,
+    right_key: usize,
+    projection: Vec<usize>,
+    columns: Vec<ColumnMeta>,
 }
 
 #[derive(Debug, Clone)]
@@ -218,16 +231,14 @@ pub(crate) fn build_prepared_join_plan(
         }
         _ => return Ok(None),
     };
-    let Some(selection) = select.selection.as_ref() else {
-        return Ok(None);
-    };
-    let filters = match selection {
-        ast::Expr::BinaryOp {
+    let filters = match select.selection.as_ref() {
+        Some(ast::Expr::BinaryOp {
             left,
             op: ast::BinaryOperator::And,
             right,
-        } => vec![left.as_ref(), right.as_ref()],
-        expression => vec![expression],
+        }) => vec![left.as_ref(), right.as_ref()],
+        Some(expression) => vec![expression],
+        None => Vec::new(),
     };
     let mut left_filter = None;
     let mut right_filter = None;
@@ -246,7 +257,7 @@ pub(crate) fn build_prepared_join_plan(
             return Ok(None);
         }
     }
-    let reverse_sources = left_filter.is_none();
+    let reverse_sources = left_filter.is_none() && right_filter.is_some();
     if reverse_sources
         && (!state
             .tables
@@ -261,14 +272,6 @@ pub(crate) fn build_prepared_join_plan(
     {
         return Ok(None);
     }
-    let (filter_slot, filter_value) = if let Some(filter) = left_filter {
-        filter
-    } else {
-        let Some(filter) = right_filter.take() else {
-            return Ok(None);
-        };
-        filter
-    };
     let mut projection = Vec::with_capacity(select.projection.len());
     for item in &select.projection {
         let expression = match item {
@@ -294,6 +297,24 @@ pub(crate) fn build_prepared_join_plan(
     let columns = match described_columns {
         Some(columns) => columns.to_vec(),
         None => describe_query_result_columns(state, statement)?,
+    };
+    if left_filter.is_none() && right_filter.is_none() {
+        return Ok(Some(PreparedReadPlan::UnfilteredInnerJoin(
+            PreparedUnfilteredInnerJoinPlan {
+                left_table_id: left_schema.id,
+                right_table_id: right_schema.id,
+                left_width,
+                left_key,
+                right_key,
+                projection,
+                columns,
+            },
+        )));
+    }
+    let (filter_slot, filter_value) = if let Some(filter) = left_filter {
+        filter
+    } else {
+        right_filter.take().expect("right-only join has a filter")
     };
     let (left_schema, right_schema, left_width, left_key, right_key) = if reverse_sources {
         (
@@ -388,7 +409,80 @@ pub(crate) fn execute_prepared_read(
         PreparedReadPlan::InnerJoin(plan) => execute_prepared_inner_join::<false>(
             state, plan, parameters, xid, snapshot, deadline, timezone, None,
         ),
+        PreparedReadPlan::UnfilteredInnerJoin(plan) => {
+            execute_prepared_unfiltered_join(state, plan, xid, snapshot, deadline)
+        }
     }
+}
+
+#[inline(never)]
+fn execute_prepared_unfiltered_join(
+    state: &DatabaseState,
+    plan: &PreparedUnfilteredInnerJoinPlan,
+    xid: Xid,
+    snapshot: &Snapshot,
+    deadline: Option<Instant>,
+) -> Result<Vec<Vec<Value>>> {
+    state.catalog.require_table_by_id(plan.left_table_id)?;
+    state.catalog.require_table_by_id(plan.right_table_id)?;
+    let left_table = state
+        .tables
+        .get(&plan.left_table_id)
+        .expect("prepared left table must have storage");
+    let right_table = state
+        .tables
+        .get(&plan.right_table_id)
+        .expect("prepared right table must have storage");
+    let mut left_rows = Vec::new();
+    state.record_read(xid, Access::Relation(plan.left_table_id));
+    for (row_id, chain) in left_table.iterate_version_chains() {
+        let Some(version) = find_visible_version(chain, snapshot, xid, &state.transactions) else {
+            continue;
+        };
+        state.record_read(xid, Access::Row(plan.left_table_id, row_id));
+        left_rows.push(&version.row);
+    }
+    let mut right_by_key = HashMap::<i32, Vec<&[Value]>>::new();
+    state.record_read(xid, Access::Relation(plan.right_table_id));
+    for (row_id, chain) in right_table.iterate_version_chains() {
+        let Some(version) = find_visible_version(chain, snapshot, xid, &state.transactions) else {
+            continue;
+        };
+        state.record_read(xid, Access::Row(plan.right_table_id, row_id));
+        if let Value::Int4(key) = version.row[plan.right_key] {
+            right_by_key.entry(key).or_default().push(&version.row);
+        }
+    }
+    let mut rows = Vec::new();
+    for left in left_rows {
+        let Value::Int4(key) = left[plan.left_key] else {
+            continue;
+        };
+        let Some(matches) = right_by_key.get(&key) else {
+            continue;
+        };
+        for right in matches {
+            if deadline.is_some_and(|deadline| Instant::now() >= deadline) {
+                return Err(PgError::create(
+                    SqlState::QueryCanceled,
+                    "canceling statement due to statement timeout",
+                ));
+            }
+            rows.push(
+                plan.projection
+                    .iter()
+                    .map(|slot| {
+                        if *slot < plan.left_width {
+                            left[*slot].clone()
+                        } else {
+                            right[*slot - plan.left_width].clone()
+                        }
+                    })
+                    .collect(),
+            );
+        }
+    }
+    Ok(rows)
 }
 
 fn execute_prepared_inner_join<const RIGHT_FILTER: bool>(

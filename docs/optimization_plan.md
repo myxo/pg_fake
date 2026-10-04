@@ -405,6 +405,22 @@ transaction-insert repeats resolved noisy readings. Raw timings and the separate
 baseline build remain locally under `target/o4-right-filter-*`. General join
 intermediate-copying work remains pending.
 
+An unfiltered two-table integer equality join with direct-column projections
+now uses a prepared path that borrows both source rows and clones only output
+values. It preserves the left scan, right scan, and result-visit order used by
+the borrowed generic path. For
+`SELECT l.name, r.name FROM l JOIN r ON l.id = r.id`, alternating release SQLx
+probes improve 61.194→27.397 us (55.23%) and 61.919→26.832 us (56.67%) at
+100 rows; 10,000-row pairs improve 3,523.605→1,934.550 us (45.10%) and
+3,527.414→1,896.784 us (46.23%). The first variant showed noisy full Tier 1
+read and join slowdowns; moving the new plan variant after existing variants
+and keeping its executor out of line removed reproducible regressions. The
+final full Tier 1 comparison and alternating isolated repeats found no
+confirmed slowdown. The prepared-join, generated SQL, and serializable
+PostgreSQL differential tests, workspace library tests, formatting, and scoped
+Clippy pass. Raw results are local under `target/o4-projection-*`; other O4
+general join and access-path work remains pending.
+
 ### O5 — Prepare simple mutation structure once; specialize resumption [PENDING]
 
 **Effort:** 4–7 days. **Dependency:** O1. **Confidence:** high for redundant work;
