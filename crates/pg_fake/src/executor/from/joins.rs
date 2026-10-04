@@ -136,7 +136,21 @@ pub(crate) fn visit_streamed_join_rows(
                 visit,
             );
         }
-        return visit_hash_join_chain_rows(
+        if hash_slots.len() > 1 && selection.is_some() {
+            return visit_hash_join_chain_rows::<true>(
+                state,
+                table,
+                scope,
+                xid,
+                snapshot,
+                context,
+                selection,
+                &starts,
+                &hash_slots,
+                visit,
+            );
+        }
+        return visit_hash_join_chain_rows::<false>(
             state,
             table,
             scope,
@@ -439,7 +453,7 @@ fn hash_join_matches<'left, 'right>(
 
 #[inline(never)]
 #[cfg_attr(feature = "execution-log", tracing::instrument(skip_all))]
-fn visit_hash_join_chain_rows(
+fn visit_hash_join_chain_rows<const PRUNE_SPARSE_RIGHT: bool>(
     state: &DatabaseState,
     table: &ast::TableWithJoins,
     scope: &BoundScope,
@@ -474,21 +488,47 @@ fn visit_hash_join_chain_rows(
             .copied()
             .unwrap_or(scope.columns.len());
         let key_type = scope.columns[left_slot].data_type.base;
+        let selective_keys = (PRUNE_SPARSE_RIGHT && rows.len() <= 8).then(|| {
+            rows.iter()
+                .filter_map(|row| create_hash_join_key(&row[left_slot], key_type))
+                .collect::<std::collections::HashSet<_>>()
+        });
         let mut right_rows = Vec::new();
-        visit_table_factor_rows(
-            state,
-            &table.joins[index].relation,
-            scope,
-            xid,
-            snapshot,
-            context,
-            selection,
-            right_start,
-            &mut |row| {
-                right_rows.push(row[right_start..right_end].to_vec());
-                Ok(())
-            },
-        )?;
+        if let Some(keys) = selective_keys {
+            visit_table_factor_rows(
+                state,
+                &table.joins[index].relation,
+                scope,
+                xid,
+                snapshot,
+                context,
+                selection,
+                right_start,
+                &mut |row| {
+                    if create_hash_join_key(&row[right_slot], key_type)
+                        .is_some_and(|key| keys.contains(&key))
+                    {
+                        right_rows.push(row[right_start..right_end].to_vec());
+                    }
+                    Ok(())
+                },
+            )?;
+        } else {
+            visit_table_factor_rows(
+                state,
+                &table.joins[index].relation,
+                scope,
+                xid,
+                snapshot,
+                context,
+                selection,
+                right_start,
+                &mut |row| {
+                    right_rows.push(row[right_start..right_end].to_vec());
+                    Ok(())
+                },
+            )?;
+        }
         if hash_slots.len() > 1 {
             let mut right_by_key = std::collections::HashMap::<EqualityKey, Vec<usize>>::new();
             for (right_index, right) in right_rows.iter().enumerate() {

@@ -501,6 +501,23 @@ gain but still slowed the selective join in both run orders:
 the no-Tier-1-slowdown rule. Its probes, full Tier 1 sweeps, binaries and
 rejected patch remain locally under `target/o4-selective-chain-*`.
 
+The sparse-key check was then isolated in a separate compiled variant for
+filtered multi-table chains, leaving the ordinary single-join row callback
+unchanged. For the same query with `WHERE a.id = 1`, three alternating
+0.5-second SQLx probes improve 105.493→86.153 us (18.33%) at 100 rows and
+7,528.276→5,146.082 us (31.64%) at 10,000 rows. Native prepared probes
+improve 92.439→72.416 us (21.66%) and 7,505.413→5,064.718 us (32.52%).
+The full ten-case Tier 1 sweep drifted across unrelated cases; isolated
+30-sample selective-join pairs favored the candidate in both orders
+(10.146→10.004 us and 10.594→10.156 us). Transaction insert, full select,
+indexed select and update were checked in isolated reverse-order pairs, with
+no confirmed slowdown. The PostgreSQL multi-join differential now includes
+filtered empty results, NULL and outer-join cases; serializable differential,
+generated SQL, the workspace suite with the same two existing exclusions,
+formatting, scoped Clippy, and the execution-log build pass. Raw runs and
+matching binaries remain under `target/o4-selective-chain-isolated-*`.
+Other O4 work remains pending.
+
 ### O5 — Prepare simple mutation structure once; specialize resumption [PENDING]
 
 **Effort:** 4–7 days. **Dependency:** O1. **Confidence:** high for redundant work;
