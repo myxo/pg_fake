@@ -945,7 +945,7 @@ pub(crate) fn execute_prepared_query(
     deadline: Option<Instant>,
     timezone: &str,
 ) -> Result<Vec<Vec<Value>>> {
-    let mut rows = Vec::new();
+    let mut rows: Vec<Vec<Value>> = Vec::new();
     let mut aggregate_states = match &plan.output {
         PreparedOutput::Rows(_) => Vec::new(),
         PreparedOutput::Aggregates(aggregates) => aggregates
@@ -968,7 +968,7 @@ pub(crate) fn execute_prepared_query(
             })
             .collect()
     };
-    let compare = |left: &Vec<Value>, right: &Vec<Value>| {
+    let compare = |left: &[Value], right: &[Value]| {
         plan.ordering
             .iter()
             .map(|spec| {
@@ -1003,7 +1003,16 @@ pub(crate) fn execute_prepared_query(
         match &plan.output {
             PreparedOutput::Rows(_) => {
                 if defer_projection {
-                    super::query::retain_top_ordered_row(&mut rows, row.to_vec(), top_k, &compare);
+                    if top_k.is_none_or(|limit| {
+                        rows.len() < limit || (limit != 0 && compare(row, &rows[0]).is_lt())
+                    }) {
+                        super::query::retain_admitted_top_ordered_row(
+                            &mut rows,
+                            row.to_vec(),
+                            top_k,
+                            |left, right| compare(left, right),
+                        );
+                    }
                 } else {
                     rows.push(project(row)?);
                 }
@@ -1103,7 +1112,7 @@ pub(crate) fn execute_prepared_query(
         }
     }
     if defer_projection {
-        rows.sort_by(compare);
+        rows.sort_by(|left, right| compare(left, right));
         let projected = rows
             .iter()
             .map(|row| project(row))

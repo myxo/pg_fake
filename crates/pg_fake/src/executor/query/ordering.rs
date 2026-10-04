@@ -248,6 +248,19 @@ pub(in crate::executor) fn retain_top_ordered_row<T>(
     top_k: Option<usize>,
     compare: impl Fn(&T, &T) -> Ordering,
 ) {
+    if top_k.is_none_or(|limit| {
+        rows.len() < limit || (limit != 0 && compare(&row, &rows[0]) == Ordering::Less)
+    }) {
+        retain_admitted_top_ordered_row(rows, row, top_k, compare);
+    }
+}
+
+pub(in crate::executor) fn retain_admitted_top_ordered_row<T>(
+    rows: &mut Vec<T>,
+    row: T,
+    top_k: Option<usize>,
+    compare: impl Fn(&T, &T) -> Ordering,
+) {
     let Some(top_k) = top_k else {
         rows.push(row);
         return;
@@ -266,9 +279,6 @@ pub(in crate::executor) fn retain_top_ordered_row<T>(
             rows.swap(parent, child);
             child = parent;
         }
-        return;
-    }
-    if compare(&row, &rows[0]) != Ordering::Less {
         return;
     }
     rows[0] = row;

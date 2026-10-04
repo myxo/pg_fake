@@ -604,6 +604,26 @@ cases pass. Initial official SQLx budgets: paging ≤22 us, ordering ≤28 us;
 also demonstrate reductions on wide 10k-row inputs. Heap work and final sorting
 are real costs, so copying alone cannot make paging constant time.
 
+The first O9 step compares each borrowed source row with the bounded heap's
+worst row before cloning it; the shared heap helper avoids repeating the
+admission comparison. Three alternating 0.5-second native pairs improve
+10,000-row paging 1,623.556→1,473.997 us (9.21%); the 100-row median improves
+17.332→16.767 us (3.26%) for the initial candidate. A final exact 20-sample,
+1-second warmup, 2-second measurement SQLx paging pair improves
+28.148→26.856 us (4.59%). A temporary 10,000-row fixture with 1 KiB text
+payloads improves from 2,084/2,306 us to 1,799/1,942 us in alternating
+512-iteration runs of the final candidate (14.77% by pair medians).
+The full Tier 1 sweeps under `target/o9-lazy-topk-tier1-*` changed direction
+with run order, and one sweep had a transient 2–4x rise across unrelated
+cases. The final full sweep's apparent many-match join slowdown reversed in
+exact alternating repeats (16.759→16.887 us, then 17.047→16.713 us); no Tier 1
+slowdown was confirmed. The focused prepared ordering test, PostgreSQL
+differential, 256 generated SQL cases, workspace library tests, formatting,
+and scoped Clippy pass. Full workspace tests exhausted disk during linking;
+strict Clippy still stops on three unrelated existing warnings. O9 stays
+pending because the official 22 us paging budget and the remaining comparator
+and OFFSET work are not yet met.
+
 ## Milestones and stopping rules
 
 1. Establish trustworthy gates and bound cache retention: O1–O2.

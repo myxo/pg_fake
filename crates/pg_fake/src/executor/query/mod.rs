@@ -44,7 +44,8 @@ pub(super) use locking::{
     resolve_select_lock_mode,
 };
 pub(super) use ordering::{
-    OrderKey, RowOrderSpec, compare_order_keys, resolve_order_specs, retain_top_ordered_row,
+    OrderKey, RowOrderSpec, compare_order_keys, resolve_order_specs,
+    retain_admitted_top_ordered_row,
 };
 use ordering::{compare_ordered_rows, sort_ordered_rows};
 pub(crate) use projection::describe_query_result_columns;
