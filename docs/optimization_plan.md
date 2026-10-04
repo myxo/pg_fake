@@ -532,6 +532,25 @@ pass. Expect roughly 5–15% native scan improvement from read bookkeeping;
 absolute savings on a 1.3-us point read will be small. Do not bypass MVCC or
 stop tracking conflicting writes to meet a target.
 
+The first O8 step remembers whether the current statement's transaction needs
+SSI read tracking, skipping graph locks for ordinary reads. If a blocked
+statement resumes after another transaction replaced that hint, it consults the
+graph. Prepared point and join probes also avoid constructing unique read keys
+when tracking is unnecessary. Three alternating 0.5-second native prepared
+probes improve the 10,000-row full read 932.641→890.690 µs (4.50%), the
+100-row selective join 3.816→2.754 µs (27.83%), and the many-match join
+7.106→6.053 µs (14.81%); the insert cycle is flat. Both full ten-case Tier 1
+Criterion sweeps improve the selective join by 11.66% and 7.57%, and the
+many-match join by 5.69% and 7.72%. An apparent indexed-select slowdown
+reversed in exact alternating repeats; no Tier 1 slowdown was confirmed.
+The focused hint-interleaving test, four serializable differential tests, and
+all 11 extended property cases pass. The workspace gate still reaches the
+pre-existing mixed-case `min`/`max` collation failure, and strict Clippy still
+stops on four existing warnings; Clippy passes with those four lint categories
+allowed. Raw runs are under `target/o8-read-tracking-*`. The saved point-read
+profile attributes 15.8% of active samples to transaction start, 30.39% to
+commit, and 7.79% to GC, so the remaining start/commit work stays pending.
+
 ### O9 — Reduce ordered-row copying and comparator overhead [PENDING]
 
 **Effort:** 2–4 days. **Dependency:** O1, O8. **Confidence:** high for extra copies;

@@ -21,6 +21,7 @@ pub(crate) struct DatabaseState {
     pub(crate) tables: BTreeMap<TableId, Table>,
     pub(crate) transactions: TransactionRegistry,
     pub(crate) serializable: Arc<Mutex<crate::serializable::DependencyGraph>>,
+    recent_read_tracker: Option<(Xid, bool)>,
     pub(crate) row_locks: RowLockManager,
     pub(crate) advisory_locks: Arc<Mutex<crate::advisory::AdvisoryLockManager>>,
     pub(crate) relation_locks: RelationLockManager,
@@ -53,6 +54,7 @@ impl DatabaseState {
             tables: BTreeMap::new(),
             transactions,
             serializable: Default::default(),
+            recent_read_tracker: None,
             row_locks: RowLockManager::create(),
             advisory_locks: Default::default(),
             relation_locks: RelationLockManager::create(),
@@ -198,6 +200,7 @@ impl DatabaseState {
             .lock()
             .expect("dependency graph is poisoned")
             .set_snapshot(xid, snapshot.commit_seq, serializable);
+        self.recent_read_tracker = Some((xid, serializable));
         if first_serializable_statement {
             let touched = self
                 .touched_tables
@@ -220,10 +223,25 @@ impl DatabaseState {
     }
 
     pub(crate) fn record_read(&self, xid: Xid, access: crate::serializable::Access) {
+        if self.recent_read_tracker == Some((xid, false)) {
+            return;
+        }
         self.serializable
             .lock()
             .expect("dependency graph is poisoned")
             .read(xid, access);
+    }
+
+    pub(crate) fn tracks_serializable_reads(&self, xid: Xid) -> bool {
+        if let Some((tracked, serializable)) = self.recent_read_tracker
+            && tracked == xid
+        {
+            return serializable;
+        }
+        self.serializable
+            .lock()
+            .expect("dependency graph is poisoned")
+            .is_serializable(xid)
     }
 
     pub(crate) fn uses_serializable_snapshot(&self, xid: Xid) -> bool {
@@ -397,5 +415,42 @@ impl DatabaseState {
         for sequence_id in reclaimed.sequences {
             sequence_values.remove(&sequence_id);
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::DatabaseState;
+    use crate::{
+        catalog::TableId,
+        serializable::Access,
+        storage::RowId,
+        txn::{CommandId, Snapshot},
+    };
+
+    #[test]
+    fn preserves_serializable_reads_after_tracking_hint_changes() {
+        let mut state = DatabaseState::create();
+        let reader = state.transactions.begin();
+        let writer = state.transactions.begin();
+        {
+            let mut graph = state.serializable.lock().unwrap();
+            graph.begin(reader);
+            graph.begin(writer);
+        }
+        let snapshot = Snapshot::create(&state.transactions);
+        state.begin_statement_tracking(reader, snapshot, true);
+        state.begin_statement_tracking(writer, snapshot, false);
+
+        let table = TableId(1);
+        assert!(state.tracks_serializable_reads(reader));
+        assert!(!state.tracks_serializable_reads(writer));
+        state.record_read(reader, Access::Relation(table));
+        state.serializable.lock().unwrap().replace_table_writes(
+            writer,
+            table,
+            std::collections::BTreeSet::from([(CommandId(0), Access::Row(table, RowId(1)))]),
+        );
+        assert!(state.serializable.lock().unwrap().has_edge(reader, writer));
     }
 }

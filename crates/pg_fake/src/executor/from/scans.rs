@@ -154,7 +154,9 @@ pub(super) fn visit_table_factor_rows(
             &row,
             context,
         )?;
-        if let Some(key) = table.create_unique_read_key(&[column], std::slice::from_ref(&value)) {
+        if state.tracks_serializable_reads(xid)
+            && let Some(key) = table.create_unique_read_key(&[column], std::slice::from_ref(&value))
+        {
             state.record_read(xid, Access::Unique(schema.id, vec![column], key));
         }
         let Some((row_id, indexed_version)) = table.find_unique_visible_version(

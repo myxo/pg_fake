@@ -528,8 +528,9 @@ fn execute_prepared_unique_join(
         if left_rows.is_empty() {
             return Ok(Vec::new());
         }
-        if let Some(key) = right_table
-            .create_unique_read_key(&[plan.right_key], std::slice::from_ref(&filter_value))
+        if state.tracks_serializable_reads(xid)
+            && let Some(key) = right_table
+                .create_unique_read_key(&[plan.right_key], std::slice::from_ref(&filter_value))
         {
             state.record_read(
                 xid,
@@ -569,8 +570,9 @@ fn execute_prepared_unique_join(
         }
         return Ok(rows);
     }
-    if let Some(key) =
-        left_table.create_unique_read_key(&[plan.filter_slot], std::slice::from_ref(&filter_value))
+    if state.tracks_serializable_reads(xid)
+        && let Some(key) = left_table
+            .create_unique_read_key(&[plan.filter_slot], std::slice::from_ref(&filter_value))
     {
         state.record_read(
             xid,
@@ -591,8 +593,9 @@ fn execute_prepared_unique_join(
     if join_key.is_null() {
         return Ok(Vec::new());
     }
-    if let Some(key) =
-        right_table.create_unique_read_key(&[plan.right_key], std::slice::from_ref(join_key))
+    if state.tracks_serializable_reads(xid)
+        && let Some(key) =
+            right_table.create_unique_read_key(&[plan.right_key], std::slice::from_ref(join_key))
     {
         state.record_read(
             xid,
@@ -704,8 +707,9 @@ fn execute_prepared_off_key_unique_join(
             if join_key.is_null() {
                 continue;
             }
-            if let Some(key) = right_table
-                .create_unique_read_key(&[plan.right_key], std::slice::from_ref(join_key))
+            if state.tracks_serializable_reads(xid)
+                && let Some(key) = right_table
+                    .create_unique_read_key(&[plan.right_key], std::slice::from_ref(join_key))
             {
                 state.record_read(
                     xid,

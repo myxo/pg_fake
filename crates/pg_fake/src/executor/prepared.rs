@@ -1079,8 +1079,9 @@ pub(crate) fn execute_prepared_query(
                 PreparedAccess::Unique { column, value } => {
                     let value =
                         evaluate_prepared_expression(value, &[], parameters, deadline, timezone)?;
-                    if let Some(key) =
-                        table.create_unique_read_key(&[*column], std::slice::from_ref(&value))
+                    if state.tracks_serializable_reads(xid)
+                        && let Some(key) =
+                            table.create_unique_read_key(&[*column], std::slice::from_ref(&value))
                     {
                         state.record_read(
                             xid,
