@@ -266,3 +266,53 @@ fn compares_prepared_unfiltered_left_joins() {
         assert_statement(&runtime, &mut postgres, &mut fake, sql, RowOrder::Unordered);
     }
 }
+
+#[test]
+fn compares_prepared_wide_integer_joins() {
+    let server = start_isolated_postgres_server();
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap();
+    let mut postgres = runtime
+        .block_on(PgConnection::connect(&server.url))
+        .unwrap();
+    let mut fake = PgFakeConnection::new(Db::create());
+    for (suffix, data_type, matched_key) in [
+        ("small", "smallint", "123"),
+        ("big", "bigint", "3000000000"),
+    ] {
+        let left = format!("prepared_wide_{suffix}_l");
+        let right = format!("prepared_wide_{suffix}_r");
+        for sql in [
+            format!("CREATE TABLE {left} (id {data_type}, name text)"),
+            format!("CREATE TABLE {right} (id {data_type}, name text)"),
+            format!(
+                "INSERT INTO {left} VALUES ({matched_key},'a1'), ({matched_key},'a2'), (2,'a3'), (NULL,'an')"
+            ),
+            format!(
+                "INSERT INTO {right} VALUES ({matched_key},'b1'), ({matched_key},'b2'), (4,'b4'), (NULL,'bn')"
+            ),
+            format!("SELECT l.name,r.name FROM {left} l LEFT JOIN {right} r ON l.id=r.id"),
+            format!("SELECT l.id,r.id FROM {left} l LEFT JOIN {right} r ON l.id=r.id"),
+            format!("SELECT r.name,l.name FROM {left} l LEFT OUTER JOIN {right} r ON r.id=l.id"),
+            format!("SELECT l.name,r.name FROM {left} l JOIN {right} r ON l.id=r.id"),
+            format!(
+                "SELECT l.name,r.name FROM {left} l LEFT JOIN {right} r ON l.id=r.id WHERE r.id IS NULL"
+            ),
+            "BEGIN ISOLATION LEVEL SERIALIZABLE".to_owned(),
+            format!("SELECT l.name,r.name FROM {left} l LEFT JOIN {right} r ON l.id=r.id"),
+            "COMMIT".to_owned(),
+            format!("DELETE FROM {right}"),
+            format!("SELECT l.id,r.id FROM {left} l LEFT JOIN {right} r ON l.id=r.id"),
+        ] {
+            assert_statement(
+                &runtime,
+                &mut postgres,
+                &mut fake,
+                &sql,
+                RowOrder::Unordered,
+            );
+        }
+    }
+}

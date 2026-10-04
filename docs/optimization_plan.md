@@ -639,6 +639,28 @@ the execution-log build pass.
 Raw timings and matching binaries remain under `target/o4-left-*`. Other
 O4 work remains pending.
 
+The prepared unfiltered two-table `LEFT JOIN` route now also covers same-type
+`smallint` and `bigint` equality keys. It keeps the existing `integer` route
+unchanged and uses a separate executor for the wider keys; filtered and inner
+joins retain their existing paths. Three alternating 0.5-second SQLx probes
+with half the right keys present improve `smallint` from 69.948→22.200 us
+(68.26%) at 100 rows and 4,357.770→1,426.676 us (67.26%) at 10,000 rows.
+`bigint` improves 71.293→22.210 us (68.85%) and 4,298.685→1,409.644 us
+(67.21%). Native prepared probes improve 77.77–78.02% at 100 rows and
+68.79–68.92% at 10,000 rows. Full Tier 1 sweeps drifted across unrelated
+cases; exact 30-sample reverse-order repeats found no confirmed slowdown.
+Selective join pairs measured candidate/baseline 10.079/10.107 us, then
+baseline/candidate 10.156/10.025 us. Many-match pairs measured
+17.093/17.023 us, then 16.787/16.744 us. Ordering and paging pairs changed
+direction with run order. The PostgreSQL differential covers duplicate and
+NULL keys, typed integer projections, a `bigint` key above the `int4` range,
+empty right tables, filtered fallbacks and a serializable read. The workspace
+suite passes with the two established exclusions, all 11 extended property
+cases pass at 10,000 iterations and 600 seconds, and formatting, scoped Clippy
+and the all-features build pass. Strict Clippy still reports three existing
+warnings in unrelated files. Raw probes, matching binaries and full Tier 1
+logs remain under `target/o4-left-wide/`. Other O4 work remains pending.
+
 ### O5 — Prepare simple mutation structure once; specialize resumption [PENDING]
 
 **Effort:** 4–7 days. **Dependency:** O1. **Confidence:** high for redundant work;

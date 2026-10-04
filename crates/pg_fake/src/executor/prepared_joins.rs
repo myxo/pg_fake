@@ -26,6 +26,7 @@ pub(crate) enum PreparedReadPlan {
     DoubleFilteredInnerJoin(Box<PreparedDoubleFilteredInnerJoinPlan>),
     UnfilteredInnerJoin(PreparedUnfilteredInnerJoinPlan),
     UnfilteredLeftJoin(PreparedUnfilteredInnerJoinPlan),
+    UnfilteredWideLeftJoin(PreparedUnfilteredInnerJoinPlan),
     UnfilteredJoinChain(PreparedUnfilteredJoinChainPlan),
 }
 
@@ -37,7 +38,9 @@ impl PreparedReadPlan {
             | Self::UniqueInnerJoin(plan)
             | Self::AdaptiveUniqueInnerJoin(plan) => &plan.columns,
             Self::DoubleFilteredInnerJoin(plan) => &plan.join.columns,
-            Self::UnfilteredInnerJoin(plan) | Self::UnfilteredLeftJoin(plan) => &plan.columns,
+            Self::UnfilteredInnerJoin(plan)
+            | Self::UnfilteredLeftJoin(plan)
+            | Self::UnfilteredWideLeftJoin(plan) => &plan.columns,
             Self::UnfilteredJoinChain(plan) => &plan.columns,
         }
     }
@@ -235,28 +238,45 @@ pub(crate) fn build_prepared_join_plan(
     let right_schema = state.catalog.require_named_table(&right_name)?;
     let scope = bind_query_scope(&state.catalog, select)?;
     let left_width = left_schema.columns.len();
-    let (left_key, right_key) = match (
+    let (left_key, right_key, wide_key) = match (
         try_resolve_column_reference(left, &scope),
         try_resolve_column_reference(right, &scope),
     ) {
         (Some((left_slot, left_type)), Some((right_slot, right_type)))
             if left_slot < left_width
                 && right_slot >= left_width
-                && left_type.base == BaseType::Int4
-                && right_type.base == BaseType::Int4 =>
+                && left_type.base == right_type.base
+                && matches!(
+                    left_type.base,
+                    BaseType::Int2 | BaseType::Int4 | BaseType::Int8
+                ) =>
         {
-            (left_slot, right_slot - left_width)
+            (
+                left_slot,
+                right_slot - left_width,
+                left_type.base != BaseType::Int4,
+            )
         }
         (Some((right_slot, right_type)), Some((left_slot, left_type)))
             if left_slot < left_width
                 && right_slot >= left_width
-                && left_type.base == BaseType::Int4
-                && right_type.base == BaseType::Int4 =>
+                && left_type.base == right_type.base
+                && matches!(
+                    left_type.base,
+                    BaseType::Int2 | BaseType::Int4 | BaseType::Int8
+                ) =>
         {
-            (left_slot, right_slot - left_width)
+            (
+                left_slot,
+                right_slot - left_width,
+                left_type.base != BaseType::Int4,
+            )
         }
         _ => return Ok(None),
     };
+    if wide_key && !preserve_left {
+        return Ok(None);
+    }
     let filters = match select.selection.as_ref() {
         Some(ast::Expr::BinaryOp {
             left,
@@ -328,7 +348,9 @@ pub(crate) fn build_prepared_join_plan(
             projection,
             columns,
         };
-        return Ok(Some(if preserve_left {
+        return Ok(Some(if wide_key {
+            PreparedReadPlan::UnfilteredWideLeftJoin(plan)
+        } else if preserve_left {
             PreparedReadPlan::UnfilteredLeftJoin(plan)
         } else {
             PreparedReadPlan::UnfilteredInnerJoin(plan)
@@ -550,6 +572,9 @@ pub(crate) fn execute_prepared_read(
         PreparedReadPlan::UnfilteredLeftJoin(plan) => {
             execute_prepared_unfiltered_join::<true>(state, plan, xid, snapshot, deadline)
         }
+        PreparedReadPlan::UnfilteredWideLeftJoin(plan) => {
+            execute_prepared_wide_left_join(state, plan, xid, snapshot, deadline)
+        }
         PreparedReadPlan::UnfilteredJoinChain(plan) => {
             if plan.joins.iter().any(|join| join.3) {
                 execute_prepared_unfiltered_join_chain(
@@ -648,6 +673,102 @@ fn execute_prepared_unfiltered_join<const PRESERVE_LEFT: bool>(
                 );
             }
         } else if PRESERVE_LEFT {
+            if deadline.is_some_and(|deadline| Instant::now() >= deadline) {
+                return Err(PgError::create(
+                    SqlState::QueryCanceled,
+                    "canceling statement due to statement timeout",
+                ));
+            }
+            rows.push(
+                plan.projection
+                    .iter()
+                    .map(|slot| {
+                        if *slot < plan.left_width {
+                            left[*slot].clone()
+                        } else {
+                            Value::Null
+                        }
+                    })
+                    .collect(),
+            );
+        }
+    }
+    Ok(rows)
+}
+
+#[inline(never)]
+fn execute_prepared_wide_left_join(
+    state: &DatabaseState,
+    plan: &PreparedUnfilteredInnerJoinPlan,
+    xid: Xid,
+    snapshot: &Snapshot,
+    deadline: Option<Instant>,
+) -> Result<Vec<Vec<Value>>> {
+    state.catalog.require_table_by_id(plan.left_table_id)?;
+    state.catalog.require_table_by_id(plan.right_table_id)?;
+    let left_table = state
+        .tables
+        .get(&plan.left_table_id)
+        .expect("prepared left table must have storage");
+    let right_table = state
+        .tables
+        .get(&plan.right_table_id)
+        .expect("prepared right table must have storage");
+    let mut left_rows = Vec::new();
+    state.record_read(xid, Access::Relation(plan.left_table_id));
+    for (row_id, chain) in left_table.iterate_version_chains() {
+        let Some(version) = find_visible_version(chain, snapshot, xid, &state.transactions) else {
+            continue;
+        };
+        state.record_read(xid, Access::Row(plan.left_table_id, row_id));
+        left_rows.push(&version.row);
+    }
+    let mut right_by_key = HashMap::<i64, Vec<&[Value]>>::new();
+    state.record_read(xid, Access::Relation(plan.right_table_id));
+    for (row_id, chain) in right_table.iterate_version_chains() {
+        let Some(version) = find_visible_version(chain, snapshot, xid, &state.transactions) else {
+            continue;
+        };
+        state.record_read(xid, Access::Row(plan.right_table_id, row_id));
+        let key = match version.row[plan.right_key] {
+            Value::Int2(key) => Some(i64::from(key)),
+            Value::Int8(key) => Some(key),
+            _ => None,
+        };
+        if let Some(key) = key {
+            right_by_key.entry(key).or_default().push(&version.row);
+        }
+    }
+    let mut rows = Vec::new();
+    for left in left_rows {
+        let key = match left[plan.left_key] {
+            Value::Int2(key) => Some(i64::from(key)),
+            Value::Int8(key) => Some(key),
+            _ => None,
+        };
+        let matches = key.and_then(|key| right_by_key.get(&key));
+        if let Some(matches) = matches {
+            for right in matches {
+                if deadline.is_some_and(|deadline| Instant::now() >= deadline) {
+                    return Err(PgError::create(
+                        SqlState::QueryCanceled,
+                        "canceling statement due to statement timeout",
+                    ));
+                }
+                rows.push(
+                    plan.projection
+                        .iter()
+                        .map(|slot| {
+                            if *slot < plan.left_width {
+                                left[*slot].clone()
+                            } else {
+                                right[*slot - plan.left_width].clone()
+                            }
+                        })
+                        .collect(),
+                );
+            }
+        } else {
             if deadline.is_some_and(|deadline| Instant::now() >= deadline) {
                 return Err(PgError::create(
                     SqlState::QueryCanceled,
