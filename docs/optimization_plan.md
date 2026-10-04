@@ -547,6 +547,22 @@ exclusions, formatting, scoped Clippy, and the execution-log build pass.
 Raw probes, release binaries and Tier 1 logs remain under
 `target/o4-indexed-chain-*`. Other O4 work remains pending.
 
+The same unique-right-key probe now supports `smallint` and `bigint` chains.
+For the three-table query above with `bigint` primary keys, medians of three
+alternating 0.5-second native prepared probes improve 33.175→24.271 us
+(26.84%) at 100 rows and 1,051.425→24.447 us (97.67%) at 10,000 rows.
+PostgreSQL differential cases cover duplicate and NULL left keys, right-index
+hits and misses at both join stages, and a `bigint` key above the `int4` range.
+The full Tier 1 sweep drifted across unrelated cases. Exact reverse-order
+30-sample pairs measured the selective join at 10.120→10.669 us (5.42%)
+and 10.119→10.333 us (2.11%) slower, within the user's accepted join-gain
+tradeoff. Many-match join pairs were flat or slightly faster:
+17.110→16.889 us and 16.630→16.622 us. The focused PostgreSQL differential,
+workspace suite with the two existing exclusions, formatting, scoped Clippy,
+and execution-log build pass. Strict Clippy still reports three existing
+warnings in unrelated files. Matching release binaries and raw timings remain
+under `target/o4-integer-chain-*`.
+
 ### O5 — Prepare simple mutation structure once; specialize resumption [PENDING]
 
 **Effort:** 4–7 days. **Dependency:** O1. **Confidence:** high for redundant work;

@@ -493,7 +493,7 @@ fn visit_hash_join_chain_rows<const PRUNE_SPARSE_RIGHT: bool>(
         let key_type = scope.columns[left_slot].data_type.base;
         let indexed_right_rows = if PRUNE_SPARSE_RIGHT
             && rows.len() <= 8
-            && key_type == BaseType::Int4
+            && matches!(key_type, BaseType::Int2 | BaseType::Int4 | BaseType::Int8)
             && let Some(selection) = selection
             && let ast::TableFactor::Table { name, .. } = &table.joins[index].relation
             && crate::executor::ctes::cte_row_source_id(name).is_none()
@@ -518,17 +518,20 @@ fn visit_hash_join_chain_rows<const PRUNE_SPARSE_RIGHT: bool>(
                     let mut seen = std::collections::HashSet::new();
                     let mut indexed = Vec::new();
                     for left in &rows {
-                        let Value::Int4(value) = &left[left_slot] else {
-                            continue;
+                        let value = &left[left_slot];
+                        let key = match (key_type, value) {
+                            (BaseType::Int2, Value::Int2(value)) => EqualityKey::Int2(*value),
+                            (BaseType::Int4, Value::Int4(value)) => EqualityKey::Int4(*value),
+                            (BaseType::Int8, Value::Int8(value)) => EqualityKey::Int8(*value),
+                            _ => continue,
                         };
-                        if !seen.insert(*value) {
+                        if !seen.insert(key) {
                             continue;
                         }
-                        let value = Value::Int4(*value);
                         if state.tracks_serializable_reads(xid)
                             && let Some(key) = table.create_unique_read_key(
                                 &[right_column],
-                                std::slice::from_ref(&value),
+                                std::slice::from_ref(value),
                             )
                         {
                             state.record_read(
@@ -538,7 +541,7 @@ fn visit_hash_join_chain_rows<const PRUNE_SPARSE_RIGHT: bool>(
                         }
                         if let Some((row_id, version)) = table.find_unique_visible_version(
                             &[right_column],
-                            std::slice::from_ref(&value),
+                            std::slice::from_ref(value),
                             snapshot,
                             xid,
                             &state.transactions,

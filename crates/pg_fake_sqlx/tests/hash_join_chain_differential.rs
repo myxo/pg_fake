@@ -127,4 +127,78 @@ fn compares_multi_table_hash_join_chains() {
         "COMMIT",
         RowOrder::Unordered,
     );
+    for data_type in ["smallint", "bigint"] {
+        for name in ["a", "b", "c"] {
+            let key = if name == "a" { "" } else { " PRIMARY KEY" };
+            assert_statement(
+                &runtime,
+                &mut postgres,
+                &mut fake,
+                &format!("CREATE TABLE hash_{data_type}_{name} (id {data_type}{key}, name text)"),
+                RowOrder::Unordered,
+            );
+            let values = match name {
+                "a" => "(1,'one'), (1,'another'), (2,'two'), (3,'three'), (NULL,'missing')",
+                "b" => "(1,'one'), (2,'two'), (4,'four')",
+                _ => "(1,'one'), (4,'four')",
+            };
+            let large_value = if data_type == "bigint" {
+                ", (5000000000,'large')"
+            } else {
+                ""
+            };
+            assert_statement(
+                &runtime,
+                &mut postgres,
+                &mut fake,
+                &format!("INSERT INTO hash_{data_type}_{name} VALUES {values}{large_value}"),
+                RowOrder::Unordered,
+            );
+        }
+        assert_statement(
+            &runtime,
+            &mut postgres,
+            &mut fake,
+            &format!(
+                "SELECT a.name,b.name,c.name FROM hash_{data_type}_a a JOIN hash_{data_type}_b b ON a.id=b.id JOIN hash_{data_type}_c c ON b.id=c.id WHERE a.id=1"
+            ),
+            RowOrder::Unordered,
+        );
+        assert_statement(
+            &runtime,
+            &mut postgres,
+            &mut fake,
+            &format!(
+                "SELECT a.name,b.name,c.name FROM hash_{data_type}_a a JOIN hash_{data_type}_b b ON a.id=b.id JOIN hash_{data_type}_c c ON b.id=c.id WHERE a.id IS NULL"
+            ),
+            RowOrder::Unordered,
+        );
+        assert_statement(
+            &runtime,
+            &mut postgres,
+            &mut fake,
+            &format!(
+                "SELECT a.name,b.name,c.name FROM hash_{data_type}_a a JOIN hash_{data_type}_b b ON a.id=b.id JOIN hash_{data_type}_c c ON b.id=c.id WHERE a.id=2"
+            ),
+            RowOrder::Unordered,
+        );
+        assert_statement(
+            &runtime,
+            &mut postgres,
+            &mut fake,
+            &format!(
+                "SELECT a.name,b.name,c.name FROM hash_{data_type}_a a JOIN hash_{data_type}_b b ON a.id=b.id JOIN hash_{data_type}_c c ON b.id=c.id WHERE a.id=3"
+            ),
+            RowOrder::Unordered,
+        );
+        if data_type == "bigint" {
+            assert_statement(
+                &runtime,
+                &mut postgres,
+                &mut fake,
+                "SELECT a.name,b.name,c.name FROM hash_bigint_a a JOIN hash_bigint_b b ON a.id=b.id JOIN hash_bigint_c c ON b.id=c.id WHERE a.id=5000000000",
+                RowOrder::Unordered,
+            );
+        }
+    }
 }
