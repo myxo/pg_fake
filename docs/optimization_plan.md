@@ -518,6 +518,16 @@ formatting, scoped Clippy, and the execution-log build pass. Raw runs and
 matching binaries remain under `target/o4-selective-chain-isolated-*`.
 Other O4 work remains pending.
 
+A follow-up replaced the sparse one-row hash-key set with a direct equality
+comparison. Three alternating 0.5-second SQLx probes improved the same
+filtered three-table query from 86.857→83.610 us (3.74%) at 100 rows and
+5,132.972→4,815.900 us (6.18%) at 10,000 rows. Full Tier 1 sweeps drifted
+broadly. Exact 30-sample selective-join pairs disagreed: 10.102→10.012 us,
+then 10.008→10.281 us in reverse order. With a possible Tier 1 regression
+unresolved and a modest target gain, the change was discarded. Raw probes,
+full comparisons, binaries and the rejected patch remain under
+`target/o4-single-key-*`.
+
 ### O5 — Prepare simple mutation structure once; specialize resumption [PENDING]
 
 **Effort:** 4–7 days. **Dependency:** O1. **Confidence:** high for redundant work;
