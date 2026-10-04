@@ -365,14 +365,15 @@ impl fmt::Debug for PgFakeConnection {
 }
 
 fn map_results(results: Vec<StatementResult>) -> Vec<Either<PgFakeQueryResult, PgFakeRow>> {
-    results
-        .into_iter()
-        .flat_map(|result| match result {
+    let mut output = Vec::new();
+    for result in results {
+        match result {
             StatementResult::Affected(rows_affected) => {
-                vec![Either::Left(PgFakeQueryResult { rows_affected })]
+                output.push(Either::Left(PgFakeQueryResult { rows_affected }));
             }
             StatementResult::Query(result) => {
                 let rows_affected = result.rows.len() as u64;
+                output.reserve(result.rows.len() + 1);
                 let columns = Arc::new(
                     result
                         .columns
@@ -389,29 +390,17 @@ fn map_results(results: Vec<StatementResult>) -> Vec<Either<PgFakeQueryResult, P
                         })
                         .collect::<Vec<_>>(),
                 );
-                let mut output = result
-                    .rows
-                    .into_iter()
-                    .map(|values| {
-                        let values = values
-                            .into_iter()
-                            .zip(columns.iter())
-                            .map(|(value, column)| PgFakeValue {
-                                value,
-                                type_info: column.type_info,
-                            })
-                            .collect();
-                        Either::Right(PgFakeRow {
-                            columns: columns.clone(),
-                            values,
-                        })
+                output.extend(result.rows.into_iter().map(|values| {
+                    Either::Right(PgFakeRow {
+                        columns: columns.clone(),
+                        values,
                     })
-                    .collect::<Vec<_>>();
+                }));
                 output.push(Either::Left(PgFakeQueryResult { rows_affected }));
-                output
             }
-        })
-        .collect()
+        }
+    }
+    output
 }
 
 impl Connection for PgFakeConnection {

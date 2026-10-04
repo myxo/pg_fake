@@ -466,6 +466,19 @@ as a native value reference plus type info.
 trace confirms the row-vector replacement is removed. Initial budget: 10–25%
 improvement on 100-row SQLx results; point reads may barely change.
 
+The first O6 step transfers native row vectors into `PgFakeRow`, reads type
+information from shared columns, and reserves the combined result vector without
+per-statement intermediate vectors. An alternating 100-row SQLx allocation probe
+measured 424→322 allocations per query in both pairs. Alternating release probes
+improve 100-row and 10,000-row SQLx reads by 17.76% and 24.50%; the cached
+point read is flat. The full Tier 1 comparison improves the 100-row select
+27.559→22.951 µs, ordering 39.993→33.548 µs, and many-match join
+26.210→22.869 µs. The small indexed-select difference reversed direction in
+exact repeats. Adapter tests pass apart from a PostgreSQL corpus threshold that
+also fails on clean HEAD (820/850), and the workspace gate has the same
+pre-existing mixed-case collation failure on clean HEAD. Raw runs remain under
+`target/o6-*`. Sharing prepared column metadata across executions remains pending.
+
 ### O7 — Reduce per-statement SQLx scheduling cost safely [PENDING]
 
 **Effort:** 3–6 days for a feasibility experiment and validated implementation.

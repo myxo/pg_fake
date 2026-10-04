@@ -3,12 +3,48 @@ use std::{str::FromStr, time::Duration};
 use bigdecimal::BigDecimal;
 use pg_fake::Db;
 use pg_fake_sqlx::{PgFakeConnectOptions, PgFakeConnection, PgFakePoolOptions};
-use sqlx::{Column, Connection, Executor, Row, Statement, TypeInfo};
+use sqlx::{Column, Connection, Executor, Row, Statement, TypeInfo, Value as _, ValueRef as _};
 use sqlx_postgres::PgConnection;
 
 mod common;
 
 use common::start_postgres_server;
+
+#[tokio::test]
+async fn returned_rows_keep_column_types_and_owned_values() {
+    let mut connection = PgFakeConnection::new(Db::create());
+    connection
+        .execute("CREATE TABLE typed_rows (label VARCHAR(12), amount NUMERIC(6,2))")
+        .await
+        .unwrap();
+    connection
+        .execute("INSERT INTO typed_rows VALUES ('hello', 12.34), (NULL, NULL)")
+        .await
+        .unwrap();
+
+    let rows = sqlx::query("SELECT label, amount FROM typed_rows ORDER BY amount NULLS LAST")
+        .fetch_all(&mut connection)
+        .await
+        .unwrap();
+    assert_eq!(rows[0].get::<String, _>("label"), "hello");
+    assert_eq!(rows[1].get::<Option<String>, _>("label"), None);
+    for row in &rows {
+        for index in 0..2 {
+            let value = row.try_get_raw(index).unwrap();
+            assert_eq!(value.type_info().as_ref(), row.columns()[index].type_info());
+        }
+    }
+    let owned = sqlx::ValueRef::to_owned(&rows[0].try_get_raw("label").unwrap());
+    let null = sqlx::ValueRef::to_owned(&rows[1].try_get_raw("amount").unwrap());
+    drop(rows);
+    assert_eq!(
+        <String as sqlx::Decode<'_, pg_fake_sqlx::PgFake>>::decode(owned.as_ref()).unwrap(),
+        "hello"
+    );
+    assert_eq!(owned.as_ref().type_info().name(), "VARCHAR");
+    assert!(null.is_null());
+    assert_eq!(null.as_ref().type_info().name(), "NUMERIC");
+}
 
 #[tokio::test]
 async fn round_trips_jsonb_wrappers_and_metadata() {

@@ -37,7 +37,7 @@ pub struct PgFakeValue {
 #[derive(Debug, Clone, Copy)]
 pub struct PgFakeValueRef<'r> {
     pub(crate) value: &'r CoreValue,
-    pub(crate) type_info: PgFakeTypeInfo,
+    pub(crate) type_info: &'r PgFakeTypeInfo,
 }
 
 impl Value for PgFakeValue {
@@ -46,7 +46,7 @@ impl Value for PgFakeValue {
     fn as_ref(&self) -> PgFakeValueRef<'_> {
         PgFakeValueRef {
             value: &self.value,
-            type_info: self.type_info,
+            type_info: &self.type_info,
         }
     }
 
@@ -65,12 +65,12 @@ impl<'r> ValueRef<'r> for PgFakeValueRef<'r> {
     fn to_owned(&self) -> PgFakeValue {
         PgFakeValue {
             value: self.value.clone(),
-            type_info: self.type_info,
+            type_info: *self.type_info,
         }
     }
 
     fn type_info(&self) -> Cow<'_, PgFakeTypeInfo> {
-        Cow::Owned(self.type_info)
+        Cow::Borrowed(self.type_info)
     }
 
     fn is_null(&self) -> bool {
@@ -81,7 +81,7 @@ impl<'r> ValueRef<'r> for PgFakeValueRef<'r> {
 #[derive(Clone)]
 pub struct PgFakeRow {
     pub(crate) columns: Arc<Vec<PgFakeColumn>>,
-    pub(crate) values: Vec<PgFakeValue>,
+    pub(crate) values: Vec<CoreValue>,
 }
 
 impl fmt::Debug for PgFakeRow {
@@ -105,7 +105,11 @@ impl Row for PgFakeRow {
     where
         I: ColumnIndex<Self>,
     {
-        Ok(self.values[index.index(self)?].as_ref())
+        let index = index.index(self)?;
+        Ok(PgFakeValueRef {
+            value: &self.values[index],
+            type_info: &self.columns[index].type_info,
+        })
     }
 }
 
