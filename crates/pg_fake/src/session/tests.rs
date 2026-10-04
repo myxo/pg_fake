@@ -11500,13 +11500,58 @@ fn track_right_filtered_unique_join_reads() {
         .unwrap();
     assert!(fallback.query_plan.is_none());
 
+    let left_rows = (2..=33)
+        .map(|id| format!("({id})"))
+        .collect::<Vec<_>>()
+        .join(", ");
     reader
-        .execute("CREATE TABLE right_filtered_heap_right (id integer, tag integer)")
+        .execute(&format!(
+            "INSERT INTO right_filtered_left VALUES {left_rows}"
+        ))
         .unwrap();
-    let fallback = reader
+    reader
+        .execute("CREATE TABLE right_filtered_heap_right (id integer, tag integer); INSERT INTO right_filtered_heap_right VALUES (1, 9)")
+        .unwrap();
+    let adaptive = reader
         .prepare("SELECT l.id FROM right_filtered_left l JOIN right_filtered_heap_right r ON l.id = r.id WHERE r.tag = 9")
         .unwrap();
-    assert!(fallback.query_plan.is_none());
+    assert!(matches!(
+        adaptive.query_plan.as_ref(),
+        Some(crate::executor::PreparedReadPlan::AdaptiveUniqueInnerJoin(
+            _
+        ))
+    ));
+    reader
+        .execute("BEGIN ISOLATION LEVEL SERIALIZABLE")
+        .unwrap();
+    writer.execute("BEGIN").unwrap();
+    let Some(SessionTransactionState::Active(reader_transaction)) = reader.transaction else {
+        panic!("reader transaction is active")
+    };
+    let Some(SessionTransactionState::Active(writer_transaction)) = writer.transaction else {
+        panic!("writer transaction is active")
+    };
+    assert!(
+        reader
+            .query_prepared(&adaptive, &[])
+            .unwrap()
+            .rows
+            .is_empty()
+    );
+    writer
+        .execute("INSERT INTO right_filtered_left VALUES (1)")
+        .unwrap();
+    assert!(
+        db.state
+            .lock()
+            .unwrap()
+            .serializable
+            .lock()
+            .unwrap()
+            .has_edge(reader_transaction.xid, writer_transaction.xid)
+    );
+    reader.execute("ROLLBACK").unwrap();
+    writer.execute("ROLLBACK").unwrap();
 }
 
 #[test]

@@ -228,6 +228,87 @@ fn compares_generated_integer_inner_joins() {
 }
 
 #[test]
+fn compares_nonunique_right_filters_with_unique_left_join_key() {
+    let server = start_isolated_postgres_server();
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap();
+    let mut postgres = runtime
+        .block_on(PgConnection::connect(&server.url))
+        .unwrap();
+    let mut fake = PgFakeConnection::new(Db::create());
+    for sql in [
+        "CREATE TABLE right_offkey_left (id integer PRIMARY KEY, name text)",
+        "CREATE TABLE right_offkey_right (id integer, tag integer, name text)",
+    ] {
+        assert_statement(&runtime, &mut postgres, &mut fake, sql, RowOrder::Unordered);
+    }
+    let left = (1..=100)
+        .map(|id| format!("({id}, 'left-{id}')"))
+        .collect::<Vec<_>>()
+        .join(", ");
+    let right = (1..=100)
+        .map(|id| {
+            let tag = if id <= 2 { 9 } else { 1 };
+            format!("({id}, {tag}, 'right-{id}')")
+        })
+        .chain([
+            "(1, 8, 'duplicate-a')".to_owned(),
+            "(1, 8, 'duplicate-b')".to_owned(),
+            "(NULL, 8, 'null-key')".to_owned(),
+        ])
+        .collect::<Vec<_>>()
+        .join(", ");
+    for sql in [
+        format!("INSERT INTO right_offkey_left VALUES {left}"),
+        format!("INSERT INTO right_offkey_right VALUES {right}"),
+    ] {
+        assert_statement(
+            &runtime,
+            &mut postgres,
+            &mut fake,
+            &sql,
+            RowOrder::Unordered,
+        );
+    }
+    for tag in [9, 8, 1, 0] {
+        let sql = format!(
+            "SELECT l.name, r.name FROM right_offkey_left l JOIN right_offkey_right r ON l.id = r.id WHERE r.tag = {tag}"
+        );
+        assert_statement(
+            &runtime,
+            &mut postgres,
+            &mut fake,
+            &sql,
+            RowOrder::Unordered,
+        );
+    }
+    runtime.block_on(async {
+        let sql = "SELECT l.name, r.name FROM right_offkey_left l JOIN right_offkey_right r ON l.id = r.id WHERE r.tag = $1";
+        for persistent in [true, false] {
+            for tag in [Some(9_i32), Some(8), Some(1), Some(0), None] {
+                let mut expected: Vec<(String, String)> = sqlx::query_as(sql)
+                    .bind(tag)
+                    .persistent(persistent)
+                    .fetch_all(&mut postgres)
+                    .await
+                    .unwrap();
+                let mut actual: Vec<(String, String)> = sqlx::query_as(sql)
+                    .bind(tag)
+                    .persistent(persistent)
+                    .fetch_all(&mut fake)
+                    .await
+                    .unwrap();
+                expected.sort();
+                actual.sort();
+                assert_eq!(actual, expected, "tag={tag:?}, persistent={persistent}");
+            }
+        }
+    });
+}
+
+#[test]
 fn compares_off_key_filters_with_unique_right_join_key() {
     let server = start_isolated_postgres_server();
     let runtime = tokio::runtime::Builder::new_current_thread()

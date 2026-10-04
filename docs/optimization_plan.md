@@ -421,6 +421,25 @@ PostgreSQL differential tests, workspace library tests, formatting, and scoped
 Clippy pass. Raw results are local under `target/o4-projection-*`; other O4
 general join and access-path work remains pending.
 
+A right-only integer equality filter on a nonunique column now enters the
+prepared join path when the opposite join key is unique. The existing adaptive
+executor scans the filtered source and probes the unique key while matches stay
+sparse, then falls back to hashing for dense matches. For
+`SELECT l.payload, r.payload FROM l JOIN r ON l.id = r.id WHERE r.bucket = 1`
+with a unique `l.id` and nonunique `r.bucket`, medians of three 0.5-second SQLx
+runs per binary improve 83.878→7.870 us (90.62%) at 100 sparse rows and
+5,407.642→190.421 us (96.48%) at 10,000 sparse rows. Dense-filter probes
+improve 169.849→30.509 us (82.04%) and 14,391.507→2,125.697 us (85.23%).
+The full ten-case Tier 1 sweep had apparent write and ordering regressions;
+isolated reverse-order pairs resolved the ordering and insert readings. A final
+50-sample transaction-insert pair measured 42.466→42.536 us with overlapping
+intervals, so no Tier 1 slowdown was confirmed. Prepared-join differential,
+serializable, generated SQL, workspace library, formatting and scoped Clippy
+checks pass. The workspace suite passes with the existing mixed-case collation
+failure and 820/850 corpus threshold test excluded. Raw results and matching
+release binaries remain locally under `target/o4-right-offkey-*`. General join
+intermediate-copying work remains pending.
+
 ### O5 — Prepare simple mutation structure once; specialize resumption [PENDING]
 
 **Effort:** 4–7 days. **Dependency:** O1. **Confidence:** high for redundant work;

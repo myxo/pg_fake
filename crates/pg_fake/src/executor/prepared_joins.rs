@@ -259,16 +259,10 @@ pub(crate) fn build_prepared_join_plan(
     }
     let reverse_sources = left_filter.is_none() && right_filter.is_some();
     if reverse_sources
-        && (!state
+        && !state
             .tables
             .get(&left_schema.id)
             .is_some_and(|table| table.has_unique_index(&[left_key]))
-            || !right_filter.as_ref().is_some_and(|(slot, _)| {
-                state
-                    .tables
-                    .get(&right_schema.id)
-                    .is_some_and(|table| table.has_unique_index(&[*slot]))
-            }))
     {
         return Ok(None);
     }
