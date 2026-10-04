@@ -636,6 +636,21 @@ the no-slowdown rule. Raw logs and
 the rejected patch remain under `target/o9-direct-compare-*` and
 `target/o9-direct-sort-*`.
 
+An OFFSET projection experiment skipped projection of discarded rows only when
+every output was a direct column, retaining the original evaluation order for
+expression projections. Exact 20-sample SQLx paging pairs improved
+26.624→22.793 us (14.39%) and 26.624→23.849 us (10.42%). A 10,000-row native
+prepared probe improved 1,385.266→1,349.818 us (2.56%) and
+1,456.471→1,374.676 us (5.62%); longer 1-KiB-text-row probes improved
+2,007.841→1,922.145 us (4.27%) and 1,984.177→1,870.159 us (5.75%).
+The ordering differential, generated SQL property
+test, workspace library tests, formatting, and scoped Clippy passed. However,
+exact SQLx full-read repeats confirmed a Tier 1 slowdown in both run orders:
+22.460→23.482 us (4.55%) and 19.992→20.476 us (2.42%). The candidate was
+discarded under the no-slowdown rule. Raw results and the rejected patch remain
+locally under `target/o9-offset-projection-*`; O9's paging and ordering budgets
+remain pending.
+
 ## Milestones and stopping rules
 
 1. Establish trustworthy gates and bound cache retention: O1–O2.
