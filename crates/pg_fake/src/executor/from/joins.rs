@@ -273,10 +273,7 @@ fn visit_borrowed_hash_join_chain_rows(
     else {
         unreachable!("borrowed hash source is a table");
     };
-    let mut rows = read_borrowed_table_rows(state, left_name, xid, snapshot)?
-        .into_iter()
-        .map(|row| vec![row])
-        .collect::<Vec<_>>();
+    let mut rows = read_borrowed_table_rows(state, left_name, xid, snapshot)?;
     for (index, (left_slot, right_slot, _)) in hash_slots.iter().copied().enumerate() {
         let ast::TableFactor::Table {
             name: right_name, ..
@@ -298,13 +295,13 @@ fn visit_borrowed_hash_join_chain_rows(
         let left_offset = left_slot - starts[left_index];
         if index + 1 == hash_slots.len() {
             let mut scratch = Vec::with_capacity(scope.columns.len());
-            for left in rows {
+            for left in rows.chunks_exact(index + 1) {
                 if let Some(key) = create_hash_join_key(&left[left_index][left_offset], key_type)
                     && let Some(matches) = right_by_key.get(&key)
                 {
                     for right in matches {
                         scratch.clear();
-                        for source in &left {
+                        for source in left {
                             scratch.extend_from_slice(source);
                         }
                         scratch.extend_from_slice(right);
@@ -315,19 +312,13 @@ fn visit_borrowed_hash_join_chain_rows(
             return Ok(());
         }
         let mut joined = Vec::new();
-        for mut left in rows {
+        for left in rows.chunks_exact(index + 1) {
             if let Some(key) = create_hash_join_key(&left[left_index][left_offset], key_type)
                 && let Some(matches) = right_by_key.get(&key)
             {
-                if matches.len() == 1 {
-                    left.push(matches[0]);
-                    joined.push(left);
-                } else {
-                    joined.extend(matches.iter().map(|&right| {
-                        let mut row = left.clone();
-                        row.push(right);
-                        row
-                    }));
+                for &right in matches {
+                    joined.extend_from_slice(left);
+                    joined.push(right);
                 }
             }
         }

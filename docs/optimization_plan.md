@@ -475,6 +475,20 @@ excluded. Formatting and scoped Clippy pass; strict Clippy stops on three
 existing warnings. Raw probes, matching release binaries and Tier 1 logs remain
 under `target/o4-borrowed-chain-*`. Other O4 work remains pending.
 
+The borrowed chain now stores intermediate source-row references contiguously,
+removing one heap allocation per partial match. Against the preceding borrowed
+path, three alternating 0.5-second SQLx probes improve the same three-table
+query from 86.224→80.800 us (6.29%) at 100 rows and 6,049.116→5,401.225 us
+(10.71%) at 10,000 rows. Native prepared probes improve 70.581→65.747 us
+(6.85%) and 5,839.368→5,188.057 us (11.15%). The full ten-case Tier 1 sweep
+drifted broadly and showed an apparent transaction-insert rise of
+41.981→42.203 us. Isolated 30-sample pairs measured 42.742→42.251 us, then
+42.292→42.272 us in reverse order, so no slowdown was confirmed. The expanded
+multi-join PostgreSQL differential, serializable differential, generated SQL,
+workspace suite with the same two existing exclusions, formatting, and scoped
+Clippy pass. Raw probes, release binaries, and Tier 1 logs remain under
+`target/o4-flat-chain-*`. Other O4 work remains pending.
+
 ### O5 — Prepare simple mutation structure once; specialize resumption [PENDING]
 
 **Effort:** 4–7 days. **Dependency:** O1. **Confidence:** high for redundant work;
