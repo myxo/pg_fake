@@ -598,6 +598,27 @@ formatting, scoped Clippy, and the execution-log build pass. Raw probes,
 matching binaries and Tier 1 logs
 remain under `target/o4-prepared-chain-*`. Other O4 work remains pending.
 
+The prepared unfiltered chain now also covers same-type `smallint` and
+`bigint` equality keys, including chains that use a different integer width
+at a later stage. Three alternating 0.5-second SQLx probes of a three-table
+join improve `smallint` from 85.063→42.087 us (50.52%) at 100 rows and
+5,610.963→3,243.952 us (42.19%) at 10,000 rows. The corresponding `bigint`
+probes improve 86.277→42.109 us (51.19%) and 5,721.709→3,306.125 us
+(42.22%). The existing `integer` chain is effectively flat at 100 and
+10,000 rows. Full Tier 1 sweeps showed broad timing drift, including a
+transient near-doubling of both joins in one candidate run. Isolated
+reverse-order 30-sample pairs measured the official selective join at
+9.875→10.213 us and 10.034→10.218 us (3.42% and 1.83% slower), while the
+many-match join improved 16.624→16.170 us and 15.970→15.484 us (2.73%
+and 3.04%). This follows the user's stated willingness to accept a modest
+join slowdown for a larger join gain. Isolated alternating SQLx read,
+paging, ordering and update probes found no reproducible non-join slowdown.
+The focused PostgreSQL differential, all 11 extended property cases,
+formatting, scoped Clippy and the execution-log build pass. The workspace
+suite passes with the two existing exclusions. Raw probes, matching binaries
+and full Tier 1 logs remain under `target/o4-wide-*`. Other O4 work remains
+pending.
+
 ### O5 — Prepare simple mutation structure once; specialize resumption [PENDING]
 
 **Effort:** 4–7 days. **Dependency:** O1. **Confidence:** high for redundant work;

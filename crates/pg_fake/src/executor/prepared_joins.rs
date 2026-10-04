@@ -8,7 +8,7 @@ use crate::{
     value::{BaseType, Value},
 };
 use sqlparser::ast;
-use std::{collections::HashMap, time::Instant};
+use std::{collections::HashMap, hash::Hash, time::Instant};
 
 use super::{
     PreparedQueryPlan, StatementContext, normalize_relation_name,
@@ -56,7 +56,7 @@ pub(crate) struct PreparedUnfilteredInnerJoinPlan {
 #[derive(Debug, Clone)]
 pub(crate) struct PreparedUnfilteredJoinChainPlan {
     table_ids: Vec<TableId>,
-    joins: Vec<(usize, usize, usize)>,
+    joins: Vec<(usize, usize, usize, bool)>,
     projection: Vec<(usize, usize)>,
     columns: Vec<ColumnMeta>,
 }
@@ -436,7 +436,12 @@ fn build_prepared_unfiltered_join_chain_plan(
         ) else {
             return Ok(None);
         };
-        if first_type.base != BaseType::Int4 || second_type.base != BaseType::Int4 {
+        if first_type.base != second_type.base
+            || !matches!(
+                first_type.base,
+                BaseType::Int2 | BaseType::Int4 | BaseType::Int8
+            )
+        {
             return Ok(None);
         }
         let right_start = starts[index + 1];
@@ -454,6 +459,7 @@ fn build_prepared_unfiltered_join_chain_plan(
             left_source,
             left_slot - starts[left_source],
             right_slot - right_start,
+            first_type.base != BaseType::Int4,
         ));
     }
     let mut projection = Vec::with_capacity(select.projection.len());
@@ -478,14 +484,13 @@ fn build_prepared_unfiltered_join_chain_plan(
         Some(columns) => columns.to_vec(),
         None => describe_query_result_columns(state, statement)?,
     };
-    Ok(Some(PreparedReadPlan::UnfilteredJoinChain(
-        PreparedUnfilteredJoinChainPlan {
-            table_ids,
-            joins,
-            projection,
-            columns,
-        },
-    )))
+    let plan = PreparedUnfilteredJoinChainPlan {
+        table_ids,
+        joins,
+        projection,
+        columns,
+    };
+    Ok(Some(PreparedReadPlan::UnfilteredJoinChain(plan)))
 }
 
 pub(crate) fn execute_prepared_read(
@@ -534,7 +539,33 @@ pub(crate) fn execute_prepared_read(
             execute_prepared_unfiltered_join(state, plan, xid, snapshot, deadline)
         }
         PreparedReadPlan::UnfilteredJoinChain(plan) => {
-            execute_prepared_unfiltered_join_chain(state, plan, xid, snapshot, deadline)
+            if plan.joins.iter().any(|join| join.3) {
+                execute_prepared_unfiltered_join_chain(
+                    state,
+                    plan,
+                    xid,
+                    snapshot,
+                    deadline,
+                    |value| match value {
+                        Value::Int2(key) => Some(i64::from(*key)),
+                        Value::Int4(key) => Some(i64::from(*key)),
+                        Value::Int8(key) => Some(*key),
+                        _ => None,
+                    },
+                )
+            } else {
+                execute_prepared_unfiltered_join_chain(
+                    state,
+                    plan,
+                    xid,
+                    snapshot,
+                    deadline,
+                    |value| match value {
+                        Value::Int4(key) => Some(*key),
+                        _ => None,
+                    },
+                )
+            }
         }
     }
 }
@@ -610,12 +641,13 @@ fn execute_prepared_unfiltered_join(
 }
 
 #[inline(never)]
-fn execute_prepared_unfiltered_join_chain(
+fn execute_prepared_unfiltered_join_chain<K: Copy + Eq + Hash>(
     state: &DatabaseState,
     plan: &PreparedUnfilteredJoinChainPlan,
     xid: Xid,
     snapshot: &Snapshot,
     deadline: Option<Instant>,
+    extract_key: impl Fn(&Value) -> Option<K>,
 ) -> Result<Vec<Vec<Value>>> {
     for table_id in &plan.table_ids {
         state.catalog.require_table_by_id(*table_id)?;
@@ -634,13 +666,13 @@ fn execute_prepared_unfiltered_join_chain(
         state.record_read(xid, Access::Row(first_id, row_id));
         left_rows.push(version.row.as_slice());
     }
-    for (index, &(left_source, left_key, right_key)) in plan.joins.iter().enumerate() {
+    for (index, &(left_source, left_key, right_key, _)) in plan.joins.iter().enumerate() {
         let right_id = plan.table_ids[index + 1];
         let right_table = state
             .tables
             .get(&right_id)
             .expect("prepared right table must have storage");
-        let mut right_by_key = HashMap::<i32, Vec<&[Value]>>::new();
+        let mut right_by_key = HashMap::<K, Vec<&[Value]>>::new();
         state.record_read(xid, Access::Relation(right_id));
         for (row_id, chain) in right_table.iterate_version_chains() {
             let Some(version) = find_visible_version(chain, snapshot, xid, &state.transactions)
@@ -648,7 +680,7 @@ fn execute_prepared_unfiltered_join_chain(
                 continue;
             };
             state.record_read(xid, Access::Row(right_id, row_id));
-            if let Value::Int4(key) = version.row[right_key] {
+            if let Some(key) = extract_key(&version.row[right_key]) {
                 right_by_key
                     .entry(key)
                     .or_default()
@@ -658,7 +690,7 @@ fn execute_prepared_unfiltered_join_chain(
         if index + 1 == plan.joins.len() {
             let mut rows = Vec::new();
             for left in left_rows.chunks_exact(index + 1) {
-                let Value::Int4(key) = left[left_source][left_key] else {
+                let Some(key) = extract_key(&left[left_source][left_key]) else {
                     continue;
                 };
                 let Some(matches) = right_by_key.get(&key) else {
@@ -689,7 +721,7 @@ fn execute_prepared_unfiltered_join_chain(
         }
         let mut joined = Vec::new();
         for left in left_rows.chunks_exact(index + 1) {
-            let Value::Int4(key) = left[left_source][left_key] else {
+            let Some(key) = extract_key(&left[left_source][left_key]) else {
                 continue;
             };
             if let Some(matches) = right_by_key.get(&key) {

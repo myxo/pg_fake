@@ -175,6 +175,15 @@ fn compares_multi_table_hash_join_chains() {
             &mut postgres,
             &mut fake,
             &format!(
+                "SELECT c.name,a.name,b.name FROM hash_{data_type}_a a JOIN hash_{data_type}_b b ON b.id=a.id JOIN hash_{data_type}_c c ON c.id=b.id"
+            ),
+            RowOrder::Unordered,
+        );
+        assert_statement(
+            &runtime,
+            &mut postgres,
+            &mut fake,
+            &format!(
                 "SELECT a.name,b.name,c.name FROM hash_{data_type}_a a JOIN hash_{data_type}_b b ON a.id=b.id JOIN hash_{data_type}_c c ON b.id=c.id WHERE a.id=1"
             ),
             RowOrder::Unordered,
@@ -215,5 +224,16 @@ fn compares_multi_table_hash_join_chains() {
                 RowOrder::Unordered,
             );
         }
+    }
+    for sql in [
+        "CREATE TABLE hash_mixed_a (id smallint, name text)",
+        "CREATE TABLE hash_mixed_b (id smallint, next_id bigint, name text)",
+        "CREATE TABLE hash_mixed_c (id bigint, name text)",
+        "INSERT INTO hash_mixed_a VALUES (1,'a1'), (1,'a2'), (2,'a3'), (NULL,'an')",
+        "INSERT INTO hash_mixed_b VALUES (1,5000000000,'b1'), (2,2,'b2'), (NULL,3,'bn')",
+        "INSERT INTO hash_mixed_c VALUES (5000000000,'c1'), (5000000000,'c2'), (2,'c3'), (NULL,'cn')",
+        "SELECT a.name,b.name,c.name FROM hash_mixed_a a JOIN hash_mixed_b b ON a.id=b.id JOIN hash_mixed_c c ON b.next_id=c.id",
+    ] {
+        assert_statement(&runtime, &mut postgres, &mut fake, sql, RowOrder::Unordered);
     }
 }
