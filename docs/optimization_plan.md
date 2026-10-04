@@ -624,6 +624,18 @@ strict Clippy still stops on three unrelated existing warnings. O9 stays
 pending because the official 22 us paging budget and the remaining comparator
 and OFFSET work are not yet met.
 
+A direct comparator experiment improved isolated 100-row SQLx full ordering
+28.070→27.124 us (3.37%) and 28.302→27.442 us (3.04%), but its large-row
+paging readings were inconsistent and sometimes slower. Restricting the direct
+comparator to full ordering improved exact SQLx ordering 28.293→27.053 us
+(4.38%) and 27.876→27.576 us (1.08%). Both full Tier 1 sweeps and an isolated
+repeat then found confirmed slowdowns outside ordering: selective read
+10.862→11.069 us (1.91%), selective join 9.966→10.289 us (3.24%), and
+many-match join 17.302→17.511 us (1.21%). Both variants were discarded under
+the no-slowdown rule. Raw logs and
+the rejected patch remain under `target/o9-direct-compare-*` and
+`target/o9-direct-sort-*`.
+
 ## Milestones and stopping rules
 
 1. Establish trustworthy gates and bound cache retention: O1–O2.
