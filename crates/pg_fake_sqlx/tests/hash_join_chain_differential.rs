@@ -24,9 +24,11 @@ fn compares_multi_table_hash_join_chains() {
         "CREATE TABLE hash_chain_a (id integer, name text)",
         "CREATE TABLE hash_chain_b (id integer, name text)",
         "CREATE TABLE hash_chain_c (id integer, name text)",
+        "CREATE TABLE hash_chain_d (id integer, name text)",
         "INSERT INTO hash_chain_a VALUES (1,'a1'), (2,'a2'), (3,'a3'), (NULL,'an')",
         "INSERT INTO hash_chain_b VALUES (1,'b1'), (1,'bx'), (2,'b2'), (4,'b4'), (NULL,'bn')",
         "INSERT INTO hash_chain_c VALUES (1,'c1'), (1,'cx'), (2,'c2'), (5,'c5'), (NULL,'cn')",
+        "INSERT INTO hash_chain_d VALUES (1,'d1'), (2,'d2'), (3,'d3'), (NULL,'dn')",
     ] {
         assert_statement(&runtime, &mut postgres, &mut fake, sql, RowOrder::Unordered);
     }
@@ -36,6 +38,8 @@ fn compares_multi_table_hash_join_chains() {
         "SELECT a.name,b.name,c.name FROM hash_chain_a a JOIN hash_chain_b b ON a.id=b.id LEFT JOIN hash_chain_c c ON b.id=c.id",
         "SELECT a.name,b.name,c.name FROM hash_chain_a a LEFT JOIN hash_chain_b b ON a.id=b.id JOIN hash_chain_c c ON b.id=c.id",
         "SELECT a.name,b.name,c.name FROM hash_chain_a a JOIN hash_chain_b b ON a.id=b.id JOIN hash_chain_c c ON b.id=c.id WHERE a.id=1",
+        "SELECT a.name,b.name,c.name,d.name FROM hash_chain_a a JOIN hash_chain_b b ON a.id=b.id JOIN hash_chain_c c ON b.id=c.id JOIN hash_chain_d d ON a.id=d.id",
+        "SELECT a.name,b.name,c.name FROM hash_chain_a a JOIN hash_chain_b b ON a.id=b.id JOIN hash_chain_a c ON a.id=c.id",
     ] {
         assert_statement(&runtime, &mut postgres, &mut fake, sql, RowOrder::Unordered);
     }

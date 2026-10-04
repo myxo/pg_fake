@@ -106,6 +106,36 @@ pub(crate) fn visit_streamed_join_rows(
                 visit,
             );
         }
+        if hash_slots.len() > 1
+            && selection.is_none()
+            && hash_slots
+                .iter()
+                .all(|(_, _, preserve_left)| !preserve_left)
+            && context
+                .query_source_state
+                .lock()
+                .expect("query source mutex is poisoned")
+                .is_empty()
+            && let ast::TableFactor::Table {
+                name: left_name, ..
+            } = &table.relation
+            && crate::executor::ctes::cte_row_source_id(left_name).is_none()
+            && table.joins.iter().all(|join| {
+                matches!(&join.relation, ast::TableFactor::Table { name, .. }
+                    if crate::executor::ctes::cte_row_source_id(name).is_none())
+            })
+        {
+            return visit_borrowed_hash_join_chain_rows(
+                state,
+                table,
+                scope,
+                xid,
+                snapshot,
+                &starts,
+                &hash_slots,
+                visit,
+            );
+        }
         return visit_hash_join_chain_rows(
             state,
             table,
@@ -225,6 +255,110 @@ fn visit_borrowed_hash_inner_join(
         }
     }
     Ok(())
+}
+
+fn visit_borrowed_hash_join_chain_rows(
+    state: &DatabaseState,
+    table: &ast::TableWithJoins,
+    scope: &BoundScope,
+    xid: Xid,
+    snapshot: &Snapshot,
+    starts: &[usize],
+    hash_slots: &[(usize, usize, bool)],
+    visit: &mut dyn FnMut(&[Value]) -> Result<()>,
+) -> Result<()> {
+    let ast::TableFactor::Table {
+        name: left_name, ..
+    } = &table.relation
+    else {
+        unreachable!("borrowed hash source is a table");
+    };
+    let mut rows = read_borrowed_table_rows(state, left_name, xid, snapshot)?
+        .into_iter()
+        .map(|row| vec![row])
+        .collect::<Vec<_>>();
+    for (index, (left_slot, right_slot, _)) in hash_slots.iter().copied().enumerate() {
+        let ast::TableFactor::Table {
+            name: right_name, ..
+        } = &table.joins[index].relation
+        else {
+            unreachable!("borrowed hash source is a table");
+        };
+        let right_rows = read_borrowed_table_rows(state, right_name, xid, snapshot)?;
+        let key_type = scope.columns[left_slot].data_type.base;
+        let mut right_by_key = std::collections::HashMap::<EqualityKey, Vec<&[Value]>>::new();
+        for right in right_rows {
+            if let Some(key) =
+                create_hash_join_key(&right[right_slot - starts[index + 1]], key_type)
+            {
+                right_by_key.entry(key).or_default().push(right);
+            }
+        }
+        let left_index = starts.partition_point(|&start| start <= left_slot) - 1;
+        let left_offset = left_slot - starts[left_index];
+        if index + 1 == hash_slots.len() {
+            let mut scratch = Vec::with_capacity(scope.columns.len());
+            for left in rows {
+                if let Some(key) = create_hash_join_key(&left[left_index][left_offset], key_type)
+                    && let Some(matches) = right_by_key.get(&key)
+                {
+                    for right in matches {
+                        scratch.clear();
+                        for source in &left {
+                            scratch.extend_from_slice(source);
+                        }
+                        scratch.extend_from_slice(right);
+                        visit(&scratch)?;
+                    }
+                }
+            }
+            return Ok(());
+        }
+        let mut joined = Vec::new();
+        for mut left in rows {
+            if let Some(key) = create_hash_join_key(&left[left_index][left_offset], key_type)
+                && let Some(matches) = right_by_key.get(&key)
+            {
+                if matches.len() == 1 {
+                    left.push(matches[0]);
+                    joined.push(left);
+                } else {
+                    joined.extend(matches.iter().map(|&right| {
+                        let mut row = left.clone();
+                        row.push(right);
+                        row
+                    }));
+                }
+            }
+        }
+        rows = joined;
+    }
+    Ok(())
+}
+
+fn read_borrowed_table_rows<'a>(
+    state: &'a DatabaseState,
+    name: &ast::ObjectName,
+    xid: Xid,
+    snapshot: &Snapshot,
+) -> Result<Vec<&'a [Value]>> {
+    let schema = state
+        .catalog
+        .require_named_table(&normalize_relation_name(name)?)?;
+    let table = state
+        .tables
+        .get(&schema.id)
+        .expect("catalog table must have storage");
+    let mut rows = Vec::new();
+    state.record_read(xid, Access::Relation(schema.id));
+    for (row_id, chain) in table.iterate_version_chains() {
+        let Some(version) = find_visible_version(chain, snapshot, xid, &state.transactions) else {
+            continue;
+        };
+        state.record_read(xid, Access::Row(schema.id, row_id));
+        rows.push(version.row.as_slice());
+    }
+    Ok(rows)
 }
 
 #[cfg_attr(feature = "execution-log", tracing::instrument(skip_all))]

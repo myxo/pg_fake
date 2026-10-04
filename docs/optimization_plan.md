@@ -457,6 +457,24 @@ The workspace suite passes with the two existing collation and corpus-threshold
 failures excluded.
 Other O4 join and access-path work remains pending.
 
+An unfiltered multi-table inner hash join now borrows visible source rows
+through each join stage and materializes a row only for a final match. The
+filtered, outer, CTE and single-join paths retain their earlier behavior. For
+`SELECT a.name, b.name, c.name FROM a JOIN b ON a.id=b.id JOIN c ON b.id=c.id`,
+medians of three alternating 0.5-second SQLx runs improve 109.324→85.627 us
+(21.68%) at 100 rows and 8,256.068→6,055.033 us (26.66%) at 10,000 rows.
+Native prepared runs improve 94.901→70.979 us (25.21%) and
+8,067.382→5,846.362 us (27.53%). The full ten-case Tier 1 sweep favored the
+candidate joins but showed an apparent 32.795→33.543 us ordering slowdown.
+Isolated 30-sample ordering pairs reversed direction: 28.293→28.245 us,
+then 28.057→28.162 us in reverse run order. No Tier 1 slowdown was confirmed.
+The PostgreSQL multi-join differential now covers four-table chains and
+self-joins; serializable differential, generated SQL, and the workspace suite
+pass with the same two existing collation and corpus-threshold failures
+excluded. Formatting and scoped Clippy pass; strict Clippy stops on three
+existing warnings. Raw probes, matching release binaries and Tier 1 logs remain
+under `target/o4-borrowed-chain-*`. Other O4 work remains pending.
+
 ### O5 — Prepare simple mutation structure once; specialize resumption [PENDING]
 
 **Effort:** 4–7 days. **Dependency:** O1. **Confidence:** high for redundant work;
