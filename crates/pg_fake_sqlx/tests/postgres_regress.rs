@@ -1,8 +1,8 @@
 use std::{fs, path::PathBuf, sync::Mutex};
 
-use pg_fake::parser::{self, Statement};
+use pg_fake::error::SqlState;
 use pg_fake_sqlx::{Db, PgFake, PgFakeConnection};
-use sqlparser::ast;
+use sqlparser::ast::{self, Statement};
 use sqlx::{
     Column, ColumnIndex, Connection, Database, Decode, Executor, IntoArguments, Row, Type,
     TypeInfo, ValueRef,
@@ -310,22 +310,22 @@ fn compare_source_statement(
     if normalized.contains("COPY") && normalized.contains("FROM STDIN") {
         return Err("requires inline COPY fixture data".into());
     }
-    let mut parsed = match parser::parse(sql) {
+    let mut parsed = match crate::common::parse_sql(sql) {
         Ok(parsed) if parsed.len() == 1 => parsed,
         Ok(_) => return Err("does not contain exactly one SQL statement".into()),
-        Err(fake_error) => match runtime.block_on(sqlx::raw_sql(sql).execute(&mut *postgres)) {
+        Err(_) => match runtime.block_on(sqlx::raw_sql(sql).execute(&mut *postgres)) {
             Err(postgres_error)
                 if postgres_error
                     .as_database_error()
                     .and_then(|error| error.code())
-                    .is_some_and(|code| code == fake_error.sqlstate.get_code()) =>
+                    .is_some_and(|code| code == SqlState::SyntaxError.get_code()) =>
             {
                 return Ok(());
             }
             Err(postgres_error) => {
                 return Err(format!(
                     "pg_fake cannot parse it ({}) while PostgreSQL returns {}",
-                    fake_error.sqlstate.get_code(),
+                    SqlState::SyntaxError.get_code(),
                     postgres_error
                         .as_database_error()
                         .and_then(|error| error.code())

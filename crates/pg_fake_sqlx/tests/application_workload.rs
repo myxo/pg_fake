@@ -9,9 +9,9 @@ use std::{
 };
 
 use bigdecimal::BigDecimal;
-use pg_fake::parser::{self, Statement};
 use pg_fake_sqlx::{Db, PgFakeConnectOptions, PgFakeConnection, PgFakePoolOptions};
 use serde_json::{Value as JsonValue, json};
+use sqlparser::ast::Statement;
 use sqlx::{Column, Connection, Executor, Row, Statement as _, TypeInfo};
 use sqlx_core::migrate::{Migration, MigrationType, Migrator};
 use sqlx_postgres::{PgConnection, PgPoolOptions};
@@ -188,7 +188,7 @@ fn get_sqlstate(error: sqlx::Error) -> String {
 }
 
 fn get_manifest_row_order(sql: &str) -> RowOrder {
-    let mut statements = parser::parse(sql).expect("manifest SQL must parse");
+    let mut statements = crate::common::parse_sql(sql).expect("manifest SQL must parse");
     assert_eq!(statements.len(), 1);
     match statements.pop().unwrap() {
         Statement::Query(query) if query.order_by.is_some() => RowOrder::Ordered,

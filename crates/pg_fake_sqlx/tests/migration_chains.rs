@@ -259,7 +259,7 @@ fn diagnose_fake_migration(
         .block_on(migrator.run_direct(Some(version - 1), &mut fake, false))
         .expect("preceding migration prefix must succeed during diagnosis");
     runtime.block_on(fake.execute("BEGIN")).unwrap();
-    let statements = pg_fake::parser::parse(scenario.migrations[version as usize - 1].1).unwrap();
+    let statements = crate::common::parse_sql(scenario.migrations[version as usize - 1].1).unwrap();
     for (index, statement) in statements.into_iter().enumerate() {
         let sql = statement.to_string();
         if let Err(error) = runtime.block_on(sqlx::raw_sql(sql.as_str()).execute(&mut fake)) {
@@ -276,7 +276,7 @@ async fn diagnose_fake_migration_on_connection_async(
     sql: &str,
 ) -> String {
     connection.execute("BEGIN").await.unwrap();
-    let statements = pg_fake::parser::parse(sql).unwrap();
+    let statements = crate::common::parse_sql(sql).unwrap();
     for (index, statement) in statements.into_iter().enumerate() {
         let statement_sql = statement.to_string();
         if let Err(error) = sqlx::raw_sql(statement_sql.as_str())

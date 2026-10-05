@@ -38,3 +38,10 @@ pub(crate) fn start_postgres_server() -> PostgresServer {
         _container: container,
     }
 }
+
+#[allow(dead_code)]
+pub(crate) fn parse_sql(
+    sql: &str,
+) -> Result<Vec<sqlparser::ast::Statement>, sqlparser::parser::ParserError> {
+    sqlparser::parser::Parser::parse_sql(&sqlparser::dialect::PostgreSqlDialect {}, sql)
+}

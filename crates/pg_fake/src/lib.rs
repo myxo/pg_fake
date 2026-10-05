@@ -8,7 +8,7 @@ mod database;
 pub mod error;
 mod executor;
 pub mod jsonb;
-pub mod parser;
+mod parser;
 mod results;
 mod serializable;
 mod session;

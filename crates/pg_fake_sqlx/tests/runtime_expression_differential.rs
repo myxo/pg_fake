@@ -139,7 +139,7 @@ fn matches_runtime_expression_fixtures() {
         RowOrder::Unordered,
     );
     for statement in
-        pg_fake::parser::parse(include_str!("fixtures/runtime_expressions.sql")).unwrap()
+        crate::common::parse_sql(include_str!("fixtures/runtime_expressions.sql")).unwrap()
     {
         assert_statement(
             &runtime,

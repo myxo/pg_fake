@@ -1,6 +1,5 @@
 //! SQL parser.
 
-pub use ast::Statement;
 use sqlparser::ast;
 use sqlparser::{dialect::PostgreSqlDialect, parser::Parser};
 
@@ -8,7 +7,7 @@ use crate::error::{PgError, Result, SqlState};
 
 /// Parses one or more PostgreSQL statements into owned syntax trees.
 #[cfg_attr(feature = "execution-log", tracing::instrument(skip_all))]
-pub fn parse(sql: &str) -> Result<Vec<ast::Statement>> {
+pub(crate) fn parse(sql: &str) -> Result<Vec<ast::Statement>> {
     Parser::parse_sql(&PostgreSqlDialect {}, sql)
         .map_err(|error| PgError::create(SqlState::SyntaxError, error.to_string()))
 }

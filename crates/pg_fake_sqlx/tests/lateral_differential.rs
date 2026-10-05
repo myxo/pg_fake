@@ -27,7 +27,7 @@ fn matches_lateral_fixtures_and_errors() {
         "SELECT 1",
         RowOrder::Unordered,
     );
-    for statement in pg_fake::parser::parse(include_str!("fixtures/lateral.sql")).unwrap() {
+    for statement in crate::common::parse_sql(include_str!("fixtures/lateral.sql")).unwrap() {
         assert_statement(
             &runtime,
             &mut postgres,

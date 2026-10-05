@@ -10,12 +10,20 @@ use std::{
 use pg_fake::{
     Db, StatementResult,
     error::SqlState,
-    parser::{self, Statement},
     value::{BaseType, Value},
 };
 use postgres::{Client, NoTls, SimpleQueryMessage};
+use sqlparser::{
+    ast::Statement,
+    dialect::PostgreSqlDialect,
+    parser::{Parser, ParserError},
+};
 use testcontainers::{Container, ImageExt, runners::SyncRunner};
 use testcontainers_modules::postgres::Postgres;
+
+fn parse_sql(sql: &str) -> Result<Vec<Statement>, ParserError> {
+    Parser::parse_sql(&PostgreSqlDialect {}, sql)
+}
 
 #[derive(Debug, PartialEq, Eq)]
 enum Outcome {
@@ -101,7 +109,7 @@ fn assert_differential(script: &str, row_order: RowOrder) {
     let db = Db::create();
     let mut fake = db.create_session();
 
-    for statement in parser::parse(&script).unwrap() {
+    for statement in parse_sql(&script).unwrap() {
         let sql = statement.to_string();
         let expected = execute_on_postgres(&mut postgres, &statement, &sql);
         let actual = execute_on_fake(&mut fake, &statement, &sql);
@@ -131,7 +139,7 @@ fn assert_session_differential(operations: &[(SessionName, &str)], row_order: Ro
         .iter()
         .map(|(session, sql)| {
             let sql = sql.replace("__TABLE__", &table_name);
-            let mut statements = parser::parse(&sql).unwrap();
+            let mut statements = parse_sql(&sql).unwrap();
             assert_eq!(statements.len(), 1, "operation must contain one statement");
             (*session, statements.pop().unwrap(), sql)
         })

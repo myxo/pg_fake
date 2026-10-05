@@ -1,8 +1,8 @@
 use std::str::FromStr;
 
 use bigdecimal::BigDecimal;
-use pg_fake::parser::{self, Statement};
 use pg_fake_sqlx::{PgFake, PgFakeConnection};
+use sqlparser::ast::Statement;
 #[cfg(test)]
 use sqlx::Connection;
 use sqlx::{Column, ColumnIndex, Database, Decode, Executor, Row, Type, TypeInfo, ValueRef};
@@ -110,8 +110,8 @@ impl TestConnection<'_> {
 }
 
 fn parse_single_statement(sql: &str) -> Statement {
-    let mut statements =
-        parser::parse(sql).unwrap_or_else(|error| panic!("SQL must parse: {sql}\n{error}"));
+    let mut statements = crate::common::parse_sql(sql)
+        .unwrap_or_else(|error| panic!("SQL must parse: {sql}\n{error}"));
     assert_eq!(statements.len(), 1, "operation must be one statement");
     statements.pop().expect("statement count was checked")
 }
