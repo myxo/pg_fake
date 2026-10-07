@@ -472,10 +472,16 @@ fn evaluate_inner(
                 row,
                 context,
             )?;
-            let escape = match escape_char.as_ref().map(|escape| &escape.value) {
+            let escape = match escape_char.as_deref() {
                 None => "\\",
-                Some(ast::Value::SingleQuotedString(escape)) => escape,
-                Some(ast::Value::Null) => return Ok(Value::Null),
+                Some(ast::Expr::Value(ast::ValueWithSpan {
+                    value: ast::Value::SingleQuotedString(escape),
+                    ..
+                })) => escape,
+                Some(ast::Expr::Value(ast::ValueWithSpan {
+                    value: ast::Value::Null,
+                    ..
+                })) => return Ok(Value::Null),
                 _ => return reject_unsupported("LIKE escape is not implemented"),
             };
             let (Value::Text(value), Value::Text(pattern)) = (value, pattern) else {

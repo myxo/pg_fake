@@ -31,7 +31,7 @@ uuid = "1"
 [dev-dependencies]
 chaos_theory = "0.5"
 dotenvy = "0.15"
-sqlparser = "0.62"
+sqlparser = { package = "pg_fake_sqlparser", version = "0.63.0" }
 sqlx-postgres = { version = "0.8.6", features = ["bigdecimal", "chrono", "json", "migrate", "time", "uuid"] }
 testcontainers = { version = "0.27", features = ["blocking"] }
 testcontainers-modules = { version = "0.15", features = ["blocking", "postgres"] }

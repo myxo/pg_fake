@@ -11,6 +11,7 @@ SELECT '2024-03-10 02:30:00'::timestamp AT TIME ZONE 'America/New_York', '2024-1
 SELECT '2000-01-01'::timestamp AT TIME ZONE '+03:00', '2000-01-01'::timestamp AT TIME ZONE 'UTC-05:30', '2000-01-01'::date AT TIME ZONE 'UTC', NULL::timestamp AT TIME ZONE 'UTC', 'infinity'::timestamp AT TIME ZONE 'unknown_zone';
 SELECT id, label LIKE 'Alpha%', label ILIKE 'alpha%', label NOT LIKE '%2', label NOT ILIKE '%3', label LIKE '%!_%' ESCAPE '!' FROM runtime_values ORDER BY id;
 SELECT 'a_b' LIKE 'a\_b', 'a%b' LIKE 'a!%b' ESCAPE '!', 'a\b' LIKE 'a\b' ESCAPE '', 'éx' LIKE '_x', 'x' LIKE 'x\', '' LIKE '%\', 'abc' LIKE '%b%', 'abcb' LIKE '%b', 'a  '::char(3) LIKE 'a';
+SELECT 'a_b' LIKE 'a!_b' ESCAPE NULL, 'A_B' ILIKE 'a!_b' ESCAPE '!', 'A_B' ILIKE 'a!_b' ESCAPE NULL;
 SELECT id, label ~ '^A', label ~* '^a', label !~ '^A', label !~* '^a', regexp_like(label, '^alpha_[0-9]{1,2}$', 'i') FROM runtime_values ORDER BY id;
 SELECT regexp_like('a-b', '(a|z)-[a-z]+'), regexp_like('ABC', '^abc$', 'ic'), regexp_like('ABC', '^abc$', 'ci'), 'a  '::char(3) ~ '^a$', regexp_like('a  '::char(3), '^a$');
 SELECT date_trunc('month', occurred) AS month, floor(amount) AS amount, count(*), string_agg(to_char(occurred, 'DD'), ':' ORDER BY id DESC) FILTER (WHERE label ILIKE 'a%') FROM runtime_values GROUP BY date_trunc('month', occurred), floor(amount) ORDER BY month, amount;

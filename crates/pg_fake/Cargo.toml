@@ -19,7 +19,7 @@ rand_chacha = { version = "0.9", features = ["os_rng"] }
 regex = "1"
 serde = "1"
 serde_json = { version = "1", features = ["arbitrary_precision", "unbounded_depth", "raw_value"] }
-sqlparser = { version = "0.62", features = ["visitor"] }
+sqlparser = { package = "pg_fake_sqlparser", version = "0.63.0", features = ["visitor"] }
 thiserror = "2"
 tracing = { version = "0.1", optional = true, features = ["attributes"] }
 uuid = { version = "1", features = ["v4"] }

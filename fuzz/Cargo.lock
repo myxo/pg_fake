@@ -949,11 +949,11 @@ dependencies = [
  "bigdecimal",
  "chrono",
  "chrono-tz",
+ "pg_fake_sqlparser",
  "rand_chacha 0.9.0",
  "regex",
  "serde",
  "serde_json",
- "sqlparser",
  "thiserror",
  "uuid",
 ]
@@ -967,10 +967,33 @@ dependencies = [
  "chaos_theory_libfuzzer",
  "dotenvy",
  "pg_fake",
+ "pg_fake_sqlparser",
  "pg_fake_sqlx",
  "sqlx",
  "sqlx-postgres",
  "tokio",
+]
+
+[[package]]
+name = "pg_fake_sqlparser"
+version = "0.63.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "a37846f7f423f314a92faecb667207e30c8ce3f7b5bae3158c22aaa911e49bfa"
+dependencies = [
+ "log",
+ "pg_fake_sqlparser_derive",
+ "recursive",
+]
+
+[[package]]
+name = "pg_fake_sqlparser_derive"
+version = "0.6.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "318da15061d81ef6504720de0ff041f728267f5c7776ca221b49526d024b7b7c"
+dependencies = [
+ "proc-macro2",
+ "quote",
+ "syn 3.0.4",
 ]
 
 [[package]]
@@ -1392,26 +1415,6 @@ checksum = "d91ed6c858b01f942cd56b37a94b3e0a1798290327d1236e4d9cf4eaca44d29d"
 dependencies = [
  "base64ct",
  "der",
-]
-
-[[package]]
-name = "sqlparser"
-version = "0.62.0"
-source = "git+https://github.com/myxo/datafusion-sqlparser-rs?rev=dfbc74760f1f453cfd207226fdf986285e1f8485#dfbc74760f1f453cfd207226fdf986285e1f8485"
-dependencies = [
- "log",
- "recursive",
- "sqlparser_derive",
-]
-
-[[package]]
-name = "sqlparser_derive"
-version = "0.5.0"
-source = "git+https://github.com/myxo/datafusion-sqlparser-rs?rev=dfbc74760f1f453cfd207226fdf986285e1f8485#dfbc74760f1f453cfd207226fdf986285e1f8485"
-dependencies = [
- "proc-macro2",
- "quote",
- "syn 2.0.119",
 ]
 
 [[package]]
