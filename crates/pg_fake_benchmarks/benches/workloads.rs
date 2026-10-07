@@ -2233,6 +2233,7 @@ fn benchmarks(criterion: &mut Criterion) {
         benchmark_serializable(criterion, &runtime, &postgres_url);
         foreign_key_insert_benchmark(criterion, &runtime, &mut connections);
         inner_join_benchmark(criterion, &runtime, &mut connections);
+        benchmark_selective_indexed_join(criterion, &runtime, &mut connections);
         benchmark_lateral(criterion, &runtime, &mut connections);
         benchmark_skip_locked(criterion, &runtime, &mut connections);
         derived_and_scalar_subquery_benchmark(criterion, &runtime, &mut connections);
@@ -2712,6 +2713,64 @@ fn inner_join_benchmark(
             "DROP TABLE selective_inner_join_left, selective_inner_join_right, many_match_inner_join_left, many_match_inner_join_right",
         );
     }
+}
+
+fn benchmark_selective_indexed_join(
+    criterion: &mut Criterion,
+    runtime: &Runtime,
+    connections: &mut [NamedBenchmarkConnection<'_>],
+) {
+    let mut group = criterion
+        .benchmark_group(benchmarks::find_benchmark("selective_indexed_join").format_name());
+    group.throughput(Throughput::Elements(1));
+    for rows in [100_usize, 1_000] {
+        let values = (1..=rows)
+            .map(|id| format!("({id}, {id})"))
+            .collect::<Vec<_>>()
+            .join(",");
+        for (_, connection) in connections.iter_mut() {
+            connection.execute(
+                runtime,
+                "CREATE TABLE indexed_join_left (id INTEGER PRIMARY KEY)",
+            );
+            connection.execute(
+                runtime,
+                "CREATE TABLE indexed_join_middle (id INTEGER PRIMARY KEY)",
+            );
+            connection.execute(
+                runtime,
+                "CREATE TABLE indexed_join_right (id INTEGER PRIMARY KEY, value INTEGER)",
+            );
+            connection.execute(runtime, "INSERT INTO indexed_join_left VALUES (50)");
+            connection.execute(runtime, "INSERT INTO indexed_join_middle VALUES (50)");
+            connection.execute(
+                runtime,
+                &format!("INSERT INTO indexed_join_right VALUES {values}"),
+            );
+            connection.execute(runtime, "ANALYZE indexed_join_left");
+            connection.execute(runtime, "ANALYZE indexed_join_middle");
+            connection.execute(runtime, "ANALYZE indexed_join_right");
+        }
+        for (shape, predicate) in [("plain", ""), ("filtered", " AND right_row.value >= 0")] {
+            let query = format!(
+                "SELECT right_row.value FROM indexed_join_left AS left_row JOIN indexed_join_middle AS middle_row ON middle_row.id = left_row.id JOIN indexed_join_right AS right_row ON right_row.id = middle_row.id WHERE left_row.id = 50{predicate}"
+            );
+            for (connection_name, connection) in connections.iter_mut() {
+                group.bench_with_input(
+                    BenchmarkId::new(format!("{shape}_{connection_name}"), rows),
+                    &rows,
+                    |benchmark, _| benchmark.iter(|| connection.fetch(runtime, &query)),
+                );
+            }
+        }
+        for (_, connection) in connections.iter_mut() {
+            connection.execute(
+                runtime,
+                "DROP TABLE indexed_join_left, indexed_join_middle, indexed_join_right",
+            );
+        }
+    }
+    group.finish();
 }
 
 fn benchmark_lateral(

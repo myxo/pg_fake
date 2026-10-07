@@ -511,6 +511,32 @@ pub fn list_benchmarks() -> Vec<Benchmark> {
         ),
         build_benchmark(
             BenchmarkTier::Important,
+            "selective_indexed_join",
+            vec![
+                build_value("plain_pg_fake/100", &["plain_pg_fake", "100"]),
+                build_value("plain_postgres_18/100", &["plain_postgres_18", "100"]),
+                build_value("plain_pg_fake/1000", &["plain_pg_fake", "1000"]),
+                build_value("plain_postgres_18/1000", &["plain_postgres_18", "1000"]),
+                build_value("filtered_pg_fake/100", &["filtered_pg_fake", "100"]),
+                build_value("filtered_postgres_18/100", &["filtered_postgres_18", "100"]),
+                build_value("filtered_pg_fake/1000", &["filtered_pg_fake", "1000"]),
+                build_value(
+                    "filtered_postgres_18/1000",
+                    &["filtered_postgres_18", "1000"],
+                ),
+            ],
+            vec![
+                build_comparison("plain_postgres_18/100", "plain_pg_fake/100"),
+                build_comparison("plain_postgres_18/1000", "plain_pg_fake/1000"),
+                build_comparison("filtered_postgres_18/100", "filtered_pg_fake/100"),
+                build_comparison("filtered_postgres_18/1000", "filtered_pg_fake/1000"),
+                build_comparison("plain_pg_fake/100", "filtered_pg_fake/100"),
+                build_comparison("plain_pg_fake/1000", "filtered_pg_fake/1000"),
+                build_comparison("filtered_pg_fake/100", "filtered_pg_fake/1000"),
+            ],
+        ),
+        build_benchmark(
+            BenchmarkTier::Important,
             "derived_and_scalar_subquery_100_rows",
             build_postgres_values(),
             build_postgres_comparisons(),

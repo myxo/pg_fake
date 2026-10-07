@@ -10,7 +10,7 @@ Benchmarks are prioritized by their impact on everyday application tests using
 | `tier3_` | Rare | Recursive/data-modifying CTEs, advanced windows, lateral queries, nested views, compound index/array aggregation workloads, triggers, temporary tables, catalog lookups, specialized locking/settings, JSON joins, and transaction-history/MVCC/contention diagnostics. |
 
 The shared catalog in [`src/lib.rs`](src/lib.rs) assigns every workload a tier.
-The [complete tier assessment](tiers.md) explains the assignment of all 78
+The [complete tier assessment](tiers.md) explains the assignment of all 79
 benchmark groups based on their actual timed operations.
 Console and saved reports group measurements and comparisons by tier, with
 Tier 1 first. These priorities are independent of the SQL fidelity tiers in the
@@ -63,6 +63,8 @@ Diagnostic groups isolate costs within `pg_fake`:
   long-lived repeatable-read snapshot;
 - `point_lookup_index_vs_scan` compares a primary-key predicate with an
   equivalent heap predicate at 100 and 10,000 rows;
+- `selective_indexed_join` compares a single-result join chain with and without
+  an added predicate on the indexed table at 100 and 1,000 rows;
 - `concurrent_uncontended_reads` compares sequential and parallel sessions, and
   `concurrent_same_row_contention` exercises a blocking same-row update.
 
