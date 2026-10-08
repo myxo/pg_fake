@@ -48,6 +48,10 @@ enum PreparedAccess {
         column: usize,
         value: PreparedExpression,
     },
+    Nonunique {
+        column: usize,
+        value: PreparedExpression,
+    },
 }
 
 #[derive(Debug, Clone)]
@@ -565,7 +569,7 @@ pub(crate) fn build_prepared_query_plan(
             (None, Some(schema)) => {
                 let access = selection
                     .as_ref()
-                    .and_then(|selection| find_unique_access(selection, schema))
+                    .and_then(|selection| find_index_access(selection, schema))
                     .unwrap_or(PreparedAccess::Scan);
                 PreparedSource::Table {
                     table_id: schema.id,
@@ -900,7 +904,7 @@ pub(super) fn bind_prepared_expression(
     }
 }
 
-fn find_unique_access(
+fn find_index_access(
     selection: &PreparedExpression,
     schema: &TableSchema,
 ) -> Option<PreparedAccess> {
@@ -922,7 +926,10 @@ fn find_unique_access(
         }
         _ => return None,
     };
-    schema
+    if value.get_data_type() != schema.columns[column].data_type.base {
+        return None;
+    }
+    let unique = schema
         .constraints
         .iter()
         .any(|constraint| match constraint {
@@ -932,7 +939,25 @@ fn find_unique_access(
             }
             _ => false,
         })
-        .then_some(PreparedAccess::Unique { column, value })
+        || schema.indexes.iter().any(|index| {
+            index.unique
+                && index.predicate.is_none()
+                && index.columns.len() == 1
+                && index.columns[0].name == schema.columns[column].name
+        });
+    if unique {
+        return Some(PreparedAccess::Unique { column, value });
+    }
+    schema
+        .indexes
+        .iter()
+        .any(|index| {
+            !index.unique
+                && index.predicate.is_none()
+                && index.columns.len() == 1
+                && index.columns[0].name == schema.columns[column].name
+        })
+        .then_some(PreparedAccess::Nonunique { column, value })
 }
 
 pub(crate) fn execute_prepared_query(
@@ -1118,6 +1143,21 @@ pub(crate) fn execute_prepared_query(
                         );
                     }
                     if let Some((row_id, version)) = table.find_unique_visible_version(
+                        &[*column],
+                        &[value],
+                        snapshot,
+                        xid,
+                        &state.transactions,
+                    ) {
+                        state.record_read(xid, crate::serializable::Access::Row(*table_id, row_id));
+                        visit(&version.row)?;
+                    }
+                }
+                PreparedAccess::Nonunique { column, value } => {
+                    let value =
+                        evaluate_prepared_expression(value, &[], parameters, deadline, timezone)?;
+                    state.record_read(xid, crate::serializable::Access::Relation(*table_id));
+                    for (row_id, version) in table.find_nonunique_visible_versions(
                         &[*column],
                         &[value],
                         snapshot,

@@ -302,16 +302,19 @@ fn can_push_filter(expr: &ast::Expr, scope: &BoundScope, start: usize, end: usiz
 
 #[cfg_attr(feature = "execution-log", tracing::instrument(skip_all))]
 fn is_point_lookup_value(expr: &ast::Expr) -> bool {
-    matches!(expr, ast::Expr::Value(_))
-        || matches!(
-            expr,
+    let mut expr = expr;
+    loop {
+        match expr {
+            ast::Expr::Value(_) => return true,
             ast::Expr::Cast {
                 kind: ast::CastKind::Cast | ast::CastKind::DoubleColon,
-                expr,
+                expr: inner,
                 format: None,
                 ..
-            } if matches!(expr.as_ref(), ast::Expr::Value(_))
-        )
+            } => expr = inner,
+            _ => return false,
+        }
+    }
 }
 
 #[cfg_attr(feature = "execution-log", tracing::instrument(skip_all))]

@@ -6,7 +6,7 @@ use crate::{
         equality::{EqualityKey, create_equality_key},
         lateral::contains_lateral_source,
         normalize_relation_name, normalize_unqualified_object_name,
-        scope::{self, BoundScope, try_resolve_column_reference},
+        scope::{self, BoundScope, RowScope, try_resolve_column_reference},
         subqueries::evaluate_query_expression,
     },
     serializable::Access,
@@ -505,56 +505,65 @@ fn visit_hash_join_chain_rows<const PRUNE_SPARSE_RIGHT: bool>(
         {
             let mut filters = Vec::new();
             collect_pushdown_filters(selection, scope, right_start, right_end, &mut filters);
-            if filters.is_empty() {
-                let schema = state
-                    .catalog
-                    .require_named_table(&normalize_relation_name(name)?)?;
-                let table = state
-                    .tables
-                    .get(&schema.id)
-                    .expect("catalog table must have storage");
-                let right_column = right_slot - right_start;
-                if table.has_unique_index(&[right_column]) {
-                    let mut seen = std::collections::HashSet::new();
-                    let mut indexed = Vec::new();
-                    for left in &rows {
-                        let value = &left[left_slot];
-                        let key = match (key_type, value) {
-                            (BaseType::Int2, Value::Int2(value)) => EqualityKey::Int2(*value),
-                            (BaseType::Int4, Value::Int4(value)) => EqualityKey::Int4(*value),
-                            (BaseType::Int8, Value::Int8(value)) => EqualityKey::Int8(*value),
-                            _ => continue,
-                        };
-                        if !seen.insert(key) {
-                            continue;
-                        }
-                        if state.tracks_serializable_reads(xid)
-                            && let Some(key) = table.create_unique_read_key(
-                                &[right_column],
-                                std::slice::from_ref(value),
-                            )
-                        {
-                            state.record_read(
-                                xid,
-                                Access::Unique(schema.id, vec![right_column], key),
-                            );
-                        }
-                        if let Some((row_id, version)) = table.find_unique_visible_version(
-                            &[right_column],
-                            std::slice::from_ref(value),
-                            snapshot,
-                            xid,
-                            &state.transactions,
-                        ) {
-                            state.record_read(xid, Access::Row(schema.id, row_id));
+            let schema = state
+                .catalog
+                .require_named_table(&normalize_relation_name(name)?)?;
+            let table = state
+                .tables
+                .get(&schema.id)
+                .expect("catalog table must have storage");
+            let right_column = right_slot - right_start;
+            if table.has_unique_index(&[right_column]) {
+                let mut probe_row = vec![Value::Null; scope.columns.len()];
+                let mut seen = std::collections::HashSet::new();
+                let mut indexed = Vec::new();
+                for left in &rows {
+                    let value = &left[left_slot];
+                    let key = match (key_type, value) {
+                        (BaseType::Int2, Value::Int2(value)) => EqualityKey::Int2(*value),
+                        (BaseType::Int4, Value::Int4(value)) => EqualityKey::Int4(*value),
+                        (BaseType::Int8, Value::Int8(value)) => EqualityKey::Int8(*value),
+                        _ => continue,
+                    };
+                    if !seen.insert(key) {
+                        continue;
+                    }
+                    if state.tracks_serializable_reads(xid)
+                        && let Some(key) = table
+                            .create_unique_read_key(&[right_column], std::slice::from_ref(value))
+                    {
+                        state.record_read(xid, Access::Unique(schema.id, vec![right_column], key));
+                    }
+                    if let Some((row_id, version)) = table.find_unique_visible_version(
+                        &[right_column],
+                        std::slice::from_ref(value),
+                        snapshot,
+                        xid,
+                        &state.transactions,
+                    ) {
+                        state.record_read(xid, Access::Row(schema.id, row_id));
+                        probe_row[right_start..right_end].clone_from_slice(&version.row);
+                        let passes = filters.iter().try_fold(true, |passes, filter| {
+                            if !passes {
+                                return Ok(false);
+                            }
+                            Ok(matches!(
+                                crate::executor::expressions::evaluate(
+                                    filter,
+                                    RowScope::Bound(scope),
+                                    &probe_row,
+                                    context,
+                                )?,
+                                Value::Bool(true)
+                            ))
+                        })?;
+                        if passes {
                             indexed.push((row_id, version.row.clone()));
                         }
                     }
-                    indexed.sort_by_key(|(row_id, _)| *row_id);
-                    Some(indexed.into_iter().map(|(_, row)| row).collect::<Vec<_>>())
-                } else {
-                    None
                 }
+                indexed.sort_by_key(|(row_id, _)| *row_id);
+                Some(indexed.into_iter().map(|(_, row)| row).collect::<Vec<_>>())
             } else {
                 None
             }

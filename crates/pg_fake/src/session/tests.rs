@@ -1869,6 +1869,40 @@ fn skips_scans_for_missing_prepared_unique_keys() {
 }
 
 #[test]
+fn updates_and_deletes_by_typed_prepared_unique_key() {
+    let db = Db::create();
+    let mut session = db.create_session();
+    session
+        .execute(
+            "CREATE TABLE typed_write_keys (id BIGINT PRIMARY KEY, amount INTEGER); \
+             INSERT INTO typed_write_keys VALUES (1, 10), (2, 20)",
+        )
+        .unwrap();
+    let update = session
+        .prepare_with_parameter_types(
+            "UPDATE typed_write_keys SET amount = amount + 1 WHERE id = $1",
+            &[Some(BaseType::Int8)],
+        )
+        .unwrap();
+    let delete = session
+        .prepare_with_parameter_types(
+            "DELETE FROM typed_write_keys WHERE id = $1",
+            &[Some(BaseType::Int8)],
+        )
+        .unwrap();
+
+    assert_eq!(session.execute_prepared(&update, &[Value::Int8(2)]), Ok(1));
+    assert_eq!(session.execute_prepared(&delete, &[Value::Int8(1)]), Ok(1));
+    assert_eq!(
+        session
+            .query("SELECT id, amount FROM typed_write_keys", &[])
+            .unwrap()
+            .rows,
+        vec![vec![Value::Int8(2), Value::Int4(21)]]
+    );
+}
+
+#[test]
 #[cfg_attr(feature = "execution-log", tracing::instrument(skip_all))]
 fn finishes_implicit_prepared_transactions() {
     let db = Db::create();
@@ -11248,6 +11282,121 @@ fn match_compiled_integer_joins_with_general_execution() {
             assert_eq!(one_shot_rows, general_rows, "one-shot {sql}");
         }
     }
+}
+
+#[test]
+fn filters_indexed_join_chain_candidates() {
+    let db = Db::create();
+    let mut session = db.create_session();
+    session
+        .execute(
+            "CREATE TABLE chain_left (id INTEGER PRIMARY KEY); \
+             CREATE TABLE chain_middle (id INTEGER PRIMARY KEY); \
+             CREATE TABLE chain_right (id INTEGER PRIMARY KEY, value INTEGER); \
+             INSERT INTO chain_left VALUES (1); \
+             INSERT INTO chain_middle VALUES (1); \
+             INSERT INTO chain_right VALUES (1, 10), (2, 20)",
+        )
+        .unwrap();
+    let statement = session
+        .prepare(
+            "SELECT r.value FROM chain_left l \
+             JOIN chain_middle m ON m.id = l.id \
+             JOIN chain_right r ON r.id = m.id \
+             WHERE l.id = 1 AND r.value >= $1",
+        )
+        .unwrap();
+    assert_eq!(
+        session
+            .query_prepared(&statement, &[Value::Int4(5)])
+            .unwrap()
+            .rows,
+        vec![vec![Value::Int4(10)]]
+    );
+    assert!(
+        session
+            .query_prepared(&statement, &[Value::Int4(15)])
+            .unwrap()
+            .rows
+            .is_empty()
+    );
+}
+
+#[test]
+fn reads_nonunique_index_across_writes_and_rollback() {
+    let db = Db::create();
+    let mut session = db.create_session();
+    session
+        .execute(
+            "CREATE TABLE indexed_items (id INTEGER PRIMARY KEY, key INTEGER); \
+             INSERT INTO indexed_items VALUES (1, 7), (2, 7), (3, 8); \
+             CREATE INDEX indexed_items_key ON indexed_items (key)",
+        )
+        .unwrap();
+    let statement = session
+        .prepare("SELECT id FROM indexed_items WHERE key = $1")
+        .unwrap();
+    assert!(statement.query_plan.is_some());
+    assert_eq!(
+        session
+            .query_prepared(&statement, &[Value::Int4(7)])
+            .unwrap()
+            .rows,
+        vec![vec![Value::Int4(1)], vec![Value::Int4(2)]]
+    );
+    session
+        .execute("UPDATE indexed_items SET key = 8 WHERE id = 1")
+        .unwrap();
+    assert_eq!(
+        session
+            .query_prepared(&statement, &[Value::Int4(7)])
+            .unwrap()
+            .rows,
+        vec![vec![Value::Int4(2)]]
+    );
+    session
+        .execute("BEGIN; DELETE FROM indexed_items WHERE id = 2")
+        .unwrap();
+    assert!(
+        session
+            .query_prepared(&statement, &[Value::Int4(7)])
+            .unwrap()
+            .rows
+            .is_empty()
+    );
+    session.execute("ROLLBACK").unwrap();
+    assert_eq!(
+        session
+            .query_prepared(&statement, &[Value::Int4(7)])
+            .unwrap()
+            .rows,
+        vec![vec![Value::Int4(2)]]
+    );
+    session
+        .execute("BEGIN; UPDATE indexed_items SET key = 9 WHERE id = 2")
+        .unwrap();
+    assert!(
+        session
+            .query_prepared(&statement, &[Value::Int4(7)])
+            .unwrap()
+            .rows
+            .is_empty()
+    );
+    session.execute("ROLLBACK").unwrap();
+    assert_eq!(
+        session
+            .query_prepared(&statement, &[Value::Int4(7)])
+            .unwrap()
+            .rows,
+        vec![vec![Value::Int4(2)]]
+    );
+    assert!(
+        session
+            .query_prepared(&statement, &[Value::Int4(9)])
+            .unwrap()
+            .rows
+            .is_empty()
+    );
 }
 
 #[test]

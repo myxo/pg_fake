@@ -40,6 +40,7 @@ struct VersionChainStore {
 
 #[derive(Debug, Clone, PartialEq)]
 struct VersionReclamation {
+    touched: BTreeMap<Xid, BTreeSet<RowId>>,
     pending: BTreeMap<Xid, BTreeSet<RowId>>,
     committed: BTreeMap<CommitSeq, BTreeSet<RowId>>,
 }
@@ -54,10 +55,15 @@ struct TruncatedStorage {
 fn discard_transaction_versions(
     store: &mut VersionChainStore,
     reclamation: &mut VersionReclamation,
+    touched: &BTreeSet<RowId>,
     xid: Xid,
     boundary: CommandId,
 ) {
-    store.chains.retain(|_, chain| {
+    for row_id in touched {
+        let chain = store
+            .chains
+            .get_mut(row_id)
+            .expect("touched row must have a version chain");
         chain
             .versions
             .retain(|version| version.xmin != xid || version.xmin_command_id < boundary);
@@ -71,8 +77,10 @@ fn discard_transaction_versions(
                 version.xmax_command_id = None;
             }
         }
-        !chain.versions.is_empty()
-    });
+        if chain.versions.is_empty() {
+            store.chains.remove(row_id);
+        }
+    }
     if let Some(rows) = reclamation.pending.get_mut(&xid) {
         rows.retain(|row| {
             store.chains.get(row).is_some_and(|chain| {
@@ -84,6 +92,19 @@ fn discard_transaction_versions(
         });
         if rows.is_empty() {
             reclamation.pending.remove(&xid);
+        }
+    }
+    if let Some(rows) = reclamation.touched.get_mut(&xid) {
+        rows.retain(|row| {
+            store.chains.get(row).is_some_and(|chain| {
+                chain
+                    .versions
+                    .iter()
+                    .any(|version| version.xmin == xid || version.xmax == Some(xid))
+            })
+        });
+        if rows.is_empty() {
+            reclamation.touched.remove(&xid);
         }
     }
 }
@@ -109,26 +130,27 @@ enum NormalizedIndexValue {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
-pub(crate) struct UniqueIndexKey(Vec<NormalizedIndexValue>);
+pub(crate) struct IndexKey(Vec<NormalizedIndexValue>);
 
 #[derive(Debug, Clone, PartialEq)]
-struct UniqueIndex {
+struct TableIndex {
+    unique: bool,
     columns: Vec<usize>,
     predicate: Option<ast::Expr>,
-    entries: BTreeMap<UniqueIndexKey, BTreeSet<RowId>>,
+    entries: BTreeMap<IndexKey, BTreeSet<RowId>>,
 }
 
 #[derive(Default)]
 pub(crate) struct PendingUniqueChanges {
-    entries: Vec<BTreeMap<UniqueIndexKey, BTreeSet<RowId>>>,
-    row_keys: BTreeMap<RowId, Vec<Option<UniqueIndexKey>>>,
+    entries: Vec<BTreeMap<IndexKey, BTreeSet<RowId>>>,
+    row_keys: BTreeMap<RowId, Vec<Option<IndexKey>>>,
 }
 
 #[derive(Debug, Clone, PartialEq)]
 pub(crate) struct Table {
     pub(crate) schema: Arc<TableSchema>,
     version_chains: VersionChainStore,
-    indexes: Vec<UniqueIndex>,
+    indexes: Vec<TableIndex>,
     reclamation: Box<VersionReclamation>,
     truncated: BTreeMap<Xid, Vec<TruncatedStorage>>,
     next_rowid: u64,
@@ -142,7 +164,8 @@ impl Table {
             .iter()
             .filter_map(|constraint| match constraint {
                 Constraint::PrimaryKey { columns, .. } | Constraint::Unique { columns, .. } => {
-                    Some(UniqueIndex {
+                    Some(TableIndex {
+                        unique: true,
                         columns: columns
                             .iter()
                             .map(|name| {
@@ -163,8 +186,7 @@ impl Table {
                 schema
                     .indexes
                     .iter()
-                    .filter(|&index| index.unique)
-                    .map(|index| create_unique_index(&schema, index)),
+                    .map(|index| create_index(&schema, index)),
             )
             .collect();
         Table {
@@ -174,6 +196,7 @@ impl Table {
             },
             indexes,
             reclamation: Box::new(VersionReclamation {
+                touched: BTreeMap::new(),
                 pending: BTreeMap::new(),
                 committed: BTreeMap::new(),
             }),
@@ -198,7 +221,8 @@ impl Table {
             .iter()
             .filter_map(|constraint| match constraint {
                 Constraint::PrimaryKey { columns, .. } | Constraint::Unique { columns, .. } => {
-                    Some(UniqueIndex {
+                    Some(TableIndex {
+                        unique: true,
                         columns: columns
                             .iter()
                             .map(|name| {
@@ -219,8 +243,7 @@ impl Table {
                 self.schema
                     .indexes
                     .iter()
-                    .filter(|&index| index.unique)
-                    .map(|index| create_unique_index(&self.schema, index)),
+                    .map(|index| create_index(&self.schema, index)),
             )
             .collect();
         self.rebuild_indexes();
@@ -247,10 +270,40 @@ impl Table {
         &self,
         columns: &[usize],
         values: &[Value],
-    ) -> Option<UniqueIndexKey> {
+    ) -> Option<IndexKey> {
         self.has_unique_index(columns)
             .then(|| build_index_key(&self.schema, columns, values))
             .flatten()
+    }
+
+    pub(crate) fn find_nonunique_visible_versions(
+        &self,
+        columns: &[usize],
+        values: &[Value],
+        snapshot: &Snapshot,
+        current_xid: Xid,
+        transactions: &TransactionRegistry,
+    ) -> Vec<(RowId, &RowVersion)> {
+        let index = self
+            .indexes
+            .iter()
+            .find(|index| !index.unique && index.columns == columns && index.predicate.is_none())
+            .expect("nonunique lookup requires a matching index");
+        let Some(key) = build_index_key(&self.schema, columns, values) else {
+            return Vec::new();
+        };
+        index.entries.get(&key).map_or_else(Vec::new, |row_ids| {
+            row_ids
+                .iter()
+                .filter_map(|row_id| {
+                    let version = self.version_chains.chains.get(row_id).and_then(|chain| {
+                        find_visible_version(chain, snapshot, current_xid, transactions)
+                    })?;
+                    (build_row_index_key(&self.schema, index, &version.row).as_ref() == Some(&key))
+                        .then_some((*row_id, version))
+                })
+                .collect()
+        })
     }
 
     pub(crate) fn collect_transaction_accesses(
@@ -271,7 +324,7 @@ impl Table {
                 };
                 let Some(command) = command else { continue };
                 accesses.insert((command, Access::Row(self.schema.id, *row_id)));
-                for index in &self.indexes {
+                for index in self.indexes.iter().filter(|index| index.unique) {
                     if let Some(key) = build_row_index_key(&self.schema, index, &version.row) {
                         accesses.insert((
                             command,
@@ -303,6 +356,7 @@ impl Table {
             reclamation: std::mem::replace(
                 self.reclamation.as_mut(),
                 VersionReclamation {
+                    touched: BTreeMap::new(),
                     pending: BTreeMap::new(),
                     committed: BTreeMap::new(),
                 },
@@ -316,6 +370,11 @@ impl Table {
     pub(crate) fn insert(&mut self, xmin: Xid, command_id: CommandId, row: Row) -> RowId {
         let row_id = RowId(self.next_rowid);
         self.next_rowid += 1;
+        self.reclamation
+            .touched
+            .entry(xmin)
+            .or_default()
+            .insert(row_id);
         self.add_index_entries(row_id, &row, None);
         let previous = self.version_chains.chains.insert(
             row_id,
@@ -359,6 +418,11 @@ impl Table {
             .entry(xmax)
             .or_default()
             .insert(row_id);
+        self.reclamation
+            .touched
+            .entry(xmax)
+            .or_default()
+            .insert(row_id);
         row_id
     }
 
@@ -395,6 +459,7 @@ impl Table {
     }
 
     pub(crate) fn discard_versions_since(&mut self, xid: Xid, boundary: CommandId) {
+        let mut restored_truncate = false;
         if let Some(storages) = self.truncated.get_mut(&xid) {
             while storages
                 .last()
@@ -403,23 +468,83 @@ impl Table {
                 let storage = storages.pop().expect("selected truncate exists");
                 self.version_chains = storage.version_chains;
                 *self.reclamation = storage.reclamation;
+                restored_truncate = true;
             }
             if storages.is_empty() {
                 self.truncated.remove(&xid);
             }
         }
+        let touched = self
+            .reclamation
+            .touched
+            .get(&xid)
+            .cloned()
+            .unwrap_or_default();
+        let previous_keys = if restored_truncate {
+            Vec::new()
+        } else {
+            touched
+                .iter()
+                .map(|row_id| {
+                    let chain = self
+                        .version_chains
+                        .chains
+                        .get(row_id)
+                        .expect("touched row must have a version chain");
+                    let keys = self
+                        .indexes
+                        .iter()
+                        .map(|index| {
+                            chain
+                                .versions
+                                .iter()
+                                .filter_map(|version| {
+                                    build_row_index_key(&self.schema, index, &version.row)
+                                })
+                                .collect::<BTreeSet<_>>()
+                        })
+                        .collect::<Vec<_>>();
+                    (*row_id, keys)
+                })
+                .collect::<Vec<_>>()
+        };
         discard_transaction_versions(
             &mut self.version_chains,
             &mut self.reclamation,
+            &touched,
             xid,
             boundary,
         );
-        self.rebuild_indexes();
+        if restored_truncate {
+            self.rebuild_indexes();
+            return;
+        }
+        for (row_id, keys) in previous_keys {
+            let chain = self.version_chains.chains.get(&row_id);
+            for (index, previous) in self.indexes.iter_mut().zip(keys) {
+                let retained = chain
+                    .into_iter()
+                    .flat_map(|chain| chain.versions.iter())
+                    .filter_map(|version| build_row_index_key(&self.schema, index, &version.row))
+                    .collect::<BTreeSet<_>>();
+                for key in previous.difference(&retained) {
+                    let row_ids = index
+                        .entries
+                        .get_mut(key)
+                        .expect("rolled-back index entry must exist");
+                    assert!(row_ids.remove(&row_id));
+                    if row_ids.is_empty() {
+                        index.entries.remove(key);
+                    }
+                }
+            }
+        }
     }
 
     #[cfg_attr(feature = "execution-log", tracing::instrument(skip_all))]
     pub(crate) fn commit_transaction_versions(&mut self, xid: Xid, commit_seq: CommitSeq) -> bool {
         let truncated = self.truncated.remove(&xid).is_some();
+        self.reclamation.touched.remove(&xid);
         if let Some(row_ids) = self.reclamation.pending.remove(&xid) {
             self.reclamation
                 .committed
@@ -552,6 +677,9 @@ impl Table {
             .iter()
             .filter(|index| {
                 let _ = changed_columns;
+                if !index.unique {
+                    return false;
+                }
                 arbiter_columns.is_none_or(|columns| {
                     index.columns == columns && index.predicate.as_ref() == arbiter_predicate
                 })
@@ -607,6 +735,9 @@ impl Table {
             .iter()
             .enumerate()
             .any(|(index_number, index)| {
+                if !index.unique {
+                    return false;
+                }
                 if !matches_index_predicate(&self.schema, index, row, context) {
                     return false;
                 }
@@ -665,6 +796,9 @@ impl Table {
             .indexes
             .iter()
             .map(|index| {
+                if !index.unique {
+                    return None;
+                }
                 if !matches_index_predicate(&self.schema, index, row, context) {
                     return None;
                 }
@@ -686,7 +820,8 @@ impl Table {
         context: &StatementContext,
     ) -> bool {
         self.indexes.iter().any(|index| {
-            matches_index_predicate(&self.schema, index, left, context)
+            index.unique
+                && matches_index_predicate(&self.schema, index, left, context)
                 && matches_index_predicate(&self.schema, index, right, context)
                 && build_row_index_key(&self.schema, index, left)
                     .is_some_and(|key| build_row_index_key(&self.schema, index, right) == Some(key))
@@ -706,7 +841,8 @@ impl Table {
     ) -> Option<(RowId, &RowVersion)> {
         let snapshot = snapshot.include_current_command();
         let index = self.indexes.iter().find(|index| {
-            index.columns == arbiter_columns
+            index.unique
+                && index.columns == arbiter_columns
                 && index.predicate.as_ref() == arbiter_predicate
                 && matches_index_predicate(&self.schema, index, row, context)
         })?;
@@ -734,9 +870,11 @@ impl Table {
         self.indexes
             .iter()
             .filter(|index| {
-                arbiter_columns.is_none_or(|columns| {
-                    index.columns == columns && index.predicate.as_ref() == arbiter_predicate
-                }) && matches_index_predicate(&self.schema, index, row, context)
+                index.unique
+                    && arbiter_columns.is_none_or(|columns| {
+                        index.columns == columns && index.predicate.as_ref() == arbiter_predicate
+                    })
+                    && matches_index_predicate(&self.schema, index, row, context)
             })
             .find_map(|index| {
                 let key = build_row_index_key(&self.schema, index, row)?;
@@ -805,15 +943,18 @@ impl Table {
                     })
                     .is_some_and(|version| {
                         self.indexes.iter().any(|index| {
-                            arbiter_columns.is_none_or(|columns| {
-                                index.columns == columns
-                                    && index.predicate.as_ref() == arbiter_predicate
-                            }) && matches_index_predicate(
-                                &self.schema,
-                                index,
-                                &version.row,
-                                context,
-                            ) && build_row_index_key(&self.schema, index, &version.row).is_some()
+                            index.unique
+                                && arbiter_columns.is_none_or(|columns| {
+                                    index.columns == columns
+                                        && index.predicate.as_ref() == arbiter_predicate
+                                })
+                                && matches_index_predicate(
+                                    &self.schema,
+                                    index,
+                                    &version.row,
+                                    context,
+                                )
+                                && build_row_index_key(&self.schema, index, &version.row).is_some()
                         })
                     })
                     .then_some(*row_id)
@@ -844,7 +985,7 @@ impl Table {
         let index = self
             .indexes
             .iter()
-            .find(|index| index.columns == columns && index.predicate.is_none())?;
+            .find(|index| index.unique && index.columns == columns && index.predicate.is_none())?;
         let key = build_index_key(&self.schema, columns, values)?;
         index.entries.get(&key)?.iter().find_map(|row_id| {
             self.version_chains
@@ -876,7 +1017,7 @@ impl Table {
     pub(crate) fn has_unique_index(&self, columns: &[usize]) -> bool {
         self.indexes
             .iter()
-            .any(|index| index.columns == columns && index.predicate.is_none())
+            .any(|index| index.unique && index.columns == columns && index.predicate.is_none())
     }
 
     #[cfg_attr(feature = "execution-log", tracing::instrument(skip_all))]
@@ -891,7 +1032,7 @@ impl Table {
         let index = self
             .indexes
             .iter()
-            .find(|index| index.columns == columns && index.predicate.is_none())?;
+            .find(|index| index.unique && index.columns == columns && index.predicate.is_none())?;
         let key = build_index_key(&self.schema, columns, values)?;
         index.entries.get(&key)?.iter().find_map(|row_id| {
             let version = self.version_chains.chains.get(row_id).and_then(|chain| {
@@ -962,8 +1103,9 @@ impl Table {
     }
 }
 
-fn create_unique_index(schema: &TableSchema, index: &IndexSchema) -> UniqueIndex {
-    UniqueIndex {
+fn create_index(schema: &TableSchema, index: &IndexSchema) -> TableIndex {
+    TableIndex {
+        unique: index.unique,
         columns: index
             .columns
             .iter()
@@ -982,7 +1124,7 @@ fn create_unique_index(schema: &TableSchema, index: &IndexSchema) -> UniqueIndex
 
 fn matches_index_predicate(
     schema: &TableSchema,
-    index: &UniqueIndex,
+    index: &TableIndex,
     row: &Row,
     context: &StatementContext,
 ) -> bool {
@@ -993,11 +1135,7 @@ fn matches_index_predicate(
 }
 
 #[cfg_attr(feature = "execution-log", tracing::instrument(skip_all))]
-fn build_row_index_key(
-    schema: &TableSchema,
-    index: &UniqueIndex,
-    row: &Row,
-) -> Option<UniqueIndexKey> {
+fn build_row_index_key(schema: &TableSchema, index: &TableIndex, row: &Row) -> Option<IndexKey> {
     if index.columns.iter().any(|column| *column >= row.len()) {
         return None;
     }
@@ -1010,18 +1148,14 @@ fn build_row_index_key(
 }
 
 #[cfg_attr(feature = "execution-log", tracing::instrument(skip_all))]
-fn build_index_key(
-    schema: &TableSchema,
-    columns: &[usize],
-    values: &[Value],
-) -> Option<UniqueIndexKey> {
+fn build_index_key(schema: &TableSchema, columns: &[usize], values: &[Value]) -> Option<IndexKey> {
     assert_eq!(columns.len(), values.len());
     columns
         .iter()
         .zip(values)
         .map(|(column, value)| normalize_index_value(value, schema.columns[*column].data_type.base))
         .collect::<Option<Vec<_>>>()
-        .map(UniqueIndexKey)
+        .map(IndexKey)
 }
 
 #[cfg_attr(feature = "execution-log", tracing::instrument(skip_all))]

@@ -2,7 +2,7 @@ use std::collections::{BTreeMap, BTreeSet};
 
 use crate::{
     catalog::TableId,
-    storage::{RowId, UniqueIndexKey},
+    storage::{IndexKey, RowId},
     txn::{CommandId, CommitSeq, Xid},
 };
 
@@ -10,7 +10,7 @@ use crate::{
 pub(crate) enum Access {
     Relation(TableId),
     Row(TableId, RowId),
-    Unique(TableId, Vec<usize>, UniqueIndexKey),
+    Unique(TableId, Vec<usize>, IndexKey),
 }
 
 impl Access {
