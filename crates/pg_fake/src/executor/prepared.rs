@@ -908,6 +908,24 @@ fn find_index_access(
     selection: &PreparedExpression,
     schema: &TableSchema,
 ) -> Option<PreparedAccess> {
+    if let PreparedExpression::Binary {
+        left,
+        operator: ast::BinaryOperator::And,
+        right,
+        ..
+    } = selection
+    {
+        let left = find_index_access(left, schema);
+        if matches!(left, Some(PreparedAccess::Unique { .. })) {
+            return left;
+        }
+        let right = find_index_access(right, schema);
+        return if matches!(right, Some(PreparedAccess::Unique { .. })) {
+            right
+        } else {
+            left.or(right)
+        };
+    }
     let PreparedExpression::Binary {
         left,
         operator: ast::BinaryOperator::Eq,

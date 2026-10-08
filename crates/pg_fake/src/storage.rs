@@ -306,6 +306,12 @@ impl Table {
         })
     }
 
+    pub(crate) fn has_nonunique_index(&self, columns: &[usize]) -> bool {
+        self.indexes
+            .iter()
+            .any(|index| !index.unique && index.columns == columns && index.predicate.is_none())
+    }
+
     pub(crate) fn collect_transaction_accesses(
         &self,
         xid: Xid,

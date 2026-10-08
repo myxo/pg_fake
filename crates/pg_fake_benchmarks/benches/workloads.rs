@@ -147,6 +147,31 @@ impl BenchmarkConnection<'_> {
         }
     }
 
+    fn fetch_bound_uuid(&mut self, runtime: &Runtime, sql: &str, parameter: uuid::Uuid) {
+        match self {
+            Self::PgFake(connection) => {
+                let rows = runtime
+                    .block_on(
+                        sqlx::query(sql)
+                            .bind(parameter)
+                            .fetch_all(&mut **connection),
+                    )
+                    .unwrap();
+                black_box(rows);
+            }
+            Self::Postgres(connection) => {
+                let rows = runtime
+                    .block_on(
+                        sqlx::query(sql)
+                            .bind(parameter)
+                            .fetch_all(&mut **connection),
+                    )
+                    .unwrap();
+                black_box(rows);
+            }
+        }
+    }
+
     fn round_trip_offset_datetime(&mut self, runtime: &Runtime, value: time::OffsetDateTime) {
         match self {
             Self::PgFake(connection) => {
@@ -2091,6 +2116,10 @@ fn benchmark_lookup_scaling(
                 "SELECT amount FROM lookup_scaling_indexed WHERE lookup_key = $1",
             ),
             (
+                "nonunique_filtered",
+                "SELECT amount FROM lookup_scaling_indexed WHERE lookup_key = $1 AND amount >= 0",
+            ),
+            (
                 "heap_scan",
                 "SELECT amount FROM lookup_scaling_heap WHERE id = $1",
             ),
@@ -2891,25 +2920,32 @@ fn benchmark_selective_indexed_join(
         .benchmark_group(benchmarks::find_benchmark("selective_indexed_join").format_name());
     group.throughput(Throughput::Elements(1));
     for rows in [100_usize, 1_000] {
+        let key = uuid::Uuid::from_u128(50);
         let values = (1..=rows)
-            .map(|id| format!("({id}, {id})"))
+            .map(|id| format!("('{}', {id})", uuid::Uuid::from_u128(id as u128)))
             .collect::<Vec<_>>()
             .join(",");
         for (_, connection) in connections.iter_mut() {
             connection.execute(
                 runtime,
-                "CREATE TABLE indexed_join_left (id INTEGER PRIMARY KEY)",
+                "CREATE TABLE indexed_join_left (id UUID PRIMARY KEY)",
             );
             connection.execute(
                 runtime,
-                "CREATE TABLE indexed_join_middle (id INTEGER PRIMARY KEY)",
+                "CREATE TABLE indexed_join_middle (id UUID PRIMARY KEY)",
             );
             connection.execute(
                 runtime,
-                "CREATE TABLE indexed_join_right (id INTEGER PRIMARY KEY, value INTEGER)",
+                "CREATE TABLE indexed_join_right (id UUID PRIMARY KEY, value INTEGER)",
             );
-            connection.execute(runtime, "INSERT INTO indexed_join_left VALUES (50)");
-            connection.execute(runtime, "INSERT INTO indexed_join_middle VALUES (50)");
+            connection.execute(
+                runtime,
+                &format!("INSERT INTO indexed_join_left VALUES ('{key}')"),
+            );
+            connection.execute(
+                runtime,
+                &format!("INSERT INTO indexed_join_middle VALUES ('{key}')"),
+            );
             connection.execute(
                 runtime,
                 &format!("INSERT INTO indexed_join_right VALUES {values}"),
@@ -2920,15 +2956,27 @@ fn benchmark_selective_indexed_join(
         }
         for (shape, predicate) in [("plain", ""), ("filtered", " AND right_row.value >= 0")] {
             let query = format!(
-                "SELECT right_row.value FROM indexed_join_left AS left_row JOIN indexed_join_middle AS middle_row ON middle_row.id = left_row.id JOIN indexed_join_right AS right_row ON right_row.id = middle_row.id WHERE left_row.id = 50{predicate}"
+                "SELECT right_row.value FROM indexed_join_left AS left_row JOIN indexed_join_middle AS middle_row ON middle_row.id = left_row.id JOIN indexed_join_right AS right_row ON right_row.id = middle_row.id WHERE left_row.id = $1{predicate}"
             );
             for (connection_name, connection) in connections.iter_mut() {
                 group.bench_with_input(
                     BenchmarkId::new(format!("{shape}_{connection_name}"), rows),
                     &rows,
-                    |benchmark, _| benchmark.iter(|| connection.fetch(runtime, &query)),
+                    |benchmark, _| {
+                        benchmark.iter(|| connection.fetch_bound_uuid(runtime, &query, key))
+                    },
                 );
             }
+        }
+        let two_table_query = "SELECT right_row.value FROM indexed_join_left AS left_row JOIN indexed_join_right AS right_row ON right_row.id = left_row.id WHERE left_row.id = $1 AND right_row.value >= 0";
+        for (connection_name, connection) in connections.iter_mut() {
+            group.bench_with_input(
+                BenchmarkId::new(format!("two_table_filtered_{connection_name}"), rows),
+                &rows,
+                |benchmark, _| {
+                    benchmark.iter(|| connection.fetch_bound_uuid(runtime, two_table_query, key))
+                },
+            );
         }
         for (_, connection) in connections.iter_mut() {
             connection.execute(

@@ -139,7 +139,7 @@ pub(crate) fn visit_streamed_join_rows(
                 visit,
             );
         }
-        if hash_slots.len() > 1 && selection.is_some() {
+        if selection.is_some() && (hash_slots.len() > 1 || !hash_slots[0].2) {
             return visit_hash_join_chain_rows::<true>(
                 state,
                 table,
@@ -492,8 +492,7 @@ fn visit_hash_join_chain_rows<const PRUNE_SPARSE_RIGHT: bool>(
             .unwrap_or(scope.columns.len());
         let key_type = scope.columns[left_slot].data_type.base;
         let indexed_right_rows = if PRUNE_SPARSE_RIGHT
-            && rows.len() <= 8
-            && matches!(key_type, BaseType::Int2 | BaseType::Int4 | BaseType::Int8)
+            && rows.len() <= 32
             && let Some(selection) = selection
             && let ast::TableFactor::Table { name, .. } = &table.joins[index].relation
             && crate::executor::ctes::cte_row_source_id(name).is_none()
@@ -519,11 +518,8 @@ fn visit_hash_join_chain_rows<const PRUNE_SPARSE_RIGHT: bool>(
                 let mut indexed = Vec::new();
                 for left in &rows {
                     let value = &left[left_slot];
-                    let key = match (key_type, value) {
-                        (BaseType::Int2, Value::Int2(value)) => EqualityKey::Int2(*value),
-                        (BaseType::Int4, Value::Int4(value)) => EqualityKey::Int4(*value),
-                        (BaseType::Int8, Value::Int8(value)) => EqualityKey::Int8(*value),
-                        _ => continue,
+                    let Some(key) = create_hash_join_key(value, key_type) else {
+                        continue;
                     };
                     if !seen.insert(key) {
                         continue;
@@ -570,7 +566,7 @@ fn visit_hash_join_chain_rows<const PRUNE_SPARSE_RIGHT: bool>(
         } else {
             None
         };
-        let selective_keys = (PRUNE_SPARSE_RIGHT && rows.len() <= 8).then(|| {
+        let selective_keys = (PRUNE_SPARSE_RIGHT && rows.len() <= 32).then(|| {
             rows.iter()
                 .filter_map(|row| create_hash_join_key(&row[left_slot], key_type))
                 .collect::<std::collections::HashSet<_>>()

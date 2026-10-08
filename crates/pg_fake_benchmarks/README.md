@@ -63,10 +63,11 @@ Diagnostic groups isolate costs within `pg_fake`:
   long-lived repeatable-read snapshot;
 - `point_lookup_index_vs_scan` compares a primary-key predicate with an
   equivalent heap predicate at 100 and 10,000 rows;
-- `lookup_scaling` compares selective lookups through unique and nonunique
-  indexes with a heap scan at 100 and 1,000 rows through both SQLx adapters;
-- `selective_indexed_join` compares a single-result join chain with and without
-  an added predicate on the indexed table at 100 and 1,000 rows;
+- `lookup_scaling` compares selective unique, nonunique, and heap lookups at
+  100 and 1,000 rows, including a filtered nonunique lookup that uses the
+  general query path;
+- `selective_indexed_join` compares UUID-key two-table and join-chain reads
+  with a predicate on the indexed side at 100 and 1,000 rows;
 - `populated_table_writes` measures indexed UPDATE and DELETE against stable
   100- and 1,000-row tables, rolling each timed write back afterward;
 - `core_snapshot_1000_rows` extends the snapshot fixture-size check beyond

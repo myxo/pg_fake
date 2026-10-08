@@ -77,9 +77,9 @@ in [`src/lib.rs`](src/lib.rs); update this assessment when adding or moving one.
 | `tier2_adapter_overhead_select_100_rows` | Compares core and SQLx overhead for an ordinary read; diagnoses implementation cost rather than adding a Tier 1 workflow. |
 | `tier2_core_parsed_vs_prepared_point_select` | Compares one-shot and prepared execution, a targeted optimization diagnostic. |
 | `tier2_point_lookup_index_vs_scan` | Compares prepared core lookups at 100 and 10,000 rows; Tier 1 already covers the basic indexed and heap lookup paths. |
-| `tier2_lookup_scaling` | Compares selective unique-index, nonunique-index, and heap lookups at two table sizes through SQLx and PostgreSQL. |
+| `tier2_lookup_scaling` | Compares selective unique-index, nonunique-index, filtered nonunique-index, and heap lookups at two table sizes through SQLx and PostgreSQL. |
 | `tier2_populated_table_writes` | Measures indexed UPDATE and DELETE against stable 100- and 1,000-row tables, separating write cost from fixture setup. |
-| `tier2_selective_indexed_join` | Checks whether an added predicate on the indexed side of a selective equality-join chain causes table-size-dependent work. |
+| `tier2_selective_indexed_join` | Checks whether a predicate on the indexed side of two-table and chained UUID equality joins causes table-size-dependent work. |
 | `tier2_concurrent_uncontended_reads` | Compares two independent sessions reading without lock contention; relevant to concurrent application tests. |
 | `tier2_foreign_key_insert` | Times both a parent insert and a referencing child insert, exercising referential checks across tables. |
 | `tier2_derived_and_scalar_subquery_100_rows` | Combines a derived table, scalar subquery, and subquery membership test. |

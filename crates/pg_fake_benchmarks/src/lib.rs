@@ -515,6 +515,22 @@ pub fn list_benchmarks() -> Vec<Benchmark> {
                     "nonunique_index_postgres_18/1000",
                     &["nonunique_index_postgres_18", "1000"],
                 ),
+                build_value(
+                    "nonunique_filtered_pg_fake/100",
+                    &["nonunique_filtered_pg_fake", "100"],
+                ),
+                build_value(
+                    "nonunique_filtered_postgres_18/100",
+                    &["nonunique_filtered_postgres_18", "100"],
+                ),
+                build_value(
+                    "nonunique_filtered_pg_fake/1000",
+                    &["nonunique_filtered_pg_fake", "1000"],
+                ),
+                build_value(
+                    "nonunique_filtered_postgres_18/1000",
+                    &["nonunique_filtered_postgres_18", "1000"],
+                ),
                 build_value("heap_scan_pg_fake/100", &["heap_scan_pg_fake", "100"]),
                 build_value(
                     "heap_scan_postgres_18/100",
@@ -537,12 +553,24 @@ pub fn list_benchmarks() -> Vec<Benchmark> {
                     "nonunique_index_postgres_18/1000",
                     "nonunique_index_pg_fake/1000",
                 ),
+                build_comparison(
+                    "nonunique_filtered_postgres_18/100",
+                    "nonunique_filtered_pg_fake/100",
+                ),
+                build_comparison(
+                    "nonunique_filtered_postgres_18/1000",
+                    "nonunique_filtered_pg_fake/1000",
+                ),
                 build_comparison("heap_scan_postgres_18/100", "heap_scan_pg_fake/100"),
                 build_comparison("heap_scan_postgres_18/1000", "heap_scan_pg_fake/1000"),
                 build_comparison("unique_index_pg_fake/100", "unique_index_pg_fake/1000"),
                 build_comparison(
                     "nonunique_index_pg_fake/100",
                     "nonunique_index_pg_fake/1000",
+                ),
+                build_comparison(
+                    "nonunique_filtered_pg_fake/100",
+                    "nonunique_filtered_pg_fake/1000",
                 ),
                 build_comparison("heap_scan_pg_fake/100", "heap_scan_pg_fake/1000"),
             ],
@@ -617,15 +645,43 @@ pub fn list_benchmarks() -> Vec<Benchmark> {
                     "filtered_postgres_18/1000",
                     &["filtered_postgres_18", "1000"],
                 ),
+                build_value(
+                    "two_table_filtered_pg_fake/100",
+                    &["two_table_filtered_pg_fake", "100"],
+                ),
+                build_value(
+                    "two_table_filtered_postgres_18/100",
+                    &["two_table_filtered_postgres_18", "100"],
+                ),
+                build_value(
+                    "two_table_filtered_pg_fake/1000",
+                    &["two_table_filtered_pg_fake", "1000"],
+                ),
+                build_value(
+                    "two_table_filtered_postgres_18/1000",
+                    &["two_table_filtered_postgres_18", "1000"],
+                ),
             ],
             vec![
                 build_comparison("plain_postgres_18/100", "plain_pg_fake/100"),
                 build_comparison("plain_postgres_18/1000", "plain_pg_fake/1000"),
                 build_comparison("filtered_postgres_18/100", "filtered_pg_fake/100"),
                 build_comparison("filtered_postgres_18/1000", "filtered_pg_fake/1000"),
+                build_comparison(
+                    "two_table_filtered_postgres_18/100",
+                    "two_table_filtered_pg_fake/100",
+                ),
+                build_comparison(
+                    "two_table_filtered_postgres_18/1000",
+                    "two_table_filtered_pg_fake/1000",
+                ),
                 build_comparison("plain_pg_fake/100", "filtered_pg_fake/100"),
                 build_comparison("plain_pg_fake/1000", "filtered_pg_fake/1000"),
                 build_comparison("filtered_pg_fake/100", "filtered_pg_fake/1000"),
+                build_comparison(
+                    "two_table_filtered_pg_fake/100",
+                    "two_table_filtered_pg_fake/1000",
+                ),
             ],
         ),
         build_benchmark(

@@ -9,7 +9,7 @@ use crate::{
         scope::{BoundScope, RowScope},
     },
     serializable::Access,
-    storage::Table,
+    storage::{RowId, RowVersion, Table},
     txn::{Snapshot, Xid, find_visible_version},
     value::Value,
 };
@@ -140,9 +140,12 @@ pub(super) fn visit_table_factor_rows(
             continue;
         }
         let column = slot - start;
-        if !table.has_unique_index(&[column])
-            || resolve_operator_type(left, right, RowScope::Bound(scope))?
-                != schema.columns[column].data_type.base
+        let unique = table.has_unique_index(&[column]);
+        if !unique && !table.has_nonunique_index(&[column]) {
+            continue;
+        }
+        if resolve_operator_type(left, right, RowScope::Bound(scope))?
+            != schema.columns[column].data_type.base
         {
             continue;
         }
@@ -154,34 +157,51 @@ pub(super) fn visit_table_factor_rows(
             &row,
             context,
         )?;
-        if state.tracks_serializable_reads(xid)
-            && let Some(key) = table.create_unique_read_key(&[column], std::slice::from_ref(&value))
-        {
-            state.record_read(xid, Access::Unique(schema.id, vec![column], key));
-        }
-        let Some((row_id, indexed_version)) = table.find_unique_visible_version(
-            &[column],
-            &[value],
-            source_snapshot,
-            xid,
-            transactions,
-        ) else {
-            return Ok(());
-        };
-        state.record_read(xid, Access::Row(schema.id, row_id));
-        let indexed_row = &indexed_version.row;
-        row[start..start + indexed_row.len()].clone_from_slice(indexed_row);
-        let passes = filters.iter().try_fold(true, |passes, filter| {
-            if !passes {
-                return Ok(false);
+        let mut visit_indexed_row = |row_id: RowId, indexed_version: &RowVersion| -> Result<()> {
+            state.record_read(xid, Access::Row(schema.id, row_id));
+            let indexed_row = &indexed_version.row;
+            row[start..start + indexed_row.len()].clone_from_slice(indexed_row);
+            let passes = filters.iter().try_fold(true, |passes, filter| {
+                if !passes {
+                    return Ok(false);
+                }
+                Ok(matches!(
+                    evaluate(filter, RowScope::Bound(scope), &row, context)?,
+                    Value::Bool(true)
+                ))
+            })?;
+            if passes {
+                visit(&row)?;
             }
-            Ok(matches!(
-                evaluate(filter, RowScope::Bound(scope), &row, context)?,
-                Value::Bool(true)
-            ))
-        })?;
-        if passes {
-            visit(&row)?;
+            Ok(())
+        };
+        if unique {
+            if state.tracks_serializable_reads(xid)
+                && let Some(key) =
+                    table.create_unique_read_key(&[column], std::slice::from_ref(&value))
+            {
+                state.record_read(xid, Access::Unique(schema.id, vec![column], key));
+            }
+            if let Some((row_id, indexed_version)) = table.find_unique_visible_version(
+                &[column],
+                &[value],
+                source_snapshot,
+                xid,
+                transactions,
+            ) {
+                visit_indexed_row(row_id, indexed_version)?;
+            }
+        } else {
+            state.record_read(xid, Access::Relation(schema.id));
+            for (row_id, indexed_version) in table.find_nonunique_visible_versions(
+                &[column],
+                &[value],
+                source_snapshot,
+                xid,
+                transactions,
+            ) {
+                visit_indexed_row(row_id, indexed_version)?;
+            }
         }
         return Ok(());
     }

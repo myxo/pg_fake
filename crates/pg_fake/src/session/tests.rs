@@ -11323,6 +11323,64 @@ fn filters_indexed_join_chain_candidates() {
 }
 
 #[test]
+fn probes_uuid_join_chain_from_nonunique_source() {
+    let db = Db::create();
+    let mut session = db.create_session();
+    let hub = uuid::Uuid::from_u128(1);
+    session
+        .execute(&format!(
+            "CREATE TABLE uuid_hubs (id UUID PRIMARY KEY); \
+             CREATE TABLE uuid_users (id UUID PRIMARY KEY, name INTEGER, active BOOLEAN); \
+             CREATE TABLE uuid_memberships (id INTEGER PRIMARY KEY, hub_id UUID, user_id UUID, deleted_at INTEGER); \
+             CREATE INDEX uuid_memberships_hub ON uuid_memberships (hub_id); \
+             INSERT INTO uuid_hubs VALUES ('{hub}')"
+        ))
+        .unwrap();
+    for id in 1..=10 {
+        let user = uuid::Uuid::from_u128(100 + id);
+        session
+            .execute(&format!(
+                "INSERT INTO uuid_users VALUES ('{user}', {id}, {}); \
+                 INSERT INTO uuid_memberships VALUES ({id}, '{hub}', '{user}', NULL)",
+                id != 10
+            ))
+            .unwrap();
+    }
+    let statement = session
+        .prepare_with_parameter_types(
+            "SELECT u.name FROM uuid_memberships m \
+             JOIN uuid_hubs h ON h.id = m.hub_id \
+             JOIN uuid_users u ON u.id = m.user_id \
+             WHERE m.hub_id = $1 AND m.deleted_at IS NULL AND u.active \
+             ORDER BY u.name",
+            &[Some(BaseType::Uuid)],
+        )
+        .unwrap();
+    assert_eq!(
+        session
+            .query_prepared(&statement, &[Value::Uuid(hub)])
+            .unwrap()
+            .rows,
+        (1..=9).map(|id| vec![Value::Int4(id)]).collect::<Vec<_>>()
+    );
+    let two_table = session
+        .prepare_with_parameter_types(
+            "SELECT u.name FROM uuid_memberships m \
+             JOIN uuid_users u ON u.id = m.user_id \
+             WHERE m.hub_id = $1 AND u.active",
+            &[Some(BaseType::Uuid)],
+        )
+        .unwrap();
+    assert_eq!(
+        session
+            .query_prepared(&two_table, &[Value::Uuid(hub)])
+            .unwrap()
+            .rows,
+        (1..=9).map(|id| vec![Value::Int4(id)]).collect::<Vec<_>>()
+    );
+}
+
+#[test]
 fn reads_nonunique_index_across_writes_and_rollback() {
     let db = Db::create();
     let mut session = db.create_session();
@@ -11343,6 +11401,16 @@ fn reads_nonunique_index_across_writes_and_rollback() {
             .unwrap()
             .rows,
         vec![vec![Value::Int4(1)], vec![Value::Int4(2)]]
+    );
+    let filtered = session
+        .prepare("SELECT id FROM indexed_items WHERE key = $1 AND id > 1")
+        .unwrap();
+    assert_eq!(
+        session
+            .query_prepared(&filtered, &[Value::Int4(7)])
+            .unwrap()
+            .rows,
+        vec![vec![Value::Int4(2)]]
     );
     session
         .execute("UPDATE indexed_items SET key = 8 WHERE id = 1")
