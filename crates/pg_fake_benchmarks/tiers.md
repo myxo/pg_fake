@@ -36,11 +36,14 @@ in [`src/lib.rs`](src/lib.rs); update this assessment when adding or moving one.
 | `tier1_selective_inner_join` | Performs a two-table equality join with a simple filter and one matching result. |
 | `tier1_many_match_inner_join` | Performs the same basic equality-join shape with multiple matches; no lateral, recursive, or aggregate operation. |
 
-## Tier 2: important operations (46 groups)
+## Tier 2: important operations (51 groups)
 
 | Benchmark | Reason |
 | --- | --- |
+| `tier2_insert_bound_row` | Inserts a row through a bound SQLx parameter, exposing adapter and parameter handling costs. |
+| `tier2_update_bound_row` | Updates a row through a bound SQLx parameter, separate from the literal-value Tier 1 update. |
 | `tier2_core_snapshot_100_rows` | Forks a database fixture; useful test setup, outside the basic SQL operations prioritized in Tier 1. |
+| `tier2_core_snapshot_1000_rows` | Checks how fixture-fork cost changes with a larger populated database. |
 | `tier2_session_settings_roundtrip` | Sets, reads, and resets connection settings used by applications and drivers. |
 | `tier2_nested_savepoint_release` | Exercises explicit SAVEPOINT/RELEASE statements for nested transactions, which driver transaction nesting also relies on. |
 | `tier2_nested_savepoint_rollback` | Exercises partial rollback of nested transactions, beyond a basic transaction. |
@@ -74,6 +77,8 @@ in [`src/lib.rs`](src/lib.rs); update this assessment when adding or moving one.
 | `tier2_adapter_overhead_select_100_rows` | Compares core and SQLx overhead for an ordinary read; diagnoses implementation cost rather than adding a Tier 1 workflow. |
 | `tier2_core_parsed_vs_prepared_point_select` | Compares one-shot and prepared execution, a targeted optimization diagnostic. |
 | `tier2_point_lookup_index_vs_scan` | Compares prepared core lookups at 100 and 10,000 rows; Tier 1 already covers the basic indexed and heap lookup paths. |
+| `tier2_lookup_scaling` | Compares selective unique-index, nonunique-index, and heap lookups at two table sizes through SQLx and PostgreSQL. |
+| `tier2_populated_table_writes` | Measures indexed UPDATE and DELETE against stable 100- and 1,000-row tables, separating write cost from fixture setup. |
 | `tier2_selective_indexed_join` | Checks whether an added predicate on the indexed side of a selective equality-join chain causes table-size-dependent work. |
 | `tier2_concurrent_uncontended_reads` | Compares two independent sessions reading without lock contention; relevant to concurrent application tests. |
 | `tier2_foreign_key_insert` | Times both a parent insert and a referencing child insert, exercising referential checks across tables. |

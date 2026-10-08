@@ -122,6 +122,31 @@ impl BenchmarkConnection<'_> {
         }
     }
 
+    fn fetch_bound(&mut self, runtime: &Runtime, sql: &str, parameter: i64) {
+        match self {
+            Self::PgFake(connection) => {
+                let rows = runtime
+                    .block_on(
+                        sqlx::query(sql)
+                            .bind(parameter)
+                            .fetch_all(&mut **connection),
+                    )
+                    .unwrap();
+                black_box(rows);
+            }
+            Self::Postgres(connection) => {
+                let rows = runtime
+                    .block_on(
+                        sqlx::query(sql)
+                            .bind(parameter)
+                            .fetch_all(&mut **connection),
+                    )
+                    .unwrap();
+                black_box(rows);
+            }
+        }
+    }
+
     fn round_trip_offset_datetime(&mut self, runtime: &Runtime, value: time::OffsetDateTime) {
         match self {
             Self::PgFake(connection) => {
@@ -1825,19 +1850,23 @@ fn core_vs_sqlx_benchmark(criterion: &mut Criterion, runtime: &Runtime) {
 }
 
 fn benchmark_snapshots(criterion: &mut Criterion) {
-    let db = Db::create();
-    let mut session = db.create_session();
-    core_execute(
-        &mut session,
-        "CREATE TABLE snapshot_fixture(id INT PRIMARY KEY, name TEXT)",
-    );
-    core_execute(&mut session, &insert_values_sql("snapshot_fixture", 100));
-    let mut group = criterion
-        .benchmark_group(benchmarks::find_benchmark("core_snapshot_100_rows").format_name());
-    group.bench_function("pg_fake", |benchmark| {
-        benchmark.iter(|| black_box(db.snapshot()))
-    });
-    group.finish();
+    for (rows, name) in [
+        (100, "core_snapshot_100_rows"),
+        (1_000, "core_snapshot_1000_rows"),
+    ] {
+        let db = Db::create();
+        let mut session = db.create_session();
+        core_execute(
+            &mut session,
+            "CREATE TABLE snapshot_fixture(id INT PRIMARY KEY, name TEXT)",
+        );
+        core_execute(&mut session, &insert_values_sql("snapshot_fixture", rows));
+        let mut group = criterion.benchmark_group(benchmarks::find_benchmark(name).format_name());
+        group.bench_function("pg_fake", |benchmark| {
+            benchmark.iter(|| black_box(db.snapshot()))
+        });
+        group.finish();
+    }
 }
 
 fn parsed_vs_prepared_benchmark(criterion: &mut Criterion) {
@@ -2007,6 +2036,142 @@ fn indexed_vs_scan_benchmark(criterion: &mut Criterion) {
             },
         );
         scanned.rollback().unwrap();
+    }
+    group.finish();
+}
+
+fn benchmark_lookup_scaling(
+    criterion: &mut Criterion,
+    runtime: &Runtime,
+    connections: &mut [NamedBenchmarkConnection<'_>],
+) {
+    let mut group =
+        criterion.benchmark_group(benchmarks::find_benchmark("lookup_scaling").format_name());
+    group.throughput(Throughput::Elements(1));
+    for rows in [100_usize, 1_000] {
+        let indexed_values = (1..=rows)
+            .map(|id| format!("({id}, {id}, {id})"))
+            .collect::<Vec<_>>()
+            .join(",");
+        let heap_values = (1..=rows)
+            .map(|id| format!("({id}, {id})"))
+            .collect::<Vec<_>>()
+            .join(",");
+        for (_, connection) in connections.iter_mut() {
+            connection.execute(
+                runtime,
+                "CREATE TABLE lookup_scaling_indexed (id BIGINT PRIMARY KEY, lookup_key BIGINT, amount INTEGER)",
+            );
+            connection.execute(
+                runtime,
+                "CREATE INDEX lookup_scaling_nonunique ON lookup_scaling_indexed (lookup_key)",
+            );
+            connection.execute(
+                runtime,
+                "CREATE TABLE lookup_scaling_heap (id BIGINT, amount INTEGER)",
+            );
+            connection.execute(
+                runtime,
+                &format!("INSERT INTO lookup_scaling_indexed VALUES {indexed_values}"),
+            );
+            connection.execute(
+                runtime,
+                &format!("INSERT INTO lookup_scaling_heap VALUES {heap_values}"),
+            );
+            connection.execute(runtime, "ANALYZE lookup_scaling_indexed");
+            connection.execute(runtime, "ANALYZE lookup_scaling_heap");
+        }
+        for (shape, query) in [
+            (
+                "unique_index",
+                "SELECT amount FROM lookup_scaling_indexed WHERE id = $1",
+            ),
+            (
+                "nonunique_index",
+                "SELECT amount FROM lookup_scaling_indexed WHERE lookup_key = $1",
+            ),
+            (
+                "heap_scan",
+                "SELECT amount FROM lookup_scaling_heap WHERE id = $1",
+            ),
+        ] {
+            for (name, connection) in connections.iter_mut() {
+                group.bench_with_input(
+                    BenchmarkId::new(format!("{shape}_{name}"), rows),
+                    &rows,
+                    |benchmark, _| {
+                        benchmark.iter(|| connection.fetch_bound(runtime, query, rows as i64))
+                    },
+                );
+            }
+        }
+        for (_, connection) in connections.iter_mut() {
+            connection.execute(
+                runtime,
+                "DROP TABLE lookup_scaling_indexed, lookup_scaling_heap",
+            );
+        }
+    }
+    group.finish();
+}
+
+fn benchmark_populated_table_writes(
+    criterion: &mut Criterion,
+    runtime: &Runtime,
+    connections: &mut [NamedBenchmarkConnection<'_>],
+) {
+    let mut group = criterion
+        .benchmark_group(benchmarks::find_benchmark("populated_table_writes").format_name());
+    group.sample_size(20);
+    group.measurement_time(Duration::from_secs(2));
+    group.throughput(Throughput::Elements(1));
+    for rows in [100_usize, 1_000] {
+        let values = (1..=rows)
+            .map(|id| format!("({id}, 0)"))
+            .collect::<Vec<_>>()
+            .join(",");
+        for (_, connection) in connections.iter_mut() {
+            connection.execute(
+                runtime,
+                "CREATE TABLE populated_table_writes (id BIGINT PRIMARY KEY, amount INTEGER)",
+            );
+            connection.execute(
+                runtime,
+                &format!("INSERT INTO populated_table_writes VALUES {values}"),
+            );
+            connection.execute(runtime, "ANALYZE populated_table_writes");
+            connection.clear_statements(runtime);
+        }
+        for (operation, query) in [
+            (
+                "update",
+                "UPDATE populated_table_writes SET amount = amount + 1 WHERE id = $1",
+            ),
+            ("delete", "DELETE FROM populated_table_writes WHERE id = $1"),
+        ] {
+            for (name, connection) in connections.iter_mut() {
+                group.bench_with_input(
+                    BenchmarkId::new(format!("{operation}_{name}"), rows),
+                    &rows,
+                    |benchmark, _| {
+                        benchmark.iter_custom(|iterations| {
+                            let mut elapsed = Duration::ZERO;
+                            for _ in 0..iterations {
+                                connection.execute(runtime, "BEGIN");
+                                let started = Instant::now();
+                                connection.execute_bound(runtime, query, rows as i64);
+                                elapsed += started.elapsed();
+                                connection.execute(runtime, "ROLLBACK");
+                            }
+                            elapsed
+                        });
+                    },
+                );
+            }
+        }
+        for (_, connection) in connections.iter_mut() {
+            connection.execute(runtime, "DROP TABLE populated_table_writes");
+        }
     }
     group.finish();
 }
@@ -2229,6 +2394,8 @@ fn benchmarks(criterion: &mut Criterion) {
         transaction_history_benchmark(criterion);
         mvcc_version_chain_benchmark(criterion);
         indexed_vs_scan_benchmark(criterion);
+        benchmark_lookup_scaling(criterion, &runtime, &mut connections);
+        benchmark_populated_table_writes(criterion, &runtime, &mut connections);
         concurrency_benchmark(criterion, &runtime);
         benchmark_serializable(criterion, &runtime, &postgres_url);
         foreign_key_insert_benchmark(criterion, &runtime, &mut connections);

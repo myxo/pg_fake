@@ -82,6 +82,12 @@ pub fn list_benchmarks() -> Vec<Benchmark> {
         ),
         build_benchmark(
             BenchmarkTier::Important,
+            "core_snapshot_1000_rows",
+            vec![build_value("pg_fake", &["pg_fake"])],
+            vec![],
+        ),
+        build_benchmark(
+            BenchmarkTier::Important,
             "session_settings_roundtrip",
             build_postgres_values(),
             build_postgres_comparisons(),
@@ -474,6 +480,93 @@ pub fn list_benchmarks() -> Vec<Benchmark> {
             vec![
                 build_comparison("heap_scan/100", "unique_index/100"),
                 build_comparison("heap_scan/10,000", "unique_index/10,000"),
+            ],
+        ),
+        build_benchmark(
+            BenchmarkTier::Important,
+            "lookup_scaling",
+            vec![
+                build_value("unique_index_pg_fake/100", &["unique_index_pg_fake", "100"]),
+                build_value(
+                    "unique_index_postgres_18/100",
+                    &["unique_index_postgres_18", "100"],
+                ),
+                build_value(
+                    "unique_index_pg_fake/1000",
+                    &["unique_index_pg_fake", "1000"],
+                ),
+                build_value(
+                    "unique_index_postgres_18/1000",
+                    &["unique_index_postgres_18", "1000"],
+                ),
+                build_value(
+                    "nonunique_index_pg_fake/100",
+                    &["nonunique_index_pg_fake", "100"],
+                ),
+                build_value(
+                    "nonunique_index_postgres_18/100",
+                    &["nonunique_index_postgres_18", "100"],
+                ),
+                build_value(
+                    "nonunique_index_pg_fake/1000",
+                    &["nonunique_index_pg_fake", "1000"],
+                ),
+                build_value(
+                    "nonunique_index_postgres_18/1000",
+                    &["nonunique_index_postgres_18", "1000"],
+                ),
+                build_value("heap_scan_pg_fake/100", &["heap_scan_pg_fake", "100"]),
+                build_value(
+                    "heap_scan_postgres_18/100",
+                    &["heap_scan_postgres_18", "100"],
+                ),
+                build_value("heap_scan_pg_fake/1000", &["heap_scan_pg_fake", "1000"]),
+                build_value(
+                    "heap_scan_postgres_18/1000",
+                    &["heap_scan_postgres_18", "1000"],
+                ),
+            ],
+            vec![
+                build_comparison("unique_index_postgres_18/100", "unique_index_pg_fake/100"),
+                build_comparison("unique_index_postgres_18/1000", "unique_index_pg_fake/1000"),
+                build_comparison(
+                    "nonunique_index_postgres_18/100",
+                    "nonunique_index_pg_fake/100",
+                ),
+                build_comparison(
+                    "nonunique_index_postgres_18/1000",
+                    "nonunique_index_pg_fake/1000",
+                ),
+                build_comparison("heap_scan_postgres_18/100", "heap_scan_pg_fake/100"),
+                build_comparison("heap_scan_postgres_18/1000", "heap_scan_pg_fake/1000"),
+                build_comparison("unique_index_pg_fake/100", "unique_index_pg_fake/1000"),
+                build_comparison(
+                    "nonunique_index_pg_fake/100",
+                    "nonunique_index_pg_fake/1000",
+                ),
+                build_comparison("heap_scan_pg_fake/100", "heap_scan_pg_fake/1000"),
+            ],
+        ),
+        build_benchmark(
+            BenchmarkTier::Important,
+            "populated_table_writes",
+            vec![
+                build_value("update_pg_fake/100", &["update_pg_fake", "100"]),
+                build_value("update_postgres_18/100", &["update_postgres_18", "100"]),
+                build_value("update_pg_fake/1000", &["update_pg_fake", "1000"]),
+                build_value("update_postgres_18/1000", &["update_postgres_18", "1000"]),
+                build_value("delete_pg_fake/100", &["delete_pg_fake", "100"]),
+                build_value("delete_postgres_18/100", &["delete_postgres_18", "100"]),
+                build_value("delete_pg_fake/1000", &["delete_pg_fake", "1000"]),
+                build_value("delete_postgres_18/1000", &["delete_postgres_18", "1000"]),
+            ],
+            vec![
+                build_comparison("update_postgres_18/100", "update_pg_fake/100"),
+                build_comparison("update_postgres_18/1000", "update_pg_fake/1000"),
+                build_comparison("delete_postgres_18/100", "delete_pg_fake/100"),
+                build_comparison("delete_postgres_18/1000", "delete_pg_fake/1000"),
+                build_comparison("update_pg_fake/100", "update_pg_fake/1000"),
+                build_comparison("delete_pg_fake/100", "delete_pg_fake/1000"),
             ],
         ),
         build_benchmark(
