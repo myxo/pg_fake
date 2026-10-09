@@ -1,0 +1,1 @@
+{"group_id":"tier2_lookup_scaling","function_id":"heap_scan_postgres_18","value_str":"1000","throughput":{"Elements":1},"full_id":"tier2_lookup_scaling/heap_scan_postgres_18/1000","directory_name":"tier2_lookup_scaling/heap_scan_postgres_18/1000","title":"tier2_lookup_scaling/heap_scan_postgres_18/1000"}
