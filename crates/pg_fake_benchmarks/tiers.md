@@ -36,7 +36,7 @@ in [`src/lib.rs`](src/lib.rs); update this assessment when adding or moving one.
 | `tier1_selective_inner_join` | Performs a two-table equality join with a simple filter and one matching result. |
 | `tier1_many_match_inner_join` | Performs the same basic equality-join shape with multiple matches; no lateral, recursive, or aggregate operation. |
 
-## Tier 2: important operations (66 groups)
+## Tier 2: important operations (72 groups)
 
 | Benchmark | Reason |
 | --- | --- |
@@ -97,6 +97,12 @@ in [`src/lib.rs`](src/lib.rs); update this assessment when adding or moving one.
 | `tier2_join_2way_filtered_1k` | Measures a filtered two-table join with a UUID key lookup into an indexed table of 1,000 rows. |
 | `tier2_concurrent_reads` | Compares two independent sessions reading without lock contention; relevant to concurrent application tests. |
 | `tier2_foreign_key_insert` | Times both a parent insert and a referencing child insert, exercising referential checks across tables. |
+| `tier2_join_profile_100` | Measures the membership profile query with 100 users, two joins, soft-delete filters, ordering, varying UUID parameters, and two fully decoded rows. |
+| `tier2_join_profile_1k` | Measures the membership profile query with 1,000 users, two joins, soft-delete filters, ordering, varying UUID parameters, and two fully decoded rows. |
+| `tier2_join_profile_3k` | Measures the membership profile query with 3,000 users, two joins, soft-delete filters, ordering, varying UUID parameters, and two fully decoded rows. |
+| `tier2_join_members_100` | Measures the shared-hub members query with 100 users, three joins, soft-delete filters, ordering, varying UUID parameters, and ten fully decoded rows. |
+| `tier2_join_members_1k` | Measures the shared-hub members query with 1,000 users, three joins, soft-delete filters, ordering, varying UUID parameters, and ten fully decoded rows. |
+| `tier2_join_members_3k` | Measures the shared-hub members query with 3,000 users, three joins, soft-delete filters, ordering, varying UUID parameters, and ten fully decoded rows. |
 | `tier2_derived_scalar_subq_100` | Combines a derived table, scalar subquery, and subquery membership test. |
 | `tier2_materialized_cte_100` | Reuses a non-recursive read CTE from two sides of a join. |
 | `tier2_derived_source_join_100` | Joins two derived table sources on an equality key, covering the materialized-source path. |

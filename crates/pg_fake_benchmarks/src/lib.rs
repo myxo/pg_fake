@@ -625,6 +625,42 @@ pub fn list_benchmarks() -> Vec<Benchmark> {
         ),
         build_benchmark(
             BenchmarkTier::Important,
+            "join_profile_100",
+            build_postgres_values(),
+            build_postgres_comparisons(),
+        ),
+        build_benchmark(
+            BenchmarkTier::Important,
+            "join_profile_1k",
+            build_postgres_values(),
+            build_postgres_comparisons(),
+        ),
+        build_benchmark(
+            BenchmarkTier::Important,
+            "join_profile_3k",
+            build_postgres_values(),
+            build_postgres_comparisons(),
+        ),
+        build_benchmark(
+            BenchmarkTier::Important,
+            "join_members_100",
+            build_postgres_values(),
+            build_postgres_comparisons(),
+        ),
+        build_benchmark(
+            BenchmarkTier::Important,
+            "join_members_1k",
+            build_postgres_values(),
+            build_postgres_comparisons(),
+        ),
+        build_benchmark(
+            BenchmarkTier::Important,
+            "join_members_3k",
+            build_postgres_values(),
+            build_postgres_comparisons(),
+        ),
+        build_benchmark(
+            BenchmarkTier::Important,
             "derived_scalar_subq_100",
             build_postgres_values(),
             build_postgres_comparisons(),

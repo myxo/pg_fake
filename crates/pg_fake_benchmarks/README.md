@@ -10,7 +10,7 @@ Benchmarks are prioritized by their impact on everyday application tests using
 | `tier3_` | Rare | Recursive/data-modifying CTEs, advanced windows, lateral queries, nested views, compound index/array aggregation workloads, triggers, temporary tables, catalog lookups, specialized locking/settings, JSON joins, and transaction-history/MVCC/contention diagnostics. |
 
 The shared catalog in [`src/lib.rs`](src/lib.rs) assigns every workload a tier.
-The [complete tier assessment](tiers.md) explains the assignment of all 100
+The [complete tier assessment](tiers.md) explains the assignment of all 106
 benchmark groups based on their actual timed operations.
 Group names stay within 32 characters including the tier prefix. Row counts use
 compact suffixes such as `_100` and `_1k`; the tier assessment describes each
@@ -85,6 +85,15 @@ with `pg_fake`:
   general query path;
 - `join_` measures UUID-key two-table and join-chain reads
   with a predicate on the indexed side at 100 and 1,000 rows;
+- `join_profile_` and `join_members_` reproduce application membership queries at
+  100, 1,000, and 3,000 users. Each fixture has N personal hubs, N/10 shared hubs,
+  and 2N memberships, with indexes on membership user and hub IDs. Profile queries
+  return two rows through two joins; members queries return ten rows through three
+  joins. Both include soft-delete filters, ordering, varying bound UUIDs, and full
+  tuple decoding. Expected rows are checked before timing; setup and ANALYZE are
+  excluded. These fixtures use temporary tables, matching the standalone join
+  reproducer. Run them with `cargo x bench join_profile_` and
+  `cargo x bench join_members_`;
 - `update_indexed_` and `delete_indexed_` measure indexed writes against stable
   100- and 1,000-row tables, rolling each timed write back afterward.
 
@@ -98,7 +107,7 @@ By default, it starts a PostgreSQL 18 Testcontainers container. It detects the
 default Colima socket (`~/.colima/default/docker.sock`); set `DOCKER_HOST` for
 another Docker socket or profile.
 
-PostgreSQL workloads use ordinary tables with stable names inside the
+Most PostgreSQL workloads use ordinary tables with stable names inside the
 `pgfake_benchmark` schema. The suite takes a database-scoped advisory lock,
 recreates that schema before benchmarking, and drops it afterward.
 

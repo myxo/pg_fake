@@ -22,6 +22,8 @@ enum BenchmarkConnection<'a> {
 }
 
 type NamedBenchmarkConnection<'a> = (&'static str, BenchmarkConnection<'a>);
+type ProfileJoinRow = (uuid::Uuid, String, Option<String>, String, bool);
+type MembersJoinRow = (uuid::Uuid, String, String, String);
 
 impl BenchmarkConnection<'_> {
     fn execute(&mut self, runtime: &Runtime, sql: &str) {
@@ -169,6 +171,66 @@ impl BenchmarkConnection<'_> {
                     .unwrap();
                 black_box(rows);
             }
+        }
+    }
+
+    fn fetch_profile_join(
+        &mut self,
+        runtime: &Runtime,
+        parameter: uuid::Uuid,
+    ) -> Vec<ProfileJoinRow> {
+        let query = "SELECT h.id, h.name, h.display_name, m.role, (u.hub_id = h.id) AS is_personal
+            FROM membership_join_memberships m
+            JOIN membership_join_hubs h ON h.id = m.hub_id
+            JOIN membership_join_users u ON u.id = m.user_id
+            WHERE m.user_id = $1 AND m.deleted_at IS NULL AND h.deleted_at IS NULL
+            ORDER BY m.created_at ASC, m.id ASC";
+        match self {
+            Self::PgFake(connection) => runtime
+                .block_on(
+                    sqlx::query_as::<_, ProfileJoinRow>(query)
+                        .bind(parameter)
+                        .fetch_all(&mut **connection),
+                )
+                .unwrap(),
+            Self::Postgres(connection) => runtime
+                .block_on(
+                    sqlx::query_as::<_, ProfileJoinRow>(query)
+                        .bind(parameter)
+                        .fetch_all(&mut **connection),
+                )
+                .unwrap(),
+        }
+    }
+
+    fn fetch_members_join(
+        &mut self,
+        runtime: &Runtime,
+        parameter: uuid::Uuid,
+    ) -> Vec<MembersJoinRow> {
+        let query = "SELECT m.user_id, u.name, personal.name, m.role
+            FROM membership_join_memberships m
+            JOIN membership_join_hubs h ON h.id = m.hub_id
+            JOIN membership_join_users u ON u.id = m.user_id
+            JOIN membership_join_hubs personal ON personal.id = u.hub_id
+            WHERE m.hub_id = $1 AND m.deleted_at IS NULL
+              AND h.deleted_at IS NULL AND personal.deleted_at IS NULL
+            ORDER BY m.created_at ASC, m.id ASC";
+        match self {
+            Self::PgFake(connection) => runtime
+                .block_on(
+                    sqlx::query_as::<_, MembersJoinRow>(query)
+                        .bind(parameter)
+                        .fetch_all(&mut **connection),
+                )
+                .unwrap(),
+            Self::Postgres(connection) => runtime
+                .block_on(
+                    sqlx::query_as::<_, MembersJoinRow>(query)
+                        .bind(parameter)
+                        .fetch_all(&mut **connection),
+                )
+                .unwrap(),
         }
     }
 
@@ -2407,6 +2469,7 @@ fn benchmarks(criterion: &mut Criterion) {
         foreign_key_insert_benchmark(criterion, &runtime, &mut connections);
         inner_join_benchmark(criterion, &runtime, &mut connections);
         benchmark_selective_indexed_join(criterion, &runtime, &mut connections);
+        benchmark_membership_joins(criterion, &runtime, &mut connections);
         benchmark_lateral(criterion, &runtime, &mut connections);
         benchmark_skip_locked(criterion, &runtime, &mut connections);
         derived_and_scalar_subquery_benchmark(criterion, &runtime, &mut connections);
@@ -2954,6 +3017,156 @@ fn benchmark_selective_indexed_join(
                 runtime,
                 "DROP TABLE indexed_join_left, indexed_join_middle, indexed_join_right",
             );
+        }
+    }
+}
+
+fn make_membership_join_uuid(kind: u128, index: usize) -> uuid::Uuid {
+    uuid::Uuid::from_u128((kind << 96) | (index as u128 + 1))
+}
+
+fn benchmark_membership_joins(
+    criterion: &mut Criterion,
+    runtime: &Runtime,
+    connections: &mut [NamedBenchmarkConnection<'_>],
+) {
+    for (users, size) in [(100_usize, "100"), (1_000, "1k"), (3_000, "3k")] {
+        let groups = users / 10;
+        let hubs = (0..users + groups)
+            .map(|i| {
+                format!(
+                    "('{}', 'hub-{i}', 'Hub {i}')",
+                    make_membership_join_uuid(1, i)
+                )
+            })
+            .collect::<Vec<_>>()
+            .join(",");
+        let user_values = (0..users)
+            .map(|i| {
+                format!(
+                    "('{}', 'user-{i}', '{}')",
+                    make_membership_join_uuid(2, i),
+                    make_membership_join_uuid(1, i)
+                )
+            })
+            .collect::<Vec<_>>()
+            .join(",");
+        let memberships = (0..users)
+            .flat_map(|i| {
+                [(0, i, "owner"), (1, users + i / 10, "member")].map(|(j, hub, role)| {
+                    format!(
+                        "('{}', '{}', '{}', '{role}', {i})",
+                        make_membership_join_uuid(3, i * 2 + j),
+                        make_membership_join_uuid(1, hub),
+                        make_membership_join_uuid(2, i)
+                    )
+                })
+            })
+            .collect::<Vec<_>>()
+            .join(",");
+        for (_, connection) in connections.iter_mut() {
+            for sql in [
+                "CREATE TEMP TABLE membership_join_hubs (id UUID PRIMARY KEY, name TEXT NOT NULL, display_name TEXT, deleted_at BIGINT)",
+                "CREATE TEMP TABLE membership_join_users (id UUID PRIMARY KEY, name TEXT NOT NULL, hub_id UUID NOT NULL)",
+                "CREATE TEMP TABLE membership_join_memberships (id UUID PRIMARY KEY, hub_id UUID NOT NULL, user_id UUID NOT NULL, role TEXT NOT NULL, created_at BIGINT NOT NULL, deleted_at BIGINT)",
+                "CREATE INDEX membership_join_user ON membership_join_memberships (user_id)",
+                "CREATE INDEX membership_join_hub ON membership_join_memberships (hub_id)",
+                "BEGIN",
+            ] {
+                connection.execute(runtime, sql);
+            }
+            connection.execute(
+                runtime,
+                &format!("INSERT INTO membership_join_hubs (id, name, display_name) VALUES {hubs}"),
+            );
+            connection.execute(
+                runtime,
+                &format!(
+                    "INSERT INTO membership_join_users (id, name, hub_id) VALUES {user_values}"
+                ),
+            );
+            connection.execute(runtime, &format!("INSERT INTO membership_join_memberships (id, hub_id, user_id, role, created_at) VALUES {memberships}"));
+            for sql in [
+                "COMMIT",
+                "ANALYZE membership_join_hubs",
+                "ANALYZE membership_join_users",
+                "ANALYZE membership_join_memberships",
+            ] {
+                connection.execute(runtime, sql);
+            }
+            for user in [0, users / 2, users - 1] {
+                let shared_hub = users + user / 10;
+                let expected = [(user, "owner", true), (shared_hub, "member", false)].map(
+                    |(hub, role, personal)| {
+                        (
+                            make_membership_join_uuid(1, hub),
+                            format!("hub-{hub}"),
+                            Some(format!("Hub {hub}")),
+                            role.to_owned(),
+                            personal,
+                        )
+                    },
+                );
+                assert_eq!(
+                    connection.fetch_profile_join(runtime, make_membership_join_uuid(2, user)),
+                    expected
+                );
+            }
+            for shared_group in [0, groups / 2, groups - 1] {
+                let expected = (shared_group * 10..shared_group * 10 + 10)
+                    .map(|user| {
+                        (
+                            make_membership_join_uuid(2, user),
+                            format!("user-{user}"),
+                            format!("hub-{user}"),
+                            "member".to_owned(),
+                        )
+                    })
+                    .collect::<Vec<_>>();
+                assert_eq!(
+                    connection.fetch_members_join(
+                        runtime,
+                        make_membership_join_uuid(1, users + shared_group)
+                    ),
+                    expected
+                );
+            }
+        }
+        let mut group = criterion.benchmark_group(
+            benchmarks::find_benchmark(&format!("join_profile_{size}")).format_name(),
+        );
+        group.throughput(Throughput::Elements(1));
+        for (name, connection) in connections.iter_mut() {
+            let mut target = 0;
+            group.bench_function(*name, |benchmark| {
+                benchmark.iter(|| {
+                    let rows = connection
+                        .fetch_profile_join(runtime, make_membership_join_uuid(2, target));
+                    target = (target + 37) % users;
+                    black_box(rows);
+                });
+            });
+        }
+        group.finish();
+        let mut group = criterion.benchmark_group(
+            benchmarks::find_benchmark(&format!("join_members_{size}")).format_name(),
+        );
+        group.throughput(Throughput::Elements(1));
+        for (name, connection) in connections.iter_mut() {
+            let mut target = 0;
+            group.bench_function(*name, |benchmark| {
+                benchmark.iter(|| {
+                    let rows = connection
+                        .fetch_members_join(runtime, make_membership_join_uuid(1, users + target));
+                    target = (target + 37) % groups;
+                    black_box(rows);
+                });
+            });
+        }
+        group.finish();
+        for (_, connection) in connections.iter_mut() {
+            connection.execute(runtime, "DROP TABLE membership_join_memberships, membership_join_users, membership_join_hubs");
+            connection.clear_statements(runtime);
         }
     }
 }
