@@ -291,10 +291,26 @@ fn collect_report(root: &Path, result: &str, benchmarks: &[Benchmark]) -> Report
                 ) else {
                     continue;
                 };
+                let (name, baseline_label, candidate_label) = if let Some((scenario, size)) =
+                    comparison.baseline.split_once("_postgres_18/")
+                    && comparison.candidate == format!("{scenario}_pg_fake/{size}")
+                {
+                    (
+                        format!("{}/{scenario}/{size}", benchmark.format_name()),
+                        "postgres_18",
+                        "pg_fake",
+                    )
+                } else {
+                    (
+                        benchmark.format_name(),
+                        comparison.baseline,
+                        comparison.candidate,
+                    )
+                };
                 speedups.push((
-                    benchmark.format_name(),
-                    comparison.baseline.to_owned(),
-                    comparison.candidate.to_owned(),
+                    name,
+                    baseline_label.to_owned(),
+                    candidate_label.to_owned(),
                     format_relative(baseline, candidate),
                 ));
             }
