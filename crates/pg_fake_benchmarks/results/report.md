@@ -138,46 +138,46 @@
 | tier2_point_lookup_index_vs_scan/unique_index/100 | 563.52 ns | -2.45% |
 | tier2_point_lookup_index_vs_scan/heap_scan/10,000 | 293.47 us | -1.13% |
 | tier2_point_lookup_index_vs_scan/unique_index/10,000 | 628.01 ns | -1.56% |
-| tier2_lookup_scaling/unique_index_pg_fake/100 | 8.30 us | N/A |
-| tier2_lookup_scaling/unique_index_postgres_18/100 | 38.18 us | N/A |
-| tier2_lookup_scaling/unique_index_pg_fake/1000 | 8.88 us | N/A |
-| tier2_lookup_scaling/unique_index_postgres_18/1000 | 32.87 us | N/A |
-| tier2_lookup_scaling/nonunique_index_pg_fake/100 | 8.02 us | N/A |
-| tier2_lookup_scaling/nonunique_index_postgres_18/100 | 51.39 us | N/A |
-| tier2_lookup_scaling/nonunique_index_pg_fake/1000 | 9.07 us | N/A |
-| tier2_lookup_scaling/nonunique_index_postgres_18/1000 | 33.79 us | N/A |
-| tier2_lookup_scaling/nonunique_filtered_pg_fake/100 | 8.83 us | N/A |
-| tier2_lookup_scaling/nonunique_filtered_postgres_18/100 | 39.54 us | N/A |
-| tier2_lookup_scaling/nonunique_filtered_pg_fake/1000 | 8.75 us | N/A |
-| tier2_lookup_scaling/nonunique_filtered_postgres_18/1000 | 34.81 us | N/A |
-| tier2_lookup_scaling/heap_scan_pg_fake/100 | 17.39 us | N/A |
-| tier2_lookup_scaling/heap_scan_postgres_18/100 | 38.58 us | N/A |
-| tier2_lookup_scaling/heap_scan_pg_fake/1000 | 87.21 us | N/A |
-| tier2_lookup_scaling/heap_scan_postgres_18/1000 | 65.56 us | N/A |
-| tier2_populated_table_writes/update_pg_fake/100 | 32.42 us | N/A |
-| tier2_populated_table_writes/update_postgres_18/100 | 40.76 us | N/A |
-| tier2_populated_table_writes/update_pg_fake/1000 | 34.60 us | N/A |
-| tier2_populated_table_writes/update_postgres_18/1000 | 35.68 us | N/A |
-| tier2_populated_table_writes/delete_pg_fake/100 | 22.09 us | N/A |
-| tier2_populated_table_writes/delete_postgres_18/100 | 38.45 us | N/A |
-| tier2_populated_table_writes/delete_pg_fake/1000 | 22.27 us | N/A |
-| tier2_populated_table_writes/delete_postgres_18/1000 | 34.36 us | N/A |
+| tier2_lookup_scaling_unique_index_100_rows/pg_fake | 8.30 us | N/A |
+| tier2_lookup_scaling_unique_index_100_rows/postgres_18 | 38.18 us | N/A |
+| tier2_lookup_scaling_unique_index_1000_rows/pg_fake | 8.88 us | N/A |
+| tier2_lookup_scaling_unique_index_1000_rows/postgres_18 | 32.87 us | N/A |
+| tier2_lookup_scaling_nonunique_index_100_rows/pg_fake | 8.02 us | N/A |
+| tier2_lookup_scaling_nonunique_index_100_rows/postgres_18 | 51.39 us | N/A |
+| tier2_lookup_scaling_nonunique_index_1000_rows/pg_fake | 9.07 us | N/A |
+| tier2_lookup_scaling_nonunique_index_1000_rows/postgres_18 | 33.79 us | N/A |
+| tier2_lookup_scaling_nonunique_filtered_100_rows/pg_fake | 8.83 us | N/A |
+| tier2_lookup_scaling_nonunique_filtered_100_rows/postgres_18 | 39.54 us | N/A |
+| tier2_lookup_scaling_nonunique_filtered_1000_rows/pg_fake | 8.75 us | N/A |
+| tier2_lookup_scaling_nonunique_filtered_1000_rows/postgres_18 | 34.81 us | N/A |
+| tier2_lookup_scaling_heap_scan_100_rows/pg_fake | 17.39 us | N/A |
+| tier2_lookup_scaling_heap_scan_100_rows/postgres_18 | 38.58 us | N/A |
+| tier2_lookup_scaling_heap_scan_1000_rows/pg_fake | 87.21 us | N/A |
+| tier2_lookup_scaling_heap_scan_1000_rows/postgres_18 | 65.56 us | N/A |
+| tier2_populated_table_writes_update_100_rows/pg_fake | 32.42 us | N/A |
+| tier2_populated_table_writes_update_100_rows/postgres_18 | 40.76 us | N/A |
+| tier2_populated_table_writes_update_1000_rows/pg_fake | 34.60 us | N/A |
+| tier2_populated_table_writes_update_1000_rows/postgres_18 | 35.68 us | N/A |
+| tier2_populated_table_writes_delete_100_rows/pg_fake | 22.09 us | N/A |
+| tier2_populated_table_writes_delete_100_rows/postgres_18 | 38.45 us | N/A |
+| tier2_populated_table_writes_delete_1000_rows/pg_fake | 22.27 us | N/A |
+| tier2_populated_table_writes_delete_1000_rows/postgres_18 | 34.36 us | N/A |
 | tier2_concurrent_uncontended_reads/sequential | 13.88 us | +12.97% |
 | tier2_concurrent_uncontended_reads/parallel | 11.50 us | +3.89% |
 | tier2_foreign_key_insert/pg_fake | 71.03 us | +7.52% |
 | tier2_foreign_key_insert/postgres_18 | 188.96 us | +3.11% |
-| tier2_selective_indexed_join/plain_pg_fake/100 | 44.19 us | N/A |
-| tier2_selective_indexed_join/plain_postgres_18/100 | 33.61 us | N/A |
-| tier2_selective_indexed_join/plain_pg_fake/1000 | 41.98 us | N/A |
-| tier2_selective_indexed_join/plain_postgres_18/1000 | 48.80 us | N/A |
-| tier2_selective_indexed_join/filtered_pg_fake/100 | 46.91 us | N/A |
-| tier2_selective_indexed_join/filtered_postgres_18/100 | 32.18 us | N/A |
-| tier2_selective_indexed_join/filtered_pg_fake/1000 | 51.19 us | N/A |
-| tier2_selective_indexed_join/filtered_postgres_18/1000 | 46.78 us | N/A |
-| tier2_selective_indexed_join/two_table_filtered_pg_fake/100 | 45.74 us | N/A |
-| tier2_selective_indexed_join/two_table_filtered_postgres_18/100 | 33.60 us | N/A |
-| tier2_selective_indexed_join/two_table_filtered_pg_fake/1000 | 46.32 us | N/A |
-| tier2_selective_indexed_join/two_table_filtered_postgres_18/1000 | 46.55 us | N/A |
+| tier2_selective_indexed_join_plain_100_rows/pg_fake | 44.19 us | N/A |
+| tier2_selective_indexed_join_plain_100_rows/postgres_18 | 33.61 us | N/A |
+| tier2_selective_indexed_join_plain_1000_rows/pg_fake | 41.98 us | N/A |
+| tier2_selective_indexed_join_plain_1000_rows/postgres_18 | 48.80 us | N/A |
+| tier2_selective_indexed_join_filtered_100_rows/pg_fake | 46.91 us | N/A |
+| tier2_selective_indexed_join_filtered_100_rows/postgres_18 | 32.18 us | N/A |
+| tier2_selective_indexed_join_filtered_1000_rows/pg_fake | 51.19 us | N/A |
+| tier2_selective_indexed_join_filtered_1000_rows/postgres_18 | 46.78 us | N/A |
+| tier2_selective_indexed_join_two_table_filtered_100_rows/pg_fake | 45.74 us | N/A |
+| tier2_selective_indexed_join_two_table_filtered_100_rows/postgres_18 | 33.60 us | N/A |
+| tier2_selective_indexed_join_two_table_filtered_1000_rows/pg_fake | 46.32 us | N/A |
+| tier2_selective_indexed_join_two_table_filtered_1000_rows/postgres_18 | 46.55 us | N/A |
 | tier2_derived_and_scalar_subquery_100_rows/pg_fake | 359.56 us | -7.76% |
 | tier2_derived_and_scalar_subquery_100_rows/postgres_18 | 126.24 us | +45.69% |
 | tier2_materialized_cte_100_rows/pg_fake | 118.15 us | +4.62% |
@@ -237,36 +237,26 @@
 | tier2_core_parsed_vs_prepared_point_select | parse_and_analyze | prepared_reuse | 🟢 ↑ 36.79x |
 | tier2_point_lookup_index_vs_scan | heap_scan/100 | unique_index/100 | 🟢 ↑ 5.89x |
 | tier2_point_lookup_index_vs_scan | heap_scan/10,000 | unique_index/10,000 | 🟢 ↑ 467.29x |
-| tier2_lookup_scaling/unique_index/100 | postgres_18 | pg_fake | 🟢 ↑ 4.60x |
-| tier2_lookup_scaling/unique_index/1000 | postgres_18 | pg_fake | 🟢 ↑ 3.70x |
-| tier2_lookup_scaling/nonunique_index/100 | postgres_18 | pg_fake | 🟢 ↑ 6.41x |
-| tier2_lookup_scaling/nonunique_index/1000 | postgres_18 | pg_fake | 🟢 ↑ 3.72x |
-| tier2_lookup_scaling/nonunique_filtered/100 | postgres_18 | pg_fake | 🟢 ↑ 4.48x |
-| tier2_lookup_scaling/nonunique_filtered/1000 | postgres_18 | pg_fake | 🟢 ↑ 3.98x |
-| tier2_lookup_scaling/heap_scan/100 | postgres_18 | pg_fake | 🟢 ↑ 2.22x |
-| tier2_lookup_scaling/heap_scan/1000 | postgres_18 | pg_fake | 🔴 ↓ 1.33x |
-| tier2_lookup_scaling | unique_index_pg_fake/100 | unique_index_pg_fake/1000 | 🔴 ↓ 1.07x |
-| tier2_lookup_scaling | nonunique_index_pg_fake/100 | nonunique_index_pg_fake/1000 | 🔴 ↓ 1.13x |
-| tier2_lookup_scaling | nonunique_filtered_pg_fake/100 | nonunique_filtered_pg_fake/1000 | 🟢 ↑ 1.01x |
-| tier2_lookup_scaling | heap_scan_pg_fake/100 | heap_scan_pg_fake/1000 | 🔴 ↓ 5.01x |
-| tier2_populated_table_writes/update/100 | postgres_18 | pg_fake | 🟢 ↑ 1.26x |
-| tier2_populated_table_writes/update/1000 | postgres_18 | pg_fake | 🟢 ↑ 1.03x |
-| tier2_populated_table_writes/delete/100 | postgres_18 | pg_fake | 🟢 ↑ 1.74x |
-| tier2_populated_table_writes/delete/1000 | postgres_18 | pg_fake | 🟢 ↑ 1.54x |
-| tier2_populated_table_writes | update_pg_fake/100 | update_pg_fake/1000 | 🔴 ↓ 1.07x |
-| tier2_populated_table_writes | delete_pg_fake/100 | delete_pg_fake/1000 | 🔴 ↓ 1.01x |
+| tier2_lookup_scaling_unique_index_100_rows | postgres_18 | pg_fake | 🟢 ↑ 4.60x |
+| tier2_lookup_scaling_unique_index_1000_rows | postgres_18 | pg_fake | 🟢 ↑ 3.70x |
+| tier2_lookup_scaling_nonunique_index_100_rows | postgres_18 | pg_fake | 🟢 ↑ 6.41x |
+| tier2_lookup_scaling_nonunique_index_1000_rows | postgres_18 | pg_fake | 🟢 ↑ 3.72x |
+| tier2_lookup_scaling_nonunique_filtered_100_rows | postgres_18 | pg_fake | 🟢 ↑ 4.48x |
+| tier2_lookup_scaling_nonunique_filtered_1000_rows | postgres_18 | pg_fake | 🟢 ↑ 3.98x |
+| tier2_lookup_scaling_heap_scan_100_rows | postgres_18 | pg_fake | 🟢 ↑ 2.22x |
+| tier2_lookup_scaling_heap_scan_1000_rows | postgres_18 | pg_fake | 🔴 ↓ 1.33x |
+| tier2_populated_table_writes_update_100_rows | postgres_18 | pg_fake | 🟢 ↑ 1.26x |
+| tier2_populated_table_writes_update_1000_rows | postgres_18 | pg_fake | 🟢 ↑ 1.03x |
+| tier2_populated_table_writes_delete_100_rows | postgres_18 | pg_fake | 🟢 ↑ 1.74x |
+| tier2_populated_table_writes_delete_1000_rows | postgres_18 | pg_fake | 🟢 ↑ 1.54x |
 | tier2_concurrent_uncontended_reads | sequential | parallel | 🟢 ↑ 1.21x |
 | tier2_foreign_key_insert | postgres_18 | pg_fake | 🟢 ↑ 2.66x |
-| tier2_selective_indexed_join/plain/100 | postgres_18 | pg_fake | 🔴 ↓ 1.31x |
-| tier2_selective_indexed_join/plain/1000 | postgres_18 | pg_fake | 🟢 ↑ 1.16x |
-| tier2_selective_indexed_join/filtered/100 | postgres_18 | pg_fake | 🔴 ↓ 1.46x |
-| tier2_selective_indexed_join/filtered/1000 | postgres_18 | pg_fake | 🔴 ↓ 1.09x |
-| tier2_selective_indexed_join/two_table_filtered/100 | postgres_18 | pg_fake | 🔴 ↓ 1.36x |
-| tier2_selective_indexed_join/two_table_filtered/1000 | postgres_18 | pg_fake | 🟢 ↑ 1.00x |
-| tier2_selective_indexed_join | plain_pg_fake/100 | filtered_pg_fake/100 | 🔴 ↓ 1.06x |
-| tier2_selective_indexed_join | plain_pg_fake/1000 | filtered_pg_fake/1000 | 🔴 ↓ 1.22x |
-| tier2_selective_indexed_join | filtered_pg_fake/100 | filtered_pg_fake/1000 | 🔴 ↓ 1.09x |
-| tier2_selective_indexed_join | two_table_filtered_pg_fake/100 | two_table_filtered_pg_fake/1000 | 🔴 ↓ 1.01x |
+| tier2_selective_indexed_join_plain_100_rows | postgres_18 | pg_fake | 🔴 ↓ 1.31x |
+| tier2_selective_indexed_join_plain_1000_rows | postgres_18 | pg_fake | 🟢 ↑ 1.16x |
+| tier2_selective_indexed_join_filtered_100_rows | postgres_18 | pg_fake | 🔴 ↓ 1.46x |
+| tier2_selective_indexed_join_filtered_1000_rows | postgres_18 | pg_fake | 🔴 ↓ 1.09x |
+| tier2_selective_indexed_join_two_table_filtered_100_rows | postgres_18 | pg_fake | 🔴 ↓ 1.36x |
+| tier2_selective_indexed_join_two_table_filtered_1000_rows | postgres_18 | pg_fake | 🟢 ↑ 1.00x |
 | tier2_derived_and_scalar_subquery_100_rows | postgres_18 | pg_fake | 🔴 ↓ 2.85x |
 | tier2_materialized_cte_100_rows | postgres_18 | pg_fake | 🔴 ↓ 1.19x |
 | tier2_derived_source_join_100_rows | postgres_18 | pg_fake | 🔴 ↓ 1.94x |

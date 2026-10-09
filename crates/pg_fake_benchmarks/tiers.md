@@ -36,7 +36,7 @@ in [`src/lib.rs`](src/lib.rs); update this assessment when adding or moving one.
 | `tier1_selective_inner_join` | Performs a two-table equality join with a simple filter and one matching result. |
 | `tier1_many_match_inner_join` | Performs the same basic equality-join shape with multiple matches; no lateral, recursive, or aggregate operation. |
 
-## Tier 2: important operations (51 groups)
+## Tier 2: important operations (66 groups)
 
 | Benchmark | Reason |
 | --- | --- |
@@ -77,9 +77,24 @@ in [`src/lib.rs`](src/lib.rs); update this assessment when adding or moving one.
 | `tier2_adapter_overhead_select_100_rows` | Compares core and SQLx overhead for an ordinary read; diagnoses implementation cost rather than adding a Tier 1 workflow. |
 | `tier2_core_parsed_vs_prepared_point_select` | Compares one-shot and prepared execution, a targeted optimization diagnostic. |
 | `tier2_point_lookup_index_vs_scan` | Compares prepared core lookups at 100 and 10,000 rows; Tier 1 already covers the basic indexed and heap lookup paths. |
-| `tier2_lookup_scaling` | Compares selective unique-index, nonunique-index, filtered nonunique-index, and heap lookups at two table sizes through SQLx and PostgreSQL. |
-| `tier2_populated_table_writes` | Measures indexed UPDATE and DELETE against stable 100- and 1,000-row tables, separating write cost from fixture setup. |
-| `tier2_selective_indexed_join` | Checks whether a predicate on the indexed side of two-table and chained UUID equality joins causes table-size-dependent work. |
+| `tier2_lookup_scaling_unique_index_100_rows` | Measures a selective unique index lookup over 100 rows through each SQLx backend. |
+| `tier2_lookup_scaling_unique_index_1000_rows` | Measures a selective unique index lookup over 1,000 rows through each SQLx backend. |
+| `tier2_lookup_scaling_nonunique_index_100_rows` | Measures a selective nonunique index lookup over 100 rows through each SQLx backend. |
+| `tier2_lookup_scaling_nonunique_index_1000_rows` | Measures a selective nonunique index lookup over 1,000 rows through each SQLx backend. |
+| `tier2_lookup_scaling_nonunique_filtered_100_rows` | Measures a selective nonunique filtered lookup over 100 rows through each SQLx backend. |
+| `tier2_lookup_scaling_nonunique_filtered_1000_rows` | Measures a selective nonunique filtered lookup over 1,000 rows through each SQLx backend. |
+| `tier2_lookup_scaling_heap_scan_100_rows` | Measures a selective heap scan lookup over 100 rows through each SQLx backend. |
+| `tier2_lookup_scaling_heap_scan_1000_rows` | Measures a selective heap scan lookup over 1,000 rows through each SQLx backend. |
+| `tier2_populated_table_writes_update_100_rows` | Measures indexed UPDATE over 100 rows, with fixture setup and rollback outside the timed write. |
+| `tier2_populated_table_writes_update_1000_rows` | Measures indexed UPDATE over 1,000 rows, with fixture setup and rollback outside the timed write. |
+| `tier2_populated_table_writes_delete_100_rows` | Measures indexed DELETE over 100 rows, with fixture setup and rollback outside the timed write. |
+| `tier2_populated_table_writes_delete_1000_rows` | Measures indexed DELETE over 1,000 rows, with fixture setup and rollback outside the timed write. |
+| `tier2_selective_indexed_join_plain_100_rows` | Measures a three-table join chain with a UUID key lookup into an indexed table of 100 rows. |
+| `tier2_selective_indexed_join_plain_1000_rows` | Measures a three-table join chain with a UUID key lookup into an indexed table of 1,000 rows. |
+| `tier2_selective_indexed_join_filtered_100_rows` | Measures a filtered three-table join chain with a UUID key lookup into an indexed table of 100 rows. |
+| `tier2_selective_indexed_join_filtered_1000_rows` | Measures a filtered three-table join chain with a UUID key lookup into an indexed table of 1,000 rows. |
+| `tier2_selective_indexed_join_two_table_filtered_100_rows` | Measures a filtered two-table join with a UUID key lookup into an indexed table of 100 rows. |
+| `tier2_selective_indexed_join_two_table_filtered_1000_rows` | Measures a filtered two-table join with a UUID key lookup into an indexed table of 1,000 rows. |
 | `tier2_concurrent_uncontended_reads` | Compares two independent sessions reading without lock contention; relevant to concurrent application tests. |
 | `tier2_foreign_key_insert` | Times both a parent insert and a referencing child insert, exercising referential checks across tables. |
 | `tier2_derived_and_scalar_subquery_100_rows` | Combines a derived table, scalar subquery, and subquery membership test. |

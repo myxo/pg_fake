@@ -10,8 +10,12 @@ Benchmarks are prioritized by their impact on everyday application tests using
 | `tier3_` | Rare | Recursive/data-modifying CTEs, advanced windows, lateral queries, nested views, compound index/array aggregation workloads, triggers, temporary tables, catalog lookups, specialized locking/settings, JSON joins, and transaction-history/MVCC/contention diagnostics. |
 
 The shared catalog in [`src/lib.rs`](src/lib.rs) assigns every workload a tier.
-The [complete tier assessment](tiers.md) explains the assignment of all 85
+The [complete tier assessment](tiers.md) explains the assignment of all 100
 benchmark groups based on their actual timed operations.
+Backend comparisons use one group per workload scenario and dataset size, such
+as `tier2_selective_indexed_join_filtered_100_rows`. Each group uses
+`postgres_18` as the baseline and `pg_fake` as the candidate. Comparisons between
+API modes or execution strategies live in dedicated diagnostic groups.
 Console and saved reports group measurements and comparisons by tier, with
 Tier 1 first. These priorities are independent of the SQL fidelity tiers in the
 project specification.
@@ -63,17 +67,22 @@ Diagnostic groups isolate costs within `pg_fake`:
   long-lived repeatable-read snapshot;
 - `point_lookup_index_vs_scan` compares a primary-key predicate with an
   equivalent heap predicate at 100 and 10,000 rows;
-- `lookup_scaling` compares selective unique, nonunique, and heap lookups at
-  100 and 1,000 rows, including a filtered nonunique lookup that uses the
-  general query path;
-- `selective_indexed_join` compares UUID-key two-table and join-chain reads
-  with a predicate on the indexed side at 100 and 1,000 rows;
-- `populated_table_writes` measures indexed UPDATE and DELETE against stable
-  100- and 1,000-row tables, rolling each timed write back afterward;
 - `core_snapshot_1000_rows` extends the snapshot fixture-size check beyond
   the existing 100-row case;
 - `concurrent_uncontended_reads` compares sequential and parallel sessions, and
   `concurrent_same_row_contention` exercises a blocking same-row update.
+
+Additional backend comparison families cover larger fixtures. Each prefix below
+expands into separate scenario and row-count groups, all comparing `postgres_18`
+with `pg_fake`:
+
+- `lookup_scaling_` measures selective unique, nonunique, and heap lookups at
+  100 and 1,000 rows, including a filtered nonunique lookup that uses the
+  general query path;
+- `selective_indexed_join_` measures UUID-key two-table and join-chain reads
+  with a predicate on the indexed side at 100 and 1,000 rows;
+- `populated_table_writes_` measures indexed UPDATE and DELETE against stable
+  100- and 1,000-row tables, rolling each timed write back afterward.
 
 The point-lookup comparison isolates native core index execution across table
 sizes, while the paired SQLx filtered selects compare otherwise identical heap

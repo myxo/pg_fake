@@ -2070,9 +2070,6 @@ fn benchmark_lookup_scaling(
     runtime: &Runtime,
     connections: &mut [NamedBenchmarkConnection<'_>],
 ) {
-    let mut group =
-        criterion.benchmark_group(benchmarks::find_benchmark("lookup_scaling").format_name());
-    group.throughput(Throughput::Elements(1));
     for rows in [100_usize, 1_000] {
         let indexed_values = (1..=rows)
             .map(|id| format!("({id}, {id}, {id})"))
@@ -2124,15 +2121,17 @@ fn benchmark_lookup_scaling(
                 "SELECT amount FROM lookup_scaling_heap WHERE id = $1",
             ),
         ] {
+            let mut group = criterion.benchmark_group(
+                benchmarks::find_benchmark(&format!("lookup_scaling_{shape}_{rows}_rows"))
+                    .format_name(),
+            );
+            group.throughput(Throughput::Elements(1));
             for (name, connection) in connections.iter_mut() {
-                group.bench_with_input(
-                    BenchmarkId::new(format!("{shape}_{name}"), rows),
-                    &rows,
-                    |benchmark, _| {
-                        benchmark.iter(|| connection.fetch_bound(runtime, query, rows as i64))
-                    },
-                );
+                group.bench_function(*name, |benchmark| {
+                    benchmark.iter(|| connection.fetch_bound(runtime, query, rows as i64))
+                });
             }
+            group.finish();
         }
         for (_, connection) in connections.iter_mut() {
             connection.execute(
@@ -2141,7 +2140,6 @@ fn benchmark_lookup_scaling(
             );
         }
     }
-    group.finish();
 }
 
 fn benchmark_populated_table_writes(
@@ -2149,11 +2147,6 @@ fn benchmark_populated_table_writes(
     runtime: &Runtime,
     connections: &mut [NamedBenchmarkConnection<'_>],
 ) {
-    let mut group = criterion
-        .benchmark_group(benchmarks::find_benchmark("populated_table_writes").format_name());
-    group.sample_size(20);
-    group.measurement_time(Duration::from_secs(2));
-    group.throughput(Throughput::Elements(1));
     for rows in [100_usize, 1_000] {
         let values = (1..=rows)
             .map(|id| format!("({id}, 0)"))
@@ -2178,31 +2171,36 @@ fn benchmark_populated_table_writes(
             ),
             ("delete", "DELETE FROM populated_table_writes WHERE id = $1"),
         ] {
+            let mut group = criterion.benchmark_group(
+                benchmarks::find_benchmark(&format!(
+                    "populated_table_writes_{operation}_{rows}_rows"
+                ))
+                .format_name(),
+            );
+            group.sample_size(20);
+            group.measurement_time(Duration::from_secs(2));
+            group.throughput(Throughput::Elements(1));
             for (name, connection) in connections.iter_mut() {
-                group.bench_with_input(
-                    BenchmarkId::new(format!("{operation}_{name}"), rows),
-                    &rows,
-                    |benchmark, _| {
-                        benchmark.iter_custom(|iterations| {
-                            let mut elapsed = Duration::ZERO;
-                            for _ in 0..iterations {
-                                connection.execute(runtime, "BEGIN");
-                                let started = Instant::now();
-                                connection.execute_bound(runtime, query, rows as i64);
-                                elapsed += started.elapsed();
-                                connection.execute(runtime, "ROLLBACK");
-                            }
-                            elapsed
-                        });
-                    },
-                );
+                group.bench_function(*name, |benchmark| {
+                    benchmark.iter_custom(|iterations| {
+                        let mut elapsed = Duration::ZERO;
+                        for _ in 0..iterations {
+                            connection.execute(runtime, "BEGIN");
+                            let started = Instant::now();
+                            connection.execute_bound(runtime, query, rows as i64);
+                            elapsed += started.elapsed();
+                            connection.execute(runtime, "ROLLBACK");
+                        }
+                        elapsed
+                    });
+                });
             }
+            group.finish();
         }
         for (_, connection) in connections.iter_mut() {
             connection.execute(runtime, "DROP TABLE populated_table_writes");
         }
     }
-    group.finish();
 }
 
 fn concurrency_benchmark(criterion: &mut Criterion, runtime: &Runtime) {
@@ -2916,9 +2914,6 @@ fn benchmark_selective_indexed_join(
     runtime: &Runtime,
     connections: &mut [NamedBenchmarkConnection<'_>],
 ) {
-    let mut group = criterion
-        .benchmark_group(benchmarks::find_benchmark("selective_indexed_join").format_name());
-    group.throughput(Throughput::Elements(1));
     for rows in [100_usize, 1_000] {
         let key = uuid::Uuid::from_u128(50);
         let values = (1..=rows)
@@ -2958,26 +2953,32 @@ fn benchmark_selective_indexed_join(
             let query = format!(
                 "SELECT right_row.value FROM indexed_join_left AS left_row JOIN indexed_join_middle AS middle_row ON middle_row.id = left_row.id JOIN indexed_join_right AS right_row ON right_row.id = middle_row.id WHERE left_row.id = $1{predicate}"
             );
+            let mut group = criterion.benchmark_group(
+                benchmarks::find_benchmark(&format!("selective_indexed_join_{shape}_{rows}_rows"))
+                    .format_name(),
+            );
+            group.throughput(Throughput::Elements(1));
             for (connection_name, connection) in connections.iter_mut() {
-                group.bench_with_input(
-                    BenchmarkId::new(format!("{shape}_{connection_name}"), rows),
-                    &rows,
-                    |benchmark, _| {
-                        benchmark.iter(|| connection.fetch_bound_uuid(runtime, &query, key))
-                    },
-                );
+                group.bench_function(*connection_name, |benchmark| {
+                    benchmark.iter(|| connection.fetch_bound_uuid(runtime, &query, key))
+                });
             }
+            group.finish();
         }
         let two_table_query = "SELECT right_row.value FROM indexed_join_left AS left_row JOIN indexed_join_right AS right_row ON right_row.id = left_row.id WHERE left_row.id = $1 AND right_row.value >= 0";
+        let mut group = criterion.benchmark_group(
+            benchmarks::find_benchmark(&format!(
+                "selective_indexed_join_two_table_filtered_{rows}_rows"
+            ))
+            .format_name(),
+        );
+        group.throughput(Throughput::Elements(1));
         for (connection_name, connection) in connections.iter_mut() {
-            group.bench_with_input(
-                BenchmarkId::new(format!("two_table_filtered_{connection_name}"), rows),
-                &rows,
-                |benchmark, _| {
-                    benchmark.iter(|| connection.fetch_bound_uuid(runtime, two_table_query, key))
-                },
-            );
+            group.bench_function(*connection_name, |benchmark| {
+                benchmark.iter(|| connection.fetch_bound_uuid(runtime, two_table_query, key))
+            });
         }
+        group.finish();
         for (_, connection) in connections.iter_mut() {
             connection.execute(
                 runtime,
@@ -2985,7 +2986,6 @@ fn benchmark_selective_indexed_join(
             );
         }
     }
-    group.finish();
 }
 
 fn benchmark_lateral(
