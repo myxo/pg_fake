@@ -27,6 +27,7 @@ use std::time::Instant;
 #[derive(Debug, Clone)]
 pub(crate) struct PreparedQueryPlan {
     source: PreparedSource,
+    joins: Vec<PreparedIndexedJoin>,
     output: PreparedOutput,
     selection: Option<PreparedExpression>,
     columns: Vec<ColumnMeta>,
@@ -67,6 +68,13 @@ enum PreparedSource {
         table: Box<ast::TableWithJoins>,
         scope: BoundScope,
     },
+}
+
+#[derive(Debug, Clone)]
+struct PreparedIndexedJoin {
+    table_id: TableId,
+    left_slot: usize,
+    right_column: usize,
 }
 
 #[derive(Debug, Clone)]
@@ -291,8 +299,8 @@ pub(crate) fn build_prepared_query_plan(
     }
     let cte_row_source = crate::executor::ctes::cte_row_source_id(name);
     if !select.from[0].joins.is_empty()
-        && (cte_row_source.is_none()
-            || select.from[0].joins.len() != 1
+        && cte_row_source.is_some()
+        && (select.from[0].joins.len() != 1
             || !crate::executor::from::can_stream_join(&select.from[0])
             || !matches!(
                 select.from[0].joins[0].join_operator,
@@ -320,6 +328,83 @@ pub(crate) fn build_prepared_query_plan(
         Some(state.catalog.require_named_table(&relation_name)?)
     };
     let scope = bind_query_scope(&state.catalog, select)?;
+    let mut joins = Vec::new();
+    if let Some(schema) = schema {
+        if !select.from[0].joins.is_empty()
+            && (select.from[0].joins.len() < 2 || select.selection.is_none())
+        {
+            return Ok(None);
+        }
+        let mut width = schema.columns.len();
+        for join in &select.from[0].joins {
+            let ast::TableFactor::Table {
+                name, args: None, ..
+            } = &join.relation
+            else {
+                return Ok(None);
+            };
+            if crate::executor::ctes::cte_row_source_id(name).is_some() {
+                return Ok(None);
+            }
+            let name = normalize_relation_name(name)?;
+            if super::describe_visible_system_relation(&state.catalog, &name).is_some()
+                || state.catalog.require_named_view(&name).is_ok()
+            {
+                return Ok(None);
+            }
+            let right_schema = state.catalog.require_named_table(&name)?;
+            let condition = match &join.join_operator {
+                ast::JoinOperator::Join(ast::JoinConstraint::On(condition))
+                | ast::JoinOperator::Inner(ast::JoinConstraint::On(condition)) => condition,
+                _ => return Ok(None),
+            };
+            let ast::Expr::BinaryOp {
+                left,
+                op: ast::BinaryOperator::Eq,
+                right,
+            } = condition
+            else {
+                return Ok(None);
+            };
+            let (Some((first, first_type)), Some((second, second_type))) = (
+                super::scope::try_resolve_column_reference(left, &scope),
+                super::scope::try_resolve_column_reference(right, &scope),
+            ) else {
+                return Ok(None);
+            };
+            if first_type.base != second_type.base
+                || !matches!(
+                    first_type.base,
+                    BaseType::Int2 | BaseType::Int4 | BaseType::Int8 | BaseType::Uuid
+                )
+            {
+                return Ok(None);
+            }
+            let end = width + right_schema.columns.len();
+            let (left_slot, right_slot) = if first < width && (width..end).contains(&second) {
+                (first, second)
+            } else if second < width && (width..end).contains(&first) {
+                (second, first)
+            } else {
+                return Ok(None);
+            };
+            let right_column = right_slot - width;
+            if !state
+                .tables
+                .get(&right_schema.id)
+                .expect("catalog table must have storage")
+                .has_unique_index(&[right_column])
+            {
+                return Ok(None);
+            }
+            joins.push(PreparedIndexedJoin {
+                table_id: right_schema.id,
+                left_slot,
+                right_column,
+            });
+            width = end;
+        }
+    }
     if aggregate_query && described_columns.is_none() {
         if schema.is_none() {
             return Ok(None);
@@ -508,7 +593,8 @@ pub(crate) fn build_prepared_query_plan(
                 return Ok(None);
             };
             if !orders.iter().all(|order| match &order.expr {
-                ast::Expr::Identifier(ident) => columns.iter().any(|column| column.name == normalize_identifier(ident)),
+                ast::Expr::Identifier(ident) => !joins.is_empty() || columns.iter().any(|column| column.name == normalize_identifier(ident)),
+                ast::Expr::CompoundIdentifier(_) => !joins.is_empty(),
                 ast::Expr::Value(value) => matches!(&value.value, ast::Value::Number(number, _) if number.bytes().all(|byte| byte.is_ascii_digit())),
                 _ => false,
             }) { return Ok(None); }
@@ -531,11 +617,16 @@ pub(crate) fn build_prepared_query_plan(
             }
             for spec in super::query::resolve_order_specs(state, query, &sources, &columns, &scope)?
             {
-                let super::query::OrderKey::Output(output_slot) = spec.key else {
-                    return Ok(None);
-                };
-                let PreparedProjection::Column(source_slot) = projection[output_slot] else {
-                    return Ok(None);
+                let source_slot = match spec.key {
+                    super::query::OrderKey::Output(output_slot) => {
+                        let PreparedProjection::Column(source_slot) = projection[output_slot]
+                        else {
+                            return Ok(None);
+                        };
+                        source_slot
+                    }
+                    super::query::OrderKey::Input(source_slot, _) => source_slot,
+                    super::query::OrderKey::Expression(_) => return Ok(None),
                 };
                 ordering.push(super::query::RowOrderSpec {
                     key: super::query::OrderKey::Output(source_slot),
@@ -558,7 +649,7 @@ pub(crate) fn build_prepared_query_plan(
         }
         None => None,
     };
-    let source = if !select.from[0].joins.is_empty() {
+    let source = if !select.from[0].joins.is_empty() && cte_row_source.is_some() {
         PreparedSource::StreamedJoin {
             table: Box::new(select.from[0].clone()),
             scope: scope.clone(),
@@ -571,6 +662,9 @@ pub(crate) fn build_prepared_query_plan(
                     .as_ref()
                     .and_then(|selection| find_index_access(selection, schema))
                     .unwrap_or(PreparedAccess::Scan);
+                if !joins.is_empty() && matches!(access, PreparedAccess::Scan) {
+                    return Ok(None);
+                }
                 PreparedSource::Table {
                     table_id: schema.id,
                     access,
@@ -581,6 +675,7 @@ pub(crate) fn build_prepared_query_plan(
     };
     Ok(Some(PreparedQueryPlan {
         source,
+        joins,
         output,
         selection,
         columns,
@@ -944,7 +1039,9 @@ fn find_index_access(
         }
         _ => return None,
     };
-    if value.get_data_type() != schema.columns[column].data_type.base {
+    if column >= schema.columns.len()
+        || value.get_data_type() != schema.columns[column].data_type.base
+    {
         return None;
     }
     let unique = schema
@@ -1105,6 +1202,55 @@ pub(crate) fn execute_prepared_query(
         }
         Ok(())
     };
+    let mut joined = Vec::new();
+    let mut visit_source = |row: &[Value]| -> Result<()> {
+        if plan.joins.is_empty() {
+            return visit(row);
+        }
+        if deadline.is_some_and(|deadline| Instant::now() >= deadline) {
+            return Err(PgError::create(
+                SqlState::QueryCanceled,
+                "canceling statement due to statement timeout",
+            ));
+        }
+        joined.clear();
+        joined.extend_from_slice(row);
+        for join in &plan.joins {
+            let value = &joined[join.left_slot];
+            if value.is_null() {
+                return Ok(());
+            }
+            let table = state
+                .tables
+                .get(&join.table_id)
+                .expect("prepared table must have storage");
+            if state.tracks_serializable_reads(xid)
+                && let Some(key) =
+                    table.create_unique_read_key(&[join.right_column], std::slice::from_ref(value))
+            {
+                state.record_read(
+                    xid,
+                    crate::serializable::Access::Unique(
+                        join.table_id,
+                        vec![join.right_column],
+                        key,
+                    ),
+                );
+            }
+            let Some((row_id, version)) = table.find_unique_visible_version(
+                &[join.right_column],
+                std::slice::from_ref(value),
+                snapshot,
+                xid,
+                &state.transactions,
+            ) else {
+                return Ok(());
+            };
+            state.record_read(xid, crate::serializable::Access::Row(join.table_id, row_id));
+            joined.extend_from_slice(&version.row);
+        }
+        visit(&joined)
+    };
     match &plan.source {
         PreparedSource::CteRows { id } => {
             let source = context
@@ -1112,7 +1258,7 @@ pub(crate) fn execute_prepared_query(
                 .get_cte_row_source(*id)
                 .expect("prepared CTE row source was registered");
             for row in &source.rows {
-                visit(row)?;
+                visit_source(row)?;
             }
         }
         PreparedSource::StreamedJoin { table, scope } => {
@@ -1124,7 +1270,7 @@ pub(crate) fn execute_prepared_query(
                 snapshot,
                 context.expect("prepared recursive join requires its statement context"),
                 None,
-                &mut |row| visit(row),
+                &mut |row| visit_source(row),
             )?;
         }
         PreparedSource::Table { table_id, access } => {
@@ -1144,7 +1290,7 @@ pub(crate) fn execute_prepared_query(
                                 xid,
                                 crate::serializable::Access::Row(*table_id, row_id),
                             );
-                            visit(&version.row)?;
+                            visit_source(&version.row)?;
                         }
                     }
                 }
@@ -1168,7 +1314,7 @@ pub(crate) fn execute_prepared_query(
                         &state.transactions,
                     ) {
                         state.record_read(xid, crate::serializable::Access::Row(*table_id, row_id));
-                        visit(&version.row)?;
+                        visit_source(&version.row)?;
                     }
                 }
                 PreparedAccess::Nonunique { column, value } => {
@@ -1183,7 +1329,7 @@ pub(crate) fn execute_prepared_query(
                         &state.transactions,
                     ) {
                         state.record_read(xid, crate::serializable::Access::Row(*table_id, row_id));
-                        visit(&version.row)?;
+                        visit_source(&version.row)?;
                     }
                 }
             }

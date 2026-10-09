@@ -316,3 +316,104 @@ fn compares_prepared_wide_integer_joins() {
         }
     }
 }
+
+#[test]
+fn compares_generated_indexed_membership_joins() {
+    use chaos_theory::{check, make::int_in};
+    use std::cell::RefCell;
+    use uuid::Uuid;
+
+    let server = start_isolated_postgres_server();
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap();
+    let postgres = RefCell::new(
+        runtime
+            .block_on(PgConnection::connect(&server.url))
+            .unwrap(),
+    );
+    check(|src| {
+        let mut postgres = postgres.borrow_mut();
+        let mut fake = PgFakeConnection::new(Db::create());
+        for sql in [
+            "CREATE TEMP TABLE membership_source (id INTEGER PRIMARY KEY, hub_id UUID, user_id UUID, created_at INTEGER, deleted_at INTEGER)",
+            "CREATE INDEX membership_source_hub ON membership_source (hub_id)",
+            "CREATE INDEX membership_source_user ON membership_source (user_id)",
+            "CREATE TEMP TABLE membership_hubs (id UUID PRIMARY KEY, name TEXT, deleted_at INTEGER)",
+            "CREATE TEMP TABLE membership_users (id UUID PRIMARY KEY, hub_id UUID, name TEXT)",
+        ] {
+            assert_statement(&runtime, &mut postgres, &mut fake, sql, RowOrder::Unordered);
+        }
+        for id in 1..=5 {
+            let uuid = Uuid::from_u128(id);
+            let personal = Uuid::from_u128(src.any_of("personal", int_in(1_u64..=6)) as u128);
+            let deleted = if src.any_of("deleted_hub", int_in(0..=3)) == 0 {
+                "1"
+            } else {
+                "NULL"
+            };
+            for sql in [
+                format!("INSERT INTO membership_hubs VALUES ('{uuid}', 'hub-{id}', {deleted})"),
+                format!(
+                    "INSERT INTO membership_users VALUES ('{uuid}', '{personal}', 'user-{id}')"
+                ),
+            ] {
+                assert_statement(
+                    &runtime,
+                    &mut postgres,
+                    &mut fake,
+                    &sql,
+                    RowOrder::Unordered,
+                );
+            }
+        }
+        for id in 0..src.any_of("rows", int_in(1..=24)) {
+            let hub = Uuid::from_u128(src.any_of("hub", int_in(1_u64..=6)) as u128);
+            let user = if src.any_of("null_user", int_in(0..=4)) == 0 {
+                "NULL".to_owned()
+            } else {
+                format!(
+                    "'{}'",
+                    Uuid::from_u128(src.any_of("user", int_in(1_u64..=6)) as u128)
+                )
+            };
+            let created = src.any_of("created", int_in(0..=3));
+            let deleted = if src.any_of("deleted_membership", int_in(0..=3)) == 0 {
+                "1"
+            } else {
+                "NULL"
+            };
+            let sql = format!(
+                "INSERT INTO membership_source VALUES ({id}, '{hub}', {user}, {created}, {deleted})"
+            );
+            assert_statement(
+                &runtime,
+                &mut postgres,
+                &mut fake,
+                &sql,
+                RowOrder::Unordered,
+            );
+        }
+        runtime.block_on(async {
+            for sql in [
+                "SELECT m.id, h.name, u.name, (u.hub_id = h.id) AS personal FROM membership_source m JOIN membership_hubs h ON h.id = m.hub_id JOIN membership_users u ON m.user_id = u.id WHERE m.user_id = $1 AND m.deleted_at IS NULL AND h.deleted_at IS NULL ORDER BY m.created_at, m.id DESC",
+                "SELECT m.id, h.name, personal.name, (u.hub_id = h.id) AS personal FROM membership_source m JOIN membership_hubs h ON m.hub_id = h.id JOIN membership_users u ON u.id = m.user_id JOIN membership_hubs personal ON personal.id = u.hub_id WHERE m.hub_id = $1 AND m.deleted_at IS NULL AND h.deleted_at IS NULL AND personal.deleted_at IS NULL ORDER BY m.created_at DESC, m.id",
+            ] {
+                for key in [Some(Uuid::from_u128(1)), Some(Uuid::from_u128(2)), Some(Uuid::from_u128(6)), None] {
+                    type Row = (i32, Option<String>, Option<String>, Option<bool>);
+                    let expected: Vec<Row> = sqlx::query_as(sql).bind(key).fetch_all(&mut *postgres).await.unwrap();
+                    let actual: Vec<Row> = sqlx::query_as(sql).bind(key).fetch_all(&mut fake).await.unwrap();
+                    assert_eq!(actual, expected, "{sql}: {key:?}");
+                }
+            }
+        });
+        assert_statement(
+            &runtime,
+            &mut postgres,
+            &mut fake,
+            "DROP TABLE membership_source, membership_users, membership_hubs",
+            RowOrder::Unordered,
+        );
+    });
+}

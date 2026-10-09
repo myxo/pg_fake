@@ -12002,3 +12002,184 @@ fn track_compiled_indexed_join_key_gaps() {
     reader.execute("ROLLBACK").unwrap();
     writer.execute("ROLLBACK").unwrap();
 }
+
+#[test]
+fn matches_prepared_indexed_join_chains_across_writes() {
+    let db = Db::create();
+    let mut session = db.create_session();
+    let first = uuid::Uuid::from_u128(1);
+    let second = uuid::Uuid::from_u128(2);
+    let missing = uuid::Uuid::from_u128(3);
+    session.execute(&format!(
+        "CREATE TABLE prepared_memberships (id INTEGER PRIMARY KEY, hub_id UUID, user_id UUID, created_at INTEGER, deleted_at INTEGER); \
+         CREATE INDEX prepared_memberships_hub ON prepared_memberships (hub_id); \
+         CREATE TABLE prepared_hubs (id UUID UNIQUE, rank INTEGER, deleted_at INTEGER); \
+         CREATE TABLE prepared_users (id UUID PRIMARY KEY, hub_id UUID, rank INTEGER); \
+         INSERT INTO prepared_hubs VALUES ('{first}', 1, NULL), ('{second}', 2, NULL), (NULL, 3, NULL); \
+         INSERT INTO prepared_users VALUES ('{first}', '{first}', 10), ('{second}', '{second}', 20); \
+         INSERT INTO prepared_memberships VALUES \
+         (1, '{first}', '{first}', 2, NULL), (2, '{first}', '{second}', 1, NULL), \
+         (3, '{first}', '{first}', NULL, NULL), (4, '{first}', '{missing}', 0, NULL), \
+         (5, '{first}', NULL, 0, NULL), (6, NULL, '{first}', 0, NULL), \
+         (7, '{second}', '{second}', 0, 1), (8, '{missing}', '{first}', 0, NULL)"
+    )).unwrap();
+    let mut statements = Vec::new();
+    for (projection, ordering) in [
+        (
+            "m.id, h.rank, u.rank, (u.hub_id = h.id) AS personal",
+            "m.created_at ASC NULLS LAST, m.id DESC",
+        ),
+        ("m.id AS rank, h.rank AS hub_rank", "rank DESC, h.rank"),
+        ("m.id, h.rank", "2 DESC, m.id"),
+        (
+            "m.id, h.rank",
+            "m.created_at ASC NULLS FIRST, m.id LIMIT 2 OFFSET 1",
+        ),
+    ] {
+        let sql = format!(
+            "SELECT {projection} FROM prepared_memberships m \
+             JOIN prepared_hubs h ON m.hub_id = h.id \
+             JOIN prepared_users u ON u.id = m.user_id \
+             JOIN prepared_hubs personal ON personal.id = u.hub_id \
+             WHERE h.rank >= $2 AND m.hub_id = $1 AND m.deleted_at IS NULL \
+             AND h.deleted_at IS NULL AND personal.deleted_at IS NULL ORDER BY {ordering}"
+        );
+        let prepared = session.prepare(&sql).unwrap();
+        assert!(prepared.query_plan.is_some(), "{sql}");
+        let mut general = prepared.clone();
+        general.query_plan = None;
+        statements.push((prepared, general));
+    }
+    for mutation in [
+        "BEGIN",
+        "UPDATE prepared_hubs SET deleted_at = 1 WHERE rank = 2",
+        "DELETE FROM prepared_users WHERE rank = 10",
+        "ROLLBACK",
+    ] {
+        session.execute(mutation).unwrap();
+        for (prepared, general) in &statements {
+            for key in [
+                Value::Uuid(first),
+                Value::Uuid(second),
+                Value::Uuid(missing),
+                Value::Null,
+            ] {
+                for minimum in [0, 2, 3] {
+                    let parameters = [key.clone(), Value::Int4(minimum)];
+                    let actual = session.query_prepared(prepared, &parameters).unwrap();
+                    let expected = session.query_prepared(general, &parameters).unwrap();
+                    assert_eq!(
+                        actual.rows,
+                        expected.rows,
+                        "{}: {mutation}, {parameters:?}",
+                        &prepared.statement.to_string()
+                    );
+                    assert_eq!(actual.columns, expected.columns);
+                }
+            }
+        }
+    }
+    let prepared = &statements[0].0;
+    session
+        .execute("BEGIN ISOLATION LEVEL REPEATABLE READ")
+        .unwrap();
+    let expected = session
+        .query_prepared(prepared, &[Value::Uuid(first), Value::Int4(0)])
+        .unwrap();
+    let mut writer = db.create_session();
+    writer
+        .execute(
+            "UPDATE prepared_users SET rank = rank + 1; DELETE FROM prepared_hubs WHERE rank = 2",
+        )
+        .unwrap();
+    let actual = session
+        .query_prepared(prepared, &[Value::Uuid(first), Value::Int4(0)])
+        .unwrap();
+    assert_eq!(actual.rows, expected.rows);
+    session.execute("COMMIT").unwrap();
+    let actual = session
+        .query_prepared(prepared, &[Value::Uuid(first), Value::Int4(0)])
+        .unwrap();
+    assert_ne!(actual.rows, expected.rows);
+    session
+        .execute("DROP INDEX prepared_memberships_hub")
+        .unwrap();
+    let error = session
+        .query_prepared(prepared, &[Value::Uuid(first), Value::Int4(0)])
+        .unwrap_err();
+    assert_eq!(error.sqlstate, SqlState::FeatureNotSupported);
+    assert_eq!(error.message, "cached plan must be replanned");
+    let refreshed = session.prepare(&prepared.statement.to_string()).unwrap();
+    assert!(refreshed.query_plan.is_none());
+    let expected = session
+        .query_prepared(&refreshed, &[Value::Uuid(first), Value::Int4(0)])
+        .unwrap();
+    assert_eq!(actual.rows, expected.rows);
+}
+
+#[test]
+fn preserves_recursive_join_fallback_with_physical_source_first() {
+    let db = Db::create();
+    let mut session = db.create_session();
+    session.execute("CREATE TABLE walk_edges (parent INTEGER PRIMARY KEY, child INTEGER); INSERT INTO walk_edges VALUES (1, 2), (2, 3); CREATE TABLE walk_labels (id INTEGER PRIMARY KEY); INSERT INTO walk_labels VALUES (2), (3)").unwrap();
+    let rows = session.query("WITH RECURSIVE walk(id) AS (VALUES (1) UNION ALL SELECT e.child FROM walk_edges e JOIN walk_labels l ON l.id = e.child JOIN walk w ON e.parent = w.id WHERE e.parent = 1) SELECT id FROM walk ORDER BY id", &[]).unwrap().rows;
+    assert_eq!(rows, vec![vec![Value::Int4(1)], vec![Value::Int4(2)]]);
+}
+
+#[test]
+fn tracks_prepared_join_chain_key_gaps_and_deadlines() {
+    let db = Db::create();
+    let mut reader = db.create_session();
+    let mut writer = db.create_session();
+    reader.execute("CREATE TABLE gap_left (id integer PRIMARY KEY); CREATE TABLE gap_middle (id integer PRIMARY KEY); CREATE TABLE gap_right (id integer PRIMARY KEY); INSERT INTO gap_left VALUES (1); INSERT INTO gap_middle VALUES (1)").unwrap();
+    let statement = reader
+        .prepare("SELECT l.id FROM gap_left l JOIN gap_middle m ON m.id = l.id JOIN gap_right r ON m.id = r.id WHERE l.id = 1")
+        .unwrap();
+    assert!(statement.query_plan.is_some());
+    reader
+        .execute("BEGIN ISOLATION LEVEL SERIALIZABLE")
+        .unwrap();
+    writer.execute("BEGIN").unwrap();
+    let Some(SessionTransactionState::Active(reader_transaction)) = reader.transaction else {
+        panic!("reader transaction is active")
+    };
+    let Some(SessionTransactionState::Active(writer_transaction)) = writer.transaction else {
+        panic!("writer transaction is active")
+    };
+    assert!(
+        reader
+            .query_prepared(&statement, &[])
+            .unwrap()
+            .rows
+            .is_empty()
+    );
+    writer.execute("INSERT INTO gap_right VALUES (2)").unwrap();
+    assert!(
+        !db.state
+            .lock()
+            .unwrap()
+            .serializable
+            .lock()
+            .unwrap()
+            .has_edge(reader_transaction.xid, writer_transaction.xid)
+    );
+    writer.execute("INSERT INTO gap_right VALUES (1)").unwrap();
+    assert!(
+        db.state
+            .lock()
+            .unwrap()
+            .serializable
+            .lock()
+            .unwrap()
+            .has_edge(reader_transaction.xid, writer_transaction.xid)
+    );
+    reader.execute("ROLLBACK").unwrap();
+    writer.execute("ROLLBACK").unwrap();
+    reader.execute("BEGIN").unwrap();
+    reader.settings.statement_timeout = Duration::from_nanos(1);
+    assert_eq!(
+        reader.query_prepared(&statement, &[]).unwrap_err().sqlstate,
+        SqlState::QueryCanceled
+    );
+    reader.execute("ROLLBACK").unwrap();
+}
