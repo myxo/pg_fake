@@ -12,8 +12,11 @@ Benchmarks are prioritized by their impact on everyday application tests using
 The shared catalog in [`src/lib.rs`](src/lib.rs) assigns every workload a tier.
 The [complete tier assessment](tiers.md) explains the assignment of all 100
 benchmark groups based on their actual timed operations.
+Group names stay within 32 characters including the tier prefix. Row counts use
+compact suffixes such as `_100` and `_1k`; the tier assessment describes each
+workload in full.
 Backend comparisons use one group per workload scenario and dataset size, such
-as `tier2_selective_indexed_join_filtered_100_rows`. Each group uses
+as `tier2_join_3way_filtered_100`. Each group uses
 `postgres_18` as the baseline and `pg_fake` as the candidate. Comparisons between
 API modes or execution strategies live in dedicated diagnostic groups.
 Console and saved reports group measurements and comparisons by tier, with
@@ -48,9 +51,9 @@ filtered heap select, the same filtered select over a primary key, and a
 not-null, default, and column- and table-level `CHECK` validation. They also
 cover a sequence-backed identity insert with `RETURNING`, and a UUID key lookup
 that applies timestamp-with-time-zone and interval arithmetic.
-The `offset_datetime_bind_store_fetch` workload measures a `time::OffsetDateTime`
+The `offset_datetime_roundtrip` workload measures a `time::OffsetDateTime`
 bind, `timestamptz` store, and decoded `RETURNING` value through each SQLx
-adapter. The `hashed_advisory_lock_acquisition` workload measures an explicit
+adapter. The `hashed_advisory_lock` workload measures an explicit
 transaction that derives an advisory key with `hashtextextended` and acquires
 the corresponding transaction lock.
 The `nested_savepoint_release` and `nested_savepoint_rollback` workloads measure
@@ -58,30 +61,31 @@ two nested savepoints with inserts, followed by release or partial rollback.
 
 Diagnostic groups isolate costs within `pg_fake`:
 
-- `adapter_overhead_select_100_rows` compares the native core API with SQLx;
-- `core_parsed_vs_prepared_point_select` compares one-shot parsing and analysis
+- `adapter_select_100` compares the native core API with SQLx;
+- `core_parse_vs_prepare` compares one-shot parsing and analysis
   with prepared reuse;
-- `transaction_history_point_select` measures lookup after 1, 100, 10,000, and
+- `tx_history_lookup` measures lookup after 1, 100, 10,000, and
   100,000 completed transactions;
 - `mvcc_old_snapshot_read` measures reads through version chains retained by a
   long-lived repeatable-read snapshot;
-- `point_lookup_index_vs_scan` compares a primary-key predicate with an
+- `lookup_index_vs_scan` compares a primary-key predicate with an
   equivalent heap predicate at 100 and 10,000 rows;
-- `core_snapshot_1000_rows` extends the snapshot fixture-size check beyond
+- `core_snapshot_1k` extends the snapshot fixture-size check beyond
   the existing 100-row case;
-- `concurrent_uncontended_reads` compares sequential and parallel sessions, and
-  `concurrent_same_row_contention` exercises a blocking same-row update.
+- `concurrent_reads` compares sequential and parallel sessions, and
+  `same_row_contention` exercises a blocking same-row update.
 
 Additional backend comparison families cover larger fixtures. Each prefix below
 expands into separate scenario and row-count groups, all comparing `postgres_18`
 with `pg_fake`:
 
-- `lookup_scaling_` measures selective unique, nonunique, and heap lookups at
+- `lookup_unique_`, `lookup_nonuniq_`, and `lookup_heap_scan_` measure selective
+  unique, nonunique, and heap lookups at
   100 and 1,000 rows, including a filtered nonunique lookup that uses the
   general query path;
-- `selective_indexed_join_` measures UUID-key two-table and join-chain reads
+- `join_` measures UUID-key two-table and join-chain reads
   with a predicate on the indexed side at 100 and 1,000 rows;
-- `populated_table_writes_` measures indexed UPDATE and DELETE against stable
+- `update_indexed_` and `delete_indexed_` measure indexed writes against stable
   100- and 1,000-row tables, rolling each timed write back afterward.
 
 The point-lookup comparison isolates native core index execution across table

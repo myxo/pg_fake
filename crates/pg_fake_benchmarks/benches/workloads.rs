@@ -417,9 +417,8 @@ fn transactional_ddl_benchmark(
     runtime: &Runtime,
     connections: &mut [NamedBenchmarkConnection<'_>],
 ) {
-    let mut group = criterion.benchmark_group(
-        benchmarks::find_benchmark("transactional_ddl_create_rollback").format_name(),
-    );
+    let mut group =
+        criterion.benchmark_group(benchmarks::find_benchmark("ddl_create_rollback").format_name());
     for (name, connection) in connections.iter_mut() {
         group.bench_function(*name, |benchmark| {
             benchmark.iter(|| {
@@ -465,9 +464,8 @@ fn benchmark_transaction_local_gucs(
     runtime: &Runtime,
     connections: &mut [NamedBenchmarkConnection<'_>],
 ) {
-    let mut group = criterion.benchmark_group(
-        benchmarks::find_benchmark("transaction_local_guc_roundtrip").format_name(),
-    );
+    let mut group =
+        criterion.benchmark_group(benchmarks::find_benchmark("tx_local_guc").format_name());
     for (backend, connection) in connections.iter_mut() {
         group.bench_function(*backend, |benchmark| {
             benchmark.iter(|| {
@@ -535,9 +533,8 @@ fn migration_table_lock_benchmark(
         connection.execute(runtime, "CREATE TABLE migration_lock_first (id INTEGER)");
         connection.execute(runtime, "CREATE TABLE migration_lock_second (id INTEGER)");
     }
-    let mut group = criterion.benchmark_group(
-        benchmarks::find_benchmark("migration_table_lock_two_relations").format_name(),
-    );
+    let mut group = criterion
+        .benchmark_group(benchmarks::find_benchmark("migration_lock_2tables").format_name());
     for (name, connection) in connections.iter_mut() {
         group.bench_function(*name, |benchmark| {
             benchmark.iter(|| {
@@ -648,7 +645,7 @@ fn alter_table_benchmark(
         .join(",");
     let insert = format!("INSERT INTO alter_table_rewrite_100_rows VALUES {values}");
     let mut group = criterion
-        .benchmark_group(benchmarks::find_benchmark("alter_table_rewrite_100_rows").format_name());
+        .benchmark_group(benchmarks::find_benchmark("alter_table_rewrite_100").format_name());
     group.throughput(Throughput::Elements(100));
     for (name, connection) in connections.iter_mut() {
         group.bench_function(*name, |benchmark| {
@@ -700,7 +697,7 @@ fn partial_unique_index_benchmark(
         );
     }
     let mut group = criterion
-        .benchmark_group(benchmarks::find_benchmark("partial_unique_index_100_rows").format_name());
+        .benchmark_group(benchmarks::find_benchmark("partial_unique_index_100").format_name());
     group.throughput(Throughput::Elements(100));
     for (name, connection) in connections.iter_mut() {
         group.bench_function(*name, |benchmark| {
@@ -725,9 +722,8 @@ fn temporary_table_benchmark(
     runtime: &Runtime,
     connections: &mut [NamedBenchmarkConnection<'_>],
 ) {
-    let mut group = criterion.benchmark_group(
-        benchmarks::find_benchmark("temporary_table_on_commit_drop").format_name(),
-    );
+    let mut group =
+        criterion.benchmark_group(benchmarks::find_benchmark("temp_on_commit_drop").format_name());
     for (name, connection) in connections.iter_mut() {
         group.bench_function(*name, |benchmark| {
             benchmark.iter(|| {
@@ -760,9 +756,8 @@ fn procedural_trigger_benchmark(
             "CREATE TRIGGER procedural_trigger_insert_update_trigger BEFORE INSERT OR UPDATE ON procedural_trigger_insert_update FOR EACH ROW EXECUTE FUNCTION procedural_trigger_insert_update_function()",
         );
     }
-    let mut group = criterion.benchmark_group(
-        benchmarks::find_benchmark("procedural_trigger_insert_update").format_name(),
-    );
+    let mut group = criterion
+        .benchmark_group(benchmarks::find_benchmark("trigger_insert_update").format_name());
     group.throughput(Throughput::Elements(2));
     for (name, connection) in connections.iter_mut() {
         group.bench_function(*name, |benchmark| {
@@ -921,9 +916,8 @@ fn offset_datetime_benchmark(
         );
     }
     let value = time::OffsetDateTime::from_unix_timestamp_nanos(1_704_164_645_123_456_000).unwrap();
-    let mut group = criterion.benchmark_group(
-        benchmarks::find_benchmark("offset_datetime_bind_store_fetch").format_name(),
-    );
+    let mut group = criterion
+        .benchmark_group(benchmarks::find_benchmark("offset_datetime_roundtrip").format_name());
     group.throughput(Throughput::Elements(1));
     for (name, connection) in connections.iter_mut() {
         group.bench_function(*name, |benchmark| {
@@ -953,9 +947,8 @@ fn bigint_uuid_array_benchmark(
         None,
         Some(uuid::Uuid::parse_str("018f0f60-4bc5-7d4c-8a4b-23e99e0d3a90").unwrap()),
     ];
-    let mut group = criterion.benchmark_group(
-        benchmarks::find_benchmark("bigint_uuid_array_bind_store_fetch").format_name(),
-    );
+    let mut group = criterion
+        .benchmark_group(benchmarks::find_benchmark("int8_uuid_array_roundtrip").format_name());
     group.throughput(Throughput::Elements(1));
     for (name, connection) in connections.iter_mut() {
         group.bench_function(*name, |benchmark| {
@@ -995,7 +988,7 @@ fn required_array_query_benchmarks(
         })
         .collect::<Vec<_>>();
     let mut group =
-        criterion.benchmark_group(benchmarks::find_benchmark("uuid_any_100_rows").format_name());
+        criterion.benchmark_group(benchmarks::find_benchmark("uuid_any_100").format_name());
     group.throughput(Throughput::Elements(100));
     for (name, connection) in connections.iter_mut() {
         group.bench_function(*name, |benchmark| {
@@ -1008,9 +1001,8 @@ fn required_array_query_benchmarks(
                         (array_agg(issued_at ORDER BY issued_at DESC) \
                             FILTER (WHERE issued_at <= 75))[2] \
                  FROM required_array_query_100_rows";
-    let mut group = criterion.benchmark_group(
-        benchmarks::find_benchmark("ordered_filtered_array_agg_100_rows").format_name(),
-    );
+    let mut group = criterion
+        .benchmark_group(benchmarks::find_benchmark("array_agg_order_filter_100").format_name());
     group.throughput(Throughput::Elements(100));
     for (name, connection) in connections.iter_mut() {
         group.bench_function(*name, |benchmark| {
@@ -1044,12 +1036,12 @@ fn general_array_operation_benchmarks(
     }
     for (name, query, expected) in [
         (
-            "array_containment_100_rows",
+            "array_containment_100",
             "SELECT id FROM general_array_benchmark WHERE values @> ARRAY[3,4] ORDER BY id",
             100,
         ),
         (
-            "correlated_unnest_100_rows",
+            "correlated_unnest_100",
             "SELECT source.id, expanded.value FROM general_array_benchmark AS source CROSS JOIN LATERAL unnest(source.values) AS expanded(value) ORDER BY source.id",
             300,
         ),
@@ -1073,9 +1065,8 @@ fn hashed_advisory_lock_benchmark(
     runtime: &Runtime,
     connections: &mut [NamedBenchmarkConnection<'_>],
 ) {
-    let mut group = criterion.benchmark_group(
-        benchmarks::find_benchmark("hashed_advisory_lock_acquisition").format_name(),
-    );
+    let mut group =
+        criterion.benchmark_group(benchmarks::find_benchmark("hashed_advisory_lock").format_name());
     group.throughput(Throughput::Elements(1));
     for (name, connection) in connections.iter_mut() {
         group.bench_function(*name, |benchmark| {
@@ -1206,31 +1197,31 @@ fn migration_data_transform_benchmark(
     }
     for (name, query) in [
         (
-            "runtime_temporal_100_rows",
+            "runtime_temporal_100",
             "SELECT id, to_char(date_trunc('minute', to_timestamp(id)), 'YYYY-MM-DD HH24:MI:SS'), floor(id::numeric / 7) FROM migration_data_transform_100_rows ORDER BY id",
         ),
         (
-            "runtime_patterns_100_rows",
+            "runtime_patterns_100",
             "SELECT id, label ILIKE '%VALUE%', regexp_like(label, '[a-z]+ [0-9]+', 'i') FROM migration_data_transform_100_rows ORDER BY id",
         ),
         (
-            "window_row_number_100_rows",
+            "window_row_number_100",
             "SELECT id, row_number() OVER (ORDER BY id DESC) FROM migration_data_transform_100_rows ORDER BY id",
         ),
         (
-            "window_rank_100_rows",
+            "window_rank_100",
             "SELECT id, rank() OVER ranked, dense_rank() OVER ranked, ntile(10) OVER ranked FROM migration_data_transform_100_rows WINDOW ranked AS (PARTITION BY bucket ORDER BY id DESC) ORDER BY id",
         ),
         (
-            "window_offset_100_rows",
+            "window_offset_100",
             "SELECT id, lag(id, 1, -1) OVER ordered, lead(id, 1, -1) OVER ordered, first_value(id) OVER ordered, last_value(id) OVER ordered, nth_value(id, 2) OVER ordered FROM migration_data_transform_100_rows WINDOW ordered AS (PARTITION BY bucket ORDER BY id) ORDER BY id",
         ),
         (
-            "window_moving_aggregate_100_rows",
+            "window_moving_agg_100",
             "SELECT id, sum(id) OVER (PARTITION BY bucket ORDER BY id ROWS BETWEEN 2 PRECEDING AND 2 FOLLOWING), avg(id) OVER (PARTITION BY bucket ORDER BY id GROUPS BETWEEN 1 PRECEDING AND CURRENT ROW) FROM migration_data_transform_100_rows ORDER BY id",
         ),
         (
-            "ordered_string_agg_100_rows",
+            "ordered_string_agg_100",
             "SELECT bucket, string_agg(btrim(label), ',' ORDER BY id) FROM migration_data_transform_100_rows GROUP BY bucket ORDER BY bucket",
         ),
     ] {
@@ -1554,9 +1545,8 @@ fn repeatable_read_benchmark(
         );
     }
     let select = "SELECT * FROM transaction_repeatable_read_select_for_update FOR UPDATE";
-    let mut group = criterion.benchmark_group(
-        benchmarks::find_benchmark("transaction_repeatable_read_select_for_update").format_name(),
-    );
+    let mut group =
+        criterion.benchmark_group(benchmarks::find_benchmark("rr_select_for_update").format_name());
 
     for (name, connection) in connections.iter_mut() {
         group.bench_function(*name, |benchmark| {
@@ -1628,8 +1618,8 @@ fn benchmark_serializable(criterion: &mut Criterion, runtime: &Runtime, postgres
         );
         first.execute(runtime, "INSERT INTO ssi_benchmark VALUES (1, 0), (2, 0)");
     }
-    let mut group = criterion
-        .benchmark_group(benchmarks::find_benchmark("serializable_uncontended_read").format_name());
+    let mut group =
+        criterion.benchmark_group(benchmarks::find_benchmark("serializable_read").format_name());
     for (name, first, _) in &mut connections {
         group.bench_function(*name, |benchmark| {
             benchmark.iter(|| {
@@ -1680,7 +1670,7 @@ fn select_benchmark(
     }
     let select = "SELECT * FROM select_100_rows";
     let mut group =
-        criterion.benchmark_group(benchmarks::find_benchmark("select_100_rows").format_name());
+        criterion.benchmark_group(benchmarks::find_benchmark("select_100").format_name());
 
     for (name, connection) in connections.iter_mut() {
         group.bench_function(*name, |benchmark| {
@@ -1692,8 +1682,8 @@ fn select_benchmark(
     group.finish();
 
     let select = "SELECT * FROM select_100_rows WHERE id = 50";
-    let mut group = criterion
-        .benchmark_group(benchmarks::find_benchmark("select_where_100_rows").format_name());
+    let mut group =
+        criterion.benchmark_group(benchmarks::find_benchmark("select_where_100").format_name());
 
     for (name, connection) in connections.iter_mut() {
         group.bench_function(*name, |benchmark| {
@@ -1706,7 +1696,7 @@ fn select_benchmark(
 
     let select = "SELECT * FROM select_where_indexed_100_rows WHERE id = 50";
     let mut group = criterion
-        .benchmark_group(benchmarks::find_benchmark("select_where_indexed_100_rows").format_name());
+        .benchmark_group(benchmarks::find_benchmark("select_where_indexed_100").format_name());
 
     for (name, connection) in connections.iter_mut() {
         group.bench_function(*name, |benchmark| {
@@ -1720,7 +1710,7 @@ fn select_benchmark(
     let select =
         "SELECT id, name FROM limit_offset_ordered_100_rows ORDER BY id DESC LIMIT 10 OFFSET 40";
     let mut group = criterion
-        .benchmark_group(benchmarks::find_benchmark("limit_offset_ordered_100_rows").format_name());
+        .benchmark_group(benchmarks::find_benchmark("limit_offset_ordered_100").format_name());
 
     for (name, connection) in connections.iter_mut() {
         group.bench_function(*name, |benchmark| {
@@ -1764,7 +1754,7 @@ fn nested_filtered_view_benchmark(
         );
     }
     let mut group = criterion
-        .benchmark_group(benchmarks::find_benchmark("nested_filtered_view_100_rows").format_name());
+        .benchmark_group(benchmarks::find_benchmark("nested_filtered_view_100").format_name());
     for (name, connection) in connections.iter_mut() {
         group.bench_function(*name, |benchmark| {
             benchmark.iter(|| {
@@ -1811,7 +1801,7 @@ fn order_by_benchmark(
     }
     let select = "SELECT id, bucket FROM order_by_100_rows ORDER BY bucket DESC NULLS LAST, id ASC";
     let mut group =
-        criterion.benchmark_group(benchmarks::find_benchmark("order_by_100_rows").format_name());
+        criterion.benchmark_group(benchmarks::find_benchmark("order_by_100").format_name());
 
     for (name, connection) in connections.iter_mut() {
         group.bench_function(*name, |benchmark| {
@@ -1853,9 +1843,8 @@ fn core_vs_sqlx_benchmark(criterion: &mut Criterion, runtime: &Runtime) {
     );
     fake_execute(runtime, &mut sqlx, "BEGIN");
 
-    let mut group = criterion.benchmark_group(
-        benchmarks::find_benchmark("adapter_overhead_select_100_rows").format_name(),
-    );
+    let mut group =
+        criterion.benchmark_group(benchmarks::find_benchmark("adapter_select_100").format_name());
     group.throughput(Throughput::Elements(100));
     group.bench_function("core", |benchmark| {
         benchmark.iter(|| {
@@ -1875,10 +1864,7 @@ fn core_vs_sqlx_benchmark(criterion: &mut Criterion, runtime: &Runtime) {
 }
 
 fn benchmark_snapshots(criterion: &mut Criterion) {
-    for (rows, name) in [
-        (100, "core_snapshot_100_rows"),
-        (1_000, "core_snapshot_1000_rows"),
-    ] {
+    for (rows, name) in [(100, "core_snapshot_100"), (1_000, "core_snapshot_1k")] {
         let db = Db::create();
         let mut session = db.create_session();
         core_execute(
@@ -1909,9 +1895,8 @@ fn parsed_vs_prepared_benchmark(criterion: &mut Criterion) {
     core_execute(&mut session, "BEGIN");
     let parameters = [Value::Int4(50)];
 
-    let mut group = criterion.benchmark_group(
-        benchmarks::find_benchmark("core_parsed_vs_prepared_point_select").format_name(),
-    );
+    let mut group = criterion
+        .benchmark_group(benchmarks::find_benchmark("core_parse_vs_prepare").format_name());
     group.bench_function("parse_and_analyze", |benchmark| {
         benchmark.iter(|| {
             let result = session.query(query, &parameters).unwrap();
@@ -1930,9 +1915,8 @@ fn parsed_vs_prepared_benchmark(criterion: &mut Criterion) {
 }
 
 fn transaction_history_benchmark(criterion: &mut Criterion) {
-    let mut group = criterion.benchmark_group(
-        benchmarks::find_benchmark("transaction_history_point_select").format_name(),
-    );
+    let mut group =
+        criterion.benchmark_group(benchmarks::find_benchmark("tx_history_lookup").format_name());
     for completed in [1_u64, 100, 10_000, 100_000] {
         let mut session = Db::create().create_session();
         core_execute(
@@ -2007,8 +1991,8 @@ fn mvcc_version_chain_benchmark(criterion: &mut Criterion) {
 }
 
 fn indexed_vs_scan_benchmark(criterion: &mut Criterion) {
-    let mut group = criterion
-        .benchmark_group(benchmarks::find_benchmark("point_lookup_index_vs_scan").format_name());
+    let mut group =
+        criterion.benchmark_group(benchmarks::find_benchmark("lookup_index_vs_scan").format_name());
     for rows in [100_usize, 10_000] {
         group.throughput(Throughput::Elements(rows as u64));
 
@@ -2070,7 +2054,7 @@ fn benchmark_lookup_scaling(
     runtime: &Runtime,
     connections: &mut [NamedBenchmarkConnection<'_>],
 ) {
-    for rows in [100_usize, 1_000] {
+    for (rows, size) in [(100_usize, "100"), (1_000, "1k")] {
         let indexed_values = (1..=rows)
             .map(|id| format!("({id}, {id}, {id})"))
             .collect::<Vec<_>>()
@@ -2105,15 +2089,15 @@ fn benchmark_lookup_scaling(
         }
         for (shape, query) in [
             (
-                "unique_index",
+                "unique",
                 "SELECT amount FROM lookup_scaling_indexed WHERE id = $1",
             ),
             (
-                "nonunique_index",
+                "nonuniq",
                 "SELECT amount FROM lookup_scaling_indexed WHERE lookup_key = $1",
             ),
             (
-                "nonunique_filtered",
+                "nonuniq_filter",
                 "SELECT amount FROM lookup_scaling_indexed WHERE lookup_key = $1 AND amount >= 0",
             ),
             (
@@ -2122,8 +2106,7 @@ fn benchmark_lookup_scaling(
             ),
         ] {
             let mut group = criterion.benchmark_group(
-                benchmarks::find_benchmark(&format!("lookup_scaling_{shape}_{rows}_rows"))
-                    .format_name(),
+                benchmarks::find_benchmark(&format!("lookup_{shape}_{size}")).format_name(),
             );
             group.throughput(Throughput::Elements(1));
             for (name, connection) in connections.iter_mut() {
@@ -2147,7 +2130,7 @@ fn benchmark_populated_table_writes(
     runtime: &Runtime,
     connections: &mut [NamedBenchmarkConnection<'_>],
 ) {
-    for rows in [100_usize, 1_000] {
+    for (rows, size) in [(100_usize, "100"), (1_000, "1k")] {
         let values = (1..=rows)
             .map(|id| format!("({id}, 0)"))
             .collect::<Vec<_>>()
@@ -2172,10 +2155,7 @@ fn benchmark_populated_table_writes(
             ("delete", "DELETE FROM populated_table_writes WHERE id = $1"),
         ] {
             let mut group = criterion.benchmark_group(
-                benchmarks::find_benchmark(&format!(
-                    "populated_table_writes_{operation}_{rows}_rows"
-                ))
-                .format_name(),
+                benchmarks::find_benchmark(&format!("{operation}_indexed_{size}")).format_name(),
             );
             group.sample_size(20);
             group.measurement_time(Duration::from_secs(2));
@@ -2230,8 +2210,8 @@ fn concurrency_benchmark(criterion: &mut Criterion, runtime: &Runtime) {
         fake_execute(runtime, connection, "BEGIN");
     }
 
-    let mut group = criterion
-        .benchmark_group(benchmarks::find_benchmark("concurrent_uncontended_reads").format_name());
+    let mut group =
+        criterion.benchmark_group(benchmarks::find_benchmark("concurrent_reads").format_name());
     group.throughput(Throughput::Elements(2));
     group.bench_function("sequential", |benchmark| {
         benchmark.iter(|| {
@@ -2292,9 +2272,8 @@ fn concurrency_benchmark(criterion: &mut Criterion, runtime: &Runtime) {
     );
     let mut first = PgFakeConnection::new(db.clone());
     let mut second = PgFakeConnection::new(db);
-    let mut group = criterion.benchmark_group(
-        benchmarks::find_benchmark("concurrent_same_row_contention").format_name(),
-    );
+    let mut group =
+        criterion.benchmark_group(benchmarks::find_benchmark("same_row_contention").format_name());
     group.sample_size(20);
     group.measurement_time(Duration::from_secs(2));
     group.bench_function("wait_then_rollback", |benchmark| {
@@ -2464,8 +2443,8 @@ fn on_conflict_benchmark(
         );
     }
     let query = "INSERT INTO insert_on_conflict_do_nothing VALUES (1, 'proposed') ON CONFLICT (id) DO NOTHING";
-    let mut group = criterion
-        .benchmark_group(benchmarks::find_benchmark("insert_on_conflict_do_nothing").format_name());
+    let mut group =
+        criterion.benchmark_group(benchmarks::find_benchmark("on_conflict_nothing").format_name());
     group.throughput(Throughput::Elements(1));
     for (name, connection) in connections.iter_mut() {
         group.bench_function(*name, |benchmark| {
@@ -2475,9 +2454,8 @@ fn on_conflict_benchmark(
     group.finish();
 
     let insert = "INSERT INTO insert_on_conflict_do_nothing VALUES (2, 'new') ON CONFLICT (id) DO UPDATE SET value = excluded.value";
-    let mut group = criterion.benchmark_group(
-        benchmarks::find_benchmark("insert_on_conflict_conflict_free").format_name(),
-    );
+    let mut group = criterion
+        .benchmark_group(benchmarks::find_benchmark("on_conflict_no_conflict").format_name());
     group.throughput(Throughput::Elements(1));
     for (name, connection) in connections.iter_mut() {
         group.bench_function(*name, |benchmark| {
@@ -2493,8 +2471,8 @@ fn on_conflict_benchmark(
     group.finish();
 
     let update = "INSERT INTO insert_on_conflict_do_nothing VALUES (1, 'proposed') ON CONFLICT (id) DO UPDATE SET value = excluded.value";
-    let mut group = criterion
-        .benchmark_group(benchmarks::find_benchmark("insert_on_conflict_do_update").format_name());
+    let mut group =
+        criterion.benchmark_group(benchmarks::find_benchmark("on_conflict_update").format_name());
     group.throughput(Throughput::Elements(1));
     for (name, connection) in connections.iter_mut() {
         group.bench_function(*name, |benchmark| {
@@ -2528,8 +2506,8 @@ fn global_aggregate_benchmark(
         );
     }
     let query = "SELECT count(*), sum(id), avg(id), min(bucket), max(bucket) FROM global_aggregate_100_rows";
-    let mut group = criterion
-        .benchmark_group(benchmarks::find_benchmark("global_aggregate_100_rows").format_name());
+    let mut group =
+        criterion.benchmark_group(benchmarks::find_benchmark("global_aggregate_100").format_name());
     group.throughput(Throughput::Elements(100));
     for (name, connection) in connections.iter_mut() {
         group.bench_function(*name, |benchmark| {
@@ -2565,7 +2543,7 @@ fn grouped_aggregate_benchmark(
     }
     let query = "SELECT bucket, count(*), sum(id) FROM grouped_aggregate_100_rows GROUP BY bucket HAVING count(*) > 5 ORDER BY bucket";
     let mut group = criterion
-        .benchmark_group(benchmarks::find_benchmark("grouped_aggregate_100_rows").format_name());
+        .benchmark_group(benchmarks::find_benchmark("grouped_aggregate_100").format_name());
     group.throughput(Throughput::Elements(100));
     for (name, connection) in connections.iter_mut() {
         group.bench_function(*name, |benchmark| {
@@ -2600,8 +2578,8 @@ fn select_distinct_benchmark(
         );
     }
     let query = "SELECT DISTINCT bucket FROM select_distinct_100_rows ORDER BY bucket";
-    let mut group = criterion
-        .benchmark_group(benchmarks::find_benchmark("select_distinct_100_rows").format_name());
+    let mut group =
+        criterion.benchmark_group(benchmarks::find_benchmark("select_distinct_100").format_name());
     group.throughput(Throughput::Elements(100));
     for (name, connection) in connections.iter_mut() {
         group.bench_function(*name, |benchmark| {
@@ -2627,11 +2605,11 @@ fn set_operation_benchmark(
         .join(",");
     for (name, query) in [
         (
-            "union_all_100_rows",
+            "union_all_100",
             format!("VALUES {values} UNION ALL VALUES {values}"),
         ),
         (
-            "union_100_rows",
+            "union_100",
             format!("VALUES {values} UNION VALUES {values}"),
         ),
     ] {
@@ -2667,9 +2645,8 @@ fn derived_and_scalar_subquery_benchmark(
         }
     }
     let query = "SELECT source.id FROM (SELECT id FROM derived_and_scalar_subquery_100_rows WHERE id <= (SELECT 100)) AS source WHERE source.id = ANY (SELECT id FROM derived_and_scalar_subquery_100_rows) ORDER BY source.id";
-    let mut group = criterion.benchmark_group(
-        benchmarks::find_benchmark("derived_and_scalar_subquery_100_rows").format_name(),
-    );
+    let mut group = criterion
+        .benchmark_group(benchmarks::find_benchmark("derived_scalar_subq_100").format_name());
     group.throughput(Throughput::Elements(100));
     for (name, connection) in connections.iter_mut() {
         group.bench_function(*name, |benchmark| {
@@ -2682,7 +2659,7 @@ fn derived_and_scalar_subquery_benchmark(
 
     let query = "SELECT outer_row.id FROM correlated_exists_100_rows AS outer_row WHERE EXISTS (SELECT 1 FROM correlated_exists_100_rows AS inner_row WHERE inner_row.id = outer_row.id)";
     let mut group = criterion
-        .benchmark_group(benchmarks::find_benchmark("correlated_exists_100_rows").format_name());
+        .benchmark_group(benchmarks::find_benchmark("correlated_exists_100").format_name());
     group.throughput(Throughput::Elements(100));
     for (name, connection) in connections.iter_mut() {
         group.bench_function(*name, |benchmark| {
@@ -2720,8 +2697,8 @@ fn materialized_cte_benchmark(
         );
     }
     let query = "WITH source(value) AS (SELECT id FROM materialized_cte_100_rows) SELECT left_source.value FROM source AS left_source JOIN source AS right_source ON left_source.value = right_source.value ORDER BY left_source.value";
-    let mut group = criterion
-        .benchmark_group(benchmarks::find_benchmark("materialized_cte_100_rows").format_name());
+    let mut group =
+        criterion.benchmark_group(benchmarks::find_benchmark("materialized_cte_100").format_name());
     group.throughput(Throughput::Elements(100));
     for (name, connection) in connections.iter_mut() {
         group.bench_function(*name, |benchmark| {
@@ -2759,7 +2736,7 @@ fn derived_source_join_benchmark(
     }
     let query = "SELECT left_source.id FROM (SELECT id FROM derived_join_left) AS left_source JOIN (SELECT id FROM derived_join_right) AS right_source ON left_source.id = right_source.id ORDER BY left_source.id";
     let mut group = criterion
-        .benchmark_group(benchmarks::find_benchmark("derived_source_join_100_rows").format_name());
+        .benchmark_group(benchmarks::find_benchmark("derived_source_join_100").format_name());
     group.throughput(Throughput::Elements(100));
     for (name, connection) in connections.iter_mut() {
         group.bench_function(*name, |benchmark| {
@@ -2794,9 +2771,8 @@ fn data_modifying_cte_benchmark(
         );
     }
     let query = "WITH updated AS (UPDATE data_modifying_cte_update_100_rows SET value = value RETURNING id) SELECT count(*) FROM updated";
-    let mut group = criterion.benchmark_group(
-        benchmarks::find_benchmark("data_modifying_cte_update_100_rows").format_name(),
-    );
+    let mut group =
+        criterion.benchmark_group(benchmarks::find_benchmark("cte_update_100").format_name());
     group.throughput(Throughput::Elements(100));
     for (name, connection) in connections.iter_mut() {
         group.bench_function(*name, |benchmark| {
@@ -2815,9 +2791,8 @@ fn recursive_cte_benchmark(
     connections: &mut [NamedBenchmarkConnection<'_>],
 ) {
     let series_query = "WITH RECURSIVE series(value) AS (VALUES (1) UNION ALL SELECT value + 1 FROM series WHERE value < 100) SELECT value FROM series";
-    let mut group = criterion.benchmark_group(
-        benchmarks::find_benchmark("recursive_cte_numeric_series_100_rows").format_name(),
-    );
+    let mut group =
+        criterion.benchmark_group(benchmarks::find_benchmark("recursive_series_100").format_name());
     group.throughput(Throughput::Elements(100));
     for (name, connection) in connections.iter_mut() {
         group.bench_function(*name, |benchmark| {
@@ -2841,9 +2816,8 @@ fn recursive_cte_benchmark(
         );
     }
     let traversal_query = "WITH RECURSIVE walk(value) AS (VALUES (1) UNION ALL SELECT edges.child FROM walk JOIN recursive_cte_branching_edges AS edges ON edges.parent = walk.value) SELECT value FROM walk";
-    let mut group = criterion.benchmark_group(
-        benchmarks::find_benchmark("recursive_cte_branching_traversal_127_rows").format_name(),
-    );
+    let mut group =
+        criterion.benchmark_group(benchmarks::find_benchmark("recursive_tree_127").format_name());
     group.throughput(Throughput::Elements(127));
     for (name, connection) in connections.iter_mut() {
         group.bench_function(*name, |benchmark| {
@@ -2914,7 +2888,7 @@ fn benchmark_selective_indexed_join(
     runtime: &Runtime,
     connections: &mut [NamedBenchmarkConnection<'_>],
 ) {
-    for rows in [100_usize, 1_000] {
+    for (rows, size) in [(100_usize, "100"), (1_000, "1k")] {
         let key = uuid::Uuid::from_u128(50);
         let values = (1..=rows)
             .map(|id| format!("('{}', {id})", uuid::Uuid::from_u128(id as u128)))
@@ -2949,13 +2923,12 @@ fn benchmark_selective_indexed_join(
             connection.execute(runtime, "ANALYZE indexed_join_middle");
             connection.execute(runtime, "ANALYZE indexed_join_right");
         }
-        for (shape, predicate) in [("plain", ""), ("filtered", " AND right_row.value >= 0")] {
+        for (shape, predicate) in [("3way", ""), ("3way_filtered", " AND right_row.value >= 0")] {
             let query = format!(
                 "SELECT right_row.value FROM indexed_join_left AS left_row JOIN indexed_join_middle AS middle_row ON middle_row.id = left_row.id JOIN indexed_join_right AS right_row ON right_row.id = middle_row.id WHERE left_row.id = $1{predicate}"
             );
             let mut group = criterion.benchmark_group(
-                benchmarks::find_benchmark(&format!("selective_indexed_join_{shape}_{rows}_rows"))
-                    .format_name(),
+                benchmarks::find_benchmark(&format!("join_{shape}_{size}")).format_name(),
             );
             group.throughput(Throughput::Elements(1));
             for (connection_name, connection) in connections.iter_mut() {
@@ -2967,10 +2940,7 @@ fn benchmark_selective_indexed_join(
         }
         let two_table_query = "SELECT right_row.value FROM indexed_join_left AS left_row JOIN indexed_join_right AS right_row ON right_row.id = left_row.id WHERE left_row.id = $1 AND right_row.value >= 0";
         let mut group = criterion.benchmark_group(
-            benchmarks::find_benchmark(&format!(
-                "selective_indexed_join_two_table_filtered_{rows}_rows"
-            ))
-            .format_name(),
+            benchmarks::find_benchmark(&format!("join_2way_filtered_{size}")).format_name(),
         );
         group.throughput(Throughput::Elements(1));
         for (connection_name, connection) in connections.iter_mut() {
@@ -3008,9 +2978,8 @@ fn benchmark_lateral(
         );
     }
     let query = "SELECT p.id, x.id FROM lateral_benchmark_items p LEFT JOIN LATERAL (SELECT c.id FROM lateral_benchmark_items c WHERE c.parent_id = p.parent_id ORDER BY c.id DESC LIMIT 1) x ON TRUE";
-    let mut group = criterion.benchmark_group(
-        benchmarks::find_benchmark("lateral_latest_per_parent_100_rows").format_name(),
-    );
+    let mut group =
+        criterion.benchmark_group(benchmarks::find_benchmark("lateral_latest_100").format_name());
     group.throughput(Throughput::Elements(100));
     for (name, connection) in connections.iter_mut() {
         group.bench_function(*name, |benchmark| {
@@ -3043,7 +3012,7 @@ fn benchmark_skip_locked(
         );
     }
     let mut group = criterion
-        .benchmark_group(benchmarks::find_benchmark("skip_locked_queue_100_rows").format_name());
+        .benchmark_group(benchmarks::find_benchmark("skip_locked_queue_100").format_name());
     group.throughput(Throughput::Elements(10));
     for (name, connection) in connections.iter_mut() {
         group.bench_function(*name, |benchmark| {
