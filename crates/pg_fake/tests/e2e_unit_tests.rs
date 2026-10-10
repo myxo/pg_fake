@@ -12,7 +12,7 @@ use pg_fake::{
     error::SqlState,
     value::{BaseType, Value},
 };
-use postgres::{Client, NoTls, SimpleQueryMessage};
+use postgres::{Client, Config, NoTls, SimpleQueryMessage};
 use sqlparser::{
     ast::Statement,
     dialect::PostgreSqlDialect,
@@ -48,8 +48,17 @@ static TABLE_NUMBER: AtomicU64 = AtomicU64::new(1);
 static TEST_LOCK: Mutex<()> = Mutex::new(());
 
 struct PostgresServer {
-    url: String,
+    config: Config,
+    database: String,
+    connection: Client,
     _container: Option<Container<Postgres>>,
+}
+
+impl Drop for PostgresServer {
+    fn drop(&mut self) {
+        let sql = format!("DROP DATABASE {} WITH (FORCE)", self.database);
+        let _ = self.connection.batch_execute(&sql);
+    }
 }
 
 fn start_postgres_server() -> PostgresServer {
@@ -79,8 +88,24 @@ fn start_postgres_server() -> PostgresServer {
                 .expect("PostgreSQL port must be available")
         )
     });
+    let mut config: Config = url
+        .parse()
+        .expect("must parse PostgreSQL test configuration");
+    let mut connection = config.connect(NoTls).expect("must connect to PostgreSQL");
+    let backend: i32 = connection
+        .query_one("SELECT pg_backend_pid()", &[])
+        .expect("must identify differential-test setup connection")
+        .get(0);
+    let database = format!("pg_fake_differential_{}_{backend}", std::process::id());
+    let sql = format!("CREATE DATABASE {database} TEMPLATE template0 LC_COLLATE 'C' LC_CTYPE 'C'");
+    connection
+        .batch_execute(&sql)
+        .expect("must create isolated differential-test database");
+    config.dbname(&database);
     PostgresServer {
-        url,
+        config,
+        database,
+        connection,
         _container: container,
     }
 }
@@ -105,7 +130,10 @@ fn assert_differential(script: &str, row_order: RowOrder) {
         TABLE_NUMBER.fetch_add(1, Ordering::Relaxed)
     );
     let script = script.replace("__TABLE__", &table_name);
-    let mut postgres = Client::connect(&server.url, NoTls).expect("must connect to PostgreSQL");
+    let mut postgres = server
+        .config
+        .connect(NoTls)
+        .expect("must connect to PostgreSQL");
     let db = Db::create();
     let mut fake = db.create_session();
 
@@ -144,10 +172,14 @@ fn assert_session_differential(operations: &[(SessionName, &str)], row_order: Ro
             (*session, statements.pop().unwrap(), sql)
         })
         .collect::<Vec<_>>();
-    let mut postgres_first =
-        Client::connect(&server.url, NoTls).expect("must connect to PostgreSQL");
-    let mut postgres_second =
-        Client::connect(&server.url, NoTls).expect("must connect to PostgreSQL");
+    let mut postgres_first = server
+        .config
+        .connect(NoTls)
+        .expect("must connect to PostgreSQL");
+    let mut postgres_second = server
+        .config
+        .connect(NoTls)
+        .expect("must connect to PostgreSQL");
     let db = Db::create();
     let mut fake_first = db.create_session();
     let mut fake_second = db.create_session();
@@ -797,7 +829,10 @@ fn matches_parameter_and_prepared_reuse() {
         std::process::id(),
         TABLE_NUMBER.fetch_add(1, Ordering::Relaxed)
     );
-    let mut postgres = Client::connect(&server.url, NoTls).expect("must connect to PostgreSQL");
+    let mut postgres = server
+        .config
+        .connect(NoTls)
+        .expect("must connect to PostgreSQL");
     let db = Db::create();
     let mut fake = db.create_session();
     let create = format!("CREATE TABLE {table} (id INTEGER, name TEXT, amount SMALLINT)");
@@ -881,7 +916,10 @@ fn matches_multi_statement_batches_and_metadata() {
     let batch_table = format!("pg_fake_batch_{}_{}", std::process::id(), suffix);
     let types_table = format!("pg_fake_types_{}_{}", std::process::id(), suffix);
     let failed_table = format!("pg_fake_failed_{}_{}", std::process::id(), suffix);
-    let mut postgres = Client::connect(&server.url, NoTls).expect("must connect to PostgreSQL");
+    let mut postgres = server
+        .config
+        .connect(NoTls)
+        .expect("must connect to PostgreSQL");
     let db = Db::create();
     let mut fake = db.create_session();
 

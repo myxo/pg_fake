@@ -129,7 +129,7 @@ tsrf:1
 tstypes:1
 tuplesort:1
 typed_table:1
-union:26
+union:35
 updatable_views:1
 update:12
 uuid:10

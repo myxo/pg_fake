@@ -437,7 +437,9 @@ fn collect_phase2_report(
         for case in feature.cases {
             total += 1;
             let database = format!("pg_fake_regress_phase2_{}_{}", std::process::id(), total);
-            let sql = format!("CREATE DATABASE {database}");
+            let sql = format!(
+                "CREATE DATABASE {database} TEMPLATE template0 LC_COLLATE 'C' LC_CTYPE 'C'"
+            );
             runtime
                 .block_on(sqlx::raw_sql(sql.as_str()).execute(&mut *admin))
                 .expect("must create PostgreSQL Phase 2 regression database");
@@ -496,7 +498,9 @@ fn collect_phase3_report(
         for case in feature.cases {
             total += 1;
             let database = format!("pg_fake_regress_phase3_{}_{}", std::process::id(), total);
-            let sql = format!("CREATE DATABASE {database}");
+            let sql = format!(
+                "CREATE DATABASE {database} TEMPLATE template0 LC_COLLATE 'C' LC_CTYPE 'C'"
+            );
             runtime
                 .block_on(sqlx::raw_sql(sql.as_str()).execute(&mut *admin))
                 .expect("must create PostgreSQL Phase 3 regression database");
@@ -593,7 +597,8 @@ fn reports_phase2_regression_progress() {
         };
 
         let database = format!("pg_fake_regress_source_{}_{}", std::process::id(), index);
-        let sql = format!("CREATE DATABASE {database}");
+        let sql =
+            format!("CREATE DATABASE {database} TEMPLATE template0 LC_COLLATE 'C' LC_CTYPE 'C'");
         runtime
             .block_on(sqlx::raw_sql(sql.as_str()).execute(&mut admin))
             .expect("must create PostgreSQL regression database");

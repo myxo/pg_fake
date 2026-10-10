@@ -129,7 +129,7 @@ tsrf:1	later
 tstypes:1	later
 tuplesort:1	later
 typed_table:1	parser
-union:26	parser
+union:35	later
 updatable_views:1	later
 update:12	later
 uuid:10	later

@@ -136,9 +136,9 @@ against it. Basically, just apply sql to both systems and see that they return t
 
 We run the PostgreSQL regression tests and differential property tests with custom generators.
 
-SQLx tests use `PG_FAKE_DATABASE_URL` from the environment or `.env` when set;
+PostgreSQL comparison tests use `PG_FAKE_DATABASE_URL` from the environment or `.env` when set;
 otherwise they start PostgreSQL 18 containers. The configured database must be
-dedicated to testing. Property tests run concurrently in separate databases;
+dedicated to testing. Differential tests use separate databases with C collation;
 the configured PostgreSQL role must have `CREATEDB` permission. Each suite drops
 its database when it finishes, including when a test panics.
 
