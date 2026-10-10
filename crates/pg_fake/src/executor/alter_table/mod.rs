@@ -164,11 +164,11 @@ fn apply_table_changes(
             defer_all,
             &[],
         )?;
-        if state
+        if let Some(constraint) = state
             .tables
             .get(&schema.id)
             .expect("catalog table must have storage")
-            .has_visible_unique_conflict(
+            .find_unique_conflict_name(
                 &altered.row,
                 snapshot,
                 xid,
@@ -180,10 +180,7 @@ fn apply_table_changes(
                 context,
             )
         {
-            return Err(PgError::create(
-                SqlState::UniqueViolation,
-                format!("could not create unique constraint on {:?}", schema.name),
-            ));
+            return Err(PgError::create_unique_violation(constraint));
         }
     }
     validate_foreign_key_definitions(&state.catalog, &schema)?;

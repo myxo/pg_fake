@@ -202,6 +202,7 @@ impl std::fmt::Display for SqlState {
 pub struct PgError {
     pub sqlstate: SqlState,
     pub message: String,
+    pub constraint: Option<String>,
     pub detail: Option<String>,
     pub hint: Option<String>,
     pub position: Option<usize>,
@@ -213,10 +214,20 @@ impl PgError {
         PgError {
             sqlstate,
             message: message.into(),
+            constraint: None,
             detail: None,
             hint: None,
             position: None,
         }
+    }
+
+    pub(crate) fn create_unique_violation(constraint: &str) -> Self {
+        let mut error = Self::create(
+            SqlState::UniqueViolation,
+            format!("duplicate key value violates unique constraint {constraint:?}"),
+        );
+        error.constraint = Some(constraint.to_owned());
+        error
     }
 }
 

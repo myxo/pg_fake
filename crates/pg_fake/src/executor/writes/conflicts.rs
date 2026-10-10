@@ -415,17 +415,20 @@ pub(super) fn execute_insert_conflict(
         .expect("catalog table must have storage");
     let Some(update) = update else {
         return Ok(
-            if table.has_visible_unique_conflict(
-                row,
-                snapshot,
-                xid,
-                &state.transactions,
-                None,
-                None,
-                arbiter.get_columns(),
-                arbiter.get_predicate(),
-                context,
-            ) {
+            if table
+                .find_unique_conflict_name(
+                    row,
+                    snapshot,
+                    xid,
+                    &state.transactions,
+                    None,
+                    None,
+                    arbiter.get_columns(),
+                    arbiter.get_predicate(),
+                    context,
+                )
+                .is_some()
+            {
                 InsertConflictOutcome::Skip
             } else {
                 InsertConflictOutcome::Insert
@@ -443,11 +446,11 @@ pub(super) fn execute_insert_conflict(
         let Some(updated) = &prepared.updated else {
             return Ok(InsertConflictOutcome::Skip);
         };
-        if state
+        if let Some(constraint) = state
             .tables
             .get(&schema.id)
             .expect("catalog table must have storage")
-            .has_visible_unique_conflict(
+            .find_unique_conflict_name(
                 updated,
                 snapshot,
                 xid,
@@ -459,13 +462,7 @@ pub(super) fn execute_insert_conflict(
                 context,
             )
         {
-            return Err(PgError::create(
-                SqlState::UniqueViolation,
-                format!(
-                    "duplicate key value violates unique constraint on {:?}",
-                    schema.name
-                ),
-            ));
+            return Err(PgError::create_unique_violation(constraint));
         }
         state
             .tables
@@ -584,11 +581,11 @@ pub(super) fn execute_insert_conflict(
     };
     validate_not_null(schema, &updated)?;
     validate_check_constraints(schema, &updated, context)?;
-    if state
+    if let Some(constraint) = state
         .tables
         .get(&schema.id)
         .expect("catalog table must have storage")
-        .has_visible_unique_conflict(
+        .find_unique_conflict_name(
             &updated,
             snapshot,
             xid,
@@ -600,13 +597,7 @@ pub(super) fn execute_insert_conflict(
             context,
         )
     {
-        return Err(PgError::create(
-            SqlState::UniqueViolation,
-            format!(
-                "duplicate key value violates unique constraint on {:?}",
-                schema.name
-            ),
-        ));
+        return Err(PgError::create_unique_violation(constraint));
     }
     state
         .tables

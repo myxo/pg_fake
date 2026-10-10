@@ -145,6 +145,7 @@ pub(super) fn execute_create_index(
             state,
             &table,
             &columns,
+            &resolved_name.name,
             create.predicate.as_ref(),
             xid,
             snapshot,
@@ -256,6 +257,7 @@ fn validate_unique_index_rows(
     state: &DatabaseState,
     schema: &TableSchema,
     columns: &[IndexColumnDefinition],
+    name: &str,
     predicate: Option<&ast::Expr>,
     xid: Xid,
     snapshot: &Snapshot,
@@ -297,10 +299,7 @@ fn validate_unique_index_rows(
                     .is_ok_and(|ordering| ordering == Ordering::Equal)
             });
             if duplicate {
-                return Err(PgError::create(
-                    SqlState::UniqueViolation,
-                    format!("could not create unique index on {:?}", schema.name),
-                ));
+                return Err(PgError::create_unique_violation(name));
             }
         }
     }

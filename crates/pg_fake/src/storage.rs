@@ -134,6 +134,7 @@ pub(crate) struct IndexKey(Vec<NormalizedIndexValue>);
 
 #[derive(Debug, Clone, PartialEq)]
 struct TableIndex {
+    name: String,
     unique: bool,
     columns: Vec<usize>,
     predicate: Option<ast::Expr>,
@@ -163,23 +164,23 @@ impl Table {
             .constraints
             .iter()
             .filter_map(|constraint| match constraint {
-                Constraint::PrimaryKey { columns, .. } | Constraint::Unique { columns, .. } => {
-                    Some(TableIndex {
-                        unique: true,
-                        columns: columns
-                            .iter()
-                            .map(|name| {
-                                schema
-                                    .columns
-                                    .iter()
-                                    .position(|column| &column.name == name)
-                                    .expect("constraint columns must exist")
-                            })
-                            .collect(),
-                        predicate: None,
-                        entries: BTreeMap::new(),
-                    })
-                }
+                Constraint::PrimaryKey { name, columns, .. }
+                | Constraint::Unique { name, columns, .. } => Some(TableIndex {
+                    name: name.clone(),
+                    unique: true,
+                    columns: columns
+                        .iter()
+                        .map(|name| {
+                            schema
+                                .columns
+                                .iter()
+                                .position(|column| &column.name == name)
+                                .expect("constraint columns must exist")
+                        })
+                        .collect(),
+                    predicate: None,
+                    entries: BTreeMap::new(),
+                }),
                 Constraint::Check { .. } | Constraint::ForeignKey(_) => None,
             })
             .chain(
@@ -220,23 +221,23 @@ impl Table {
             .constraints
             .iter()
             .filter_map(|constraint| match constraint {
-                Constraint::PrimaryKey { columns, .. } | Constraint::Unique { columns, .. } => {
-                    Some(TableIndex {
-                        unique: true,
-                        columns: columns
-                            .iter()
-                            .map(|name| {
-                                self.schema
-                                    .columns
-                                    .iter()
-                                    .position(|column| &column.name == name)
-                                    .expect("constraint columns must exist")
-                            })
-                            .collect(),
-                        predicate: None,
-                        entries: BTreeMap::new(),
-                    })
-                }
+                Constraint::PrimaryKey { name, columns, .. }
+                | Constraint::Unique { name, columns, .. } => Some(TableIndex {
+                    name: name.clone(),
+                    unique: true,
+                    columns: columns
+                        .iter()
+                        .map(|name| {
+                            self.schema
+                                .columns
+                                .iter()
+                                .position(|column| &column.name == name)
+                                .expect("constraint columns must exist")
+                        })
+                        .collect(),
+                    predicate: None,
+                    entries: BTreeMap::new(),
+                }),
                 Constraint::Check { .. } | Constraint::ForeignKey(_) => None,
             })
             .chain(
@@ -666,7 +667,7 @@ impl Table {
     }
 
     #[cfg_attr(feature = "execution-log", tracing::instrument(skip_all))]
-    pub(crate) fn has_visible_unique_conflict(
+    pub(crate) fn find_unique_conflict_name(
         &self,
         row: &Row,
         snapshot: &Snapshot,
@@ -677,7 +678,7 @@ impl Table {
         arbiter_columns: Option<&[usize]>,
         arbiter_predicate: Option<&ast::Expr>,
         context: &StatementContext,
-    ) -> bool {
+    ) -> Option<&str> {
         let snapshot = snapshot.include_current_command();
         self.indexes
             .iter()
@@ -690,7 +691,7 @@ impl Table {
                     index.columns == columns && index.predicate.as_ref() == arbiter_predicate
                 })
             })
-            .any(|index| {
+            .find(|index| {
                 if !matches_index_predicate(&self.schema, index, row, context) {
                     return false;
                 }
@@ -715,6 +716,7 @@ impl Table {
                     })
                 })
             })
+            .map(|index| index.name.as_str())
     }
 
     pub(crate) fn pending_unique_changes(&self) -> PendingUniqueChanges {
@@ -726,7 +728,7 @@ impl Table {
         }
     }
 
-    pub(crate) fn has_visible_unique_conflict_with_pending(
+    pub(crate) fn find_unique_conflict_name_with_pending(
         &self,
         row: &Row,
         snapshot: &Snapshot,
@@ -735,12 +737,12 @@ impl Table {
         excluded_row: Option<RowId>,
         context: &StatementContext,
         pending: &PendingUniqueChanges,
-    ) -> bool {
+    ) -> Option<&str> {
         let snapshot = snapshot.include_current_command();
         self.indexes
             .iter()
             .enumerate()
-            .any(|(index_number, index)| {
+            .find(|(index_number, index)| {
                 if !index.unique {
                     return false;
                 }
@@ -750,7 +752,7 @@ impl Table {
                 let Some(key) = build_row_index_key(&self.schema, index, row) else {
                     return false;
                 };
-                if pending.entries[index_number]
+                if pending.entries[*index_number]
                     .get(&key)
                     .is_some_and(|row_ids| {
                         row_ids.iter().any(|row_id| Some(*row_id) != excluded_row)
@@ -776,6 +778,7 @@ impl Table {
                     })
                 })
             })
+            .map(|(_, index)| index.name.as_str())
     }
 
     pub(crate) fn record_pending_unique_change(
@@ -819,19 +822,23 @@ impl Table {
         pending.row_keys.insert(row_id, keys);
     }
 
-    pub(crate) fn rows_have_unique_conflict(
+    pub(crate) fn find_row_unique_conflict_name(
         &self,
         left: &Row,
         right: &Row,
         context: &StatementContext,
-    ) -> bool {
-        self.indexes.iter().any(|index| {
-            index.unique
-                && matches_index_predicate(&self.schema, index, left, context)
-                && matches_index_predicate(&self.schema, index, right, context)
-                && build_row_index_key(&self.schema, index, left)
-                    .is_some_and(|key| build_row_index_key(&self.schema, index, right) == Some(key))
-        })
+    ) -> Option<&str> {
+        self.indexes
+            .iter()
+            .find(|index| {
+                index.unique
+                    && matches_index_predicate(&self.schema, index, left, context)
+                    && matches_index_predicate(&self.schema, index, right, context)
+                    && build_row_index_key(&self.schema, index, left).is_some_and(|key| {
+                        build_row_index_key(&self.schema, index, right) == Some(key)
+                    })
+            })
+            .map(|index| index.name.as_str())
     }
 
     #[cfg_attr(feature = "execution-log", tracing::instrument(skip_all))]
@@ -1111,6 +1118,7 @@ impl Table {
 
 fn create_index(schema: &TableSchema, index: &IndexSchema) -> TableIndex {
     TableIndex {
+        name: index.name.clone(),
         unique: index.unique,
         columns: index
             .columns

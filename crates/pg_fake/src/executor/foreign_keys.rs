@@ -546,11 +546,11 @@ fn apply_cascaded_row_update(
     };
     validate_not_null(schema, &updated)?;
     validate_check_constraints(schema, &updated, context)?;
-    if state
+    if let Some(constraint) = state
         .tables
         .get(&schema.id)
         .expect("catalog table must have storage")
-        .has_visible_unique_conflict(
+        .find_unique_conflict_name(
             &updated,
             snapshot,
             xid,
@@ -562,13 +562,7 @@ fn apply_cascaded_row_update(
             context,
         )
     {
-        return Err(PgError::create(
-            SqlState::UniqueViolation,
-            format!(
-                "duplicate key value violates unique constraint on {:?}",
-                schema.name
-            ),
-        ));
+        return Err(PgError::create_unique_violation(constraint));
     }
     state
         .tables

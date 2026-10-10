@@ -33,6 +33,8 @@ behavior is grouped into three tiers.
 - NULL / three-valued logic;
 - supported type coercions;
 - whether a constraint violation occurs (unique, not-null, foreign key, check);
+- the violated constraint or index name for unique violations, including through
+  SQLx `DatabaseError::constraint()`;
 - transaction visibility and isolation outcomes;
 - sequence value allocation;
 - **`SQLSTATE` error codes**: for any error reproducible in Postgres and in
@@ -429,7 +431,7 @@ let rows = sess.query_prepared(&stmt, &[Value::Int4(1)])?;
 - **Multi-statement strings** (`"INSERT ...; INSERT ...;"`) are supported in
   `execute`, returning a result per statement, mirroring the Postgres simple
   query protocol.
-- **Errors** use a single `PgError { sqlstate, message, detail?, hint?, position? }`.
+- **Errors** use a single `PgError { sqlstate, message, constraint?, detail?, hint?, position? }`.
   `sqlstate` is Tier A; `message` is Tier B.
 - **Transaction control** is available through both `sess.begin()` (returning a
   `Transaction` RAII guard where drop without commit rolls back) and SQL

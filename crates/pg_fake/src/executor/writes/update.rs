@@ -264,11 +264,11 @@ pub(in crate::executor) fn execute_update(
                 validate_not_null(&schema, &updated)?;
                 validate_check_constraints(&schema, &updated, context)?;
             }
-            if state
+            if let Some(constraint) = state
                 .tables
                 .get(&schema.id)
                 .expect("catalog table must have storage")
-                .has_visible_unique_conflict(
+                .find_unique_conflict_name(
                     &updated,
                     snapshot,
                     xid,
@@ -280,13 +280,7 @@ pub(in crate::executor) fn execute_update(
                     context,
                 )
             {
-                return Err(PgError::create(
-                    SqlState::UniqueViolation,
-                    format!(
-                        "duplicate key value violates unique constraint on {:?}",
-                        schema.name
-                    ),
-                ));
+                return Err(PgError::create_unique_violation(constraint));
             }
             if can_move_updated_row {
                 state
@@ -522,7 +516,7 @@ pub(in crate::executor) fn prepare_update_rows(
         if let Some(updated) = &updated {
             validate_not_null(schema, updated)?;
             validate_check_constraints(schema, updated, context)?;
-            if validation_table.has_visible_unique_conflict_with_pending(
+            if let Some(constraint) = validation_table.find_unique_conflict_name_with_pending(
                 updated,
                 snapshot,
                 xid,
@@ -531,13 +525,7 @@ pub(in crate::executor) fn prepare_update_rows(
                 context,
                 &pending_unique_changes,
             ) {
-                return Err(PgError::create(
-                    SqlState::UniqueViolation,
-                    format!(
-                        "duplicate key value violates unique constraint on {:?}",
-                        schema.name
-                    ),
-                ));
+                return Err(PgError::create_unique_violation(constraint));
             }
             validation_table.record_pending_unique_change(
                 row_id,

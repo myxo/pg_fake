@@ -167,11 +167,11 @@ pub(in crate::executor) fn execute_insert(
             }
             InsertConflictOutcome::Insert => {}
         }
-        if state
+        if let Some(constraint) = state
             .tables
             .get(&schema.id)
             .expect("catalog table must have storage")
-            .has_visible_unique_conflict(
+            .find_unique_conflict_name(
                 &row,
                 snapshot,
                 xid,
@@ -183,13 +183,7 @@ pub(in crate::executor) fn execute_insert(
                 context,
             )
         {
-            return Err(PgError::create(
-                SqlState::UniqueViolation,
-                format!(
-                    "duplicate key value violates unique constraint on {:?}",
-                    schema.name
-                ),
-            ));
+            return Err(PgError::create_unique_violation(constraint));
         }
         affected += 1;
         if !can_move_inserted_row {

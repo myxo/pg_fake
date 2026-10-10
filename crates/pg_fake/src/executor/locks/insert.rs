@@ -139,10 +139,11 @@ pub(super) fn collect_triggered_insert_locks(
             if state
                 .row_locks
                 .would_block(key, xid, RowLockMode::NoKeyUpdate)
-                && chain
-                    .versions
-                    .iter()
-                    .any(|version| table.rows_have_unique_conflict(&version.row, updated, context))
+                && chain.versions.iter().any(|version| {
+                    table
+                        .find_row_unique_conflict_name(&version.row, updated, context)
+                        .is_some()
+                })
             {
                 locks.push(RequiredRowLock {
                     key,

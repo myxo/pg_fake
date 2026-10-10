@@ -130,27 +130,25 @@ pub(super) fn evaluate_insert_rows(
                 .tables
                 .get(&schema.id)
                 .expect("catalog table must have storage");
-            if table.has_visible_unique_conflict(
-                row,
-                snapshot,
-                xid,
-                &state.transactions,
-                None,
-                None,
-                None,
-                None,
-                context,
-            ) || prior
-                .iter()
-                .any(|previous| table.rows_have_unique_conflict(previous, row, context))
+            if let Some(constraint) = table
+                .find_unique_conflict_name(
+                    row,
+                    snapshot,
+                    xid,
+                    &state.transactions,
+                    None,
+                    None,
+                    None,
+                    None,
+                    context,
+                )
+                .or_else(|| {
+                    prior.iter().find_map(|previous| {
+                        table.find_row_unique_conflict_name(previous, row, context)
+                    })
+                })
             {
-                return Err(PgError::create(
-                    SqlState::UniqueViolation,
-                    format!(
-                        "duplicate key value violates unique constraint on {:?}",
-                        schema.name
-                    ),
-                ));
+                return Err(PgError::create_unique_violation(constraint));
             }
         }
         Ok(())
@@ -234,17 +232,19 @@ pub(super) fn evaluate_insert_rows(
                 }
                 None if !prior_updates_conflicts
                     && prior_arbiter.as_ref().is_some_and(|arbiter| {
-                        validation_table.has_visible_unique_conflict(
-                            row,
-                            snapshot,
-                            xid,
-                            &state.transactions,
-                            None,
-                            None,
-                            arbiter.get_columns(),
-                            arbiter.get_predicate(),
-                            context,
-                        )
+                        validation_table
+                            .find_unique_conflict_name(
+                                row,
+                                snapshot,
+                                xid,
+                                &state.transactions,
+                                None,
+                                None,
+                                arbiter.get_columns(),
+                                arbiter.get_predicate(),
+                                context,
+                            )
+                            .is_some()
                     }) => {}
                 None => {
                     let row_id = validation_table.insert(xid, context.command_id, row.clone());
@@ -274,17 +274,19 @@ pub(super) fn evaluate_insert_rows(
         {
             let skips_do_nothing_conflict = conflict_arbiter.as_ref().is_some_and(|arbiter| {
                 conflict_update.is_none()
-                    && validation_table.has_visible_unique_conflict(
-                        &row,
-                        snapshot,
-                        xid,
-                        &state.transactions,
-                        None,
-                        None,
-                        arbiter.get_columns(),
-                        arbiter.get_predicate(),
-                        context,
-                    )
+                    && validation_table
+                        .find_unique_conflict_name(
+                            &row,
+                            snapshot,
+                            xid,
+                            &state.transactions,
+                            None,
+                            None,
+                            arbiter.get_columns(),
+                            arbiter.get_predicate(),
+                            context,
+                        )
+                        .is_some()
             });
             match cached_conflict {
                 Some(prepared) => {
@@ -369,17 +371,19 @@ pub(super) fn evaluate_insert_rows(
         )?;
         let skips_do_nothing_conflict = conflict_arbiter.as_ref().is_some_and(|arbiter| {
             conflict_update.is_none()
-                && validation_table.has_visible_unique_conflict(
-                    &row,
-                    snapshot,
-                    xid,
-                    &state.transactions,
-                    None,
-                    None,
-                    arbiter.get_columns(),
-                    arbiter.get_predicate(),
-                    context,
-                )
+                && validation_table
+                    .find_unique_conflict_name(
+                        &row,
+                        snapshot,
+                        xid,
+                        &state.transactions,
+                        None,
+                        None,
+                        arbiter.get_columns(),
+                        arbiter.get_predicate(),
+                        context,
+                    )
+                    .is_some()
         });
         let returned_row = match &prepared_conflict {
             Some(prepared) => match &prepared.updated {
@@ -396,7 +400,7 @@ pub(super) fn evaluate_insert_rows(
         match &prepared_conflict {
             Some(prepared) => {
                 if let Some(updated) = &prepared.updated {
-                    if validation_table.has_visible_unique_conflict(
+                    if let Some(constraint) = validation_table.find_unique_conflict_name(
                         updated,
                         snapshot,
                         xid,
@@ -407,13 +411,7 @@ pub(super) fn evaluate_insert_rows(
                         None,
                         context,
                     ) {
-                        return Err(PgError::create(
-                            SqlState::UniqueViolation,
-                            format!(
-                                "duplicate key value violates unique constraint on {:?}",
-                                schema.name
-                            ),
-                        ));
+                        return Err(PgError::create_unique_violation(constraint));
                     }
                     validation_table.append_updated_version(
                         prepared.row_id,
@@ -428,7 +426,7 @@ pub(super) fn evaluate_insert_rows(
             }
             None if skips_do_nothing_conflict => {}
             None => {
-                if validation_table.has_visible_unique_conflict(
+                if let Some(constraint) = validation_table.find_unique_conflict_name(
                     &row,
                     snapshot,
                     xid,
@@ -439,13 +437,7 @@ pub(super) fn evaluate_insert_rows(
                     None,
                     context,
                 ) {
-                    return Err(PgError::create(
-                        SqlState::UniqueViolation,
-                        format!(
-                            "duplicate key value violates unique constraint on {:?}",
-                            schema.name
-                        ),
-                    ));
+                    return Err(PgError::create_unique_violation(constraint));
                 }
                 let row_id = validation_table.insert(xid, context.command_id, row.clone());
                 affected_rows.insert(row_id);

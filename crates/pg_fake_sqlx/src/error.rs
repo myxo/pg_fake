@@ -45,6 +45,10 @@ impl DatabaseError for PgFakeDatabaseError {
         Some(Cow::Borrowed(self.error.sqlstate.get_code()))
     }
 
+    fn constraint(&self) -> Option<&str> {
+        self.error.constraint.as_deref()
+    }
+
     fn as_error(&self) -> &(dyn StdError + Send + Sync + 'static) {
         self
     }
