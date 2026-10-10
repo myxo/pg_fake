@@ -634,27 +634,30 @@ async fn sqlx_error_category_matches_postgres() {
     let expected = postgres
         .execute("INSERT INTO pg_fake_sqlx_unique_values VALUES (1)")
         .await
-        .unwrap_err()
-        .as_database_error()
-        .and_then(|error| error.code())
-        .expect("PostgreSQL unique violations must have a SQLSTATE")
-        .into_owned();
+        .unwrap_err();
+    let expected = expected.as_database_error().unwrap();
     let mut connection = PgFakeConnection::new(Db::create());
     connection
-        .execute("CREATE TABLE unique_values (id integer UNIQUE)")
+        .execute("CREATE TABLE pg_fake_sqlx_unique_values (id integer UNIQUE)")
         .await
         .unwrap();
     connection
-        .execute("INSERT INTO unique_values VALUES (1)")
+        .execute("INSERT INTO pg_fake_sqlx_unique_values VALUES (1)")
         .await
         .unwrap();
     let error = connection
-        .execute("INSERT INTO unique_values VALUES (1)")
+        .execute("INSERT INTO pg_fake_sqlx_unique_values VALUES (1)")
         .await
         .unwrap_err();
     let database_error = error.as_database_error().unwrap();
-    assert_eq!(database_error.code().as_deref(), Some(expected.as_str()));
+    assert_eq!(expected.code().as_deref(), Some("23505"));
+    assert_eq!(database_error.code(), expected.code());
     assert!(database_error.is_unique_violation());
+    assert_eq!(
+        expected.constraint(),
+        Some("pg_fake_sqlx_unique_values_id_key")
+    );
+    assert_eq!(database_error.constraint(), expected.constraint());
     drop(postgres);
     tokio::task::spawn_blocking(move || drop(server))
         .await

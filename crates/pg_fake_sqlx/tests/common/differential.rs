@@ -16,7 +16,10 @@ use super::common;
 pub(super) enum Outcome {
     Affected(u64),
     Rows(Vec<Vec<Option<String>>>),
-    Error(String),
+    Error {
+        sqlstate: String,
+        constraint: Option<String>,
+    },
 }
 
 #[derive(Clone, Copy)]
@@ -189,13 +192,22 @@ where
 }
 
 fn make_error_outcome(error: sqlx::Error) -> Outcome {
-    Outcome::Error(
-        error
-            .as_database_error()
-            .and_then(|error| error.code())
-            .expect("database execution errors must have a SQLSTATE")
-            .into_owned(),
-    )
+    let error = error
+        .as_database_error()
+        .expect("database execution errors must be database errors");
+    let sqlstate = error
+        .code()
+        .expect("database execution errors must have a SQLSTATE")
+        .into_owned();
+    let constraint = if sqlstate == "23505" {
+        error.constraint().map(str::to_owned)
+    } else {
+        None
+    };
+    Outcome::Error {
+        sqlstate,
+        constraint,
+    }
 }
 
 pub(super) fn assert_statement(
@@ -232,7 +244,7 @@ fn assert_statement_outcome(
         TestConnection::Fake(fake),
     ]
     .map(|mut connection| connection.execute(runtime, &statement, sql));
-    if !allow_error && let Outcome::Error(sqlstate) = &expected {
+    if !allow_error && let Outcome::Error { sqlstate, .. } = &expected {
         panic!("unexpected PostgreSQL error ({sqlstate}): {sql}");
     }
     match (expected, actual) {
