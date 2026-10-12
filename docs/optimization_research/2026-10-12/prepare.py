@@ -1,0 +1,63 @@
+from pathlib import Path
+import json
+import subprocess
+import sys
+
+
+def prepare_probes():
+    evidence = Path(__file__).resolve().parent
+    repository = evidence.parents[2]
+    output = repository / "target" / "optimization-research"
+    output.mkdir(parents=True, exist_ok=True)
+    build = subprocess.run(
+        ["cargo", "build", "--offline", "--release", "-p", "pg_fake", "--message-format=json"],
+        cwd=repository, capture_output=True, text=True, check=True,
+    )
+    libraries = [
+        filename
+        for line in build.stdout.splitlines()
+        if (message := json.loads(line)).get("reason") == "compiler-artifact"
+        and message["target"]["name"] == "pg_fake"
+        for filename in message["filenames"]
+        if filename.endswith(".rlib")
+    ]
+    assert len(libraries) == 1
+    for name in ["probe", "handoff_probe"]:
+        subprocess.run(
+            ["rustc", "--edition=2024", "-O", "-g", str(evidence / f"{name}.rs"),
+             "--extern", f"pg_fake={libraries[0]}", "-L",
+             f"dependency={repository / 'target/release/deps'}", "-o", str(output / name)],
+            check=True,
+        )
+    if "--sqlx" not in sys.argv:
+        print(output / "probe")
+        return
+
+    source = (repository / "crates/pg_fake_benchmarks/benches/workloads.rs").read_text()
+    start = source.index("fn benchmarks(criterion: &mut Criterion) {")
+    end = source.index("\nfn on_conflict_benchmark(", start)
+    source = source[:start] + (evidence / "fake_entry.rs").read_text() + source[end:]
+    (output / "workloads.rs").write_text(source)
+    manifest = (repository / "crates/pg_fake_benchmarks/Cargo.toml").read_text()
+    manifest = manifest.replace('name = "pg_fake_benchmarks"', 'name = "optimization-research"', 1)
+    manifest = manifest.replace('edition.workspace = true', 'edition = "2024"')
+    manifest = manifest.replace('license.workspace = true', 'license = "MIT"')
+    manifest = manifest.replace('[lints]\nworkspace = true\n', '[workspace]\n')
+    manifest = manifest.replace('[dev-dependencies]', '[dependencies]')
+    for name in ["pg_fake", "pg_fake_sqlx"]:
+        manifest = manifest.replace(f'path = "../{name}"', f'path = "{repository}/crates/{name}"')
+    manifest = manifest[:manifest.index('[[bench]]')]
+    manifest += f'pg_fake_benchmarks = {{ path = "{repository}/crates/pg_fake_benchmarks" }}\n'
+    manifest += '\n[[bin]]\nname = "research-workloads"\npath = "workloads.rs"\n'
+    (output / "Cargo.toml").write_text(manifest)
+    (output / "Cargo.lock").write_bytes((repository / "Cargo.lock").read_bytes())
+    subprocess.run(
+        ["cargo", "build", "--offline", "--release", "--manifest-path",
+         str(output / "Cargo.toml"), "--target-dir", str(repository / "target")],
+        check=True,
+    )
+    print(repository / "target/release/research-workloads")
+
+
+if __name__ == "__main__":
+    prepare_probes()
