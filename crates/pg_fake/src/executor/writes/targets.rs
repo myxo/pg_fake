@@ -128,13 +128,14 @@ pub(super) fn collect_mutation_targets(
             .collect();
     }
     if let [source_row] = source_rows
-        && let Some((column, value)) = from::resolve_unique_point_lookup(
-            table,
-            schema,
-            selection,
-            RowScope::Bound(scope),
-            context,
-        )?
+        && let Some(from::UniquePointLookup { column, value, .. }) =
+            from::resolve_unique_point_lookup(
+                table,
+                schema,
+                selection,
+                RowScope::Bound(scope),
+                context,
+            )?
     {
         if let Some(key) = table.create_unique_read_key(&[column], std::slice::from_ref(&value)) {
             state.record_read(

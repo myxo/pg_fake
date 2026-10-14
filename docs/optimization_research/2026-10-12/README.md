@@ -71,6 +71,13 @@ small research programs are diagnostic artifacts, not new production benchmarks
 or changes to the supported API. Integrate stable regression cases with the
 Criterion catalog when executing each experiment.
 
+For implementation experiments, `prepare.py --full-fake --sqlx` builds the full
+pg_fake-only Criterion catalog. `--e01 --sqlx` builds only the guarded-mutation
+cases, and `--regression --sqlx` builds the E01 regression-control groups. None
+of these entry points starts a PostgreSQL benchmark. `--serializable --sqlx`
+builds the serializable pg_fake controls. PostgreSQL remains in the differential
+correctness tests.
+
 ## Feature-by-feature findings
 
 ### Selective joins and guarded writes: assessment of the handoff

@@ -1,6 +1,6 @@
 use crate::executor::{
     DatabaseState, PreparedMutationTarget, StatementContext,
-    expressions::is_null_literal,
+    expressions::{is_null_literal, validate_constant_boolean_operands},
     from::resolve_unique_point_lookup,
     normalize_relation_name, prepared, query, resolve_insert_table_name,
     scope::{RowScope, bind_target_scope},
@@ -209,9 +209,20 @@ pub(crate) fn collect_required_row_locks(
                 }),
             })
             .collect()
-    } else if let Some((column, value)) =
+    } else if let Some(super::from::UniquePointLookup {
+        column,
+        value,
+        needs_recheck,
+    }) =
         resolve_unique_point_lookup(table, schema, selection, RowScope::Table(schema), context)?
     {
+        if needs_recheck {
+            validate_constant_boolean_operands(
+                selection.expect("conjunctive lookup retains its predicate"),
+                RowScope::Table(schema),
+                context,
+            )?;
+        }
         if let Some(key) = table.create_unique_read_key(&[column], std::slice::from_ref(&value)) {
             state.record_read(
                 xid,
@@ -227,6 +238,20 @@ pub(crate) fn collect_required_row_locks(
         ) {
             Some((row_id, version)) => {
                 state.record_read(xid, crate::serializable::Access::Row(schema.id, row_id));
+                if needs_recheck {
+                    let value = super::subqueries::evaluate_query_expression(
+                        state,
+                        selection.expect("conjunctive lookup retains its predicate"),
+                        &bind_target_scope(schema, alias),
+                        &version.row,
+                        xid,
+                        snapshot,
+                        context,
+                    )?;
+                    if !matches!(value, Value::Bool(true)) {
+                        return Ok(Vec::new());
+                    }
+                }
                 check_concurrent_update(state, version, xid, snapshot)?;
                 vec![RequiredRowLock {
                     key: RowLockKey {

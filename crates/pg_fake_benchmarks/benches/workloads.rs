@@ -1673,7 +1673,15 @@ fn benchmark_serializable(criterion: &mut Criterion, runtime: &Runtime, postgres
             BenchmarkConnection::Postgres(&mut postgres_second),
         ),
     ];
-    for (_, first, _) in &mut connections {
+    benchmark_serializable_connections(criterion, runtime, &mut connections);
+}
+
+fn benchmark_serializable_connections(
+    criterion: &mut Criterion,
+    runtime: &Runtime,
+    connections: &mut [(&str, BenchmarkConnection<'_>, BenchmarkConnection<'_>)],
+) {
+    for (_, first, _) in connections.iter_mut() {
         first.execute(
             runtime,
             "CREATE TABLE ssi_benchmark(id INT PRIMARY KEY, value INT)",
@@ -1682,7 +1690,7 @@ fn benchmark_serializable(criterion: &mut Criterion, runtime: &Runtime, postgres
     }
     let mut group =
         criterion.benchmark_group(benchmarks::find_benchmark("serializable_read").format_name());
-    for (name, first, _) in &mut connections {
+    for (name, first, _) in connections.iter_mut() {
         group.bench_function(*name, |benchmark| {
             benchmark.iter(|| {
                 first.execute(runtime, "BEGIN ISOLATION LEVEL SERIALIZABLE");
@@ -1696,13 +1704,13 @@ fn benchmark_serializable(criterion: &mut Criterion, runtime: &Runtime, postgres
         .benchmark_group(benchmarks::find_benchmark("serializable_write_skew").format_name());
     group.sample_size(20);
     group.measurement_time(Duration::from_secs(2));
-    for (name, first, second) in &mut connections {
+    for (name, first, second) in connections.iter_mut() {
         group.bench_function(*name, |benchmark| {
             benchmark.iter(|| run_write_skew(runtime, first, second));
         });
     }
     group.finish();
-    for (_, first, _) in &mut connections {
+    for (_, first, _) in connections.iter_mut() {
         first.execute(runtime, "DROP TABLE ssi_benchmark");
     }
 }
@@ -2111,6 +2119,135 @@ fn indexed_vs_scan_benchmark(criterion: &mut Criterion) {
     group.finish();
 }
 
+fn benchmark_guarded_mutations(criterion: &mut Criterion) {
+    let mut group = criterion.benchmark_group("guarded_mutations");
+    for rows in [100_usize, 1_000, 10_000] {
+        let mut session = Db::create().create_session();
+        core_execute(
+            &mut session,
+            "CREATE TABLE guarded_bench (id UUID PRIMARY KEY, group_id UUID, account_id UUID, name TEXT, deleted_at TIMESTAMPTZ)",
+        );
+        let values = (0..rows)
+            .map(|i| {
+                format!(
+                    "('{}', '{}', '{}', 'original', NULL)",
+                    make_membership_join_uuid(4, i),
+                    make_membership_join_uuid(2, i),
+                    make_membership_join_uuid(1, i),
+                )
+            })
+            .collect::<Vec<_>>()
+            .join(",");
+        core_execute(
+            &mut session,
+            &format!("INSERT INTO guarded_bench VALUES {values}"),
+        );
+        for (name, sql, parameter_count, false_guard, full_transaction) in [
+            (
+                "guard_update",
+                "UPDATE guarded_bench SET name = 'changed' WHERE id = $1 AND group_id = $2 AND account_id = $3 AND deleted_at IS NULL",
+                3,
+                false,
+                false,
+            ),
+            (
+                "guard_delete",
+                "DELETE FROM guarded_bench WHERE id = $1 AND group_id = $2 AND account_id = $3 AND deleted_at IS NULL",
+                3,
+                false,
+                false,
+            ),
+            (
+                "guard_update_transaction",
+                "UPDATE guarded_bench SET name = 'changed' WHERE id = $1 AND group_id = $2 AND account_id = $3 AND deleted_at IS NULL",
+                3,
+                false,
+                true,
+            ),
+            (
+                "guard_delete_transaction",
+                "DELETE FROM guarded_bench WHERE id = $1 AND group_id = $2 AND account_id = $3 AND deleted_at IS NULL",
+                3,
+                false,
+                true,
+            ),
+            (
+                "bare_update",
+                "UPDATE guarded_bench SET name = 'changed' WHERE id = $1",
+                1,
+                false,
+                false,
+            ),
+            (
+                "bare_delete",
+                "DELETE FROM guarded_bench WHERE id = $1",
+                1,
+                false,
+                false,
+            ),
+            (
+                "false_guard_update",
+                "UPDATE guarded_bench SET name = 'changed' WHERE id = $1 AND group_id = $2 AND account_id = $3 AND deleted_at IS NULL",
+                3,
+                true,
+                false,
+            ),
+            (
+                "missing_guard_delete",
+                "DELETE FROM guarded_bench WHERE id = $1 AND group_id = $2 AND account_id = $3 AND deleted_at IS NULL",
+                3,
+                true,
+                false,
+            ),
+        ] {
+            let statement = session.prepare(sql).unwrap();
+            let parameters = (0..rows)
+                .map(|i| {
+                    vec![
+                        Value::Uuid(make_membership_join_uuid(
+                            4,
+                            if name == "missing_guard_delete" {
+                                rows + i
+                            } else {
+                                i
+                            },
+                        )),
+                        Value::Uuid(make_membership_join_uuid(
+                            2,
+                            if false_guard { rows + i } else { i },
+                        )),
+                        Value::Uuid(make_membership_join_uuid(1, i)),
+                    ]
+                })
+                .collect::<Vec<_>>();
+            let mut index = 0;
+            group.bench_function(BenchmarkId::new(name, rows), |benchmark| {
+                benchmark.iter_custom(|iterations| {
+                    let mut elapsed = Duration::ZERO;
+                    for _ in 0..iterations {
+                        let values = &parameters[index % rows][..parameter_count];
+                        index += 1;
+                        let transaction_started = Instant::now();
+                        core_execute(&mut session, "BEGIN");
+                        let mutation_started = Instant::now();
+                        let affected = session.execute_prepared(&statement, values).unwrap();
+                        black_box(affected);
+                        if full_transaction {
+                            core_execute(&mut session, "ROLLBACK");
+                            elapsed += transaction_started.elapsed();
+                        } else {
+                            elapsed += mutation_started.elapsed();
+                            core_execute(&mut session, "ROLLBACK");
+                        }
+                    }
+                    elapsed
+                });
+            });
+        }
+    }
+    group.finish();
+}
+
 fn benchmark_lookup_scaling(
     criterion: &mut Criterion,
     runtime: &Runtime,
@@ -2462,6 +2599,7 @@ fn benchmarks(criterion: &mut Criterion) {
         transaction_history_benchmark(criterion);
         mvcc_version_chain_benchmark(criterion);
         indexed_vs_scan_benchmark(criterion);
+        benchmark_guarded_mutations(criterion);
         benchmark_lookup_scaling(criterion, &runtime, &mut connections);
         benchmark_populated_table_writes(criterion, &runtime, &mut connections);
         concurrency_benchmark(criterion, &runtime);

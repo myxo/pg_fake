@@ -31,7 +31,7 @@ type RowConsumer<'a> = dyn FnMut(&[Value], &[RowOrigin]) -> Result<()> + 'a;
 use joins::materialize_table_with_joins_rows;
 pub(super) use joins::{can_stream_join, visit_streamed_join_rows};
 use scans::collect_pushdown_filters;
-pub(super) use scans::{is_selection_fully_pushed, resolve_unique_point_lookup};
+pub(super) use scans::{UniquePointLookup, is_selection_fully_pushed, resolve_unique_point_lookup};
 
 #[derive(Clone)]
 pub(crate) struct RowOrigin {

@@ -118,20 +118,8 @@ pub(super) fn visit_table_factor_rows(
         else {
             continue;
         };
-        let (column, value) = match (left.as_ref(), right.as_ref()) {
-            (ast::Expr::Identifier(column), value) if is_point_lookup_value(value) => {
-                (std::slice::from_ref(column), value)
-            }
-            (value, ast::Expr::Identifier(column)) if is_point_lookup_value(value) => {
-                (std::slice::from_ref(column), value)
-            }
-            (ast::Expr::CompoundIdentifier(column), value) if is_point_lookup_value(value) => {
-                (column.as_slice(), value)
-            }
-            (value, ast::Expr::CompoundIdentifier(column)) if is_point_lookup_value(value) => {
-                (column.as_slice(), value)
-            }
-            _ => continue,
+        let Some((column, value)) = resolve_point_lookup_parts(left, right) else {
+            continue;
         };
         let Ok((slot, _)) = scope.resolve_column(column) else {
             continue;
@@ -236,6 +224,7 @@ pub(super) fn collect_pushdown_filters<'a>(
     end: usize,
     filters: &mut Vec<&'a ast::Expr>,
 ) {
+    let expr = strip_nested(expr);
     if let ast::Expr::BinaryOp {
         left,
         op: ast::BinaryOperator::And,
@@ -253,6 +242,7 @@ pub(super) fn collect_pushdown_filters<'a>(
 
 #[cfg_attr(feature = "execution-log", tracing::instrument(skip_all))]
 fn resolve_pushdown_column(expr: &ast::Expr, scope: &BoundScope) -> Option<usize> {
+    let expr = strip_nested(expr);
     if let ast::Expr::IsNull(inner) | ast::Expr::IsNotNull(inner) = expr {
         return match inner.as_ref() {
             ast::Expr::Identifier(column) => scope
@@ -268,7 +258,7 @@ fn resolve_pushdown_column(expr: &ast::Expr, scope: &BoundScope) -> Option<usize
     let ast::Expr::BinaryOp { left, right, .. } = expr else {
         return None;
     };
-    match (left.as_ref(), right.as_ref()) {
+    match (strip_nested(left), strip_nested(right)) {
         (ast::Expr::Identifier(column), value) if is_point_lookup_value(value) => scope
             .resolve_column(std::slice::from_ref(column))
             .ok()
@@ -308,6 +298,7 @@ pub(in crate::executor) fn is_selection_fully_pushed(
 
 #[cfg_attr(feature = "execution-log", tracing::instrument(skip_all))]
 fn can_push_filter(expr: &ast::Expr, scope: &BoundScope, start: usize, end: usize) -> bool {
+    let expr = strip_nested(expr);
     if let ast::Expr::BinaryOp {
         left,
         op: ast::BinaryOperator::And,
@@ -322,7 +313,7 @@ fn can_push_filter(expr: &ast::Expr, scope: &BoundScope, start: usize, end: usiz
 
 #[cfg_attr(feature = "execution-log", tracing::instrument(skip_all))]
 fn is_point_lookup_value(expr: &ast::Expr) -> bool {
-    let mut expr = expr;
+    let mut expr = strip_nested(expr);
     loop {
         match expr {
             ast::Expr::Value(_) => return true,
@@ -331,10 +322,44 @@ fn is_point_lookup_value(expr: &ast::Expr) -> bool {
                 expr: inner,
                 format: None,
                 ..
-            } => expr = inner,
+            } => expr = strip_nested(inner),
             _ => return false,
         }
     }
+}
+
+fn strip_nested(mut expr: &ast::Expr) -> &ast::Expr {
+    while let ast::Expr::Nested(inner) = expr {
+        expr = inner;
+    }
+    expr
+}
+
+fn resolve_point_lookup_parts<'a>(
+    left: &'a ast::Expr,
+    right: &'a ast::Expr,
+) -> Option<(&'a [ast::Ident], &'a ast::Expr)> {
+    match (strip_nested(left), strip_nested(right)) {
+        (ast::Expr::Identifier(column), value) if is_point_lookup_value(value) => {
+            Some((std::slice::from_ref(column), value))
+        }
+        (value, ast::Expr::Identifier(column)) if is_point_lookup_value(value) => {
+            Some((std::slice::from_ref(column), value))
+        }
+        (ast::Expr::CompoundIdentifier(column), value) if is_point_lookup_value(value) => {
+            Some((column, value))
+        }
+        (value, ast::Expr::CompoundIdentifier(column)) if is_point_lookup_value(value) => {
+            Some((column, value))
+        }
+        _ => None,
+    }
+}
+
+pub(in crate::executor) struct UniquePointLookup {
+    pub(in crate::executor) column: usize,
+    pub(in crate::executor) value: Value,
+    pub(in crate::executor) needs_recheck: bool,
 }
 
 #[cfg_attr(feature = "execution-log", tracing::instrument(skip_all))]
@@ -344,46 +369,57 @@ pub(in crate::executor) fn resolve_unique_point_lookup(
     selection: Option<&ast::Expr>,
     scope: RowScope<'_>,
     context: &StatementContext,
-) -> Result<Option<(usize, Value)>> {
-    let Some(ast::Expr::BinaryOp {
-        left,
-        op: ast::BinaryOperator::Eq,
-        right,
-    }) = selection
-    else {
+) -> Result<Option<UniquePointLookup>> {
+    let Some(selection) = selection else {
         return Ok(None);
     };
-    let (column, value) = match (left.as_ref(), right.as_ref()) {
-        (ast::Expr::Identifier(column), value) if is_point_lookup_value(value) => {
-            (std::slice::from_ref(column), value)
+    let mut pending = Vec::new();
+    let mut current = selection;
+    let mut needs_recheck = false;
+    loop {
+        match strip_nested(current) {
+            ast::Expr::BinaryOp {
+                left,
+                op: ast::BinaryOperator::And,
+                right,
+            } => {
+                pending.push(right.as_ref());
+                current = left;
+                needs_recheck = true;
+                continue;
+            }
+            ast::Expr::BinaryOp {
+                left,
+                op: ast::BinaryOperator::Eq,
+                right,
+            } => {
+                if let Some((column, value)) = resolve_point_lookup_parts(left, right)
+                    && let Ok((column, _)) = scope.resolve_column(column)
+                    && column < schema.columns.len()
+                    && table.has_unique_index(&[column])
+                    && resolve_operator_type(left, right, scope)?
+                        == schema.columns[column].data_type.base
+                {
+                    let value = evaluate_and_coerce(
+                        value,
+                        schema.columns[column].data_type.base,
+                        CastContext::Implicit,
+                        scope,
+                        &[],
+                        context,
+                    )?;
+                    return Ok(Some(UniquePointLookup {
+                        column,
+                        value,
+                        needs_recheck,
+                    }));
+                }
+            }
+            _ => {}
         }
-        (value, ast::Expr::Identifier(column)) if is_point_lookup_value(value) => {
-            (std::slice::from_ref(column), value)
-        }
-        (ast::Expr::CompoundIdentifier(column), value) if is_point_lookup_value(value) => {
-            (column.as_slice(), value)
-        }
-        (value, ast::Expr::CompoundIdentifier(column)) if is_point_lookup_value(value) => {
-            (column.as_slice(), value)
-        }
-        _ => return Ok(None),
-    };
-    let Ok((column, _)) = scope.resolve_column(column) else {
-        return Ok(None);
-    };
-    if column >= schema.columns.len()
-        || !table.has_unique_index(&[column])
-        || resolve_operator_type(left, right, scope)? != schema.columns[column].data_type.base
-    {
-        return Ok(None);
+        let Some(next) = pending.pop() else {
+            return Ok(None);
+        };
+        current = next;
     }
-    let value = evaluate_and_coerce(
-        value,
-        schema.columns[column].data_type.base,
-        CastContext::Implicit,
-        scope,
-        &[],
-        context,
-    )?;
-    Ok(Some((column, value)))
 }

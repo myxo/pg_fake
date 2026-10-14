@@ -1,8 +1,7 @@
 # Optimization experiments
 
-Status: research completed; implementation experiments pending. This is separate
-from the SQL compatibility roadmap in `plan.md`. No engine optimization has been
-implemented by this planning task.
+Status: research completed; E01 accepted, E02–E16 pending. This is separate
+from the SQL compatibility roadmap in `plan.md`.
 
 Research revision: `2b5243fc043adef6d713de71b2f9bc03dd57074a`.
 The [research record](optimization_research/2026-10-12/README.md) contains fresh
@@ -53,7 +52,7 @@ For the **same operation**, let `B` be the parent revision's mean latency and
    cases; an aggregate/geometric mean must not hide a regression.
 4. Run all Tier 1 controls, directly affected Tier 2/3 cases, and the small-input
    and fallback cases listed below against both revisions. Before acceptance run
-   the full benchmark suite, including native diagnostics and concurrency. Repeat
+   the full pg_fake benchmark suite, including native diagnostics and concurrency. Repeat
    suspected regressions in three paired runs. A partial suite is a screening
    result, not a final acceptance gate.
 5. Correctness checks must pass: relevant property/differential tests against
@@ -83,23 +82,24 @@ Profile separately from timing, after setup and warmup. Compare work counts
 (rows visited, candidates fetched, AST walks, frame inputs) when sampling cannot
 separate competing explanations. Keep counters local to the diagnostic build.
 
-Example Criterion workflow using the existing benchmark binary:
+Example Criterion workflow using the fake-only runner in each revision:
 
 ```sh
-cargo bench -p pg_fake_benchmarks --bench workloads -- FILTER --noplot --save-baseline exp01-parent
-cargo bench -p pg_fake_benchmarks --bench workloads -- FILTER --noplot --baseline exp01-parent
+python3 docs/optimization_research/2026-10-12/prepare.py --full-fake --sqlx
+target/release/research-workloads --bench --noplot --sample-size 100 --warm-up-time 3 --measurement-time 5 FILTER --save-baseline exp01-parent
 ```
 
+Run the corresponding binary from the candidate revision with the same settings.
 Use unique baseline names per pair and preserve raw results outside directories
 that a subsequent run overwrites. Build both revisions before timing; do not run
 compilation or profilers alongside a timed run. `cargo x bench` restores the
 repository baseline, so it is not a substitute for this paired comparison.
 
-The regular harness requires PostgreSQL even for a pg_fake-only filter and drops
-its reserved `pgfake_benchmark` schema. Use a verified disposable PostgreSQL 18
-instance for the full gate. The research's isolated fake-only runner is useful
-for screening, but does not replace PostgreSQL differential checks or the full
-suite. Do not overwrite committed results during an experiment.
+The regular harness runs PostgreSQL benchmarks even for a pg_fake-only filter and
+drops its reserved `pgfake_benchmark` schema. Use the research's isolated fake-only
+runner for all performance measurements, including the full suite. PostgreSQL 18
+remains the reference for differential correctness checks. Do not overwrite
+committed results during an experiment.
 
 Record the hypothesis, exact commands, timing summary, correctness results,
 memory observations, and acceptance decision in an experiment record beside this
@@ -138,7 +138,9 @@ decision. Dependencies refer to reusable mechanisms, not a requirement to keep
 an unsuccessful earlier change. If a prerequisite is rejected, revise the
 dependent design and record that decision before implementing it.
 
-### E01 — Extract indexed mutation candidates from conjunctions [PENDING]
+### E01 — Extract indexed mutation candidates from conjunctions [ACCEPTED]
+
+Decision and measurements: [E01 experiment record](optimization_e01.md).
 
 **Idea:** share a predicate-constraint extractor between scans, mutation target
 selection, and lock discovery. Find usable equalities inside nested `AND`, use

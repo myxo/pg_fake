@@ -97,6 +97,115 @@ fn preserves_index_versions_across_reads_updates_and_rollback() {
 }
 
 #[test]
+fn selects_guarded_mutations_through_unique_keys() {
+    let db = Db::create();
+    let mut session = db.create_session();
+    session
+        .execute(
+            "CREATE TABLE guarded_mutations (id INTEGER PRIMARY KEY, group_id INTEGER, marker INTEGER, deleted_at INTEGER); \
+             INSERT INTO guarded_mutations VALUES (1, 10, 0, NULL), (2, 20, 0, NULL), (3, 30, 0, 1)",
+        )
+        .unwrap();
+    let update = session
+        .prepare(
+            "UPDATE guarded_mutations SET marker = marker + 1 \
+             WHERE group_id = $2 AND (id = $1 AND deleted_at IS NULL) RETURNING id",
+        )
+        .unwrap();
+    assert_eq!(
+        session
+            .query_prepared(&update, &[Value::Int4(1), Value::Int4(10)])
+            .unwrap()
+            .rows,
+        vec![vec![Value::Int4(1)]]
+    );
+    assert!(
+        session
+            .query_prepared(&update, &[Value::Int4(1), Value::Int4(20)])
+            .unwrap()
+            .rows
+            .is_empty()
+    );
+    assert!(
+        session
+            .query_prepared(&update, &[Value::Int4(3), Value::Int4(30)])
+            .unwrap()
+            .rows
+            .is_empty()
+    );
+    assert_eq!(
+        query_rows(
+            &mut session,
+            "SELECT id, marker FROM guarded_mutations ORDER BY id",
+        ),
+        vec![
+            vec![Value::Int4(1), Value::Int4(1)],
+            vec![Value::Int4(2), Value::Int4(0)],
+            vec![Value::Int4(3), Value::Int4(0)],
+        ]
+    );
+    session.execute("BEGIN").unwrap();
+    assert_eq!(
+        query_rows(
+            &mut session,
+            "DELETE FROM guarded_mutations WHERE marker = 1 AND id = 1 RETURNING id",
+        ),
+        vec![vec![Value::Int4(1)]]
+    );
+    session.execute("ROLLBACK").unwrap();
+    assert!(
+        query_rows(
+            &mut session,
+            "DELETE FROM guarded_mutations WHERE id = 1 AND marker = 0 RETURNING id",
+        )
+        .is_empty()
+    );
+    assert_eq!(
+        query_rows(
+            &mut session,
+            "DELETE FROM guarded_mutations WHERE (id = 2 OR id = 3) AND marker = 0 RETURNING id",
+        ),
+        vec![vec![Value::Int4(2)], vec![Value::Int4(3)]]
+    );
+    assert_eq!(
+        query_rows(&mut session, "SELECT id FROM guarded_mutations"),
+        vec![vec![Value::Int4(1)]]
+    );
+}
+
+#[test]
+fn skips_row_locks_when_an_indexed_mutation_guard_is_false() {
+    let db = Db::create();
+    let mut holder = db.create_session();
+    holder
+        .execute(
+            "CREATE TABLE guarded_lock (id INTEGER PRIMARY KEY, marker INTEGER); \
+             INSERT INTO guarded_lock VALUES (1, 10)",
+        )
+        .unwrap();
+    holder
+        .execute("BEGIN; UPDATE guarded_lock SET marker = 11 WHERE id = 1")
+        .unwrap();
+    let mut contender = db.create_session();
+    contender.execute("SET lock_timeout = '10ms'").unwrap();
+    assert!(
+        query_rows(
+            &mut contender,
+            "UPDATE guarded_lock SET marker = 12 WHERE id = 1 AND marker = 99 RETURNING id",
+        )
+        .is_empty()
+    );
+    holder.execute("ROLLBACK").unwrap();
+    assert_eq!(
+        query_rows(
+            &mut contender,
+            "SELECT marker FROM guarded_lock WHERE id = 1"
+        ),
+        vec![vec![Value::Int4(10)]]
+    );
+}
+
+#[test]
 fn validates_insert_batches_against_stored_and_pending_keys() {
     let db = Db::create();
     let mut session = db.create_session();
