@@ -6,8 +6,9 @@ Classify the operation being timed, including its SQL clauses and workflow,
 rather than only the leading statement or benchmark name. Incidental fixture
 values do not determine a tier.
 
-- Tier 1 is a small set of representative basic inserts, updates, default
-  transactions, reads, sorting/paging, and simple equality joins.
+- Tier 1 is a small set of representative bound SQLx inserts, updates, default
+  transactions, reads, sorting/paging, and simple equality joins. Timed queries
+  reuse SQL text while parameter values change between iterations.
 - Tier 2 covers additional application features and supporting test/driver
   workflows. An insert variant does not inherit Tier 1 merely because it inserts
   rows: `RETURNING`, default evaluation, identity allocation, foreign-key writes,
@@ -25,23 +26,23 @@ in [`src/lib.rs`](src/lib.rs); update this assessment when adding or moving one.
 
 | Benchmark | Reason |
 | --- | --- |
-| `tier1_insert_row` | Inserts an explicitly supplied row through the ordinary insert path. |
-| `tier1_update_row` | Updates a row by primary key using an ordinary UPDATE and WHERE predicate. |
-| `tier1_transaction_insert` | Wraps an ordinary insert in BEGIN/COMMIT, covering the basic explicit transaction path. |
-| `tier1_select_100` | Fetches a small table with a plain SELECT. |
-| `tier1_select_where_100` | Performs a simple equality lookup without an index. |
-| `tier1_select_where_indexed_100` | Performs the corresponding equality lookup with a primary-key index. |
-| `tier1_limit_offset_ordered_100` | Fetches a page using a single sort key, LIMIT, and OFFSET. |
-| `tier1_order_by_100` | Sorts a small result by scalar columns; explicit null placement remains part of ordinary ordering. |
-| `tier1_selective_inner_join` | Performs a two-table equality join with a simple filter and one matching result. |
-| `tier1_many_match_inner_join` | Performs the same basic equality-join shape with multiple matches; no lateral, recursive, or aggregate operation. |
+| `tier1_insert_row` | Inserts rows with varying bound primary keys. |
+| `tier1_update_row` | Updates rows by varying bound primary keys. |
+| `tier1_transaction_insert` | Wraps a bound insert in BEGIN/COMMIT, covering the basic explicit transaction path. |
+| `tier1_select_100` | Reads most of a 100-row table with a varying bound lower bound. |
+| `tier1_select_where_100` | Performs varying bound equality lookups without an index. |
+| `tier1_select_where_indexed_100` | Performs varying bound equality lookups with a primary-key index. |
+| `tier1_limit_offset_ordered_100` | Fetches pages using a single sort key, LIMIT, and varying bound OFFSET. |
+| `tier1_order_by_100` | Sorts a filtered 100-row result using a varying bound threshold and explicit null placement. |
+| `tier1_selective_inner_join` | Performs a two-table equality join with a varying bound key and one matching result. |
+| `tier1_many_match_inner_join` | Performs a two-table equality join with a varying bound bucket and multiple matches. |
 
 ## Tier 2: important operations (72 groups)
 
 | Benchmark | Reason |
 | --- | --- |
 | `tier2_insert_bound_row` | Inserts a row through a bound SQLx parameter, exposing adapter and parameter handling costs. |
-| `tier2_update_bound_row` | Updates a row through a bound SQLx parameter, separate from the literal-value Tier 1 update. |
+| `tier2_update_bound_row` | Repeatedly updates one row through a bound SQLx parameter, isolating that write path from the varying-key Tier 1 update. |
 | `tier2_core_snapshot_100` | Forks a database fixture; useful test setup, outside the basic SQL operations prioritized in Tier 1. |
 | `tier2_core_snapshot_1k` | Checks how fixture-fork cost changes with a larger populated database. |
 | `tier2_session_settings_roundtrip` | Sets, reads, and resets connection settings used by applications and drivers. |

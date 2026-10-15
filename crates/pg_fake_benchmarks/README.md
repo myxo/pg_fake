@@ -5,7 +5,7 @@ Benchmarks are prioritized by their impact on everyday application tests using
 
 | Prefix | Priority | Workloads |
 | --- | --- | --- |
-| `tier1_` | Essential | Plain inserts, updates, basic transactions, full and filtered selects with and without indexes, ordering/paging, and simple inner joins. |
+| `tier1_` | Essential | Bound inserts, updates, basic transactions, filtered selects with and without indexes, ordering/paging, and simple inner joins. |
 | `tier2_` | Important | Insert variants (`RETURNING`, defaults, identity, foreign keys, upserts), deletes, schema setup/migrations, snapshots, read diagnostics, aggregates, subqueries, read CTEs, JSON/array/temporal operations, savepoints, row locks, and uncontended concurrent reads. |
 | `tier3_` | Rare | Recursive/data-modifying CTEs, advanced windows, lateral queries, nested views, compound index/array aggregation workloads, triggers, temporary tables, catalog lookups, specialized locking/settings, JSON joins, and transaction-history/MVCC/contention diagnostics. |
 
@@ -44,10 +44,11 @@ The Criterion suite compares `pg_fake` with PostgreSQL 18 through SQLx. It
 covers a create/drop table lifecycle, individual constrained
 explicit/defaulted inserts, updates, deletes, explicit transactions at READ
 COMMITTED and REPEATABLE READ, row-lock
-acquisition with `SELECT ... FOR UPDATE`, a 100-row full-table select, a simple
-filtered heap select, the same filtered select over a primary key, and a
-100-row multi-key `ORDER BY` with explicit NULL placement, including an ordered
-`LIMIT`/`OFFSET` paging workload. The insert workloads include primary-key,
+acquisition with `SELECT ... FOR UPDATE`, a range read over most of a 100-row
+table, varying-key heap and primary-key lookups, and a filtered 100-row
+multi-key `ORDER BY` with explicit NULL placement, including an ordered
+`LIMIT`/`OFFSET` paging workload. Tier 1 timed SQLx calls bind values that vary
+between iterations. The insert workloads include primary-key,
 not-null, default, and column- and table-level `CHECK` validation. They also
 cover a sequence-backed identity insert with `RETURNING`, and a UUID key lookup
 that applies timestamp-with-time-zone and interval arithmetic.
@@ -160,8 +161,9 @@ Criterion run and does not read or write the committed results.
 For example, `cargo bench -p pg_fake_benchmarks --bench workloads -- tier1_`
 runs only Tier 1 measurements using Criterion's built-in name filter.
 
-Tier 1 insert/transaction fixtures and update caches are bounded with untimed
-cleanup every 128 operations. The adapter comparison uses prepared native
-execution. `insert_bound_row` and `update_bound_row` add parameterized writes.
-Record a fresh baseline with `cargo x bench record` before measuring changes;
-the old growing-fixture and native one-shot timings are not comparable.
+Tier 1 insert/transaction fixtures are bounded with untimed cleanup every 128
+operations. The adapter comparison uses prepared native execution.
+`insert_bound_row` and `update_bound_row` remain single-row write diagnostics.
+Tier 1 names remain the same so existing baseline measurements appear alongside
+the new parameterized workloads. Their differences include the changed query
+path and value distribution.
