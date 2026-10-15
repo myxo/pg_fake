@@ -307,6 +307,49 @@ impl Table {
         })
     }
 
+    pub(crate) fn find_prefix_visible_versions(
+        &self,
+        columns: &[usize],
+        values: &[Value],
+        snapshot: &Snapshot,
+        current_xid: Xid,
+        transactions: &TransactionRegistry,
+    ) -> Vec<(RowId, &RowVersion)> {
+        assert!(!values.is_empty() && values.len() < columns.len());
+        let index = self
+            .indexes
+            .iter()
+            .find(|index| index.columns == columns && index.predicate.is_none())
+            .expect("prefix lookup requires a matching index");
+        let Some(prefix) = build_index_key(&self.schema, &columns[..values.len()], values) else {
+            return Vec::new();
+        };
+        let mut candidates = BTreeSet::new();
+        for (key, row_ids) in index.entries.range(prefix.clone()..) {
+            if !key.0.starts_with(&prefix.0) {
+                break;
+            }
+            candidates.extend(row_ids);
+        }
+        candidates
+            .into_iter()
+            .filter_map(|row_id| {
+                let version = self.version_chains.chains.get(&row_id).and_then(|chain| {
+                    find_visible_version(chain, snapshot, current_xid, transactions)
+                })?;
+                build_row_index_entry_key(&self.schema, index, &version.row)
+                    .is_some_and(|key| key.0.starts_with(&prefix.0))
+                    .then_some((row_id, version))
+            })
+            .collect()
+    }
+
+    pub(crate) fn has_unfiltered_index(&self, columns: &[usize]) -> bool {
+        self.indexes
+            .iter()
+            .any(|index| index.columns == columns && index.predicate.is_none())
+    }
+
     pub(crate) fn has_nonunique_index(&self, columns: &[usize]) -> bool {
         self.indexes
             .iter()
@@ -506,7 +549,7 @@ impl Table {
                                 .versions
                                 .iter()
                                 .filter_map(|version| {
-                                    build_row_index_key(&self.schema, index, &version.row)
+                                    build_row_index_entry_key(&self.schema, index, &version.row)
                                 })
                                 .collect::<BTreeSet<_>>()
                         })
@@ -532,7 +575,9 @@ impl Table {
                 let retained = chain
                     .into_iter()
                     .flat_map(|chain| chain.versions.iter())
-                    .filter_map(|version| build_row_index_key(&self.schema, index, &version.row))
+                    .filter_map(|version| {
+                        build_row_index_entry_key(&self.schema, index, &version.row)
+                    })
                     .collect::<BTreeSet<_>>();
                 for key in previous.difference(&retained) {
                     let row_ids = index
@@ -616,7 +661,7 @@ impl Table {
                     .zip(&reclaim)
                     .filter_map(|(version, &reclaim)| {
                         (!reclaim)
-                            .then(|| build_row_index_key(&self.schema, index, &version.row))?
+                            .then(|| build_row_index_entry_key(&self.schema, index, &version.row))?
                     })
                     .collect::<BTreeSet<_>>();
                 let removed_keys = chain
@@ -624,7 +669,8 @@ impl Table {
                     .iter()
                     .zip(&reclaim)
                     .filter_map(|(version, &reclaim)| {
-                        reclaim.then(|| build_row_index_key(&self.schema, index, &version.row))?
+                        reclaim
+                            .then(|| build_row_index_entry_key(&self.schema, index, &version.row))?
                     })
                     .collect::<BTreeSet<_>>();
                 for key in removed_keys.difference(&retained_keys) {
@@ -1072,7 +1118,7 @@ impl Table {
                     index.columns.iter().any(|column| columns.contains(column))
                 })
             })
-            .map(|(index, unique)| (index, build_row_index_key(&self.schema, unique, row)))
+            .map(|(index, unique)| (index, build_row_index_entry_key(&self.schema, unique, row)))
             .collect::<Vec<_>>();
         for (index, key) in entries {
             if let Some(key) = key {
@@ -1100,7 +1146,7 @@ impl Table {
                         .iter()
                         .enumerate()
                         .filter_map(|(index, unique)| {
-                            build_row_index_key(&self.schema, unique, &version.row)
+                            build_row_index_entry_key(&self.schema, unique, &version.row)
                                 .map(|key| (index, key, *row_id))
                         })
                 })
@@ -1159,6 +1205,28 @@ fn build_row_index_key(schema: &TableSchema, index: &TableIndex, row: &Row) -> O
         .map(|column| row[*column].clone())
         .collect::<Vec<_>>();
     build_index_key(schema, &index.columns, &values)
+}
+
+// Keep the non-NULL leading columns in the ordered map so a prefix lookup can
+// find rows whose unbound suffix contains NULL. Full-key equality and unique
+// conflict checks still use build_row_index_key, which excludes such rows.
+fn build_row_index_entry_key(
+    schema: &TableSchema,
+    index: &TableIndex,
+    row: &Row,
+) -> Option<IndexKey> {
+    let mut key = Vec::with_capacity(index.columns.len());
+    for &column in &index.columns {
+        let value = row.get(column)?;
+        if value.is_null() {
+            break;
+        }
+        key.push(normalize_index_value(
+            value,
+            schema.columns[column].data_type.base,
+        )?);
+    }
+    (!key.is_empty()).then_some(IndexKey(key))
 }
 
 #[cfg_attr(feature = "execution-log", tracing::instrument(skip_all))]

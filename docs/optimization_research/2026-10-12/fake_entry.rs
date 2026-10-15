@@ -45,6 +45,7 @@ fn benchmarks(criterion: &mut Criterion) {
     indexed_vs_scan_benchmark(criterion);
     benchmark_selective_outer_joins(criterion, &[10, 100, 500, 1_000, 10_000]);
     benchmark_composite_access(criterion, &[100, 1_000, 10_000]);
+    benchmark_composite_prefix(criterion, &[100, 1_000, 10_000]);
     benchmark_guarded_mutations(criterion);
     benchmark_lookup_scaling(criterion, &runtime, &mut connections);
     benchmark_populated_table_writes(criterion, &runtime, &mut connections);

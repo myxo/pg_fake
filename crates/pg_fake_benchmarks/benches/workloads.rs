@@ -2479,6 +2479,192 @@ fn benchmark_composite_access(criterion: &mut Criterion, row_counts: &[usize]) {
     group.finish();
 }
 
+fn benchmark_composite_prefix(criterion: &mut Criterion, row_counts: &[usize]) {
+    let mut group = criterion.benchmark_group("composite_prefix");
+    for &rows in row_counts {
+        let mut session = Db::create().create_session();
+        core_execute(
+            &mut session,
+            "CREATE TABLE prefix_members (account_id INTEGER, group_id INTEGER, role TEXT); \
+             CREATE UNIQUE INDEX prefix_members_pair ON prefix_members(account_id, group_id); \
+             CREATE TABLE prefix_reverse (account_id INTEGER, group_id INTEGER, role TEXT); \
+             CREATE UNIQUE INDEX prefix_reverse_pair ON prefix_reverse(group_id, account_id); \
+             CREATE TABLE prefix_single (account_id INTEGER, group_id INTEGER, role TEXT); \
+             CREATE INDEX prefix_single_account ON prefix_single(account_id); \
+             CREATE TABLE prefix_accounts (account_id INTEGER PRIMARY KEY, name TEXT); \
+             CREATE TABLE prefix_groups (group_id INTEGER PRIMARY KEY, name TEXT)",
+        );
+        core_execute(&mut session, "BEGIN");
+        for batch_start in (0..rows).step_by(500) {
+            let batch = batch_start..rows.min(batch_start + 500);
+            let members = batch
+                .clone()
+                .map(|i| format!("({}, {i}, 'member')", i / 10))
+                .collect::<Vec<_>>()
+                .join(",");
+            let groups = batch
+                .clone()
+                .map(|i| format!("({i}, 'group {i}')"))
+                .collect::<Vec<_>>()
+                .join(",");
+            let reversed = batch
+                .clone()
+                .map(|i| format!("({i}, {}, 'member')", i / 10))
+                .collect::<Vec<_>>()
+                .join(",");
+            core_execute(
+                &mut session,
+                &format!("INSERT INTO prefix_members VALUES {members}"),
+            );
+            core_execute(
+                &mut session,
+                &format!("INSERT INTO prefix_reverse VALUES {reversed}"),
+            );
+            core_execute(
+                &mut session,
+                &format!("INSERT INTO prefix_single VALUES {members}"),
+            );
+            core_execute(
+                &mut session,
+                &format!("INSERT INTO prefix_groups VALUES {groups}"),
+            );
+        }
+        let accounts = (0..rows / 10)
+            .map(|i| format!("({i}, 'account {i}')"))
+            .collect::<Vec<_>>()
+            .join(",");
+        core_execute(
+            &mut session,
+            &format!("INSERT INTO prefix_accounts VALUES {accounts}"),
+        );
+        core_execute(&mut session, "COMMIT");
+        let cases = [
+            (
+                "leading_account",
+                "SELECT group_id FROM prefix_members WHERE account_id = $1 ORDER BY group_id",
+                10,
+            ),
+            (
+                "leading_group",
+                "SELECT account_id FROM prefix_reverse WHERE group_id = $1 ORDER BY account_id",
+                10,
+            ),
+            (
+                "direct_single",
+                "SELECT group_id FROM prefix_single WHERE account_id = $1 ORDER BY group_id",
+                10,
+            ),
+            (
+                "membership_chain",
+                "SELECT m.group_id, g.name, a.name FROM prefix_members m \
+                 JOIN prefix_groups g ON g.group_id = m.group_id \
+                 JOIN prefix_accounts a ON a.account_id = m.account_id \
+                 WHERE m.account_id = $1 ORDER BY m.group_id",
+                10,
+            ),
+        ];
+        for (name, sql, expected) in cases {
+            let statement = session.prepare(sql).unwrap();
+            assert_eq!(
+                session
+                    .query_prepared(&statement, &[Value::Int4(0)])
+                    .unwrap()
+                    .rows
+                    .len(),
+                expected
+            );
+            let keys = (0..rows / 10)
+                .map(|i| Value::Int4(i as i32))
+                .collect::<Vec<_>>();
+            let mut index = 0;
+            group.bench_function(BenchmarkId::new(name, rows), |benchmark| {
+                benchmark.iter(|| {
+                    let key = &keys[index % keys.len()];
+                    index += 1;
+                    black_box(
+                        session
+                            .query_prepared(&statement, std::slice::from_ref(key))
+                            .unwrap(),
+                    );
+                });
+            });
+        }
+        if rows == 1_000 {
+            let missing = session
+                .prepare("SELECT group_id FROM prefix_members WHERE account_id = $1")
+                .unwrap();
+            let key = [Value::Int4(1001)];
+            assert!(
+                session
+                    .query_prepared(&missing, &key)
+                    .unwrap()
+                    .rows
+                    .is_empty()
+            );
+            group.bench_function(BenchmarkId::new("missing", rows), |benchmark| {
+                benchmark.iter(|| black_box(session.query_prepared(&missing, &key).unwrap()));
+            });
+            let complete = session
+                .prepare("SELECT role FROM prefix_members WHERE account_id = $1 AND group_id = $2")
+                .unwrap();
+            let key = [Value::Int4(0), Value::Int4(0)];
+            assert_eq!(
+                session.query_prepared(&complete, &key).unwrap().rows.len(),
+                1
+            );
+            group.bench_function(BenchmarkId::new("complete_key", rows), |benchmark| {
+                benchmark.iter(|| black_box(session.query_prepared(&complete, &key).unwrap()));
+            });
+        }
+        if rows == 10_000 {
+            core_execute(
+                &mut session,
+                "CREATE TABLE prefix_dense (account_id INTEGER, group_id INTEGER); \
+                 CREATE UNIQUE INDEX prefix_dense_key ON prefix_dense(account_id, group_id)",
+            );
+            core_execute(&mut session, "BEGIN");
+            for batch_start in (0..rows).step_by(500) {
+                let values = (batch_start..rows.min(batch_start + 500))
+                    .map(|i| {
+                        let account_id = if i < 1_000 {
+                            0
+                        } else if i < 1_100 {
+                            1
+                        } else {
+                            2 + (i - 1_100) / 10
+                        };
+                        format!("({account_id}, {i})")
+                    })
+                    .collect::<Vec<_>>()
+                    .join(",");
+                core_execute(
+                    &mut session,
+                    &format!("INSERT INTO prefix_dense VALUES {values}"),
+                );
+            }
+            core_execute(&mut session, "COMMIT");
+            let statement = session
+                .prepare(
+                    "SELECT group_id FROM prefix_dense WHERE account_id = $1 ORDER BY group_id",
+                )
+                .unwrap();
+            for (name, account_id, expected) in
+                [("matches_100", 1, 100), ("matches_1000", 0, 1_000)]
+            {
+                let key = [Value::Int4(account_id)];
+                assert_eq!(
+                    session.query_prepared(&statement, &key).unwrap().rows.len(),
+                    expected
+                );
+                group.bench_function(BenchmarkId::new(name, rows), |benchmark| {
+                    benchmark.iter(|| black_box(session.query_prepared(&statement, &key).unwrap()));
+                });
+            }
+        }
+    }
+    group.finish();
+}
+
 fn benchmark_guarded_mutations(criterion: &mut Criterion) {
     let mut group = criterion.benchmark_group("guarded_mutations");
     for rows in [100_usize, 1_000, 10_000] {
@@ -2961,6 +3147,7 @@ fn benchmarks(criterion: &mut Criterion) {
         indexed_vs_scan_benchmark(criterion);
         benchmark_selective_outer_joins(criterion, &[10, 100, 500, 1_000, 10_000]);
         benchmark_composite_access(criterion, &[100, 1_000, 10_000]);
+        benchmark_composite_prefix(criterion, &[100, 1_000, 10_000]);
         benchmark_guarded_mutations(criterion);
         benchmark_lookup_scaling(criterion, &runtime, &mut connections);
         benchmark_populated_table_writes(criterion, &runtime, &mut connections);

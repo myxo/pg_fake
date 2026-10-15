@@ -1,6 +1,6 @@
 # Optimization experiments
 
-Status: research completed; E01–E03 accepted, E04–E16 pending. This is separate
+Status: research completed; E01–E04 accepted, E05–E16 pending. This is separate
 from the SQL compatibility roadmap in `plan.md`.
 
 Research revision: `2b5243fc043adef6d713de71b2f9bc03dd57074a`.
@@ -218,7 +218,7 @@ casts, duplicate nonunique keys, changed keys and old versions. Use existing
 equality normalization and MVCC rechecks. Do not call a composite key unique when
 only some components are bound. Reject per-key-width specialized executors.
 
-### E04 — Enumerate composite-index equality prefixes without scanning all keys [PENDING]
+### E04 — Enumerate composite-index equality prefixes without scanning all keys [ACCEPTED]
 
 **Idea:** add a bounded leading-key range to E03's access descriptor and index
 iteration, using the existing ordered key map. Return all matching RowIds and

@@ -14,7 +14,7 @@ use crate::{
         expressions::{
             evaluate_comparison, evaluate_literal, infer_expression_type, is_null_literal,
         },
-        index_access::{EqualityIndexAccess, find_complete_index_access},
+        index_access::{EqualityIndexAccess, find_complete_index_access, find_prefix_index_access},
         normalize_identifier, normalize_relation_name,
         query::describe_query_result_columns,
         scope::{BoundScope, RowScope, bind_query_scope},
@@ -1073,7 +1073,9 @@ fn find_index_access(
             _ => {}
         }
     }
-    find_complete_index_access(schema, &equalities, false).map(PreparedAccess::Indexed)
+    find_complete_index_access(schema, &equalities, false)
+        .or_else(|| find_prefix_index_access(schema, &equalities))
+        .map(PreparedAccess::Indexed)
 }
 
 pub(crate) fn execute_prepared_query(
@@ -1339,6 +1341,21 @@ pub(crate) fn execute_prepared_query(
                             );
                         }
                         if let Some((row_id, version)) = table.find_unique_visible_version(
+                            &access.columns,
+                            values,
+                            snapshot,
+                            xid,
+                            &state.transactions,
+                        ) {
+                            state.record_read(
+                                xid,
+                                crate::serializable::Access::Row(*table_id, row_id),
+                            );
+                            visit_source(&version.row)?;
+                        }
+                    } else if values.len() < access.columns.len() {
+                        state.record_read(xid, crate::serializable::Access::Relation(*table_id));
+                        for (row_id, version) in table.find_prefix_visible_versions(
                             &access.columns,
                             values,
                             snapshot,

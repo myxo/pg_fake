@@ -5,7 +5,7 @@ use crate::{
     executor::{
         DatabaseState, StatementContext,
         expressions::{evaluate, evaluate_and_coerce, resolve_operator_type},
-        index_access::{EqualityIndexAccess, find_complete_index_access},
+        index_access::{EqualityIndexAccess, find_complete_index_access, find_prefix_index_access},
         normalize_relation_name,
         scope::{BoundScope, RowScope},
     },
@@ -136,13 +136,9 @@ pub(super) fn visit_table_factor_rows(
             equalities.push((column, value));
         }
     }
-    let access = find_complete_index_access(schema, &equalities, false).filter(|access| {
-        if access.unique {
-            table.has_unique_index(&access.columns)
-        } else {
-            table.has_nonunique_index(&access.columns)
-        }
-    });
+    let access = find_complete_index_access(schema, &equalities, false)
+        .or_else(|| find_prefix_index_access(schema, &equalities))
+        .filter(|access| table.has_unfiltered_index(&access.columns));
     if let Some(access) = access {
         let values = access
             .columns
@@ -184,6 +180,17 @@ pub(super) fn visit_table_factor_rows(
                 state.record_read(xid, Access::Unique(schema.id, access.columns.clone(), key));
             }
             if let Some((row_id, indexed_version)) = table.find_unique_visible_version(
+                &access.columns,
+                &values,
+                source_snapshot,
+                xid,
+                transactions,
+            ) {
+                visit_indexed_row(row_id, indexed_version)?;
+            }
+        } else if values.len() < access.columns.len() {
+            state.record_read(xid, Access::Relation(schema.id));
+            for (row_id, indexed_version) in table.find_prefix_visible_versions(
                 &access.columns,
                 &values,
                 source_snapshot,
