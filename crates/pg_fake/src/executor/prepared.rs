@@ -14,6 +14,7 @@ use crate::{
         expressions::{
             evaluate_comparison, evaluate_literal, infer_expression_type, is_null_literal,
         },
+        index_access::{EqualityIndexAccess, find_complete_index_access},
         normalize_identifier, normalize_relation_name,
         query::describe_query_result_columns,
         scope::{BoundScope, RowScope, bind_query_scope},
@@ -21,6 +22,7 @@ use crate::{
     txn::{Snapshot, Xid, find_visible_version},
     value::{BaseType, PgType, Value},
 };
+use smallvec::SmallVec;
 use sqlparser::ast;
 use std::time::Instant;
 
@@ -45,14 +47,21 @@ impl PreparedQueryPlan {
 #[derive(Debug, Clone)]
 enum PreparedAccess {
     Scan,
-    Unique {
-        column: usize,
-        value: PreparedExpression,
-    },
-    Nonunique {
-        column: usize,
-        value: PreparedExpression,
-    },
+    Indexed(EqualityIndexAccess<PreparedExpression>),
+}
+
+enum EvaluatedIndexValues {
+    One(Value),
+    Many(SmallVec<[Value; 2]>),
+}
+
+impl EvaluatedIndexValues {
+    fn get_slice(&self) -> &[Value] {
+        match self {
+            Self::One(value) => std::slice::from_ref(value),
+            Self::Many(values) => values,
+        }
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -73,8 +82,7 @@ enum PreparedSource {
 #[derive(Debug, Clone)]
 struct PreparedIndexedJoin {
     table_id: TableId,
-    left_slot: usize,
-    right_column: usize,
+    access: EqualityIndexAccess<usize>,
 }
 
 #[derive(Debug, Clone)]
@@ -330,9 +338,7 @@ pub(crate) fn build_prepared_query_plan(
     let scope = bind_query_scope(&state.catalog, select)?;
     let mut joins = Vec::new();
     if let Some(schema) = schema {
-        if !select.from[0].joins.is_empty()
-            && (select.from[0].joins.len() < 2 || select.selection.is_none())
-        {
+        if !select.from[0].joins.is_empty() && select.selection.is_none() {
             return Ok(None);
         }
         let mut width = schema.columns.len();
@@ -358,49 +364,76 @@ pub(crate) fn build_prepared_query_plan(
                 | ast::JoinOperator::Inner(ast::JoinConstraint::On(condition)) => condition,
                 _ => return Ok(None),
             };
-            let ast::Expr::BinaryOp {
-                left,
-                op: ast::BinaryOperator::Eq,
-                right,
-            } = condition
-            else {
+            let end = width + right_schema.columns.len();
+            let mut equalities = Vec::new();
+            let mut pending = vec![condition];
+            while let Some(condition) = pending.pop() {
+                match condition {
+                    ast::Expr::Nested(inner) => pending.push(inner),
+                    ast::Expr::BinaryOp {
+                        left,
+                        op: ast::BinaryOperator::And,
+                        right,
+                    } => {
+                        pending.push(right);
+                        pending.push(left);
+                    }
+                    ast::Expr::BinaryOp {
+                        left,
+                        op: ast::BinaryOperator::Eq,
+                        right,
+                    } => {
+                        let (Some((first, first_type)), Some((second, second_type))) = (
+                            super::scope::try_resolve_column_reference(left, &scope),
+                            super::scope::try_resolve_column_reference(right, &scope),
+                        ) else {
+                            return Ok(None);
+                        };
+                        if first_type.base != second_type.base
+                            || !matches!(
+                                first_type.base,
+                                BaseType::Int2
+                                    | BaseType::Int4
+                                    | BaseType::Int8
+                                    | BaseType::Text
+                                    | BaseType::Uuid
+                            )
+                        {
+                            return Ok(None);
+                        }
+                        let (left_slot, right_slot) =
+                            if first < width && (width..end).contains(&second) {
+                                (first, second)
+                            } else if second < width && (width..end).contains(&first) {
+                                (second, first)
+                            } else {
+                                return Ok(None);
+                            };
+                        equalities.push((right_slot - width, left_slot));
+                    }
+                    _ => return Ok(None),
+                }
+            }
+            let Some(access) = find_complete_index_access(right_schema, &equalities, true) else {
                 return Ok(None);
             };
-            let (Some((first, first_type)), Some((second, second_type))) = (
-                super::scope::try_resolve_column_reference(left, &scope),
-                super::scope::try_resolve_column_reference(right, &scope),
-            ) else {
-                return Ok(None);
-            };
-            if first_type.base != second_type.base
-                || !matches!(
-                    first_type.base,
-                    BaseType::Int2 | BaseType::Int4 | BaseType::Int8 | BaseType::Uuid
-                )
-            {
+            if equalities.len() != access.columns.len() {
                 return Ok(None);
             }
-            let end = width + right_schema.columns.len();
-            let (left_slot, right_slot) = if first < width && (width..end).contains(&second) {
-                (first, second)
-            } else if second < width && (width..end).contains(&first) {
-                (second, first)
-            } else {
+            if select.from[0].joins.len() == 1 && access.columns.len() == 1 {
                 return Ok(None);
-            };
-            let right_column = right_slot - width;
+            }
             if !state
                 .tables
                 .get(&right_schema.id)
                 .expect("catalog table must have storage")
-                .has_unique_index(&[right_column])
+                .has_unique_index(&access.columns)
             {
                 return Ok(None);
             }
             joins.push(PreparedIndexedJoin {
                 table_id: right_schema.id,
-                left_slot,
-                right_column,
+                access,
             });
             width = end;
         }
@@ -1003,76 +1036,44 @@ fn find_index_access(
     selection: &PreparedExpression,
     schema: &TableSchema,
 ) -> Option<PreparedAccess> {
-    if let PreparedExpression::Binary {
-        left,
-        operator: ast::BinaryOperator::And,
-        right,
-        ..
-    } = selection
-    {
-        let left = find_index_access(left, schema);
-        if matches!(left, Some(PreparedAccess::Unique { .. })) {
-            return left;
-        }
-        let right = find_index_access(right, schema);
-        return if matches!(right, Some(PreparedAccess::Unique { .. })) {
-            right
-        } else {
-            left.or(right)
-        };
-    }
-    let PreparedExpression::Binary {
-        left,
-        operator: ast::BinaryOperator::Eq,
-        right,
-        ..
-    } = selection
-    else {
-        return None;
-    };
-    let (column, value) = match (left.as_ref(), right.as_ref()) {
-        (PreparedExpression::Column { slot, .. }, value) if !value.has_column() => {
-            (*slot, value.clone())
-        }
-        (value, PreparedExpression::Column { slot, .. }) if !value.has_column() => {
-            (*slot, value.clone())
-        }
-        _ => return None,
-    };
-    if column >= schema.columns.len()
-        || value.get_data_type() != schema.columns[column].data_type.base
-    {
-        return None;
-    }
-    let unique = schema
-        .constraints
-        .iter()
-        .any(|constraint| match constraint {
-            crate::catalog::Constraint::PrimaryKey { columns, .. }
-            | crate::catalog::Constraint::Unique { columns, .. } => {
-                columns.len() == 1 && columns[0] == schema.columns[column].name
+    let mut equalities = Vec::new();
+    let mut pending = vec![selection];
+    while let Some(expression) = pending.pop() {
+        match expression {
+            PreparedExpression::Binary {
+                left,
+                operator: ast::BinaryOperator::And,
+                right,
+                ..
+            } => {
+                pending.push(right);
+                pending.push(left);
             }
-            _ => false,
-        })
-        || schema.indexes.iter().any(|index| {
-            index.unique
-                && index.predicate.is_none()
-                && index.columns.len() == 1
-                && index.columns[0].name == schema.columns[column].name
-        });
-    if unique {
-        return Some(PreparedAccess::Unique { column, value });
+            PreparedExpression::Binary {
+                left,
+                operator: ast::BinaryOperator::Eq,
+                right,
+                ..
+            } => {
+                let (column, value) = match (left.as_ref(), right.as_ref()) {
+                    (PreparedExpression::Column { slot, .. }, value) if !value.has_column() => {
+                        (*slot, value)
+                    }
+                    (value, PreparedExpression::Column { slot, .. }) if !value.has_column() => {
+                        (*slot, value)
+                    }
+                    _ => continue,
+                };
+                if column < schema.columns.len()
+                    && value.get_data_type() == schema.columns[column].data_type.base
+                {
+                    equalities.push((column, value.clone()));
+                }
+            }
+            _ => {}
+        }
     }
-    schema
-        .indexes
-        .iter()
-        .any(|index| {
-            !index.unique
-                && index.predicate.is_none()
-                && index.columns.len() == 1
-                && index.columns[0].name == schema.columns[column].name
-        })
-        .then_some(PreparedAccess::Nonunique { column, value })
+    find_complete_index_access(schema, &equalities, false).map(PreparedAccess::Indexed)
 }
 
 pub(crate) fn execute_prepared_query(
@@ -1216,8 +1217,14 @@ pub(crate) fn execute_prepared_query(
         joined.clear();
         joined.extend_from_slice(row);
         for join in &plan.joins {
-            let value = &joined[join.left_slot];
-            if value.is_null() {
+            let values = match join.access.values.as_slice() {
+                [slot] => EvaluatedIndexValues::One(joined[*slot].clone()),
+                slots => EvaluatedIndexValues::Many(
+                    slots.iter().map(|slot| joined[*slot].clone()).collect(),
+                ),
+            };
+            let values = values.get_slice();
+            if values.iter().any(Value::is_null) {
                 return Ok(());
             }
             let table = state
@@ -1225,21 +1232,20 @@ pub(crate) fn execute_prepared_query(
                 .get(&join.table_id)
                 .expect("prepared table must have storage");
             if state.tracks_serializable_reads(xid)
-                && let Some(key) =
-                    table.create_unique_read_key(&[join.right_column], std::slice::from_ref(value))
+                && let Some(key) = table.create_unique_read_key(&join.access.columns, values)
             {
                 state.record_read(
                     xid,
                     crate::serializable::Access::Unique(
                         join.table_id,
-                        vec![join.right_column],
+                        join.access.columns.clone(),
                         key,
                     ),
                 );
             }
             let Some((row_id, version)) = table.find_unique_visible_version(
-                &[join.right_column],
-                std::slice::from_ref(value),
+                &join.access.columns,
+                values,
                 snapshot,
                 xid,
                 &state.transactions,
@@ -1294,42 +1300,72 @@ pub(crate) fn execute_prepared_query(
                         }
                     }
                 }
-                PreparedAccess::Unique { column, value } => {
-                    let value =
-                        evaluate_prepared_expression(value, &[], parameters, deadline, timezone)?;
-                    if state.tracks_serializable_reads(xid)
-                        && let Some(key) =
-                            table.create_unique_read_key(&[*column], std::slice::from_ref(&value))
-                    {
-                        state.record_read(
+                PreparedAccess::Indexed(access) => {
+                    let values = match access.values.as_slice() {
+                        [value] => EvaluatedIndexValues::One(evaluate_prepared_expression(
+                            value,
+                            &[],
+                            parameters,
+                            deadline,
+                            timezone,
+                        )?),
+                        expressions => EvaluatedIndexValues::Many(
+                            expressions
+                                .iter()
+                                .map(|value| {
+                                    evaluate_prepared_expression(
+                                        value,
+                                        &[],
+                                        parameters,
+                                        deadline,
+                                        timezone,
+                                    )
+                                })
+                                .collect::<Result<_>>()?,
+                        ),
+                    };
+                    let values = values.get_slice();
+                    if access.unique {
+                        if state.tracks_serializable_reads(xid)
+                            && let Some(key) = table.create_unique_read_key(&access.columns, values)
+                        {
+                            state.record_read(
+                                xid,
+                                crate::serializable::Access::Unique(
+                                    *table_id,
+                                    access.columns.clone(),
+                                    key,
+                                ),
+                            );
+                        }
+                        if let Some((row_id, version)) = table.find_unique_visible_version(
+                            &access.columns,
+                            values,
+                            snapshot,
                             xid,
-                            crate::serializable::Access::Unique(*table_id, vec![*column], key),
-                        );
-                    }
-                    if let Some((row_id, version)) = table.find_unique_visible_version(
-                        &[*column],
-                        &[value],
-                        snapshot,
-                        xid,
-                        &state.transactions,
-                    ) {
-                        state.record_read(xid, crate::serializable::Access::Row(*table_id, row_id));
-                        visit_source(&version.row)?;
-                    }
-                }
-                PreparedAccess::Nonunique { column, value } => {
-                    let value =
-                        evaluate_prepared_expression(value, &[], parameters, deadline, timezone)?;
-                    state.record_read(xid, crate::serializable::Access::Relation(*table_id));
-                    for (row_id, version) in table.find_nonunique_visible_versions(
-                        &[*column],
-                        &[value],
-                        snapshot,
-                        xid,
-                        &state.transactions,
-                    ) {
-                        state.record_read(xid, crate::serializable::Access::Row(*table_id, row_id));
-                        visit_source(&version.row)?;
+                            &state.transactions,
+                        ) {
+                            state.record_read(
+                                xid,
+                                crate::serializable::Access::Row(*table_id, row_id),
+                            );
+                            visit_source(&version.row)?;
+                        }
+                    } else {
+                        state.record_read(xid, crate::serializable::Access::Relation(*table_id));
+                        for (row_id, version) in table.find_nonunique_visible_versions(
+                            &access.columns,
+                            values,
+                            snapshot,
+                            xid,
+                            &state.transactions,
+                        ) {
+                            state.record_read(
+                                xid,
+                                crate::serializable::Access::Row(*table_id, row_id),
+                            );
+                            visit_source(&version.row)?;
+                        }
                     }
                 }
             }

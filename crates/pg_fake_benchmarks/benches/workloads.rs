@@ -2283,6 +2283,202 @@ fn benchmark_selective_outer_joins(criterion: &mut Criterion, row_counts: &[usiz
     group.finish();
 }
 
+fn benchmark_composite_access(criterion: &mut Criterion, row_counts: &[usize]) {
+    let mut group = criterion.benchmark_group("composite_access");
+    for &rows in row_counts {
+        let mut session = Db::create().create_session();
+        core_execute(
+            &mut session,
+            "CREATE TABLE composite_pairs (group_id INTEGER, account_id INTEGER, role TEXT); \
+             CREATE UNIQUE INDEX composite_pairs_key ON composite_pairs (group_id, account_id); \
+             CREATE TABLE composite_parent (id INTEGER PRIMARY KEY, group_id INTEGER, account_id INTEGER); \
+             CREATE TABLE composite_partial (group_id INTEGER, account_id INTEGER, role TEXT, deleted_at BIGINT); \
+             CREATE UNIQUE INDEX composite_partial_key ON composite_partial (group_id, account_id) WHERE deleted_at IS NULL; \
+             CREATE TABLE composite_single (group_id INTEGER, account_id INTEGER, role TEXT, deleted_at BIGINT); \
+             CREATE UNIQUE INDEX composite_single_pair ON composite_single (group_id, account_id) WHERE deleted_at IS NULL; \
+             CREATE INDEX composite_single_account ON composite_single (account_id); \
+             CREATE TABLE composite_multi (group_id INTEGER, account_id INTEGER, role TEXT); \
+             CREATE INDEX composite_multi_key ON composite_multi (group_id, account_id)",
+        );
+        core_execute(&mut session, "BEGIN");
+        for batch_start in (0..rows).step_by(500) {
+            let batch = batch_start..rows.min(batch_start + 500);
+            let keyed = batch
+                .clone()
+                .map(|i| format!("({}, {i}, 'member')", i / 10))
+                .collect::<Vec<_>>()
+                .join(",");
+            let parent = batch
+                .clone()
+                .map(|i| format!("({i}, {}, {i})", i / 10))
+                .collect::<Vec<_>>()
+                .join(",");
+            let active = batch
+                .clone()
+                .map(|i| format!("({}, {i}, 'member', NULL)", i / 10))
+                .collect::<Vec<_>>()
+                .join(",");
+            let multi = batch
+                .flat_map(|i| {
+                    [
+                        format!("({}, {i}, 'member')", i / 10),
+                        format!("({}, {i}, 'viewer')", i / 10),
+                    ]
+                })
+                .collect::<Vec<_>>()
+                .join(",");
+            core_execute(
+                &mut session,
+                &format!("INSERT INTO composite_pairs VALUES {keyed}"),
+            );
+            core_execute(
+                &mut session,
+                &format!("INSERT INTO composite_parent VALUES {parent}"),
+            );
+            core_execute(
+                &mut session,
+                &format!("INSERT INTO composite_partial VALUES {active}"),
+            );
+            core_execute(
+                &mut session,
+                &format!("INSERT INTO composite_single VALUES {active}"),
+            );
+            core_execute(
+                &mut session,
+                &format!("INSERT INTO composite_multi VALUES {multi}"),
+            );
+        }
+        core_execute(&mut session, "COMMIT");
+
+        let cases = [
+            (
+                "complete_unique",
+                "SELECT role FROM composite_pairs WHERE group_id = $1 AND account_id = $2",
+                2,
+            ),
+            (
+                "parameterized_join",
+                "SELECT p.id, m.role FROM composite_parent p JOIN composite_pairs m \
+                 ON m.group_id = p.group_id AND m.account_id = p.account_id WHERE p.id = $1",
+                1,
+            ),
+        ];
+        for (name, sql, parameter_count) in cases {
+            let statement = session.prepare(sql).unwrap();
+            let keys = (1..rows - 1)
+                .map(|i| [Value::Int4((i / 10) as i32), Value::Int4(i as i32)])
+                .collect::<Vec<_>>();
+            let parameters = if parameter_count == 1 {
+                &keys[0][1..]
+            } else {
+                &keys[0][..]
+            };
+            assert_eq!(
+                session
+                    .query_prepared(&statement, parameters)
+                    .unwrap()
+                    .rows
+                    .len(),
+                1
+            );
+            let mut index = 0;
+            group.bench_function(BenchmarkId::new(name, rows), |benchmark| {
+                benchmark.iter(|| {
+                    let key = &keys[index % keys.len()];
+                    index += 1;
+                    let parameters = if parameter_count == 1 {
+                        &key[1..]
+                    } else {
+                        &key[..]
+                    };
+                    black_box(session.query_prepared(&statement, parameters).unwrap());
+                });
+            });
+        }
+        if rows == 1_000 {
+            for (name, sql, expected) in [
+                (
+                    "partial_only",
+                    "SELECT role FROM composite_partial WHERE group_id = $1 AND account_id = $2 AND deleted_at IS NULL",
+                    1,
+                ),
+                (
+                    "diagnostic_single",
+                    "SELECT role FROM composite_single WHERE group_id = $1 AND account_id = $2 AND deleted_at IS NULL",
+                    1,
+                ),
+                (
+                    "nonunique_duplicates",
+                    "SELECT role FROM composite_multi WHERE group_id = $1 AND account_id = $2 ORDER BY role",
+                    2,
+                ),
+            ] {
+                let statement = session.prepare(sql).unwrap();
+                let key = [Value::Int4(50), Value::Int4(500)];
+                assert_eq!(
+                    session.query_prepared(&statement, &key).unwrap().rows.len(),
+                    expected
+                );
+                group.bench_function(BenchmarkId::new(name, rows), |benchmark| {
+                    benchmark.iter(|| black_box(session.query_prepared(&statement, &key).unwrap()));
+                });
+            }
+            let statement = session
+                .prepare("SELECT role FROM composite_pairs WHERE group_id = $1 AND account_id = $2")
+                .unwrap();
+            let missing = [Value::Int4(1000), Value::Int4(1000)];
+            assert!(
+                session
+                    .query_prepared(&statement, &missing)
+                    .unwrap()
+                    .rows
+                    .is_empty()
+            );
+            group.bench_function(BenchmarkId::new("complete_missing", rows), |benchmark| {
+                benchmark.iter(|| black_box(session.query_prepared(&statement, &missing).unwrap()));
+            });
+            let key = [Value::Int4(50), Value::Int4(500)];
+            group.bench_function(
+                BenchmarkId::new("complete_cold_prepare", rows),
+                |benchmark| {
+                    benchmark.iter(|| {
+                        let statement = session.prepare(
+                        "SELECT role FROM composite_pairs WHERE group_id = $1 AND account_id = $2",
+                    ).unwrap();
+                        black_box(session.query_prepared(&statement, &key).unwrap());
+                    });
+                },
+            );
+            for (name, sql) in [
+                (
+                    "complete_update",
+                    "UPDATE composite_pairs SET role = 'changed' WHERE group_id = $1 AND account_id = $2",
+                ),
+                (
+                    "complete_delete",
+                    "DELETE FROM composite_pairs WHERE group_id = $1 AND account_id = $2",
+                ),
+            ] {
+                let statement = session.prepare(sql).unwrap();
+                group.bench_function(BenchmarkId::new(name, rows), |benchmark| {
+                    benchmark.iter_custom(|iterations| {
+                        let mut elapsed = Duration::ZERO;
+                        for _ in 0..iterations {
+                            core_execute(&mut session, "BEGIN");
+                            let started = Instant::now();
+                            black_box(session.execute_prepared(&statement, &key).unwrap());
+                            elapsed += started.elapsed();
+                            core_execute(&mut session, "ROLLBACK");
+                        }
+                        elapsed
+                    });
+                });
+            }
+        }
+    }
+    group.finish();
+}
+
 fn benchmark_guarded_mutations(criterion: &mut Criterion) {
     let mut group = criterion.benchmark_group("guarded_mutations");
     for rows in [100_usize, 1_000, 10_000] {
@@ -2764,6 +2960,7 @@ fn benchmarks(criterion: &mut Criterion) {
         mvcc_version_chain_benchmark(criterion);
         indexed_vs_scan_benchmark(criterion);
         benchmark_selective_outer_joins(criterion, &[10, 100, 500, 1_000, 10_000]);
+        benchmark_composite_access(criterion, &[100, 1_000, 10_000]);
         benchmark_guarded_mutations(criterion);
         benchmark_lookup_scaling(criterion, &runtime, &mut connections);
         benchmark_populated_table_writes(criterion, &runtime, &mut connections);

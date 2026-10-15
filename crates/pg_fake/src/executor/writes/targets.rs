@@ -128,24 +128,23 @@ pub(super) fn collect_mutation_targets(
             .collect();
     }
     if let [source_row] = source_rows
-        && let Some(from::UniquePointLookup { column, value, .. }) =
-            from::resolve_unique_point_lookup(
-                table,
-                schema,
-                selection,
-                RowScope::Bound(scope),
-                context,
-            )?
+        && let Some(from::UniquePointLookup { access, .. }) = from::resolve_unique_point_lookup(
+            table,
+            schema,
+            selection,
+            RowScope::Bound(scope),
+            context,
+        )?
     {
-        if let Some(key) = table.create_unique_read_key(&[column], std::slice::from_ref(&value)) {
+        if let Some(key) = table.create_unique_read_key(&access.columns, &access.values) {
             state.record_read(
                 xid,
-                crate::serializable::Access::Unique(schema.id, vec![column], key),
+                crate::serializable::Access::Unique(schema.id, access.columns.clone(), key),
             );
         }
         let Some((row_id, version)) = table.find_unique_visible_version(
-            &[column],
-            &[value],
+            &access.columns,
+            &access.values,
             snapshot,
             xid,
             &state.transactions,

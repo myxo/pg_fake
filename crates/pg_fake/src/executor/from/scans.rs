@@ -5,6 +5,7 @@ use crate::{
     executor::{
         DatabaseState, StatementContext,
         expressions::{evaluate, evaluate_and_coerce, resolve_operator_type},
+        index_access::{EqualityIndexAccess, find_complete_index_access},
         normalize_relation_name,
         scope::{BoundScope, RowScope},
     },
@@ -109,6 +110,7 @@ pub(super) fn visit_table_factor_rows(
             )
         },
     );
+    let mut equalities = Vec::new();
     for filter in &filters {
         let ast::Expr::BinaryOp {
             left,
@@ -128,23 +130,35 @@ pub(super) fn visit_table_factor_rows(
             continue;
         }
         let column = slot - start;
-        let unique = table.has_unique_index(&[column]);
-        if !unique && !table.has_nonunique_index(&[column]) {
-            continue;
-        }
-        if resolve_operator_type(left, right, RowScope::Bound(scope))?
-            != schema.columns[column].data_type.base
+        if resolve_operator_type(left, right, RowScope::Bound(scope)).ok()
+            == Some(schema.columns[column].data_type.base)
         {
-            continue;
+            equalities.push((column, value));
         }
-        let value = evaluate_and_coerce(
-            value,
-            schema.columns[column].data_type.base,
-            CastContext::Implicit,
-            RowScope::Bound(scope),
-            &row,
-            context,
-        )?;
+    }
+    let access = find_complete_index_access(schema, &equalities, false).filter(|access| {
+        if access.unique {
+            table.has_unique_index(&access.columns)
+        } else {
+            table.has_nonunique_index(&access.columns)
+        }
+    });
+    if let Some(access) = access {
+        let values = access
+            .columns
+            .iter()
+            .zip(&access.values)
+            .map(|(&column, value)| {
+                evaluate_and_coerce(
+                    value,
+                    schema.columns[column].data_type.base,
+                    CastContext::Implicit,
+                    RowScope::Bound(scope),
+                    &row,
+                    context,
+                )
+            })
+            .collect::<Result<Vec<_>>>()?;
         let mut visit_indexed_row = |row_id: RowId, indexed_version: &RowVersion| -> Result<()> {
             state.record_read(xid, Access::Row(schema.id, row_id));
             let indexed_row = &indexed_version.row;
@@ -163,16 +177,15 @@ pub(super) fn visit_table_factor_rows(
             }
             Ok(())
         };
-        if unique {
+        if access.unique {
             if state.tracks_serializable_reads(xid)
-                && let Some(key) =
-                    table.create_unique_read_key(&[column], std::slice::from_ref(&value))
+                && let Some(key) = table.create_unique_read_key(&access.columns, &values)
             {
-                state.record_read(xid, Access::Unique(schema.id, vec![column], key));
+                state.record_read(xid, Access::Unique(schema.id, access.columns.clone(), key));
             }
             if let Some((row_id, indexed_version)) = table.find_unique_visible_version(
-                &[column],
-                &[value],
+                &access.columns,
+                &values,
                 source_snapshot,
                 xid,
                 transactions,
@@ -182,8 +195,8 @@ pub(super) fn visit_table_factor_rows(
         } else {
             state.record_read(xid, Access::Relation(schema.id));
             for (row_id, indexed_version) in table.find_nonunique_visible_versions(
-                &[column],
-                &[value],
+                &access.columns,
+                &values,
                 source_snapshot,
                 xid,
                 transactions,
@@ -357,8 +370,7 @@ fn resolve_point_lookup_parts<'a>(
 }
 
 pub(in crate::executor) struct UniquePointLookup {
-    pub(in crate::executor) column: usize,
-    pub(in crate::executor) value: Value,
+    pub(in crate::executor) access: EqualityIndexAccess<Value>,
     pub(in crate::executor) needs_recheck: bool,
 }
 
@@ -373,20 +385,17 @@ pub(in crate::executor) fn resolve_unique_point_lookup(
     let Some(selection) = selection else {
         return Ok(None);
     };
-    let mut pending = Vec::new();
-    let mut current = selection;
-    let mut needs_recheck = false;
-    loop {
+    let mut pending = vec![selection];
+    let mut equalities = Vec::new();
+    while let Some(current) = pending.pop() {
         match strip_nested(current) {
             ast::Expr::BinaryOp {
                 left,
                 op: ast::BinaryOperator::And,
                 right,
             } => {
-                pending.push(right.as_ref());
-                current = left;
-                needs_recheck = true;
-                continue;
+                pending.push(right);
+                pending.push(left);
             }
             ast::Expr::BinaryOp {
                 left,
@@ -396,30 +405,47 @@ pub(in crate::executor) fn resolve_unique_point_lookup(
                 if let Some((column, value)) = resolve_point_lookup_parts(left, right)
                     && let Ok((column, _)) = scope.resolve_column(column)
                     && column < schema.columns.len()
-                    && table.has_unique_index(&[column])
-                    && resolve_operator_type(left, right, scope)?
-                        == schema.columns[column].data_type.base
+                    && resolve_operator_type(left, right, scope).ok()
+                        == Some(schema.columns[column].data_type.base)
                 {
-                    let value = evaluate_and_coerce(
-                        value,
-                        schema.columns[column].data_type.base,
-                        CastContext::Implicit,
-                        scope,
-                        &[],
-                        context,
-                    )?;
-                    return Ok(Some(UniquePointLookup {
-                        column,
-                        value,
-                        needs_recheck,
-                    }));
+                    equalities.push((column, value));
                 }
             }
             _ => {}
         }
-        let Some(next) = pending.pop() else {
-            return Ok(None);
-        };
-        current = next;
     }
+    let Some(access) = find_complete_index_access(schema, &equalities, true)
+        .filter(|access| table.has_unique_index(&access.columns))
+    else {
+        return Ok(None);
+    };
+    let values = access
+        .columns
+        .iter()
+        .zip(&access.values)
+        .map(|(&column, value)| {
+            evaluate_and_coerce(
+                value,
+                schema.columns[column].data_type.base,
+                CastContext::Implicit,
+                scope,
+                &[],
+                context,
+            )
+        })
+        .collect::<Result<Vec<_>>>()?;
+    Ok(Some(UniquePointLookup {
+        access: EqualityIndexAccess {
+            columns: access.columns,
+            values,
+            unique: true,
+        },
+        needs_recheck: !matches!(
+            strip_nested(selection),
+            ast::Expr::BinaryOp {
+                op: ast::BinaryOperator::Eq,
+                ..
+            }
+        ),
+    }))
 }

@@ -210,8 +210,7 @@ pub(crate) fn collect_required_row_locks(
             })
             .collect()
     } else if let Some(super::from::UniquePointLookup {
-        column,
-        value,
+        access,
         needs_recheck,
     }) =
         resolve_unique_point_lookup(table, schema, selection, RowScope::Table(schema), context)?
@@ -223,15 +222,15 @@ pub(crate) fn collect_required_row_locks(
                 context,
             )?;
         }
-        if let Some(key) = table.create_unique_read_key(&[column], std::slice::from_ref(&value)) {
+        if let Some(key) = table.create_unique_read_key(&access.columns, &access.values) {
             state.record_read(
                 xid,
-                crate::serializable::Access::Unique(schema.id, vec![column], key),
+                crate::serializable::Access::Unique(schema.id, access.columns.clone(), key),
             );
         }
         match table.find_unique_visible_version(
-            &[column],
-            &[value],
+            &access.columns,
+            &access.values,
             snapshot,
             xid,
             &state.transactions,

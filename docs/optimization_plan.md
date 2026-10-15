@@ -1,6 +1,6 @@
 # Optimization experiments
 
-Status: research completed; E01–E02 accepted, E03–E16 pending. This is separate
+Status: research completed; E01–E03 accepted, E04–E16 pending. This is separate
 from the SQL compatibility roadmap in `plan.md`.
 
 Research revision: `2b5243fc043adef6d713de71b2f9bc03dd57074a`.
@@ -195,7 +195,9 @@ predicates, ON filters, RIGHT/FULL joins and OR need explicit semantic treatment
 Reject unconditional outer-join pushdown. Test nullable keys, duplicate matches,
 ordering ties, old snapshots and locking reads; do not weaken inner-join plans.
 
-### E03 — Use complete composite equality keys through one access descriptor [PENDING]
+### E03 — Use complete composite equality keys through one access descriptor [ACCEPTED]
+
+Decision and measurements: [E03 experiment record](optimization_e03.md).
 
 **Idea:** replace single-column execution assumptions with ordered vectors of
 bound equality keys, usable by reads, joins and mutation candidates. Storage

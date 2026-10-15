@@ -12,6 +12,8 @@ use std::collections::{BTreeMap, BTreeSet};
 use views::{execute_comment_on_view, execute_create_view, execute_drop_views};
 use writes::{execute_delete, execute_insert, execute_update};
 
+mod index_access;
+
 pub(crate) fn capture_insert_query_sources(
     state: &DatabaseState,
     statement: &ast::Statement,
