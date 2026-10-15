@@ -29,18 +29,44 @@ struct TierReport {
 
 fn main() {
     let commands = env::args().skip(1).collect::<Vec<_>>();
-    let (record, filter) = match commands.as_slice() {
-        [command] if command == "bench" => (false, None),
-        [command, action] if command == "bench" && action == "record" => (true, None),
-        [command, filter] if command == "bench" => (false, Some(filter.as_str())),
-        _ => panic!("usage: cargo x bench [FILTER] | cargo x bench record"),
+    let (record, thorough, diagnostics, filter) = match commands.as_slice() {
+        [command] if command == "bench" => (false, false, false, None),
+        [command, action] if command == "bench" && action == "record" => (true, false, false, None),
+        [command, action, mode]
+            if command == "bench" && action == "record" && mode == "thorough" =>
+        {
+            (true, true, false, None)
+        }
+        [command, action] if command == "bench" && action == "thorough" => {
+            (false, true, false, None)
+        }
+        [command, action, filter] if command == "bench" && action == "thorough" => {
+            (false, true, false, Some(filter.as_str()))
+        }
+        [command, action] if command == "bench" && action == "diagnostics" => {
+            (false, false, true, None)
+        }
+        [command, action, filter] if command == "bench" && action == "diagnostics" => {
+            (false, false, true, Some(filter.as_str()))
+        }
+        [command, filter] if command == "bench" => (false, false, false, Some(filter.as_str())),
+        _ => panic!(
+            "usage: cargo x bench [FILTER] | cargo x bench thorough [FILTER] | cargo x bench record [thorough] | cargo x bench diagnostics [FILTER]"
+        ),
     };
+    if diagnostics {
+        if let Some(filter) = filter {
+            validate_filter(filter);
+        }
+        run_benchmarks(false, false, true, filter);
+        return;
+    }
     let benchmarks = select_benchmarks(filter);
 
     let environment = collect_environment();
     print_environment(&environment);
     restore_baseline(record, &benchmarks);
-    run_benchmarks(record, filter);
+    run_benchmarks(record, thorough, false, filter);
 
     let report = collect_report(&find_criterion_root(), "new", &benchmarks);
     print_report(&report);
@@ -55,12 +81,7 @@ fn main() {
 
 fn select_benchmarks(filter: Option<&str>) -> Vec<Benchmark> {
     if let Some(filter) = filter {
-        assert!(
-            filter
-                .bytes()
-                .all(|byte| byte.is_ascii_alphanumeric() || b"_/".contains(&byte)),
-            "filter must be a literal benchmark name fragment (letters, digits, underscores, or slashes)"
-        );
+        validate_filter(filter);
     }
     let benchmarks = list_benchmarks()
         .into_iter()
@@ -79,6 +100,15 @@ fn select_benchmarks(filter: Option<&str>) -> Vec<Benchmark> {
         "benchmark filter matched no benchmarks"
     );
     benchmarks
+}
+
+fn validate_filter(filter: &str) {
+    assert!(
+        filter
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || b"_/".contains(&byte)),
+        "filter must be a literal benchmark name fragment (letters, digits, underscores, or slashes)"
+    );
 }
 
 fn collect_environment() -> Vec<(String, String)> {
@@ -225,7 +255,7 @@ fn restore_baseline(record: bool, benchmarks: &[Benchmark]) {
     }
 }
 
-fn run_benchmarks(record: bool, filter: Option<&str>) {
+fn run_benchmarks(record: bool, thorough: bool, diagnostics: bool, filter: Option<&str>) {
     let argument = if record {
         "--save-baseline"
     } else {
@@ -239,12 +269,26 @@ fn run_benchmarks(record: bool, filter: Option<&str>) {
         "--bench",
         "workloads",
         "--",
-        argument,
-        BASELINE,
-        "--noplot",
     ]);
+    if !diagnostics {
+        command.args([argument, BASELINE]);
+    }
+    command.arg("--noplot");
+    if thorough {
+        command.env("PG_FAKE_BENCH_THOROUGH", "1");
+    } else {
+        command.env_remove("PG_FAKE_BENCH_THOROUGH");
+    }
+    if diagnostics {
+        command.env("PG_FAKE_BENCH_DIAGNOSTICS", "1");
+    } else {
+        command.env_remove("PG_FAKE_BENCH_DIAGNOSTICS");
+    }
     if let Some(filter) = filter {
         command.arg(filter);
+        command.env("PG_FAKE_BENCH_FILTER", filter);
+    } else {
+        command.env_remove("PG_FAKE_BENCH_FILTER");
     }
     let status = command.status().expect("benchmark command must start");
     assert!(status.success(), "benchmark command must succeed");

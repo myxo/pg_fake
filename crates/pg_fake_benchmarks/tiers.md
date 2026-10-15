@@ -19,8 +19,9 @@ values do not determine a tier.
 
 All variants/backends within a benchmark group share its tier. Tier 1 already
 contains paired indexed and heap reads; their prepared scaling diagnostic is
-Tier 2. Every current group is assessed below. The executable assignments live
-in [`src/lib.rs`](src/lib.rs); update this assessment when adding or moving one.
+Tier 2. Every regular-suite group is assessed below. The executable assignments
+live in [`src/lib.rs`](src/lib.rs); update this assessment when adding or moving
+one. Core-only diagnostic groups run separately and have no tier assignment.
 
 ## Tier 1: essential operations (10 groups)
 

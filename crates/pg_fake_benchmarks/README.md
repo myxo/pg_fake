@@ -9,7 +9,7 @@ Benchmarks are prioritized by their impact on everyday application tests using
 | `tier2_` | Important | Insert variants (`RETURNING`, defaults, identity, foreign keys, upserts), deletes, schema setup/migrations, snapshots, read diagnostics, aggregates, subqueries, read CTEs, JSON/array/temporal operations, savepoints, row locks, and uncontended concurrent reads. |
 | `tier3_` | Rare | Recursive/data-modifying CTEs, advanced windows, lateral queries, nested views, compound index/array aggregation workloads, triggers, temporary tables, catalog lookups, specialized locking/settings, JSON joins, and transaction-history/MVCC/contention diagnostics. |
 
-The shared catalog in [`src/lib.rs`](src/lib.rs) assigns every workload a tier.
+The shared catalog in [`src/lib.rs`](src/lib.rs) assigns every regular workload a tier.
 The [complete tier assessment](tiers.md) explains the assignment of all 106
 benchmark groups based on their actual timed operations.
 Group names stay within 32 characters including the tier prefix. Row counts use
@@ -31,6 +31,9 @@ cargo x bench tier2_
 cargo x bench tier3_
 cargo x bench select_where
 cargo x bench tier1_insert_row/pg_fake
+cargo x bench diagnostics
+cargo x bench diagnostics composite_prefix
+cargo x bench thorough tier1_
 ```
 
 The filter is a plain substring: letters, digits, underscores, and slashes are
@@ -38,7 +41,14 @@ accepted, with no regex syntax. It matches the full Criterion name, such as
 `tier1_insert_row/pg_fake`. Filtered reports contain only selected measurements;
 comparisons appear only when both values were selected. For parameterized
 benchmarks use Criterion's unformatted number (for example `heap_scan/10000`).
-Criterion still performs fixture setup for workloads outside the filter.
+The wrapper skips fixture setup for unrelated workload families before passing
+the filter to Criterion. Shared setup within a family may still run.
+
+The regular suite excludes the core-only `selective_outer_joins`,
+`composite_access`, `composite_prefix`, and `guarded_mutations` diagnostic groups.
+Run them with `cargo x bench diagnostics [FILTER]`. Diagnostics do not start
+PostgreSQL and do not appear in the committed baseline report. A diagnostic
+filter can name a whole group or one of its Criterion cases.
 
 The Criterion suite compares `pg_fake` with PostgreSQL 18 through SQLx. It
 covers a create/drop table lifecycle, individual constrained
@@ -153,11 +163,18 @@ cargo x bench record
 This stores Criterion's compact raw JSON baseline, `environment.json`, and a
 readable `report.md` under `results/`. Transient comparison data remains under
 `target/criterion`; the wrapper disables HTML and plot generation.
-Recording always runs the full suite; `record` does not accept a filter, so the
-saved report and environment describe one complete baseline run.
+Recording always runs the regular suite; `record` does not accept a filter, so the
+saved report and environment describe one complete baseline run. The regular
+suite uses 1 second of warm-up, 2 seconds of measurement, 30 samples, and 10,000
+bootstrap resamples per benchmark. Use `cargo x bench thorough [FILTER]` for
+Criterion's longer defaults (3 seconds, 5 seconds, 100 samples, and 100,000
+resamples). `cargo x bench record thorough` records a baseline with those
+settings. Benchmark names and baseline paths are the same in both modes.
 
-Direct `cargo bench -p pg_fake_benchmarks --bench workloads` remains an ordinary
-Criterion run and does not read or write the committed results.
+Direct `cargo bench -p pg_fake_benchmarks --bench workloads` uses the regular
+sampling schedule and does not read or write the committed results. Its native
+Criterion filter does not skip unrelated fixture setup; use `cargo x bench`
+for filtered runs.
 For example, `cargo bench -p pg_fake_benchmarks --bench workloads -- tier1_`
 runs only Tier 1 measurements using Criterion's built-in name filter.
 

@@ -1,5 +1,6 @@
 use std::{
     borrow::Cow,
+    collections::HashSet,
     env,
     path::PathBuf,
     time::{Duration, Instant},
@@ -2006,8 +2007,11 @@ fn core_vs_sqlx_benchmark(criterion: &mut Criterion, runtime: &Runtime) {
     fake_execute(runtime, &mut sqlx, "ROLLBACK");
 }
 
-fn benchmark_snapshots(criterion: &mut Criterion) {
+fn benchmark_snapshots(criterion: &mut Criterion, selected: Option<&HashSet<&'static str>>) {
     for (rows, name) in [(100, "core_snapshot_100"), (1_000, "core_snapshot_1k")] {
+        if selected.is_some_and(|selected| !selected.contains(name)) {
+            continue;
+        }
         let db = Db::create();
         let mut session = db.create_session();
         core_execute(
@@ -2057,10 +2061,15 @@ fn parsed_vs_prepared_benchmark(criterion: &mut Criterion) {
     core_execute(&mut session, "ROLLBACK");
 }
 
-fn transaction_history_benchmark(criterion: &mut Criterion) {
+fn transaction_history_benchmark(criterion: &mut Criterion, filter: Option<&str>) {
     let mut group =
         criterion.benchmark_group(benchmarks::find_benchmark("tx_history_lookup").format_name());
     for completed in [1_u64, 100, 10_000, 100_000] {
+        if filter
+            .is_some_and(|filter| !format!("tier3_tx_history_lookup/{completed}").contains(filter))
+        {
+            continue;
+        }
         let mut session = Db::create().create_session();
         core_execute(
             &mut session,
@@ -2092,10 +2101,15 @@ fn transaction_history_benchmark(criterion: &mut Criterion) {
     group.finish();
 }
 
-fn mvcc_version_chain_benchmark(criterion: &mut Criterion) {
+fn mvcc_version_chain_benchmark(criterion: &mut Criterion, filter: Option<&str>) {
     let mut group = criterion
         .benchmark_group(benchmarks::find_benchmark("mvcc_old_snapshot_read").format_name());
     for updates in [1_u64, 100, 10_000] {
+        if filter.is_some_and(|filter| {
+            !format!("tier3_mvcc_old_snapshot_read/{updates}").contains(filter)
+        }) {
+            continue;
+        }
         let db = Db::create();
         let mut setup = db.create_session();
         core_execute(
@@ -2133,61 +2147,76 @@ fn mvcc_version_chain_benchmark(criterion: &mut Criterion) {
     group.finish();
 }
 
-fn indexed_vs_scan_benchmark(criterion: &mut Criterion) {
+fn indexed_vs_scan_benchmark(criterion: &mut Criterion, filter: Option<&str>) {
     let mut group =
         criterion.benchmark_group(benchmarks::find_benchmark("lookup_index_vs_scan").format_name());
     for rows in [100_usize, 10_000] {
+        if filter.is_some_and(|filter| {
+            !["unique_index", "heap_scan"]
+                .iter()
+                .any(|kind| format!("tier2_lookup_index_vs_scan/{kind}/{rows}").contains(filter))
+        }) {
+            continue;
+        }
         group.throughput(Throughput::Elements(rows as u64));
 
-        let mut indexed = Db::create().create_session();
-        core_execute(
-            &mut indexed,
-            "CREATE TABLE indexed_lookup (id INTEGER PRIMARY KEY, name TEXT)",
-        );
-        core_execute(&mut indexed, &insert_values_sql("indexed_lookup", rows));
-        let indexed_statement = indexed
-            .prepare("SELECT name FROM indexed_lookup WHERE id = $1")
-            .unwrap();
-        let indexed_parameters = [Value::Int4(rows as i32)];
-        let mut indexed = indexed.begin().unwrap();
-        group.bench_with_input(
-            BenchmarkId::new("unique_index", rows),
-            &rows,
-            |benchmark, _| {
-                benchmark.iter(|| {
-                    let result = indexed
-                        .query_prepared(&indexed_statement, &indexed_parameters)
-                        .unwrap();
-                    black_box(result);
-                });
-            },
-        );
-        indexed.rollback().unwrap();
+        if filter.is_none_or(|filter| {
+            format!("tier2_lookup_index_vs_scan/unique_index/{rows}").contains(filter)
+        }) {
+            let mut indexed = Db::create().create_session();
+            core_execute(
+                &mut indexed,
+                "CREATE TABLE indexed_lookup (id INTEGER PRIMARY KEY, name TEXT)",
+            );
+            core_execute(&mut indexed, &insert_values_sql("indexed_lookup", rows));
+            let indexed_statement = indexed
+                .prepare("SELECT name FROM indexed_lookup WHERE id = $1")
+                .unwrap();
+            let indexed_parameters = [Value::Int4(rows as i32)];
+            let mut indexed = indexed.begin().unwrap();
+            group.bench_with_input(
+                BenchmarkId::new("unique_index", rows),
+                &rows,
+                |benchmark, _| {
+                    benchmark.iter(|| {
+                        let result = indexed
+                            .query_prepared(&indexed_statement, &indexed_parameters)
+                            .unwrap();
+                        black_box(result);
+                    });
+                },
+            );
+            indexed.rollback().unwrap();
+        }
 
-        let mut scanned = Db::create().create_session();
-        core_execute(
-            &mut scanned,
-            "CREATE TABLE scanned_lookup (id INTEGER, name TEXT)",
-        );
-        core_execute(&mut scanned, &insert_values_sql("scanned_lookup", rows));
-        let scanned_statement = scanned
-            .prepare("SELECT name FROM scanned_lookup WHERE id = $1")
-            .unwrap();
-        let scanned_parameters = [Value::Int4(rows as i32)];
-        let mut scanned = scanned.begin().unwrap();
-        group.bench_with_input(
-            BenchmarkId::new("heap_scan", rows),
-            &rows,
-            |benchmark, _| {
-                benchmark.iter(|| {
-                    let result = scanned
-                        .query_prepared(&scanned_statement, &scanned_parameters)
-                        .unwrap();
-                    black_box(result);
-                });
-            },
-        );
-        scanned.rollback().unwrap();
+        if filter.is_none_or(|filter| {
+            format!("tier2_lookup_index_vs_scan/heap_scan/{rows}").contains(filter)
+        }) {
+            let mut scanned = Db::create().create_session();
+            core_execute(
+                &mut scanned,
+                "CREATE TABLE scanned_lookup (id INTEGER, name TEXT)",
+            );
+            core_execute(&mut scanned, &insert_values_sql("scanned_lookup", rows));
+            let scanned_statement = scanned
+                .prepare("SELECT name FROM scanned_lookup WHERE id = $1")
+                .unwrap();
+            let scanned_parameters = [Value::Int4(rows as i32)];
+            let mut scanned = scanned.begin().unwrap();
+            group.bench_with_input(
+                BenchmarkId::new("heap_scan", rows),
+                &rows,
+                |benchmark, _| {
+                    benchmark.iter(|| {
+                        let result = scanned
+                            .query_prepared(&scanned_statement, &scanned_parameters)
+                            .unwrap();
+                        black_box(result);
+                    });
+                },
+            );
+            scanned.rollback().unwrap();
+        }
     }
     group.finish();
 }
@@ -2871,8 +2900,16 @@ fn benchmark_lookup_scaling(
     criterion: &mut Criterion,
     runtime: &Runtime,
     connections: &mut [NamedBenchmarkConnection<'_>],
+    selected: Option<&HashSet<&'static str>>,
 ) {
     for (rows, size) in [(100_usize, "100"), (1_000, "1k")] {
+        if selected.is_some_and(|selected| {
+            !["unique", "nonuniq", "nonuniq_filter", "heap_scan"]
+                .iter()
+                .any(|shape| selected.contains(format!("lookup_{shape}_{size}").as_str()))
+        }) {
+            continue;
+        }
         let indexed_values = (1..=rows)
             .map(|id| format!("({id}, {id}, {id})"))
             .collect::<Vec<_>>()
@@ -2947,8 +2984,16 @@ fn benchmark_populated_table_writes(
     criterion: &mut Criterion,
     runtime: &Runtime,
     connections: &mut [NamedBenchmarkConnection<'_>],
+    selected: Option<&HashSet<&'static str>>,
 ) {
     for (rows, size) in [(100_usize, "100"), (1_000, "1k")] {
+        if selected.is_some_and(|selected| {
+            !["update", "delete"]
+                .iter()
+                .any(|operation| selected.contains(format!("{operation}_indexed_{size}").as_str()))
+        }) {
+            continue;
+        }
         let values = (1..=rows)
             .map(|id| format!("({id}, 0)"))
             .collect::<Vec<_>>()
@@ -3164,6 +3209,58 @@ fn foreign_key_insert_benchmark(
 }
 
 fn benchmarks(criterion: &mut Criterion) {
+    let filter = env::var("PG_FAKE_BENCH_FILTER").ok();
+    if env::var_os("PG_FAKE_BENCH_DIAGNOSTICS").is_some() {
+        let families = [
+            "selective_outer_joins",
+            "composite_access",
+            "composite_prefix",
+            "guarded_mutations",
+        ];
+        let family_filter = filter.as_ref().filter(|filter| {
+            families
+                .iter()
+                .any(|name| name.contains(*filter) || filter.contains(name))
+        });
+        let matches = |name: &str| {
+            family_filter.is_none_or(|filter| name.contains(filter) || filter.contains(name))
+        };
+        if matches("selective_outer_joins") {
+            benchmark_selective_outer_joins(criterion, &[10, 100, 500, 1_000, 10_000]);
+        }
+        if matches("composite_access") {
+            benchmark_composite_access(criterion, &[100, 1_000, 10_000]);
+        }
+        if matches("composite_prefix") {
+            benchmark_composite_prefix(criterion, &[100, 1_000, 10_000]);
+        }
+        if matches("guarded_mutations") {
+            benchmark_guarded_mutations(criterion);
+        }
+        return;
+    }
+    let selected = filter.as_ref().map(|filter| {
+        benchmarks::list_benchmarks()
+            .into_iter()
+            .filter(|benchmark| {
+                benchmark.values.iter().any(|value| {
+                    format!("{}/{}", benchmark.format_name(), value.path.join("/"))
+                        .contains(filter.as_str())
+                })
+            })
+            .map(|benchmark| benchmark.name)
+            .collect::<HashSet<_>>()
+    });
+    macro_rules! run_if {
+        ($call:expr, $($name:literal),+ $(,)?) => {
+            if selected
+                .as_ref()
+                .is_none_or(|selected| false $(|| selected.contains($name))+)
+            {
+                $call;
+            }
+        };
+    }
     let runtime = tokio::runtime::Builder::new_multi_thread()
         .enable_all()
         .build()
@@ -3180,68 +3277,296 @@ fn benchmarks(criterion: &mut Criterion) {
             ),
         ];
 
-        create_table_benchmark(criterion, &runtime, &mut connections);
-        transactional_ddl_benchmark(criterion, &runtime, &mut connections);
-        benchmark_settings(criterion, &runtime, &mut connections);
-        benchmark_transaction_local_gucs(criterion, &runtime, &mut connections);
-        benchmark_savepoints(criterion, &runtime, &mut connections);
-        migration_table_lock_benchmark(criterion, &runtime, &mut connections);
-        benchmark_sqlx_migration_chain(criterion, &runtime, &mut connections);
-        procedural_trigger_benchmark(criterion, &runtime, &mut connections);
-        alter_table_benchmark(criterion, &runtime, &mut connections);
-        partial_unique_index_benchmark(criterion, &runtime, &mut connections);
-        temporary_table_benchmark(criterion, &runtime, &mut connections);
-        sequence_benchmark(criterion, &runtime, &mut connections);
-        catalog_regclass_benchmark(criterion, &runtime, &mut connections);
-        serial_identity_benchmark(criterion, &runtime, &mut connections);
-        uuid_temporal_benchmark(criterion, &runtime, &mut connections);
-        offset_datetime_benchmark(criterion, &runtime, &mut connections);
-        bigint_uuid_array_benchmark(criterion, &runtime, &mut connections);
-        required_array_query_benchmarks(criterion, &runtime, &mut connections);
-        general_array_operation_benchmarks(criterion, &runtime, &mut connections);
-        hashed_advisory_lock_benchmark(criterion, &runtime, &mut connections);
-        benchmark_json(criterion, &runtime, &mut connections);
-        benchmark_jsonb(criterion, &runtime, &mut connections);
-        migration_data_transform_benchmark(criterion, &runtime, &mut connections);
-        insert_benchmark(criterion, &runtime, &mut connections);
-        on_conflict_benchmark(criterion, &runtime, &mut connections);
-        update_benchmark(criterion, &runtime, &mut connections);
-        delete_benchmark(criterion, &runtime, &mut connections);
-        transaction_benchmark(criterion, &runtime, &mut connections);
-        repeatable_read_benchmark(criterion, &runtime, &mut connections);
-        select_benchmark(criterion, &runtime, &mut connections);
-        nested_filtered_view_benchmark(criterion, &runtime, &mut connections);
-        order_by_benchmark(criterion, &runtime, &mut connections);
-        core_vs_sqlx_benchmark(criterion, &runtime);
-        benchmark_snapshots(criterion);
-        parsed_vs_prepared_benchmark(criterion);
-        transaction_history_benchmark(criterion);
-        mvcc_version_chain_benchmark(criterion);
-        indexed_vs_scan_benchmark(criterion);
-        benchmark_selective_outer_joins(criterion, &[10, 100, 500, 1_000, 10_000]);
-        benchmark_composite_access(criterion, &[100, 1_000, 10_000]);
-        benchmark_composite_prefix(criterion, &[100, 1_000, 10_000]);
-        benchmark_guarded_mutations(criterion);
-        benchmark_lookup_scaling(criterion, &runtime, &mut connections);
-        benchmark_populated_table_writes(criterion, &runtime, &mut connections);
-        concurrency_benchmark(criterion, &runtime);
-        benchmark_serializable(criterion, &runtime, &postgres_url);
-        foreign_key_insert_benchmark(criterion, &runtime, &mut connections);
-        inner_join_benchmark(criterion, &runtime, &mut connections);
-        benchmark_selective_indexed_join(criterion, &runtime, &mut connections);
-        benchmark_membership_joins(criterion, &runtime, &mut connections);
-        benchmark_lateral(criterion, &runtime, &mut connections);
-        benchmark_skip_locked(criterion, &runtime, &mut connections);
-        derived_and_scalar_subquery_benchmark(criterion, &runtime, &mut connections);
-        materialized_cte_benchmark(criterion, &runtime, &mut connections);
-        derived_source_join_benchmark(criterion, &runtime, &mut connections);
-        data_modifying_cte_benchmark(criterion, &runtime, &mut connections);
-        recursive_cte_benchmark(criterion, &runtime, &mut connections);
-        global_aggregate_benchmark(criterion, &runtime, &mut connections);
-        grouped_aggregate_benchmark(criterion, &runtime, &mut connections);
-        select_distinct_benchmark(criterion, &runtime, &mut connections);
-        set_operation_benchmark(criterion, &runtime, &mut connections);
-        benchmark_bound_writes(criterion, &runtime, &mut connections);
+        run_if!(
+            create_table_benchmark(criterion, &runtime, &mut connections),
+            "create_table"
+        );
+        run_if!(
+            transactional_ddl_benchmark(criterion, &runtime, &mut connections),
+            "ddl_create_rollback"
+        );
+        run_if!(
+            benchmark_settings(criterion, &runtime, &mut connections),
+            "session_settings_roundtrip"
+        );
+        run_if!(
+            benchmark_transaction_local_gucs(criterion, &runtime, &mut connections),
+            "tx_local_guc"
+        );
+        run_if!(
+            benchmark_savepoints(criterion, &runtime, &mut connections),
+            "nested_savepoint_release",
+            "nested_savepoint_rollback"
+        );
+        run_if!(
+            migration_table_lock_benchmark(criterion, &runtime, &mut connections),
+            "migration_lock_2tables"
+        );
+        run_if!(
+            benchmark_sqlx_migration_chain(criterion, &runtime, &mut connections),
+            "sqlx_migration_chain"
+        );
+        run_if!(
+            procedural_trigger_benchmark(criterion, &runtime, &mut connections),
+            "trigger_insert_update"
+        );
+        run_if!(
+            alter_table_benchmark(criterion, &runtime, &mut connections),
+            "alter_table_rewrite_100"
+        );
+        run_if!(
+            partial_unique_index_benchmark(criterion, &runtime, &mut connections),
+            "partial_unique_index_100"
+        );
+        run_if!(
+            temporary_table_benchmark(criterion, &runtime, &mut connections),
+            "temp_on_commit_drop"
+        );
+        run_if!(
+            sequence_benchmark(criterion, &runtime, &mut connections),
+            "sequence_nextval"
+        );
+        run_if!(
+            catalog_regclass_benchmark(criterion, &runtime, &mut connections),
+            "catalog_regclass_lookup"
+        );
+        run_if!(
+            serial_identity_benchmark(criterion, &runtime, &mut connections),
+            "serial_identity_insert"
+        );
+        run_if!(
+            uuid_temporal_benchmark(criterion, &runtime, &mut connections),
+            "uuid_temporal_select"
+        );
+        run_if!(
+            offset_datetime_benchmark(criterion, &runtime, &mut connections),
+            "offset_datetime_roundtrip"
+        );
+        run_if!(
+            bigint_uuid_array_benchmark(criterion, &runtime, &mut connections),
+            "int8_uuid_array_roundtrip"
+        );
+        run_if!(
+            required_array_query_benchmarks(criterion, &runtime, &mut connections),
+            "uuid_any_100",
+            "array_agg_order_filter_100"
+        );
+        run_if!(
+            general_array_operation_benchmarks(criterion, &runtime, &mut connections),
+            "array_containment_100",
+            "correlated_unnest_100"
+        );
+        run_if!(
+            hashed_advisory_lock_benchmark(criterion, &runtime, &mut connections),
+            "hashed_advisory_lock"
+        );
+        run_if!(
+            benchmark_json(criterion, &runtime, &mut connections),
+            "json_insert_returning"
+        );
+        run_if!(
+            benchmark_jsonb(criterion, &runtime, &mut connections),
+            "jsonb_extraction",
+            "jsonb_containment",
+            "jsonb_insert_returning",
+            "jsonb_join_group"
+        );
+        run_if!(
+            migration_data_transform_benchmark(criterion, &runtime, &mut connections),
+            "runtime_temporal_100",
+            "runtime_patterns_100",
+            "window_row_number_100",
+            "window_rank_100",
+            "window_offset_100",
+            "window_moving_agg_100",
+            "ordered_string_agg_100"
+        );
+        run_if!(
+            insert_benchmark(criterion, &runtime, &mut connections),
+            "insert_row",
+            "insert_row_returning",
+            "insert_row_with_defaults"
+        );
+        run_if!(
+            on_conflict_benchmark(criterion, &runtime, &mut connections),
+            "on_conflict_nothing",
+            "on_conflict_no_conflict",
+            "on_conflict_update"
+        );
+        run_if!(
+            update_benchmark(criterion, &runtime, &mut connections),
+            "update_row",
+            "update_from_row"
+        );
+        run_if!(
+            delete_benchmark(criterion, &runtime, &mut connections),
+            "delete_row"
+        );
+        run_if!(
+            transaction_benchmark(criterion, &runtime, &mut connections),
+            "transaction_insert"
+        );
+        run_if!(
+            repeatable_read_benchmark(criterion, &runtime, &mut connections),
+            "rr_select_for_update"
+        );
+        run_if!(
+            select_benchmark(criterion, &runtime, &mut connections),
+            "select_100",
+            "select_where_100",
+            "select_where_indexed_100",
+            "limit_offset_ordered_100"
+        );
+        run_if!(
+            nested_filtered_view_benchmark(criterion, &runtime, &mut connections),
+            "nested_filtered_view_100"
+        );
+        run_if!(
+            order_by_benchmark(criterion, &runtime, &mut connections),
+            "order_by_100"
+        );
+        run_if!(
+            core_vs_sqlx_benchmark(criterion, &runtime),
+            "adapter_select_100"
+        );
+        run_if!(
+            benchmark_snapshots(criterion, selected.as_ref()),
+            "core_snapshot_100",
+            "core_snapshot_1k"
+        );
+        run_if!(
+            parsed_vs_prepared_benchmark(criterion),
+            "core_parse_vs_prepare"
+        );
+        run_if!(
+            transaction_history_benchmark(criterion, filter.as_deref()),
+            "tx_history_lookup"
+        );
+        run_if!(
+            mvcc_version_chain_benchmark(criterion, filter.as_deref()),
+            "mvcc_old_snapshot_read"
+        );
+        run_if!(
+            indexed_vs_scan_benchmark(criterion, filter.as_deref()),
+            "lookup_index_vs_scan"
+        );
+        run_if!(
+            benchmark_lookup_scaling(criterion, &runtime, &mut connections, selected.as_ref()),
+            "lookup_unique_100",
+            "lookup_unique_1k",
+            "lookup_nonuniq_100",
+            "lookup_nonuniq_1k",
+            "lookup_nonuniq_filter_100",
+            "lookup_nonuniq_filter_1k",
+            "lookup_heap_scan_100",
+            "lookup_heap_scan_1k"
+        );
+        run_if!(
+            benchmark_populated_table_writes(
+                criterion,
+                &runtime,
+                &mut connections,
+                selected.as_ref()
+            ),
+            "update_indexed_100",
+            "update_indexed_1k",
+            "delete_indexed_100",
+            "delete_indexed_1k"
+        );
+        run_if!(
+            concurrency_benchmark(criterion, &runtime),
+            "concurrent_reads",
+            "same_row_contention"
+        );
+        run_if!(
+            benchmark_serializable(criterion, &runtime, &postgres_url),
+            "serializable_read",
+            "serializable_write_skew"
+        );
+        run_if!(
+            foreign_key_insert_benchmark(criterion, &runtime, &mut connections),
+            "foreign_key_insert"
+        );
+        run_if!(
+            inner_join_benchmark(criterion, &runtime, &mut connections),
+            "selective_inner_join",
+            "many_match_inner_join"
+        );
+        run_if!(
+            benchmark_selective_indexed_join(
+                criterion,
+                &runtime,
+                &mut connections,
+                selected.as_ref()
+            ),
+            "join_3way_100",
+            "join_3way_1k",
+            "join_3way_filtered_100",
+            "join_3way_filtered_1k",
+            "join_2way_filtered_100",
+            "join_2way_filtered_1k"
+        );
+        run_if!(
+            benchmark_membership_joins(criterion, &runtime, &mut connections, selected.as_ref()),
+            "join_profile_100",
+            "join_profile_1k",
+            "join_profile_3k",
+            "join_members_100",
+            "join_members_1k",
+            "join_members_3k"
+        );
+        run_if!(
+            benchmark_lateral(criterion, &runtime, &mut connections),
+            "lateral_latest_100"
+        );
+        run_if!(
+            benchmark_skip_locked(criterion, &runtime, &mut connections),
+            "skip_locked_queue_100"
+        );
+        run_if!(
+            derived_and_scalar_subquery_benchmark(criterion, &runtime, &mut connections),
+            "derived_scalar_subq_100",
+            "correlated_exists_100"
+        );
+        run_if!(
+            materialized_cte_benchmark(criterion, &runtime, &mut connections),
+            "materialized_cte_100"
+        );
+        run_if!(
+            derived_source_join_benchmark(criterion, &runtime, &mut connections),
+            "derived_source_join_100"
+        );
+        run_if!(
+            data_modifying_cte_benchmark(criterion, &runtime, &mut connections),
+            "cte_update_100"
+        );
+        run_if!(
+            recursive_cte_benchmark(criterion, &runtime, &mut connections),
+            "recursive_series_100",
+            "recursive_tree_127"
+        );
+        run_if!(
+            global_aggregate_benchmark(criterion, &runtime, &mut connections),
+            "global_aggregate_100"
+        );
+        run_if!(
+            grouped_aggregate_benchmark(criterion, &runtime, &mut connections),
+            "grouped_aggregate_100"
+        );
+        run_if!(
+            select_distinct_benchmark(criterion, &runtime, &mut connections),
+            "select_distinct_100"
+        );
+        run_if!(
+            set_operation_benchmark(criterion, &runtime, &mut connections),
+            "union_all_100",
+            "union_100"
+        );
+        run_if!(
+            benchmark_bound_writes(criterion, &runtime, &mut connections),
+            "insert_bound_row",
+            "update_bound_row"
+        );
     }
     runtime
         .block_on(
@@ -3716,8 +4041,16 @@ fn benchmark_selective_indexed_join(
     criterion: &mut Criterion,
     runtime: &Runtime,
     connections: &mut [NamedBenchmarkConnection<'_>],
+    selected: Option<&HashSet<&'static str>>,
 ) {
     for (rows, size) in [(100_usize, "100"), (1_000, "1k")] {
+        if selected.is_some_and(|selected| {
+            !["3way", "3way_filtered", "2way_filtered"]
+                .iter()
+                .any(|shape| selected.contains(format!("join_{shape}_{size}").as_str()))
+        }) {
+            continue;
+        }
         let key = uuid::Uuid::from_u128(50);
         let values = (1..=rows)
             .map(|id| format!("('{}', {id})", uuid::Uuid::from_u128(id as u128)))
@@ -3795,8 +4128,16 @@ fn benchmark_membership_joins(
     criterion: &mut Criterion,
     runtime: &Runtime,
     connections: &mut [NamedBenchmarkConnection<'_>],
+    selected: Option<&HashSet<&'static str>>,
 ) {
     for (users, size) in [(100_usize, "100"), (1_000, "1k"), (3_000, "3k")] {
+        if selected.is_some_and(|selected| {
+            !["profile", "members"]
+                .iter()
+                .any(|shape| selected.contains(format!("join_{shape}_{size}").as_str()))
+        }) {
+            continue;
+        }
         let groups = users / 10;
         let hubs = (0..users + groups)
             .map(|i| {
@@ -4007,5 +4348,18 @@ fn benchmark_skip_locked(
     }
 }
 
-criterion_group!(workloads, benchmarks);
+fn configure_benchmarks() -> Criterion {
+    let criterion = Criterion::default();
+    if env::var_os("PG_FAKE_BENCH_THOROUGH").is_some() {
+        criterion
+    } else {
+        criterion
+            .warm_up_time(Duration::from_secs(1))
+            .measurement_time(Duration::from_secs(2))
+            .sample_size(30)
+            .nresamples(10_000)
+    }
+}
+
+criterion_group!(name = workloads; config = configure_benchmarks(); targets = benchmarks);
 criterion_main!(workloads);
