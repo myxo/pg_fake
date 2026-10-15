@@ -2119,6 +2119,170 @@ fn indexed_vs_scan_benchmark(criterion: &mut Criterion) {
     group.finish();
 }
 
+fn benchmark_selective_outer_joins(criterion: &mut Criterion, row_counts: &[usize]) {
+    let mut group = criterion.benchmark_group("selective_outer_joins");
+    for &rows in row_counts {
+        let mut session = Db::create().create_session();
+        core_execute(
+            &mut session,
+            "CREATE TABLE outer_accounts (id UUID PRIMARY KEY, name TEXT, email TEXT, home_group_id UUID); \
+             CREATE TABLE outer_roles (account_id UUID, role TEXT, UNIQUE(account_id, role)); \
+             CREATE INDEX outer_roles_account ON outer_roles(account_id); \
+             CREATE TABLE outer_roles_unindexed (account_id UUID, role TEXT); \
+             CREATE TABLE outer_groups (id UUID PRIMARY KEY, name TEXT); \
+             CREATE TABLE outer_credentials (id UUID PRIMARY KEY, group_id UUID, account_id UUID, name TEXT, deleted_at TIMESTAMPTZ)",
+        );
+        core_execute(&mut session, "BEGIN");
+        for (table, values) in [
+            (
+                "outer_accounts",
+                (0..rows)
+                    .map(|i| {
+                        format!(
+                            "('{}', 'account {i}', 'a{i}@example.invalid', '{}')",
+                            make_membership_join_uuid(1, i),
+                            make_membership_join_uuid(2, i),
+                        )
+                    })
+                    .collect::<Vec<_>>(),
+            ),
+            (
+                "outer_roles",
+                (0..rows - 1)
+                    .map(|i| format!("('{}', 'member')", make_membership_join_uuid(1, i)))
+                    .chain(std::iter::once(format!(
+                        "('{}', 'viewer')",
+                        make_membership_join_uuid(1, 0)
+                    )))
+                    .collect(),
+            ),
+            (
+                "outer_roles_unindexed",
+                (0..rows - 1)
+                    .map(|i| format!("('{}', 'member')", make_membership_join_uuid(1, i)))
+                    .collect(),
+            ),
+            (
+                "outer_groups",
+                (0..rows)
+                    .map(|i| format!("('{}', 'group {i}')", make_membership_join_uuid(2, i)))
+                    .collect(),
+            ),
+            (
+                "outer_credentials",
+                (0..rows)
+                    .map(|i| {
+                        format!(
+                            "('{}', '{}', '{}', 'credential {i}', NULL)",
+                            make_membership_join_uuid(4, i),
+                            make_membership_join_uuid(2, i),
+                            make_membership_join_uuid(1, i),
+                        )
+                    })
+                    .collect(),
+            ),
+        ] {
+            for batch in values.chunks(500) {
+                core_execute(
+                    &mut session,
+                    &format!("INSERT INTO {table} VALUES {}", batch.join(",")),
+                );
+            }
+        }
+        core_execute(&mut session, "COMMIT");
+        let role_sql = "SELECT a.id, a.name, a.email, a.home_group_id, r.role \
+                        FROM outer_accounts a LEFT JOIN outer_roles r ON r.account_id = a.id \
+                        WHERE a.id = $1";
+        let group_sql = "SELECT c.id, c.account_id, c.group_id, COALESCE(c.name, '') AS name, \
+                         COALESCE(g.name, '') AS group_name FROM outer_credentials c \
+                         LEFT JOIN outer_groups g ON g.id = c.group_id \
+                         WHERE c.id = $1 AND c.deleted_at IS NULL";
+        for (name, sql, kind) in [("left_roles", role_sql, 1), ("left_group", group_sql, 4)] {
+            let statement = session.prepare(sql).unwrap();
+            let values = (1..rows - 1)
+                .map(|i| Value::Uuid(make_membership_join_uuid(kind, i)))
+                .collect::<Vec<_>>();
+            assert_eq!(
+                session
+                    .query_prepared(&statement, std::slice::from_ref(&values[0]))
+                    .unwrap()
+                    .rows
+                    .len(),
+                1
+            );
+            let mut index = 0;
+            group.bench_function(BenchmarkId::new(name, rows), |benchmark| {
+                benchmark.iter(|| {
+                    let value = &values[index % values.len()];
+                    index += 1;
+                    black_box(
+                        session
+                            .query_prepared(&statement, std::slice::from_ref(value))
+                            .unwrap(),
+                    );
+                });
+            });
+        }
+        if rows == 1_000 {
+            for (name, sql, parameter) in [
+                ("left_roles_many", role_sql, make_membership_join_uuid(1, 0)),
+                (
+                    "left_roles_zero",
+                    role_sql,
+                    make_membership_join_uuid(1, rows - 1),
+                ),
+                (
+                    "left_roles_missing",
+                    role_sql,
+                    make_membership_join_uuid(1, rows),
+                ),
+                (
+                    "left_roles_unindexed",
+                    "SELECT a.id, r.role FROM outer_accounts a LEFT JOIN outer_roles_unindexed r \
+                     ON r.account_id = a.id WHERE a.id = $1",
+                    make_membership_join_uuid(1, rows / 2),
+                ),
+            ] {
+                let statement = session.prepare(sql).unwrap();
+                let value = Value::Uuid(parameter);
+                group.bench_function(BenchmarkId::new(name, rows), |benchmark| {
+                    benchmark.iter(|| {
+                        black_box(
+                            session
+                                .query_prepared(&statement, std::slice::from_ref(&value))
+                                .unwrap(),
+                        );
+                    });
+                });
+            }
+            let statement = session
+                .prepare("SELECT a.id, r.role FROM outer_accounts a LEFT JOIN outer_roles r ON r.account_id = a.id")
+                .unwrap();
+            group.bench_function(
+                BenchmarkId::new("left_roles_full_output", rows),
+                |benchmark| {
+                    benchmark.iter(|| black_box(session.query_prepared(&statement, &[]).unwrap()));
+                },
+            );
+            let value = Value::Uuid(make_membership_join_uuid(1, rows / 2));
+            group.bench_function(
+                BenchmarkId::new("left_roles_cold_prepare", rows),
+                |benchmark| {
+                    benchmark.iter(|| {
+                        let statement = session.prepare(role_sql).unwrap();
+                        black_box(
+                            session
+                                .query_prepared(&statement, std::slice::from_ref(&value))
+                                .unwrap(),
+                        );
+                    });
+                },
+            );
+        }
+    }
+    group.finish();
+}
+
 fn benchmark_guarded_mutations(criterion: &mut Criterion) {
     let mut group = criterion.benchmark_group("guarded_mutations");
     for rows in [100_usize, 1_000, 10_000] {
@@ -2599,6 +2763,7 @@ fn benchmarks(criterion: &mut Criterion) {
         transaction_history_benchmark(criterion);
         mvcc_version_chain_benchmark(criterion);
         indexed_vs_scan_benchmark(criterion);
+        benchmark_selective_outer_joins(criterion, &[10, 100, 500, 1_000, 10_000]);
         benchmark_guarded_mutations(criterion);
         benchmark_lookup_scaling(criterion, &runtime, &mut connections);
         benchmark_populated_table_writes(criterion, &runtime, &mut connections);

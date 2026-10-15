@@ -139,7 +139,7 @@ pub(crate) fn visit_streamed_join_rows(
                 visit,
             );
         }
-        if selection.is_some() && (hash_slots.len() > 1 || !hash_slots[0].2) {
+        if selection.is_some() {
             return visit_hash_join_chain_rows::<true>(
                 state,
                 table,
@@ -169,6 +169,14 @@ pub(crate) fn visit_streamed_join_rows(
     let mut right_sources = Vec::with_capacity(table.joins.len());
     for (index, join) in table.joins.iter().enumerate() {
         let mut rows = Vec::new();
+        let right_selection = if matches!(
+            join.join_operator,
+            ast::JoinOperator::Left(_) | ast::JoinOperator::LeftOuter(_)
+        ) {
+            None
+        } else {
+            selection
+        };
         visit_table_factor_rows(
             state,
             &join.relation,
@@ -176,7 +184,7 @@ pub(crate) fn visit_streamed_join_rows(
             xid,
             snapshot,
             context,
-            selection,
+            right_selection,
             starts[index + 1],
             &mut |row| {
                 rows.push(row.to_vec());
@@ -503,7 +511,9 @@ fn visit_hash_join_chain_rows<const PRUNE_SPARSE_RIGHT: bool>(
                 .is_empty()
         {
             let mut filters = Vec::new();
-            collect_pushdown_filters(selection, scope, right_start, right_end, &mut filters);
+            if !preserve_left {
+                collect_pushdown_filters(selection, scope, right_start, right_end, &mut filters);
+            }
             let schema = state
                 .catalog
                 .require_named_table(&normalize_relation_name(name)?)?;
@@ -512,10 +522,14 @@ fn visit_hash_join_chain_rows<const PRUNE_SPARSE_RIGHT: bool>(
                 .get(&schema.id)
                 .expect("catalog table must have storage");
             let right_column = right_slot - right_start;
-            if table.has_unique_index(&[right_column]) {
+            let unique = table.has_unique_index(&[right_column]);
+            if unique || table.has_nonunique_index(&[right_column]) {
                 let mut probe_row = vec![Value::Null; scope.columns.len()];
                 let mut seen = std::collections::HashSet::new();
                 let mut indexed = Vec::new();
+                if !unique {
+                    state.record_read(xid, Access::Relation(schema.id));
+                }
                 for left in &rows {
                     let value = &left[left_slot];
                     let Some(key) = create_hash_join_key(value, key_type) else {
@@ -524,19 +538,34 @@ fn visit_hash_join_chain_rows<const PRUNE_SPARSE_RIGHT: bool>(
                     if !seen.insert(key) {
                         continue;
                     }
-                    if state.tracks_serializable_reads(xid)
+                    if unique
+                        && state.tracks_serializable_reads(xid)
                         && let Some(key) = table
                             .create_unique_read_key(&[right_column], std::slice::from_ref(value))
                     {
                         state.record_read(xid, Access::Unique(schema.id, vec![right_column], key));
                     }
-                    if let Some((row_id, version)) = table.find_unique_visible_version(
-                        &[right_column],
-                        std::slice::from_ref(value),
-                        snapshot,
-                        xid,
-                        &state.transactions,
-                    ) {
+                    let candidates = if unique {
+                        table
+                            .find_unique_visible_version(
+                                &[right_column],
+                                std::slice::from_ref(value),
+                                snapshot,
+                                xid,
+                                &state.transactions,
+                            )
+                            .into_iter()
+                            .collect()
+                    } else {
+                        table.find_nonunique_visible_versions(
+                            &[right_column],
+                            std::slice::from_ref(value),
+                            snapshot,
+                            xid,
+                            &state.transactions,
+                        )
+                    };
+                    for (row_id, version) in candidates {
                         state.record_read(xid, Access::Row(schema.id, row_id));
                         probe_row[right_start..right_end].clone_from_slice(&version.row);
                         let passes = filters.iter().try_fold(true, |passes, filter| {
@@ -571,6 +600,7 @@ fn visit_hash_join_chain_rows<const PRUNE_SPARSE_RIGHT: bool>(
                 .filter_map(|row| create_hash_join_key(&row[left_slot], key_type))
                 .collect::<std::collections::HashSet<_>>()
         });
+        let right_selection = if preserve_left { None } else { selection };
         let mut right_rows = Vec::new();
         if let Some(indexed) = indexed_right_rows {
             right_rows = indexed;
@@ -582,7 +612,7 @@ fn visit_hash_join_chain_rows<const PRUNE_SPARSE_RIGHT: bool>(
                 xid,
                 snapshot,
                 context,
-                selection,
+                right_selection,
                 right_start,
                 &mut |row| {
                     if create_hash_join_key(&row[right_slot], key_type)
@@ -601,7 +631,7 @@ fn visit_hash_join_chain_rows<const PRUNE_SPARSE_RIGHT: bool>(
                 xid,
                 snapshot,
                 context,
-                selection,
+                right_selection,
                 right_start,
                 &mut |row| {
                     right_rows.push(row[right_start..right_end].to_vec());

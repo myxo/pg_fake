@@ -178,7 +178,7 @@ pub(super) fn visit_query_source_rows(
     if crate::executor::lateral::skips_lateral_rows(selection, context) {
         return Ok(());
     }
-    let selection = selection.filter(|_| {
+    let selection_without_outer_join = selection.filter(|_| {
         !select.from.iter().any(|table| {
             table.joins.iter().any(|join| {
                 matches!(
@@ -194,7 +194,14 @@ pub(super) fn visit_query_source_rows(
     });
     if context.capture_lock_queries {
         return streaming::visit_demand_source_rows(
-            state, select, scope, xid, snapshot, context, selection, visit,
+            state,
+            select,
+            scope,
+            xid,
+            snapshot,
+            context,
+            selection_without_outer_join,
+            visit,
         );
     }
     if let [table] = select.from.as_slice()
@@ -211,6 +218,17 @@ pub(super) fn visit_query_source_rows(
             })
         && !context.retain_row_origins
     {
+        let join_selection = if matches!(
+            table.joins.as_slice(),
+            [ast::Join {
+                join_operator: ast::JoinOperator::Left(_) | ast::JoinOperator::LeftOuter(_),
+                ..
+            }]
+        ) {
+            selection
+        } else {
+            selection_without_outer_join
+        };
         return visit_streamed_join_rows(
             state,
             table,
@@ -218,7 +236,7 @@ pub(super) fn visit_query_source_rows(
             xid,
             snapshot,
             context,
-            selection,
+            join_selection,
             &mut |row| visit(row, &[]),
         );
     }
@@ -230,7 +248,7 @@ pub(super) fn visit_query_source_rows(
         xid,
         snapshot,
         context,
-        selection,
+        selection_without_outer_join,
     )? {
         visit(&row.values, &row.origins)?;
     }

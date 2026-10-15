@@ -1,6 +1,6 @@
 # Optimization experiments
 
-Status: research completed; E01 accepted, E02–E16 pending. This is separate
+Status: research completed; E01–E02 accepted, E03–E16 pending. This is separate
 from the SQL compatibility roadmap in `plan.md`.
 
 Research revision: `2b5243fc043adef6d713de71b2f9bc03dd57074a`.
@@ -167,7 +167,9 @@ casts, parameters and OR; preserve errors/volatile evaluation, RETURNING, affect
 counts, SSI read tracking, RC rechecks, RR conflicts, waits and rollback. A failed
 guard modifies nothing. Retain a correct fallback when extraction is unsafe.
 
-### E02 — Execute selective outer joins through parameterized index probes [PENDING]
+### E02 — Execute selective outer joins through parameterized index probes [ACCEPTED]
+
+Decision and measurements: [E02 experiment record](optimization_e02.md).
 
 **Idea:** extend the existing join access representation to bind a filtered
 preserved-side input and probe indexed matches on the other side. Carry join

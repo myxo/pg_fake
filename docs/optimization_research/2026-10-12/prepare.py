@@ -9,7 +9,7 @@ def prepare_probes():
     repository = evidence.parents[2]
     output = repository / "target" / "optimization-research"
     output.mkdir(parents=True, exist_ok=True)
-    if not any(arg in sys.argv for arg in ("--e01", "--full-fake", "--regression", "--serializable")):
+    if not any(arg in sys.argv for arg in ("--e01", "--e02", "--e02-regression", "--full-fake", "--regression", "--serializable")):
         build = subprocess.run(
             ["cargo", "build", "--offline", "--release", "-p", "pg_fake", "--message-format=json"],
             cwd=repository, capture_output=True, text=True, check=True,
@@ -39,6 +39,8 @@ def prepare_probes():
     end = source.index("\nfn on_conflict_benchmark(", start)
     entry = (
         "fake_e01_entry.rs" if "--e01" in sys.argv else
+        "fake_e02_regression_entry.rs" if "--e02-regression" in sys.argv else
+        "fake_e02_entry.rs" if "--e02" in sys.argv else
         "fake_regression_entry.rs" if "--regression" in sys.argv else
         "fake_serializable_entry.rs" if "--serializable" in sys.argv else
         "fake_entry.rs"
