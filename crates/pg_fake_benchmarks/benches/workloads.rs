@@ -2073,6 +2073,159 @@ fn benchmark_borrowed_source_rows(criterion: &mut Criterion) {
     group.finish();
 }
 
+fn benchmark_equality_membership(criterion: &mut Criterion) {
+    let mut group = criterion.benchmark_group("equality_membership");
+    for count in [100, 1_000, 10_000] {
+        if count == 10_000 {
+            group.sample_size(20);
+            group.warm_up_time(Duration::from_secs(1));
+            group.measurement_time(Duration::from_secs(2));
+        }
+        let db = Db::create();
+        let mut session = db.create_session();
+        session
+            .execute("CREATE TABLE equality_left (id integer, bucket integer)")
+            .unwrap();
+        session
+            .execute("CREATE TABLE equality_right (id integer, bucket integer)")
+            .unwrap();
+        for start in (0..count).step_by(100) {
+            let left = (start..(start + 100).min(count))
+                .map(|id| format!("({id},{})", id % 10))
+                .collect::<Vec<_>>()
+                .join(",");
+            let right = (start..(start + 100).min(count))
+                .map(|id| format!("({},{})", id + count / 2, id % 10))
+                .collect::<Vec<_>>()
+                .join(",");
+            session
+                .execute(&format!("INSERT INTO equality_left VALUES {left}"))
+                .unwrap();
+            session
+                .execute(&format!("INSERT INTO equality_right VALUES {right}"))
+                .unwrap();
+        }
+        for (case, sql, expected) in [
+            (
+                "distinct_high",
+                "SELECT DISTINCT id FROM equality_left",
+                count,
+            ),
+            (
+                "distinct_ten",
+                "SELECT DISTINCT bucket FROM equality_left",
+                10,
+            ),
+            ("distinct_equal", "SELECT DISTINCT 1 FROM equality_left", 1),
+            (
+                "distinct_numeric",
+                "SELECT DISTINCT id::numeric FROM equality_left",
+                count,
+            ),
+            (
+                "union",
+                "SELECT id FROM equality_left UNION SELECT id FROM equality_right",
+                count + count / 2,
+            ),
+            (
+                "union_all",
+                "SELECT id FROM equality_left UNION ALL SELECT id FROM equality_right",
+                2 * count,
+            ),
+            (
+                "intersect",
+                "SELECT id FROM equality_left INTERSECT SELECT id FROM equality_right",
+                count / 2,
+            ),
+            (
+                "intersect_all",
+                "SELECT id FROM equality_left INTERSECT ALL SELECT id FROM equality_right",
+                count / 2,
+            ),
+            (
+                "intersect_numeric",
+                "SELECT id::numeric FROM equality_left INTERSECT SELECT id::numeric FROM equality_right",
+                count / 2,
+            ),
+            (
+                "except",
+                "SELECT id FROM equality_left EXCEPT SELECT id FROM equality_right",
+                count / 2,
+            ),
+            (
+                "except_all",
+                "SELECT id FROM equality_left EXCEPT ALL SELECT id FROM equality_right",
+                count / 2,
+            ),
+            (
+                "except_numeric",
+                "SELECT id::numeric FROM equality_left EXCEPT SELECT id::numeric FROM equality_right",
+                count / 2,
+            ),
+            (
+                "distinct_on",
+                "SELECT DISTINCT ON (bucket) bucket, id FROM equality_left ORDER BY bucket, id",
+                10,
+            ),
+            (
+                "aggregate_distinct",
+                "SELECT count(DISTINCT bucket) FROM equality_left",
+                1,
+            ),
+            (
+                "empty_union",
+                "SELECT id FROM equality_left WHERE id < 0 UNION SELECT id FROM equality_right WHERE id < 0",
+                0,
+            ),
+            (
+                "tiny_union",
+                "SELECT id FROM equality_left WHERE id < 2 UNION SELECT id FROM equality_right WHERE id < 2",
+                2,
+            ),
+        ] {
+            if count == 10_000 && !matches!(case, "distinct_high" | "union") {
+                continue;
+            }
+            let statement = session.prepare(sql).unwrap();
+            assert_eq!(
+                session.query_prepared(&statement, &[]).unwrap().rows.len(),
+                expected
+            );
+            group.bench_function(format!("{case}/{count}"), |b| {
+                b.iter(|| black_box(session.query_prepared(&statement, &[]).unwrap()))
+            });
+        }
+        if count == 1_000 {
+            for (case, sql) in [
+                ("cold_distinct", "SELECT DISTINCT id FROM equality_left"),
+                (
+                    "cold_union",
+                    "SELECT id FROM equality_left UNION SELECT id FROM equality_right",
+                ),
+            ] {
+                group.bench_function(format!("{case}/{count}"), |b| {
+                    b.iter(|| {
+                        let statement = session.prepare(sql).unwrap();
+                        black_box(session.query_prepared(&statement, &[]).unwrap())
+                    })
+                });
+            }
+        }
+        if count == 100 {
+            let sql = "WITH RECURSIVE series(n) AS (VALUES (1) UNION SELECT n + 1 FROM series WHERE n < 10) SELECT n FROM series";
+            let statement = session.prepare(sql).unwrap();
+            assert_eq!(
+                session.query_prepared(&statement, &[]).unwrap().rows.len(),
+                10
+            );
+            group.bench_function("recursive_union/100", |b| {
+                b.iter(|| black_box(session.query_prepared(&statement, &[]).unwrap()))
+            });
+        }
+    }
+    group.finish();
+}
+
 fn benchmark_expression_properties(criterion: &mut Criterion) {
     let mut group = criterion.benchmark_group("expression_properties");
     for rows in [100, 1_000] {
@@ -3751,6 +3904,7 @@ fn benchmarks(criterion: &mut Criterion) {
             "partial_index_access",
             "expression_properties",
             "borrowed_source_rows",
+            "equality_membership",
             "guarded_mutations",
         ];
         let family_filter = filter.as_ref().filter(|filter| {
@@ -3781,6 +3935,9 @@ fn benchmarks(criterion: &mut Criterion) {
         }
         if matches("borrowed_source_rows") {
             benchmark_borrowed_source_rows(criterion);
+        }
+        if matches("equality_membership") {
+            benchmark_equality_membership(criterion);
         }
         if matches("guarded_mutations") {
             benchmark_guarded_mutations(criterion);

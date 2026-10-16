@@ -12,7 +12,7 @@ use crate::{
     error::{PgError, Result, SqlState},
     executor::{
         DatabaseState, StatementContext,
-        equality::are_rows_not_distinct,
+        equality::retain_first_unique_rows,
         expressions::{compare_values, validate_equality_type},
         normalize_identifier,
         scope::BoundScope,
@@ -218,33 +218,14 @@ pub(super) fn remove_duplicate_rows(
     rows: Vec<SelectRow>,
     distinct: &DistinctPlan<'_>,
 ) -> Result<Vec<SelectRow>> {
-    let mut selected: Vec<SelectRow> = Vec::new();
-    for row in rows {
-        let key = match distinct {
-            DistinctPlan::None => {
-                selected.push(row);
-                continue;
-            }
-            DistinctPlan::Rows => &row.values,
-            DistinctPlan::On { .. } => &row.distinct_keys,
-        };
-        let mut duplicate = false;
-        for existing in &selected {
-            let existing_key = match distinct {
-                DistinctPlan::Rows => &existing.values,
-                DistinctPlan::On { .. } => &existing.distinct_keys,
-                DistinctPlan::None => unreachable!("non-distinct rows returned before comparison"),
-            };
-            if are_rows_not_distinct(existing_key, key)? {
-                duplicate = true;
-                break;
-            }
-        }
-        if !duplicate {
-            selected.push(row);
-        }
+    if matches!(distinct, DistinctPlan::None) {
+        return Ok(rows);
     }
-    Ok(selected)
+    retain_first_unique_rows(rows, |row| match distinct {
+        DistinctPlan::Rows => &row.values,
+        DistinctPlan::On { .. } => &row.distinct_keys,
+        DistinctPlan::None => unreachable!("non-distinct rows returned before comparison"),
+    })
 }
 
 pub(super) fn compare_distinct_keys(left: &SelectRow, right: &SelectRow) -> Ordering {

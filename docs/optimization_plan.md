@@ -1,6 +1,6 @@
 # Optimization experiments
 
-Status: research completed; E01–E05 accepted, E06–E07 rejected, E08–E16 pending. This is separate
+Status: research completed; E01–E05 and E08 accepted, E06–E07 rejected, E09–E16 pending. This is separate
 from the SQL compatibility roadmap in `plan.md`.
 
 Research revision: `2b5243fc043adef6d713de71b2f9bc03dd57074a`.
@@ -323,7 +323,9 @@ retain owned values across lock waits and mutations. Preserve joined column slot
 row provenance, SSI reads, group representative rows and projection order. Reject
 a design that copies everything at a later boundary or slows tiny queries >5%.
 
-### E08 — Replace pairwise duplicate/membership searches with SQL equality keys [PENDING]
+### E08 — Replace pairwise duplicate/membership searches with SQL equality keys [ACCEPTED]
+
+Decision and measurements: [E08 experiment record](optimization_e08.md).
 
 **Idea:** use one typed SQL not-distinct key/membership mechanism for DISTINCT and
 set operations, retaining first-seen output order and multiplicity counts for ALL.

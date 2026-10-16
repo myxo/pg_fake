@@ -1,4 +1,4 @@
-use std::cmp::Ordering;
+use std::{cmp::Ordering, collections::HashMap};
 
 use sqlparser::ast;
 
@@ -8,7 +8,7 @@ use crate::{
     error::{PgError, Result, SqlState, reject_unsupported},
     executor::{
         DatabaseState, StatementContext,
-        equality::are_rows_not_distinct,
+        equality::{are_rows_not_distinct, create_row_equality_key, retain_first_unique_rows},
         expressions::{
             compare_values, extract_number_literal, extract_unknown_string_literal,
             validate_equality_type, validate_ordering_type,
@@ -343,14 +343,24 @@ fn execute_set_operation(
             remove_set_duplicates(left.into_iter().chain(right).collect())?
         }
         (ast::SetOperator::Intersect, ast::SetQuantifier::All) => {
-            select_set_intersection(left, right)?
+            select_set_membership(left, right, SetMembership::Intersection)?
         }
         (ast::SetOperator::Intersect, ast::SetQuantifier::None | ast::SetQuantifier::Distinct) => {
-            select_set_intersection(remove_set_duplicates(left)?, remove_set_duplicates(right)?)?
+            select_set_membership(
+                remove_set_duplicates(left)?,
+                remove_set_duplicates(right)?,
+                SetMembership::Intersection,
+            )?
         }
-        (ast::SetOperator::Except, ast::SetQuantifier::All) => select_set_difference(left, right)?,
+        (ast::SetOperator::Except, ast::SetQuantifier::All) => {
+            select_set_membership(left, right, SetMembership::Difference)?
+        }
         (ast::SetOperator::Except, ast::SetQuantifier::None | ast::SetQuantifier::Distinct) => {
-            select_set_difference(remove_set_duplicates(left)?, remove_set_duplicates(right)?)?
+            select_set_membership(
+                remove_set_duplicates(left)?,
+                remove_set_duplicates(right)?,
+                SetMembership::Difference,
+            )?
         }
         _ => return reject_unsupported("set-operation quantifier is not implemented"),
     };
@@ -498,47 +508,50 @@ fn coerce_set_rows_with_unknown(
 
 #[cfg_attr(feature = "execution-log", tracing::instrument(skip_all))]
 pub(in crate::executor) fn remove_set_duplicates(rows: Vec<Vec<Value>>) -> Result<Vec<Vec<Value>>> {
-    let mut selected: Vec<Vec<Value>> = Vec::new();
-    for row in rows {
-        let mut duplicate = false;
-        for existing in &selected {
-            if are_rows_not_distinct(existing, &row)? {
-                duplicate = true;
-                break;
-            }
-        }
-        if !duplicate {
-            selected.push(row);
-        }
-    }
-    Ok(selected)
+    retain_first_unique_rows(rows, |row| row)
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum SetMembership {
+    Intersection,
+    Difference,
 }
 
 #[cfg_attr(feature = "execution-log", tracing::instrument(skip_all))]
-fn select_set_intersection(
+fn select_set_membership(
     left: Vec<Vec<Value>>,
     right: Vec<Vec<Value>>,
+    kind: SetMembership,
 ) -> Result<Vec<Vec<Value>>> {
-    let mut consumed = vec![false; right.len()];
-    let mut selected = Vec::new();
-    for row in left {
-        let mut match_index = None;
-        for (index, candidate) in right.iter().enumerate() {
-            if !consumed[index] && are_rows_not_distinct(&row, candidate)? {
-                match_index = Some(index);
-                break;
-            }
+    let left_keys = left
+        .iter()
+        .map(|row| create_row_equality_key(row))
+        .collect::<Option<Vec<_>>>();
+    let right_keys = right
+        .iter()
+        .map(|row| create_row_equality_key(row))
+        .collect::<Option<Vec<_>>>();
+    if let (Some(left_keys), Some(right_keys)) = (left_keys, right_keys) {
+        let mut counts = HashMap::with_capacity(right.len());
+        for key in right_keys {
+            *counts.entry(key).or_insert(0usize) += 1;
         }
-        if let Some(index) = match_index {
-            consumed[index] = true;
-            selected.push(row);
-        }
+        return Ok(left
+            .into_iter()
+            .zip(left_keys)
+            .filter_map(|(row, key)| {
+                let matched = if let Some(remaining) = counts.get_mut(&key)
+                    && *remaining > 0
+                {
+                    *remaining -= 1;
+                    true
+                } else {
+                    false
+                };
+                (matched == (kind == SetMembership::Intersection)).then_some(row)
+            })
+            .collect());
     }
-    Ok(selected)
-}
-
-#[cfg_attr(feature = "execution-log", tracing::instrument(skip_all))]
-fn select_set_difference(left: Vec<Vec<Value>>, right: Vec<Vec<Value>>) -> Result<Vec<Vec<Value>>> {
     let mut consumed = vec![false; right.len()];
     let mut selected = Vec::new();
     for row in left {
@@ -551,7 +564,8 @@ fn select_set_difference(left: Vec<Vec<Value>>, right: Vec<Vec<Value>>) -> Resul
         }
         if let Some(index) = match_index {
             consumed[index] = true;
-        } else {
+        }
+        if match_index.is_some() == (kind == SetMembership::Intersection) {
             selected.push(row);
         }
     }

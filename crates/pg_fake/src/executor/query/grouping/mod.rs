@@ -13,7 +13,7 @@ use crate::{
             AggregateCall, AggregateInput, AggregateState, is_aggregate_function,
             parse_aggregate_call, prepare_aggregate_function_input,
         },
-        equality::{EqualityKey, are_rows_not_distinct, create_equality_key},
+        equality::{EqualityKey, are_rows_not_distinct, create_row_equality_key},
         expressions::{EvaluationCursor, resume_evaluation},
         from::visit_query_source_rows,
         scope::{BoundScope, RowScope, substitute_typed_subqueries},
@@ -327,16 +327,7 @@ fn prepare_group_aggregate_input(
 }
 
 fn create_grouping_key(values: &[Value]) -> Option<Vec<Option<EqualityKey>>> {
-    values
-        .iter()
-        .map(|value| {
-            if value.is_null() {
-                Some(None)
-            } else {
-                create_equality_key(value).map(Some)
-            }
-        })
-        .collect()
+    create_row_equality_key(values)
 }
 
 #[cfg_attr(feature = "execution-log", tracing::instrument(skip_all))]

@@ -50,6 +50,7 @@ fn benchmarks(criterion: &mut Criterion) {
     benchmark_partial_index_maintenance(criterion);
     benchmark_expression_properties(criterion);
     benchmark_borrowed_source_rows(criterion);
+    benchmark_equality_membership(criterion);
     benchmark_bounded_on_conflict(criterion);
     benchmark_bounded_indexed_update(criterion);
     benchmark_guarded_mutations(criterion);
