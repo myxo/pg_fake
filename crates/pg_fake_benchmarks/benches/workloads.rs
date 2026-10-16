@@ -2007,6 +2007,72 @@ fn core_vs_sqlx_benchmark(criterion: &mut Criterion, runtime: &Runtime) {
     fake_execute(runtime, &mut sqlx, "ROLLBACK");
 }
 
+fn benchmark_borrowed_source_rows(criterion: &mut Criterion) {
+    let mut group = criterion.benchmark_group("borrowed_source_rows");
+    for count in [100, 1_000] {
+        for wide in [false, true] {
+            let db = pg_fake::Db::create();
+            let mut session = db.create_session();
+            session
+                .execute(
+                    "CREATE TABLE borrowed_source_rows (id integer, bucket integer, label text, doc jsonb, tags integer[])",
+                )
+                .unwrap();
+            let payload = "x".repeat(512);
+            let document = format!(
+                "{{\"payload\":\"{}\",\"nested\":{{\"a\":[1,2,3]}}}}",
+                "y".repeat(256)
+            );
+            for start in (0..count).step_by(100) {
+                let values = (start..(start + 100).min(count))
+                    .map(|id| {
+                        if wide {
+                            format!(
+                                "({id},{},'{payload}','{document}',ARRAY[1,2,3,4,5])",
+                                id % 10
+                            )
+                        } else {
+                            format!("({id},{},NULL,NULL,NULL)", id % 10)
+                        }
+                    })
+                    .collect::<Vec<_>>()
+                    .join(",");
+                session
+                    .execute(&format!("INSERT INTO borrowed_source_rows VALUES {values}"))
+                    .unwrap();
+            }
+            for (case, sql, expected) in [
+                (
+                    "grouped",
+                    "SELECT bucket, count(*), sum(id) FROM borrowed_source_rows GROUP BY bucket ORDER BY bucket",
+                    10,
+                ),
+                (
+                    "filtered",
+                    "SELECT id FROM borrowed_source_rows WHERE bucket = 3",
+                    count / 10,
+                ),
+                (
+                    "payload",
+                    "SELECT label, doc, tags FROM borrowed_source_rows WHERE bucket = 3",
+                    count / 10,
+                ),
+            ] {
+                let statement = session.prepare(sql).unwrap();
+                assert_eq!(
+                    session.query_prepared(&statement, &[]).unwrap().rows.len(),
+                    expected
+                );
+                let name = format!("{case}/{count}/{}", if wide { "wide" } else { "narrow" });
+                group.bench_function(name, |b| {
+                    b.iter(|| black_box(session.query_prepared(&statement, &[]).unwrap()))
+                });
+            }
+        }
+    }
+    group.finish();
+}
+
 fn benchmark_expression_properties(criterion: &mut Criterion) {
     let mut group = criterion.benchmark_group("expression_properties");
     for rows in [100, 1_000] {
@@ -3684,6 +3750,7 @@ fn benchmarks(criterion: &mut Criterion) {
             "composite_prefix",
             "partial_index_access",
             "expression_properties",
+            "borrowed_source_rows",
             "guarded_mutations",
         ];
         let family_filter = filter.as_ref().filter(|filter| {
@@ -3711,6 +3778,9 @@ fn benchmarks(criterion: &mut Criterion) {
         }
         if matches("expression_properties") {
             benchmark_expression_properties(criterion);
+        }
+        if matches("borrowed_source_rows") {
+            benchmark_borrowed_source_rows(criterion);
         }
         if matches("guarded_mutations") {
             benchmark_guarded_mutations(criterion);

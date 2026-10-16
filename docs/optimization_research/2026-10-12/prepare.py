@@ -10,7 +10,7 @@ def prepare_probes():
     repository = evidence.parents[2]
     output = repository / "target" / "optimization-research"
     output.mkdir(parents=True, exist_ok=True)
-    if not any(arg in sys.argv for arg in ("--e01", "--e02", "--e02-regression", "--e03", "--e03-regression", "--e03-final-regression", "--e04", "--e05", "--e05-controls", "--e05-concurrency", "--e05-maintenance", "--e05-final-controls", "--e05-indexed-write", "--full-fake", "--regression", "--serializable")):
+    if not any(arg in sys.argv for arg in ("--e01", "--e02", "--e02-regression", "--e03", "--e03-regression", "--e03-final-regression", "--e04", "--e05", "--e05-controls", "--e05-concurrency", "--e05-maintenance", "--e05-final-controls", "--e05-indexed-write", "--e07", "--full-fake", "--regression", "--serializable")):
         build = subprocess.run(
             ["cargo", "build", "--offline", "--release", "-p", "pg_fake", "--message-format=json"],
             cwd=repository, capture_output=True, text=True, check=True,
@@ -49,6 +49,7 @@ def prepare_probes():
         "fake_e05_concurrency_entry.rs" if "--e05-concurrency" in sys.argv else
         "fake_e05_controls_entry.rs" if "--e05-controls" in sys.argv else
         "fake_e05_entry.rs" if "--e05" in sys.argv else
+        "fake_e07_entry.rs" if "--e07" in sys.argv else
         "fake_e03_final_regression_entry.rs" if "--e03-final-regression" in sys.argv else
         "fake_e03_regression_entry.rs" if "--e03-regression" in sys.argv else
         "fake_e03_entry.rs" if "--e03" in sys.argv else

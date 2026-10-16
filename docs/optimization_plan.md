@@ -1,6 +1,6 @@
 # Optimization experiments
 
-Status: research completed; E01–E05 accepted, E06 rejected, E07–E16 pending. This is separate
+Status: research completed; E01–E05 accepted, E06–E07 rejected, E08–E16 pending. This is separate
 from the SQL compatibility roadmap in `plan.md`.
 
 Research revision: `2b5243fc043adef6d713de71b2f9bc03dd57074a`.
@@ -297,7 +297,9 @@ lazy errors, volatility and wait resumptions. Do not disable recursive stack
 protection or cache flags by SQL string. Avoid a new independently traversing
 cache for every expression feature.
 
-### E07 — Borrow source rows until ownership is required [PENDING]
+### E07 — Borrow source rows until ownership is required [REJECTED]
+
+Decision and measurements: [E07 experiment record](optimization_e07.md).
 
 **Idea:** give general query consumers a borrowed row view and materialize only
 outputs or rows that must survive a wait, source mutation, grouping or window
