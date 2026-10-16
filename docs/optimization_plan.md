@@ -112,8 +112,10 @@ gates pass. Keep generated benchmark results, logs, profiles, and archives in
 ignored local storage such as `target/optimization-research/results/`; do not
 commit them or run `cargo x bench record` to update tracked results. Commit the
 experiment summary and required timings in the commit message, together with
-source changes and relevant tests. Include representative SQL queries that the
-accepted optimization speeds up, even when the SQL was already supported.
+source changes and relevant tests. Include runnable examples of the SQL queries
+the accepted optimization speeds up, even when the SQL was already supported.
+Show a representative query for each improved SQL form named in the summary,
+rather than only benchmark names or a description of the query shape.
 
 Commit message template (replace every placeholder with measured facts):
 
@@ -123,7 +125,7 @@ perf(executor): <optimization idea>
 <Why the algorithm does less work and which semantics it preserves.>
 <benchmark, size, API>: <before> us -> <after> us
   <percent>% faster; <absolute> us saved; <confidence / paired-run summary>.
-Optimized SQL: <representative query or queries>.
+Optimized SQL: <runnable representative query for each improved SQL form>.
 Controls: <largest repeatable slowdown and affected workload>; full suite <result>.
 Validation: <differential/property/concurrency checks>.
 Evidence: <experiment record>; parent <revision>; <CPU, build profile>.
