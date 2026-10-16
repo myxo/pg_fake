@@ -245,7 +245,7 @@ pub(super) fn validate_row_foreign_keys(
             .tables
             .get(&foreign_schema.id)
             .expect("catalog table must have storage");
-        if let Some(index_key) = table.create_unique_read_key(&referred_indexes, &key) {
+        if let Some(index_key) = table.create_unique_read_key(None, &referred_indexes, &key) {
             state.record_read(
                 xid,
                 crate::serializable::Access::Unique(

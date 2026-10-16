@@ -4,7 +4,7 @@ use std::{
 };
 
 use crate::{
-    catalog::{Constraint, IndexSchema, TableSchema},
+    catalog::{Constraint, IndexId, IndexSchema, TableSchema},
     executor::StatementContext,
     txn::{
         CommandId, CommitSeq, Snapshot, TransactionRegistry, TransactionStatus, Xid,
@@ -134,10 +134,12 @@ pub(crate) struct IndexKey(Vec<NormalizedIndexValue>);
 
 #[derive(Debug, Clone, PartialEq)]
 struct TableIndex {
+    id: Option<IndexId>,
     name: String,
     unique: bool,
     columns: Vec<usize>,
     predicate: Option<ast::Expr>,
+    null_predicate: Option<Vec<(usize, bool)>>,
     entries: BTreeMap<IndexKey, BTreeSet<RowId>>,
 }
 
@@ -166,6 +168,7 @@ impl Table {
             .filter_map(|constraint| match constraint {
                 Constraint::PrimaryKey { name, columns, .. }
                 | Constraint::Unique { name, columns, .. } => Some(TableIndex {
+                    id: None,
                     name: name.clone(),
                     unique: true,
                     columns: columns
@@ -179,6 +182,7 @@ impl Table {
                         })
                         .collect(),
                     predicate: None,
+                    null_predicate: None,
                     entries: BTreeMap::new(),
                 }),
                 Constraint::Check { .. } | Constraint::ForeignKey(_) => None,
@@ -223,6 +227,7 @@ impl Table {
             .filter_map(|constraint| match constraint {
                 Constraint::PrimaryKey { name, columns, .. }
                 | Constraint::Unique { name, columns, .. } => Some(TableIndex {
+                    id: None,
                     name: name.clone(),
                     unique: true,
                     columns: columns
@@ -236,6 +241,7 @@ impl Table {
                         })
                         .collect(),
                     predicate: None,
+                    null_predicate: None,
                     entries: BTreeMap::new(),
                 }),
                 Constraint::Check { .. } | Constraint::ForeignKey(_) => None,
@@ -269,16 +275,24 @@ impl Table {
 
     pub(crate) fn create_unique_read_key(
         &self,
+        index_id: Option<IndexId>,
         columns: &[usize],
         values: &[Value],
     ) -> Option<IndexKey> {
-        self.has_unique_index(columns)
+        self.indexes
+            .iter()
+            .any(|index| {
+                index.unique
+                    && index.columns == columns
+                    && index_id.map_or(index.predicate.is_none(), |id| index.id == Some(id))
+            })
             .then(|| build_index_key(&self.schema, columns, values))
             .flatten()
     }
 
     pub(crate) fn find_nonunique_visible_versions(
         &self,
+        index_id: Option<IndexId>,
         columns: &[usize],
         values: &[Value],
         snapshot: &Snapshot,
@@ -288,7 +302,11 @@ impl Table {
         let index = self
             .indexes
             .iter()
-            .find(|index| !index.unique && index.columns == columns && index.predicate.is_none())
+            .find(|index| {
+                !index.unique
+                    && index.columns == columns
+                    && index_id.map_or(index.predicate.is_none(), |id| index.id == Some(id))
+            })
             .expect("nonunique lookup requires a matching index");
         let Some(key) = build_index_key(&self.schema, columns, values) else {
             return Vec::new();
@@ -300,8 +318,9 @@ impl Table {
                     let version = self.version_chains.chains.get(row_id).and_then(|chain| {
                         find_visible_version(chain, snapshot, current_xid, transactions)
                     })?;
-                    (build_row_index_key(&self.schema, index, &version.row).as_ref() == Some(&key))
-                        .then_some((*row_id, version))
+                    (build_row_index_key(&self.schema, index, &version.row).as_ref() == Some(&key)
+                        && matches_provable_index_predicate(index, &version.row))
+                    .then_some((*row_id, version))
                 })
                 .collect()
         })
@@ -309,6 +328,7 @@ impl Table {
 
     pub(crate) fn find_prefix_visible_versions(
         &self,
+        index_id: Option<IndexId>,
         columns: &[usize],
         values: &[Value],
         snapshot: &Snapshot,
@@ -319,7 +339,10 @@ impl Table {
         let index = self
             .indexes
             .iter()
-            .find(|index| index.columns == columns && index.predicate.is_none())
+            .find(|index| {
+                index.columns == columns
+                    && index_id.map_or(index.predicate.is_none(), |id| index.id == Some(id))
+            })
             .expect("prefix lookup requires a matching index");
         let Some(prefix) = build_index_key(&self.schema, &columns[..values.len()], values) else {
             return Vec::new();
@@ -337,17 +360,12 @@ impl Table {
                 let version = self.version_chains.chains.get(&row_id).and_then(|chain| {
                     find_visible_version(chain, snapshot, current_xid, transactions)
                 })?;
-                build_row_index_entry_key(&self.schema, index, &version.row)
+                (build_row_index_entry_key(&self.schema, index, &version.row)
                     .is_some_and(|key| key.0.starts_with(&prefix.0))
-                    .then_some((row_id, version))
+                    && matches_provable_index_predicate(index, &version.row))
+                .then_some((row_id, version))
             })
             .collect()
-    }
-
-    pub(crate) fn has_unfiltered_index(&self, columns: &[usize]) -> bool {
-        self.indexes
-            .iter()
-            .any(|index| index.columns == columns && index.predicate.is_none())
     }
 
     pub(crate) fn has_nonunique_index(&self, columns: &[usize]) -> bool {
@@ -1030,7 +1048,7 @@ impl Table {
         current_xid: Xid,
         transactions: &TransactionRegistry,
     ) -> Option<RowId> {
-        self.find_unique_visible_version(columns, values, snapshot, current_xid, transactions)
+        self.find_unique_visible_version(None, columns, values, snapshot, current_xid, transactions)
             .map(|(row_id, _)| row_id)
     }
 
@@ -1082,23 +1100,26 @@ impl Table {
     #[cfg_attr(feature = "execution-log", tracing::instrument(skip_all))]
     pub(crate) fn find_unique_visible_version(
         &self,
+        index_id: Option<IndexId>,
         columns: &[usize],
         values: &[Value],
         snapshot: &Snapshot,
         current_xid: Xid,
         transactions: &TransactionRegistry,
     ) -> Option<(RowId, &RowVersion)> {
-        let index = self
-            .indexes
-            .iter()
-            .find(|index| index.unique && index.columns == columns && index.predicate.is_none())?;
+        let index = self.indexes.iter().find(|index| {
+            index.unique
+                && index.columns == columns
+                && index_id.map_or(index.predicate.is_none(), |id| index.id == Some(id))
+        })?;
         let key = build_index_key(&self.schema, columns, values)?;
         index.entries.get(&key)?.iter().find_map(|row_id| {
             let version = self.version_chains.chains.get(row_id).and_then(|chain| {
                 find_visible_version(chain, snapshot, current_xid, transactions)
             })?;
-            (build_row_index_key(&self.schema, index, &version.row).as_ref() == Some(&key))
-                .then_some((*row_id, version))
+            (build_row_index_key(&self.schema, index, &version.row).as_ref() == Some(&key)
+                && matches_provable_index_predicate(index, &version.row))
+            .then_some((*row_id, version))
         })
     }
 
@@ -1116,9 +1137,17 @@ impl Table {
             .filter(|(_, index)| {
                 changed_columns.is_none_or(|columns| {
                     index.columns.iter().any(|column| columns.contains(column))
+                        || index.null_predicate.as_ref().is_some_and(|tests| {
+                            tests.iter().any(|(column, _)| columns.contains(column))
+                        })
                 })
             })
-            .map(|(index, unique)| (index, build_row_index_entry_key(&self.schema, unique, row)))
+            .map(|(index, definition)| {
+                (
+                    index,
+                    build_row_index_entry_key(&self.schema, definition, row),
+                )
+            })
             .collect::<Vec<_>>();
         for (index, key) in entries {
             if let Some(key) = key {
@@ -1164,6 +1193,7 @@ impl Table {
 
 fn create_index(schema: &TableSchema, index: &IndexSchema) -> TableIndex {
     TableIndex {
+        id: Some(index.id),
         name: index.name.clone(),
         unique: index.unique,
         columns: index
@@ -1178,8 +1208,77 @@ fn create_index(schema: &TableSchema, index: &IndexSchema) -> TableIndex {
             })
             .collect(),
         predicate: index.predicate.clone(),
+        null_predicate: index
+            .predicate
+            .as_ref()
+            .and_then(|predicate| compile_null_predicate(schema, predicate)),
         entries: BTreeMap::new(),
     }
+}
+
+fn compile_null_predicate(
+    schema: &TableSchema,
+    expression: &ast::Expr,
+) -> Option<Vec<(usize, bool)>> {
+    fn strip_nested(mut expression: &ast::Expr) -> &ast::Expr {
+        while let ast::Expr::Nested(inner) = expression {
+            expression = inner;
+        }
+        expression
+    }
+    fn collect(
+        expression: &ast::Expr,
+        schema: &TableSchema,
+        tests: &mut Vec<(usize, bool)>,
+    ) -> Option<()> {
+        match strip_nested(expression) {
+            ast::Expr::BinaryOp {
+                left,
+                op: ast::BinaryOperator::And,
+                right,
+            } => {
+                collect(left, schema, tests)?;
+                collect(right, schema, tests)?;
+            }
+            ast::Expr::IsNull(inner) | ast::Expr::IsNotNull(inner) => {
+                let ast::Expr::Identifier(identifier) = strip_nested(inner) else {
+                    return None;
+                };
+                let name = if identifier.quote_style.is_some() {
+                    identifier.value.clone()
+                } else {
+                    identifier.value.to_ascii_lowercase()
+                };
+                let slot = schema
+                    .columns
+                    .iter()
+                    .position(|column| column.name == name)?;
+                tests.push((
+                    slot,
+                    matches!(strip_nested(expression), ast::Expr::IsNull(_)),
+                ));
+            }
+            _ => return None,
+        }
+        Some(())
+    }
+    let mut tests = Vec::new();
+    collect(expression, schema, &mut tests)?;
+    Some(tests)
+}
+
+fn matches_null_predicate(index: &TableIndex, row: &Row) -> bool {
+    index.null_predicate.as_ref().is_none_or(|tests| {
+        tests.iter().all(|(slot, is_null)| {
+            row.get(*slot)
+                .is_some_and(|value| value.is_null() == *is_null)
+        })
+    })
+}
+
+fn matches_provable_index_predicate(index: &TableIndex, row: &Row) -> bool {
+    assert!(index.predicate.is_none() || index.null_predicate.is_some());
+    matches_null_predicate(index, row)
 }
 
 fn matches_index_predicate(
@@ -1215,6 +1314,9 @@ fn build_row_index_entry_key(
     index: &TableIndex,
     row: &Row,
 ) -> Option<IndexKey> {
+    if !matches_null_predicate(index, row) {
+        return None;
+    }
     let mut key = Vec::with_capacity(index.columns.len());
     for &column in &index.columns {
         let value = row.get(column)?;

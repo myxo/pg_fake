@@ -5,7 +5,10 @@ use crate::{
     executor::{
         DatabaseState, StatementContext,
         expressions::{evaluate, evaluate_and_coerce, resolve_operator_type},
-        index_access::{EqualityIndexAccess, find_complete_index_access, find_prefix_index_access},
+        index_access::{
+            EqualityIndexAccess, find_complete_index_access, find_prefix_index_access,
+            implies_partial_index_predicate,
+        },
         normalize_relation_name,
         scope::{BoundScope, RowScope},
     },
@@ -136,9 +139,19 @@ pub(super) fn visit_table_factor_rows(
             equalities.push((column, value));
         }
     }
-    let access = find_complete_index_access(schema, &equalities, false)
-        .or_else(|| find_prefix_index_access(schema, &equalities))
-        .filter(|access| table.has_unfiltered_index(&access.columns));
+    let resolve_column = |identifiers: &[ast::Ident]| {
+        scope
+            .resolve_column(identifiers)
+            .ok()
+            .map(|(slot, _)| slot)
+            .filter(|slot| (start..start + schema.columns.len()).contains(slot))
+            .map(|slot| slot - start)
+    };
+    let implies = |predicate: &ast::Expr| {
+        implies_partial_index_predicate(predicate, &filters, schema, &resolve_column)
+    };
+    let access = find_complete_index_access(schema, &equalities, false, Some(&implies))
+        .or_else(|| find_prefix_index_access(schema, &equalities, Some(&implies)));
     if let Some(access) = access {
         let values = access
             .columns
@@ -175,11 +188,13 @@ pub(super) fn visit_table_factor_rows(
         };
         if access.unique {
             if state.tracks_serializable_reads(xid)
-                && let Some(key) = table.create_unique_read_key(&access.columns, &values)
+                && let Some(key) =
+                    table.create_unique_read_key(access.index_id, &access.columns, &values)
             {
                 state.record_read(xid, Access::Unique(schema.id, access.columns.clone(), key));
             }
             if let Some((row_id, indexed_version)) = table.find_unique_visible_version(
+                access.index_id,
                 &access.columns,
                 &values,
                 source_snapshot,
@@ -191,6 +206,7 @@ pub(super) fn visit_table_factor_rows(
         } else if values.len() < access.columns.len() {
             state.record_read(xid, Access::Relation(schema.id));
             for (row_id, indexed_version) in table.find_prefix_visible_versions(
+                access.index_id,
                 &access.columns,
                 &values,
                 source_snapshot,
@@ -202,6 +218,7 @@ pub(super) fn visit_table_factor_rows(
         } else {
             state.record_read(xid, Access::Relation(schema.id));
             for (row_id, indexed_version) in table.find_nonunique_visible_versions(
+                access.index_id,
                 &access.columns,
                 &values,
                 source_snapshot,
@@ -421,7 +438,7 @@ pub(in crate::executor) fn resolve_unique_point_lookup(
             _ => {}
         }
     }
-    let Some(access) = find_complete_index_access(schema, &equalities, true)
+    let Some(access) = find_complete_index_access(schema, &equalities, true, None)
         .filter(|access| table.has_unique_index(&access.columns))
     else {
         return Ok(None);
@@ -446,6 +463,7 @@ pub(in crate::executor) fn resolve_unique_point_lookup(
             columns: access.columns,
             values,
             unique: true,
+            index_id: access.index_id,
         },
         needs_recheck: !matches!(
             strip_nested(selection),

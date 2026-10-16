@@ -73,7 +73,7 @@ fn record_conflict_read(
             .iter()
             .map(|column| row[*column].clone())
             .collect::<Vec<_>>();
-        if let Some(key) = table.create_unique_read_key(columns, &values) {
+        if let Some(key) = table.create_unique_read_key(None, columns, &values) {
             state.record_read(
                 xid,
                 crate::serializable::Access::Unique(schema.id, columns.to_vec(), key),

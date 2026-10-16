@@ -1026,8 +1026,11 @@ fn execute_prepared_unique_join(
             return Ok(Vec::new());
         }
         if state.tracks_serializable_reads(xid)
-            && let Some(key) = right_table
-                .create_unique_read_key(&[plan.right_key], std::slice::from_ref(&filter_value))
+            && let Some(key) = right_table.create_unique_read_key(
+                None,
+                &[plan.right_key],
+                std::slice::from_ref(&filter_value),
+            )
         {
             state.record_read(
                 xid,
@@ -1035,6 +1038,7 @@ fn execute_prepared_unique_join(
             );
         }
         let Some((right_row_id, right_version)) = right_table.find_unique_visible_version(
+            None,
             &[plan.right_key],
             std::slice::from_ref(&filter_value),
             snapshot,
@@ -1068,8 +1072,11 @@ fn execute_prepared_unique_join(
         return Ok(rows);
     }
     if state.tracks_serializable_reads(xid)
-        && let Some(key) = left_table
-            .create_unique_read_key(&[plan.filter_slot], std::slice::from_ref(&filter_value))
+        && let Some(key) = left_table.create_unique_read_key(
+            None,
+            &[plan.filter_slot],
+            std::slice::from_ref(&filter_value),
+        )
     {
         state.record_read(
             xid,
@@ -1077,6 +1084,7 @@ fn execute_prepared_unique_join(
         );
     }
     let Some((left_row_id, left_version)) = left_table.find_unique_visible_version(
+        None,
         &[plan.filter_slot],
         std::slice::from_ref(&filter_value),
         snapshot,
@@ -1091,8 +1099,11 @@ fn execute_prepared_unique_join(
         return Ok(Vec::new());
     }
     if state.tracks_serializable_reads(xid)
-        && let Some(key) =
-            right_table.create_unique_read_key(&[plan.right_key], std::slice::from_ref(join_key))
+        && let Some(key) = right_table.create_unique_read_key(
+            None,
+            &[plan.right_key],
+            std::slice::from_ref(join_key),
+        )
     {
         state.record_read(
             xid,
@@ -1100,6 +1111,7 @@ fn execute_prepared_unique_join(
         );
     }
     let Some((right_row_id, right_version)) = right_table.find_unique_visible_version(
+        None,
         &[plan.right_key],
         std::slice::from_ref(join_key),
         snapshot,
@@ -1205,8 +1217,11 @@ fn execute_prepared_off_key_unique_join(
                 continue;
             }
             if state.tracks_serializable_reads(xid)
-                && let Some(key) = right_table
-                    .create_unique_read_key(&[plan.right_key], std::slice::from_ref(join_key))
+                && let Some(key) = right_table.create_unique_read_key(
+                    None,
+                    &[plan.right_key],
+                    std::slice::from_ref(join_key),
+                )
             {
                 state.record_read(
                     xid,
@@ -1214,6 +1229,7 @@ fn execute_prepared_off_key_unique_join(
                 );
             }
             let Some((right_row_id, right_version)) = right_table.find_unique_visible_version(
+                None,
                 &[plan.right_key],
                 std::slice::from_ref(join_key),
                 snapshot,

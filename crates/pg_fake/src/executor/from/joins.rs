@@ -540,14 +540,18 @@ fn visit_hash_join_chain_rows<const PRUNE_SPARSE_RIGHT: bool>(
                     }
                     if unique
                         && state.tracks_serializable_reads(xid)
-                        && let Some(key) = table
-                            .create_unique_read_key(&[right_column], std::slice::from_ref(value))
+                        && let Some(key) = table.create_unique_read_key(
+                            None,
+                            &[right_column],
+                            std::slice::from_ref(value),
+                        )
                     {
                         state.record_read(xid, Access::Unique(schema.id, vec![right_column], key));
                     }
                     let candidates = if unique {
                         table
                             .find_unique_visible_version(
+                                None,
                                 &[right_column],
                                 std::slice::from_ref(value),
                                 snapshot,
@@ -558,6 +562,7 @@ fn visit_hash_join_chain_rows<const PRUNE_SPARSE_RIGHT: bool>(
                             .collect()
                     } else {
                         table.find_nonunique_visible_versions(
+                            None,
                             &[right_column],
                             std::slice::from_ref(value),
                             snapshot,

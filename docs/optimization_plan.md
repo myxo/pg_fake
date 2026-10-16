@@ -1,6 +1,6 @@
 # Optimization experiments
 
-Status: research completed; E01–E04 accepted, E05–E16 pending. This is separate
+Status: research completed; E01–E05 accepted, E06–E16 pending. This is separate
 from the SQL compatibility roadmap in `plan.md`.
 
 Research revision: `2b5243fc043adef6d713de71b2f9bc03dd57074a`.
@@ -243,7 +243,9 @@ normalization. Preserve RowId ordering where needed, ORDER BY, multiple versions
 NULLs, multiple matches and SSI predicate coverage. Writes and rollbacks must
 maintain the same physical index rather than a second redundant prefix index.
 
-### E05 — Prove partial-index eligibility from bound predicates [PENDING]
+### E05 — Prove partial-index eligibility from bound predicates [ACCEPTED]
+
+Decision and measurements: [E05 experiment record](optimization_e05.md).
 
 **Idea:** make access-path selection prove that query constraints imply an index
 predicate, then use the common access descriptor. Start with a principled

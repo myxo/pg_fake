@@ -222,13 +222,14 @@ pub(crate) fn collect_required_row_locks(
                 context,
             )?;
         }
-        if let Some(key) = table.create_unique_read_key(&access.columns, &access.values) {
+        if let Some(key) = table.create_unique_read_key(None, &access.columns, &access.values) {
             state.record_read(
                 xid,
                 crate::serializable::Access::Unique(schema.id, access.columns.clone(), key),
             );
         }
         match table.find_unique_visible_version(
+            None,
             &access.columns,
             &access.values,
             snapshot,

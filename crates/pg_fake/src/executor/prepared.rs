@@ -14,7 +14,10 @@ use crate::{
         expressions::{
             evaluate_comparison, evaluate_literal, infer_expression_type, is_null_literal,
         },
-        index_access::{EqualityIndexAccess, find_complete_index_access, find_prefix_index_access},
+        index_access::{
+            EqualityIndexAccess, find_complete_index_access, find_prefix_index_access,
+            implies_partial_index_predicate,
+        },
         normalize_identifier, normalize_relation_name,
         query::describe_query_result_columns,
         scope::{BoundScope, RowScope, bind_query_scope},
@@ -414,7 +417,8 @@ pub(crate) fn build_prepared_query_plan(
                     _ => return Ok(None),
                 }
             }
-            let Some(access) = find_complete_index_access(right_schema, &equalities, true) else {
+            let Some(access) = find_complete_index_access(right_schema, &equalities, true, None)
+            else {
                 return Ok(None);
             };
             if equalities.len() != access.columns.len() {
@@ -693,7 +697,17 @@ pub(crate) fn build_prepared_query_plan(
             (None, Some(schema)) => {
                 let access = selection
                     .as_ref()
-                    .and_then(|selection| find_index_access(selection, schema))
+                    .and_then(|selection| {
+                        find_index_access(
+                            selection,
+                            select
+                                .selection
+                                .as_ref()
+                                .expect("bound selection has source"),
+                            schema,
+                            &scope,
+                        )
+                    })
                     .unwrap_or(PreparedAccess::Scan);
                 if !joins.is_empty() && matches!(access, PreparedAccess::Scan) {
                     return Ok(None);
@@ -1034,7 +1048,9 @@ pub(super) fn bind_prepared_expression(
 
 fn find_index_access(
     selection: &PreparedExpression,
+    source_selection: &ast::Expr,
     schema: &TableSchema,
+    scope: &BoundScope,
 ) -> Option<PreparedAccess> {
     let mut equalities = Vec::new();
     let mut pending = vec![selection];
@@ -1073,8 +1089,38 @@ fn find_index_access(
             _ => {}
         }
     }
-    find_complete_index_access(schema, &equalities, false)
-        .or_else(|| find_prefix_index_access(schema, &equalities))
+    let conjuncts = std::cell::OnceCell::new();
+    let resolve_column = |identifiers: &[ast::Ident]| {
+        scope
+            .resolve_column(identifiers)
+            .ok()
+            .map(|(slot, _)| slot)
+            .filter(|slot| *slot < schema.columns.len())
+    };
+    let implies = |predicate: &ast::Expr| {
+        let conjuncts = conjuncts.get_or_init(|| {
+            let mut conjuncts = Vec::new();
+            let mut pending = vec![source_selection];
+            while let Some(expression) = pending.pop() {
+                match expression {
+                    ast::Expr::Nested(inner) => pending.push(inner),
+                    ast::Expr::BinaryOp {
+                        left,
+                        op: ast::BinaryOperator::And,
+                        right,
+                    } => {
+                        pending.push(right);
+                        pending.push(left);
+                    }
+                    _ => conjuncts.push(expression),
+                }
+            }
+            conjuncts
+        });
+        implies_partial_index_predicate(predicate, conjuncts, schema, &resolve_column)
+    };
+    find_complete_index_access(schema, &equalities, false, Some(&implies))
+        .or_else(|| find_prefix_index_access(schema, &equalities, Some(&implies)))
         .map(PreparedAccess::Indexed)
 }
 
@@ -1234,7 +1280,8 @@ pub(crate) fn execute_prepared_query(
                 .get(&join.table_id)
                 .expect("prepared table must have storage");
             if state.tracks_serializable_reads(xid)
-                && let Some(key) = table.create_unique_read_key(&join.access.columns, values)
+                && let Some(key) =
+                    table.create_unique_read_key(join.access.index_id, &join.access.columns, values)
             {
                 state.record_read(
                     xid,
@@ -1246,6 +1293,7 @@ pub(crate) fn execute_prepared_query(
                 );
             }
             let Some((row_id, version)) = table.find_unique_visible_version(
+                join.access.index_id,
                 &join.access.columns,
                 values,
                 snapshot,
@@ -1329,7 +1377,11 @@ pub(crate) fn execute_prepared_query(
                     let values = values.get_slice();
                     if access.unique {
                         if state.tracks_serializable_reads(xid)
-                            && let Some(key) = table.create_unique_read_key(&access.columns, values)
+                            && let Some(key) = table.create_unique_read_key(
+                                access.index_id,
+                                &access.columns,
+                                values,
+                            )
                         {
                             state.record_read(
                                 xid,
@@ -1341,6 +1393,7 @@ pub(crate) fn execute_prepared_query(
                             );
                         }
                         if let Some((row_id, version)) = table.find_unique_visible_version(
+                            access.index_id,
                             &access.columns,
                             values,
                             snapshot,
@@ -1356,6 +1409,7 @@ pub(crate) fn execute_prepared_query(
                     } else if values.len() < access.columns.len() {
                         state.record_read(xid, crate::serializable::Access::Relation(*table_id));
                         for (row_id, version) in table.find_prefix_visible_versions(
+                            access.index_id,
                             &access.columns,
                             values,
                             snapshot,
@@ -1371,6 +1425,7 @@ pub(crate) fn execute_prepared_query(
                     } else {
                         state.record_read(xid, crate::serializable::Access::Relation(*table_id));
                         for (row_id, version) in table.find_nonunique_visible_versions(
+                            access.index_id,
                             &access.columns,
                             values,
                             snapshot,

@@ -1,5 +1,6 @@
 from pathlib import Path
 import json
+import re
 import subprocess
 import sys
 
@@ -9,7 +10,7 @@ def prepare_probes():
     repository = evidence.parents[2]
     output = repository / "target" / "optimization-research"
     output.mkdir(parents=True, exist_ok=True)
-    if not any(arg in sys.argv for arg in ("--e01", "--e02", "--e02-regression", "--e03", "--e03-regression", "--e03-final-regression", "--e04", "--full-fake", "--regression", "--serializable")):
+    if not any(arg in sys.argv for arg in ("--e01", "--e02", "--e02-regression", "--e03", "--e03-regression", "--e03-final-regression", "--e04", "--e05", "--e05-controls", "--e05-concurrency", "--e05-maintenance", "--e05-final-controls", "--e05-indexed-write", "--full-fake", "--regression", "--serializable")):
         build = subprocess.run(
             ["cargo", "build", "--offline", "--release", "-p", "pg_fake", "--message-format=json"],
             cwd=repository, capture_output=True, text=True, check=True,
@@ -42,6 +43,12 @@ def prepare_probes():
         "fake_e02_regression_entry.rs" if "--e02-regression" in sys.argv else
         "fake_e02_entry.rs" if "--e02" in sys.argv else
         "fake_e04_entry.rs" if "--e04" in sys.argv else
+        "fake_e05_indexed_write_entry.rs" if "--e05-indexed-write" in sys.argv else
+        "fake_e05_final_controls_entry.rs" if "--e05-final-controls" in sys.argv else
+        "fake_e05_maintenance_entry.rs" if "--e05-maintenance" in sys.argv else
+        "fake_e05_concurrency_entry.rs" if "--e05-concurrency" in sys.argv else
+        "fake_e05_controls_entry.rs" if "--e05-controls" in sys.argv else
+        "fake_e05_entry.rs" if "--e05" in sys.argv else
         "fake_e03_final_regression_entry.rs" if "--e03-final-regression" in sys.argv else
         "fake_e03_regression_entry.rs" if "--e03-regression" in sys.argv else
         "fake_e03_entry.rs" if "--e03" in sys.argv else
@@ -50,6 +57,13 @@ def prepare_probes():
         "fake_entry.rs"
     )
     source = source[:start] + (evidence / entry).read_text() + source[end:]
+    if "--use-cli-timing" in sys.argv:
+        source, overrides = re.subn(
+            r"(?m)^([ \t]*)group\.sample_size\(20\);\n\1group\.measurement_time\(Duration::from_secs\(2\)\);\n",
+            "",
+            source,
+        )
+        assert overrides == 3
     (output / "workloads.rs").write_text(source)
     manifest = (repository / "crates/pg_fake_benchmarks/Cargo.toml").read_text()
     manifest = manifest.replace('name = "pg_fake_benchmarks"', 'name = "optimization-research"', 1)

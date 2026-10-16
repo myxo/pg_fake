@@ -2692,6 +2692,39 @@ fn benchmark_composite_prefix(criterion: &mut Criterion, row_counts: &[usize]) {
             });
         }
         if rows == 1_000 {
+            core_execute(
+                &mut session,
+                "CREATE TABLE pi_soft (account_id INTEGER, group_id INTEGER, deleted_at INTEGER); \
+                 CREATE INDEX pi_soft_active ON pi_soft(account_id, group_id) WHERE deleted_at IS NULL",
+            );
+            let deleted = (0..1_000)
+                .map(|i| format!("(1, {i}, 1)"))
+                .collect::<Vec<_>>()
+                .join(",");
+            core_execute(
+                &mut session,
+                &format!("INSERT INTO pi_soft VALUES {deleted}"),
+            );
+            core_execute(&mut session, "INSERT INTO pi_soft VALUES (1, 1000, NULL)");
+            let soft_deleted = session
+                .prepare("SELECT group_id FROM pi_soft WHERE account_id=$1 AND deleted_at IS NULL")
+                .unwrap();
+            let key = [Value::Int4(1)];
+            assert_eq!(
+                session
+                    .query_prepared(&soft_deleted, &key)
+                    .unwrap()
+                    .rows
+                    .len(),
+                1
+            );
+            group.bench_function(
+                BenchmarkId::new("soft_deleted_cluster", rows),
+                |benchmark| {
+                    benchmark
+                        .iter(|| black_box(session.query_prepared(&soft_deleted, &key).unwrap()));
+                },
+            );
             let missing = session
                 .prepare("SELECT group_id FROM prefix_members WHERE account_id = $1")
                 .unwrap();
@@ -2764,6 +2797,395 @@ fn benchmark_composite_prefix(criterion: &mut Criterion, row_counts: &[usize]) {
             }
         }
     }
+    group.finish();
+}
+
+fn benchmark_partial_index_access(criterion: &mut Criterion, row_counts: &[usize]) {
+    let mut group = criterion.benchmark_group("partial_index_access");
+    for &rows in row_counts {
+        let mut session = Db::create().create_session();
+        core_execute(
+            &mut session,
+            "CREATE TABLE pi_accounts (id UUID PRIMARY KEY, name TEXT, home_group_id UUID); \
+             CREATE TABLE pi_groups (id UUID PRIMARY KEY, name TEXT, display_name TEXT, deleted_at TIMESTAMPTZ); \
+             CREATE TABLE pi_memberships (id UUID PRIMARY KEY, group_id UUID, account_id UUID, role TEXT, created_at TIMESTAMPTZ, deleted_at TIMESTAMPTZ); \
+             CREATE UNIQUE INDEX pi_active_pair ON pi_memberships (group_id, account_id) WHERE deleted_at IS NULL; \
+             CREATE INDEX pi_active_account ON pi_memberships (account_id, group_id) WHERE deleted_at IS NULL; \
+             CREATE TABLE pi_plain (account_id UUID, group_id UUID, deleted_at TIMESTAMPTZ); \
+             CREATE INDEX pi_plain_account ON pi_plain (account_id, group_id); \
+             CREATE TABLE pi_single (account_id UUID, deleted_at TIMESTAMPTZ); \
+             CREATE INDEX pi_single_active ON pi_single (account_id) WHERE deleted_at IS NULL",
+        );
+        core_execute(&mut session, "BEGIN");
+        for start in (0..rows).step_by(500) {
+            let batch = start..rows.min(start + 500);
+            let accounts = batch
+                .clone()
+                .map(|i| {
+                    format!(
+                        "('{}', 'account {i}', '{}')",
+                        make_membership_join_uuid(1, i),
+                        make_membership_join_uuid(2, i),
+                    )
+                })
+                .collect::<Vec<_>>()
+                .join(",");
+            let groups = batch
+                .clone()
+                .map(|i| {
+                    format!(
+                        "('{}', 'group {i}', NULL, NULL)",
+                        make_membership_join_uuid(2, i),
+                    )
+                })
+                .collect::<Vec<_>>()
+                .join(",");
+            let memberships = batch
+                .clone()
+                .map(|i| {
+                    format!(
+                        "('{}', '{}', '{}', 'member', TIMESTAMPTZ '2024-01-01 00:00:00+00', NULL)",
+                        make_membership_join_uuid(3, i),
+                        make_membership_join_uuid(2, i),
+                        make_membership_join_uuid(1, i),
+                    )
+                })
+                .collect::<Vec<_>>()
+                .join(",");
+            let plain = batch
+                .clone()
+                .map(|i| {
+                    format!(
+                        "('{}', '{}', NULL)",
+                        make_membership_join_uuid(1, i),
+                        make_membership_join_uuid(2, i),
+                    )
+                })
+                .collect::<Vec<_>>()
+                .join(",");
+            let single = batch
+                .map(|i| format!("('{}', NULL)", make_membership_join_uuid(1, i),))
+                .collect::<Vec<_>>()
+                .join(",");
+            for sql in [
+                format!("INSERT INTO pi_accounts VALUES {accounts}"),
+                format!("INSERT INTO pi_groups VALUES {groups}"),
+                format!("INSERT INTO pi_memberships VALUES {memberships}"),
+                format!("INSERT INTO pi_plain VALUES {plain}"),
+                format!("INSERT INTO pi_single VALUES {single}"),
+            ] {
+                core_execute(&mut session, &sql);
+            }
+        }
+        core_execute(&mut session, "COMMIT");
+        let cases = [
+            (
+                "membership_profile",
+                "SELECT g.id,g.name,g.display_name,m.role,(a.home_group_id=g.id) AS is_home \
+                 FROM pi_memberships m JOIN pi_groups g ON g.id=m.group_id \
+                 JOIN pi_accounts a ON a.id=m.account_id \
+                 WHERE m.account_id=$1 AND m.deleted_at IS NULL AND g.deleted_at IS NULL \
+                 ORDER BY m.created_at,m.id",
+            ),
+            (
+                "group_members",
+                "SELECT m.account_id,a.name,home.name AS home_group_name,m.role \
+                 FROM pi_memberships m JOIN pi_groups g ON g.id=m.group_id \
+                 JOIN pi_accounts a ON a.id=m.account_id \
+                 JOIN pi_groups home ON home.id=a.home_group_id \
+                 WHERE m.group_id=$1 AND m.deleted_at IS NULL \
+                 AND g.deleted_at IS NULL AND home.deleted_at IS NULL \
+                 ORDER BY m.created_at,m.id",
+            ),
+            (
+                "partial_complete",
+                "SELECT role FROM pi_memberships WHERE account_id=$1 AND group_id=$2 AND deleted_at IS NULL",
+            ),
+            (
+                "partial_prefix",
+                "SELECT group_id FROM pi_memberships WHERE account_id=$1 AND deleted_at IS NULL",
+            ),
+            (
+                "plain_composite",
+                "SELECT group_id FROM pi_plain WHERE account_id=$1",
+            ),
+            (
+                "partial_single",
+                "SELECT account_id FROM pi_single WHERE account_id=$1 AND deleted_at IS NULL",
+            ),
+            (
+                "unfiltered",
+                "SELECT group_id FROM pi_memberships WHERE account_id=$1",
+            ),
+        ];
+        for (name, sql) in cases {
+            let statement = session.prepare(sql).unwrap();
+            let keys = (0..rows)
+                .map(|i| Value::Uuid(make_membership_join_uuid(1, i)))
+                .collect::<Vec<_>>();
+            let mut index = 0;
+            let first = if name == "group_members" {
+                Value::Uuid(make_membership_join_uuid(2, 0))
+            } else {
+                keys[0].clone()
+            };
+            let parameters = if name == "partial_complete" {
+                vec![first.clone(), Value::Uuid(make_membership_join_uuid(2, 0))]
+            } else {
+                vec![first.clone()]
+            };
+            assert_eq!(
+                session
+                    .query_prepared(&statement, &parameters)
+                    .unwrap()
+                    .rows
+                    .len(),
+                1
+            );
+            group.bench_function(BenchmarkId::new(name, rows), |benchmark| {
+                benchmark.iter(|| {
+                    let i = index % rows;
+                    index += 1;
+                    let key = if name == "group_members" {
+                        Value::Uuid(make_membership_join_uuid(2, i))
+                    } else {
+                        keys[i].clone()
+                    };
+                    let parameters = if name == "partial_complete" {
+                        vec![key, Value::Uuid(make_membership_join_uuid(2, i))]
+                    } else {
+                        vec![key]
+                    };
+                    black_box(session.query_prepared(&statement, &parameters).unwrap());
+                });
+            });
+        }
+        if rows == 1_000 {
+            let missing = session
+                .prepare("SELECT group_id FROM pi_memberships WHERE account_id=$1 AND deleted_at IS NULL")
+                .unwrap();
+            let absent = [Value::Uuid(make_membership_join_uuid(1, rows + 1))];
+            assert!(
+                session
+                    .query_prepared(&missing, &absent)
+                    .unwrap()
+                    .rows
+                    .is_empty()
+            );
+            group.bench_function(BenchmarkId::new("missing_partial", rows), |benchmark| {
+                benchmark.iter(|| black_box(session.query_prepared(&missing, &absent).unwrap()));
+            });
+            let sql =
+                "SELECT group_id FROM pi_memberships WHERE account_id=$1 AND deleted_at IS NULL";
+            let mut index = 0;
+            group.bench_function(
+                BenchmarkId::new("cold_prepare_execute", rows),
+                |benchmark| {
+                    benchmark.iter(|| {
+                        let key = Value::Uuid(make_membership_join_uuid(1, index % rows));
+                        index += 1;
+                        let statement = session.prepare(sql).unwrap();
+                        black_box(session.query_prepared(&statement, &[key]).unwrap());
+                    });
+                },
+            );
+        }
+    }
+    group.finish();
+}
+
+fn benchmark_partial_index_maintenance(criterion: &mut Criterion) {
+    let db = Db::create();
+    let mut session = db.create_session();
+    core_execute(
+        &mut session,
+        "CREATE TABLE pi_maintenance (id INTEGER PRIMARY KEY, key_value INTEGER, deleted_at INTEGER); \
+         CREATE INDEX pi_maintenance_active ON pi_maintenance(key_value) WHERE deleted_at IS NULL",
+    );
+    let values = (0..100)
+        .map(|id| format!("({id}, {id}, NULL)"))
+        .collect::<Vec<_>>()
+        .join(",");
+    core_execute(
+        &mut session,
+        &format!("INSERT INTO pi_maintenance VALUES {values}"),
+    );
+    let insert = session
+        .prepare("INSERT INTO pi_maintenance VALUES ($1, $2, $3)")
+        .unwrap();
+    let update = session
+        .prepare("UPDATE pi_maintenance SET deleted_at = $2 WHERE id = $1")
+        .unwrap();
+    let delete = session
+        .prepare("DELETE FROM pi_maintenance WHERE id = $1")
+        .unwrap();
+    let mut group = criterion.benchmark_group("partial_index_maintenance");
+    let mut next = 0;
+    group.bench_function("insert_active_rollback", |benchmark| {
+        benchmark.iter(|| {
+            let id = Value::Int4(1_000 + next % 100);
+            next += 1;
+            core_execute(&mut session, "BEGIN");
+            black_box(
+                session
+                    .execute_prepared(&insert, &[id.clone(), id, Value::Null])
+                    .unwrap(),
+            );
+            core_execute(&mut session, "ROLLBACK");
+        });
+    });
+    let mut next = 0;
+    group.bench_function("insert_deleted_rollback", |benchmark| {
+        benchmark.iter(|| {
+            let id = Value::Int4(1_000 + next % 100);
+            next += 1;
+            core_execute(&mut session, "BEGIN");
+            black_box(
+                session
+                    .execute_prepared(&insert, &[id.clone(), id, Value::Int4(1)])
+                    .unwrap(),
+            );
+            core_execute(&mut session, "ROLLBACK");
+        });
+    });
+    let mut next = 0;
+    group.bench_function("insert_commit_delete", |benchmark| {
+        benchmark.iter(|| {
+            let id = Value::Int4(1_000 + next % 100);
+            next += 1;
+            core_execute(&mut session, "BEGIN");
+            black_box(
+                session
+                    .execute_prepared(&insert, &[id.clone(), id.clone(), Value::Null])
+                    .unwrap(),
+            );
+            core_execute(&mut session, "COMMIT; BEGIN");
+            black_box(session.execute_prepared(&delete, &[id]).unwrap());
+            core_execute(&mut session, "COMMIT");
+        });
+    });
+    let mut next = 0;
+    group.bench_function("soft_delete_rollback", |benchmark| {
+        benchmark.iter(|| {
+            let id = Value::Int4(next % 100);
+            next += 1;
+            core_execute(&mut session, "BEGIN");
+            black_box(
+                session
+                    .execute_prepared(&update, &[id, Value::Int4(1)])
+                    .unwrap(),
+            );
+            core_execute(&mut session, "ROLLBACK");
+        });
+    });
+    let mut next = 0;
+    group.bench_function("soft_delete_commit_restore", |benchmark| {
+        benchmark.iter(|| {
+            let id = Value::Int4(next % 100);
+            next += 1;
+            core_execute(&mut session, "BEGIN");
+            black_box(
+                session
+                    .execute_prepared(&update, &[id.clone(), Value::Int4(1)])
+                    .unwrap(),
+            );
+            core_execute(&mut session, "COMMIT; BEGIN");
+            black_box(
+                session
+                    .execute_prepared(&update, &[id, Value::Null])
+                    .unwrap(),
+            );
+            core_execute(&mut session, "COMMIT");
+        });
+    });
+    group.bench_function("snapshot_first_write_dispose", |benchmark| {
+        benchmark.iter(|| {
+            let fork = db.snapshot();
+            let mut fork_session = fork.create_session();
+            black_box(
+                fork_session
+                    .execute("UPDATE pi_maintenance SET deleted_at = 1 WHERE id = 0")
+                    .unwrap(),
+            );
+            drop(fork_session);
+            drop(fork);
+        });
+    });
+    group.finish();
+}
+
+fn benchmark_bounded_on_conflict(criterion: &mut Criterion) {
+    let mut session = Db::create().create_session();
+    core_execute(
+        &mut session,
+        "CREATE TABLE bounded_conflict (id INTEGER PRIMARY KEY, value TEXT)",
+    );
+    let values = (0..100)
+        .map(|id| format!("({id}, 'original')"))
+        .collect::<Vec<_>>()
+        .join(",");
+    core_execute(
+        &mut session,
+        &format!("INSERT INTO bounded_conflict VALUES {values}"),
+    );
+    let statement = session
+        .prepare(
+            "INSERT INTO bounded_conflict VALUES ($1, 'proposed') \
+             ON CONFLICT (id) DO UPDATE SET value = excluded.value",
+        )
+        .unwrap();
+    let mut group = criterion.benchmark_group("bounded_on_conflict");
+    let mut next = 0;
+    group.bench_function("update_rollback", |benchmark| {
+        benchmark.iter(|| {
+            let id = Value::Int4(next % 100);
+            next += 1;
+            core_execute(&mut session, "BEGIN");
+            black_box(session.execute_prepared(&statement, &[id]).unwrap());
+            core_execute(&mut session, "ROLLBACK");
+        });
+    });
+    let mut next = 0;
+    group.bench_function("insert_rollback", |benchmark| {
+        benchmark.iter(|| {
+            let id = Value::Int4(1_000 + next % 100);
+            next += 1;
+            core_execute(&mut session, "BEGIN");
+            black_box(session.execute_prepared(&statement, &[id]).unwrap());
+            core_execute(&mut session, "ROLLBACK");
+        });
+    });
+    group.finish();
+}
+
+fn benchmark_bounded_indexed_update(criterion: &mut Criterion) {
+    let mut session = Db::create().create_session();
+    core_execute(
+        &mut session,
+        "CREATE TABLE bounded_indexed_update (id INTEGER PRIMARY KEY, amount INTEGER)",
+    );
+    let values = (0..1_000)
+        .map(|id| format!("({id}, 0)"))
+        .collect::<Vec<_>>()
+        .join(",");
+    core_execute(
+        &mut session,
+        &format!("INSERT INTO bounded_indexed_update VALUES {values}"),
+    );
+    let statement = session
+        .prepare("UPDATE bounded_indexed_update SET amount = amount + 1 WHERE id = $1")
+        .unwrap();
+    let mut next = 0;
+    let mut group = criterion.benchmark_group("bounded_indexed_update");
+    group.bench_function("rollback_1k", |benchmark| {
+        benchmark.iter(|| {
+            let id = Value::Int4(next % 1_000);
+            next += 1;
+            core_execute(&mut session, "BEGIN");
+            black_box(session.execute_prepared(&statement, &[id]).unwrap());
+            core_execute(&mut session, "ROLLBACK");
+        });
+    });
     group.finish();
 }
 
@@ -3215,6 +3637,7 @@ fn benchmarks(criterion: &mut Criterion) {
             "selective_outer_joins",
             "composite_access",
             "composite_prefix",
+            "partial_index_access",
             "guarded_mutations",
         ];
         let family_filter = filter.as_ref().filter(|filter| {
@@ -3233,6 +3656,12 @@ fn benchmarks(criterion: &mut Criterion) {
         }
         if matches("composite_prefix") {
             benchmark_composite_prefix(criterion, &[100, 1_000, 10_000]);
+        }
+        if matches("partial_index_access") {
+            benchmark_partial_index_access(criterion, &[10, 100, 1_000, 10_000]);
+            benchmark_partial_index_maintenance(criterion);
+            benchmark_bounded_on_conflict(criterion);
+            benchmark_bounded_indexed_update(criterion);
         }
         if matches("guarded_mutations") {
             benchmark_guarded_mutations(criterion);
