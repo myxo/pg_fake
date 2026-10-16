@@ -48,6 +48,7 @@ fn benchmarks(criterion: &mut Criterion) {
     benchmark_composite_prefix(criterion, &[100, 1_000, 10_000]);
     benchmark_partial_index_access(criterion, &[10, 100, 1_000, 10_000]);
     benchmark_partial_index_maintenance(criterion);
+    benchmark_expression_properties(criterion);
     benchmark_bounded_on_conflict(criterion);
     benchmark_bounded_indexed_update(criterion);
     benchmark_guarded_mutations(criterion);

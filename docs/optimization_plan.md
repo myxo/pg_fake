@@ -1,6 +1,6 @@
 # Optimization experiments
 
-Status: research completed; E01–E05 accepted, E06–E16 pending. This is separate
+Status: research completed; E01–E05 accepted, E06 rejected, E07–E16 pending. This is separate
 from the SQL compatibility roadmap in `plan.md`.
 
 Research revision: `2b5243fc043adef6d713de71b2f9bc03dd57074a`.
@@ -270,7 +270,9 @@ plans with changed values, DDL/invalidation, savepoints and old snapshots. An
 index candidate's visible version must satisfy the predicate; historical entries
 cannot substitute for that check. Do not assume unique prefixes or weaken SSI.
 
-### E06 — Compute structural expression properties once [PENDING]
+### E06 — Compute structural expression properties once [REJECTED]
+
+Decision and measurements: [E06 experiment record](optimization_e06.md).
 
 **Idea:** compute reusable expression/statement properties in one traversal:
 subqueries, advisory calls, volatility, views and other required analysis flags.

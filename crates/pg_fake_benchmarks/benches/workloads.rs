@@ -2007,6 +2007,51 @@ fn core_vs_sqlx_benchmark(criterion: &mut Criterion, runtime: &Runtime) {
     fake_execute(runtime, &mut sqlx, "ROLLBACK");
 }
 
+fn benchmark_expression_properties(criterion: &mut Criterion) {
+    let mut group = criterion.benchmark_group("expression_properties");
+    for rows in [100, 1_000] {
+        let db = Db::create();
+        let mut session = db.create_session();
+        session
+            .execute("CREATE TABLE expression_patterns (id INTEGER PRIMARY KEY, label TEXT)")
+            .unwrap();
+        let values = (1..=rows)
+            .map(|id| format!("({id}, 'value {id}')"))
+            .collect::<Vec<_>>()
+            .join(",");
+        session
+            .execute(&format!("INSERT INTO expression_patterns VALUES {values}"))
+            .unwrap();
+        let values = (1..=rows)
+            .map(|id| format!("({id})"))
+            .collect::<Vec<_>>()
+            .join(",");
+        let cases = [
+            (
+                "values_union_all",
+                format!("VALUES {values} UNION ALL VALUES {values}"),
+                rows * 2,
+            ),
+            (
+                "patterns",
+                "SELECT id, label ILIKE '%VALUE%', regexp_like(label, '[a-z]+ [0-9]+', 'i') FROM expression_patterns".into(),
+                rows,
+            ),
+        ];
+        for (name, sql, expected) in cases {
+            let prepared = session.prepare(&sql).unwrap();
+            assert_eq!(
+                session.query_prepared(&prepared, &[]).unwrap().rows.len(),
+                expected
+            );
+            group.bench_function(BenchmarkId::new(name, rows), |benchmark| {
+                benchmark.iter(|| black_box(session.query_prepared(&prepared, &[]).unwrap()));
+            });
+        }
+    }
+    group.finish();
+}
+
 fn benchmark_snapshots(criterion: &mut Criterion, selected: Option<&HashSet<&'static str>>) {
     for (rows, name) in [(100, "core_snapshot_100"), (1_000, "core_snapshot_1k")] {
         if selected.is_some_and(|selected| !selected.contains(name)) {
@@ -3638,6 +3683,7 @@ fn benchmarks(criterion: &mut Criterion) {
             "composite_access",
             "composite_prefix",
             "partial_index_access",
+            "expression_properties",
             "guarded_mutations",
         ];
         let family_filter = filter.as_ref().filter(|filter| {
@@ -3662,6 +3708,9 @@ fn benchmarks(criterion: &mut Criterion) {
             benchmark_partial_index_maintenance(criterion);
             benchmark_bounded_on_conflict(criterion);
             benchmark_bounded_indexed_update(criterion);
+        }
+        if matches("expression_properties") {
+            benchmark_expression_properties(criterion);
         }
         if matches("guarded_mutations") {
             benchmark_guarded_mutations(criterion);
